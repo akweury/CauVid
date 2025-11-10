@@ -1,0 +1,17 @@
+# Core dependencies for video processing pipeline
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Object detection dependencies
+ultralytics>=8.0.0  # YOLOv8 for object detection
+torch>=2.0.0        # PyTorch backend for YOLO
+torchvision>=0.15.0
+
+# Data handling
+pathlib2>=2.3.0
+dataclasses-json>=0.5.0
+
+# Optional: for advanced object detection models
+# tensorflow>=2.13.0
+# transformers>=4.30.0
