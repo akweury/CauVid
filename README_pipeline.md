@@ -280,6 +280,75 @@ The matrix automatically calculates velocity statistics:
 - Maximum speed across all objects
 - Object displacement analysis
 
+### Advanced Feature Extraction
+
+The pipeline extracts sophisticated feature vectors for each object in each frame to enable temporal analysis:
+
+**Feature Vector Components** (`f_t`):
+- `mean_velocity_direction`: Object movement direction (radians)
+- `mean_speed`: Movement speed (normalized by frame diagonal)
+- `contact_pattern`: Proximity score to other objects (0-1)
+- `support_pattern`: Stability and position support score (0-1)
+- `kinetic_energy`: Normalized kinetic energy based on motion
+- `potential_energy`: Normalized potential energy based on height
+
+**Usage**:
+```python
+# Extract features during processing
+results = pipeline.process_observation(
+    observation_id,
+    extract_features=True,
+    analyze_bonds=True
+)
+
+# Access feature vectors
+object_features = results['object_features']
+features_frame_0 = object_features['circle_red_000'][0]  # Features for specific object and frame
+feature_vector = features_frame_0.feature_vector  # NumPy array [6,]
+```
+
+### Temporal Bond Analysis & Video Segmentation
+
+The pipeline performs sophisticated temporal bond analysis to segment videos based on object behavior consistency:
+
+**Bond Strength Calculation**:
+```
+bond_strength = cosine_similarity(f_t, f_t+1)
+
+if bond_strength > τ and not key_event_occurs:
+    bond_exists = True
+else:
+    bond_break = True
+```
+
+**Key Event Detection**:
+Automatically detects significant behavioral changes:
+- Direction changes > 60 degrees
+- Speed changes > threshold
+- Energy changes > threshold
+
+**Video Segmentation**:
+- Groups consecutive frames with strong bonds
+- Creates segments based on bond breaks
+- Analyzes break reasons (threshold, key_event, end_of_video)
+
+**Configuration**:
+```python
+pipeline = VideoPipeline(
+    two_parts_root="./two_parts",
+    bond_threshold=0.8,  # Minimum similarity for bonds (τ)
+    frame_height=480,    # For feature normalization
+    frame_width=640
+)
+```
+
+**Output Files**:
+- `*_features.json`: Feature vectors for all objects and frames
+- `*_bonds.json`: Bond analysis with similarity scores and break events
+- `*_segments.json`: Video segments with duration and break reasons
+
+### Precision Metrics
+
 The pipeline automatically calculates comprehensive precision metrics when ground truth is available:
 
 - **Precision**: TP / (TP + FP) - Fraction of detections that are correct
