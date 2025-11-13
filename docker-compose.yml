@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  cauvid:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cauvid-pipeline
+    volumes:
+      # Mount data directory
+      - ./two_parts:/app/two_parts:ro
+      # Mount output directory for results
+      - ./pipeline_output:/app/pipeline_output
+      # Mount logs directory
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app/src
+      - LOG_LEVEL=INFO
+    networks:
+      - cauvid-network
+    restart: unless-stopped
+    # Override default command for different operations
+    command: ["python", "example_usage.py"]
+
+  # Development service with interactive shell
+  cauvid-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cauvid-dev
+    volumes:
+      # Mount source code for development
+      - ./src:/app/src
+      - ./*.py:/app/
+      - ./two_parts:/app/two_parts:ro
+      - ./pipeline_output:/app/pipeline_output
+      - ./logs:/app/logs
+    environment:
+      - PYTHONPATH=/app/src
+      - LOG_LEVEL=DEBUG
+    networks:
+      - cauvid-network
+    stdin_open: true
+    tty: true
+    command: ["/bin/bash"]
+
+networks:
+  cauvid-network:
+    driver: bridge
+
+volumes:
+  pipeline_output:
+  logs:

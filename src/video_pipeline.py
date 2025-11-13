@@ -17,6 +17,9 @@ from typing import Dict, List, Tuple, Any, Optional
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.spatial.distance import euclidean
+import math
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +48,78 @@ class ObjectTrack:
     def __post_init__(self):
         if self.frames_data is None:
             self.frames_data = {}
+
+
+@dataclass
+class FrameFeatureVector:
+    """Represents a feature vector for an object in a specific frame."""
+    object_id: str
+    frame_idx: int
+    mean_velocity_direction: float  # angle in radians
+    mean_speed: float
+    contact_pattern: float  # normalized contact score
+    support_pattern: float  # normalized support score  
+    kinetic_energy: float   # normalized kinetic energy
+    potential_energy: float # normalized potential energy
+    feature_vector: np.ndarray = None
+    
+    def __post_init__(self):
+        if self.feature_vector is None:
+            self.feature_vector = np.array([
+                self.mean_velocity_direction,
+                self.mean_speed,
+                self.contact_pattern,
+                self.support_pattern,
+                self.kinetic_energy,
+                self.potential_energy
+            ])
+
+
+@dataclass
+class BondStrength:
+    """Represents bond strength between consecutive frames for an object."""
+    object_id: str
+    frame_t: int
+    frame_t1: int
+    similarity: float
+    bond_exists: bool
+    key_event_detected: bool = False
+
+
+@dataclass
+class BondType:
+    """Represents a classified type of bond pattern."""
+    type_id: str
+    type_name: str
+    feature_signature: np.ndarray  # Representative feature difference pattern
+    similarity_threshold: float
+    count: int = 0
+    examples: List[Tuple[str, int, int]] = None  # (object_id, frame_t, frame_t1)
+    
+    def __post_init__(self):
+        if self.examples is None:
+            self.examples = []
+
+
+@dataclass
+class ClassifiedBond:
+    """Extends BondStrength with bond type classification."""
+    bond_strength: BondStrength
+    bond_type_id: str
+    type_confidence: float
+    feature_difference: np.ndarray
+
+
+@dataclass
+class VideoSegment:
+    """Represents a continuous segment of frames with strong bonds."""
+    segment_id: str
+    start_frame: int
+    end_frame: int
+    object_ids: List[str]
+    avg_bond_strength: float
+    break_reason: str = None  # "threshold", "key_event", "end_of_video"
+    dominant_bond_types: List[Tuple[str, float]] = None  # (type_id, frequency)
 
 
 @dataclass
@@ -920,11 +995,606 @@ class ObjectCentricMatrix:
             logger.info(f"Mean Position Error: {self.overall_metrics.mean_position_error:.2f} pixels")
 
 
+class FeatureExtractor:
+    """Extracts feature vectors for each object in each frame."""
+    
+    def __init__(self, frame_height: int = 480, frame_width: int = 640):
+        """Initialize feature extractor with frame dimensions for normalization."""
+        self.frame_height = frame_height
+        self.frame_width = frame_width
+        self.frame_area = frame_height * frame_width
+    
+    def extract_features(self, time_series_matrix: TimeSeriesObjectMatrix) -> Dict[str, Dict[int, FrameFeatureVector]]:
+        """Extract feature vectors for all objects in all frames.
+        
+        Returns:
+            Dict[object_id][frame_idx] = FrameFeatureVector
+        """
+        object_features = {}
+        
+        # Get all unique object IDs
+        object_ids = set()
+        for frame_data in time_series_matrix.matrix.values():
+            for object_id in frame_data.keys():
+                object_ids.add(object_id)
+        
+        logger.info(f"Extracting features for {len(object_ids)} objects across {len(time_series_matrix.matrix)} frames")
+        
+        for obj_id in object_ids:
+            object_features[obj_id] = {}
+            
+            # Get trajectory for this object
+            trajectory = self._get_object_trajectory(time_series_matrix, obj_id)
+            
+            for frame_idx in sorted(time_series_matrix.matrix.keys()):
+                if obj_id in time_series_matrix.matrix[frame_idx]:
+                    features = self._extract_frame_features(time_series_matrix, obj_id, frame_idx, trajectory)
+                    object_features[obj_id][frame_idx] = features
+        
+        return object_features
+    
+    def _get_object_trajectory(self, time_series_matrix: TimeSeriesObjectMatrix, obj_id: str) -> List[Tuple[int, float, float]]:
+        """Get trajectory as list of (frame_idx, x, y) for an object."""
+        trajectory = []
+        
+        for frame_idx in sorted(time_series_matrix.matrix.keys()):
+            if obj_id in time_series_matrix.matrix[frame_idx]:
+                x = time_series_matrix.matrix[frame_idx][obj_id]['position_x']
+                y = time_series_matrix.matrix[frame_idx][obj_id]['position_y']
+                trajectory.append((frame_idx, x, y))
+        
+        return trajectory
+    
+    def _extract_frame_features(self, time_series_matrix: TimeSeriesObjectMatrix, obj_id: str, 
+                              frame_idx: int, trajectory: List[Tuple[int, float, float]]) -> FrameFeatureVector:
+        """Extract features for a specific object in a specific frame."""
+        
+        # Get object data for this frame
+        if obj_id not in time_series_matrix.matrix[frame_idx]:
+            raise ValueError(f"Object {obj_id} not found in frame {frame_idx}")
+            
+        obj_data = time_series_matrix.matrix[frame_idx][obj_id]
+        
+        # 1. Mean velocity direction (angle in radians)
+        velocity_x = obj_data.get('velocity_x', 0.0)
+        velocity_y = obj_data.get('velocity_y', 0.0)
+        mean_velocity_direction = math.atan2(velocity_y, velocity_x) if (velocity_x != 0 or velocity_y != 0) else 0.0
+        
+        # 2. Mean speed (normalized by frame diagonal)
+        frame_diagonal = math.sqrt(self.frame_width**2 + self.frame_height**2)
+        mean_speed = math.sqrt(velocity_x**2 + velocity_y**2) / frame_diagonal
+        
+        # 3. Contact pattern (normalized contact score based on proximity to other objects)
+        contact_pattern = self._calculate_contact_pattern(time_series_matrix, obj_id, frame_idx)
+        
+        # 4. Support pattern (normalized support score based on position and stability)
+        support_pattern = self._calculate_support_pattern(obj_data, trajectory, frame_idx)
+        
+        # 5. Kinetic energy (normalized)
+        mass = obj_data.get('area', 100.0) / 100.0  # Use area as proxy for mass
+        kinetic_energy = 0.5 * mass * (velocity_x**2 + velocity_y**2) / (frame_diagonal**2)
+        
+        # 6. Potential energy (normalized by height position)
+        potential_energy = mass * (self.frame_height - obj_data['position_y']) / self.frame_height
+        
+        return FrameFeatureVector(
+            object_id=obj_id,
+            frame_idx=frame_idx,
+            mean_velocity_direction=mean_velocity_direction,
+            mean_speed=mean_speed,
+            contact_pattern=contact_pattern,
+            support_pattern=support_pattern,
+            kinetic_energy=kinetic_energy,
+            potential_energy=potential_energy
+        )
+    
+    def _calculate_contact_pattern(self, time_series_matrix: TimeSeriesObjectMatrix, 
+                                 obj_id: str, frame_idx: int, contact_threshold: float = 50.0) -> float:
+        """Calculate contact pattern based on proximity to other objects."""
+        target_obj = None
+        other_objects = []
+        
+        if obj_id in time_series_matrix.matrix[frame_idx]:
+            target_obj = time_series_matrix.matrix[frame_idx][obj_id]
+            
+        for other_obj_id, obj_data in time_series_matrix.matrix[frame_idx].items():
+            if other_obj_id != obj_id:
+                other_objects.append(obj_data)
+        
+        if target_obj is None or not other_objects:
+            return 0.0
+        
+        # Calculate minimum distance to other objects
+        min_distance = float('inf')
+        for other_obj in other_objects:
+            distance = euclidean(
+                [target_obj['position_x'], target_obj['position_y']],
+                [other_obj['position_x'], other_obj['position_y']]
+            )
+            min_distance = min(min_distance, distance)
+        
+        # Normalize contact score (closer = higher contact)
+        contact_score = max(0.0, (contact_threshold - min_distance) / contact_threshold)
+        return contact_score
+    
+    def _calculate_support_pattern(self, obj_data: Dict, trajectory: List[Tuple[int, float, float]], 
+                                 frame_idx: int, stability_window: int = 5) -> float:
+        """Calculate support pattern based on position stability and movement."""
+        # Get recent positions for stability calculation
+        recent_positions = [(x, y) for f, x, y in trajectory if f <= frame_idx and f > frame_idx - stability_window]
+        
+        if len(recent_positions) < 2:
+            return 0.5  # Default neutral support
+        
+        # Calculate position variance (lower variance = more support)
+        x_positions = [x for x, y in recent_positions]
+        y_positions = [y for x, y in recent_positions]
+        
+        x_variance = np.var(x_positions) if len(x_positions) > 1 else 0.0
+        y_variance = np.var(y_positions) if len(y_positions) > 1 else 0.0
+        total_variance = (x_variance + y_variance) / (self.frame_width**2 + self.frame_height**2)
+        
+        # Support decreases with variance (more stable = more support)
+        support_score = max(0.0, 1.0 - total_variance * 100.0)  # Scale factor for sensitivity
+        
+        # Add height-based support (lower objects have more "ground" support)
+        height_support = (self.frame_height - obj_data['position_y']) / self.frame_height
+        
+        # Combine stability and height support
+        return (support_score + height_support) / 2.0
+
+
+class BondTypeClassifier:
+    """Classifies bonds into types based on feature difference patterns."""
+    
+    def __init__(self, similarity_threshold: float = 0.8, min_cluster_size: int = 3):
+        """Initialize bond type classifier.
+        
+        Args:
+            similarity_threshold: Minimum similarity for bonds to be same type
+            min_cluster_size: Minimum number of bonds to form a type
+        """
+        self.similarity_threshold = similarity_threshold
+        self.min_cluster_size = min_cluster_size
+        self.bond_types: Dict[str, BondType] = {}
+        self.type_counter = 0
+        
+    def classify_bonds(self, object_features: Dict[str, Dict[int, FrameFeatureVector]], 
+                      object_bonds: Dict[str, List[BondStrength]]) -> Tuple[Dict[str, List[ClassifiedBond]], Dict[str, BondType]]:
+        """Classify all bonds into types based on feature difference patterns."""
+        
+        logger.info("Analyzing bond patterns for type classification...")
+        
+        # Step 1: Extract feature differences for all bonds
+        all_feature_differences = []
+        bond_references = []  # To track which bond each difference belongs to
+        
+        for obj_id, bonds in object_bonds.items():
+            obj_features = object_features[obj_id]
+            
+            for bond in bonds:
+                if bond.frame_t in obj_features and bond.frame_t1 in obj_features:
+                    # Calculate feature difference vector
+                    feat_t = obj_features[bond.frame_t].feature_vector
+                    feat_t1 = obj_features[bond.frame_t1].feature_vector
+                    feature_diff = feat_t1 - feat_t
+                    
+                    all_feature_differences.append(feature_diff)
+                    bond_references.append((obj_id, bond))
+        
+        # Step 2: Cluster feature differences to identify bond types
+        if len(all_feature_differences) > 0:
+            feature_diff_matrix = np.array(all_feature_differences)
+            bond_types = self._cluster_feature_differences(feature_diff_matrix, bond_references)
+            
+            # Step 3: Classify each bond
+            classified_bonds = {}
+            for obj_id in object_bonds.keys():
+                classified_bonds[obj_id] = []
+            
+            for i, (obj_id, bond) in enumerate(bond_references):
+                feature_diff = all_feature_differences[i]
+                bond_type_id, confidence = self._assign_bond_type(feature_diff, bond_types)
+                
+                classified_bond = ClassifiedBond(
+                    bond_strength=bond,
+                    bond_type_id=bond_type_id,
+                    type_confidence=confidence,
+                    feature_difference=feature_diff
+                )
+                
+                classified_bonds[obj_id].append(classified_bond)
+                
+                # Update bond type statistics
+                if bond_type_id in bond_types:
+                    bond_types[bond_type_id].count += 1
+                    bond_types[bond_type_id].examples.append((obj_id, bond.frame_t, bond.frame_t1))
+        
+        else:
+            classified_bonds = {obj_id: [] for obj_id in object_bonds.keys()}
+            bond_types = {}
+        
+        self.bond_types = bond_types
+        
+        logger.info(f"Classified {sum(len(bonds) for bonds in classified_bonds.values())} bonds into {len(bond_types)} types")
+        
+        return classified_bonds, bond_types
+    
+    def _cluster_feature_differences(self, feature_diff_matrix: np.ndarray, 
+                                   bond_references: List) -> Dict[str, BondType]:
+        """Cluster feature differences to identify distinct bond types."""
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import StandardScaler
+        
+        # Normalize feature differences
+        scaler = StandardScaler()
+        normalized_diffs = scaler.fit_transform(feature_diff_matrix)
+        
+        # Use DBSCAN for clustering (handles noise well)
+        # eps controls how close points need to be to be in same cluster
+        # min_samples controls minimum cluster size
+        clustering = DBSCAN(eps=0.3, min_samples=self.min_cluster_size)
+        cluster_labels = clustering.fit_predict(normalized_diffs)
+        
+        # Create bond types from clusters
+        bond_types = {}
+        unique_labels = set(cluster_labels)
+        
+        for label in unique_labels:
+            if label == -1:  # Noise cluster
+                continue
+                
+            # Get all bonds in this cluster
+            cluster_indices = np.where(cluster_labels == label)[0]
+            cluster_diffs = feature_diff_matrix[cluster_indices]
+            
+            # Create representative signature (mean of cluster)
+            signature = np.mean(cluster_diffs, axis=0)
+            
+            # Determine bond type name based on dominant features
+            type_name = self._generate_bond_type_name(signature)
+            type_id = f"bond_type_{self.type_counter:03d}"
+            self.type_counter += 1
+            
+            bond_type = BondType(
+                type_id=type_id,
+                type_name=type_name,
+                feature_signature=signature,
+                similarity_threshold=self.similarity_threshold,
+                count=0,
+                examples=[]
+            )
+            
+            bond_types[type_id] = bond_type
+        
+        # Handle noise as separate types if significant
+        noise_indices = np.where(cluster_labels == -1)[0]
+        if len(noise_indices) >= self.min_cluster_size:
+            # Create "misc" type for noise
+            noise_diffs = feature_diff_matrix[noise_indices]
+            signature = np.mean(noise_diffs, axis=0)
+            
+            type_id = f"bond_type_{self.type_counter:03d}"
+            self.type_counter += 1
+            
+            bond_type = BondType(
+                type_id=type_id,
+                type_name="miscellaneous",
+                feature_signature=signature,
+                similarity_threshold=self.similarity_threshold * 0.8,  # Lower threshold for misc
+                count=0,
+                examples=[]
+            )
+            
+            bond_types[type_id] = bond_type
+        
+        return bond_types
+    
+    def _generate_bond_type_name(self, signature: np.ndarray) -> str:
+        """Generate descriptive name for bond type based on feature signature."""
+        feature_names = [
+            'velocity_direction', 'speed', 'contact_pattern', 
+            'support_pattern', 'kinetic_energy', 'potential_energy'
+        ]
+        
+        # Find dominant feature changes
+        abs_signature = np.abs(signature)
+        dominant_idx = np.argmax(abs_signature)
+        dominant_value = signature[dominant_idx]
+        dominant_feature = feature_names[dominant_idx]
+        
+        # Determine change direction
+        direction = "increase" if dominant_value > 0 else "decrease"
+        
+        # Determine magnitude
+        magnitude = "large" if abs_signature[dominant_idx] > np.std(abs_signature) * 2 else "small"
+        
+        # Generate name
+        if dominant_feature == 'velocity_direction':
+            return f"{magnitude}_direction_change"
+        elif dominant_feature == 'speed':
+            return f"{magnitude}_speed_{direction}"
+        elif dominant_feature == 'contact_pattern':
+            return f"{magnitude}_contact_{direction}"
+        elif dominant_feature == 'support_pattern':
+            return f"{magnitude}_support_{direction}"
+        elif dominant_feature == 'kinetic_energy':
+            return f"{magnitude}_kinetic_{direction}"
+        elif dominant_feature == 'potential_energy':
+            return f"{magnitude}_potential_{direction}"
+        else:
+            return f"{magnitude}_feature_{direction}"
+    
+    def _assign_bond_type(self, feature_diff: np.ndarray, 
+                         bond_types: Dict[str, BondType]) -> Tuple[str, float]:
+        """Assign a bond to the most similar bond type."""
+        
+        if not bond_types:
+            # Create default type if no types exist
+            return "unclassified", 0.0
+        
+        best_type_id = None
+        best_similarity = -1.0
+        
+        for type_id, bond_type in bond_types.items():
+            # Calculate similarity to type signature
+            similarity = cosine_similarity(
+                feature_diff.reshape(1, -1),
+                bond_type.feature_signature.reshape(1, -1)
+            )[0, 0]
+            
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_type_id = type_id
+        
+        # Check if similarity meets threshold
+        confidence = best_similarity if best_similarity > 0.5 else 0.0
+        
+        return best_type_id or "unclassified", confidence
+    
+    def get_bond_type_summary(self) -> Dict[str, Any]:
+        """Get summary statistics of bond types."""
+        summary = {
+            'total_types': len(self.bond_types),
+            'total_classified_bonds': sum(bt.count for bt in self.bond_types.values()),
+            'types': {}
+        }
+        
+        for type_id, bond_type in self.bond_types.items():
+            summary['types'][type_id] = {
+                'name': bond_type.type_name,
+                'count': bond_type.count,
+                'percentage': bond_type.count / summary['total_classified_bonds'] * 100 if summary['total_classified_bonds'] > 0 else 0,
+                'signature': bond_type.feature_signature.tolist(),
+                'examples': bond_type.examples[:3]  # Show first 3 examples
+            }
+        
+        return summary
+
+
+class TemporalBondAnalyzer:
+    """Analyzes temporal bonds between consecutive frames and segments video."""
+    
+    def __init__(self, bond_threshold: float = 0.8, key_event_detector=None, 
+                 classify_bond_types: bool = True):
+        """Initialize bond analyzer.
+        
+        Args:
+            bond_threshold: Minimum cosine similarity for bond to exist (τ)
+            key_event_detector: Optional function to detect key events
+            classify_bond_types: Whether to classify bonds into types
+        """
+        self.bond_threshold = bond_threshold
+        self.key_event_detector = key_event_detector or self._default_key_event_detector
+        self.classify_bond_types = classify_bond_types
+        self.bond_classifier = BondTypeClassifier() if classify_bond_types else None
+    
+    def analyze_bonds(self, object_features: Dict[str, Dict[int, FrameFeatureVector]]) -> Dict[str, Any]:
+        """Analyze bonds between consecutive frames for all objects with classification."""
+        
+        logger.info(f"Analyzing temporal bonds for {len(object_features)} objects with threshold {self.bond_threshold}")
+        
+        # Step 1: Basic bond analysis
+        object_bonds = {}
+        
+        for obj_id, frame_features in object_features.items():
+            object_bonds[obj_id] = []
+            
+            frame_indices = sorted(frame_features.keys())
+            
+            for i in range(len(frame_indices) - 1):
+                frame_t = frame_indices[i]
+                frame_t1 = frame_indices[i + 1]
+                
+                # Calculate bond strength
+                bond = self._calculate_bond_strength(
+                    frame_features[frame_t], 
+                    frame_features[frame_t1],
+                    obj_id
+                )
+                
+                object_bonds[obj_id].append(bond)
+        
+        results = {'object_bonds': object_bonds}
+        
+        # Step 2: Bond type classification if enabled
+        if self.classify_bond_types and self.bond_classifier:
+            classified_bonds, bond_types = self.bond_classifier.classify_bonds(object_features, object_bonds)
+            bond_type_summary = self.bond_classifier.get_bond_type_summary()
+            
+            results.update({
+                'classified_bonds': classified_bonds,
+                'bond_types': bond_types,
+                'bond_type_summary': bond_type_summary
+            })
+            
+            logger.info(f"Bond classification complete: {len(bond_types)} types identified")
+            for type_id, bond_type in bond_types.items():
+                logger.info(f"  {type_id} ({bond_type.type_name}): {bond_type.count} bonds")
+        
+        return results
+    
+    def _calculate_bond_strength(self, feature_t: FrameFeatureVector, feature_t1: FrameFeatureVector, 
+                               obj_id: str) -> BondStrength:
+        """Calculate bond strength between two consecutive frames."""
+        # Calculate cosine similarity
+        similarity = cosine_similarity(
+            feature_t.feature_vector.reshape(1, -1),
+            feature_t1.feature_vector.reshape(1, -1)
+        )[0, 0]
+        
+        # Check for key events
+        key_event = self.key_event_detector(feature_t, feature_t1)
+        
+        # Determine if bond exists
+        bond_exists = similarity > self.bond_threshold and not key_event
+        
+        return BondStrength(
+            object_id=obj_id,
+            frame_t=feature_t.frame_idx,
+            frame_t1=feature_t1.frame_idx,
+            similarity=similarity,
+            bond_exists=bond_exists,
+            key_event_detected=key_event
+        )
+    
+    def _default_key_event_detector(self, feature_t: FrameFeatureVector, feature_t1: FrameFeatureVector) -> bool:
+        """Default key event detector - detects significant changes in motion."""
+        # Detect significant direction change
+        direction_change = abs(feature_t1.mean_velocity_direction - feature_t.mean_velocity_direction)
+        direction_change = min(direction_change, 2 * math.pi - direction_change)  # Handle wraparound
+        
+        # Detect significant speed change
+        speed_change = abs(feature_t1.mean_speed - feature_t.mean_speed)
+        
+        # Detect significant energy change
+        energy_change = abs(feature_t1.kinetic_energy - feature_t.kinetic_energy)
+        
+        # Key event if significant change in any property
+        return (direction_change > math.pi / 3 or  # > 60 degree change
+                speed_change > 0.1 or              # Significant speed change
+                energy_change > 0.1)               # Significant energy change
+    
+    def segment_video(self, bond_analysis_results: Dict[str, Any]) -> List[VideoSegment]:
+        """Segment video based on bond analysis across all objects."""
+        
+        object_bonds = bond_analysis_results['object_bonds']
+        classified_bonds = bond_analysis_results.get('classified_bonds', {})
+        
+        if not object_bonds:
+            return []
+        
+        # Find all frame transitions where bonds break
+        all_frames = set()
+        for bonds in object_bonds.values():
+            for bond in bonds:
+                all_frames.add(bond.frame_t)
+                all_frames.add(bond.frame_t1)
+        
+        frame_indices = sorted(all_frames)
+        
+        # Find segment boundaries
+        segments = []
+        segment_start = frame_indices[0] if frame_indices else 0
+        
+        for i in range(len(frame_indices) - 1):
+            current_frame = frame_indices[i]
+            next_frame = frame_indices[i + 1]
+            
+            # Check if bonds break at this transition for any object
+            bonds_broken = 0
+            total_bonds = 0
+            bond_strengths = []
+            break_reasons = []
+            bond_type_counts = {}
+            
+            for obj_id, bonds in object_bonds.items():
+                for bond in bonds:
+                    if bond.frame_t == current_frame and bond.frame_t1 == next_frame:
+                        total_bonds += 1
+                        bond_strengths.append(bond.similarity)
+                        
+                        # Track bond types in this transition
+                        if obj_id in classified_bonds:
+                            for classified_bond in classified_bonds[obj_id]:
+                                if (classified_bond.bond_strength.frame_t == current_frame and 
+                                    classified_bond.bond_strength.frame_t1 == next_frame):
+                                    bond_type = classified_bond.bond_type_id
+                                    bond_type_counts[bond_type] = bond_type_counts.get(bond_type, 0) + 1
+                        
+                        if not bond.bond_exists:
+                            bonds_broken += 1
+                            if bond.key_event_detected:
+                                break_reasons.append("key_event")
+                            else:
+                                break_reasons.append("threshold")
+            
+            # If majority of bonds break, end current segment
+            if total_bonds > 0 and bonds_broken / total_bonds > 0.5:
+                # Calculate dominant bond types in segment
+                dominant_bond_types = []
+                if bond_type_counts:
+                    total_type_count = sum(bond_type_counts.values())
+                    dominant_bond_types = [
+                        (type_id, count / total_type_count) 
+                        for type_id, count in sorted(bond_type_counts.items(), key=lambda x: x[1], reverse=True)
+                    ]
+                
+                # Create segment
+                avg_strength = np.mean(bond_strengths) if bond_strengths else 0.0
+                most_common_reason = max(set(break_reasons), key=break_reasons.count) if break_reasons else "threshold"
+                
+                segment = VideoSegment(
+                    segment_id=f"segment_{len(segments):03d}",
+                    start_frame=segment_start,
+                    end_frame=current_frame,
+                    object_ids=list(object_bonds.keys()),
+                    avg_bond_strength=avg_strength,
+                    break_reason=most_common_reason,
+                    dominant_bond_types=dominant_bond_types
+                )
+                segments.append(segment)
+                segment_start = next_frame
+        
+        # Add final segment
+        if frame_indices:
+            # Calculate bond types for final segment
+            final_bond_type_counts = {}
+            for obj_id in classified_bonds:
+                for classified_bond in classified_bonds[obj_id]:
+                    if classified_bond.bond_strength.frame_t >= segment_start:
+                        bond_type = classified_bond.bond_type_id
+                        final_bond_type_counts[bond_type] = final_bond_type_counts.get(bond_type, 0) + 1
+            
+            final_dominant_types = []
+            if final_bond_type_counts:
+                total_type_count = sum(final_bond_type_counts.values())
+                final_dominant_types = [
+                    (type_id, count / total_type_count) 
+                    for type_id, count in sorted(final_bond_type_counts.items(), key=lambda x: x[1], reverse=True)
+                ]
+            
+            final_segment = VideoSegment(
+                segment_id=f"segment_{len(segments):03d}",
+                start_frame=segment_start,
+                end_frame=frame_indices[-1],
+                object_ids=list(object_bonds.keys()),
+                avg_bond_strength=1.0,
+                break_reason="end_of_video",
+                dominant_bond_types=final_dominant_types
+            )
+            segments.append(final_segment)
+        
+        logger.info(f"Created {len(segments)} video segments with bond type analysis")
+        return segments
+
+
 class VideoPipeline:
     """Main pipeline that orchestrates the entire video processing workflow."""
     
     def __init__(self, two_parts_root: str, output_dir: str = "output", 
-                 detector_type: str = "circle", position_threshold: float = 20.0):
+                 detector_type: str = "circle", position_threshold: float = 20.0,
+                 bond_threshold: float = 0.8, frame_height: int = 480, frame_width: int = 640):
         """Initialize the pipeline.
         
         Args:
@@ -932,25 +1602,39 @@ class VideoPipeline:
             output_dir: Directory to save pipeline outputs
             detector_type: Type of object detector to use ('circle' for synthetic circles, 'yolo' for general objects)
             position_threshold: Maximum distance in pixels for matching detections to ground truth
+            bond_threshold: Minimum cosine similarity for temporal bonds (τ)
+            frame_height: Height of video frames for feature normalization
+            frame_width: Width of video frames for feature normalization
         """
         self.frame_loader = VideoFrameLoader(two_parts_root)
         self.object_detector = ObjectDetector(model_type=detector_type)
         self.precision_evaluator = PrecisionEvaluator(position_threshold=position_threshold)
+        self.feature_extractor = FeatureExtractor(frame_height=frame_height, frame_width=frame_width)
+        self.bond_analyzer = TemporalBondAnalyzer(
+            bond_threshold=bond_threshold,
+            classify_bond_types=True  # Enable bond type classification
+        )
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         
-        logger.info(f"Initialized VideoPipeline with root: {two_parts_root}, detector: {detector_type}, threshold: {position_threshold}px")
+        logger.info(f"Initialized VideoPipeline with root: {two_parts_root}, detector: {detector_type}, "
+                   f"position_threshold: {position_threshold}px, bond_threshold: {bond_threshold}")
     
     def process_observation(self, observation_id: str, 
-                          include_ground_truth: bool = True) -> ObjectCentricMatrix:
+                          include_ground_truth: bool = True, 
+                          extract_features: bool = True,
+                          analyze_bonds: bool = True) -> Dict[str, Any]:
         """Process a single observation through the complete pipeline.
         
         Args:
             observation_id: ID of the observation to process
-            include_ground_truth: Whether to include ground truth data
+            include_ground_truth: Whether to include precision evaluation
+            extract_features: Whether to extract feature vectors
+            analyze_bonds: Whether to perform temporal bond analysis
             
         Returns:
-            ObjectCentricMatrix containing the processed results
+        Returns:
+            Dictionary containing all pipeline outputs
         """
         logger.info(f"Processing observation: {observation_id}")
         
@@ -1036,11 +1720,230 @@ class VideoPipeline:
         np.savez(str(numpy_output_file), **numpy_data)
         logger.info(f"Exported time-series numpy arrays to {numpy_output_file}")
         
+        # Initialize results dictionary
+        results = {
+            'object_centric_matrix': matrix,
+            'time_series_matrix': time_series_matrix,
+            'observation_id': observation_id
+        }
+        
+        # Extract features if requested
+        if extract_features:
+            logger.info("Extracting object feature vectors...")
+            object_features = self.feature_extractor.extract_features(time_series_matrix)
+            results['object_features'] = object_features
+            
+            # Export features to JSON
+            features_output_file = self.output_dir / f"{observation_id}_features.json"
+            self._export_features_to_json(object_features, str(features_output_file))
+            logger.info(f"Exported features to {features_output_file}")
+            
+            # Analyze bonds if requested
+            if analyze_bonds:
+                logger.info("Analyzing temporal bonds...")
+                bond_analysis_results = self.bond_analyzer.analyze_bonds(object_features)
+                results['bond_analysis'] = bond_analysis_results
+                
+                # Extract components for backward compatibility
+                object_bonds = bond_analysis_results['object_bonds']
+                results['object_bonds'] = object_bonds
+                
+                # Add new classification results
+                if 'classified_bonds' in bond_analysis_results:
+                    results['classified_bonds'] = bond_analysis_results['classified_bonds']
+                    results['bond_types'] = bond_analysis_results['bond_types']
+                    results['bond_type_summary'] = bond_analysis_results['bond_type_summary']
+                
+                # Segment video based on bonds
+                video_segments = self.bond_analyzer.segment_video(bond_analysis_results)
+                results['video_segments'] = video_segments
+                
+                # Export bonds and segments
+                bonds_output_file = self.output_dir / f"{observation_id}_bonds.json"
+                self._export_bonds_to_json(object_bonds, str(bonds_output_file))
+                
+                # Export bond types and classification
+                if 'bond_types' in results:
+                    bond_types_output_file = self.output_dir / f"{observation_id}_bond_types.json"
+                    self._export_bond_types_to_json(results['bond_types'], results['bond_type_summary'], str(bond_types_output_file))
+                
+                # Export classified bonds
+                if 'classified_bonds' in results:
+                    classified_bonds_output_file = self.output_dir / f"{observation_id}_classified_bonds.json"
+                    self._export_classified_bonds_to_json(results['classified_bonds'], str(classified_bonds_output_file))
+                
+                segments_output_file = self.output_dir / f"{observation_id}_segments.json"
+                self._export_segments_to_json(video_segments, str(segments_output_file))
+                
+                # Log results
+                if 'bond_type_summary' in results:
+                    summary = results['bond_type_summary']
+                    logger.info(f"Bond type classification complete:")
+                    logger.info(f"  Total bond types: {summary['total_types']}")
+                    logger.info(f"  Total classified bonds: {summary['total_classified_bonds']}")
+                
+                # Log segmentation results
+                logger.info(f"Video segmentation complete:")
+                logger.info(f"  Total segments: {len(video_segments)}")
+                for segment in video_segments:
+                    bond_type_info = ""
+                    if segment.dominant_bond_types:
+                        dominant_type = segment.dominant_bond_types[0]
+                        bond_type_info = f", dominant_type={dominant_type[0]}({dominant_type[1]:.1%})"
+                    
+                    logger.info(f"  {segment.segment_id}: frames {segment.start_frame}-{segment.end_frame} "
+                               f"(avg_bond={segment.avg_bond_strength:.3f}, reason={segment.break_reason}{bond_type_info})")
+        
         logger.info(f"Completed processing {observation_id}")
-        return matrix, time_series_matrix
+        return results
     
-    def process_all_observations(self) -> Dict[str, Tuple[ObjectCentricMatrix, TimeSeriesObjectMatrix]]:
-        """Process all available observations."""
+    def _export_features_to_json(self, object_features: Dict[str, Dict[int, FrameFeatureVector]], output_path: str):
+        """Export feature vectors to JSON format."""
+        export_data = {
+            'metadata': {
+                'created_at': datetime.now().isoformat(),
+                'num_objects': len(object_features),
+                'feature_dimensions': 6,
+                'features': [
+                    'mean_velocity_direction', 'mean_speed', 'contact_pattern',
+                    'support_pattern', 'kinetic_energy', 'potential_energy'
+                ]
+            },
+            'object_features': {}
+        }
+        
+        for obj_id, frame_features in object_features.items():
+            export_data['object_features'][obj_id] = {}
+            
+            for frame_idx, features in frame_features.items():
+                export_data['object_features'][obj_id][str(frame_idx)] = {
+                    'mean_velocity_direction': float(features.mean_velocity_direction),
+                    'mean_speed': float(features.mean_speed),
+                    'contact_pattern': float(features.contact_pattern),
+                    'support_pattern': float(features.support_pattern),
+                    'kinetic_energy': float(features.kinetic_energy),
+                    'potential_energy': float(features.potential_energy),
+                    'feature_vector': features.feature_vector.tolist()
+                }
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+    
+    def _export_bonds_to_json(self, object_bonds: Dict[str, List[BondStrength]], output_path: str):
+        """Export bond analysis to JSON format."""
+        export_data = {
+            'metadata': {
+                'created_at': datetime.now().isoformat(),
+                'num_objects': len(object_bonds),
+                'bond_threshold': self.bond_analyzer.bond_threshold
+            },
+            'object_bonds': {}
+        }
+        
+        for obj_id, bonds in object_bonds.items():
+            export_data['object_bonds'][obj_id] = []
+            
+            for bond in bonds:
+                export_data['object_bonds'][obj_id].append({
+                    'frame_t': bond.frame_t,
+                    'frame_t1': bond.frame_t1,
+                    'similarity': float(bond.similarity),
+                    'bond_exists': bond.bond_exists,
+                    'key_event_detected': bond.key_event_detected
+                })
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+    
+    def _export_bond_types_to_json(self, bond_types: Dict[str, BondType], 
+                                  bond_type_summary: Dict[str, Any], output_path: str):
+        """Export bond types and classification summary to JSON format."""
+        export_data = {
+            'metadata': {
+                'created_at': datetime.now().isoformat(),
+                'num_bond_types': len(bond_types),
+                'classification_summary': bond_type_summary
+            },
+            'bond_types': {}
+        }
+        
+        for type_id, bond_type in bond_types.items():
+            export_data['bond_types'][type_id] = {
+                'type_name': bond_type.type_name,
+                'feature_signature': bond_type.feature_signature.tolist(),
+                'similarity_threshold': bond_type.similarity_threshold,
+                'count': bond_type.count,
+                'examples': bond_type.examples[:5]  # First 5 examples
+            }
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+    
+    def _export_classified_bonds_to_json(self, classified_bonds: Dict[str, List[ClassifiedBond]], output_path: str):
+        """Export classified bonds to JSON format."""
+        export_data = {
+            'metadata': {
+                'created_at': datetime.now().isoformat(),
+                'num_objects': len(classified_bonds),
+                'total_classified_bonds': sum(len(bonds) for bonds in classified_bonds.values())
+            },
+            'classified_bonds': {}
+        }
+        
+        for obj_id, bonds in classified_bonds.items():
+            export_data['classified_bonds'][obj_id] = []
+            
+            for bond in bonds:
+                export_data['classified_bonds'][obj_id].append({
+                    'frame_t': bond.bond_strength.frame_t,
+                    'frame_t1': bond.bond_strength.frame_t1,
+                    'similarity': float(bond.bond_strength.similarity),
+                    'bond_exists': bond.bond_strength.bond_exists,
+                    'key_event_detected': bond.bond_strength.key_event_detected,
+                    'bond_type_id': bond.bond_type_id,
+                    'type_confidence': float(bond.type_confidence),
+                    'feature_difference': bond.feature_difference.tolist()
+                })
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+    
+    def _export_segments_to_json(self, video_segments: List[VideoSegment], output_path: str):
+        """Export video segments to JSON format."""
+        export_data = {
+            'metadata': {
+                'created_at': datetime.now().isoformat(),
+                'num_segments': len(video_segments),
+                'total_frames': max([seg.end_frame for seg in video_segments]) if video_segments else 0
+            },
+            'segments': []
+        }
+        
+        for segment in video_segments:
+            segment_data = {
+                'segment_id': segment.segment_id,
+                'start_frame': segment.start_frame,
+                'end_frame': segment.end_frame,
+                'duration': segment.end_frame - segment.start_frame + 1,
+                'object_ids': segment.object_ids,
+                'avg_bond_strength': float(segment.avg_bond_strength),
+                'break_reason': segment.break_reason
+            }
+            
+            # Add bond type information if available
+            if segment.dominant_bond_types:
+                segment_data['dominant_bond_types'] = [
+                    {'type_id': type_id, 'frequency': float(freq)}
+                    for type_id, freq in segment.dominant_bond_types
+                ]
+            
+            export_data['segments'].append(segment_data)
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+    def process_all_observations(self, **kwargs) -> Dict[str, Dict[str, Any]]:
+        """Process all available observations with optional feature extraction and bond analysis."""
         observation_ids = self.frame_loader.get_observation_ids()
         results = {}
         
@@ -1048,8 +1951,8 @@ class VideoPipeline:
         
         for observation_id in observation_ids:
             try:
-                matrix, time_series_matrix = self.process_observation(observation_id)
-                results[observation_id] = (matrix, time_series_matrix)
+                result = self.process_observation(observation_id, **kwargs)
+                results[observation_id] = result
             except Exception as e:
                 logger.error(f"Failed to process {observation_id}: {e}")
         
