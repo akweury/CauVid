@@ -11,9 +11,9 @@ from tigramite import data_processing as pp
 from tigramite.pcmci import PCMCI
 from tigramite.independence_tests.parcorr import ParCorr
 from tigramite.independence_tests.robust_parcorr import RobustParCorr
-from tigramite.independence_tests.cmisymb import CMIsymb
-from tigramite import plotting as tp
-from tigramite.jpcmciplus import JPCMCIplus
+# from tigramite.independence_tests.cmisymb import CMIsymb  # Disabled due to NumPy compatibility issues
+# from tigramite import plotting as tp  # Disabled due to NumPy compatibility issues
+# from tigramite.jpcmciplus import JPCMCIplus  # Disabled due to NumPy compatibility issues
 
 # Add parent directory to path for pipeline imports
 sys.path.append(str(Path(__file__).parent.parent / "src"))
@@ -167,7 +167,7 @@ def process_and_get_matrix_v2(observation_id: str):
         analysis_mode="multiple",
     )
 
-    pcmci = PCMCI(dataframe=dataframe, cond_ind_test=CMIsymb(), verbosity=0)
+    pcmci = PCMCI(dataframe=dataframe, cond_ind_test=ParCorr(significance="analytic"), verbosity=0)
 
     results = pcmci.run_pcmci(tau_max=1, pc_alpha=0.05)
 
@@ -197,6 +197,6 @@ def process_and_get_matrix_v2(observation_id: str):
 
 if __name__ == "__main__":
     # Example usage
-    obs_id = "observation_000000_862365"
+    obs_id = "observation_000000_733899"
     matrix = process_and_get_matrix_v2(obs_id)
     print(f"Processed time series matrix for observation {obs_id}")
