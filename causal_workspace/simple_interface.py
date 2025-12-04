@@ -18,7 +18,7 @@ from tigramite.independence_tests.robust_parcorr import RobustParCorr
 # Add parent directory to path for pipeline imports
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
-from video_pipeline import VideoPipeline
+from video_pipeline_core import VideoPipeline
 
 
 def get_time_series_matrix(observation_id: str, two_parts_root: str = "../two_parts"):
