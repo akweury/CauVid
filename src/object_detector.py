@@ -34,22 +34,26 @@ class CircleDetector(ObjectDetector):
         """Detect circular objects using HoughCircles."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Apply HoughCircles
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Apply HoughCircles with parameters tuned for 7 circles
         circles = cv2.HoughCircles(
-            gray,
+            blurred,
             cv2.HOUGH_GRADIENT,
             dp=1,
-            minDist=30,
-            param1=50,
-            param2=30,
-            minRadius=10,
-            maxRadius=50
+            minDist=5,           # Very small to allow overlapped circles
+            param1=30,           # Lower edge threshold for solid circles
+            param2=20,           # Higher accumulator threshold for solid circles
+            minRadius=10,        # Around expected radius of 15
+            maxRadius=20         # Around expected radius of 15
         )
         
         detected_objects = []
         
         if circles is not None:
             circles = np.round(circles[0, :]).astype("int")
+            print("Detected circle number:", len(circles))
             
             for i, (x, y, r) in enumerate(circles):
                 # Convert circle to bounding box

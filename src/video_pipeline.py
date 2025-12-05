@@ -18,6 +18,56 @@ from causal_workspace.simple_interface import process_and_get_matrix_v2
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def analyze_object_behaviors(time_series_matrix: TimeSeriesObjectMatrix) -> Dict[str, Any]:
+    """
+    Analyze and symbolically describe the temporal behaviors of all objects.
+    
+    This function converts raw trajectory data into symbolic behavior descriptions
+    that can be used for safety pattern analysis and causal interpretation.
+    
+    Args:
+        time_series_matrix: Time-series object matrix with object trajectories
+        
+    Returns:
+        Dictionary containing symbolic behavior descriptions for each object
+        
+    Example output structure:
+    {
+        'object_0_001': {
+            'movement_type': 'linear_motion',
+            'speed_profile': 'constant_speed',
+            'direction_changes': 2,
+            'acceleration_events': ['deceleration_at_frame_15'],
+            'spatial_bounds': {'min_x': 100, 'max_x': 200, 'min_y': 50, 'max_y': 150},
+            'interaction_events': ['close_approach_with_object_1_at_frame_20'],
+            'behavior_phases': [
+                {'phase': 'approach', 'frames': [0, 15], 'description': 'moving_right_constant_speed'},
+                {'phase': 'decelerate', 'frames': [15, 25], 'description': 'slowing_down_near_object_1'},
+                {'phase': 'avoid', 'frames': [25, 40], 'description': 'changing_direction_upward'}
+            ]
+        },
+        'object_1_002': {
+            'movement_type': 'curved_motion',
+            'speed_profile': 'accelerating',
+            'direction_changes': 1,
+            'acceleration_events': ['acceleration_at_frame_10'],
+            'spatial_bounds': {'min_x': 150, 'max_x': 300, 'min_y': 100, 'max_y': 200},
+            'interaction_events': ['collision_risk_with_object_0_at_frame_20'],
+            'behavior_phases': [
+                {'phase': 'entry', 'frames': [0, 10], 'description': 'entering_scene_from_left'},
+                {'phase': 'accelerate', 'frames': [10, 30], 'description': 'accelerating_toward_center'},
+                {'phase': 'maintain', 'frames': [30, 50], 'description': 'maintaining_trajectory'}
+            ]
+        },
+        'summary': {
+            'total_objects': 2,
+            'total_interactions': 1,
+            'dominant_behavior': 'avoidance_scenario',
+            'scenario_type': 'multi_object_interaction'
+        }
+    }
+    """
+    raise NotImplementedError("Object behavior analysis not yet implemented")
 
 def analyze_safety_patterns(causal_edges: List, time_series_matrix: TimeSeriesObjectMatrix) -> Dict[str, Any]:
     """
@@ -117,6 +167,18 @@ def main():
             extract_features=False,
             analyze_bonds=False
         )
+
+    
+            
+        ## reasoning rules based on the facts
+        from logic.facts import FactsExtractor
+        facts_extractor=FactsExtractor()
+        symbolic_facts = facts_extractor.analyze_facts_in_results(results)
+        
+        logger.info("Generated reasoning rules based on analyzed facts")
+        from logic.rules import RulesGenerator
+        rules_generator = RulesGenerator()
+        base_rules = rules_generator.generate_reasoning_rules(symbolic_facts)
         
         # Perform causal analysis
         try:
@@ -130,23 +192,18 @@ def main():
             all_causal_graphs[obs_id] = []
         
         all_results[obs_id] = results
-    
+        
+        
+        
+
     # Perform cross-observation analysis
     logger.info("Performing cross-observation analysis...")
     
-    try:
-        # Analyze safety patterns across all observations
-        # Use the first observation's data as example for single-observation analysis
-        first_obs = list(all_results.keys())[0]
-        first_result = all_results[first_obs]
-        safety_patterns = analyze_safety_patterns(
-            first_result["causal_edges"], 
-            first_result['time_series_matrix']
-        )
-        logger.info("Safety pattern analysis completed")
-    except NotImplementedError:
-        logger.info("Safety pattern analysis not yet implemented")
-        safety_patterns = {}
+
+    
+    
+    
+    
     
     try:
         # Build prediction models using all observations
