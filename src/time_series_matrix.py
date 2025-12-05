@@ -122,7 +122,7 @@ class TimeSeriesObjectMatrix:
         """Export the time-series matrix to JSON format."""
         
         export_data = {
-            'num_frames': self.num_frames,
+            'num_frames': int(self.num_frames),
             'property_names': self.property_names,
             'object_tracks': {},
             'matrix': {}
@@ -133,38 +133,80 @@ class TimeSeriesObjectMatrix:
             export_data['object_tracks'][object_id] = {
                 'object_id': track.object_id,
                 'label': track.label,
-                'frames_data': track.frames_data
+                'frames_data': self._convert_to_json_serializable(track.frames_data)
             }
         
         # Export matrix (convert frame indices to strings for JSON)
         for frame_idx, frame_data in self.matrix.items():
-            export_data['matrix'][str(frame_idx)] = frame_data
+            export_data['matrix'][str(frame_idx)] = self._convert_to_json_serializable(frame_data)
         
         with open(output_path, 'w') as f:
             json.dump(export_data, f, indent=2)
         
         logger.info(f"Exported time-series matrix to {output_path}")
     
+    def _convert_to_json_serializable(self, obj):
+        """Convert NumPy types to JSON serializable types."""
+        if isinstance(obj, dict):
+            return {k: self._convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_to_json_serializable(item) for item in obj]
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+    
     def export_to_numpy(self, output_path: str):
         """Export the time-series matrix to NumPy format."""
         
-        # Create dense matrix: [frames, objects, properties]
+        # Filter out non-numeric properties
+        numeric_properties = []
+        string_properties = []
+        
+        for prop_name in self.property_names:
+            if prop_name in ['label']:  # Known string properties
+                string_properties.append(prop_name)
+            else:
+                numeric_properties.append(prop_name)
+        
+        # Create dense matrix: [frames, objects, numeric_properties]
         unique_objects = list(self.object_tracks.keys())
-        dense_matrix = np.full((self.num_frames, len(unique_objects), len(self.property_names)), np.nan)
+        dense_matrix = np.full((self.num_frames, len(unique_objects), len(numeric_properties)), np.nan)
         
         for frame_idx, frame_data in self.matrix.items():
             for obj_idx, object_id in enumerate(unique_objects):
                 if object_id in frame_data:
-                    for prop_idx, prop_name in enumerate(self.property_names):
+                    for prop_idx, prop_name in enumerate(numeric_properties):
                         if prop_name in frame_data[object_id]:
-                            dense_matrix[frame_idx, obj_idx, prop_idx] = frame_data[object_id][prop_name]
+                            try:
+                                value = float(frame_data[object_id][prop_name])
+                                dense_matrix[frame_idx, obj_idx, prop_idx] = value
+                            except (ValueError, TypeError):
+                                # Skip non-numeric values
+                                pass
+        
+        # Collect string properties separately
+        string_data = {}
+        for prop_name in string_properties:
+            string_data[prop_name] = {}
+            for frame_idx, frame_data in self.matrix.items():
+                string_data[prop_name][str(frame_idx)] = {}
+                for object_id in unique_objects:
+                    if object_id in frame_data and prop_name in frame_data[object_id]:
+                        string_data[prop_name][str(frame_idx)][object_id] = frame_data[object_id][prop_name]
         
         # Save as compressed numpy file
         np.savez_compressed(
             output_path,
             matrix=dense_matrix,
             object_ids=unique_objects,
-            property_names=self.property_names,
+            numeric_properties=numeric_properties,
+            string_properties=string_properties,
+            string_data=string_data,
             num_frames=self.num_frames
         )
         
