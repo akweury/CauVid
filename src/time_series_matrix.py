@@ -24,15 +24,69 @@ class TimeSeriesObjectMatrix:
         self.object_tracks = {}  # object_id -> ObjectTrack
         self.num_frames = 0
         self.property_names = []
+        
+        # Object tracking state
+        self.next_object_id = 0
+        self.previous_objects = []  # Objects from previous frame for tracking
+        self.tracking_threshold = 50.0  # Maximum distance for object matching
     
+    def _calculate_distance(self, obj1_center, obj2_center):
+        """Calculate Euclidean distance between two object centers."""
+        return np.sqrt((obj1_center[0] - obj2_center[0])**2 + (obj1_center[1] - obj2_center[1])**2)
+    
+    def _find_matching_object(self, current_obj: DetectedObject):
+        """Find the best matching object from the previous frame.
+        
+        Args:
+            current_obj: Current detected object
+            
+        Returns:
+            object_id if match found, None otherwise
+        """
+        if not self.previous_objects:
+            return None
+            
+        best_match = None
+        min_distance = float('inf')
+        
+        for prev_obj_id, prev_obj_data in self.previous_objects:
+            # Check if same class/label
+            if prev_obj_data['label'] != current_obj.label:
+                continue
+                
+            # Calculate distance
+            prev_center = (prev_obj_data['position_x'], prev_obj_data['position_y'])
+            distance = self._calculate_distance(current_obj.center, prev_center)
+            
+            # Find closest match within threshold
+            if distance < self.tracking_threshold and distance < min_distance:
+                min_distance = distance
+                best_match = prev_obj_id
+                
+        return best_match
+    
+    def _generate_new_object_id(self, obj_label: str):
+        """Generate a new unique object ID."""
+        object_id = f"{obj_label}_{self.next_object_id:03d}"
+        self.next_object_id += 1
+        return object_id
+
     def add_frame_data(self, frame_idx: int, detected_objects: List[DetectedObject]):
-        """Add detected objects for a frame to the matrix."""
+        """Add detected objects for a frame to the matrix with proper object tracking."""
         
         frame_data = {}
+        current_frame_objects = []  # Store current frame objects for next frame tracking
         
         for obj in detected_objects:
-            # Generate object ID (simplified - in reality you'd want proper tracking)
-            object_id = f"obj_{obj.frame_idx}_{hash(obj.center) % 1000:03d}"
+            # Try to find matching object from previous frame
+            object_id = self._find_matching_object(obj)
+            
+            # If no match found, create new object ID
+            if object_id is None:
+                object_id = self._generate_new_object_id(obj.label)
+                logger.info(f"Created new object track: {object_id} at frame {frame_idx}")
+            else:
+                logger.debug(f"Matched existing object: {object_id} at frame {frame_idx}")
             
             # Extract object properties
             properties = {
@@ -50,6 +104,8 @@ class TimeSeriesObjectMatrix:
             }
             
             frame_data[object_id] = properties
+            current_frame_objects.append((object_id, properties))
+            current_frame_objects.append((object_id, properties))
             
             # Update object track
             if object_id not in self.object_tracks:
@@ -60,6 +116,9 @@ class TimeSeriesObjectMatrix:
                 )
             
             self.object_tracks[object_id].frames_data[frame_idx] = properties
+        
+        # Store current frame objects for next frame tracking
+        self.previous_objects = current_frame_objects
         
         self.matrix[frame_idx] = frame_data
         self.num_frames = max(self.num_frames, frame_idx + 1)
@@ -86,6 +145,35 @@ class TimeSeriesObjectMatrix:
         
         return trajectory
     
+    def get_tracking_statistics(self) -> Dict[str, Any]:
+        """Get statistics about object tracking performance."""
+        stats = {
+            'total_objects': len(self.object_tracks),
+            'total_frames': self.num_frames,
+            'objects_per_label': {},
+            'object_lifespans': {},
+            'average_lifespan': 0
+        }
+        
+        total_lifespan = 0
+        for obj_id, track in self.object_tracks.items():
+            label = track.label
+            lifespan = len(track.frames_data)
+            
+            # Count objects per label
+            if label not in stats['objects_per_label']:
+                stats['objects_per_label'][label] = 0
+            stats['objects_per_label'][label] += 1
+            
+            # Track lifespans
+            stats['object_lifespans'][obj_id] = lifespan
+            total_lifespan += lifespan
+        
+        if len(self.object_tracks) > 0:
+            stats['average_lifespan'] = total_lifespan / len(self.object_tracks)
+            
+        return stats
+
     def calculate_velocities(self):
         """Calculate velocity for each object between consecutive frames."""
         
