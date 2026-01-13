@@ -4,7 +4,6 @@ numpy
 Pillow
 torch
 torchvision
-xformers
 
 # Feature extraction and analysis dependencies
 scikit-learn
@@ -18,6 +17,7 @@ dataclasses-json
 tigramite
 numba
 
-# Utilities
+# Additional necessary packages for the pipeline
+pandas
 tqdm
-kagglehub
+matplotlib

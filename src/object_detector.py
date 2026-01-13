@@ -63,8 +63,8 @@ class CircleDetector(ObjectDetector):
                 # Calculate area
                 area = np.pi * r * r
                 
-                # Extract color features
-                color = self._extract_color_features(frame, x, y, r)
+                # Extract most common RGB color
+                rgb_color = self._get_most_common_color(frame, x, y, r)
                 
                 obj = DetectedObject(
                     label="circle",
@@ -72,20 +72,44 @@ class CircleDetector(ObjectDetector):
                     bbox=(x1, y1, x2, y2),
                     center=(float(x), float(y)),
                     area=float(area),
-                    frame_idx=frame_idx
+                    frame_idx=frame_idx,
+                    rgb_color=rgb_color
                 )
                 
                 detected_objects.append(obj)
         
         return detected_objects
     
-    def _extract_color_features(self, frame: np.ndarray, x: int, y: int, r: int) -> Tuple[float, float, float]:
-        """Extract average color within the circle."""
+    def _get_most_common_color(self, frame: np.ndarray, x: int, y: int, r: int) -> Tuple[int, int, int]:
+        """Extract the most common RGB color within the circle."""
+        # Create circular mask
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         cv2.circle(mask, (x, y), r, 255, -1)
         
-        mean_color = cv2.mean(frame, mask=mask)[:3]
-        return tuple(float(c) for c in mean_color)
+        # Extract pixels within the circle
+        pixels = frame[mask > 0]
+        
+        if len(pixels) == 0:
+            return (0, 0, 0)
+        
+        # Convert BGR to RGB for correct color representation
+        pixels_rgb = pixels[:, [2, 1, 0]]  # BGR to RGB conversion
+        
+        # Find the most common color by binning colors and finding the mode
+        # Bin colors to reduce noise (group similar colors)
+        binned_pixels = (pixels_rgb // 32) * 32  # Bin into groups of 32
+        
+        # Find unique colors and their counts
+        unique_colors, counts = np.unique(binned_pixels.reshape(-1, 3), axis=0, return_counts=True)
+        
+        # Get the most common color
+        most_common_idx = np.argmax(counts)
+        most_common_color = unique_colors[most_common_idx]
+        
+        # Ensure values are in 0-255 range and convert to int
+        most_common_color = np.clip(most_common_color, 0, 255).astype(int)
+        
+        return tuple(most_common_color)
 
 
 class YOLODetector(ObjectDetector):

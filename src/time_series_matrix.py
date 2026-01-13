@@ -100,7 +100,10 @@ class TimeSeriesObjectMatrix:
                 'width': obj.bbox[2] - obj.bbox[0],
                 'height': obj.bbox[3] - obj.bbox[1],
                 'area': obj.area,
-                'confidence': obj.confidence
+                'confidence': obj.confidence,
+                "color_r": obj.rgb_color[0] if obj.rgb_color else None,
+                "color_g": obj.rgb_color[1] if obj.rgb_color else None,
+                "color_b": obj.rgb_color[2] if obj.rgb_color else None
             }
             
             frame_data[object_id] = properties

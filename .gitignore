@@ -1,7 +1,11 @@
 
 two_parts/
+red_blue_colors/
 pipeline_output/
 output/
+dataset_mini/
+dataset/driving-video-with-object-tracking
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

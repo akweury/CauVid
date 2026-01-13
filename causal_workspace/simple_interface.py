@@ -37,7 +37,7 @@ def get_time_series_matrix(observation_id: str, two_parts_root: str = "../two_pa
         two_parts_root = str(Path(__file__).parent.parent / "two_parts")
     # Initialize pipeline
     pipeline = VideoPipeline(
-        two_parts_root=two_parts_root, output_dir="./output", detector_type="circle"
+        dataset_root=two_parts_root, output_dir="./output", detector_type="circle"
     )
 
     # Process observation

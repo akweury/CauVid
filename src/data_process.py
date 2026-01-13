@@ -26,7 +26,10 @@ def window_smooth(scenes: List[Dict], window_size: int = 3) -> List[Dict]:
             if count > 0:
                 smoothed_scene[obj_id] = {
                     'position_x': x_sum / count,
-                    'position_y': y_sum / count
+                    'position_y': y_sum / count,
+                    'color_r': scenes[i][obj_id].get('color_r'),
+                    'color_g': scenes[i][obj_id].get('color_g'),        
+                    'color_b': scenes[i][obj_id].get('color_b'),
                 }
         smoothed_scenes.append(smoothed_scene)
     
