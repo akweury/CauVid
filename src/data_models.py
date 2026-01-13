@@ -15,6 +15,7 @@ class DetectedObject:
     center: Tuple[float, float]  # x, y center coordinates
     area: float
     frame_idx: int
+    rgb_color: Optional[Tuple[int, int, int]] = None  # Most common RGB color (0-255 range)
 
 
 @dataclass
@@ -113,3 +114,4 @@ class FrameData:
     detected_objects: List[DetectedObject]
     ground_truth_objects: Optional[List[DetectedObject]] = None
     precision_metrics: Optional[PrecisionMetrics] = None
+    frame_size: Optional[Tuple[int, int]] = None  # width, height

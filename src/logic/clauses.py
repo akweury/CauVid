@@ -13,7 +13,7 @@ class Clause:
             "tn": 0,
             "fn": 0
         }
-        
+
     def update(self, body_true: bool, head_true: bool):
         if body_true and head_true:
             self.stats["tp"] += 1
@@ -32,6 +32,9 @@ class Clause:
         tp, fp, fn, tn = self.stats.values()
         total = tp + fp + fn + tn
         return (tp + fp) / (total + 1e-6)
+
+    def str(self) -> str:
+        return f"{self.head}(O):-{self.body}(O)."
 
     def __repr__(self):
         return (f"{self.head}(O):-{self.body}(O) "
@@ -60,8 +63,8 @@ class ClauseLearner:
                 clauses.append(Clause(head, body))
         return clauses
 
-    def observe_transition(self, scene_t, scene_t1):
-        
+    def observe_transition(self, scene_t, scene_t1, frame_data):
+
         for obj_id, obj_t in scene_t.items():
             if obj_id not in scene_t1:
                 continue
@@ -69,7 +72,7 @@ class ClauseLearner:
             for clause in self.clauses:
                 body_fn = self.body_predicates[clause.body]
                 head_fn = self.head_predicates[clause.head]
-                body_true = body_fn(obj_t, scene_t)
+                body_true = body_fn(obj_t, scene_t, frame_data)
                 head_true = head_fn(obj_t, obj_t1)
                 clause.update(body_true, head_true)
 
@@ -81,15 +84,130 @@ class ClauseLearner:
         ]
 
 
-def learn_rules(scene_dataset):
-    from logic.predicates import left, right, moves_down, moves_up    
-    frame_t_t1 =[]
+class ClauseEvaluator:
+
+    def __init__(self, clauses, body_predicates, head_predicates):
+        self.clauses = clauses
+        self.body_predicates = body_predicates
+        self.head_predicates = head_predicates
+
+    def evaluate_transition(self, scene_t, scene_t1):
+        violations = []
+
+        for obj_id, obj_t in scene_t.items():
+            if obj_id not in scene_t1:
+                continue
+
+            obj_t1 = scene_t1[obj_id]
+
+            for clause in self.clauses:
+                body_fn = self.body_predicates[clause.body]
+                head_fn = self.head_predicates[clause.head]
+                body_true = body_fn(obj_t, scene_t)
+                head_true = head_fn(obj_t, obj_t1)
+
+                if body_true and not head_true:
+                    violations.append({
+                        "clause": str(clause),
+                        "object_id": obj_id
+                    })
+        return violations
+
+    def evaluate_video(self, scene_sequence, frame_data):
+        report = {
+            clause.str(): {
+                "applications": 0,
+                "violations": 0,
+                "violation_rate": 0.0,
+            } for clause in self.clauses
+        }
+        active_violations = {}
+        violation_events = {clause.str(): [] for clause in self.clauses}
+
+        for i in range(len(scene_sequence)):
+            scene_t, scene_t1 = scene_sequence[i]
+
+            for obj_id, obj_t in scene_t.items():
+                if obj_id not in scene_t1:
+                    continue
+
+                obj_t1 = scene_t1[obj_id]
+
+                for clause in self.clauses:
+                    key = (obj_id, clause.str())
+                    body_fn = self.body_predicates[clause.body]
+                    head_fn = self.head_predicates[clause.head]
+                    body_true = body_fn(obj_t, scene_t, frame_data)
+                    head_true = head_fn(obj_t, obj_t1)
+
+                    violating = body_true and not head_true
+
+                    # ------------------------
+                    # CASE 1: Violation Starts
+                    # ------------------------
+                    if violating and key not in active_violations:
+                        active_violations[key] = {
+                            "start": i,
+                            "last": i
+                        }
+                    # ------------------------
+                    # CASE 2: Violation Continues
+                    # ------------------------
+                    elif violating and key in active_violations:
+                        active_violations[key]["last"] = i
+
+                    # ------------------------
+                    # CASE 3: Violation Ends
+                    # ------------------------
+
+                    elif not violating and key in active_violations:
+                        v = active_violations.pop(key)
+                        violation_events[clause.str()].append({
+                            "object_id": obj_id,
+                            "start_frame": v["start"],
+                            "end_frame": v["last"],
+                            "duration": v["last"] - v["start"] + 1
+                        })
+
+                    if body_true:
+                        report[clause.str()]["applications"] += 1
+                        if not head_true:
+                            report[clause.str()]["violations"] += 1
+
+        # Handle any ongoing violations at the end of the video
+        for (obj_id, clause_str), v in active_violations.items():
+            violation_events[clause_str].append({
+                "object_id": obj_id,
+                "start_frame": v["start"],
+                "end_frame": v["last"],
+                "duration": v["last"] - v["start"] + 1
+            })
+
+        for clause_str, data in report.items():
+            applications = data["applications"]
+            violations = data["violations"]
+            violation_rate = violations / applications if applications > 0 else 0.0
+            data["violation_rate"] = violation_rate
+
+        return report, violation_events
+
+
+def learn_rules(frames_data, scene_dataset):
+    from logic.predicates import left, right, moves_down, moves_up, red, blue
+    frame_t_t1 = []
+    frame_data = {
+        "width": frames_data[0].frame_size[0],
+        "height": frames_data[0].frame_size[1]
+    }
+
     for i in range(len(scene_dataset)-1):
-        frame_t_t1.append(scene_dataset[i:i+2])
+        frame_t_t1.append((scene_dataset[i], scene_dataset[i+1]))
 
     body_preds = {
         "left": left,
-        "right": right}
+        "right": right,
+        "red": red,
+        "blue": blue,}
 
     head_preds = {
         "moves_up": moves_up,
@@ -97,10 +215,51 @@ def learn_rules(scene_dataset):
 
     learner = ClauseLearner(body_preds, head_preds)
 
-    for frame_now, frame_next in frame_t_t1: 
-        learner.observe_transition(frame_now, frame_next)
+    for frame_now, frame_next in frame_t_t1:
+        learner.observe_transition(frame_now, frame_next, frame_data)
     rules = learner.get_accepted_clauses()
     for r in rules:
         print(r)
 
     return rules
+
+
+def make_predictions(observed_rules, processed_ts_matrix, frame_data):
+    from logic.predicates import left, right, moves_down, moves_up, red, blue
+    frame_t_t1 = []
+    for i in range(len(processed_ts_matrix)-1):
+        frame_t_t1.append(processed_ts_matrix[i:i+2])
+
+    body_preds = {
+        "left": left,
+        "right": right,
+        "red": red,
+        "blue": blue,}
+
+    head_preds = {
+        "moves_up": moves_up,
+        "moves_down": moves_down}
+
+    evaluator = ClauseEvaluator(
+        observed_rules,
+        body_preds,
+        head_preds
+    )
+    report, violation_events = evaluator.evaluate_video(frame_t_t1, frame_data)
+
+    for rule, stats in report.items():
+        print(f"Learned Rule: {rule}")
+        print(f"  Applications: {stats['applications']}")
+        print(f"  Violations: {stats['violations']}")
+        print(f"  Violation Rate: {stats['violation_rate']:.3f}")
+
+    # also print violation events
+    for rule, events in violation_events.items():
+        print(f"Violation Events for Rule: {rule}")
+        for event in events:
+            print(f"  Object ID: {event['object_id']}, "
+                  f"Start Frame: {event['start_frame']}, "
+                  f"End Frame: {event['end_frame']}, "
+                  f"Duration: {event['duration']} frames")
+
+    return report, violation_events

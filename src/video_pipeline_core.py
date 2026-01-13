@@ -24,36 +24,38 @@ logger = logging.getLogger(__name__)
 class VideoPipeline:
     """Main video processing pipeline that orchestrates all components."""
     
-    def __init__(self, two_parts_root: str, output_dir: str = "./pipeline_output",
+    def __init__(self, dataset_root: str, output_dir: str = "./pipeline_output",
                  detector_type: str = "circle", position_threshold: float = 20.0,
                  frame_height: int = 480, frame_width: int = 640):
         """
         Initialize the video processing pipeline.
         
         Args:
-            two_parts_root: Path to the two_parts data directory
+            dataset_root: Path to the dataset root directory
             output_dir: Directory to save pipeline outputs
             detector_type: Type of object detector ("circle", "yolo")
             position_threshold: Threshold for matching objects (pixels)
             frame_height: Expected frame height
             frame_width: Expected frame width
         """
-        self.two_parts_root = two_parts_root
+        self.dataset_root = dataset_root
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize components
-        self.frame_loader = VideoFrameLoader(two_parts_root)
+        self.frame_loader = VideoFrameLoader(dataset_root)
         self.detector = create_detector(detector_type, position_threshold=position_threshold)
         self.evaluator = PrecisionEvaluator(position_threshold=position_threshold)
         
-        # Pipeline configuration
-        self.frame_height = frame_height
-        self.frame_width = frame_width
-        logger.info(f"Initialized VideoPipeline with root: {two_parts_root}, detector: {detector_type}, position_threshold: {position_threshold}px")
+        logger.info(f"Initialized VideoPipeline with root: {dataset_root}, detector: {detector_type}, position_threshold: {position_threshold}px")
+    
+    def update_variant_dir(self, variant_dir: str):
+        self.frame_loader.variant_dir = self.frame_loader.observation_dir / f"observation_{variant_dir[0].split('_')[1]}"
     
     def process_observation(self, observation_id: str, include_ground_truth: bool = True,
-                          extract_features: bool = False, analyze_bonds: bool = False) -> Dict[str, Any]:
+                          extract_features: bool = False, analyze_bonds: bool = False,
+                          obs_type: str ="observation"
+                          ) -> Dict[str, Any]:
         """
         Process a complete observation through the pipeline.
         
@@ -69,8 +71,8 @@ class VideoPipeline:
         logger.info(f"Processing observation: {observation_id}")
         
         # Load frames
-        frames_data = self.frame_loader.load_frames(observation_id)
-        
+        frames_data = self.frame_loader.load_frames(observation_id, obs_type=obs_type)
+            
         # Load ground truth if requested
         ground_truth = {}
         if include_ground_truth:
@@ -82,7 +84,7 @@ class VideoPipeline:
         
         for i, frame_data in enumerate(frames_data):
             # Load the actual frame image
-            frame_img = self.frame_loader.load_single_frame(observation_id, i)
+            frame_img = self.frame_loader.load_single_frame(observation_id, i, obs_type=obs_type)
             
             logger.info(f"Processing frame {i+1}/{len(frames_data)}")
             
