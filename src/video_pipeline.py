@@ -523,8 +523,10 @@ def main():
         # Process single observation
         processed_observation = process_single_observation_logic(pipeline, obs_id)
         all_results[obs_id] = processed_observation
+    
+    
+    
         
-
 
     print("Program finished processing all observations.")
 
