@@ -13,7 +13,7 @@ from time_series_matrix import TimeSeriesObjectMatrix
 from video_pipeline_core import VideoPipeline
 
 from causal_workspace.simple_interface import process_and_get_matrix_v2
-
+import data_process 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -201,7 +201,7 @@ def display_dataset_overview(observation_ids: List[str]):
     print("🏁 Starting processing pipeline...\n")
 
 
-def log_results_summary(obs_id: str, processed_observation: Dict[str, Any]):
+def log_obs_summary(obs_id: str, processed_observation: Dict[str, Any]):
     """Log a detailed summary of processing results with data types and shapes.
     
     Args:
@@ -279,7 +279,7 @@ def process_single_observation(pipeline: VideoPipeline, obs_id: str) -> Dict[str
     )
     
     # Log results summary
-    log_results_summary(obs_id, processed_observation)
+    log_obs_summary(obs_id, processed_observation)
     
     # Extract symbolic facts
     from logic.facts import FactsExtractor
@@ -290,8 +290,52 @@ def process_single_observation(pipeline: VideoPipeline, obs_id: str) -> Dict[str
     
     return processed_observation
 
+def process_single_observation_logic(pipeline: VideoPipeline, obs_id: str) -> Dict[str, Any]:
+    """Process a single observation through the pipeline.
+    
+    Args:
+        pipeline: Initialized VideoPipeline instance
+        obs_id: Observation ID to process
+        
+    Returns:
+        Dictionary containing processing results
+    """
+    logger.info(f"Processing observation: {obs_id}")
+    
+    
+    
+    # Process the observation
+    obs_raw = pipeline.process_observation(
+        observation_id=obs_id,
+        include_ground_truth=True,
+        extract_features=False,
+        analyze_bonds=False
+    )
+    # Log results summary
+    log_observation_summary(obs_id, obs_raw)
+    
+    from logic.facts import FactsExtractor
+    facts_extractor = FactsExtractor()
+    kinematics_facts = facts_extractor.analyze_facts_in_results(obs_raw)
+    
+        
+    # smooth the observation data
+    ts_matrix = list(obs_raw["time_series_matrix"].matrix.values())
+    processed_ts_matrix = data_process.window_smooth(ts_matrix, window_size=3)
 
-def log_observation_summary(obs_id: str, processed_observation: Dict[str, Any], observation_ids: List[str]):
+    # Extract symbolic facts
+    from logic.clauses import learn_rules
+    symbolic_facts = learn_rules(processed_ts_matrix)    
+    
+    facts = {
+        "kinematics_facts": kinematics_facts,
+        "symbolic_facts": symbolic_facts
+    }
+    
+    return facts  
+
+
+def log_observation_summary(obs_id: str, processed_observation: Dict[str, Any]):
     """Log detailed processing summary for current observation.
     
     Args:
@@ -404,12 +448,6 @@ def log_observation_summary(obs_id: str, processed_observation: Dict[str, Any], 
         
     print(f"\n⚡ Processing Status: {processing_status}")
     
-    # Progress indicator
-    current_idx = observation_ids.index(obs_id) + 1
-    total_obs = len(observation_ids)
-    progress_bar = "█" * int(20 * current_idx / total_obs) + "░" * (20 - int(20 * current_idx / total_obs))
-    print(f"📈 Progress: [{progress_bar}] {current_idx}/{total_obs} ({100*current_idx/total_obs:.1f}%)")
-    
     print("="*80 + "\n")
 
 
@@ -480,11 +518,15 @@ def main():
     # Process all observations
     all_results = {}
     
+    # Iterate through each observation ID
     for obs_id in observation_ids:
         # Process single observation
-        processed_observation = process_single_observation(pipeline, obs_id)
+        processed_observation = process_single_observation_logic(pipeline, obs_id)
         all_results[obs_id] = processed_observation
+        
 
+
+    print("Program finished processing all observations.")
 
 if __name__ == "__main__":
     main()
