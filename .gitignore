@@ -5,6 +5,8 @@ pipeline_output/
 output/
 dataset_mini/
 dataset/driving-video-with-object-tracking
+external/
+output/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
