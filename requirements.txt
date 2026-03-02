@@ -1,10 +1,9 @@
 # Core dependencies for video processing pipeline
 opencv-python
-numpy
+numpy<2
 Pillow
 torch
 torchvision
-xformers
 
 # Feature extraction and analysis dependencies
 scikit-learn
@@ -21,3 +20,21 @@ numba
 # Utilities
 tqdm
 kagglehub
+
+# Depth Anything 3 dependencies
+omegaconf
+moviepy==1.0.3
+addict
+einops
+plyfile
+pycolmap
+evo
+open3d
+e3nn
+trimesh
+pillow-heif
+huggingface_hub
+fastapi
+uvicorn
+typer
+safetensors

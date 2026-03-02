@@ -9,6 +9,8 @@ external/
 output/
 dataset/
 
+# Large video files
+*.mov
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

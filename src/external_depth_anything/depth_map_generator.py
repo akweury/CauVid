@@ -13,10 +13,18 @@ from PIL import Image
 from tqdm import tqdm
 import argparse
 
+# Fix OpenMP library conflict on macOS
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 # Add project root to Python path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Add Depth-Anything-3 source to Python path
+DEPTH_ANYTHING_SRC = PROJECT_ROOT / "external" / "Depth-Anything-3" / "src"
+if str(DEPTH_ANYTHING_SRC) not in sys.path:
+    sys.path.insert(0, str(DEPTH_ANYTHING_SRC))
 
 import config
 
@@ -26,8 +34,8 @@ try:
 except ImportError as e:
     print("❌ Error: Failed to import Depth Anything 3")
     print(f"Import error: {e}")
-    print("\nPlease ensure you're using the Python 3.10 environment (.venv310)")
-    print("Run: .venv310\\Scripts\\Activate.ps1")
+    print("\nPlease ensure all dependencies are installed:")
+    print("  pip install moviepy==1.0.3 omegaconf addict einops plyfile pycolmap evo")
     sys.exit(1)
 
 
