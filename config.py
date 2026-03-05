@@ -8,12 +8,12 @@ from pathlib import Path
 
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.absolute()
+driving_demo_video_id = "0153f03b-8fbdc1ad"
 
 # Dataset paths
 DATASET_PATHS = {
     # Mini driving dataset path
     "driving_mini": PROJECT_ROOT / "dataset" / "driving_mini",
-
     # Main dataset directory
     "dataset_root": PROJECT_ROOT / "dataset",
     
@@ -25,7 +25,9 @@ DATASET_PATHS = {
 OUTPUT_PATHS = {
     # General output directory
     "output": PROJECT_ROOT / "output",
-    
+    "driving_trajectory_visualization": PROJECT_ROOT / "output" / "driving_trajectory_visualization",
+    "driving_trajectory_visualization_smoothed": PROJECT_ROOT / "output" / "driving_trajectory_visualization_smoothed",
+    "driving_trajectory_visualization_with_frames": PROJECT_ROOT / "output" / "driving_trajectory_visualization_with_frames",
     # Pipeline output directory
     "pipeline_output": PROJECT_ROOT / "pipeline_output",
     

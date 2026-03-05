@@ -171,10 +171,22 @@ def generate_depth_maps(
                     # Get depth map for this image
                     depth = prediction.depth[i]
                     
+                    # Load original image to get its size
+                    original_img = Image.open(img_path)
+                    original_width, original_height = original_img.size
+                    
+                    # Resize depth map to match original image size
+                    if depth.shape[0] != original_height or depth.shape[1] != original_width:
+                        # Convert to PIL Image for resizing
+                        depth_pil = Image.fromarray(depth.astype(np.float32))
+                        depth_pil_resized = depth_pil.resize((original_width, original_height), Image.BILINEAR)
+                        depth = np.array(depth_pil_resized)
+                        print(f"  ℹ️  Resized depth map from {prediction.depth[i].shape} to {depth.shape} to match input image")
+                    
                     # Save depth map as numpy array
                     depth_npz_path = output_dir / f"{img_name}_depth.npz"
                     np.savez_compressed(depth_npz_path, depth=depth)
-                    print(f"  ✓ Saved: {depth_npz_path.name}")
+                    print(f"  ✓ Saved: {depth_npz_path.name} (size: {depth.shape})")
                     
                     # Save depth map as normalized image for visualization
                     depth_normalized = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)

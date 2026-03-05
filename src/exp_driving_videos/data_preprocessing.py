@@ -6,6 +6,8 @@ Includes functions for converting videos to frames and other preprocessing tasks
 
 import cv2
 import os
+import subprocess
+import json
 import sys
 from pathlib import Path
 import config
@@ -21,23 +23,135 @@ if str(PROJECT_ROOT) not in sys.path:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def get_video_rotation(video_path):
+    """
+    Get the rotation metadata from a video file using ffprobe.
+    Returns rotation angle in degrees (0, 90, 180, 270) or 0 if not found.
+    
+    Falls back to checking frame dimensions if ffprobe is not available.
+    """
+    try:
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream_tags=rotate',
+            '-of', 'json',
+            str(video_path)
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            if 'streams' in data and len(data['streams']) > 0:
+                tags = data['streams'][0].get('tags', {})
+                rotation = int(tags.get('rotate', 0))
+                if rotation > 0:
+                    return rotation
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError, KeyError):
+        logger.debug("ffprobe not available or failed, checking frame dimensions")
+    
+    # Fallback: check if video dimensions suggest it needs rotation
+    # If width < height, it's likely a portrait/rotated video that needs correction
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            
+            # If portrait orientation (width < height), assume 90 degree rotation
+            if width < height:
+                logger.info(f"  Video dimensions {width}x{height} suggest 90° rotation needed")
+                return 90
+    except Exception:
+        pass
+    
+    return 0
+
+def rotate_frame(frame, rotation):
+    """
+    Rotate frame based on rotation angle.
+    
+    Args:
+        frame: Input frame (numpy array)
+        rotation: Rotation angle in degrees (90, 180, 270)
+    
+    Returns:
+        Rotated frame
+    """
+    if rotation == 90:
+        # Rotate 90 degrees counter-clockwise
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation == 270:
+        # Rotate 90 degrees clockwise (or 270 counter-clockwise)
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
+
+
+def extract_frames(video_path, output_dir):
+    """
+    Extract frames from a video file with automatic rotation correction.
+    
+    Args:
+        video_path: Path to the video file
+        output_dir: Directory where frames will be saved
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Open video file
+    cap = cv2.VideoCapture(str(video_path))
+    
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    
+    # Get rotation metadata
+    rotation = get_video_rotation(video_path)
+    if rotation > 0:
+        logger.info(f"  Detected rotation: {rotation} degrees - will correct during extraction")
+    
+    frame_count = 0
+    
+    while True:
+        ret, frame = cap.read()
+        
+        if not ret:
+            break
+        
+        # Apply rotation correction if needed
+        if rotation > 0:
+            frame = rotate_frame(frame, rotation)
+        
+        # Save frame with zero-indexed numbering
+        frame_filename = f"{output_dir}/frame_{frame_count:05d}.jpg"
+        cv2.imwrite(frame_filename, frame)
+        frame_count += 1
+    
+    cap.release()
+    logger.info(f"  Extracted {frame_count} frames to {output_dir}")
+
+
+
 def convert_videos_to_frames(
     video_folder: Union[str, Path], 
     output_folder: Union[str, Path],
     video_extensions: List[str] = ['.mov', '.mp4', '.avi'],
     frame_format: str = '.jpg',
-    frame_rate: Optional[int] = None,
+    target_fps: float = 5.0,
     max_frames_per_video: Optional[int] = None
 ) -> bool:
     """
-    Convert video files in a folder to individual frames
+    Convert video files in a folder to individual frames with frame rate downsampling.
     
     Args:
         video_folder: Path to folder containing video files
         output_folder: Path to folder where frames will be saved
         video_extensions: List of video file extensions to process (default: ['.mov', '.mp4', '.avi'])
         frame_format: Output frame format (default: '.jpg')
-        frame_rate: Extract frames at specific intervals (None for all frames)
+        target_fps: Target frame rate for extraction (default: 5.0 fps). 
+                   For example, a 30fps video will be downsampled to 5fps by keeping every 6th frame.
         max_frames_per_video: Maximum number of frames to extract per video (None for unlimited)
         
     Returns:
@@ -46,12 +160,17 @@ def convert_videos_to_frames(
     Frame organization:
         output_folder/
         ├── video1_name/
+        │   ├── frame_00000.jpg
         │   ├── frame_00001.jpg
-        │   ├── frame_00002.jpg
         │   └── ...
         └── video2_name/
-            ├── frame_00001.jpg
+            ├── frame_00000.jpg
             └── ...
+            
+    Example:
+        For a 40-second video at 30fps (1200 frames):
+        - With target_fps=5.0, only 200 frames will be saved (40s * 5fps)
+        - Every 6th frame will be kept (30/5 = 6)
     """
     
     video_folder = Path(video_folder)
@@ -81,7 +200,10 @@ def convert_videos_to_frames(
     success_count = 0
     
     for video_path in video_files:
+        
         logger.info(f"Processing: {video_path.name}")
+        # extract_frames(video_path, output_folder / video_path.stem)
+        
         
         try:
             # Create output subfolder for this video
@@ -98,9 +220,19 @@ def convert_videos_to_frames(
             
             # Get video properties
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
+            original_fps = cap.get(cv2.CAP_PROP_FPS)
             
-            logger.info(f"  Video info: {total_frames} frames, {fps:.2f} FPS")
+            # Get video rotation metadata
+            rotation = get_video_rotation(video_path)
+            if rotation > 0:
+                logger.info(f"  Detected rotation: {rotation} degrees - will correct during extraction")
+            
+            # Calculate frame skip interval to achieve target fps
+            # For example: 30fps video -> 5fps target = keep every 6th frame
+            frame_skip = max(1, int(round(original_fps / target_fps)))
+            
+            logger.info(f"  Video info: {total_frames} frames, {original_fps:.2f} FPS")
+            logger.info(f"  Downsampling: {original_fps:.2f} fps -> {target_fps:.2f} fps (keeping every {frame_skip} frame)")
             
             frame_count = 0
             extracted_count = 0
@@ -111,28 +243,31 @@ def convert_videos_to_frames(
                 if not ret:
                     break
                 
+                # Only save frames at the target interval
+                if frame_count % frame_skip == 0:
+                    # Stop if max_frames_per_video limit reached
+                    if max_frames_per_video is not None and extracted_count >= max_frames_per_video:
+                        break
+                    
+                    # Apply rotation correction if needed
+                    if rotation > 0:
+                        frame = rotate_frame(frame, rotation)
+                    
+                    # Save frame (zero-indexed)
+                    frame_filename = f"frame_{extracted_count:05d}{frame_format}"
+                    frame_path = video_output_folder / frame_filename
+                    
+                    if cv2.imwrite(str(frame_path), frame):
+                        extracted_count += 1
+                    else:
+                        logger.error(f"Failed to save frame: {frame_path}")
+                
                 frame_count += 1
-                
-                # Skip frames if frame_rate is specified
-                if frame_rate is not None and frame_count % frame_rate != 0:
-                    continue
-                
-                # Stop if max_frames_per_video limit reached
-                if max_frames_per_video is not None and extracted_count >= max_frames_per_video:
-                    break
-                
-                # Save frame
-                frame_filename = f"frame_{extracted_count+1:05d}{frame_format}"
-                frame_path = video_output_folder / frame_filename
-                
-                if cv2.imwrite(str(frame_path), frame):
-                    extracted_count += 1
-                else:
-                    logger.error(f"Failed to save frame: {frame_path}")
             
             cap.release()
             
-            logger.info(f"  Extracted {extracted_count} frames from {video_path.name}")
+            actual_fps = extracted_count / (total_frames / original_fps) if total_frames > 0 else 0
+            logger.info(f"  Extracted {extracted_count} frames from {video_path.name} (effective fps: {actual_fps:.2f})")
             success_count += 1
             
         except Exception as e:
@@ -381,7 +516,7 @@ def process_video_to_depth_pipeline(
     video_folder: Union[str, Path],
     output_base_folder: Union[str, Path],
     model_name: str = "depth-anything/DA3-Large",
-    frame_rate: Optional[int] = None,
+    target_fps: float = 5.0,
     max_frames_per_video: Optional[int] = None,
     batch_size: int = 4,
     device: str = "auto"
@@ -393,7 +528,7 @@ def process_video_to_depth_pipeline(
         video_folder: Path to folder containing video files
         output_base_folder: Base path where frames and depth maps will be saved
         model_name: Depth Anything V3 model to use
-        frame_rate: Extract frames at specific intervals (None for all frames)
+        target_fps: Target frame rate for extraction (default: 5.0 fps)
         max_frames_per_video: Maximum number of frames to extract per video
         batch_size: Batch size for depth map generation
         device: Device to use for depth estimation
@@ -425,7 +560,7 @@ def process_video_to_depth_pipeline(
     if not convert_videos_to_frames(
         video_folder=video_folder,
         output_folder=frames_folder,
-        frame_rate=frame_rate,
+        target_fps=target_fps,
         max_frames_per_video=max_frames_per_video
     ):
         logger.error("Failed to convert videos to frames")
@@ -475,8 +610,8 @@ if __name__ == "__main__":
                 video_folder=video_folder,
                 output_base_folder=data_root_folder / "processed",
                 model_name="depth-anything/DA3-Large",  # or DA3-Base, DA3-Small
-                frame_rate=10,  # Extract every 10th frame (optional)
-                max_frames_per_video=100,  # Limit frames per video (optional)
+                target_fps=5.0,  # Extract at 5 fps (e.g., 30fps video -> every 6th frame)
+                max_frames_per_video=None,  # No limit, extract all at target fps
                 batch_size=4,  # Adjust based on your GPU memory
                 device="auto"  # auto-detect best device
             )

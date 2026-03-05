@@ -8,7 +8,7 @@ dataset/driving-video-with-object-tracking
 external/
 output/
 dataset/
-
+temp/
 # Large video files
 *.mov
 
