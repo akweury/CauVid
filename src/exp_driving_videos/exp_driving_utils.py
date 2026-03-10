@@ -1,5 +1,6 @@
 import torch 
 import numpy as np 
+import cv2 
 
 import config
 
@@ -153,6 +154,24 @@ def load_driving_mini_inputs():
     input_data = load_perception_inputs(frame_path, depth_map_path, label_file_path)
     return input_data
 
+
+def load_frame(frame, bbox=None, obj_id=None, label=None):
+    # Load and process the frame
+    img = cv2.imread(frame)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    if bbox is not None:
+        # Draw bounding box on frame
+        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 3)
+        cv2.putText(img, f"Object {obj_id} ({label})", (x1, y1 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    
+    return img 
+
+
+
 if __name__ == "__main__":
     dataset_path = config.DATASET_PATHS['driving_mini'] 
     frame_path = dataset_path / "frames"/config.driving_demo_video_id  
@@ -166,3 +185,6 @@ if __name__ == "__main__":
     print("Loaded bounding boxes:", len(input_data['bboxes']))
     print("Loaded labels:", len(input_data['labels']))
     print("Loaded object IDs:", len(input_data['obj_ids']))
+    
+    
+    

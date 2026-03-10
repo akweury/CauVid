@@ -66,6 +66,8 @@ def raw2frame_data(input_data):
         debug_visual_frame(frame_full_path, frame_i_bboxes, frame_i_labels)
     
     return frames_data
+
+
 def debug_visual_frame(frame_path, bboxes, labels):
     """
     Visualize a single frame with bounding boxes and labels for debugging purposes.
@@ -168,12 +170,10 @@ def estimate3d_positions(bboxes, depth_map_file_name, frame_path):
         
     return positions_3d
     
-    
-
-def raw2matrix(raw_frame_input, min_frame_number=5):
+def raw2obj_matrix(raw_frame_input, min_frame_number=5):
     frames_data = raw2frame_data(raw_frame_input)
     obj_matrices = {}
-    for frame_data in frames_data:
+    for frame_index, frame_data in enumerate(frames_data):
         # Process the frame data to create a matrix representation
         # use frame image, depth map, bounding boxes, labels to create a matrix representation of the scene
         bboxes = frame_data["bboxes"]
@@ -184,18 +184,19 @@ def raw2matrix(raw_frame_input, min_frame_number=5):
         
         positions_3d = estimate3d_positions(bboxes, depth_map, frame)  # Function to estimate 3D positions from bounding boxes and depth map
         for obj_id, label, position, bbox in zip(obj_ids, labels, positions_3d, bboxes):
-            
             if obj_id not in obj_matrices:
                 obj_matrices[obj_id] = {
                     "label": label,
                     "position": [position],
                     "frames": [frame],
-                    "bboxes": [bbox]
+                    "bboxes": [bbox],
+                    "frame_indices": [frame_index]
                 }
             else:
                 obj_matrices[obj_id]["position"].append(position)
                 obj_matrices[obj_id]["bboxes"].append(bbox)
                 obj_matrices[obj_id]["frames"].append(frame)
+                obj_matrices[obj_id]["frame_indices"].append(frame_index)
     # filter out objects that appear in less than min_frame_number frames
     obj_matrices = {obj_id: data for obj_id, data in obj_matrices.items() if len(data["position"]) >= min_frame_number}
     
@@ -226,63 +227,23 @@ def smooth_matrices(obj_matrices):
     for obj_id, data in obj_matrices.items():
         label = data["label"]
         position = data["position"]
-        
+        position = [torch.tensor(p, dtype=torch.float32) for p in position]  # Convert positions to tensors
         smoothed_position = smooth_positions(position)  # Smooth the position across frames
         smoothed_matrices[obj_id] = {
             "label": label,
-            "position": smoothed_position
+            "position": smoothed_position,
+            "frames": data["frames"],
+            "bboxes": data["bboxes"],
+            "frame_indices": data["frame_indices"]
         }
     return smoothed_matrices
 
-def trajectory_visual(matrices, output_path):
-    """
-    Visualize trajectories of objects in the scene (top-down view).
-    Creates individual figures for each object and saves them.
-    
-    Parameters:
-    matrices (dict): A dictionary containing object matrices with positions.
-    output_path (Path): Path to the folder where trajectory visualizations will be saved.
-    """
-    
-    # Create output folder if it doesn't exist
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Create individual figure for each object
-    for obj_id, data in matrices.items():
-        label = data["label"]
-        position = torch.stack(data["position"])
-        x = position[:, 0].numpy()
-        z = position[:, 2].numpy()
-        
-        # Create a new figure for this object
-        plt.figure(figsize=(10, 10))
-        plt.plot(x, z, marker='o', linestyle='-', linewidth=2, markersize=4)
-        plt.xlabel("X (meters)", fontsize=12)
-        plt.ylabel("Z (meters)", fontsize=12)
-        plt.title(f"Top-down Trajectory: Object {obj_id} ({label})", fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        
-        # Add start and end markers
-        plt.scatter(x[0], z[0], color='green', s=100, marker='o', label='Start', zorder=5)
-        plt.scatter(x[-1], z[-1], color='red', s=100, marker='X', label='End', zorder=5)
-        plt.legend()
-        
-        # Save the figure
-        safe_label = label.replace(' ', '_').replace('/', '_')
-        filename = f"trajectory_obj{obj_id}_{safe_label}.png"
-        save_path = output_path / filename
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved trajectory for Object {obj_id} ({label}): {save_path}")
-        
-        # Close the figure to free memory
-        plt.close()
-
-def trajectory_with_frames_visual(matrices, input_data, output_path):
+def trajectory_with_frames_visual(matrices, smooth_matrices, input_data, output_path):
     os.makedirs(output_path, exist_ok=True)
     # for each trajectory, show the smoothed trajectory on the left, highlight the current position, 
     # and the image on the right,bounding box the the target object, saved as a gif file
     
-    def create_trajectory_figure_with_current(position, current_idx, obj_id, label, target_height):
+    def create_trajectory_figure_with_current(position, current_idx, obj_id, label, target_height, title_suffix=""):
         """
         Create trajectory plot with current position highlighted.
         
@@ -296,6 +257,7 @@ def trajectory_with_frames_visual(matrices, input_data, output_path):
         Returns:
             Trajectory image as numpy array (RGB)
         """
+        position = torch.stack(position)  # Ensure position is a tensor of shape (num_frames, 3)
         # Create the trajectory plot
         fig, ax = plt.subplots(figsize=(5, 5))
         x = position[:, 0].numpy()
@@ -321,7 +283,7 @@ def trajectory_with_frames_visual(matrices, input_data, output_path):
         
         ax.set_xlabel("X (meters)", fontsize=12)
         ax.set_ylabel("Z (meters)", fontsize=12)
-        ax.set_title(f"Trajectory: Object {obj_id} ({label})\nFrame {current_idx+1}/{len(position)}", 
+        ax.set_title(f"Object {obj_id} ({label})\nFrame {current_idx+1}/{len(position)} {title_suffix}", 
                     fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.legend(loc='best', fontsize=9)
@@ -343,33 +305,31 @@ def trajectory_with_frames_visual(matrices, input_data, output_path):
         
     for obj_id, data in matrices.items():
         label = data["label"]
-        position = torch.stack(data["position"])
+        position = data["position"]
         frames = data["frames"]
         bboxes = data["bboxes"]
         
         # each bbox is one frame, so we can visualize the trajectory and the frame with bbox side by side
         visual_frames = []
         for i, (bbox, frame) in enumerate(zip(bboxes, frames)):
-            # Load and process the frame
-            img = cv2.imread(frame)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            frame_height = img.shape[0]
-            
-            # Draw bounding box on frame
-            frame_copy = img.copy()
-            x1, y1, x2, y2 = bbox
-            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (255, 0, 0), 3)
-            cv2.putText(frame_copy, f"Object {obj_id} ({label})", (x1, y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            frame_img = utils.load_frame(frame, bbox, obj_id, label)  # Load the frame and draw the bounding box
+            frame_height = frame_img.shape[0]
             
             # Create trajectory plot with current position highlighted
             trajectory_img_current = create_trajectory_figure_with_current(
                 position, i, obj_id, label, frame_height
             )
             
+            # Create smoothed trajectory plot with current position highlighted
+            trajectory_img_current_smoothed = create_trajectory_figure_with_current(
+                smooth_matrices[obj_id]["position"], i, obj_id, label, frame_height, title_suffix="(Smoothed)"
+                
+            )
+            
             # Combine trajectory and frame side by side
-            combined_img = np.hstack((trajectory_img_current, frame_copy))
+            combined_img = np.hstack((trajectory_img_current, 
+                                      trajectory_img_current_smoothed, 
+                                      frame_img))
             visual_frames.append(combined_img)
         
         # save the visual frames as a gif, with 2 fps
@@ -378,27 +338,50 @@ def trajectory_with_frames_visual(matrices, input_data, output_path):
         imageio.mimsave(gif_path, visual_frames, fps=2)
         print(f"Saved trajectory gif for Object {obj_id} ({label}): {gif_path}")
 
+def save_matrices(matrices, output_path):
+    """
+    Save the smoothed object matrices to a file for later use.
+
+    Parameters:
+    matrices (dict): A dictionary containing smoothed object matrices.
+    output_path (Path): Path to the file where matrices will be saved.
+    """
+    os.makedirs(output_path, exist_ok=True)
     
-     
+    import pickle
+    
+    ouput_file = output_path / "smoothed_object_matrices.pkl"
+    with open(ouput_file, 'wb') as f:
+        pickle.dump(matrices, f)
+    
+    print(f"Saved smoothed object matrices to: {ouput_file}")
+    
 
 if __name__ == "__main__":
-    # Example usage
-    
-    
+    # Example usage    
     input_data = utils.load_driving_mini_inputs()
-    matrices = raw2matrix(input_data)    
     
-    # trajectory_visual(matrices, config.get_output_path("driving_trajectory_visualization"))
+    
+    obj_matrices = raw2obj_matrix(input_data)     
+
     print("Generated object matrices for the scene:")
-    print("Number of objects:", len(matrices))
+    print("Number of objects:", len(obj_matrices))
     
-    smooth_matrices = smooth_matrices(matrices)
-    # trajectory_visual(smooth_matrices, config.get_output_path("driving_trajectory_visualization_smoothed"))
+    smooth_matrices = smooth_matrices(obj_matrices)
     
+    # processing: label the trajectory with symbols, such as leftside, rightside, towarding left, towarding right, etc. based on the relative position and movement of the object compared to the ego vehicle
+    # this can be done by comparing the position of the object to the ego vehicle's position
+
+    
+    
+    # save the smooth_matrices for later use
+    save_matrices(smooth_matrices, config.get_output_path("pipeline_output"))
     
     # for each trajectory, show the smoothed trajectory on the left, highlight the current position, 
     # and the image on the right,bounding box the the target object, saved as a gif file
-    trajectory_with_frames_visual(matrices, input_data, config.get_output_path("driving_trajectory_visualization_with_frames")) 
+    # trajectory_with_frames_visual(matrices,smooth_matrices, input_data, config.get_output_path("driving_trajectory_visualization_with_frames")) 
+    
+    
     
     
     

@@ -28,6 +28,8 @@ OUTPUT_PATHS = {
     "driving_trajectory_visualization": PROJECT_ROOT / "output" / "driving_trajectory_visualization",
     "driving_trajectory_visualization_smoothed": PROJECT_ROOT / "output" / "driving_trajectory_visualization_smoothed",
     "driving_trajectory_visualization_with_frames": PROJECT_ROOT / "output" / "driving_trajectory_visualization_with_frames",
+    "driving_primitive_visualization": PROJECT_ROOT / "output" / "driving_primitive_visualization",
+    "driving_ego_primitive_visualization": PROJECT_ROOT / "output" / "driving_ego_primitive_visualization",
     # Pipeline output directory
     "pipeline_output": PROJECT_ROOT / "pipeline_output",
     
