@@ -8,8 +8,8 @@ from pathlib import Path
 
 # Project root directory
 PROJECT_ROOT = Path(__file__).parent.absolute()
-# driving_demo_video_id = "0153f03b-8fbdc1ad"
-driving_demo_video_id = "01118704-e91b1b1c"
+driving_demo_video_id = "0153f03b-8fbdc1ad"
+# driving_demo_video_id = "01118704-e91b1b1c"
 
 # Dataset paths
 DATASET_PATHS = {

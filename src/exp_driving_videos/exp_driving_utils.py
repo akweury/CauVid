@@ -1,6 +1,8 @@
 import torch 
 import numpy as np 
 import cv2 
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 import config
 
@@ -171,6 +173,11 @@ def load_frame(frame, bbox=None, obj_id=None, label=None):
     return img 
 
 
+def load_matrix(file_name):
+    import pickle
+    with open(file_name, 'rb') as f:
+        matrix = pickle.load(f)
+    return matrix
 
 if __name__ == "__main__":
     dataset_path = config.DATASET_PATHS['driving_mini'] 
@@ -188,3 +195,87 @@ if __name__ == "__main__":
     
     
     
+def create_line_chart_img(x, y, title, xlabel, ylabel):
+    
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    ax.plot(x, y, marker='o')
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True)
+    
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    buf = renderer.buffer_rgba()
+    w, h = int(renderer.width), int(renderer.height)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+    img = img[:, :, :3]
+    plt.close(fig)
+    return img
+
+
+def create_state_bar_chart_img(rotations_list, state_threshold=0.1):        
+    """
+    Create a square visualization showing ego rotation states across time.
+    The bar spans from top to bottom and extends horizontally across frames.
+
+    Colors:
+    green = straight
+    red   = left turn
+    blue  = right turn
+    """
+    states = []
+    for r in rotations_list:
+        if r > state_threshold:
+            states.append("right")
+        elif r < -state_threshold:
+            states.append("left")
+        else:
+            states.append("straight")
+
+    colors = {
+        "straight": (0.2, 0.8, 0.2),  # green
+        "left": (0.9, 0.2, 0.2),      # red
+        "right": (0.2, 0.4, 0.9)      # blue
+    }
+
+    # Build color strip
+    color_strip = np.array([colors[s] for s in states])
+    color_strip = color_strip[np.newaxis, :, :]  # shape (1, N, 3)
+
+    fig, ax = plt.subplots(1, 1, figsize=(5, 5))
+
+    # Stretch vertically to make a fat bar
+    ax.imshow(color_strip, aspect='auto', extent=[0, len(states), 0, 1])
+
+    ax.set_xlim(0, len(states))
+    ax.set_ylim(0, 1)
+
+    ax.set_xlabel("Frame Index", fontsize=12)
+    ax.set_ylabel("Rotation State", fontsize=12)
+    ax.set_title("Ego Rotation State History", fontsize=12)
+
+    ax.set_yticks([])
+
+    # Legend
+    legend_handles = [
+        mpatches.Patch(color=colors["straight"], label="Straight"),
+        mpatches.Patch(color=colors["left"], label="Left Turn"),
+        mpatches.Patch(color=colors["right"], label="Right Turn")
+    ]
+
+    ax.legend(handles=legend_handles, loc="upper right")
+
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    buf = renderer.buffer_rgba()
+    w, h = int(renderer.width), int(renderer.height)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+    img = img[:, :, :3]
+
+    plt.close(fig)
+    return img
