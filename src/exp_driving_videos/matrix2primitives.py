@@ -75,6 +75,7 @@ def estimate_ego_motion(obj_primitives, window_size=5):
     vx_ego_list = []
     vz_ego_list = []
     w_ego_list = []
+    
     for frame_index in range(obj_primitives.shape[0]):
         frame_obj_velocities = []
         for obj_prim in obj_primitives[frame_index]:
@@ -118,6 +119,7 @@ def estimate_ego_motion(obj_primitives, window_size=5):
     ego_velo_smoothed_z = np.convolve(ego_velocities[:, 1], np.ones(window_size)/window_size, mode='same')
     ego_w_smoothed = np.convolve(ego_w, np.ones(window_size)/window_size, mode='same')
     
+    ego_motion = np.stack([ego_velo_smoothed_x, ego_velo_smoothed_z, ego_w_smoothed], axis=1)
     # update the smoothed ego velocities and rotations back to the obj_primitives_new
     for frame_index in range(obj_primitives_new.shape[0]):
         for i in range(obj_primitives_new.shape[1]):
@@ -126,7 +128,7 @@ def estimate_ego_motion(obj_primitives, window_size=5):
                 obj_primitives_new[frame_index, i]['vz_ego'] = ego_velo_smoothed_z[frame_index]
                 obj_primitives_new[frame_index, i]['w_ego'] = ego_w_smoothed[frame_index]
     
-    return obj_primitives_new
+    return obj_primitives_new, ego_motion 
 
 def estimate_obj_world_primitives(obj_primitives, window_size=3):
     """ 
@@ -202,10 +204,19 @@ def estimate_closing_speed(obj_primitives):
 
 
 
-def visualize_ego_primitives(obj_primitives, output_path):
+def visualize_ego_primitives(obj_primitives, output_path, video_id=None):
     os.makedirs(output_path, exist_ok=True)
-    video_path = output_path / f"ego_primitives_{config.driving_demo_video_id}.mp4"
+    if video_id is None:
+        video_path = output_path / f"ego_primitives_{config.driving_demo_video_id}.mp4"
+    else:
+        video_path = output_path / f"ego_primitives_{video_id}.mp4"
 
+    # if video already exists, skip the visualization process
+    if video_path.exists():
+        print(f"Video {video_path} already exists, skipping visualization.")
+        return
+
+    
     visual_frames = []
     velocities_x_list = []
     velocities_z_list = []
@@ -340,17 +351,66 @@ def visualize_others_primitives(primitives, output_path):
         print(f"Saved primitive gif for Object {obj_id} ({label}): {gif_path}")
     
     
-    
 
+
+
+def matrix2primitives(matrix, video_id=None, visualize_ego=False, visualize_others=False, save_primitives=False):
+    # check if primitive data is existed or not, if existed, load the primitive data and return directly to save time, otherwise, process the matrix to get the primitives.
     
+    def save_primitives_to_file(obj_primitives, ego_motion, output_path, video_id=None):
+        os.makedirs(output_path, exist_ok=True)
+        if video_id is None:
+            file_path = output_path / f"obj_primitives_{config.driving_demo_video_id}.pkl"
+        else:
+            file_path = output_path / f"obj_primitives_{video_id}.pkl"
+        utils.save_pkl_file(file_path, {"obj_primitives": obj_primitives, "ego_motion": ego_motion})
+        print(f"Saved primitives to file: {file_path}")
     
+    def load_primitive_files(file_path):
+        data = utils.load_matrix(file_path)
+        obj_primitives = data.get("obj_primitives", None)
+        ego_motion = data.get("ego_motion", None)
+        print(f"Loaded primitives from file: {file_path}")
+        return obj_primitives, ego_motion
+
+    primitive_file_path = config.get_output_path("pipeline_output") / f"obj_primitives_{video_id}.pkl"
+    if primitive_file_path.exists():
+        obj_primitives, ego_motion = load_primitive_files(primitive_file_path)  # This will print the loaded primitive data for debugging
+        print(f"Primitive file already exists for video {video_id}, loading from file: {primitive_file_path}")
+        return obj_primitives, ego_motion
     
+    # convert matrices to frame-centric object primitives    
+    obj_primitives = obj_centric2frame_centric(matrix)
     
+    # estimate velocity of other objects in the camera frame based on the change in position over time, 
+    # and smooth the velocity using a simple moving average filter
+    obj_primitives = estimate_vx_vz_obj(obj_primitives)
+    
+    # estimate ego motion, including ego velocity and ego rotation, 
+    # based on the relative velocity of the other objects in the frame,
+    obj_primitives, ego_motion = estimate_ego_motion(obj_primitives)
+    
+    # estimate other world primitives, including object velocity in the world frame by adding ego velocity 
+    # and the effect of ego rotation to the object velocity in the camera frame, 
+    # and then smooth the world velocity across frames using a simple moving average filter.
+    obj_primitives = estimate_obj_world_primitives(obj_primitives)
+    
+    # estimate closing speed
+    obj_primitives = estimate_closing_speed(obj_primitives)
+    
+    if visualize_ego:
+        # visual ego primitives
+        visualize_ego_primitives(obj_primitives, config.get_output_path("driving_ego_primitive_visualization"), video_id)
+    
+    if save_primitives:
+        save_primitives_to_file(obj_primitives,ego_motion, config.get_output_path("pipeline_output"), video_id)
+        
+    return obj_primitives,ego_motion
     
     
 if __name__ == "__main__":    
     # load processed matrices
-    obj_matrix = utils.load_matrix(config.get_output_path("pipeline_output") / "smoothed_object_matrices.pkl")    
+    obj_matrix = utils.load_matrix(config.get_output_path("pipeline_output") / f"smoothed_object_matrices_{config.driving_demo_video_id}.pkl")    
     # convert matrices to frame-centric object primitives    
     obj_primitives = obj_centric2frame_centric(obj_matrix)
     

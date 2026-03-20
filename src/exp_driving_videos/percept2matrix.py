@@ -15,7 +15,7 @@ import torch
 
 import config 
 
-def raw2frame_data(input_data):
+def raw2frame_data(input_data, video_id=None):
     """
     Convert perception data to a matrix representation.
 
@@ -39,12 +39,16 @@ def raw2frame_data(input_data):
     
     # Get the frame path from config
     dataset_path = config.DATASET_PATHS['driving_mini']
-    frame_folder = dataset_path / "frames" / config.driving_demo_video_id
+    
+    if video_id is None:
+        video_id = config.driving_demo_video_id
+    frame_folder = dataset_path / "frames" / video_id
+    
     
     for i in tqdm(range(len(depth_maps))):
         
         frame_i_indices = torch.tensor(frame_indices) == i
-        video_i_indices = [video_name == config.driving_demo_video_id for video_name in video_names]
+        video_i_indices = [video_name == video_id for video_name in video_names]
         frame_mask = frame_i_indices & torch.tensor(video_i_indices)
         frame_i_bboxes = torch.tensor(bboxes)[frame_mask]
         frame_i_labels = [labels[j] for j in range(len(labels)) if frame_mask[j]]
@@ -170,8 +174,8 @@ def estimate3d_positions(bboxes, depth_map_file_name, frame_path):
         
     return positions_3d
     
-def raw2obj_matrix(raw_frame_input, min_frame_number=5):
-    frames_data = raw2frame_data(raw_frame_input)
+def raw2obj_matrix(raw_frame_input, video_id, min_frame_number=5):
+    frames_data = raw2frame_data(raw_frame_input, video_id)
     obj_matrices = {}
     for frame_index, frame_data in enumerate(frames_data):
         # Process the frame data to create a matrix representation
@@ -198,9 +202,12 @@ def raw2obj_matrix(raw_frame_input, min_frame_number=5):
                 obj_matrices[obj_id]["frames"].append(frame)
                 obj_matrices[obj_id]["frame_indices"].append(frame_index)
     # filter out objects that appear in less than min_frame_number frames
-    obj_matrices = {obj_id: data for obj_id, data in obj_matrices.items() if len(data["position"]) >= min_frame_number}
+    filtered_obj_matrices = {obj_id: data for obj_id, data in obj_matrices.items() if len(data["position"]) >= min_frame_number}
     
-    return obj_matrices
+    if len(filtered_obj_matrices) == 0:
+        frames_data = raw2frame_data(raw_frame_input, video_id)
+        print(f"No valid object matrices found for video {video_id} after filtering with min_frame_number={min_frame_number}.")
+    return filtered_obj_matrices
 
 def smooth_matrices(obj_matrices):
     """
@@ -338,7 +345,7 @@ def trajectory_with_frames_visual(matrices, smooth_matrices, input_data, output_
         imageio.mimsave(gif_path, visual_frames, fps=2)
         print(f"Saved trajectory gif for Object {obj_id} ({label}): {gif_path}")
 
-def save_matrices(matrices, output_path):
+def save_matrices(matrices, output_path, video_id=None):
     """
     Save the smoothed object matrices to a file for later use.
 
@@ -350,36 +357,64 @@ def save_matrices(matrices, output_path):
     
     import pickle
     
-    ouput_file = output_path / "smoothed_object_matrices.pkl"
+    if video_id is None:
+        ouput_file = output_path / f"smoothed_object_matrices_{config.driving_demo_video_id}.pkl"
+    else:
+        ouput_file = output_path / f"smoothed_object_matrices_{video_id}.pkl"
     with open(ouput_file, 'wb') as f:
         pickle.dump(matrices, f)
     
     print(f"Saved smoothed object matrices to: {ouput_file}")
+   
+
+def percept2matrix(video_id=None, save_matrices_flag=True):
+    # load the matrix if it already exists
+    matrix_file = config.get_output_path("pipeline_output") / f"smoothed_object_matrices_{video_id}.pkl"
+    if matrix_file.exists():
+        print(f"Matrix file already exists for video {video_id}, loading from file: {matrix_file}")
+        smoothed_matrices = utils.load_matrix(matrix_file)  # This will print the loaded matrix for debugging
+        return smoothed_matrices
     
+    input_data = utils.load_driving_mini_inputs(video_id)
+    
+    obj_matrices = raw2obj_matrix(input_data, video_id)     
+
+    print("Generated object matrices for the scene:")
+    print("Number of objects:", len(obj_matrices))
+    
+    smoothed_matrices = smooth_matrices(obj_matrices)
+    
+    if save_matrices_flag:
+        # save the smoothed_matrices for later use
+        save_matrices(smoothed_matrices, config.get_output_path("pipeline_output"), video_id)
+    
+    if len(smoothed_matrices)==0:
+        print("No valid object matrices found after filtering. Skipping visualization.")
+        return smoothed_matrices
+    return smoothed_matrices
+
 
 if __name__ == "__main__":
     # Example usage    
     input_data = utils.load_driving_mini_inputs()
     
     
-    obj_matrices = raw2obj_matrix(input_data)     
+    obj_matrices = raw2obj_matrix(input_data, config.driving_demo_video_id)     
 
     print("Generated object matrices for the scene:")
     print("Number of objects:", len(obj_matrices))
     
-    smooth_matrices = smooth_matrices(obj_matrices)
+    smoothed_matrices = smooth_matrices(obj_matrices)
     
     # processing: label the trajectory with symbols, such as leftside, rightside, towarding left, towarding right, etc. based on the relative position and movement of the object compared to the ego vehicle
     # this can be done by comparing the position of the object to the ego vehicle's position
 
-    
-    
-    # save the smooth_matrices for later use
-    save_matrices(smooth_matrices, config.get_output_path("pipeline_output"))
+    # save the smoothed_matrices for later use
+    save_matrices(smoothed_matrices, config.get_output_path("pipeline_output"))
     
     # for each trajectory, show the smoothed trajectory on the left, highlight the current position, 
     # and the image on the right,bounding box the the target object, saved as a gif file
-    # trajectory_with_frames_visual(matrices,smooth_matrices, input_data, config.get_output_path("driving_trajectory_visualization_with_frames")) 
+    # trajectory_with_frames_visual(matrices, smoothed_matrices, input_data, config.get_output_path("driving_trajectory_visualization_with_frames")) 
     
     
     

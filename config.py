@@ -26,6 +26,7 @@ DATASET_PATHS = {
 OUTPUT_PATHS = {
     # General output directory
     "output": PROJECT_ROOT / "output",
+    "driving_segmentation_visualization": PROJECT_ROOT / "output" / "driving_segmentation_visualization",
     "driving_trajectory_visualization": PROJECT_ROOT / "output" / "driving_trajectory_visualization",
     "driving_trajectory_visualization_smoothed": PROJECT_ROOT / "output" / "driving_trajectory_visualization_smoothed",
     "driving_trajectory_visualization_with_frames": PROJECT_ROOT / "output" / "driving_trajectory_visualization_with_frames",

@@ -98,3 +98,43 @@ def estimate_closing_speed(vx_obj_w, vz_obj_w, vx_ego, vz_ego, dx_obj, dz_obj):
     unit_vector = relative_position / distance
     closing_speed = -np.dot(relative_velocity, unit_vector)
     return closing_speed
+
+
+
+
+
+def detect_change_points(array, activity_percentile=75, min_segment_len=10):
+    change_points = []
+    
+    diff = np.diff(array)   
+    activity = np.abs(diff)
+
+    # 3. Adaptive threshold (relative, not absolute)
+    thr = np.percentile(activity, activity_percentile)
+
+    # 4. Binary mask: active vs flat
+    active = activity > thr
+
+    # 5. Group consecutive regions
+    change_points = []
+    in_active = active[0]
+
+    for i in range(1, len(active)):
+        # detect transitions: flat ↔ active
+        if active[i] != in_active:
+            change_points.append(i)
+            in_active = active[i]
+
+    # 6. Build segments and merge short ones
+    segments = []
+    prev = 0
+    for cp in change_points + [len(array)]:
+        if cp - prev >= min_segment_len:
+            segments.append((prev, cp))
+            prev = cp
+
+    # fallback if nothing valid
+    if not segments:
+        segments = [(0, len(array))]
+
+    return segments

@@ -1,3 +1,5 @@
+import os
+
 import torch 
 import numpy as np 
 import cv2 
@@ -148,10 +150,14 @@ def load_perception_inputs(frame_path, depth_map_path, label_file_path):
     return input_data
 
 
-def load_driving_mini_inputs():
+def load_driving_mini_inputs(video_id=None):
     dataset_path = config.DATASET_PATHS['driving_mini'] 
-    frame_path = dataset_path / "frames"/config.driving_demo_video_id  
-    depth_map_path = dataset_path / "depth_maps"/config.driving_demo_video_id
+    if video_id is None:
+        frame_path = dataset_path / "frames"/config.driving_demo_video_id  
+        depth_map_path = dataset_path / "depth_maps"/config.driving_demo_video_id
+    else:
+        frame_path = dataset_path / "frames"/video_id
+        depth_map_path = dataset_path / "depth_maps"/video_id
     label_file_path =dataset_path/"labels.csv"
     input_data = load_perception_inputs(frame_path, depth_map_path, label_file_path)
     return input_data
@@ -201,6 +207,118 @@ def create_line_chart_img(x, y, title, xlabel, ylabel):
     ax.plot(x, y, marker='o')
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True)
+    
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    buf = renderer.buffer_rgba()
+    w, h = int(renderer.width), int(renderer.height)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+    img = img[:, :, :3]
+    plt.close(fig)
+    return img
+
+def combine_images_vertically(image_list):
+    """
+    Combine a list of images vertically into a single image.
+
+    Parameters:
+    image_list (list): A list of images (numpy arrays) to combine.
+
+    Returns:
+    numpy.ndarray: The combined image.
+    """
+    # Ensure all images have the same width
+    widths = [img.shape[1] for img in image_list]
+    max_width = max(widths)
+    
+    # resize images to have the same width
+    resized_images = []
+    for img in image_list:
+        if img.shape[1] != max_width:
+            scale_factor = max_width / img.shape[1]
+            new_height = int(img.shape[0] * scale_factor)
+            resized_img = cv2.resize(img, (max_width, new_height))
+            resized_images.append(resized_img)
+        else:
+            resized_images.append(img)
+
+    
+    # Concatenate images vertically
+    combined_image = np.vstack(resized_images)
+    
+    return combined_image
+
+
+
+def combine_images_horizontally(image_list):
+    """
+    Combine a list of images horizontally into a single image.
+
+    Parameters:
+    image_list (list): A list of images (numpy arrays) to combine.
+
+    Returns:
+    numpy.ndarray: The combined image.
+    """
+    # Ensure all images have the same height
+    heights = [img.shape[0] for img in image_list]
+    max_height = max(heights)
+    
+    # Pad images to have the same height
+    padded_images = []
+    for img in image_list:
+        if img.shape[0] < max_height:
+            padding = max_height - img.shape[0]
+            padded_img = np.pad(img, ((0, padding), (0, 0), (0, 0)), mode='constant', constant_values=255)
+            padded_images.append(padded_img)
+        else:
+            padded_images.append(img)
+    
+    # Concatenate images horizontally
+    combined_image = np.hstack(padded_images)
+    
+    return combined_image
+
+def create_segment_feature_img(segments, frame_index, colors, title, width=6, height=5):
+    fig, ax = plt.subplots(1, 1, figsize=(width, height))
+    for seg in segments:
+        s, e, feat, label = seg['start'], seg['end'], seg['features'], seg['label']
+        ax.axvspan(s, e, color=colors.get(label, "gray"), alpha=0.3)
+        ax.text((s+e)/2, 0.5, f"{label}", ha='center', va='center', fontsize=10)
+        
+    # highlight current frame
+    ax.axvline(frame_index, color='red', linestyle='--', label='Current Frame')
+    ax.set_xlabel("Frame Index")
+    ax.set_title(title)
+    ax.grid(True)
+    
+    plt.tight_layout()
+
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    buf = renderer.buffer_rgba()
+    w, h = int(renderer.width), int(renderer.height)
+    img = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+    img = img[:, :, :3]
+    plt.close(fig)
+    return img
+    
+def create_timeline_line_chart_img(signal, frame_index, segments, colors, title, width=6, height=5):
+    
+    fig, ax = plt.subplots(1, 1, figsize=(width, height))
+    x = list(range(len(signal)))
+    y = signal
+    ax.plot(x, y, marker='o')
+    ax.scatter(frame_index, signal[frame_index], color='red', s=100, label='Current Frame')
+    for seg in segments:
+        s, e, feat, label = seg['start'], seg['end'], seg['features'], seg['label']
+        ax.axvspan(s, e, color=colors.get(label, "gray"), alpha=0.3)
+        # ax.text((s+e)/2, max(signal)*0.8, f"{label}", ha='center', va='center', fontsize=12)
+    ax.set_xlabel("Frame Index")
     ax.set_title(title)
     ax.grid(True)
     
@@ -279,3 +397,18 @@ def create_state_bar_chart_img(rotations_list, state_threshold=0.1):
 
     plt.close(fig)
     return img
+
+def save_pkl_file(filename, data):
+    import pickle
+    with open(filename, 'wb') as f:
+        pickle.dump(data, f)    
+        
+        
+        
+def write_video(frames, video_path, fps=2):
+    import imageio
+    writer = imageio.get_writer(video_path, fps=fps, codec="libx264")
+    for frame in frames:
+        writer.append_data(frame)
+    writer.close()
+    
