@@ -285,10 +285,10 @@ def combine_images_horizontally(image_list):
 
 def create_segment_feature_img(segments, frame_index, colors, title, width=6, height=5):
     fig, ax = plt.subplots(1, 1, figsize=(width, height))
-    for seg in segments:
+    for si, seg in enumerate(segments):
         s, e, feat, label = seg['start'], seg['end'], seg['features'], seg['label']
-        ax.axvspan(s, e, color=colors.get(label, "gray"), alpha=0.3)
-        ax.text((s+e)/2, 0.5, f"{label}", ha='center', va='center', fontsize=10)
+        ax.axvspan(s, e, color=colors[si], alpha=0.3)
+        ax.text((s+e)/2, 0.5, f"{si}\n{label}", ha='center', va='center', fontsize=10)
         
     # highlight current frame
     ax.axvline(frame_index, color='red', linestyle='--', label='Current Frame')
@@ -307,16 +307,16 @@ def create_segment_feature_img(segments, frame_index, colors, title, width=6, he
     plt.close(fig)
     return img
     
-def create_timeline_line_chart_img(signal, frame_index, segments, colors, title, width=6, height=5):
+def create_timeline_line_chart_img(signal, frame_index, segments, colors, title, width=10, height=5):
     
     fig, ax = plt.subplots(1, 1, figsize=(width, height))
     x = list(range(len(signal)))
     y = signal
     ax.plot(x, y, marker='o')
     ax.scatter(frame_index, signal[frame_index], color='red', s=100, label='Current Frame')
-    for seg in segments:
-        s, e, feat, label = seg['start'], seg['end'], seg['features'], seg['label']
-        ax.axvspan(s, e, color=colors.get(label, "gray"), alpha=0.3)
+    for si, seg in enumerate(segments):
+        s, e = seg['start'], seg['end']
+        ax.axvspan(s, e, color=colors[si], alpha=0.3)
         # ax.text((s+e)/2, max(signal)*0.8, f"{label}", ha='center', va='center', fontsize=12)
     ax.set_xlabel("Frame Index")
     ax.set_title(title)

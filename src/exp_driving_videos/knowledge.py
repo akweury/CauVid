@@ -103,38 +103,58 @@ def estimate_closing_speed(vx_obj_w, vz_obj_w, vx_ego, vz_ego, dx_obj, dz_obj):
 
 
 
-def detect_change_points(array, activity_percentile=75, min_segment_len=10):
-    change_points = []
-    
-    diff = np.diff(array)   
+def detect_change_points(array, activity_percentile=75, min_segment_len=2):
+
+
+    # 2) First derivative
+    diff = np.diff(array)
     activity = np.abs(diff)
 
-    # 3. Adaptive threshold (relative, not absolute)
+    # 3) Adaptive threshold
     thr = np.percentile(activity, activity_percentile)
 
-    # 4. Binary mask: active vs flat
-    active = activity > thr
+    # 4) Extrema via sign changes (wave structure)
+    sign = np.sign(diff)
 
-    # 5. Group consecutive regions
-    change_points = []
-    in_active = active[0]
+    # stabilize sign (avoid zeros)
+    for i in range(1, len(sign)):
+        if sign[i] == 0:
+            sign[i] = sign[i-1]
+    for i in range(len(sign)-2, -1, -1):
+        if sign[i] == 0:
+            sign[i] = sign[i+1]
+    sign[sign == 0] = 1
 
-    for i in range(1, len(active)):
-        # detect transitions: flat ↔ active
-        if active[i] != in_active:
-            change_points.append(i)
-            in_active = active[i]
+    raw_extrema = np.where(np.diff(sign) != 0)[0] + 1
 
-    # 6. Build segments and merge short ones
+    # filter extrema by local activity (THIS is the key change)
+    extrema = []
+    for t in raw_extrema:
+        if t < len(activity) and activity[t-1] > thr:
+            extrema.append(t)
+
+    extrema = np.array(extrema)
+
+    # 5) Strong changes (same threshold control)
+    strong_changes = np.where(activity > thr)[0] + 1
+
+    # 6) Candidate change points (controlled by threshold)
+    cps = np.unique(np.concatenate(([0], extrema, strong_changes, [len(array)])))
+
+    # 7) Build initial segments
     segments = []
-    prev = 0
-    for cp in change_points + [len(array)]:
-        if cp - prev >= min_segment_len:
-            segments.append((prev, cp))
-            prev = cp
+    for i in range(len(cps) - 1):
+        s, e = int(cps[i]), int(cps[i + 1])
+        if e > s:
+            segments.append((s, e))
 
-    # fallback if nothing valid
-    if not segments:
-        segments = [(0, len(array))]
+    # 8) Minimal filtering only (no merging)
+    filtered = []
+    for s, e in segments:
+        if (e - s) >= min_segment_len:
+            filtered.append((s, e))
 
-    return segments
+    if not filtered:
+        return [(0, len(array))]
+
+    return filtered

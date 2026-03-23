@@ -14,13 +14,18 @@ def get_mini_video_ids():
 def main():   
       
     # get all the video ids 
-    video_ids = get_mini_video_ids()
+    video_ids = get_mini_video_ids()[:1]
     
-    for video_id in video_ids:
-        print(f"Processing video: {video_id}")
-        matrix = percept2matrix(video_id, save_matrices_flag=True)
-        primitives_continued, ego_motion = matrix2primitives(matrix, video_id, visualize_ego=True, save_primitives=True)
-        primitives_segmented = primitive_segmentation(primitives_continued, ego_motion, video_id)
+    for vid in video_ids:
+        print(f"Processing video: {vid}")
+        matrix = percept2matrix(vid, save_matrices_flag=True)
+        prims, ego_motion = matrix2primitives(matrix, vid, visualize_ego=True, save_primitives=True)
+        
+        for ap in range(90, 100, 1):
+            prims_seg = primitive_segmentation(prims, ego_motion, vid, activity_percentile=ap, min_segment_len=2)
+        
+            
+            
 if __name__ == "__main__":
     main()
 
