@@ -10,7 +10,7 @@ import cv2
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-from src.exp_driving_videos import exp_driving_utils as utils
+from exp_driving_videos.pipe_utils import exp_driving_utils as utils
 import torch 
 
 import config 

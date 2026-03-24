@@ -190,25 +190,6 @@ def signal2segs(signal):
     return merged_segs
 
 
-def extract_features_from_segments(segments, signals):
-    
-    features = []  # This should be a list of feature vectors corresponding to each segment
-    for (s,e) in segments:
-        
-        feat = {
-            "yaw_sum": signals['ego_w'][s:e].sum(),
-            "yaw_range": signals['ego_w'][s:e].max() - signals['ego_w'][s:e].min(),
-            "vz_mean": signals['ego_vz'][s:e].mean(),
-            "vz_trend": (signals['ego_vz'][e-1] - signals['ego_vz'][s]) / (e - s + 1e-5),
-            "vx_mean": signals['ego_vx'][s:e].mean(),
-        }
-        features.append(feat)
-    
-    
-    
-    return features
-
-
 def classify_segments(segment_features, yaw_percentile=70, vz_trend_percentile=70):
     # This should be a list of labels corresponding to each segment based on the extracted feature
     labels = []  

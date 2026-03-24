@@ -315,7 +315,7 @@ def create_timeline_line_chart_img(signal, frame_index, segments, colors, title,
     ax.plot(x, y, marker='o')
     ax.scatter(frame_index, signal[frame_index], color='red', s=100, label='Current Frame')
     for si, seg in enumerate(segments):
-        s, e = seg['start'], seg['end']
+        s, e = seg
         ax.axvspan(s, e, color=colors[si], alpha=0.3)
         # ax.text((s+e)/2, max(signal)*0.8, f"{label}", ha='center', va='center', fontsize=12)
     ax.set_xlabel("Frame Index")

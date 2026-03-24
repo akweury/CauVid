@@ -1,8 +1,8 @@
 
 
-from src.exp_driving_videos.matrix2primitives import matrix2primitives
-from src.exp_driving_videos.percept2matrix import percept2matrix
-from src.exp_driving_videos.primitive_segmentation import primitive_segmentation
+from exp_driving_videos.pipe_utils.matrix2primitives import matrix2primitives
+from exp_driving_videos.pipe_utils.signal2segs import signal2segs
+from exp_driving_videos.pipe_utils.percept2matrix import percept2matrix
 import config 
 
 
@@ -18,11 +18,23 @@ def main():
     
     for vid in video_ids:
         print(f"Processing video: {vid}")
+        
+        # time series position matrix
         matrix = percept2matrix(vid, save_matrices_flag=True)
+        # convert the position matrix to primitive signals
         prims, ego_motion = matrix2primitives(matrix, vid, visualize_ego=True, save_primitives=True)
         
-        for ap in range(90, 100, 1):
-            prims_seg = primitive_segmentation(prims, ego_motion, vid, activity_percentile=ap, min_segment_len=2)
+        # extract ego motion signals
+        ego_w_signal = ego_motion[:,2]
+        ego_vx_signal = ego_motion[:,0]
+        ego_vz_signal = ego_motion[:,1]
+        # segment the signals
+        ego_w_segs = signal2segs(ego_w_signal)
+        ego_vx_segs = signal2segs(ego_vx_signal)
+        ego_vz_segs = signal2segs(ego_vz_signal)
+        
+        
+        
         
             
             

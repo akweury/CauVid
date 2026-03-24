@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 
 import config 
-from src.exp_driving_videos import exp_driving_utils as utils
+from exp_driving_videos.pipe_utils import exp_driving_utils as utils
 from src.exp_driving_videos import knowledge 
 
 def obj_centric2frame_centric(matrix):
