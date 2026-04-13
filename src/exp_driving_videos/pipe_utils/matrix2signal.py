@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 
 import config 
-from exp_driving_videos.pipe_utils import exp_driving_utils as utils
+from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
 from src.exp_driving_videos import knowledge 
 
 def obj_centric2frame_centric(matrix):
@@ -115,9 +115,15 @@ def estimate_ego_motion(obj_primitives, window_size=5):
     # smooth the ego velocities and rotations across frames using a simple moving average filter
     ego_velocities = np.array(list(zip(vx_ego_list, vz_ego_list)))  
     ego_w = np.array(w_ego_list)
-    ego_velo_smoothed_x = np.convolve(ego_velocities[:, 0], np.ones(window_size)/window_size, mode='same')
-    ego_velo_smoothed_z = np.convolve(ego_velocities[:, 1], np.ones(window_size)/window_size, mode='same')
-    ego_w_smoothed = np.convolve(ego_w, np.ones(window_size)/window_size, mode='same')
+    
+    # normalization
+    ego_w_normalized = (ego_w - np.mean(ego_w)) / (np.std(ego_w) + 1e-6)
+    ego_v_normalized = (ego_velocities - np.mean(ego_velocities, axis=0)) / (np.std(ego_velocities, axis=0) + 1e-6)
+    
+    # smooth the normalized velocities and rotations
+    ego_velo_smoothed_x = np.convolve(ego_v_normalized[:, 0], np.ones(window_size)/window_size, mode='same')
+    ego_velo_smoothed_z = np.convolve(ego_v_normalized[:, 1], np.ones(window_size)/window_size, mode='same')
+    ego_w_smoothed = np.convolve(ego_w_normalized, np.ones(window_size)/window_size, mode='same')
     
     ego_motion = np.stack([ego_velo_smoothed_x, ego_velo_smoothed_z, ego_w_smoothed], axis=1)
     # update the smoothed ego velocities and rotations back to the obj_primitives_new
@@ -354,7 +360,7 @@ def visualize_others_primitives(primitives, output_path):
 
 
 
-def matrix2primitives(matrix, video_id=None, visualize_ego=False, visualize_others=False, save_primitives=False):
+def matrix2signal(matrix, video_id=None, visualize_ego=False, visualize_others=False, save_primitives=False):
     # check if primitive data is existed or not, if existed, load the primitive data and return directly to save time, otherwise, process the matrix to get the primitives.
     
     def save_primitives_to_file(obj_primitives, ego_motion, output_path, video_id=None):

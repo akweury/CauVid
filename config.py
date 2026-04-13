@@ -32,6 +32,8 @@ OUTPUT_PATHS = {
     "driving_trajectory_visualization_with_frames": PROJECT_ROOT / "output" / "driving_trajectory_visualization_with_frames",
     "driving_primitive_visualization": PROJECT_ROOT / "output" / "driving_primitive_visualization",
     "driving_ego_primitive_visualization": PROJECT_ROOT / "output" / "driving_ego_primitive_visualization",
+    "driving_seg_feat_vis": PROJECT_ROOT / "output" / "driving_seg_feat_vis",
+    "driving_seg_grps_vis": PROJECT_ROOT / "output" / "driving_seg_grps_vis",
     # Pipeline output directory
     "pipeline_output": PROJECT_ROOT / "pipeline_output",
     
@@ -81,7 +83,7 @@ def get_output_path(output_name: str) -> Path:
     """
     if output_name not in OUTPUT_PATHS:
         raise KeyError(f"Output path '{output_name}' not found. Available outputs: {list(OUTPUT_PATHS.keys())}")
-    
+    os.makedirs(OUTPUT_PATHS[output_name], exist_ok=True)  # Ensure the output directory exists
     return OUTPUT_PATHS[output_name]
 
 def ensure_directories():
@@ -92,6 +94,11 @@ def ensure_directories():
         if not path.exists():
             print(f"Creating directory: {path}")
             path.mkdir(parents=True, exist_ok=True)
+
+def get_mini_video_ids():
+    folder_path = get_dataset_path('driving_mini') / "videos"
+    video_ids = [f.stem for f in folder_path.glob("*.mov")]
+    return video_ids
 
 # Ensure directories exist when config is imported
 if __name__ == "__main__":

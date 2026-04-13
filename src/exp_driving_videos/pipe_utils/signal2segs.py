@@ -6,14 +6,14 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 import config 
-from exp_driving_videos.pipe_utils import exp_driving_utils as utils
-from exp_driving_videos.pipe_utils.percept2matrix import percept2matrix
-from exp_driving_videos.pipe_utils.matrix2primitives import matrix2primitives
+from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
+from src.exp_driving_videos.pipe_utils.percept2matrix import percept2matrix
+from src.exp_driving_videos.pipe_utils.matrix2signal import matrix2signal
 
 
 ######################## Helper functions for signal segmentation ########################
 
-def _smooth_sign_als(signed_signal):
+def _smooth_sign_als(signed_signal, max_run_length=4):
     smoothed_signed_signal = signed_signal.copy()
     i = 0
     while i < len(smoothed_signed_signal):
@@ -25,8 +25,8 @@ def _smooth_sign_als(signed_signal):
         run_end = i
         run_length = run_end - run_start
         
-        # If the run is short (less than 4 frames) and surrounded by the same different value, smooth it
-        if run_length < 4:
+        # If the run is short (less than max_run_length frames) and surrounded by the same different value, smooth it
+        if run_length < max_run_length:
             prev_value = smoothed_signed_signal[run_start - 1] if run_start > 0 else None
             next_value = smoothed_signed_signal[run_end] if run_end < len(smoothed_signed_signal) else None
             
@@ -40,7 +40,7 @@ def _smooth_sign_als(signed_signal):
         current_value = smoothed_signed_signal[0]
         while run_start < len(smoothed_signed_signal) and smoothed_signed_signal[run_start] == current_value:
             run_start += 1
-        if run_start < 4 and run_start < len(smoothed_signed_signal):
+        if run_start < max_run_length and run_start < len(smoothed_signed_signal):
             next_value = smoothed_signed_signal[run_start]
             smoothed_signed_signal[:run_start] = next_value
         
@@ -49,12 +49,12 @@ def _smooth_sign_als(signed_signal):
         current_value = smoothed_signed_signal[-1]
         while run_end >= 0 and smoothed_signed_signal[run_end] == current_value:
             run_end -= 1
-        if len(smoothed_signed_signal) - 1 - run_end < 4 and run_end >= 0:
+        if len(smoothed_signed_signal) - 1 - run_end < max_run_length and run_end >= 0:
             prev_value = smoothed_signed_signal[run_end]
             smoothed_signed_signal[run_end + 1:] = prev_value           
     return smoothed_signed_signal
 
-def _seg_and_merge(smoothed_signed_signal, signal):
+def _seg_and_merge(smoothed_signed_signal, signal, variance_threshold=0.01):
     # the signal is splitted by the flip signs, save all the segment ranges in the segs
     segs = []
     current_sign = smoothed_signed_signal[0]
@@ -70,7 +70,7 @@ def _seg_and_merge(smoothed_signed_signal, signal):
     merged_segs = []
     for seg in segs:
         s, e = seg
-        if np.var(signal[s:e]) < 0.01:  # If the variance of the signal within the segment is low, merge it with the previous segment
+        if np.var(signal[s:e]) < variance_threshold:  # If the variance of the signal within the segment is low, merge it with the previous segment
             if merged_segs:
                 merged_segs[-1] = (merged_segs[-1][0], e)
             else:
@@ -164,28 +164,22 @@ def _vis_segs_video(primitive_continued, signals, segments, video_id):
 
 ####################### Main functions for signal segmentation and primitive segmentation #######################
 
-def signal2segs(signal):
+def signal2segs(signal, max_run_length=2, variance_threshold=0.001):
     """
     Input: a 1D signal (e.g., ego yaw rate over time)
     
     Output: a list of segments, where each segment is a tuple of (start_index, end_index) 
             indicating the range of frames that belong to the same segment.
     """
-    # normalization
-    signal_normalized = (signal - np.mean(signal)) / (np.std(signal) + 1e-6)
-    
-    # window smoothing
-    signal_smoothed = np.convolve(signal_normalized, np.ones(5)/5, mode='same')
-    
     # signal flip sign 
-    signed_signal = np.sign(np.diff(signal_smoothed))
+    signed_signal = np.sign(np.diff(signal))
     
-    # if a sign flip only last within 4 frames, we consider it as noise and smooth it out
-    smoothed_signed_signal = _smooth_sign_als(signed_signal)
+    # if a sign flip only last within max_run_length frames, we consider it as noise and smooth it out
+    smoothed_signed_signal = _smooth_sign_als(signed_signal, max_run_length=max_run_length)
     
     # each continuous segment with the same sign is a segment.
     # merge the segments if the signal has a low variance within the segment (indicating it's mostly flat and the sign change is just noise)
-    merged_segs = _seg_and_merge(smoothed_signed_signal, signal)
+    merged_segs = _seg_and_merge(smoothed_signed_signal, signal, variance_threshold=variance_threshold)
     
     return merged_segs
 
@@ -221,21 +215,26 @@ def classify_segments(segment_features, yaw_percentile=70, vz_trend_percentile=7
 
 def _pre_steps(vid):
     matrix = percept2matrix(vid, save_matrices_flag=True)
-    _, ego_motion = matrix2primitives(matrix, vid, visualize_ego=True, save_primitives=True)
+    _, ego_motion = matrix2signal(matrix, vid, visualize_ego=True, save_primitives=True)
     ego_w = ego_motion[:, 2]
     ego_vz = ego_motion[:, 1]
     ego_vx = ego_motion[:, 0]
-    return ego_w 
+    return ego_w , ego_vx, ego_vz
 
 
 def main_test():
     vid = config.driving_demo_video_id
     
-    ego_w= _pre_steps(vid)   
+    ego_w, ego_vx, ego_vz = _pre_steps(vid)   
     
-    ego_w_segs = signal2segs(ego_w)
-    
-    _vis_segs(vid,ego_w, ego_w_segs, "ego_w")
+    for variance_threshold in [0.001, 0.002,0.005]:
+        for max_run_length in [1,2,3]:
+            ego_w_segs = signal2segs(ego_w, max_run_length=max_run_length, variance_threshold=variance_threshold)
+            ego_vx_segs = signal2segs(ego_vx, max_run_length=max_run_length, variance_threshold=variance_threshold)
+            ego_vz_segs = signal2segs(ego_vz, max_run_length=max_run_length, variance_threshold=variance_threshold)
+            _vis_segs(vid,ego_w, ego_w_segs, f"ego_w_max_run_length_{max_run_length}_variance_{variance_threshold}")
+            _vis_segs(vid,ego_vx, ego_vx_segs, f"ego_vx_max_run_length_{max_run_length}_variance_{variance_threshold}")
+            _vis_segs(vid,ego_vz, ego_vz_segs, f"ego_vz_max_run_length_{max_run_length}_variance_{variance_threshold}")
 
         
 if __name__ == "__main__":
