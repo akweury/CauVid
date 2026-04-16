@@ -389,6 +389,54 @@ def est_obj_rel_speed(obj_speeds, ego_data):
         obj_speeds_rel[obj_id] = rel_track
     return obj_speeds_rel
 
+def percept2obj_dist_rank_and_bboxes(video_id, obj_matrix, depth_maps, frames_data):
+    """For each object, compute its distance rank among all tracked objects per frame
+    (rank 1 = closest to ego), and return the per-frame bboxes.
+
+    Returns
+    -------
+    obj_ranks : dict  {obj_id: list[int]}
+        Length == num_frames; -1 where the object is absent, otherwise 1-based
+        rank (1 = closest, 2 = second-closest, …).
+    obj_bboxes : dict  {obj_id: {fi: list}}
+        Sparse dict of frame_index → bbox for each object.
+    """
+    num_frames = len(frames_data)
+
+    # ── pass 1: collect raw z-depth and bboxes per object per frame ──────────
+    obj_depths  = {}   # {obj_id: {fi: float}}
+    obj_bboxes  = {}   # {obj_id: {fi: list}}
+    for obj_id, data in obj_matrix.items():
+        positions     = data["position"]
+        frame_indices = data["frame_indices"]
+        bboxes        = data["bboxes"]
+        fi_depth_map  = {}
+        fi_bbox_map   = {}
+        for pos, fi, bb in zip(positions, frame_indices, bboxes):
+            if fi < num_frames:
+                fi_depth_map[fi] = pos[2].item()   # z-coord as proxy for ego distance
+                fi_bbox_map[fi]  = bb.tolist() if hasattr(bb, "tolist") else list(bb)
+        obj_depths[obj_id] = fi_depth_map
+        obj_bboxes[obj_id] = fi_bbox_map
+
+    # ── pass 2: rank objects by depth within each frame ───────────────────────
+    # For each frame, sort present objects by ascending z (smaller z = closer).
+    obj_ranks = {obj_id: [-1] * num_frames for obj_id in obj_matrix}
+    for fi in range(num_frames):
+        present = [(oid, obj_depths[oid][fi])
+                   for oid in obj_depths if fi in obj_depths[oid]]
+        if not present:
+            continue
+        # sort ascending by depth; assign rank 1 to closest
+        present.sort(key=lambda x: x[1])
+        for rank, (oid, _) in enumerate(present, start=1):
+            obj_ranks[oid][fi] = rank
+
+    return obj_ranks, obj_bboxes
+    
+    
+    
+    
 def percept2obj_speed(video_id, obj_matrix, bg_masks, flows, depth_maps, ego_data,
                       min_obj_frames=5, min_bbox_area=400):
     """
@@ -582,6 +630,192 @@ def estimate_obj_x_motion(obj_speeds, motion_cfg):
     return obj_x_motion
 
 
+def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data,
+                         fps=5, output_dir=None):
+    """
+    Produce a single MP4 showing every frame with ALL tracked objects annotated.
+
+    Per frame:
+      - Rank-1 (closest) object: bright-green bbox, thicker border, "Rank #1" label
+      - All other present objects: cyan-yellow bbox, normal border, "Rank #N | <label>" label
+      - Above every object bbox: object motion-mask state, e.g. "Rel: Approaching | Left"
+      - Bottom-left: ego motion overlay (Moving/Stopped, Straight/Turning)
+
+    Output: *output_dir*/<video_id>_full_scene.mp4
+    """
+    import pathlib
+
+    obj_bboxes = obj_motion_data.get("obj_bboxes", {})
+    obj_ranks  = obj_motion_data.get("obj_ranks",  {})
+    obj_z_motion_rel_mask = obj_motion_data.get("mask_o_vz_rel")
+    obj_x_motion_rel_mask = obj_motion_data.get("mask_o_vx_rel")
+    obj_z_motion_abs_mask = obj_motion_data.get("mask_o_vz_abs")
+    obj_x_motion_abs_mask = obj_motion_data.get("mask_o_vx_abs")
+
+    _Z_LABEL = {
+        -1: ("Absent",      (80,  80,  80)),
+         0: ("Same Dist.",  (0,  200,   0)),
+         1: ("Approaching", (0,   60, 220)),
+         2: ("Moving Away", (220, 80,   0)),
+    }
+    _X_LABEL = {
+        -1: ("Absent",  (80,  80,  80)),
+         0: ("Stable",  (180, 180,   0)),
+         1: ("Left",    (255, 100, 100)),
+         2: ("Right",   (100, 100, 255)),
+    }
+
+    ego_vx_full      = list(ego_data["vx"])
+    ego_vz_full      = list(ego_data["vz"])
+    num_frames       = len(frames_data)
+    ego_stopped_full = list(ego_data.get("stopped_mask", [False] * num_frames))
+    ego_turn_full    = list(ego_data.get("turn_mask",    [False] * num_frames))
+    for _sig in (ego_vx_full, ego_vz_full, ego_stopped_full, ego_turn_full):
+        if len(_sig) < num_frames:
+            _sig += [_sig[-1]] * (num_frames - len(_sig))
+    ego_stopped_full = [bool(v) for v in ego_stopped_full[:num_frames]]
+    ego_turn_full    = [bool(v) for v in ego_turn_full[:num_frames]]
+
+    # precompute per-object label lookup {obj_id: {fi: label_str}}
+    obj_label_map = {}
+    for fi, frame_data in enumerate(frames_data):
+        obj_ids_fi = frame_data.get("obj_ids", [])
+        labels_fi  = frame_data.get("labels", [])
+        for k, oid in enumerate(obj_ids_fi):
+            if oid not in obj_label_map:
+                obj_label_map[oid] = {}
+            obj_label_map[oid][fi] = labels_fi[k] if k < len(labels_fi) else str(oid)
+
+    if output_dir is None:
+        output_dir = pathlib.Path(config.get_output_path("pipeline_output")) / "obj_speed_vis"
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    first_img     = utils.load_frame(frames_data[0]["frame"])
+    frame_h, frame_w = first_img.shape[:2]
+
+    out_path = output_dir / f"{video_id}_full_scene.mp4"
+    fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
+    writer   = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
+
+    font       = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.7, frame_w / 1000)
+    thickness  = max(2, int(font_scale * 2))
+    pad        = int(10 * font_scale)
+
+    # colour constants
+    _COLOR_RANK1   = (0, 255, 0)        # bright green  – closest object
+    _COLOR_OTHER   = (0, 220, 220)      # cyan-yellow   – all other objects
+    _THICK_RANK1   = thickness * 2
+    _THICK_OTHER   = thickness
+
+    def _motion_text_and_color(oid, fi):
+        """Return a concise object motion-mask row for the full-scene overlay."""
+        prefix = "Rel"
+        z_track = obj_z_motion_rel_mask.get(oid) if obj_z_motion_rel_mask is not None else None
+        x_track = obj_x_motion_rel_mask.get(oid) if obj_x_motion_rel_mask is not None else None
+
+        if z_track is None and x_track is None:
+            prefix = "Abs"
+            z_track = obj_z_motion_abs_mask.get(oid) if obj_z_motion_abs_mask is not None else None
+            x_track = obj_x_motion_abs_mask.get(oid) if obj_x_motion_abs_mask is not None else None
+
+        if z_track is None and x_track is None:
+            return None, (200, 200, 200)
+
+        z_cat = z_track[fi] if z_track is not None and fi < len(z_track) else -1
+        x_cat = x_track[fi] if x_track is not None and fi < len(x_track) else -1
+        z_text, z_color = _Z_LABEL.get(z_cat, ("Unknown", (128, 128, 128)))
+        x_text, x_color = _X_LABEL.get(x_cat, ("Unknown", (128, 128, 128)))
+        mask_color = x_color if x_cat in (1, 2) else z_color
+        return f"{prefix}: {z_text} | {x_text}", mask_color
+
+    def _draw_label_rows(img, x, y_top, rows):
+        row_gap = max(2, int(3 * font_scale))
+        line_sizes = [cv2.getTextSize(text, font, scale, thick) for text, scale, thick, _ in rows]
+        total_h = sum(sz[0][1] + sz[1] for sz in line_sizes) + row_gap * (len(rows) - 1)
+        max_w = max(sz[0][0] for sz in line_sizes)
+
+        text_x = min(max(0, x), max(0, frame_w - max_w - 8))
+        first_baseline = max(y_top - 4, total_h + 4)
+        y_positions = []
+        cursor = first_baseline
+        for idx in range(len(rows) - 1, -1, -1):
+            (_tw, th), baseline = line_sizes[idx]
+            y_positions.insert(0, cursor)
+            cursor -= th + baseline + row_gap
+
+        bg_x1 = max(0, text_x - 4)
+        bg_x2 = min(frame_w, text_x + max_w + 8)
+        bg_y1 = max(0, y_positions[0] - line_sizes[0][0][1] - 3)
+        bg_y2 = min(frame_h, y_positions[-1] + line_sizes[-1][1] + 3)
+        label_ov = img.copy()
+        cv2.rectangle(label_ov, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), cv2.FILLED)
+        cv2.addWeighted(label_ov, 0.4, img, 0.6, 0, img)
+
+        for (text, scale, thick, color), y_pos in zip(rows, y_positions):
+            cv2.putText(img, text, (text_x, y_pos), font, scale, color, thick, cv2.LINE_AA)
+
+    for fi, frame_data in enumerate(frames_data):
+        frame_img = utils.load_frame(frame_data["frame"])
+        if frame_img.shape[0] != frame_h or frame_img.shape[1] != frame_w:
+            frame_img = cv2.resize(frame_img, (frame_w, frame_h))
+        frame_bgr = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+
+        # ── draw all tracked objects ──────────────────────────────────────────
+        for oid, fi_bbox_map in obj_bboxes.items():
+            bb = fi_bbox_map.get(fi)
+            if bb is None:
+                continue
+            bb = bb.tolist() if hasattr(bb, "tolist") else list(bb)
+            ox1, oy1, ox2, oy2 = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+
+            rank_track = obj_ranks.get(oid, [])
+            rank_val   = rank_track[fi] if fi < len(rank_track) else -1
+
+            is_closest = (rank_val == 1)
+            color      = _COLOR_RANK1 if is_closest else _COLOR_OTHER
+            bthick     = _THICK_RANK1 if is_closest else _THICK_OTHER
+
+            cv2.rectangle(frame_bgr, (ox1, oy1), (ox2, oy2), color, bthick)
+
+            rank_str  = f"Rank #{rank_val}" if rank_val >= 1 else "Rank: ?"
+            obj_label = obj_label_map.get(oid, {}).get(fi, str(oid))
+            title_str = f"{rank_str} | {obj_label}"
+            motion_str, motion_color = _motion_text_and_color(oid, fi)
+
+            # draw label rows just above the bbox
+            label_rows = [(title_str, font_scale * 0.8, bthick, color)]
+            if motion_str:
+                label_rows.append((motion_str, font_scale * 0.7, _THICK_OTHER, motion_color))
+            _draw_label_rows(frame_bgr, ox1, oy1, label_rows)
+
+        # ── ego state label — bottom-left ─────────────────────────────────────
+        ego_z_text  = "Stopped" if ego_stopped_full[fi] else "Moving"
+        ego_z_color = (255, 165, 0)   if ego_stopped_full[fi] else (200, 200, 200)
+        ego_x_text  = "Turning" if ego_turn_full[fi] else "Straight"
+        ego_x_color = (180, 100, 220) if ego_turn_full[fi] else (200, 200, 200)
+
+        e_lines = [("Ego", (255, 255, 255)), (ego_z_text, ego_z_color), (ego_x_text, ego_x_color)]
+        e_sizes = [cv2.getTextSize(t, font, font_scale, thickness) for t, _ in e_lines]
+        ebox_w  = max(sz[0][0] for sz in e_sizes) + 3 * pad
+        ebox_h  = sum(sz[0][1] + sz[1] for sz in e_sizes) + (len(e_lines) + 1) * pad
+        eby0    = frame_h - ebox_h - pad
+        ego_ov  = frame_bgr.copy()
+        cv2.rectangle(ego_ov, (pad, eby0), (pad + ebox_w, eby0 + ebox_h), (0, 0, 0), cv2.FILLED)
+        cv2.addWeighted(ego_ov, 0.45, frame_bgr, 0.55, 0, frame_bgr)
+        ey = eby0
+        for (etxt, ecol), ((_etw, _eth), _ebl) in zip(e_lines, e_sizes):
+            ey += _eth + pad
+            cv2.putText(frame_bgr, etxt, (2 * pad, ey), font, font_scale, ecol, thickness, cv2.LINE_AA)
+            ey += _ebl
+
+        writer.write(frame_bgr)
+
+    writer.release()
+    print(f"Saved full-scene visualization ({num_frames} frames) → {out_path}")
+
+
 def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
                         fps=5, chart_width=10, chart_height=3, output_dir=None):
     """
@@ -622,6 +856,8 @@ def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
     obj_x_motion_abs_mask = obj_motion_data.get("mask_o_vx_abs", None)
     obj_z_motion_rel_mask = obj_motion_data.get("mask_o_vz_rel", None)
     obj_x_motion_rel_mask = obj_motion_data.get("mask_o_vx_rel", None)
+    obj_ranks  = obj_motion_data.get("obj_ranks",  {})
+    obj_bboxes = obj_motion_data.get("obj_bboxes", {})
     
     if output_dir is None:
         output_dir = pathlib.Path(config.get_output_path("pipeline_output")) / "obj_speed_vis"
@@ -846,42 +1082,94 @@ def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
             obj_lbl_font_scale = font_scale * 1.4
             obj_lbl_thickness  = max(2, int(obj_lbl_font_scale * 2))
 
+            # ── compute target bbox area for distance comparison ──────────────
+            target_area = 0.0
+            if fi in info_map:
+                _tb = info_map[fi][0]
+                _tx1, _ty1, _tx2, _ty2 = int(_tb[0]), int(_tb[1]), int(_tb[2]), int(_tb[3])
+                target_area = max(0, _tx2 - _tx1) * max(0, _ty2 - _ty1)
+
+            # ── draw all other objects with relative-distance color ───────────
+            # Uses obj_bboxes {obj_id: {fi: bbox}} built by percept2obj_dist_rank_and_bboxes.
+            # Larger bbox area → closer than target → red (255,0,0); smaller → farther → gray.
+            for _oid, _fi_bbox_map in obj_bboxes.items():
+                if _oid == obj_id:
+                    continue   # target drawn separately below
+                _bb = _fi_bbox_map.get(fi)
+                if _bb is None:
+                    continue
+                _bb = _bb.tolist() if hasattr(_bb, "tolist") else list(_bb)
+                _ox1, _oy1, _ox2, _oy2 = int(_bb[0]), int(_bb[1]), int(_bb[2]), int(_bb[3])
+                _area = max(0, _ox2 - _ox1) * max(0, _oy2 - _oy1)
+                # closer (larger area) → red; farther (smaller area) → yellow
+                _other_color = (0, 0, 255) if _area > target_area else (0, 220, 220)
+                _other_thickness = thickness * 2
+                cv2.rectangle(frame_bgr, (_ox1, _oy1), (_ox2, _oy2), _other_color, _other_thickness)
+                # rank label above bbox
+                _o_rank_track = obj_ranks.get(_oid, [])
+                _o_rank_val   = _o_rank_track[fi] if fi < len(_o_rank_track) else -1
+                _o_rank_str   = f"Rank #{_o_rank_val}" if _o_rank_val >= 1 else ""
+                # look up label from obj_frame_info
+                _olbl = obj_frame_info.get(_oid, {}).get(fi, (None, ""))[1]
+                # combine rank + label into two rows (rank on top, label below)
+                _label_y = max(_oy1 - 4, 10)
+                if _olbl:
+                    cv2.putText(frame_bgr, _olbl, (_ox1, _label_y),
+                                font, font_scale * 0.7, _other_color, _other_thickness, cv2.LINE_AA)
+                    _label_y = max(_label_y - int(font_scale * 0.7 * 20) - 2, 10)
+                if _o_rank_str:
+                    cv2.putText(frame_bgr, _o_rank_str, (_ox1, _label_y),
+                                font, font_scale * 0.7, _other_color, _other_thickness, cv2.LINE_AA)
+
+            # ── draw target object with green bbox + abs/rel labels above ─────
             if fi in info_map:
                 bbox, lbl = info_map[fi]
                 x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), bbox_color, 2)
+                _target_border = (0, 200, 0)   # green for target
+                cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), _target_border, 2)
 
-                # two label rows above bbox:
-                #   row 1 (higher): abs z + abs x
-                #   row 2 (closer): rel z + rel x
-                abs_row = f"Abs: {z_abs_text} | {x_abs_text}"
-                rel_row = f"Rel: {z_text} | {x_text}"
-                (_aw, _ah), _abl = cv2.getTextSize(abs_row, font, obj_lbl_font_scale, obj_lbl_thickness)
-                (_rw, _rh), _rbl = cv2.getTextSize(rel_row, font, obj_lbl_font_scale, obj_lbl_thickness)
+                # rank of this object among all tracked objects (1 = closest)
+                _rank_track = obj_ranks.get(obj_id, [])
+                _rank_val   = _rank_track[fi] if fi < len(_rank_track) else -1
+                _rank_str   = f"Rank #{_rank_val}" if _rank_val >= 0 else "Rank: ?"
+
+                # three label rows above bbox:
+                #   row 1 (highest): rank
+                #   row 2: abs z + abs x
+                #   row 3 (closest): rel z + rel x
+                rank_row = _rank_str
+                abs_row  = f"Abs: {z_abs_text} | {x_abs_text}"
+                rel_row  = f"Rel: {z_text} | {x_text}"
+                (_nw, _nh), _nbl = cv2.getTextSize(rank_row, font, obj_lbl_font_scale, obj_lbl_thickness)
+                (_aw, _ah), _abl = cv2.getTextSize(abs_row,  font, obj_lbl_font_scale, obj_lbl_thickness)
+                (_rw, _rh), _rbl = cv2.getTextSize(rel_row,  font, obj_lbl_font_scale, obj_lbl_thickness)
                 row_gap = 4
-                total_label_h = _ah + _abl + row_gap + _rh + _rbl
-                rel_y   = max(y1 - 4, total_label_h + 4)
-                abs_y   = rel_y - (_rh + _rbl + row_gap)
+                total_label_h = (_nh + _nbl) + row_gap + (_ah + _abl) + row_gap + (_rh + _rbl)
+                rel_y  = max(y1 - 4, total_label_h + 4)
+                abs_y  = rel_y  - (_rh + _rbl + row_gap)
+                rank_y = abs_y  - (_ah + _abl + row_gap)
 
-                # semi-transparent background behind both rows
+                # semi-transparent background behind all three rows
                 bg_x1 = max(0, x1)
-                bg_x2 = min(frame_w, x1 + max(_aw, _rw) + 8)
-                bg_y1 = max(0, abs_y - _ah - 2)
+                bg_x2 = min(frame_w, x1 + max(_nw, _aw, _rw) + 8)
+                bg_y1 = max(0, rank_y - _nh - 2)
                 bg_y2 = min(frame_h, rel_y + _rbl + 2)
                 lbl_ov = frame_bgr.copy()
                 cv2.rectangle(lbl_ov, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), cv2.FILLED)
                 cv2.addWeighted(lbl_ov, 0.4, frame_bgr, 0.6, 0, frame_bgr)
 
-                cv2.putText(frame_bgr, abs_row, (x1, abs_y),
+                cv2.putText(frame_bgr, rank_row, (x1, rank_y),
+                            font, obj_lbl_font_scale, (0, 200, 0), obj_lbl_thickness, cv2.LINE_AA)
+                cv2.putText(frame_bgr, abs_row,  (x1, abs_y),
                             font, obj_lbl_font_scale, (200, 200, 200), obj_lbl_thickness, cv2.LINE_AA)
-                cv2.putText(frame_bgr, rel_row, (x1, rel_y),
+                cv2.putText(frame_bgr, rel_row,  (x1, rel_y),
                             font, obj_lbl_font_scale, bbox_color, obj_lbl_thickness, cv2.LINE_AA)
             else:
                 overlay = frame_bgr.copy()
                 cv2.rectangle(overlay, (0, 0), (frame_w, frame_h), (40, 40, 40), cv2.FILLED)
                 cv2.addWeighted(overlay, 0.25, frame_bgr, 0.75, 0, frame_bgr)
 
-            # ── ego state label — top-left ────────────────────────────────────
+            # ── ego state label — bottom-left ─────────────────────────────────
             ego_z_text  = "Stopped" if ego_stopped_signal[fi] else "Moving"
             ego_z_color = (255, 165, 0)   if ego_stopped_signal[fi] else (200, 200, 200)
             ego_x_text  = "Turning" if ego_turn_signal[fi] else "Straight"
@@ -891,10 +1179,11 @@ def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
             e_sizes = [cv2.getTextSize(t, font, font_scale, thickness) for t, _ in e_lines]
             ebox_w  = max(sz[0][0] for sz in e_sizes) + 3 * pad
             ebox_h  = sum(sz[0][1] + sz[1] for sz in e_sizes) + (len(e_lines) + 1) * pad
+            eby0    = frame_h - ebox_h - pad   # top of box anchored to bottom
             ego_ov  = frame_bgr.copy()
-            cv2.rectangle(ego_ov, (pad, pad), (pad + ebox_w, pad + ebox_h), (0, 0, 0), cv2.FILLED)
+            cv2.rectangle(ego_ov, (pad, eby0), (pad + ebox_w, eby0 + ebox_h), (0, 0, 0), cv2.FILLED)
             cv2.addWeighted(ego_ov, 0.45, frame_bgr, 0.55, 0, frame_bgr)
-            ey = pad
+            ey = eby0
             for (etxt, ecol), ((_etw, _eth), _ebl) in zip(e_lines, e_sizes):
                 ey += _eth + pad
                 cv2.putText(frame_bgr, etxt, (2 * pad, ey), font, font_scale, ecol, thickness, cv2.LINE_AA)
@@ -1423,21 +1712,26 @@ def est_obj_motion_mask(obj_matrix, video_id, motion_cfg, vis_cfg, frames_data, 
     
     obj_speeds = percept2obj_speed(video_id, obj_matrix, bg_masks, flows, depth_maps, ego_data,
                                    min_obj_frames=min_obj_frames, min_bbox_area=min_bbox_area)
+    obj_ranks, obj_bboxes = percept2obj_dist_rank_and_bboxes(video_id, obj_matrix, depth_maps, frames_data)
     mask_o_vz_abs = estimate_obj_z_motion(obj_speeds, motion_cfg)
     mask_o_vx_abs = estimate_obj_x_motion(obj_speeds, motion_cfg)    
     obj_speeds_rel = est_obj_rel_speed(obj_speeds, ego_data)
     mask_o_vz_rel = estimate_obj_z_motion(obj_speeds_rel, motion_cfg)
     mask_o_vx_rel = estimate_obj_x_motion(obj_speeds_rel, motion_cfg)
     
+    # also rank the objects by their distance to the ego
+    
     obj_motion_data = {
         "obj_speeds": obj_speeds,
+        "obj_ranks": obj_ranks,
+        "obj_bboxes": obj_bboxes,
         "obj_speeds_rel": obj_speeds_rel,
         "mask_o_vz_abs": mask_o_vz_abs,
         "mask_o_vx_abs": mask_o_vx_abs,
         "mask_o_vz_rel": mask_o_vz_rel,
         "mask_o_vx_rel": mask_o_vx_rel,
     }
-    
+    visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data)
     visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data, **vis_cfg)
     return mask_o_vz_rel, obj_speeds_rel
     
@@ -1505,7 +1799,64 @@ def merge_segs(stopped_mask, turn_mask):
             
     
     return merged_mask
+def rank_objects_by_distance(obj_matrix, depth_maps, frames_data):
+    """
+    Rank objects by their median distance to the ego across all observed frames.
 
+    Parameters
+    ----------
+    obj_matrix : dict
+        {obj_id: {"label": str,
+                  "position":     list[Tensor(3,)],
+                  "frames":       list[str],
+                  "bboxes":       list,
+                  "frame_indices": list[int]}}
+    depth_maps : list of str
+        File paths to per-frame depth maps, aligned to frame indices.
+    frames_data : list of dict
+        As returned by raw2frame_data — one dict per frame with a "frame" key.
+
+    Returns
+    -------
+    dict  — same structure as input obj_matrix but with an added "distance_rank" key
+            for each object, where 0 = closest object by median distance, 1 = second closest, etc.
+    """
+    ranked = {}
+    for obj_id, data in obj_matrix.items():
+        positions     = data["position"]
+        frames        = data["frames"]
+        bboxes        = data["bboxes"]
+        frame_indices = data["frame_indices"]
+        label         = data["label"]
+
+        distances = []
+        for pos, fi in zip(positions, frame_indices):
+            depth_map_path = depth_maps[fi]
+            depth_map = utils.load_depth_npz(depth_map_path)
+            x, y, z = pos.tolist() if hasattr(pos, "tolist") else list(pos)
+            # guard against out-of-bounds coordinates
+            h, w = depth_map.shape
+            px = min(max(int(round(x)), 0), w - 1)
+            py = min(max(int(round(y)), 0), h - 1)
+            distance = float(depth_map[py, px])
+            distances.append(distance)
+
+        median_distance = np.median(distances) if distances else float("inf")
+        ranked[obj_id] = {
+            "label": label,
+            "position": positions,
+            "frames": frames,
+            "bboxes": bboxes,
+            "frame_indices": frame_indices,
+            "median_distance": median_distance,
+        }
+
+    # assign distance ranks (0=closest)
+    sorted_objs = sorted(ranked.items(), key=lambda item: item[1]["median_distance"])
+    for rank, (obj_id, data) in enumerate(sorted_objs):
+        ranked[obj_id]["distance_rank"] = rank
+
+    return ranked
 
 def filter_obj_matrix(obj_matrix, min_obj_frames=5, min_bbox_area=400):
     """
@@ -1618,6 +1969,7 @@ def main():
     print(f"Estimating Other mask for video: {video_id}")
     obj_matrix = percept2matrix(frames_data, video_id)
     obj_matrix_filtered = filter_obj_matrix(obj_matrix, motion_cfg["min_obj_frames"], motion_cfg["min_bbox_area"])
+    obj_matrix_ranked = rank_objects_by_distance(obj_matrix_filtered, depth_maps, frames_data)
     # need to segment objects into driving/turning/stopped based on the ego mask
     ego_data = {
         "vx": ego_motion[0],
@@ -1625,7 +1977,7 @@ def main():
         "stopped_mask": stopped_mask,
         "turn_mask": turn_mask,
     }
-    obj_stopped_mask, obj_speeds = est_obj_motion_mask(obj_matrix_filtered, video_id, motion_cfg, vis_cfg, frames_data, bg_masks, flows, depth_maps, ego_data)
+    obj_stopped_mask, obj_speeds = est_obj_motion_mask(obj_matrix_ranked, video_id, motion_cfg, vis_cfg, frames_data, bg_masks, flows, depth_maps, ego_data)
     
     
 if __name__ == "__main__":
