@@ -281,22 +281,15 @@ def trajectory_with_frames_visual(matrices, smooth_matrices, input_data, output_
         imageio.mimsave(gif_path, visual_frames, fps=2)
         print(f"Saved trajectory gif for Object {obj_id} ({label}): {gif_path}")
 
-def save_matrices(matrices, output_path, video_id=None):
+def save_matrices(matrices, output_path):
     """
     Save the smoothed object matrices to a file for later use.
 
     Parameters:
     matrices (dict): A dictionary containing smoothed object matrices.
     output_path (Path): Path to the file where matrices will be saved.
-    """
-    os.makedirs(output_path, exist_ok=True)
-    
-    import pickle
-    
-    if video_id is None:
-        ouput_file = output_path / f"smoothed_object_matrices_{config.driving_demo_video_id}.pkl"
-    else:
-        ouput_file = output_path / f"smoothed_object_matrices_{video_id}.pkl"
+    """    
+    ouput_file = output_path / f"smoothed_object_matrices.pkl"
     with open(ouput_file, 'wb') as f:
         pickle.dump(matrices, f)
     
@@ -305,7 +298,8 @@ def save_matrices(matrices, output_path, video_id=None):
 
 def percept2matrix(frames_data,video_id):
     # load the matrix if it already exists
-    matrix_file = config.get_output_path("pipeline_output") / f"smoothed_object_matrices_{video_id}.pkl"
+    out_path = get_out_path(video_id)
+    matrix_file = out_path / f"smoothed_object_matrices.pkl"
     if matrix_file.exists():
         print(f"Matrix file already exists for video {video_id}, loading from file: {matrix_file}")
         smoothed_matrices = utils.load_matrix(matrix_file)  # This will print the loaded matrix for debugging
@@ -313,7 +307,7 @@ def percept2matrix(frames_data,video_id):
         obj_matrices = raw2obj_matrix(frames_data, video_id)     
         smoothed_matrices = smooth_matrices(obj_matrices)
         # save the smoothed_matrices for later use
-        save_matrices(smoothed_matrices, config.get_output_path("pipeline_output"), video_id)
+        save_matrices(smoothed_matrices, out_path)
         if len(smoothed_matrices)==0:
             print("No valid object matrices found after filtering. Skipping visualization.")
             return smoothed_matrices
@@ -630,7 +624,7 @@ def estimate_obj_x_motion(obj_speeds, motion_cfg):
     return obj_x_motion
 
 
-def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data,
+def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data, out_path,
                          fps=5, output_dir=None):
     """
     Produce a single MP4 showing every frame with ALL tracked objects annotated.
@@ -641,8 +635,15 @@ def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data,
       - Above every object bbox: object motion-mask state, e.g. "Rel: Approaching | Left"
       - Bottom-left: ego motion overlay (Moving/Stopped, Straight/Turning)
 
-    Output: *output_dir*/<video_id>_full_scene.mp4
+    Output: *out_path*/full_scene.mp4
     """
+    out_file = out_path / f"full_scene.mp4"
+    # if video is exist then return
+    if out_file.exists():
+        print(f"Full-scene video already exists for video {video_id}, skipping generation: {out_file}")
+        return
+    
+    
     import pathlib
 
     obj_bboxes = obj_motion_data.get("obj_bboxes", {})
@@ -686,17 +687,14 @@ def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data,
                 obj_label_map[oid] = {}
             obj_label_map[oid][fi] = labels_fi[k] if k < len(labels_fi) else str(oid)
 
-    if output_dir is None:
-        output_dir = pathlib.Path(config.get_output_path("pipeline_output")) / "obj_speed_vis"
-    output_dir = pathlib.Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+
 
     first_img     = utils.load_frame(frames_data[0]["frame"])
     frame_h, frame_w = first_img.shape[:2]
 
-    out_path = output_dir / f"{video_id}_full_scene.mp4"
+    
     fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
-    writer   = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_w, frame_h))
+    writer   = cv2.VideoWriter(str(out_file), fourcc, fps, (frame_w, frame_h))
 
     font       = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = max(0.7, frame_w / 1000)
@@ -813,7 +811,7 @@ def visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data,
         writer.write(frame_bgr)
 
     writer.release()
-    print(f"Saved full-scene visualization ({num_frames} frames) → {out_path}")
+    print(f"Saved full-scene visualization ({num_frames} frames) → {out_file}")
 
 
 def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
@@ -1060,12 +1058,75 @@ def visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data,
         thickness  = max(2, int(font_scale * 2))
         pad        = int(10 * font_scale)
 
+        def _draw_frame_axes(img):
+            axis_len = max(36, int(min(frame_w, frame_h) * 0.08))
+            origin_x = pad * 2
+            origin_y = pad * 2
+            label_scale = max(0.45, font_scale * 0.65)
+            label_thickness = max(1, thickness - 1)
+            axis_thickness = max(2, thickness)
+            x_color = (255, 220, 80)
+            z_color = (80, 220, 255)
+
+            box_pad = max(6, pad // 2)
+            box_x2 = origin_x + axis_len + int(24 * label_scale) + box_pad
+            box_y2 = origin_y + axis_len + int(18 * label_scale) + box_pad
+            axes_ov = img.copy()
+            cv2.rectangle(
+                axes_ov,
+                (max(0, origin_x - box_pad), max(0, origin_y - box_pad)),
+                (min(frame_w, box_x2), min(frame_h, box_y2)),
+                (0, 0, 0),
+                cv2.FILLED,
+            )
+            cv2.addWeighted(axes_ov, 0.35, img, 0.65, 0, img)
+
+            cv2.arrowedLine(
+                img,
+                (origin_x, origin_y),
+                (origin_x + axis_len, origin_y),
+                x_color,
+                axis_thickness,
+                cv2.LINE_AA,
+                tipLength=0.25,
+            )
+            cv2.arrowedLine(
+                img,
+                (origin_x, origin_y),
+                (origin_x, origin_y + axis_len),
+                z_color,
+                axis_thickness,
+                cv2.LINE_AA,
+                tipLength=0.25,
+            )
+            cv2.putText(
+                img,
+                "x",
+                (origin_x + axis_len + box_pad // 2, origin_y + int(5 * label_scale)),
+                font,
+                label_scale,
+                x_color,
+                label_thickness,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                img,
+                "z",
+                (origin_x - int(5 * label_scale), origin_y + axis_len + int(14 * label_scale)),
+                font,
+                label_scale,
+                z_color,
+                label_thickness,
+                cv2.LINE_AA,
+            )
+
         for fi, frame_data in enumerate(frames_data[:active_frames]):
             frame_img = utils.load_frame(frame_data["frame"])
             if frame_img.shape[0] != frame_h or frame_img.shape[1] != frame_w:
                 frame_img = cv2.resize(frame_img, (frame_w, frame_h))
 
             frame_bgr = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+            _draw_frame_axes(frame_bgr)
             s = speed_track[fi]
 
             z_cat = z_track[fi] if z_track is not None else (0 if not is_absent(s) else -1)
@@ -1702,46 +1763,67 @@ def visualize_ego_rotation(frames_data, ego_rotations, video_id,
     print(f"Saved ego rotation visualization ({num_frames} frames) → {out_path}")
     return out_path
 
-def est_obj_motion_mask(obj_matrix, video_id, motion_cfg, vis_cfg, frames_data, bg_masks, flows, depth_maps, ego_data):
-    # print all obj id
-    for obj_id in obj_matrix:
-        print(f"Object ID: {obj_id}")
+def est_obj_motion_data(obj_matrix, video_id, motion_cfg, vis_cfg, 
+                        frames_data, bg_masks, flows, depth_maps, ego_data):
+    
+    out_path = motion_cfg.get("out_path", get_out_path(video_id))
+    
+    obj_motion_data_file = out_path / f"obj_motion_data.npz"
+    if obj_motion_data_file.exists():
+        print(f"Object motion data file already exists for video {video_id}, loading from file: {obj_motion_data_file}")
+        loaded = np.load(obj_motion_data_file, allow_pickle=True)
+        obj_motion_data = {k: loaded[k].item() for k in loaded.files}
+        return obj_motion_data
+    else:
+        # print all obj id
+        for obj_id in obj_matrix:
+            print(f"Object ID: {obj_id}")
 
-    min_obj_frames = motion_cfg.get("min_obj_frames", 10)
-    min_bbox_area  = motion_cfg.get("min_bbox_area",  400)
+        min_obj_frames = motion_cfg.get("min_obj_frames", 10)
+        min_bbox_area  = motion_cfg.get("min_bbox_area",  400)
+        
+        obj_speeds = percept2obj_speed(video_id, obj_matrix, bg_masks, flows, depth_maps, ego_data,
+                                    min_obj_frames=min_obj_frames, min_bbox_area=min_bbox_area)
+        obj_ranks, obj_bboxes = percept2obj_dist_rank_and_bboxes(video_id, obj_matrix, depth_maps, frames_data)
+        mask_o_vz_abs = estimate_obj_z_motion(obj_speeds, motion_cfg)
+        mask_o_vx_abs = estimate_obj_x_motion(obj_speeds, motion_cfg)    
+        obj_speeds_rel = est_obj_rel_speed(obj_speeds, ego_data)
+        mask_o_vz_rel = estimate_obj_z_motion(obj_speeds_rel, motion_cfg)
+        mask_o_vx_rel = estimate_obj_x_motion(obj_speeds_rel, motion_cfg)
+        
+        # also rank the objects by their distance to the ego
+        
+        obj_motion_data = {
+            "obj_speeds": obj_speeds,
+            "obj_ranks": obj_ranks,
+            "obj_bboxes": obj_bboxes,
+            "obj_speeds_rel": obj_speeds_rel,
+            "mask_o_vz_abs": mask_o_vz_abs,
+            "mask_o_vx_abs": mask_o_vx_abs,
+            "mask_o_vz_rel": mask_o_vz_rel,
+            "mask_o_vx_rel": mask_o_vx_rel,
+        }
+        visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data, out_path)
+        # visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data, **vis_cfg)
+        
+        # save the object motion data for later use
+        np.savez(obj_motion_data_file, **obj_motion_data)    
+        print(f"Saved object motion data for video {video_id} → {obj_motion_data_file}")
+    return obj_motion_data
     
-    obj_speeds = percept2obj_speed(video_id, obj_matrix, bg_masks, flows, depth_maps, ego_data,
-                                   min_obj_frames=min_obj_frames, min_bbox_area=min_bbox_area)
-    obj_ranks, obj_bboxes = percept2obj_dist_rank_and_bboxes(video_id, obj_matrix, depth_maps, frames_data)
-    mask_o_vz_abs = estimate_obj_z_motion(obj_speeds, motion_cfg)
-    mask_o_vx_abs = estimate_obj_x_motion(obj_speeds, motion_cfg)    
-    obj_speeds_rel = est_obj_rel_speed(obj_speeds, ego_data)
-    mask_o_vz_rel = estimate_obj_z_motion(obj_speeds_rel, motion_cfg)
-    mask_o_vx_rel = estimate_obj_x_motion(obj_speeds_rel, motion_cfg)
-    
-    # also rank the objects by their distance to the ego
-    
-    obj_motion_data = {
-        "obj_speeds": obj_speeds,
-        "obj_ranks": obj_ranks,
-        "obj_bboxes": obj_bboxes,
-        "obj_speeds_rel": obj_speeds_rel,
-        "mask_o_vz_abs": mask_o_vz_abs,
-        "mask_o_vx_abs": mask_o_vx_abs,
-        "mask_o_vz_rel": mask_o_vz_rel,
-        "mask_o_vx_rel": mask_o_vx_rel,
-    }
-    visualize_full_scene(frames_data, video_id, ego_data, obj_motion_data)
-    visualize_obj_speed(frames_data, video_id, ego_data, obj_motion_data, **vis_cfg)
-    return mask_o_vz_rel, obj_speeds_rel
-    
+def get_out_path(video_id):
+    out_path = config.get_output_path("pipeline_output") / f"{video_id}"
+    out_path.mkdir(parents=True, exist_ok=True)
+    return out_path
+
 
 def est_motion_mask(video_id,frames_data, bg_masks,flows,depth_maps, motion_cfg, vis_cfg):
+    out_path = get_out_path(video_id)
+    stop_mask_file = out_path / f"stop_mask.npy"
+    turnning_mask_file = out_path / f"turning_mask.npy"
+    ego_x_speeds_file = out_path / f"ego_x_speeds.npy"
+    ego_z_speeds_file = out_path / f"ego_z_speeds.npy"
     
-    stop_mask_file = config.get_output_path("pipeline_output") / f"{video_id}_stop_mask.npy"
-    ego_x_speeds_file = config.get_output_path("pipeline_output") / f"{video_id}_ego_x_speeds.npy"
-    ego_z_speeds_file = config.get_output_path("pipeline_output") / f"{video_id}_ego_z_speeds.npy"
-    turnning_mask_file = config.get_output_path("pipeline_output") / f"{video_id}_turning_mask.npy"
     if stop_mask_file.exists() and ego_x_speeds_file.exists() and ego_z_speeds_file.exists() and turnning_mask_file.exists():
         print(f"Stop mask file already exists for video {video_id}, loading from file: {stop_mask_file}")
         stopped_mask = np.load(stop_mask_file)
@@ -1858,7 +1940,7 @@ def rank_objects_by_distance(obj_matrix, depth_maps, frames_data):
 
     return ranked
 
-def filter_obj_matrix(obj_matrix, min_obj_frames=5, min_bbox_area=400):
+def filter_obj_matrix(obj_matrix, motion_cfg):
     """
     Filter an object matrix, keeping only objects with sufficient observations
     and reasonably sized bounding boxes.
@@ -1887,7 +1969,11 @@ def filter_obj_matrix(obj_matrix, min_obj_frames=5, min_bbox_area=400):
     -------
     dict  — filtered subset of obj_matrix with the same structure.
     """
-    filtered_file = config.get_output_path("pipeline_output") / f"filtered_obj_matrix_minframes{min_obj_frames}_minarea{min_bbox_area}.pkl"
+    out_path = motion_cfg.get("out_path", config.get_output_path("pipeline_output"))
+    min_obj_frames = motion_cfg.get("min_obj_frames", 5)
+    min_bbox_area = motion_cfg.get("min_bbox_area", 400)
+    
+    filtered_file = out_path / f"filtered_obj_matrix_minframes{min_obj_frames}_minarea{min_bbox_area}.pkl"
     if filtered_file.exists():
         print(f"Filtered object matrix file already exists, loading from file: {filtered_file}")
         with open(filtered_file, "rb") as f:
@@ -1936,7 +2022,7 @@ def filter_obj_matrix(obj_matrix, min_obj_frames=5, min_bbox_area=400):
 
 def main():
     video_id = config.get_mini_video_ids()[0]
-
+    out_path = get_out_path(video_id)
     motion_cfg = {
         "save_flow":         True,
         "smooth_window":     5,
@@ -1951,24 +2037,25 @@ def main():
         "left_threshold":     50,  # vx < -this → moving left
         "right_threshold":    50,  # vx >  this  → moving right
         "min_run_duration":   3,   # min consecutive frames to keep approach/away/left/right label
+        "out_path":          out_path,
     }
 
     vis_cfg = {
         "fps":          5,
         "chart_width":  10,
         "chart_height": 3,
-        "output_dir":   None,   # None → pipeline_output/ego_speed_vis/
+        "output_dir":   out_path
     }
 
     
     print(f"Estimating Ego mask for video: {video_id}")
-    frames_data, bg_masks, depth_maps, flows = utils.load_video_data(video_id)
-    stopped_mask,turn_mask, ego_motion = est_motion_mask(video_id, frames_data, bg_masks,flows, depth_maps, motion_cfg, vis_cfg)
     
-        
+    frames_data, bg_masks, depth_maps, flows = utils.load_video_data(out_path, video_id)
+    stopped_mask,turn_mask, ego_motion = est_motion_mask(video_id, frames_data, bg_masks,flows, depth_maps, motion_cfg, vis_cfg)
+
     print(f"Estimating Other mask for video: {video_id}")
     obj_matrix = percept2matrix(frames_data, video_id)
-    obj_matrix_filtered = filter_obj_matrix(obj_matrix, motion_cfg["min_obj_frames"], motion_cfg["min_bbox_area"])
+    obj_matrix_filtered = filter_obj_matrix(obj_matrix, motion_cfg)
     obj_matrix_ranked = rank_objects_by_distance(obj_matrix_filtered, depth_maps, frames_data)
     # need to segment objects into driving/turning/stopped based on the ego mask
     ego_data = {
@@ -1977,9 +2064,11 @@ def main():
         "stopped_mask": stopped_mask,
         "turn_mask": turn_mask,
     }
-    obj_stopped_mask, obj_speeds = est_obj_motion_mask(obj_matrix_ranked, video_id, motion_cfg, vis_cfg, frames_data, bg_masks, flows, depth_maps, ego_data)
+    obj_motion_data = est_obj_motion_data(obj_matrix_ranked, video_id, motion_cfg, vis_cfg, frames_data, bg_masks, flows, depth_maps, ego_data)
     
+    
+    print(f"Finished processing video {video_id}. Output saved to {out_path}")
     
 if __name__ == "__main__":
     main()
- 
+    

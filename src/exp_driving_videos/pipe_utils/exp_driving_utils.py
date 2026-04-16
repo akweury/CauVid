@@ -789,9 +789,9 @@ def extract_flow(frames_data, video_id=None):
         np.save(flow_file, flows)
     return flows
 
-def load_video_data(video_id):
+def load_video_data(out_path, video_id):
     
-    video_data_file = config.get_output_path("pipeline_output") / f"video_data_{video_id}.pkl"
+    video_data_file = out_path / f"video_data.pkl"
     if video_data_file.exists():
         print(f"Loading cached video data: {video_data_file}")
         video_data = load_matrix(video_data_file)
