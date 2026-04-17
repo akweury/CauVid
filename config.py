@@ -50,6 +50,11 @@ MODEL_PATHS = {
     "depth_anything": PROJECT_ROOT / "external" / "Depth-Anything-3",
 }
 
+# Config file paths
+CONFIG_PATHS = {
+    "pattern_mining": PROJECT_ROOT / "configs" / "pattern_mining" / "default.yaml",
+}
+
 def get_dataset_path(dataset_name: str) -> Path:
     """
     Get dataset path by name
@@ -86,6 +91,23 @@ def get_output_path(output_name: str) -> Path:
     os.makedirs(OUTPUT_PATHS[output_name], exist_ok=True)  # Ensure the output directory exists
     return OUTPUT_PATHS[output_name]
 
+def get_config_path(config_name: str) -> Path:
+    """
+    Get config file path by name.
+    
+    Args:
+        config_name: Name of the config file entry (e.g., 'pattern_mining')
+    
+    Returns:
+        Path object to the config file
+        
+    Raises:
+        KeyError: If config_name is not found in configuration
+    """
+    if config_name not in CONFIG_PATHS:
+        raise KeyError(f"Config '{config_name}' not found. Available configs: {list(CONFIG_PATHS.keys())}")
+    return CONFIG_PATHS[config_name]
+
 def ensure_directories():
     """Create all configured directories if they don't exist"""
     all_paths = {**DATASET_PATHS, **OUTPUT_PATHS, **MODEL_PATHS}
@@ -107,7 +129,6 @@ if __name__ == "__main__":
     print(f"Project root: {PROJECT_ROOT}")
     for name, path in DATASET_PATHS.items():
         print(f"  {name}: {path}")
-
 
 
 

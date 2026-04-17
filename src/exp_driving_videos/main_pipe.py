@@ -2,7 +2,7 @@
 
 from exp_driving_videos.pipe_utils.matrix2signal import matrix2signal
 from exp_driving_videos.pipe_utils.signal2segs import signal2segs
-from exp_driving_videos.pipe_utils.percept2matrix import percept2matrix
+from exp_driving_videos.pipe_utils.percept2matrix import raw2objs
 import config 
 
 
@@ -20,7 +20,7 @@ def main():
         print(f"Processing video: {vid}")
         
         # time series position matrix
-        matrix = percept2matrix(vid, save_matrices_flag=True)
+        matrix = raw2objs(vid, save_matrices_flag=True)
         # convert the position matrix to primitive signals
         prims, ego_motion = matrix2signal(matrix, vid, visualize_ego=True, save_primitives=True)
         

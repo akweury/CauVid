@@ -1,13 +1,109 @@
 import os
+from copy import deepcopy
+from pathlib import Path
 
-import torch 
 import numpy as np 
-import cv2 
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from tqdm import tqdm
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
+try:
+    import cv2
+except ModuleNotFoundError:
+    cv2 = None
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+except ModuleNotFoundError:
+    plt = None
+    mpatches = None
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:
+    tqdm = lambda iterable, *args, **kwargs: iterable
 
 import config
+
+
+def merge_cfg(base, override):
+    cfg = deepcopy(base)
+    if not override:
+        return cfg
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(cfg.get(key), dict):
+            cfg[key] = merge_cfg(cfg[key], value)
+        else:
+            cfg[key] = value
+    return cfg
+
+
+def parse_yaml_scalar(value):
+    if value == "null":
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value.startswith("[") and value.endswith("]"):
+        items = value[1:-1].strip()
+        if not items:
+            return []
+        return [parse_yaml_scalar(item.strip()) for item in items.split(",")]
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value.strip("\"'")
+
+
+def load_simple_yaml_cfg(cfg_path):
+    root = {}
+    stack = [(-1, root)]
+    with open(cfg_path, "r") as f:
+        for raw_line in f:
+            if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+                continue
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            key, sep, value = raw_line.strip().partition(":")
+            if not sep:
+                continue
+            while stack and indent <= stack[-1][0]:
+                stack.pop()
+            parent = stack[-1][1]
+            value = value.strip()
+            if value == "":
+                child = {}
+                parent[key] = child
+                stack.append((indent, child))
+            else:
+                parent[key] = parse_yaml_scalar(value)
+    return root
+
+
+def load_pattern_cfg_file(cfg_path):
+    try:
+        from omegaconf import OmegaConf
+
+        loaded = OmegaConf.load(cfg_path)
+        return OmegaConf.to_container(loaded, resolve=True) or {}
+    except ModuleNotFoundError:
+        try:
+            import yaml
+
+            with open(cfg_path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except ModuleNotFoundError:
+            return load_simple_yaml_cfg(cfg_path)
+
+
+def get_pattern_cfg(cfg=None):
+    base_cfg = load_pattern_cfg_file(config.get_config_path("pattern_mining"))
+    if isinstance(cfg, (str, Path)):
+        cfg = load_pattern_cfg_file(cfg)
+    return merge_cfg(base_cfg, cfg or {})
 
 def load_video_frames(frame_path):
     """
@@ -795,7 +891,7 @@ def load_video_data(out_path, video_id):
     if video_data_file.exists():
         print(f"Loading cached video data: {video_data_file}")
         video_data = load_matrix(video_data_file)
-        return video_data['frames_data'], video_data['bg_masks'], video_data['depth_maps'], video_data['flows']
+        return video_data
     else:
         input_data  = load_driving_mini_inputs(video_id)
         frames_data = raw2frame_data(input_data, video_id)
@@ -809,7 +905,7 @@ def load_video_data(out_path, video_id):
             'flows': flows
         }
         save_pkl_file(video_data_file, video_data)
-    return frames_data, bg_mask, depth_maps, flows
+    return video_data
     
 def estimate_obj_velo(flow, depth_map_file, bg_mask, bbox, ego_vx, ego_vz):
     x1, y1, x2, y2 = bbox

@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 import config 
 from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
-from src.exp_driving_videos.pipe_utils.percept2matrix import percept2matrix
+from src.exp_driving_videos.pipe_utils.percept2matrix import raw2objs
 from src.exp_driving_videos.pipe_utils.matrix2signal import matrix2signal
 
 
@@ -214,7 +214,7 @@ def classify_segments(segment_features, yaw_percentile=70, vz_trend_percentile=7
     return labels
 
 def _pre_steps(vid):
-    matrix = percept2matrix(vid, save_matrices_flag=True)
+    matrix = raw2objs(vid, save_matrices_flag=True)
     _, ego_motion = matrix2signal(matrix, vid, visualize_ego=True, save_primitives=True)
     ego_w = ego_motion[:, 2]
     ego_vz = ego_motion[:, 1]

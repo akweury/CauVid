@@ -1,0 +1,60 @@
+video_ids: null
+output_root: null
+
+preprocess:
+  enabled: false
+  motion:
+    save_flow: true
+    smooth_window: 5
+    stop_threshold: 10.0
+    min_stop_duration: 3
+    rotation_threshold: 25
+    min_rot_duration: 3
+    min_obj_frames: 10
+    min_bbox_area: 5000
+    approach_threshold: 50
+    away_threshold: 50
+    left_threshold: 50
+    right_threshold: 50
+    min_run_duration: 3
+  visualization:
+    fps: 5
+    chart_width: 10
+    chart_height: 3
+
+predicate:
+  force_recompute: false
+  visualize: true
+  vis_fps: 10
+
+rules:
+  max_lag: 2
+  min_support: 3
+  min_conf: 0.5
+  min_lift: 1.1
+  min_stability: 0.2
+  top_k: 20
+  eps: 1.0e-6
+  output_file: mined_atomic_rules.csv
+
+extended_rules:
+  enabled: false
+  min_support: 5
+  min_confidence: 0.5
+  max_size: 3
+  output_file: mined_extended_rules.csv
+
+rule_vis:
+  enabled: false
+  top_k: 10
+  fps: 10
+  output_dir: null
+
+combine_segments:
+  min_duration: 5
+
+pre_steps:
+  save_matrices_flag: true
+  save_flow_flag: true
+  visualize_ego: true
+  save_primitives: true

@@ -18,40 +18,162 @@ class Config:
     # relative distance change
     REL_EPS = 0.05
     
-    
-    
-    
-    
-    
-def ego_speed_change(segment, cfg=Config()):
-    """
-    segment: a dict
-    """
-    
-    slope = segment["slope"]
-    if slope > cfg.SPEED_ESP:
-        return "speeding_up"
-    elif slope < -cfg.SPEED_ESP:
-        return "slowing_down"
-    else:
-        return "constant_speed"
-    
+def ego_speed_change(ego, eps=1e-2, ratio_th=0.7):
+    vx = ego["speed_x"]
+    vz = ego["speed_z"]
 
-def ego_turn(segment, cfg=Config()):
-    """
-    segment: a dict
-    """
+    speed = np.sqrt(vx**2 + vz**2)
+    diff = np.diff(speed)
     
-    yaw = abs(segment["yaw_mean"])
+    valid = np.abs(diff) > eps
+    if valid.sum() == 0:
+        return "constant_speed", 0.0
+
+    diff = diff[valid]
+
     
-    if yaw < cfg.TURN_WEAK:
-        return "straight"
-    elif yaw < cfg.TURN_STRONG:
-        return "weak_turn"
+    pos_ratio = (diff > 0).mean()
+    neg_ratio = (diff < 0).mean()
+
+    
+    if pos_ratio > ratio_th:
+        label = "speeding_up"
+    elif neg_ratio > ratio_th:
+        label = "slowing_down"
     else:
-        return "strong_turn"
+        label = "constant_speed"
+        
+    confidence = abs(pos_ratio - neg_ratio)
+
+    return label, confidence
+
+def ego_is_moving(ego, eps=0.5, ratio_th = 0.7):
+    stop_mask = ego['stop_mask'] 
+    pos_ratio = (stop_mask==True).mean()
+    neg_ratio = (stop_mask==False).mean()
+    
+    if pos_ratio > ratio_th:
+        label = "stopped"
+    elif neg_ratio > ratio_th:
+        label = "moving"
+    else:
+        label = "uncertain"
+    
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence
+
+    
+def ego_is_turning(ego, eps=0.1, ratio_th=0.7):
+    turn_mask = ego['turn_mask']
+    pos_ratio = (turn_mask==True).mean()
+    neg_ratio = (turn_mask==False).mean()
+    if pos_ratio > ratio_th:
+        label = "turning"
+    elif neg_ratio > ratio_th:
+        label = "not_turning"
+    else:
+        label = "uncertain"
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence
+    
+def compute_focus_score(obj):
+    """ 
+    heuristic scoring function to select interesting objects to focus on for predicate extraction.
+    """
+    proximity = (1.0/(np.array(obj["rank"]) + 1e-6)).mean()
+    
+    vz_rel = np.mean(obj["speeds_rel"][:,1])  # relative speed in z-axis
+    approaching = max(0, -vz_rel)  # only consider approaching speed
+    
+    vx_rel = np.mean(obj["speeds_rel"][:,0])  # relative speed in x-axis
+    rel_speed = abs(vz_rel) + 0.5 * abs(vx_rel)  # weighted sum of relative speeds
+    
+    lateral= abs(vx_rel)
+    
+    moving = np.mean(obj["mask_o_vz_rel"]) > 0.5  # majority of frames show moving towards ego
+    
+    weights = np.array([1.0, 1.0, 0.5, 0.5, 0.5])  # weights for each factor
+    factors = np.array([proximity, approaching, rel_speed, lateral, moving])
+    focus_score = np.dot(weights, factors)
+    
+    return focus_score
+    
+def select_focus_objects(objects, top_k, speed_th=0.5):
+    
+    """ 
+    three kinds of approaches:
+    1. heuristic closest object
+    2. heuristic score
+    3. learnable attention model (e.g., train a small MLP to predict which objects 
+    are most relevant for predicate extraction, 
+    using some proxy labels or self-supervised objectives)
+    """
+    scores = [(compute_focus_score(obj), obj) for obj in objects]
+    scores.sort(reverse=True, key=lambda x: x[0])
+    top_objects = [obj for _, obj in scores[:top_k]]
+    top_scores = [score for score, _ in scores[:top_k]]
+    return top_objects, top_scores
+  
+def obj_is_moving(obj, ratio_th=0.7):
+    
+    pos_ratio = np.mean(obj['mask_o_vz_rel'])
+    neg_ratio = 1 - pos_ratio
+    
+    if pos_ratio > ratio_th:
+        label = "moving"
+    elif neg_ratio > ratio_th:
+        label = "stopped"
+    else:
+        label = "uncertain"
+    
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence  
+   
+def obj_is_turning(obj, ratio_th=0.7):
+    turn_mask = obj['mask_o_vx_rel']
+    pos_ratio = np.mean(turn_mask)
+    neg_ratio = 1 - pos_ratio
+    
+    if pos_ratio > ratio_th:
+        label = "turning"
+    elif neg_ratio > ratio_th:
+        label = "not_turning"
+    else:
+        label = "uncertain"
+    
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence
     
     
+def obj_lateral_motion(obj, ratio_th=0.7):
+    lateral_mask = obj['mask_o_vx_rel']
+    pos_ratio = np.mean(lateral_mask)
+    neg_ratio = 1 - pos_ratio
+    
+    if pos_ratio > ratio_th:
+        label = "lateral_motion"
+    elif neg_ratio > ratio_th:
+        label = "no_lateral_motion"
+    else:
+        label = "uncertain"
+    
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence
+    
+def obj_relative_motion(obj, ratio_th=0.7):
+    vz_rel_mask = obj['mask_o_vz_rel']
+    pos_ratio = np.mean(vz_rel_mask)
+    neg_ratio = 1 - pos_ratio
+    
+    if pos_ratio > ratio_th:
+        label = "approaching"
+    elif neg_ratio > ratio_th:
+        label = "moving_away"
+    else:
+        label = "uncertain"
+    
+    confidence = abs(pos_ratio - neg_ratio)
+    return label, confidence
 # -----------------------------
 # Relative geometry predicates
 # -----------------------------
@@ -79,47 +201,72 @@ def close(obj_pos, cfg=Config()):
 # Relative Motion Predicates
 # ------------------------------
 
-def relative_motion(dz_series, cfg=Config()):
-    """
-    dz_series: a time series of relative distance change in the z-axis (forward-backward)
-    """
-    delta = dz_series[-1] - dz_series[0]
-    
-    if delta > cfg.REL_EPS:
-        return "moving_away (z-axis)"
-    elif delta < -cfg.REL_EPS:
-        return "approaching (z-axis)"
-    else:
-        return "stable (z-axis)"
+def relative_motion(obj):
+    motion, confidence = "unknown", 0.0
+
+    vz_rels = obj["speeds_rel"][:,1].mean()
+    vz_mean = np.mean(vz_rels)
+    raise NotImplementedError("Need to consider lateral motion as well")
+    return motion, confidence
     
     
 # ------------------------------
 # Full Predicate Extraction
 # ------------------------------
 
-def extract_predicates(segment, objects, cfg=Config()):
+def extract_predicates(objects, ego, cfg=Config()):
     """
-    segment: a dict with features fo ego """
+    every predicate is related to a specific time segment
+    """
+    
     predicates = {}
-    
-    
     # ego predicates 
-    predicates["ego_speed_change"] = ego_speed_change(segment,cfg)
-    predicates["ego_turn"] = ego_turn(segment,cfg)
+    predicates["ego_speed_change"] = ego_speed_change(ego)
+    predicates['ego_is_moving'] = ego_is_moving(ego)
+    predicates["ego_is_turning"] = ego_is_turning(ego)
     
-    # object related predicates 
-    obj_preds = []
+    # obj predicates 
+    obj_predicates =[]
     for obj in objects:
-        p = {}
-        if front(obj["position"]):
-            p["front"] = True
-        
-        if close(obj["position"], cfg):
-            p["close"] = True
-        
-        p["relative_motion"] = relative_motion(obj["dz_series"], cfg)
-        
-        obj_preds.append(p)
-    predicates["objects"] = obj_preds
+        obj_predicates.append({
+            "id": obj["id"],
+            "rel_motion": obj_relative_motion(obj),
+            "lateral_motion": obj_lateral_motion(obj),
+            "is_moving": obj_is_moving(obj),
+            "is_turning": obj_is_turning(obj),
+            "rank": np.mean(obj["rank"]),
+        })
     
-    return predicates
+    # focus on interesting objects
+    focus_objs, focus_obj_scores = select_focus_objects(objects, top_k=3)
+    focus_preds = []
+    for obj, score in zip(focus_objs, focus_obj_scores):
+        focus_preds.append({
+            "id": obj["id"],
+            "rel_motion": obj_relative_motion(obj),
+            "lateral_motion": obj_lateral_motion(obj),
+            "is_moving": obj_is_moving(obj),
+            "is_turning": obj_is_turning(obj),
+            "rank": np.mean(obj["rank"]),
+            "score": score,
+        })
+    
+    
+    # global predicates 
+    global_preds = {
+        "any_approach": any(
+            obj_relative_motion(o)[0] == "approaching" for o in objects
+        ),
+        "num_approaching": sum(
+            obj_relative_motion(o)[0] == "approaching" for o in objects
+        )
+    }
+    
+    all_preds= {
+        "ego": predicates,
+        "objects": obj_predicates,
+        "focus_objects": focus_preds,
+        "global": global_preds
+    }
+    
+    return all_preds

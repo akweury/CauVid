@@ -1,818 +1,672 @@
-import os
-from collections import Counter
+from collections import defaultdict
 from itertools import combinations
-
-from blinker import signal
+import json
+import math 
 import numpy as np
-import pandas as pd 
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+import pathlib
 
 import config 
-from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
-from src.exp_driving_videos.pipe_utils.percept2matrix import percept2matrix, percept2ego_speed
-from src.exp_driving_videos.pipe_utils.matrix2signal import matrix2signal
-from src.exp_driving_videos.pipe_utils.signal2segs import signal2segs
-
-from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
 from src.exp_driving_videos.pipe_utils.predicate_vocab import extract_predicates
 
 
-######################## Helper functions for pattern detection ########################
+def _get_pattern_cfg(cfg=None):
+    from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
 
+    return utils.get_pattern_cfg(cfg)
+
+
+######################## Helper functions for pattern detection ########################
+def _extract_ego_per_segs(segments, prim_data):
+    ego_in_segments = []
+    for (start, end, seg_type) in segments:
+        ego_speed_x = prim_data["ego_x_speed"][start:end]
+        ego_speed_z = prim_data["ego_z_speed"][start:end]
+        ego_stop_mask = prim_data["ego_stop_mask"][start:end]
+        ego_turn_mask = prim_data["ego_turn_mask"][start:end]
+    
+        ego_in_segments.append({
+            "start": start,
+            "end": end,
+            "type": seg_type,
+            "speed_x": ego_speed_x,
+            "speed_z": ego_speed_z,
+            "stop_mask": ego_stop_mask,
+            "turn_mask": ego_turn_mask,
+        })
+    return ego_in_segments
+         
 def _extract_objs_per_segs(seg_prims, objects):
     """
     For each segment primitive, collect the objects that are visible within that segment's
     frame range and return per-segment summaries compatible with extract_predicates.
-
-    Parameters
-    ----------
-    seg_prims : list of dict
-        Each dict has at least "start" and "end" (integer frame indices).
-    objects : np.ndarray, shape (num_frames, num_objs), dtype=object
-        Frame-centric object primitives returned by matrix2signal.  Each cell is
-        either None or a dict with keys including 'dx_obj' and 'dz_obj'.
-
-    Returns
-    -------
-    seg_objs : list of list of dict
-        Parallel to seg_prims.  Each inner list contains one dict per object that
-        has at least one valid observation inside the segment.  Each dict has:
-            "position"  : (mean_dx, mean_dz)   – mean relative position over the segment
-            "dz_series" : np.ndarray            – time-ordered dz_obj values in the segment
     """
-    num_objs = objects.shape[1]
-    seg_objs = []
-
-    for prim in seg_prims:
-        start, end = prim["start"], prim["end"]
-        # slice rows for this segment; end is exclusive like Python slices
-        segment_slice = objects[start:end]  # shape: (duration, num_objs)
-
+    
+    # seg_type: 0 normal, 1 stop, 2 turn
+    obj_ids = list(objects['obj_speeds'].keys())
+    objs_in_segments = []
+    for (start, end, seg_type) in seg_prims:
         objs_in_seg = []
-        for obj_id in range(num_objs):
-            obj_cells = segment_slice[:, obj_id]  # one cell per frame in the segment
+        # iterative over objects
+        for obj_id in obj_ids:
+            obj_seg_speed = objects['obj_speeds'][obj_id][start:end]
+            obj_seg_rank = objects['obj_ranks'][obj_id][start:end]
+            obj_seg_speeds_rel = objects['obj_speeds_rel'][obj_id][start:end]
+            obj_seg_mask_o_vz_abs = objects['mask_o_vz_abs'][obj_id][start:end]
+            obj_seg_mask_o_vx_abs = objects['mask_o_vx_abs'][obj_id][start:end]
+            obj_seg_mask_o_vz_rel = objects['mask_o_vz_rel'][obj_id][start:end]
+            obj_seg_mask_o_vx_rel = objects['mask_o_vx_rel'][obj_id][start:end]
 
-            # collect valid cells together with their absolute frame index
-            valid_cells_with_idx = [
-                (start + frame_offset, cell)
-                for frame_offset, cell in enumerate(obj_cells)
-                if cell is not None
-                and cell.get("dx_obj") is not None
-                and cell.get("dz_obj") is not None
-            ]
-
-            if not valid_cells_with_idx:
-                continue
-
-            frame_indices, valid_cells = zip(*valid_cells_with_idx)
-
-            dx_vals = np.array([c["dx_obj"] for c in valid_cells], dtype=float)
-            dz_vals = np.array([c["dz_obj"] for c in valid_cells], dtype=float)
-
-            # most frequent label across visible frames
-            labels = [c["label"] for c in valid_cells if c.get("label") is not None]
-            label = Counter(labels).most_common(1)[0][0] if labels else None
-
-            # per-frame bounding boxes: absolute_frame_index -> bbox
-            frame_bboxes = {
-                fi: c["bbox"]
-                for fi, c in zip(frame_indices, valid_cells)
-                if c.get("bbox") is not None
-            }
-
+            if np.all(obj_seg_speed==-1):
+                continue  # skip objects not visible in this segment
             objs_in_seg.append({
-                "position":    (float(np.mean(dx_vals)), float(np.mean(dz_vals))),
-                "dz_series":   dz_vals,
-                "label":       label,
-                "frame_bboxes": frame_bboxes,
+                "id":         obj_id,
+                "speed":     obj_seg_speed,
+                "rank":      obj_seg_rank,
+                "speeds_rel": obj_seg_speeds_rel,
+                "mask_o_vz_abs": obj_seg_mask_o_vz_abs,
+                "mask_o_vx_abs": obj_seg_mask_o_vx_abs,
+                "mask_o_vz_rel": obj_seg_mask_o_vz_rel,
+                "mask_o_vx_rel": obj_seg_mask_o_vx_rel,
             })
+        objs_in_segments.append(objs_in_seg)
+    return objs_in_segments
 
-        seg_objs.append(objs_in_seg)
+def _gen_atoms(timeline_predicates):
+    
+    # todo: add obj id to the atoms
+    
+    timeline_atoms = []
+    for t in range(len(timeline_predicates)):
+        
+        pred_t = timeline_predicates[t]
+        atoms_t = []
+        # ego
+        for k,v in pred_t['ego'].items():
+            atoms_t.append((k,v[0],t))
+        
+        # focus objects
+        for obj in pred_t['focus_objects']:
+            atoms_t.append(("rel_motion",obj['rel_motion'][0],t))
+        
+        # global
+        for k, v in pred_t['global'].items():
+            atoms_t.append((k,v,t))
+        
+        timeline_atoms.append(atoms_t)
+    return timeline_atoms 
 
-    return seg_objs
-
-
-def _flatten_predicates(pred_dict):
+def _gen_atomic_rules(timeline_atoms, cfg=None):
     """
-    Convert a nested predicate dict (output of extract_predicates) into a flat
-    boolean/categorical record suitable for rule mining.
-
-    Existential quantification over the object list: a flag is True when *any*
-    object in the segment satisfies the condition.  For the nearest-front object
-    specifically, relative-motion is also captured as its own key.
-
-    Parameters
-    ----------
-    pred_dict : dict
-        As returned by extract_predicates:
-        {
-            "ego_speed_change": str,
-            "ego_turn": str,
-            "objects": [ {"front": bool?, "close": bool?, "relative_motion": str}, ... ]
-        }
-
-    Returns
-    -------
-    record : dict
-        Flat key-value pairs, all hashable.
+    
+    output: rules[(P,Q,dt)] = count
+    
     """
-    objects = pred_dict.get("objects", [])
+    def is_trivial_rule(p,q):
+        return p[0]==q[0] and p[1]==q[1]
+    def is_valid_rule(p,q):
+        p_type = p[0]
+        q_type = q[0]
+        
+        # only keep object -> ego
+        if "rel_motion" in p_type and "ego" in q_type:
+            return True
+        return False
+    
+    def is_valid_Q(q):
+        key, value, t = q
+        if key == "ego_speed_change" and value != "constant_speed":
+            return True
+        if key == "ego_is_turning" and value != "not_turning":
+            return True
+        
+        return False
+    
+    def is_informative_P(p):
+        key, value, t = p
+        
+        if key == "rel_motion" and value == "moving_away":
+            return False 
+        
+        return True
+    
+    cfg = _get_pattern_cfg(cfg)
+    max_lag = cfg["rules"]["max_lag"]
 
-    # --- existential flags over all visible objects ---
-    has_front_obj       = any(o.get("front") for o in objects)
-    has_close_obj       = any(o.get("close") for o in objects)
-    has_approaching_obj = any("approaching" in o.get("relative_motion", "") for o in objects)
-    has_moving_away_obj = any("moving_away" in o.get("relative_motion", "") for o in objects)
-    has_front_close_obj = any(o.get("front") and o.get("close") for o in objects)
-    front_obj_approaching = any(
-        o.get("front") and "approaching" in o.get("relative_motion", "") for o in objects
-    )
-    close_obj_approaching = any(
-        o.get("close") and "approaching" in o.get("relative_motion", "") for o in objects
-    )
+    rule_counts = defaultdict(int)
+    P_counts = defaultdict(int)
+    Q_counts = defaultdict(int)
+    
+    T = len(timeline_atoms)
+    for t in range(T):
+        for q in timeline_atoms[t]:
+            Q_counts[q] += 1
+    
+    for t in range(T):
+        P_atoms = timeline_atoms[t]
+        for p in P_atoms:
+            P_counts[p] += 1
+            
+        for dt in range(1, max_lag + 1):
+            if t+dt>=T:
+                continue
+            Q_atoms = timeline_atoms[t+dt]
+            for p in P_atoms:
+                for q in Q_atoms:
+                    rule = (p,q,dt)
+                    if is_trivial_rule(p,q):
+                        continue
+                    if not is_valid_rule(p,q):
+                        continue
+                    if not is_valid_Q(q):
+                        continue
+                    if not is_informative_P(p):
+                        continue
+                    rule_counts[rule] +=1
+    
+    print(f"Atomic rules generated: {len(rule_counts)}")  
+    print(f"Unique P conditions: {len(P_counts)}")
+    print(f"Unique Q conditions: {len(Q_counts)}")      
+    
+    return rule_counts, P_counts, Q_counts
 
-    # --- nearest front object (smallest dz among front objects) ---
-    # objects list doesn't carry raw dz here, so "nearest front" is approximated
-    # as the first front+close object found, falling back to first front object.
-    nearest_front_rel_motion = None
-    front_objs = [o for o in objects if o.get("front")]
-    close_front_objs = [o for o in front_objs if o.get("close")]
-    nearest = (close_front_objs or front_objs)
-    if nearest:
-        nearest_front_rel_motion = nearest[0].get("relative_motion")
-
-    return {
-        # consequent candidates
-        "ego_speed_change":       pred_dict.get("ego_speed_change"),
-        "ego_turn":               pred_dict.get("ego_turn"),
-        # antecedent candidates
-        "has_front_obj":          has_front_obj,
-        "has_close_obj":          has_close_obj,
-        "has_approaching_obj":    has_approaching_obj,
-        "has_moving_away_obj":    has_moving_away_obj,
-        "has_front_close_obj":    has_front_close_obj,
-        "front_obj_approaching":  front_obj_approaching,
-        "close_obj_approaching":  close_obj_approaching,
-        "nearest_front_rel_motion": nearest_front_rel_motion,  # categorical
-    }
-
-
-def _gen_atomic_rules(all_predicates, min_support=2, min_confidence=0.0):
+def _score_rules_global(global_rule_counts, global_P_counts, global_Q_counts, total_T, rule_video_support, num_videos, cfg=None):
+    
     """
-    Mine atomic (|P|=1) rules of the form  P → Q  from a flat predicate table.
-
-    Parameters
-    ----------
-    all_predicates : list of dict
-        Nested predicate dicts as returned by extract_predicates, one per segment
-        across *all* videos.
-    min_support : int
-        Minimum number of segments where both P and Q hold.
-    min_confidence : float
-        Minimum confidence (support / total_P) to keep a rule.
-
-    Returns
-    -------
-    rules : list of dict
-        Each rule dict:
-        {
-            "antecedent":  (feature_name, feature_value),
-            "consequent":  (feature_name, feature_value),
-            "support":     int,
-            "total_P":     int,
-            "total_Q":     int,
-            "n":           int,
-            "confidence":  float,
-            "lift":        float,
-        }
-        Sorted by lift descending.
+    Score rules based on confidence, lift, and stability across videos.
     """
-    # ── 1. flatten all predicate dicts into a list of flat records ────────────
-    flat_records = [_flatten_predicates(p) for p in all_predicates]
-    n = len(flat_records)
-    if n == 0:
+    cfg = _get_pattern_cfg(cfg)
+    eps = cfg["rules"]["eps"]
+    if total_T == 0 or num_videos == 0:
         return []
+    scored_rules = []
+    for (p,q,dt), count in global_rule_counts.items():
+        
+        support = count
+        
+        if global_P_counts[p]==0:
+            continue
+        
+        confidence = support / global_P_counts[p]
+        
+        # P(Q)
+        p_q = global_Q_counts[q]/total_T
+        
+        # lift: confidence / P(Q)
+        # lift > 1 means P increases the likelihood of Q compared to random chance; lift < 1 means P decreases the likelihood of Q.
+        lift = confidence / (p_q + eps)  # add small constant to avoid division by zero
+        
+        # log-lift:
+        log_lift = math.log(lift + eps)  # add small constant to avoid log(0)
+        
+        # stability: fraction of videos where the rule holds among those where P holds
+        stability = len(rule_video_support[(p,q,dt)]) / num_videos
+        
+        # score
+        score = confidence * log_lift * stability
+        
+        scored_rules.append({
+            "rule": (p,q,dt),
+            "support": support,
+            "confidence": confidence,
+            "lift": lift,
+            "log_lift": log_lift,
+            "stability": stability,
+            "score": score
+        })
+    return scored_rules
+    
+def _filter_rules(scored_rules, cfg=None):
+    cfg = _get_pattern_cfg(cfg)
+    rule_cfg = cfg["rules"]
+    min_support = rule_cfg["min_support"]
+    min_conf = rule_cfg["min_conf"]
+    min_lift = rule_cfg["min_lift"]
+    min_stability = rule_cfg["min_stability"]
 
-    # ── 2. define antecedent and consequent feature sets ──────────────────────
-    antecedent_keys = [
-        "has_front_obj",
-        "has_close_obj",
-        "has_approaching_obj",
-        "has_moving_away_obj",
-        "has_front_close_obj",
-        "front_obj_approaching",
-        "close_obj_approaching",
-        "nearest_front_rel_motion",
-    ]
-    consequent_keys = [
-        "ego_speed_change",
-        "ego_turn",
-    ]
+    filtered = []
+    for r in scored_rules:
+        if (r["support"] >= min_support and 
+            r["confidence"] >= min_conf and 
+            r["lift"] >= min_lift and
+            r["stability"] >= min_stability):
+            filtered.append(r)
+    print(f"Rules after filtering: {len(filtered)}")
+    return filtered
 
-    # collect all unique values for each key
-    def unique_vals(key):
-        return {r[key] for r in flat_records if r[key] is not None}
+def _get_top_rules(filtered_rules, cfg=None):
+    cfg = _get_pattern_cfg(cfg)
+    top_k = cfg["rules"]["top_k"]
+    top_rules = sorted(filtered_rules, key=lambda x: x["score"], reverse=True)[:top_k]
+    return top_rules
 
-    # ── 3. count occurrences ──────────────────────────────────────────────────
-    rules = []
-    for q_key in consequent_keys:
-        for q_val in unique_vals(q_key):
-            total_Q = sum(1 for r in flat_records if r[q_key] == q_val)
-
-            for p_key in antecedent_keys:
-                if p_key == q_key:
-                    continue
-                for p_val in unique_vals(p_key):
-                    total_P = sum(1 for r in flat_records if r[p_key] == p_val)
-                    support  = sum(
-                        1 for r in flat_records
-                        if r[p_key] == p_val and r[q_key] == q_val
-                    )
-
-                    if support < min_support or total_P == 0:
-                        continue
-
-                    confidence = support / total_P
-                    if confidence < min_confidence:
-                        continue
-
-                    lift = confidence / (total_Q / n) if total_Q > 0 else 0.0
-
-                    rules.append({
-                        "antecedent":  (p_key, p_val),
-                        "consequent":  (q_key, q_val),
-                        "support":     support,
-                        "total_P":     total_P,
-                        "total_Q":     total_Q,
-                        "n":           n,
-                        "confidence":  confidence,
-                        "lift":        lift,
-                    })
-
-    rules.sort(key=lambda r: r["lift"], reverse=True)
-    return rules
-
-
-def _ext_atomic_rules(all_predicates, atomic_rules_filtered, min_support=5, min_confidence=0.5, max_size=3):
-    """
-    Extend filtered atomic rules to conjunctive antecedents  P1 ∧ P2 ∧ … → Q
-    with |P| up to *max_size*, using Apriori-style pruning.
-
-    Parameters
-    ----------
-    all_predicates : list of dict
-        Nested predicate dicts as returned by extract_predicates (one per segment).
-    atomic_rules_filtered : list of dict
-        Filtered atomic rules from _gen_atomic_rules.  The antecedent (key, val)
-        pairs found here seed the candidate pool to keep the search space tractable.
-    min_support : int
-        Minimum number of segments where P ∧ Q both hold.
-    min_confidence : float
-        Minimum confidence (support / total_P) to keep a rule.
-    max_size : int
-        Maximum number of conjuncts in the antecedent (must be >= 2).
-
-    Returns
-    -------
-    rules : list of dict
-        Same schema as _gen_atomic_rules, but 'antecedent' is now a tuple of
-        (feature_name, feature_value) pairs (one per conjunct), sorted by key.
-        Sorted by lift descending.
-    """
-    flat_records = [_flatten_predicates(p) for p in all_predicates]
-    n = len(flat_records)
-    if n == 0 or max_size < 2:
-        return []
-
-    consequent_keys = {"ego_speed_change", "ego_turn"}
-
-    # ── seed: unique antecedent (key, val) conditions from filtered atomic rules ──
-    seed_conditions = [
-        rule["antecedent"]
-        for rule in atomic_rules_filtered
-        if rule["antecedent"][0] not in consequent_keys
-    ]
-    seed_conditions = list(dict.fromkeys(seed_conditions))  # deduplicate, preserve order
-
-    def unique_q_vals(key):
-        return {r[key] for r in flat_records if r[key] is not None}
-
-    def count_cond(conditions):
-        """Count records satisfying all (key, val) conditions."""
-        return sum(
-            1 for r in flat_records
-            if all(r.get(k) == v for k, v in conditions)
-        )
-
-    def count_cond_and_q(conditions, q_key, q_val):
-        return sum(
-            1 for r in flat_records
-            if all(r.get(k) == v for k, v in conditions) and r[q_key] == q_val
-        )
-
-    # ── level-1 frequent itemsets from seed conditions ────────────────────────
-    frequent_itemsets = {1: {}}
-    for cond in seed_conditions:
-        sup = count_cond([cond])
-        if sup >= min_support:
-            frequent_itemsets[1][frozenset([cond])] = sup
-
-    rules = []
-
-    for size in range(2, max_size + 1):
-        prev = frequent_itemsets.get(size - 1, {})
-        if not prev:
-            break
-
-        # ── candidate generation: union pairs of (size-1)-itemsets ───────────
-        prev_list = list(prev.keys())
-        candidates = set()
-        for a, b in combinations(prev_list, 2):
-            union = a | b
-            if len(union) != size:
-                continue
-            # all feature keys must be distinct (no contradictory values)
-            keys_in_union = [k for k, _v in union]
-            if len(keys_in_union) != len(set(keys_in_union)):
-                continue
-            # Apriori pruning: every (size-1)-subset must be frequent
-            if all(frozenset(sub) in prev for sub in combinations(union, size - 1)):
-                candidates.add(union)
-
-        # ── count support; mine rules ─────────────────────────────────────────
-        frequent_itemsets[size] = {}
-        for itemset in candidates:
-            conditions = list(itemset)
-            sup = count_cond(conditions)
-            if sup < min_support:
-                continue
-
-            frequent_itemsets[size][itemset] = sup
-            antecedent_tuple = tuple(sorted(conditions))  # deterministic, serialisable
-
-            for q_key in consequent_keys:
-                for q_val in unique_q_vals(q_key):
-                    total_Q = sum(1 for r in flat_records if r[q_key] == q_val)
-                    support = count_cond_and_q(conditions, q_key, q_val)
-
-                    if support < min_support:
-                        continue
-
-                    confidence = support / sup
-                    if confidence < min_confidence:
-                        continue
-
-                    lift = confidence / (total_Q / n) if total_Q > 0 else 0.0
-
-                    rules.append({
-                        "antecedent":  antecedent_tuple,
-                        "consequent":  (q_key, q_val),
-                        "support":     support,
-                        "total_P":     sup,
-                        "total_Q":     total_Q,
-                        "n":           n,
-                        "confidence":  confidence,
-                        "lift":        lift,
-                    })
-
-    rules.sort(key=lambda r: r["lift"], reverse=True)
-    return rules
-
+def _format_rules(rules):
+    formated_rules = []
+    for r in rules:
+        p, q, dt = r["rule"]
+        formated_rules.append((
+            f"{q[0]}={q[1]} at {q[2]} (Δt={dt}) :- {p[0]}={p[1]} at {p[2]}. | "
+            f"conf={r['confidence']:.2f}, "
+            f"lift={r['lift']:.2f}, "
+            f"stab={r['stability']:.2f}, "
+            f"score={r['score']:.3f}"
+        ))
+    return formated_rules
 
 ######################## Visualization Functions #######################
 
-def _vis_seg_predicates(vid, seg_prims, seg_objs, objects_mat, fps=10, output_dir=None):
-    """Generate one short MP4 per segment showing the predicates for that segment
-    overlaid on the original video frames.
+def _vis_seg_predicates(vid, frame_data, predicates, seg_objs, seg_ego, cfg=None, output_dir=None):
+    """Generate one short MP4 showing segment frames with predicate annotations.
 
-    Output: *output_dir*/seg_predicate_vis/<vid>/seg_NNNN_framesS-E.mp4
+    Output: *output_dir*/seg_predicate_vis/<vid>/seg_framesS-E_predicates.mp4
     """
     import cv2
-    import pathlib
+    from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
 
-    if output_dir is None:
-        output_dir = config.get_output_path("pipeline_output") / "seg_predicate_vis"
-    seg_dir = pathlib.Path(output_dir) / str(vid)
-    seg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = _get_pattern_cfg(cfg)
+    fps = cfg["predicate"]["vis_fps"]
 
-    # Determine canonical frame size from first loadable frame
-    canvas_w, canvas_h = 640, 360
-    found = False
-    for fi in range(objects_mat.shape[0]):
-        if found:
+    fps = max(1, int(fps))
+    start = int(seg_ego.get("start", 0))
+    end = int(seg_ego.get("end", start + 1))
+    seg_type = int(seg_ego.get("type", 0))
+    duration = max(1, end - start)
+    num_frames = len(frame_data)
+    start = max(0, min(start, max(0, num_frames - 1)))
+    end = max(start + 1, min(end, num_frames))
+    duration = max(1, end - start)
+
+    sample_img = None
+    for sample_fi in range(start, end):
+        try:
+            sample_img = utils.load_frame(frame_data[sample_fi]["frame"])
             break
-        for obj_id in range(objects_mat.shape[1]):
-            cell = objects_mat[fi, obj_id]
-            if cell is not None and cell.get("frame") is not None:
-                try:
-                    sample = utils.load_frame(cell["frame"])
-                    canvas_h, canvas_w = sample.shape[:2]
-                    found = True
-                    break
-                except Exception:
-                    continue
+        except Exception:
+            continue
+    if sample_img is None:
+        sample_img = np.full((360, 640, 3), 180, dtype=np.uint8)
 
-    line_h = 28
-    padding = 10
+    frame_h, canvas_w = sample_img.shape[:2]
+    panel_h = max(280, min(360, int(frame_h * 0.45)))
+    canvas_h = frame_h + panel_h
+    pad = max(14, int(canvas_w * 0.025))
+    line_h = max(20, int(panel_h * 0.075))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    body_scale = max(0.42, min(0.56, canvas_w / 1600))
+    title_scale = max(0.50, min(0.66, canvas_w / 1350))
+    frame_text_scale = max(0.68, min(0.95, canvas_w / 1050))
+    bbox_text_scale = max(0.58, min(0.82, canvas_w / 1200))
 
-    for seg_idx, (prim, objs) in enumerate(zip(seg_prims, seg_objs)):
-        start, end = prim["start"], prim["end"]
-        predicates = extract_predicates(prim, objs)
-        flat_rec = _flatten_predicates(predicates)
-        pred_lines = [
-            f"ego_speed_change : {flat_rec.get('ego_speed_change')}",
-            f"ego_turn         : {flat_rec.get('ego_turn')}",
-            f"has_front_obj    : {flat_rec.get('has_front_obj')}",
-            f"has_close_obj    : {flat_rec.get('has_close_obj')}",
-            f"has_approaching  : {flat_rec.get('has_approaching_obj')}",
-            f"has_moving_away  : {flat_rec.get('has_moving_away_obj')}",
-            f"front_approaching: {flat_rec.get('front_obj_approaching')}",
-            f"close_approaching: {flat_rec.get('close_obj_approaching')}",
-            f"nearest_front_rm : {flat_rec.get('nearest_front_rel_motion')}",
+    def _label_conf(value):
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return str(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return str(value[0]), None
+        return str(value), None
+
+    def _fmt_value(value):
+        label, conf = _label_conf(value)
+        if conf is None:
+            return label
+        return f"{label} ({conf:.2f})"
+
+    def _obj_id_key(obj_id):
+        if hasattr(obj_id, "item"):
+            obj_id = obj_id.item()
+        return str(obj_id)
+
+    def _put_text(img, text, x, y, scale=0.55, color=(230, 230, 230), thickness=1):
+        cv2.putText(img, str(text), (int(x), int(y)), font, scale, color, thickness, cv2.LINE_AA)
+
+    def _draw_section(img, title, lines, x, y, w, h, accent):
+        cv2.rectangle(img, (x, y), (x + w, y + h), (34, 34, 34), cv2.FILLED)
+        cv2.rectangle(img, (x, y), (x + w, y + h), (70, 70, 70), 1)
+        cv2.rectangle(img, (x, y), (x + 6, y + h), accent, cv2.FILLED)
+        _put_text(img, title, x + 16, y + int(28 * title_scale / 0.62), title_scale, accent, 2)
+        cy = y + int(54 * title_scale / 0.62)
+        for line in lines:
+            if cy > y + h - 12:
+                _put_text(img, "...", x + 16, cy, body_scale, (160, 160, 160), 1)
+                break
+            _put_text(img, line, x + 16, cy, body_scale, (225, 225, 225), 1)
+            cy += line_h
+
+    def _load_frame_or_blank(fi):
+        if fi < 0 or fi >= num_frames:
+            return np.full((frame_h, canvas_w, 3), 180, dtype=np.uint8)
+        try:
+            frame_img = utils.load_frame(frame_data[fi]["frame"])
+        except Exception:
+            frame_img = np.full((frame_h, canvas_w, 3), 180, dtype=np.uint8)
+        if frame_img.shape[0] != frame_h or frame_img.shape[1] != canvas_w:
+            frame_img = cv2.resize(frame_img, (canvas_w, frame_h))
+        return frame_img
+
+    def _draw_frame_overlays(frame_img, fi):
+        header = f"Video {vid} | frames {start}-{end} | frame {fi} | {seg_type_text}"
+        overlay = frame_img.copy()
+        header_h = max(48, int(54 * frame_text_scale / 0.68))
+        cv2.rectangle(overlay, (0, 0), (canvas_w, header_h), (0, 0, 0), cv2.FILLED)
+        cv2.addWeighted(overlay, 0.42, frame_img, 0.58, 0, frame_img)
+        _put_text(frame_img, header, 10, int(header_h * 0.68), frame_text_scale, (255, 255, 90), 2)
+
+        info = frame_data[fi] if 0 <= fi < num_frames else {}
+        bboxes = info.get("bboxes", [])
+        obj_ids = info.get("obj_ids", [])
+        for idx, bbox in enumerate(bboxes):
+            bb = bbox.tolist() if hasattr(bbox, "tolist") else list(bbox)
+            if len(bb) < 4:
+                continue
+            x1, y1, x2, y2 = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+            obj_id = obj_ids[idx] if idx < len(obj_ids) else idx
+            focus_obj = focus_obj_by_id.get(_obj_id_key(obj_id))
+            if focus_obj is None:
+                continue
+
+            rel_text = _label_conf(focus_obj.get("rel_motion", "unknown"))[0]
+            turning_text = _label_conf(focus_obj.get("is_turning", "unknown"))[0]
+            bbox_label = f"{rel_text} | {turning_text}"
+            bbox_color = (40, 40, 255)
+            bbox_thickness = 3
+            cv2.rectangle(frame_img, (x1, y1), (x2, y2), bbox_color, bbox_thickness)
+
+            (text_w, text_h), baseline = cv2.getTextSize(bbox_label, font, bbox_text_scale, 2)
+            label_y = max(text_h + 6, y1 - 8)
+            label_x = min(max(0, x1), max(0, canvas_w - text_w - 8))
+            bg_y1 = max(0, label_y - text_h - 4)
+            bg_y2 = min(frame_h, label_y + baseline + 4)
+            label_overlay = frame_img.copy()
+            cv2.rectangle(label_overlay, (label_x - 4, bg_y1), (label_x + text_w + 4, bg_y2),
+                          (0, 0, 0), cv2.FILLED)
+            cv2.addWeighted(label_overlay, 0.42, frame_img, 0.58, 0, frame_img)
+            _put_text(frame_img, bbox_label, label_x, label_y, bbox_text_scale, bbox_color, 2)
+
+        ego_box_lines = [
+            f"speed: {_fmt_value(ego_preds.get('ego_speed_change', 'unknown'))}",
+            f"moving: {_fmt_value(ego_preds.get('ego_is_moving', 'unknown'))}",
+            f"turning: {_fmt_value(ego_preds.get('ego_is_turning', 'unknown'))}",
         ]
-        txt_h = len(pred_lines) * line_h + 2 * padding
-        total_h = canvas_h + txt_h
+        ego_scale = max(0.58, min(0.82, canvas_w / 1200))
+        ego_thick = 2
+        ego_pad = max(8, int(10 * ego_scale))
+        text_sizes = [cv2.getTextSize(line, font, ego_scale, ego_thick) for line in ego_box_lines]
+        box_w = max(size[0][0] for size in text_sizes) + 2 * ego_pad
+        box_h = sum(size[0][1] + size[1] for size in text_sizes) + (len(ego_box_lines) + 1) * ego_pad
+        box_x = pad
+        box_y = max(header_h + pad, frame_h - box_h - pad)
 
-        out_path = seg_dir / f"seg_{seg_idx:04d}_frames{start}-{end}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, fps, (canvas_w, total_h))
+        ego_overlay = frame_img.copy()
+        cv2.rectangle(ego_overlay, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), cv2.FILLED)
+        cv2.addWeighted(ego_overlay, 0.48, frame_img, 0.52, 0, frame_img)
 
-        for fi in range(start, end):
-            frame_img = None
-            for obj_id in range(objects_mat.shape[1]):
-                cell = objects_mat[fi, obj_id]
-                if cell is not None and cell.get("frame") is not None:
-                    try:
-                        frame_img = utils.load_frame(cell["frame"])
-                        break
-                    except Exception:
-                        continue
-            if frame_img is None:
-                frame_img = np.full((canvas_h, canvas_w, 3), 180, dtype=np.uint8)
-            if frame_img.shape[0] != canvas_h or frame_img.shape[1] != canvas_w:
-                frame_img = cv2.resize(frame_img, (canvas_w, canvas_h))
+        text_y = box_y + ego_pad
+        for line, ((_, text_h), baseline) in zip(ego_box_lines, text_sizes):
+            text_y += text_h
+            _put_text(frame_img, line, box_x + ego_pad, text_y, ego_scale, (80, 220, 255), ego_thick)
+            text_y += baseline + ego_pad
 
-            header = (
-                f"Seg {seg_idx}  [{start},{end}]  frame {fi}  "
-                f"speed={flat_rec.get('ego_speed_change')}  turn={flat_rec.get('ego_turn')}"
-            )
-            cv2.putText(frame_img, header, (8, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (255, 255, 50), 2, cv2.LINE_AA)
+    def _draw_predicate_panel(progress, current_frame):
+        panel = np.full((panel_h, canvas_w, 3), 22, dtype=np.uint8)
+        _put_text(panel, "predicate summary", pad, 28, title_scale, (245, 245, 245), 2)
+        _put_text(panel, f"segment frame {current_frame} / {end - 1}",
+                  pad, 54, body_scale, (170, 170, 170), 1)
 
-            # draw bounding boxes for all objects visible in this frame
-            for obj in objs:
-                bbox = obj.get("frame_bboxes", {}).get(fi)
-                if bbox is not None:
-                    try:
-                        x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-                        cv2.rectangle(frame_img, (x1, y1), (x2, y2), (0, 255, 80), 2)
-                        lbl = obj.get("label") or ""
-                        if lbl:
-                            cv2.putText(frame_img, lbl, (x1, max(y1 - 4, 12)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 80), 1, cv2.LINE_AA)
-                    except (TypeError, IndexError):
-                        pass
+        bar_x, bar_y, bar_w, bar_h = pad, 70, canvas_w - 2 * pad, 8
+        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (70, 70, 70), cv2.FILLED)
+        cv2.rectangle(panel, (bar_x, bar_y), (bar_x + int(bar_w * progress), bar_y + bar_h),
+                      (80, 200, 255), cv2.FILLED)
 
-            txt_panel = np.full((txt_h, canvas_w, 3), 30, dtype=np.uint8)
-            for li, line in enumerate(pred_lines):
-                y = padding + li * line_h + line_h // 2
-                cv2.putText(txt_panel, line, (padding, y), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.50, (80, 200, 255), 1, cv2.LINE_AA)
+        col_w = (canvas_w - 3 * pad) // 2
+        row1_y = 96
+        row_h = max(84, int((panel_h - row1_y - pad) * 0.38))
+        row2_y = row1_y + row_h + pad
+        row2_h = max(100, panel_h - row2_y - pad)
+        _draw_section(panel, "Ego Predicates", ego_lines, pad, row1_y, col_w, row_h, (80, 200, 255))
+        _draw_section(panel, "Global Predicates", global_lines,
+                      2 * pad + col_w, row1_y, col_w, row_h, (120, 220, 120))
+        _draw_section(panel, "Focus Objects", focus_lines, pad, row2_y, col_w, row2_h, (220, 190, 80))
+        _draw_section(panel, "Object Predicates", object_lines,
+                      2 * pad + col_w, row2_y, col_w, row2_h, (210, 140, 230))
+        return panel
 
-            composite = np.vstack([frame_img, txt_panel])
-            writer.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+    ego_preds = predicates.get("ego", {})
+    global_preds = predicates.get("global", {})
+    object_preds = predicates.get("objects", [])
+    focus_preds = predicates.get("focus_objects", [])
+    focus_obj_by_id = {_obj_id_key(obj.get("id")): obj for obj in focus_preds}
 
-        writer.release()
-
-    print(f"Saved {len(seg_prims)} segment predicate videos to {seg_dir}")
-
-
-def _vis_rules(vid, all_predicates, rules, top_k=10, fps=10, output_dir=None):
-    """
-    For a single video, produce an MP4 where every original video frame is shown
-    with rule annotations:
-      - top panel    : original frame with a yellow segment-info header
-      - bottom panel : fixed-height dark panel listing the top-k rules whose
-                       antecedent fires in the current segment
-
-    Output: *output_dir*/<vid>_rules.mp4
-
-    Parameters
-    ----------
-    vid : str
-        Video ID to visualize.
-    all_predicates : list of dict
-        Per-segment predicate dicts (all videos). Predicates for *vid* are
-        re-derived internally so that raw frame images are accessible.
-    rules : list of dict
-        Rules from _gen_atomic_rules / _ext_atomic_rules.  'antecedent' is
-        either a single (key, val) tuple (atomic) or a tuple of (key, val)
-        pairs (conjunctive).
-    top_k : int
-        Maximum number of rules checked per segment (highest lift first).
-    fps : int
-        Frames per second for the output MP4.
-    output_dir : Path-like or None
-        Destination directory; created if absent.
-    """
-    import cv2
-    import pathlib
-
-    if output_dir is None:
-        output_dir = config.get_output_path("pipeline_output") / "rule_vis"
-    output_dir = pathlib.Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # ── 1. re-derive segments / objects / predicates for this video ───────────
-    ego_sig_seg = _pre_steps(vid)
-    ego_segs    = _combine_sig_seg(ego_sig_seg)
-    seg_prims   = _seg2prims(ego_segs)
-    seg_objs    = _extract_objs_per_segs(seg_prims, ego_sig_seg["objects"])
-    objects_mat = ego_sig_seg["objects"]          # shape (num_frames, num_objs)
-    num_frames  = objects_mat.shape[0]
-
-    vid_predicates = [
-        extract_predicates(prim, seg_objs[p_i])
-        for p_i, prim in enumerate(seg_prims)
+    ego_lines = [
+        f"speed_change : {_fmt_value(ego_preds.get('ego_speed_change', 'unknown'))}",
+        f"is_moving    : {_fmt_value(ego_preds.get('ego_is_moving', 'unknown'))}",
+        f"is_turning   : {_fmt_value(ego_preds.get('ego_is_turning', 'unknown'))}",
     ]
-    flat_records = [_flatten_predicates(p) for p in vid_predicates]
+    global_lines = [
+        f"any_approach    : {global_preds.get('any_approach', False)}",
+        f"num_approaching : {global_preds.get('num_approaching', 0)}",
+        f"visible_objects : {len(seg_objs)}",
+        f"focus_objects   : {len(focus_preds)}",
+    ]
+    focus_lines = []
+    for obj in focus_preds[:5]:
+        focus_lines.append(
+            f"id={obj.get('id')} score={float(obj.get('score', 0.0)):.2f} "
+            f"rank={float(obj.get('rank', -1.0)):.1f} "
+            f"rel={_label_conf(obj.get('rel_motion', 'unknown'))[0]} "
+            f"lat={_label_conf(obj.get('lateral_motion', 'unknown'))[0]}"
+        )
+    if not focus_lines:
+        focus_lines.append("none")
 
-    # frame-index → (seg_idx, flat_record, prim) lookup
-    frame_to_seg = {}
-    for seg_idx, prim in enumerate(seg_prims):
-        for fi in range(prim["start"], prim["end"]):
-            frame_to_seg[fi] = (seg_idx, flat_records[seg_idx], prim)
+    object_lines = []
+    for obj in object_preds[:10]:
+        object_lines.append(
+            f"id={obj.get('id')} rank={float(obj.get('rank', -1.0)):.1f} "
+            f"rel={_label_conf(obj.get('rel_motion', 'unknown'))[0]} "
+            f"lat={_label_conf(obj.get('lateral_motion', 'unknown'))[0]} "
+            f"move={_label_conf(obj.get('is_moving', 'unknown'))[0]} "
+            f"turn={_label_conf(obj.get('is_turning', 'unknown'))[0]}"
+        )
+    if len(object_preds) > 10:
+        object_lines.append(f"... {len(object_preds) - 10} more objects")
+    elif not object_lines:
+        object_lines.append("none")
 
-    # ── 2. top-k rules by lift ────────────────────────────────────────────────
-    top_rules = sorted(rules, key=lambda r: r["lift"], reverse=True)[:top_k]
+    out_path = output_dir / f"seg_frames{start}-{end}_predicates.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (canvas_w, canvas_h))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open MP4 writer for {out_path}")
 
-    def rule_fires(flat_record, rule):
-        ant = rule["antecedent"]
-        if isinstance(ant[0], tuple):
-            return all(flat_record.get(k) == v for k, v in ant)
-        k, v = ant
-        return flat_record.get(k) == v
-
-    def rule_label(rule):
-        ant = rule["antecedent"]
-        if isinstance(ant[0], tuple):
-            p_str = " & ".join(f"{k}={v}" for k, v in ant)
-        else:
-            k, v = ant
-            p_str = f"{k}={v}"
-        q_key, q_val = rule["consequent"]
-        return (f"{p_str} -> {q_key}={q_val}  "
-                f"[sup={rule['support']} conf={rule['confidence']:.2f} "
-                f"lift={rule['lift']:.2f}]")
-
-    # ── 3. canonical frame size from the first loadable frame ────────────────
-    canvas_w, canvas_h = 640, 360  # fallback defaults
-    for fi in range(num_frames):
-        found = False
-        for obj_id in range(objects_mat.shape[1]):
-            cell = objects_mat[fi, obj_id]
-            if cell is not None and cell.get("frame") is not None:
-                try:
-                    sample = utils.load_frame(cell["frame"])
-                    canvas_h, canvas_w = sample.shape[:2]
-                    found = True
-                    break
-                except Exception:
-                    continue
-        if found:
-            break
-
-    line_h    = 28
-    padding   = 10
-    max_txt_h = top_k * line_h + 2 * padding   # fixed height keeps video dims constant
-    total_h   = canvas_h + max_txt_h
-
-    # ── 4. open VideoWriter ───────────────────────────────────────────────────
-    out_path = output_dir / f"{vid}_rules.mp4"
-    fourcc   = cv2.VideoWriter_fourcc(*"mp4v")
-    writer   = cv2.VideoWriter(str(out_path), fourcc, fps, (canvas_w, total_h))
-
-    # ── 5. write every frame ──────────────────────────────────────────────────
-    for fi in range(num_frames):
-        frame_img = None
-        for obj_id in range(objects_mat.shape[1]):
-            cell = objects_mat[fi, obj_id]
-            if cell is not None and cell.get("frame") is not None:
-                try:
-                    frame_img = utils.load_frame(cell["frame"])
-                    break
-                except Exception:
-                    continue
-
-        if frame_img is None:
-            frame_img = np.full((canvas_h, canvas_w, 3), 180, dtype=np.uint8)
-
-        if frame_img.shape[0] != canvas_h or frame_img.shape[1] != canvas_w:
-            frame_img = cv2.resize(frame_img, (canvas_w, canvas_h))
-
-        seg_entry = frame_to_seg.get(fi)
-        if seg_entry is not None:
-            seg_idx, flat_rec, prim = seg_entry
-            start, end = prim["start"], prim["end"]
-            fired  = [r for r in top_rules if rule_fires(flat_rec, r)]
-            header = (f"Seg {seg_idx}  [{start},{end}]  frame {fi}  "
-                      f"speed={flat_rec.get('ego_speed_change')}  "
-                      f"turn={flat_rec.get('ego_turn')}")
-        else:
-            fired  = []
-            header = f"frame {fi}  (outside segmented range)"
-
-        cv2.putText(frame_img, header, (8, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 50), 2, cv2.LINE_AA)
-
-        txt_panel = np.full((max_txt_h, canvas_w, 3), 30, dtype=np.uint8)
-        if not fired:
-            cv2.putText(txt_panel, "No rules fired.",
-                        (padding, padding + line_h // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
-        else:
-            for li, rule in enumerate(fired):
-                y = padding + li * line_h + line_h // 2
-                cv2.putText(txt_panel, rule_label(rule), (padding, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, (50, 220, 100), 1, cv2.LINE_AA)
-
-        composite = np.vstack([frame_img, txt_panel])          # (total_h, canvas_w, 3)
-        writer.write(cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+    total_frames = max(fps * 2, min(fps * 4, duration))
+    seg_type_text = {0: "normal", 1: "stopped", 2: "turning"}.get(seg_type, str(seg_type))
+    for frame_i in range(total_frames):
+        progress = 1.0 if total_frames <= 1 else frame_i / (total_frames - 1)
+        current_frame = start + min(duration - 1, int(round(progress * (duration - 1))))
+        frame_img = _load_frame_or_blank(current_frame)
+        _draw_frame_overlays(frame_img, current_frame)
+        pred_panel = _draw_predicate_panel(progress, current_frame)
+        writer.write(cv2.cvtColor(np.vstack([frame_img, pred_panel]), cv2.COLOR_RGB2BGR))
 
     writer.release()
-    print(f"Saved rule-vis video ({num_frames} frames) to {out_path}")
-
+    print(f"Saved predicate visualization to {out_path}")
+    return out_path
 
 ######################## Pipeline functions #########################
-def _combine_sig_seg(sig_seg, min_duration=5):
-    """
-    The sig_seg is a dict including the signals and their segmentation for ego_w, ego_vs, and ego_vz.
-    We will combine the segmentation results of the three signals 
-    to get a more comprehensive segmentation for the ego motion.
-    """
-    ego_w_signal = sig_seg["ego_w_signal"]
-    ego_vx_signal = sig_seg["ego_vx_signal"]
-    ego_vz_signal = sig_seg["ego_vz_signal"]
-    ego_w_segs = sig_seg["ego_w_segs"]
-    ego_vx_segs = sig_seg["ego_vx_segs"]
-    ego_vz_segs = sig_seg["ego_vz_segs"]
-    
-    # merge the segments from the three signals by splitting at all unique segment boundaries
-    boundaries = set()
-    for segs in [ego_w_segs, ego_vx_segs, ego_vz_segs]:
-        for s, e in segs:
-            boundaries.add(s)
-            boundaries.add(e)
-    boundaries = sorted(boundaries) 
-    
-    # merge the short segments that are shorter than a certain duration threshold (e.g., 5 frames) into their neighboring segments
-    i = 0
-    while i < len(boundaries) - 1:
-        if boundaries[i + 1] - boundaries[i] < min_duration:
-            if i > 0:
-                boundaries.pop(i)
-            else:
-                boundaries.pop(i + 1)
-        else:
-            i += 1    
-    combined_segs = [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
-    
-    # merge segments if their symbolic state is consistent across all three signals (e.g., all increasing or all decreasing)
-    merged_prims = []
-    for s, e in combined_segs:
-        merged_prims.append({
-            "start":s,
-            "end":e,
-            "signal_ego_w": ego_w_signal[s:e],
-            "signal_ego_vx": ego_vx_signal[s:e],
-            "signal_ego_vz": ego_vz_signal[s:e]
-        })
-    return merged_prims
 
+def load_primitive_data(path, cfg=None):
+    from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
+    _get_pattern_cfg(cfg)
 
-
-def _seg2prims(sig_seg):
-    # extract features for each segment, 
-    # here we simply use the mean and variance of the signal within the segment as features
-    prims = []
-    for seg in sig_seg:
-        s, e = seg["start"], seg["end"]
-        seg_signal = seg["signal_ego_w"]  # assuming we're using ego_w signal for feature extraction
-        
-        # determine the trend of the signal within the segment: increasing, decreasing, or stable
-        trend_type = 1 if seg_signal[-1] > seg_signal[0] else -1 if seg_signal[-1] < seg_signal[0] else 0
-        
-        prims.append({
-            "start": s,
-            "end": e,
-            "duration": e - s,
-            "mean": np.mean(seg_signal),
-            "min": np.min(seg_signal),
-            "max": np.max(seg_signal),
-            "amplitude": np.max(seg_signal) - np.min(seg_signal),
-            "var": np.var(seg_signal),
-            "slope": (seg_signal[-1] - seg_signal[0]) / (e - s + 1e-6),  # to avoid division by zero
-            "trend": trend_type,
-            "mean_abs_diff": np.mean(np.abs(np.diff(seg_signal))),
-            "max_abs_diff": np.max(np.abs(np.diff(seg_signal))),
-            "energy": np.sum(seg_signal ** 2),
-            "yaw_mean": np.mean(seg["signal_ego_w"])  # add mean yaw as a feature for predicate extraction
-        })
-        
-    return prims
-
-
-######################## Test functions #########################
-def _pre_steps(vid):   
-    # extract the time series position matrix for the video
-    matrix = percept2matrix(vid, save_matrices_flag=True)
-    flow = percept2ego_speed(vid, save_flow_flag=True)
-    # convert the position matrix to signals
-    objs, ego_motion = matrix2signal(matrix, vid, visualize_ego=True, save_primitives=True)
-    signal_ego_w = ego_motion[:, 2]
-    signal_ego_vz = ego_motion[:, 1]
-    signal_ego_vx = ego_motion[:, 0]
-    
-    # segment the signals
-    ego_w_segs = signal2segs(signal_ego_w)
-    ego_vx_segs = signal2segs(signal_ego_vx)
-    ego_vz_segs = signal2segs(signal_ego_vz)
-    
-    sig_seg = {
-        "ego_w_signal": signal_ego_w,
-        "ego_vx_signal": signal_ego_vx,
-        "ego_vz_signal": signal_ego_vz,
-        "ego_w_segs": ego_w_segs,
-        "ego_vx_segs": ego_vx_segs, 
-        "ego_vz_segs": ego_vz_segs,
-        "objects": objs
+    ego_x_speed = np.load(path / "ego_x_speeds.npy")
+    ego_z_speed = np.load(path / "ego_z_speeds.npy")
+    ego_stop_mask = np.load(path / "stop_mask.npy")
+    ego_turn_mask = np.load(path / "turning_mask.npy")
+    frame_data = utils.load_matrix(path / "video_data.pkl")['frames_data']
+    # load npz file containing the object motion data, which is a dict with keys "obj_ids", "dz_series", "labels", 
+    # and "frame_bboxes"
+    loaded = np.load(path / "obj_motion_data.npz", allow_pickle=True)    
+    obj_motion_data = {
+        key: loaded[key].item()
+        if loaded[key].shape == () and loaded[key].dtype == object
+        else loaded[key]
+        for key in loaded.files
     }
-    return sig_seg     
+    primitive_data = {
+        "ego_x_speed": ego_x_speed,
+        "ego_z_speed": ego_z_speed, 
+        "ego_stop_mask": ego_stop_mask,
+        "ego_turn_mask": ego_turn_mask,
+        "obj_motion_data": obj_motion_data,
+        "frame_data": frame_data
+    }
+    return primitive_data
+
+
+def segment_ego_signal(primitive_data, cfg=None):
+    _get_pattern_cfg(cfg)
+    ego_stop_mask = primitive_data["ego_stop_mask"]
+    ego_turn_mask = primitive_data["ego_turn_mask"]
+    # combine the two masks to get a more comprehensive segmentation of the ego signal
+    combined_mask = np.zeros_like(ego_stop_mask, dtype=int)
+    # stop mask has two values: 0 for non-stop, 1 for stop; 
+    # turn mask has two values: 0 for non-turn, 1 for turn
+    combined_mask[ego_stop_mask == 1] = 1   # stop segments
+    combined_mask[ego_turn_mask == 1] = 2    # turn segments (overlapping segments will be labeled as turn for now)
     
-def main_test():
-    vids = config.get_mini_video_ids()
-
-    # ── collect predicates across all videos and all segments ────────────────
-    all_predicates = []
-    for vid in vids:
-        ego_sig_seg = _pre_steps(vid)
-        ego_segs = _combine_sig_seg(ego_sig_seg)
-        seg_prims = _seg2prims(ego_segs)
-        seg_objs = _extract_objs_per_segs(seg_prims, ego_sig_seg["objects"])
-
-        for p_i, prim in enumerate(seg_prims):
-            objs = seg_objs[p_i]
-            predicates = extract_predicates(prim, objs)
-            all_predicates.append(predicates)
-
+    # add (s,e) tuples for each contiguous segment in the combined mask, along with the type of segment (stop or turn)
+    segments = []
+    current_type = 0
+    start_idx = 0
+    for i in range(1, len(combined_mask)):
+        if combined_mask[i] != current_type:
+            if current_type != 0:  # only consider non-zero segments
+                segments.append((start_idx, i, current_type))
+            start_idx = i
+            current_type = combined_mask[i]
+    # handle the last segment
+    if current_type != 0:
+        segments.append((start_idx, len(combined_mask), current_type))
+    
+    return segments
+    
+    
+def extract_video_predicates(vid, out_path, cfg=None):
+    cfg = _get_pattern_cfg(cfg)
+    pred_cfg = cfg["predicate"]
+    
+    out_file = out_path / "predicates.json"
+    if out_file.exists() and not pred_cfg["force_recompute"]:
+        print(f"Predicates for video {vid} already exist at {out_file}, loading...")
+        with open(out_file, "r") as f:
+            return json.load(f)
+    
+    # load ego data
+    prim_data = load_primitive_data(out_path, cfg)
+    
+    # segment the ego data based on ego_stop_mask and ego_turn_mask
+    segments = segment_ego_signal(prim_data, cfg)
+    objs = _extract_objs_per_segs(segments, prim_data["obj_motion_data"])
+    ego = _extract_ego_per_segs(segments, prim_data)
+    timeline_predicates = []
+    for seg_objs, seg_ego in zip(objs, ego):
+        predicates_t = extract_predicates(seg_objs, seg_ego)
+        timeline_predicates.append(predicates_t)
         # ── visualize each segment's predicates as a short MP4 ───────────────
-        _vis_seg_predicates(vid, seg_prims, seg_objs, ego_sig_seg["objects"])
+        if pred_cfg["visualize"]:
+            _vis_seg_predicates(vid, prim_data["frame_data"], predicates_t, seg_objs, seg_ego, cfg, output_dir=out_path)
+    
+    # save predicates to JSON file
+    with open(out_file, "w") as f:
+        json.dump(timeline_predicates, f, indent=2)
+    print(f"Saved predicates for video {vid} to {out_file}")
+    
+    return timeline_predicates 
 
 
-    # ── mine atomic (|P|=1) rules P → Q ──────────────────────────────────────
-    # Q candidates: ego_speed_change, ego_turn
-    # P candidates: object-presence and relative-motion flags (see _gen_atomic_rules)
-    atomic_rules = _gen_atomic_rules(all_predicates, min_support=2, min_confidence=0.0)
+def main_test(cfg=None):
+    """
+    drawback: 
+    - rules have to be filtered based on carefully designed functions such as is_valid_rule, is_trivial_rule
+    
+    
+    """
+    
+    
+    import pandas as pd
 
+    cfg = _get_pattern_cfg(cfg)
+    vids = cfg["video_ids"] or config.get_mini_video_ids()
+    output_root = cfg["output_root"] or config.get_output_path("pipeline_output")
+    
+    global_rule_counts = defaultdict(float)
+    global_P_counts = defaultdict(float)
+    global_Q_counts = defaultdict(float)    
+    rule_video_support = defaultdict(set)  # rule → set of vids that support it
+    all_predicates = []
+    
+    total_T = 0
+    
+    for vid in vids:
+        print(f"Processing video {vid}...")
+        out_path = pathlib.Path(output_root) / f"{vid}"
+        # preprocess the video to extract primitive data and save to out_path
+        preprocess_cfg = cfg.get("preprocess", {})
+        if preprocess_cfg.get("enabled", cfg.get("run_preprocess", False)):
+            from src.exp_driving_videos.pipe_utils.percept2matrix import run_single_video
+            run_single_video(vid, cfg)
+        
+        # ---------------  Predicates Extraction -------------------------------
+        video_predicates = extract_video_predicates(vid, out_path, cfg)
+        all_predicates.extend(video_predicates)
+        print(f"Extracted predicates video {vid}, total {len(video_predicates)} segments.")
+
+        # --------------- Generate atomic rules (length-1, with time lag delta t) -------------------------------
+        timeline_atoms = _gen_atoms(video_predicates)
+        rule_counts, P_counts, Q_counts= _gen_atomic_rules(timeline_atoms, cfg)
+        total_T += len(timeline_atoms)
+        print(f"[{vid}] T={len(timeline_atoms)}, rules={len(rule_counts)}")
+        
+        # --------------- Aggregate rule counts across videos -------------------------------
+        for r,c in rule_counts.items():
+            global_rule_counts[r] += c 
+            rule_video_support[r].add(vid)
+            
+        for p,c in P_counts.items():
+            global_P_counts[p] += c
+            
+        for q,c in Q_counts.items():
+            global_Q_counts[q] += c
+        
+        # debug
+        print("Total segments:", total_T)
+        print("Total unique rules:", len(global_rule_counts))
+
+    # -------------- Scoring (support / confidence / causal strength) -------------------------------
     # score rules: based on support and confidence
-    print(f"Found {len(atomic_rules)} atomic rules from {len(all_predicates)} segments.")
-    for rule in atomic_rules[:20]:   # print top-20 by lift
-        p_key, p_val = rule["antecedent"]
-        q_key, q_val = rule["consequent"]
-        print(
-            f"  [{p_key}={p_val}] -> [{q_key}={q_val}] "
-            f"sup={rule['support']} conf={rule['confidence']:.2f} lift={rule['lift']:.2f}"
-        )
+    scored_rules = _score_rules_global(global_rule_counts, global_P_counts, global_Q_counts, total_T, rule_video_support, num_videos=len(vids), cfg=cfg)
+    formated_rules = _format_rules(scored_rules)
     
-    # save rules to a CSV file
-    rules_df = pd.DataFrame(atomic_rules)
-    rule_file = config.get_output_path("pipeline_output") / "mined_atomic_rules.csv"
-    rules_df.to_csv(rule_file, index=False)
-    print(f"Saved mined rules to {rule_file}")
-    # before the extensive rule mining, 
-    # filter out rules with low support (e.g., less than 5 segments) or low confidence (e.g., less than 0.5) to focus on more promising patterns.
-    atomic_rules_filtered = [r for r in atomic_rules if r["support"] >= 5 and r["confidence"] >= 0.5]
-    print(f"Filtered down to {len(atomic_rules_filtered)} rules with support >= 5 and confidence >= 0.5.")
+    print("All scored rules:")
+    for r in formated_rules:
+        print(r)
+    # -------------- Filtering ---------------------------------
+    # before the extensive rule mining, filter the atomic rules to a smaller set based on minimum support and confidence thresholds,
+    filtered = _filter_rules(scored_rules, cfg)
+    top_rules = _get_top_rules(filtered, cfg)
+    formated_rules = _format_rules(top_rules)
+    for r in formated_rules:
+        print(r)
     
-    
-    # extend to more complex rules (|P|>1) by combining antecedents, 
-    # e.g., P1 AND P2 → Q, and evaluate their support/confidence/lift similarly.  
-    # This can be done by iterating over pairs of antecedent features and counting co-occurrences in the flat_records.
-    rules_extended = _ext_atomic_rules(all_predicates, atomic_rules_filtered, min_support=5, min_confidence=0.5)
-    
-    # turn scored rules into a compact rule set that can be easily interpreted and visualized, 
-    # e.g., by selecting top-k rules by lift or confidence, 
-    # and by grouping rules with similar antecedents or consequents together.
-    compact_rules_df = pd.DataFrame(rules_extended)
-    compact_rule_file = config.get_output_path("pipeline_output") / "mined_extended_rules.csv"
+    if cfg["extended_rules"]["enabled"]:
+        print("Extended rule mining is enabled, but the current global atomic-rule schema does not provide antecedent/consequent fields required by _ext_atomic_rules.")
+
+    compact_rules_df = pd.DataFrame(top_rules)
+    compact_rule_file = pathlib.Path(output_root) / cfg["rules"]["output_file"]
     compact_rules_df.to_csv(compact_rule_file, index=False)
-    print(f"Saved extended rules to {compact_rule_file}")
-    
-    
-    # a visualization of the rules, the video at the top
-    # below the video, each activated rule is displayed as a text description
-    _vis_rules(vids[0], all_predicates, rules_extended)
+    print(f"Saved atomic rules to {compact_rule_file}")
+
+    if cfg["rule_vis"]["enabled"]:
+        print("Rule visualization is skipped because global atomic rules use the compact (p, q, dt) schema, while _vis_rules expects antecedent/consequent rule records.")
     
     
     
