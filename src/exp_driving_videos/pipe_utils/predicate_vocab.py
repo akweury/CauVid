@@ -82,18 +82,18 @@ def compute_focus_score(obj):
     """
     proximity = (1.0/(np.array(obj["rank"]) + 1e-6)).mean()
     
-    vz_rel = np.mean(obj["speeds_rel"][:,1])  # relative speed in z-axis
+    vz_rel = np.mean(obj["speed"][:,1])  # relative speed in z-axis
     approaching = max(0, -vz_rel)  # only consider approaching speed
     
-    vx_rel = np.mean(obj["speeds_rel"][:,0])  # relative speed in x-axis
-    rel_speed = abs(vz_rel) + 0.5 * abs(vx_rel)  # weighted sum of relative speeds
+    vx_rel = np.mean(obj["speed"][:,0])  # relative speed in x-axis
+    rel_speed = obj['vx']['label'] != "stable"
     
     lateral= abs(vx_rel)
     
-    moving = np.mean(obj["mask_o_vz_rel"]) > 0.5  # majority of frames show moving towards ego
+    moving = obj["vz"]['label'] == "approaching" 
     
-    weights = np.array([1.0, 1.0, 0.5, 0.5, 0.5])  # weights for each factor
-    factors = np.array([proximity, approaching, rel_speed, lateral, moving])
+    weights = np.array([1.1, 1.0, 1.0])  # weights for each factor
+    factors = np.array([proximity, lateral, moving])
     focus_score = np.dot(weights, factors)
     
     return focus_score
@@ -115,7 +115,8 @@ def select_focus_objects(objects, top_k, speed_th=0.5):
     return top_objects, top_scores
   
 def obj_is_moving(obj, ratio_th=0.7):
-    
+    vx = obj['vx']
+    vz = obj['vz']
     pos_ratio = np.mean(obj['mask_o_vz_rel'])
     neg_ratio = 1 - pos_ratio
     
@@ -146,33 +147,27 @@ def obj_is_turning(obj, ratio_th=0.7):
     
     
 def obj_lateral_motion(obj, ratio_th=0.7):
-    lateral_mask = obj['mask_o_vx_rel']
-    pos_ratio = np.mean(lateral_mask)
-    neg_ratio = 1 - pos_ratio
-    
-    if pos_ratio > ratio_th:
-        label = "lateral_motion"
-    elif neg_ratio > ratio_th:
-        label = "no_lateral_motion"
+    vx = obj['vx']
+    label = vx['label']
+    if label == "left":
+        confidence = vx['left_ratio']
+    elif label == "right":
+        confidence = vx['right_ratio']
     else:
-        label = "uncertain"
-    
-    confidence = abs(pos_ratio - neg_ratio)
+        confidence = 1 - max(vx['left_ratio'], vx['right_ratio'])
     return label, confidence
     
 def obj_relative_motion(obj, ratio_th=0.7):
-    vz_rel_mask = obj['mask_o_vz_rel']
-    pos_ratio = np.mean(vz_rel_mask)
-    neg_ratio = 1 - pos_ratio
+    vz = obj['vz']
+    label = vz['label']
     
-    if pos_ratio > ratio_th:
-        label = "approaching"
-    elif neg_ratio > ratio_th:
-        label = "moving_away"
+    if label =="approaching":
+        confidence = vz['approach_ratio']
+    elif label == "moving_away":
+        confidence = vz['away_ratio']
     else:
-        label = "uncertain"
-    
-    confidence = abs(pos_ratio - neg_ratio)
+        confidence = 1 - max(vz['approach_ratio'],vz["away_ratio"])
+        
     return label, confidence
 # -----------------------------
 # Relative geometry predicates
@@ -232,8 +227,8 @@ def extract_predicates(objects, ego, cfg=Config()):
             "id": obj["id"],
             "rel_motion": obj_relative_motion(obj),
             "lateral_motion": obj_lateral_motion(obj),
-            "is_moving": obj_is_moving(obj),
-            "is_turning": obj_is_turning(obj),
+            # "is_moving": obj_is_moving(obj),
+            # "is_turning": obj_is_turning(obj),
             "rank": np.mean(obj["rank"]),
         })
     
@@ -245,8 +240,8 @@ def extract_predicates(objects, ego, cfg=Config()):
             "id": obj["id"],
             "rel_motion": obj_relative_motion(obj),
             "lateral_motion": obj_lateral_motion(obj),
-            "is_moving": obj_is_moving(obj),
-            "is_turning": obj_is_turning(obj),
+            # "is_moving": obj_is_moving(obj),
+            # "is_turning": obj_is_turning(obj),
             "rank": np.mean(obj["rank"]),
             "score": score,
         })

@@ -35,6 +35,89 @@ def _extract_ego_per_segs(segments, prim_data):
         })
     return ego_in_segments
          
+         
+         
+
+def _estimate_obj_z_motion(obj_speeds):
+    """
+    Return segment-level motion stats instead of frame labels.
+    """
+    vz = np.array([float(s[1]) for s in obj_speeds])
+    
+    valid_mask = vz != -1 
+    vz = vz[valid_mask]
+    
+    if len(vz) == 0:
+        obj_motion = -1
+        return obj_motion
+    
+    # adaptive thresholds
+    eps = 0.1 * np.std(vz) if np.std(vz) > 0 else 0.01
+    
+    # -- ratios --
+    approach_ratio = (vz<-eps).mean()
+    away_ratio = (vz>eps).mean()
+    
+    # -- mean / strength ---
+    vz_mean = np.mean(vz)
+    vz_std = np.std(vz)
+    
+    # --- change detection ---
+    sign = np.sign(vz)
+    change_ratio = (np.diff(sign) != 0).mean() if len(sign) > 1 else 0
+    
+    # final label
+    if approach_ratio > 0.7:
+        label = "approaching"
+    elif away_ratio > 0.7:
+        label = "moving_away"
+    else:
+        label = "transition"
+        
+    obj_motion = {
+        "label": label,
+        "approach_ratio": approach_ratio,
+        "away_ratio": away_ratio,
+        "vz_mean": vz_mean,
+        "vz_std": vz_std,
+        "change_ratio": change_ratio
+    }
+    return obj_motion 
+
+def _estimate_obj_x_motion(obj_speeds):
+    """
+    Similar to estimate_obj_z_motion but for lateral (x) motion.
+    """
+    vx = np.array([float(s[0]) for s in obj_speeds])
+    
+    valid_mask = vx != -1 
+    vx = vx[valid_mask]
+    
+    if len(vx) == 0:
+        obj_motion = -1
+        return obj_motion
+    
+    eps = 0.1 * np.std(vx) if np.std(vx) > 0 else 0.01
+    
+    left_ratio = (vx<-eps).mean()
+    right_ratio = (vx>eps).mean()
+    
+    if left_ratio > 0.7:
+        label = "left"
+    elif right_ratio > 0.7:
+        label = "right"
+    else:
+        label = "stable"
+        
+    obj_motion = {
+        "label": label,
+        "left_ratio": left_ratio,
+        "right_ratio": right_ratio,
+        "vx_mean": np.mean(vx),
+        "vx_std": np.std(vx)
+    }
+    return obj_motion
+
 def _extract_objs_per_segs(seg_prims, objects):
     """
     For each segment primitive, collect the objects that are visible within that segment's
@@ -50,23 +133,19 @@ def _extract_objs_per_segs(seg_prims, objects):
         for obj_id in obj_ids:
             obj_seg_speed = objects['obj_speeds'][obj_id][start:end]
             obj_seg_rank = objects['obj_ranks'][obj_id][start:end]
-            obj_seg_speeds_rel = objects['obj_speeds_rel'][obj_id][start:end]
-            obj_seg_mask_o_vz_abs = objects['mask_o_vz_abs'][obj_id][start:end]
-            obj_seg_mask_o_vx_abs = objects['mask_o_vx_abs'][obj_id][start:end]
-            obj_seg_mask_o_vz_rel = objects['mask_o_vz_rel'][obj_id][start:end]
-            obj_seg_mask_o_vx_rel = objects['mask_o_vx_rel'][obj_id][start:end]
+            obj_seg_speeds_rel = objects['obj_speeds'][obj_id][start:end]
+            obj_seg_vz = _estimate_obj_z_motion(objects['obj_speeds'][obj_id][start:end])
+            obj_seg_vx = _estimate_obj_x_motion(objects['obj_speeds'][obj_id][start:end])
 
-            if np.all(obj_seg_speed==-1):
+            if np.all(obj_seg_speed == -1):
                 continue  # skip objects not visible in this segment
             objs_in_seg.append({
                 "id":         obj_id,
                 "speed":     obj_seg_speed,
                 "rank":      obj_seg_rank,
                 "speeds_rel": obj_seg_speeds_rel,
-                "mask_o_vz_abs": obj_seg_mask_o_vz_abs,
-                "mask_o_vx_abs": obj_seg_mask_o_vx_abs,
-                "mask_o_vz_rel": obj_seg_mask_o_vz_rel,
-                "mask_o_vx_rel": obj_seg_mask_o_vx_rel,
+                "vz": obj_seg_vz,
+                "vx": obj_seg_vx,
             })
         objs_in_segments.append(objs_in_seg)
     return objs_in_segments
@@ -82,15 +161,15 @@ def _gen_atoms(timeline_predicates):
         atoms_t = []
         # ego
         for k,v in pred_t['ego'].items():
-            atoms_t.append((k,v[0],t))
+            atoms_t.append((k,v[0]))
         
         # focus objects
         for obj in pred_t['focus_objects']:
-            atoms_t.append(("rel_motion",obj['rel_motion'][0],t))
+            atoms_t.append(("rel_motion",obj['rel_motion'][0]))
         
         # global
         for k, v in pred_t['global'].items():
-            atoms_t.append((k,v,t))
+            atoms_t.append((k,v))
         
         timeline_atoms.append(atoms_t)
     return timeline_atoms 
@@ -103,17 +182,18 @@ def _gen_atomic_rules(timeline_atoms, cfg=None):
     """
     def is_trivial_rule(p,q):
         return p[0]==q[0] and p[1]==q[1]
+    
     def is_valid_rule(p,q):
         p_type = p[0]
         q_type = q[0]
         
         # only keep object -> ego
-        if "rel_motion" in p_type and "ego" in q_type:
+        if "ego" in q_type:
             return True
         return False
     
     def is_valid_Q(q):
-        key, value, t = q
+        key, value = q
         if key == "ego_speed_change" and value != "constant_speed":
             return True
         if key == "ego_is_turning" and value != "not_turning":
@@ -122,7 +202,7 @@ def _gen_atomic_rules(timeline_atoms, cfg=None):
         return False
     
     def is_informative_P(p):
-        key, value, t = p
+        key, value = p
         
         if key == "rel_motion" and value == "moving_away":
             return False 
@@ -157,8 +237,8 @@ def _gen_atomic_rules(timeline_atoms, cfg=None):
                         continue
                     if not is_valid_rule(p,q):
                         continue
-                    if not is_valid_Q(q):
-                        continue
+                    # if not is_valid_Q(q):
+                    #     continue
                     if not is_informative_P(p):
                         continue
                     rule_counts[rule] +=1
@@ -244,7 +324,7 @@ def _format_rules(rules):
     for r in rules:
         p, q, dt = r["rule"]
         formated_rules.append((
-            f"{q[0]}={q[1]} at {q[2]} (Δt={dt}) :- {p[0]}={p[1]} at {p[2]}. | "
+            f"{q[0]}={q[1]} (Δt={dt}) :- {p[0]}={p[1]}. | "
             f"conf={r['confidence']:.2f}, "
             f"lift={r['lift']:.2f}, "
             f"stab={r['stability']:.2f}, "
@@ -555,10 +635,10 @@ def extract_video_predicates(vid, out_path, cfg=None):
     pred_cfg = cfg["predicate"]
     
     out_file = out_path / "predicates.json"
-    if out_file.exists() and not pred_cfg["force_recompute"]:
-        print(f"Predicates for video {vid} already exist at {out_file}, loading...")
-        with open(out_file, "r") as f:
-            return json.load(f)
+    # if out_file.exists() and not pred_cfg["force_recompute"]:
+    #     print(f"Predicates for video {vid} already exist at {out_file}, loading...")
+    #     with open(out_file, "r") as f:
+    #         return json.load(f)
     
     # load ego data
     prim_data = load_primitive_data(out_path, cfg)

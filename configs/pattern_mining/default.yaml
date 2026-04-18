@@ -24,7 +24,7 @@ preprocess:
 
 predicate:
   force_recompute: false
-  visualize: true
+  visualize: false
   vis_fps: 10
 
 rules:
