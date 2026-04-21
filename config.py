@@ -10,11 +10,21 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.absolute()
 driving_demo_video_id = "0153f03b-8fbdc1ad"
 # driving_demo_video_id = "01118704-e91b1b1c"
+DEFAULT_STORAGE_ROOT = Path("/home/ml-jsha/storage/CauVid_Data")
+DEFAULT_RAW_DRIVING_DATASET = Path("/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking")
+DEFAULT_OUTPUT_ROOT = Path(os.environ.get("CAUVID_OUTPUT_PATH", PROJECT_ROOT / "output"))
+DEFAULT_PIPELINE_OUTPUT_ROOT = Path(os.environ.get("CAUVID_PIPELINE_OUTPUT_PATH", PROJECT_ROOT / "pipeline_output"))
+DEFAULT_TEMP_ROOT = Path(os.environ.get("CAUVID_TEMP_PATH", PROJECT_ROOT / "temp"))
 
 # Dataset paths
 DATASET_PATHS = {
     # Mini driving dataset path
-    "driving_mini": PROJECT_ROOT / "dataset" / "driving_mini",
+    "driving_mini": Path(os.environ.get("CAUVID_DRIVING_MINI_PATH", PROJECT_ROOT / "dataset" / "driving_mini")),
+    # Raw driving dataset path containing .mov videos and mot_labels.csv
+    "driving_raw": Path(os.environ.get(
+        "CAUVID_RAW_DRIVING_DATASET",
+        DEFAULT_RAW_DRIVING_DATASET if DEFAULT_RAW_DRIVING_DATASET.exists() else PROJECT_ROOT / "dataset" / "driving-video-with-object-tracking",
+    )),
     # Main dataset directory
     "dataset_root": PROJECT_ROOT / "dataset",
     
@@ -25,20 +35,20 @@ DATASET_PATHS = {
 # Output paths
 OUTPUT_PATHS = {
     # General output directory
-    "output": PROJECT_ROOT / "output",
-    "driving_segmentation_visualization": PROJECT_ROOT / "output" / "driving_segmentation_visualization",
-    "driving_trajectory_visualization": PROJECT_ROOT / "output" / "driving_trajectory_visualization",
-    "driving_trajectory_visualization_smoothed": PROJECT_ROOT / "output" / "driving_trajectory_visualization_smoothed",
-    "driving_trajectory_visualization_with_frames": PROJECT_ROOT / "output" / "driving_trajectory_visualization_with_frames",
-    "driving_primitive_visualization": PROJECT_ROOT / "output" / "driving_primitive_visualization",
-    "driving_ego_primitive_visualization": PROJECT_ROOT / "output" / "driving_ego_primitive_visualization",
-    "driving_seg_feat_vis": PROJECT_ROOT / "output" / "driving_seg_feat_vis",
-    "driving_seg_grps_vis": PROJECT_ROOT / "output" / "driving_seg_grps_vis",
+    "output": DEFAULT_OUTPUT_ROOT,
+    "driving_segmentation_visualization": DEFAULT_OUTPUT_ROOT / "driving_segmentation_visualization",
+    "driving_trajectory_visualization": DEFAULT_OUTPUT_ROOT / "driving_trajectory_visualization",
+    "driving_trajectory_visualization_smoothed": DEFAULT_OUTPUT_ROOT / "driving_trajectory_visualization_smoothed",
+    "driving_trajectory_visualization_with_frames": DEFAULT_OUTPUT_ROOT / "driving_trajectory_visualization_with_frames",
+    "driving_primitive_visualization": DEFAULT_OUTPUT_ROOT / "driving_primitive_visualization",
+    "driving_ego_primitive_visualization": DEFAULT_OUTPUT_ROOT / "driving_ego_primitive_visualization",
+    "driving_seg_feat_vis": DEFAULT_OUTPUT_ROOT / "driving_seg_feat_vis",
+    "driving_seg_grps_vis": DEFAULT_OUTPUT_ROOT / "driving_seg_grps_vis",
     # Pipeline output directory
-    "pipeline_output": PROJECT_ROOT / "pipeline_output",
+    "pipeline_output": DEFAULT_PIPELINE_OUTPUT_ROOT,
     
     # Temporary output directory
-    "temp": PROJECT_ROOT / "temp",
+    "temp": DEFAULT_TEMP_ROOT,
 }
 
 # Model paths
@@ -129,7 +139,5 @@ if __name__ == "__main__":
     print(f"Project root: {PROJECT_ROOT}")
     for name, path in DATASET_PATHS.items():
         print(f"  {name}: {path}")
-
-
 
 

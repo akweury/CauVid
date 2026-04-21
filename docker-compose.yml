@@ -7,20 +7,30 @@ services:
       dockerfile: Dockerfile
     container_name: cauvid-pipeline
     volumes:
-      # Mount data directory
-      - ./two_parts:/app/two_parts:ro
-      # Mount output directory for results
-      - ./pipeline_output:/app/pipeline_output
+      # Mount raw server dataset and prepared dataset separately.
+      - ${CAUVID_RAW_DRIVING_DATASET:-/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking}:/app/raw_driving_data:ro
+      - ${CAUVID_DRIVING_MINI_HOST:-/home/ml-jsha/storage/CauVid_Data/driving_mini}:/app/dataset/driving_mini
+      - ./external:/app/external:ro
+      # Mount output directories for results and visualizations
+      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/home/ml-jsha/storage/CauVid_Data/pipeline_output}:/app/pipeline_output
+      - ${CAUVID_OUTPUT_HOST:-/home/ml-jsha/storage/CauVid_Data/output}:/app/output
       # Mount logs directory
-      - ./logs:/app/logs
+      - ${CAUVID_LOGS_HOST:-/home/ml-jsha/storage/CauVid_Data/logs}:/app/logs
+      # Persist downloaded torchvision model weights across runs
+      - ${CAUVID_TORCH_CACHE_HOST:-/home/ml-jsha/storage/CauVid_Data/.cache/torch}:/app/.cache/torch
     environment:
-      - PYTHONPATH=/app/src
+      - PYTHONPATH=/app
       - LOG_LEVEL=INFO
+      - MPLBACKEND=Agg
+      - TORCH_HOME=/app/.cache/torch
+      - CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data
+      - CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini
+      - CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output
+      - CAUVID_OUTPUT_PATH=/app/output
     networks:
       - cauvid-network
-    restart: unless-stopped
-    # Override default command for different operations
-    command: ["python", "example_usage.py"]
+    restart: "no"
+    command: ["python", "-m", "src.exp_driving_videos.pipe_utils.percept2matrix"]
 
   # Development service with interactive shell
   cauvid-dev:
@@ -31,13 +41,23 @@ services:
     volumes:
       # Mount source code for development
       - ./src:/app/src
-      - ./*.py:/app/
-      - ./two_parts:/app/two_parts:ro
-      - ./pipeline_output:/app/pipeline_output
-      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ${CAUVID_RAW_DRIVING_DATASET:-/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking}:/app/raw_driving_data:ro
+      - ${CAUVID_DRIVING_MINI_HOST:-/home/ml-jsha/storage/CauVid_Data/driving_mini}:/app/dataset/driving_mini
+      - ./external:/app/external:ro
+      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/home/ml-jsha/storage/CauVid_Data/pipeline_output}:/app/pipeline_output
+      - ${CAUVID_OUTPUT_HOST:-/home/ml-jsha/storage/CauVid_Data/output}:/app/output
+      - ${CAUVID_LOGS_HOST:-/home/ml-jsha/storage/CauVid_Data/logs}:/app/logs
+      - ${CAUVID_TORCH_CACHE_HOST:-/home/ml-jsha/storage/CauVid_Data/.cache/torch}:/app/.cache/torch
     environment:
-      - PYTHONPATH=/app/src
+      - PYTHONPATH=/app
       - LOG_LEVEL=DEBUG
+      - MPLBACKEND=Agg
+      - TORCH_HOME=/app/.cache/torch
+      - CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data
+      - CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini
+      - CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output
+      - CAUVID_OUTPUT_PATH=/app/output
     networks:
       - cauvid-network
     stdin_open: true

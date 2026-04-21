@@ -16,6 +16,7 @@ NC='\033[0m' # No Color
 IMAGE_NAME="cauvid-pipeline"
 CONTAINER_NAME="cauvid-app"
 VERSION="latest"
+REMOTE_STORAGE_ROOT="/home/ml-jsha/storage/CauVid_Data"
 
 # Functions
 print_help() {
@@ -25,7 +26,9 @@ print_help() {
     echo ""
     echo "Commands:"
     echo "  build         Build the Docker image"
-    echo "  run           Run the pipeline with example data"
+    echo "  prepare       Prepare raw .mov + CSV dataset for percept2matrix"
+    echo "  run           Run driving perception-to-matrix preprocessing"
+    echo "  preprocess    Run driving perception-to-matrix preprocessing"
     echo "  demo          Run advanced features demo"
     echo "  bonds         Run bond type classification demo"
     echo "  dev           Start development container with interactive shell"
@@ -38,10 +41,14 @@ print_help() {
     echo "Options:"
     echo "  -v, --verbose    Verbose output"
     echo "  -f, --force      Force rebuild/restart"
+    echo "  CAUVID_STORAGE_ROOT defaults outputs to /home/ml-jsha/storage/CauVid_Data when present"
+    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" enables GPU access for docker run"
     echo ""
     echo "Examples:"
     echo "  $0 build                    # Build the Docker image"
-    echo "  $0 run                      # Run example pipeline"
+    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
+    echo "  $0 run                      # Run driving preprocessing over dataset/driving_mini/videos"
+    echo "  $0 preprocess               # Same as run"
     echo "  $0 demo                     # Run advanced features demo"
     echo "  $0 dev                      # Start development environment"
     echo "  $0 clean                    # Clean up all containers and images"
@@ -71,8 +78,17 @@ check_dependencies() {
         warn "Docker Compose is not installed. Some features may not work."
     fi
     
-    if [ ! -d "two_parts" ]; then
-        warn "two_parts directory not found. Make sure your data is available."
+    local storage_root
+    storage_root="$(get_storage_root)"
+    local raw_dataset="${CAUVID_RAW_DRIVING_DATASET:-$storage_root/driving-video-with-object-tracking}"
+    local prepared_dataset="${CAUVID_DRIVING_MINI_HOST:-$storage_root/driving_mini}"
+
+    if [ ! -d "$raw_dataset" ]; then
+        warn "Raw dataset directory not found: $raw_dataset"
+    fi
+
+    if [ ! -d "$prepared_dataset" ]; then
+        warn "Prepared dataset directory not found yet: $prepared_dataset"
     fi
     
     log "Dependencies check complete"
@@ -92,21 +108,117 @@ build_image() {
     log "Image built successfully: ${IMAGE_NAME}:${VERSION}"
 }
 
+get_storage_root() {
+    if [ -n "${CAUVID_STORAGE_ROOT:-}" ]; then
+        echo "$CAUVID_STORAGE_ROOT"
+    elif [ -d "$REMOTE_STORAGE_ROOT" ]; then
+        echo "$REMOTE_STORAGE_ROOT"
+    else
+        echo "$(pwd)"
+    fi
+}
+
+get_raw_dataset() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_RAW_DRIVING_DATASET:-$storage_root/driving-video-with-object-tracking}"
+}
+
+get_prepared_dataset() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_DRIVING_MINI_HOST:-$storage_root/driving_mini}"
+}
+
+get_pipeline_output_dir() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_PIPELINE_OUTPUT_HOST:-$storage_root/pipeline_output}"
+}
+
+get_output_dir() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_OUTPUT_HOST:-$storage_root/output}"
+}
+
+get_logs_dir() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_LOGS_HOST:-$storage_root/logs}"
+}
+
+get_torch_cache_dir() {
+    local storage_root
+    storage_root="$(get_storage_root)"
+    echo "${CAUVID_TORCH_CACHE_HOST:-$storage_root/.cache/torch}"
+}
+
 run_pipeline() {
-    log "Running CauVid pipeline..."
+    log "Running driving perception-to-matrix preprocessing..."
     
-    # Create output directory if it doesn't exist
-    mkdir -p pipeline_output logs
+    # Create writable host directories for outputs, logs, and model cache.
+    local raw_dataset prepared_dataset pipeline_output_dir output_dir logs_dir torch_cache_dir
+    raw_dataset="$(get_raw_dataset)"
+    prepared_dataset="$(get_prepared_dataset)"
+    pipeline_output_dir="$(get_pipeline_output_dir)"
+    output_dir="$(get_output_dir)"
+    logs_dir="$(get_logs_dir)"
+    torch_cache_dir="$(get_torch_cache_dir)"
+    mkdir -p "$prepared_dataset" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
-        -v "$(pwd)/two_parts:/app/two_parts:ro" \
-        -v "$(pwd)/pipeline_output:/app/pipeline_output" \
-        -v "$(pwd)/logs:/app/logs" \
+        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        -v "$raw_dataset:/app/raw_driving_data:ro" \
+        -v "$prepared_dataset:/app/dataset/driving_mini" \
+        -v "$pipeline_output_dir:/app/pipeline_output" \
+        -v "$output_dir:/app/output" \
+        -v "$logs_dir:/app/logs" \
+        -v "$torch_cache_dir:/app/.cache/torch" \
+        -e PYTHONPATH=/app \
+        -e MPLBACKEND=Agg \
+        -e TORCH_HOME=/app/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/app/output \
         --name ${CONTAINER_NAME} \
         ${IMAGE_NAME}:${VERSION} \
-        python example_usage.py
+        python -m src.exp_driving_videos.pipe_utils.percept2matrix
     
-    log "Pipeline completed. Check pipeline_output/ for results."
+    log "Preprocessing completed. Check $pipeline_output_dir for per-video pipeline_data.pkl files."
+}
+
+prepare_driving_dataset() {
+    log "Preparing raw driving dataset..."
+
+    local raw_dataset prepared_dataset output_dir logs_dir torch_cache_dir
+    raw_dataset="$(get_raw_dataset)"
+    prepared_dataset="$(get_prepared_dataset)"
+    output_dir="$(get_output_dir)"
+    logs_dir="$(get_logs_dir)"
+    torch_cache_dir="$(get_torch_cache_dir)"
+    mkdir -p "$prepared_dataset" "$output_dir" "$logs_dir" "$torch_cache_dir"
+
+    docker run --rm \
+        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        -v "$raw_dataset:/app/raw_driving_data:ro" \
+        -v "$prepared_dataset:/app/dataset/driving_mini" \
+        -v "$(pwd)/external:/app/external:ro" \
+        -v "$output_dir:/app/output" \
+        -v "$logs_dir:/app/logs" \
+        -v "$torch_cache_dir:/app/.cache/torch" \
+        -e PYTHONPATH=/app \
+        -e MPLBACKEND=Agg \
+        -e TORCH_HOME=/app/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
+        -e CAUVID_OUTPUT_PATH=/app/output \
+        --name ${CONTAINER_NAME}-prepare \
+        ${IMAGE_NAME}:${VERSION} \
+        python -m src.exp_driving_videos.prepare_driving_dataset "$@"
+
+    log "Dataset preparation completed: $prepared_dataset"
 }
 
 run_demo() {
@@ -126,12 +238,30 @@ run_demo() {
             ;;
     esac
     
-    mkdir -p pipeline_output logs
+    local raw_dataset prepared_dataset pipeline_output_dir output_dir logs_dir torch_cache_dir
+    raw_dataset="$(get_raw_dataset)"
+    prepared_dataset="$(get_prepared_dataset)"
+    pipeline_output_dir="$(get_pipeline_output_dir)"
+    output_dir="$(get_output_dir)"
+    logs_dir="$(get_logs_dir)"
+    torch_cache_dir="$(get_torch_cache_dir)"
+    mkdir -p "$prepared_dataset" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
-        -v "$(pwd)/two_parts:/app/two_parts:ro" \
-        -v "$(pwd)/pipeline_output:/app/pipeline_output" \
-        -v "$(pwd)/logs:/app/logs" \
+        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        -v "$raw_dataset:/app/raw_driving_data:ro" \
+        -v "$prepared_dataset:/app/dataset/driving_mini" \
+        -v "$pipeline_output_dir:/app/pipeline_output" \
+        -v "$output_dir:/app/output" \
+        -v "$logs_dir:/app/logs" \
+        -v "$torch_cache_dir:/app/.cache/torch" \
+        -e PYTHONPATH=/app \
+        -e MPLBACKEND=Agg \
+        -e TORCH_HOME=/app/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/app/output \
         --name ${CONTAINER_NAME}-demo \
         ${IMAGE_NAME}:${VERSION} \
         python $demo_script
@@ -142,14 +272,33 @@ run_demo() {
 start_dev() {
     log "Starting development container..."
     
-    mkdir -p pipeline_output logs
+    local raw_dataset prepared_dataset pipeline_output_dir output_dir logs_dir torch_cache_dir
+    raw_dataset="$(get_raw_dataset)"
+    prepared_dataset="$(get_prepared_dataset)"
+    pipeline_output_dir="$(get_pipeline_output_dir)"
+    output_dir="$(get_output_dir)"
+    logs_dir="$(get_logs_dir)"
+    torch_cache_dir="$(get_torch_cache_dir)"
+    mkdir -p "$prepared_dataset" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run -it --rm \
+        ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$(pwd)/src:/app/src" \
-        -v "$(pwd):/app/project" \
-        -v "$(pwd)/two_parts:/app/two_parts:ro" \
-        -v "$(pwd)/pipeline_output:/app/pipeline_output" \
-        -v "$(pwd)/logs:/app/logs" \
+        -v "$(pwd)/configs:/app/configs" \
+        -v "$raw_dataset:/app/raw_driving_data:ro" \
+        -v "$prepared_dataset:/app/dataset/driving_mini" \
+        -v "$(pwd)/external:/app/external:ro" \
+        -v "$pipeline_output_dir:/app/pipeline_output" \
+        -v "$output_dir:/app/output" \
+        -v "$logs_dir:/app/logs" \
+        -v "$torch_cache_dir:/app/.cache/torch" \
+        -e PYTHONPATH=/app \
+        -e MPLBACKEND=Agg \
+        -e TORCH_HOME=/app/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/app/output \
         --name ${CONTAINER_NAME}-dev \
         ${IMAGE_NAME}:${VERSION} \
         /bin/bash
@@ -213,7 +362,17 @@ while [[ $# -gt 0 ]]; do
             COMMAND="build"
             shift
             ;;
+        prepare)
+            COMMAND="prepare"
+            shift
+            PASSTHROUGH_ARGS=("$@")
+            break
+            ;;
         run)
+            COMMAND="run"
+            shift
+            ;;
+        preprocess)
             COMMAND="run"
             shift
             ;;
@@ -277,6 +436,10 @@ check_dependencies
 case $COMMAND in
     build)
         build_image $FORCE
+        ;;
+    prepare)
+        build_image false
+        prepare_driving_dataset "${PASSTHROUGH_ARGS[@]:-}"
         ;;
     run)
         build_image false

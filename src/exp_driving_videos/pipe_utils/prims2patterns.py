@@ -577,20 +577,57 @@ def load_primitive_data(path, cfg=None):
     from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
     _get_pattern_cfg(cfg)
 
-    ego_x_speed = np.load(path / "ego_x_speeds.npy")
-    ego_z_speed = np.load(path / "ego_z_speeds.npy")
-    ego_stop_mask = np.load(path / "stop_mask.npy")
-    ego_turn_mask = np.load(path / "turning_mask.npy")
-    frame_data = utils.load_matrix(path / "video_data.pkl")['frames_data']
-    # load npz file containing the object motion data, which is a dict with keys "obj_ids", "dz_series", "labels", 
-    # and "frame_bboxes"
-    loaded = np.load(path / "obj_motion_data.npz", allow_pickle=True)    
-    obj_motion_data = {
-        key: loaded[key].item()
-        if loaded[key].shape == () and loaded[key].dtype == object
-        else loaded[key]
-        for key in loaded.files
-    }
+    path = pathlib.Path(path)
+    pipeline_file = path / "pipeline_data.pkl"
+    if pipeline_file.exists():
+        import pickle
+
+        def _read_stage(stage_name):
+            entry = pipeline_data.get("stages", {}).get(stage_name)
+            if isinstance(entry, dict) and entry.get("_stage_cache"):
+                return entry.get("data")
+            return entry
+
+        with open(pipeline_file, "rb") as f:
+            pipeline_data = pickle.load(f)
+
+        ego_data = _read_stage("ego_data")
+        video_data = _read_stage("video_data")
+        obj_motion_data = _read_stage("obj_motion_data")
+        if ego_data is None or video_data is None or obj_motion_data is None:
+            missing = [
+                name
+                for name, value in {
+                    "ego_data": ego_data,
+                    "video_data": video_data,
+                    "obj_motion_data": obj_motion_data,
+                }.items()
+                if value is None
+            ]
+            raise FileNotFoundError(
+                f"{pipeline_file} is missing required stage(s): {', '.join(missing)}"
+            )
+
+        ego_x_speed = np.asarray(ego_data["ego_x_speeds"])
+        ego_z_speed = np.asarray(ego_data["ego_z_speeds"])
+        ego_stop_mask = np.asarray(ego_data["stopped_mask"])
+        ego_turn_mask = np.asarray(ego_data["turning_mask"])
+        frame_data = video_data["frames_data"]
+    else:
+        ego_x_speed = np.load(path / "ego_x_speeds.npy")
+        ego_z_speed = np.load(path / "ego_z_speeds.npy")
+        ego_stop_mask = np.load(path / "stop_mask.npy")
+        ego_turn_mask = np.load(path / "turning_mask.npy")
+        frame_data = utils.load_matrix(path / "video_data.pkl")['frames_data']
+        # load npz file containing the object motion data, which is a dict with keys "obj_ids", "dz_series", "labels",
+        # and "frame_bboxes"
+        loaded = np.load(path / "obj_motion_data.npz", allow_pickle=True)
+        obj_motion_data = {
+            key: loaded[key].item()
+            if loaded[key].shape == () and loaded[key].dtype == object
+            else loaded[key]
+            for key in loaded.files
+        }
     primitive_data = {
         "ego_x_speed": ego_x_speed,
         "ego_z_speed": ego_z_speed, 

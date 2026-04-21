@@ -20,7 +20,171 @@ from src.exp_driving_videos.pipe_utils import exp_driving_utils as utils
 import config 
 
 
-    
+PIPELINE_DATA_FILENAME = "pipeline_data.pkl"
+PIPELINE_DATA_VERSION = 1
+
+
+def get_pipeline_data_file(out_path):
+    return pathlib.Path(out_path) / PIPELINE_DATA_FILENAME
+
+
+def load_pipeline_data(out_path, video_id=None):
+    pipeline_file = get_pipeline_data_file(out_path)
+    if pipeline_file.exists():
+        with open(pipeline_file, "rb") as f:
+            data = pickle.load(f)
+        data.setdefault("schema_version", PIPELINE_DATA_VERSION)
+        data.setdefault("video_id", video_id)
+        data.setdefault("stages", {})
+        return data
+
+    return {
+        "schema_version": PIPELINE_DATA_VERSION,
+        "video_id": video_id,
+        "stages": {},
+    }
+
+
+def save_pipeline_data(out_path, pipeline_data):
+    pipeline_file = get_pipeline_data_file(out_path)
+    pipeline_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = pipeline_file.with_suffix(f"{pipeline_file.suffix}.tmp")
+    with open(tmp_file, "wb") as f:
+        pickle.dump(pipeline_data, f)
+    os.replace(tmp_file, pipeline_file)
+    return pipeline_file
+
+
+def _stage_entry(value, params=None):
+    return {
+        "_stage_cache": True,
+        "params": params or {},
+        "data": value,
+    }
+
+
+def get_pipeline_stage(pipeline_data, stage_name, params=None):
+    stages = pipeline_data.setdefault("stages", {})
+    entry = stages.get(stage_name)
+    if not entry:
+        return None
+
+    if isinstance(entry, dict) and entry.get("_stage_cache"):
+        if params is None or (entry.get("params") or {}) == (params or {}):
+            return entry.get("data")
+        return None
+
+    # Backward compatibility if an early consolidated file stored raw values.
+    return entry if params in (None, {}) else None
+
+
+def set_pipeline_stage(pipeline_data, out_path, stage_name, value, params=None):
+    pipeline_data.setdefault("stages", {})[stage_name] = _stage_entry(value, params)
+    return save_pipeline_data(out_path, pipeline_data)
+
+
+def _legacy_load_pickle(file_path):
+    file_path = pathlib.Path(file_path)
+    if not file_path.exists():
+        return None
+    with open(file_path, "rb") as f:
+        return pickle.load(f)
+
+
+def _legacy_load_npz_dict(file_path):
+    file_path = pathlib.Path(file_path)
+    if not file_path.exists():
+        return None
+    loaded = np.load(file_path, allow_pickle=True)
+    return {
+        key: loaded[key].item()
+        if loaded[key].shape == () and loaded[key].dtype == object
+        else loaded[key]
+        for key in loaded.files
+    }
+
+
+def _motion_param_subset(motion_cfg, keys):
+    return {key: motion_cfg.get(key) for key in keys}
+
+
+def _obj_matrix_params(cfg):
+    if cfg is None:
+        source_cfg = {}
+    elif isinstance(cfg, (str, os.PathLike)) or "preprocess" in cfg:
+        source_cfg = _get_preprocess_cfg(cfg)
+    else:
+        source_cfg = cfg
+    return {
+        "min_frame_number": source_cfg.get("min_frame_number", 5),
+    }
+
+
+def _filter_params(motion_cfg):
+    return _motion_param_subset(motion_cfg, ["min_obj_frames", "min_bbox_area"])
+
+
+def _ego_params(motion_cfg):
+    return _motion_param_subset(
+        motion_cfg,
+        [
+            "smooth_window",
+            "stop_threshold",
+            "min_stop_duration",
+            "rotation_threshold",
+            "min_rot_duration",
+        ],
+    )
+
+
+def _object_speed_params(motion_cfg):
+    return _motion_param_subset(motion_cfg, ["min_obj_frames", "min_bbox_area"])
+
+
+def _load_or_compute_video_data(video_id, out_path, pipeline_data):
+    cached = get_pipeline_stage(pipeline_data, "video_data")
+    if cached is not None:
+        print(f"Loading cached video data from: {get_pipeline_data_file(out_path)}")
+        return cached
+
+    legacy_file = out_path / "video_data.pkl"
+    legacy = _legacy_load_pickle(legacy_file)
+    if legacy is not None:
+        print(f"Migrating cached video data into: {get_pipeline_data_file(out_path)}")
+        set_pipeline_stage(pipeline_data, out_path, "video_data", legacy)
+        return legacy
+
+    input_data = utils.load_driving_mini_inputs(video_id)
+    frames_data = utils.raw2frame_data(input_data, video_id)
+    bg_mask = utils.extract_bg_mask(frames_data, video_id)
+    depth_maps = [fd["depth_map"] for fd in frames_data]
+    flows = _load_or_compute_flow(frames_data, video_id)
+    video_data = {
+        "frames_data": frames_data,
+        "bg_masks": bg_mask,
+        "depth_maps": depth_maps,
+        "flows": flows,
+    }
+    set_pipeline_stage(pipeline_data, out_path, "video_data", video_data)
+    return video_data
+
+
+def _load_or_compute_flow(frames_data, video_id):
+    legacy_flow_file = config.get_output_path("pipeline_output") / f"optical_flow_{video_id}.npy"
+    if legacy_flow_file.exists():
+        print(f"Loading legacy cached optical flow: {legacy_flow_file}")
+        return np.load(legacy_flow_file)
+
+    flows = []
+    for i in range(len(frames_data) - 1):
+        frame1 = utils.load_frame(frames_data[i]["frame"])
+        frame2 = utils.load_frame(frames_data[i + 1]["frame"])
+        flow = utils.compute_optical_flow(frame1, frame2)
+        flows.append(flow)
+    return flows
+
+
+
 def estimate3d_positions(bboxes, depth_map_file_name, frame_path):
     """
     Estimate 3D positions of objects based on bounding boxes and depth maps.
@@ -106,7 +270,7 @@ def estimate3d_positions(bboxes, depth_map_file_name, frame_path):
 
 
 
-def raw2objs(frames_data, video_id, out_path, cfg):
+def raw2objs(frames_data, video_id, out_path, cfg, pipeline_data=None):
     
     """
     Convert raw frame data to objects with 3D positions
@@ -114,46 +278,54 @@ def raw2objs(frames_data, video_id, out_path, cfg):
     """
     
     
-    # load the matrix if it already exists
+    params = _obj_matrix_params(cfg)
+    if pipeline_data is not None:
+        cached = get_pipeline_stage(pipeline_data, "smoothed_object_matrices", params)
+        if cached is not None:
+            print(f"Loading cached smoothed object matrices from: {get_pipeline_data_file(out_path)}")
+            return cached
+
     matrix_file = out_path / f"smoothed_object_matrices.pkl"
-    if matrix_file.exists():
-        print(f"Matrix file already exists for video {video_id}, loading from file: {matrix_file}")
-        smoothed_matrices = utils.load_matrix(matrix_file)  # This will print the loaded matrix for debugging
-    else:
-        obj_matrices = {}
-        for frame_index, frame_data in enumerate(frames_data):
-            # Process the frame data to create a matrix representation
-            # use frame image, depth map, bounding boxes, labels to create a matrix representation of the scene
-            bboxes = frame_data["bboxes"]
-            labels = frame_data["labels"]
-            depth_map = frame_data["depth_map"]
-            frame = frame_data["frame"]
-            obj_ids = frame_data["obj_ids"]
-            
-            positions_3d = estimate3d_positions(bboxes, depth_map, frame)  # Function to estimate 3D positions from bounding boxes and depth map
-            for obj_id, label, position, bbox in zip(obj_ids, labels, positions_3d, bboxes):
-                if obj_id not in obj_matrices:
-                    obj_matrices[obj_id] = {
-                        "label": label,
-                        "position": [position],
-                        "frames": [frame],
-                        "bboxes": [bbox],
-                        "frame_indices": [frame_index]
-                    }
-                else:
-                    obj_matrices[obj_id]["position"].append(position)
-                    obj_matrices[obj_id]["bboxes"].append(bbox)
-                    obj_matrices[obj_id]["frames"].append(frame)
-                    obj_matrices[obj_id]["frame_indices"].append(frame_index)
-        # filter out objects that appear in less than min_frame_number frames
-        min_frame_number = cfg.get("min_frame_number", 5)
-        filtered_obj_matrices = {obj_id: data for obj_id, data in obj_matrices.items() if len(data["position"]) >= min_frame_number}
+    legacy = _legacy_load_pickle(matrix_file)
+    if legacy is not None:
+        print(f"Migrating cached smoothed object matrices into: {get_pipeline_data_file(out_path)}")
+        if pipeline_data is not None:
+            set_pipeline_stage(pipeline_data, out_path, "smoothed_object_matrices", legacy, params)
+        return legacy
+
+    obj_matrices = {}
+    for frame_index, frame_data in enumerate(frames_data):
+        # Process the frame data to create a matrix representation.
+        bboxes = frame_data["bboxes"]
+        labels = frame_data["labels"]
+        depth_map = frame_data["depth_map"]
+        frame = frame_data["frame"]
+        obj_ids = frame_data["obj_ids"]
         
-        if len(filtered_obj_matrices) == 0:
-            print(f"No valid object matrices found for video {video_id} after filtering with min_frame_number={min_frame_number}.")
-        smoothed_matrices = smooth_matrices(filtered_obj_matrices)
-        # save the smoothed_matrices for later use
-        save_matrices(smoothed_matrices, out_path)   
+        positions_3d = estimate3d_positions(bboxes, depth_map, frame)  # Function to estimate 3D positions from bounding boxes and depth map
+        for obj_id, label, position, bbox in zip(obj_ids, labels, positions_3d, bboxes):
+            if obj_id not in obj_matrices:
+                obj_matrices[obj_id] = {
+                    "label": label,
+                    "position": [position],
+                    "frames": [frame],
+                    "bboxes": [bbox],
+                    "frame_indices": [frame_index]
+                }
+            else:
+                obj_matrices[obj_id]["position"].append(position)
+                obj_matrices[obj_id]["bboxes"].append(bbox)
+                obj_matrices[obj_id]["frames"].append(frame)
+                obj_matrices[obj_id]["frame_indices"].append(frame_index)
+    # filter out objects that appear in less than min_frame_number frames
+    min_frame_number = params["min_frame_number"]
+    filtered_obj_matrices = {obj_id: data for obj_id, data in obj_matrices.items() if len(data["position"]) >= min_frame_number}
+
+    if len(filtered_obj_matrices) == 0:
+        print(f"No valid object matrices found for video {video_id} after filtering with min_frame_number={min_frame_number}.")
+    smoothed_matrices = smooth_matrices(filtered_obj_matrices)
+    if pipeline_data is not None:
+        set_pipeline_stage(pipeline_data, out_path, "smoothed_object_matrices", smoothed_matrices, params)
     return smoothed_matrices
 
 
@@ -444,7 +616,7 @@ def percept2obj_dist_rank_and_bboxes(obj_matrix, video_data):
     
     
     
-def percept2obj_speed(video_id, obj_matrix, video_data, ego_data, cfg=None):
+def percept2obj_speed(video_id, obj_matrix, video_data, ego_data, cfg=None, pipeline_data=None):
     """
     Compute per-frame speed for every tracked object across the full video.
 
@@ -477,35 +649,50 @@ def percept2obj_speed(video_id, obj_matrix, video_data, ego_data, cfg=None):
     min_bbox_area  = cfg.get("min_bbox_area", 400) if cfg else 400
     
     ego_motion = (ego_data["ego_x_speeds"], ego_data["ego_z_speeds"])
+    params = _object_speed_params(cfg or {})
+    out_path = cfg.get("out_path") if cfg else None
+    if pipeline_data is not None:
+        cached = get_pipeline_stage(pipeline_data, "object_speeds", params)
+        if cached is not None:
+            print(f"Loading cached object speeds from: {get_pipeline_data_file(out_path)}")
+            return cached
+
     obj_speed_file = config.get_output_path("pipeline_output") / f"object_speeds_{video_id}.pkl"
-    if obj_speed_file.exists():
-        print(f"Object speed file already exists for video {video_id}, loading from file: {obj_speed_file}")
-        obj_speeds = utils.load_matrix(obj_speed_file)  # This will print the loaded speeds for debugging
-    else:
-        num_frames = len(bg_masks)
-        obj_speeds = {}
+    legacy = _legacy_load_pickle(obj_speed_file)
+    if legacy is not None:
+        if out_path is not None:
+            print(f"Migrating cached object speeds into: {get_pipeline_data_file(out_path)}")
+        else:
+            print(f"Loading legacy cached object speeds: {obj_speed_file}")
+        if pipeline_data is not None and out_path is not None:
+            set_pipeline_stage(pipeline_data, out_path, "object_speeds", legacy, params)
+        return legacy
 
-        for obj_id, data in obj_matrix.items():
-            positions     = data["position"]        # list of Tensor(3,)
-            frame_indices = data["frame_indices"]   # list of int
-            bboxes = data["bboxes"]
+    num_frames = len(bg_masks)
+    obj_speeds = {}
 
-            # skip objects that appear too rarely
-            if len(frame_indices) < min_obj_frames:
-                continue
+    for obj_id, data in obj_matrix.items():
+        positions     = data["position"]        # list of Tensor(3,)
+        frame_indices = data["frame_indices"]   # list of int
+        bboxes = data["bboxes"]
 
-            # core speed computation over observed frames only
-            obj_vx, obj_vz = _compute_obj_speed_from_flow(bboxes, frame_indices, bg_masks, flows, depth_maps, ego_motion, min_bbox_area)
-            # scatter into the full timeline; NaN entries (small-bbox frames) stay absent
-            speed_track = np.zeros((num_frames, 2), dtype=np.float32) - 1.0
-            for obs_i, fi in enumerate(frame_indices):
-                if 0 <= fi < num_frames:
-                    vx, vz = obj_vx[obs_i], obj_vz[obs_i]
-                    if not (np.isnan(vx) or np.isnan(vz)):
-                        speed_track[fi] = [vx, vz]
-            obj_speeds[obj_id] = speed_track
-        # save the computed speeds for later use
-        utils.save_pkl_file(obj_speed_file,obj_speeds)
+        # skip objects that appear too rarely
+        if len(frame_indices) < min_obj_frames:
+            continue
+
+        # core speed computation over observed frames only
+        obj_vx, obj_vz = _compute_obj_speed_from_flow(bboxes, frame_indices, bg_masks, flows, depth_maps, ego_motion, min_bbox_area)
+        # scatter into the full timeline; NaN entries (small-bbox frames) stay absent
+        speed_track = np.zeros((num_frames, 2), dtype=np.float32) - 1.0
+        for obs_i, fi in enumerate(frame_indices):
+            if 0 <= fi < num_frames:
+                vx, vz = obj_vx[obs_i], obj_vz[obs_i]
+                if not (np.isnan(vx) or np.isnan(vz)):
+                    speed_track[fi] = [vx, vz]
+        obj_speeds[obj_id] = speed_track
+
+    if pipeline_data is not None and out_path is not None:
+        set_pipeline_stage(pipeline_data, out_path, "object_speeds", obj_speeds, params)
     return obj_speeds
 
 def estimate_obj_z_motion(obj_speeds, motion_cfg):
@@ -1759,18 +1946,26 @@ def visualize_ego_rotation(frames_data, ego_rotations, video_id,
     print(f"Saved ego rotation visualization ({num_frames} frames) → {out_path}")
     return out_path
 
-def est_obj_motion_data(video_data, ego_data, obj_matrix, video_id, motion_cfg, vis_cfg):
+def est_obj_motion_data(video_data, ego_data, obj_matrix, video_id, motion_cfg, vis_cfg, pipeline_data=None):
     
     out_path = motion_cfg.get("out_path", get_out_path(video_id))
+    params = _object_speed_params(motion_cfg)
+    if pipeline_data is not None:
+        cached = get_pipeline_stage(pipeline_data, "obj_motion_data", params)
+        if cached is not None:
+            print(f"Loading cached object motion data from: {get_pipeline_data_file(out_path)}")
+            return cached
+
     obj_motion_data_file = out_path / f"obj_motion_data.npz"
-    # if obj_motion_data_file.exists():
-    #     print(f"Object motion data file already exists for video {video_id}, loading from file: {obj_motion_data_file}")
-    #     loaded = np.load(obj_motion_data_file, allow_pickle=True)
-    #     obj_data = {k: loaded[k].item() for k in loaded.files}
-    #     return obj_data
+    legacy = _legacy_load_npz_dict(obj_motion_data_file)
+    if legacy is not None:
+        print(f"Migrating cached object motion data into: {get_pipeline_data_file(out_path)}")
+        if pipeline_data is not None:
+            set_pipeline_stage(pipeline_data, out_path, "obj_motion_data", legacy, params)
+        return legacy
     
     
-    obj_speeds = percept2obj_speed(video_id, obj_matrix, video_data, ego_data, cfg=motion_cfg)
+    obj_speeds = percept2obj_speed(video_id, obj_matrix, video_data, ego_data, cfg=motion_cfg, pipeline_data=pipeline_data)
     obj_ranks, obj_bboxes = percept2obj_dist_rank_and_bboxes(obj_matrix, video_data)    
     obj_data = {
         "obj_speeds": obj_speeds,
@@ -1780,9 +1975,9 @@ def est_obj_motion_data(video_data, ego_data, obj_matrix, video_id, motion_cfg, 
     # visualize_full_scene(video_data["frames_data"], video_id, ego_data, obj_data, out_path)
     # visualize_obj_speed(video_data["frames_data"], video_id, ego_data, obj_data, **vis_cfg)
 
-    # save the object motion data for later use
-    np.savez(obj_motion_data_file, **obj_data)    
-    print(f"Saved object motion data for video {video_id} → {obj_motion_data_file}")
+    if pipeline_data is not None:
+        set_pipeline_stage(pipeline_data, out_path, "obj_motion_data", obj_data, params)
+        print(f"Saved object motion data for video {video_id} → {get_pipeline_data_file(out_path)}")
     return obj_data
     
 def get_out_path(video_id):
@@ -1791,9 +1986,16 @@ def get_out_path(video_id):
     return out_path
 
 
-def est_motion_mask(video_id, video_data, motion_cfg, vis_cfg):
+def est_motion_mask(video_id, video_data, motion_cfg, vis_cfg, pipeline_data=None):
        
     out_path = get_out_path(video_id)
+    params = _ego_params(motion_cfg)
+    if pipeline_data is not None:
+        cached = get_pipeline_stage(pipeline_data, "ego_data", params)
+        if cached is not None:
+            print(f"Loading cached ego motion data from: {get_pipeline_data_file(out_path)}")
+            return cached
+
     stop_mask_file = out_path / f"stop_mask.npy"
     turnning_mask_file = out_path / f"turning_mask.npy"
     ego_x_speeds_file = out_path / f"ego_x_speeds.npy"
@@ -1805,6 +2007,16 @@ def est_motion_mask(video_id, video_data, motion_cfg, vis_cfg):
         turning_mask = np.load(turnning_mask_file)
         ego_x_speeds = np.load(ego_x_speeds_file)
         ego_z_speeds = np.load(ego_z_speeds_file)
+        ego_data = {
+            "ego_x_speeds": ego_x_speeds,
+            "ego_z_speeds": ego_z_speeds,
+            "stopped_mask": stopped_mask,
+            "turning_mask": turning_mask,
+        }
+        if pipeline_data is not None:
+            print(f"Migrating cached ego motion data into: {get_pipeline_data_file(out_path)}")
+            set_pipeline_stage(pipeline_data, out_path, "ego_data", ego_data, params)
+        return ego_data
     else:
         """Estimate and visualize the ego stop mask for a single video."""
         ego_x_speeds, ego_z_speeds = percept2ego_speed(video_data, motion_cfg)
@@ -1814,19 +2026,15 @@ def est_motion_mask(video_id, video_data, motion_cfg, vis_cfg):
         print(f"[stop] Visualizing ego speed for video: {video_id}")
         visualize_mask(video_data['frames_data'], ego_z_speeds, ego_x_speeds, stopped_mask,turning_mask, video_id, **vis_cfg)
         # visualize_ego_speed(frames_data, ego_x_speeds, ego_z_speeds, video_id, stopped_mask,turning_mask, **vis_cfg)
-        
-        # save the stop mask and ego speeds for later use
-        np.save(stop_mask_file, stopped_mask)
-        np.save(ego_x_speeds_file, ego_x_speeds)
-        np.save(ego_z_speeds_file, ego_z_speeds)
-        np.save(turnning_mask_file, turning_mask)
-    ego_motion = (ego_x_speeds, ego_z_speeds)
+
     ego_data = {
         "ego_x_speeds": ego_x_speeds,
         "ego_z_speeds": ego_z_speeds,
         "stopped_mask": stopped_mask,
         "turning_mask": turning_mask,
     }
+    if pipeline_data is not None:
+        set_pipeline_stage(pipeline_data, out_path, "ego_data", ego_data, params)
     return ego_data 
 
 
@@ -1921,7 +2129,7 @@ def rank_objects_by_distance(obj_matrix, depth_maps, frames_data):
 
     return ranked
 
-def filter_obj_matrix(obj_matrix, motion_cfg):
+def filter_obj_matrix(obj_matrix, motion_cfg, pipeline_data=None):
     """
     Filter an object matrix, keeping only objects with sufficient observations
     and reasonably sized bounding boxes.
@@ -1953,13 +2161,20 @@ def filter_obj_matrix(obj_matrix, motion_cfg):
     out_path = motion_cfg.get("out_path", config.get_output_path("pipeline_output"))
     min_obj_frames = motion_cfg.get("min_obj_frames", 5)
     min_bbox_area = motion_cfg.get("min_bbox_area", 400)
+    params = _filter_params(motion_cfg)
+    if pipeline_data is not None:
+        cached = get_pipeline_stage(pipeline_data, "filtered_obj_matrix", params)
+        if cached is not None:
+            print(f"Loading cached filtered object matrix from: {get_pipeline_data_file(out_path)}")
+            return cached
     
     filtered_file = out_path / f"filtered_obj_matrix_minframes{min_obj_frames}_minarea{min_bbox_area}.pkl"
-    if filtered_file.exists():
-        print(f"Filtered object matrix file already exists, loading from file: {filtered_file}")
-        with open(filtered_file, "rb") as f:
-            filtered = pickle.load(f)
-        return filtered
+    legacy = _legacy_load_pickle(filtered_file)
+    if legacy is not None:
+        print(f"Migrating cached filtered object matrix into: {get_pipeline_data_file(out_path)}")
+        if pipeline_data is not None:
+            set_pipeline_stage(pipeline_data, out_path, "filtered_obj_matrix", legacy, params)
+        return legacy
     else:
         filtered = {}
         for obj_id, data in obj_matrix.items():
@@ -1995,10 +2210,9 @@ def filter_obj_matrix(obj_matrix, motion_cfg):
 
         print(f"filter_obj_matrix: {len(obj_matrix)} objects → {len(filtered)} kept "
             f"(min_frames={min_obj_frames}, min_bbox_area={min_bbox_area})")
-        # save the filtered matrix for later use
-        with open(filtered_file, "wb") as f:
-            pickle.dump(filtered, f)
-    return filtered
+        if pipeline_data is not None:
+            set_pipeline_stage(pipeline_data, out_path, "filtered_obj_matrix", filtered, params)
+        return filtered
 
 
 def _get_preprocess_cfg(cfg=None):
@@ -2043,22 +2257,30 @@ def _get_cfgs(out_path, cfg=None):
     
 def run_single_video(video_id, cfg=None):
     out_path = get_out_path(video_id)
+    pipeline_data = load_pipeline_data(out_path, video_id)
     motion_cfg, vis_cfg = _get_cfgs(out_path, cfg)
     
     # ----------- Estimate ego motion masks (stopped, turning) and visualize them -----------
     print(f"Estimating Ego mask for video: {video_id}")
-    video_data = utils.load_video_data(out_path, video_id)
-    ego_data = est_motion_mask(video_id, video_data, motion_cfg, vis_cfg)
+    video_data = _load_or_compute_video_data(video_id, out_path, pipeline_data)
+    ego_data = est_motion_mask(video_id, video_data, motion_cfg, vis_cfg, pipeline_data)
 
     # ----------- Estimate object motion data and visualize the full scene -----------
     print(f"Estimating Other mask for video: {video_id}")
-    objs = raw2objs(video_data['frames_data'], video_id, out_path, cfg)
-    objs_filtered = filter_obj_matrix(objs, motion_cfg)
-    objs_ranked = rank_objects_by_distance(objs_filtered, video_data['depth_maps'], video_data['frames_data'])
+    objs = raw2objs(video_data['frames_data'], video_id, out_path, cfg, pipeline_data)
+    objs_filtered = filter_obj_matrix(objs, motion_cfg, pipeline_data)
+
+    ranked_params = _filter_params(motion_cfg)
+    objs_ranked = get_pipeline_stage(pipeline_data, "ranked_obj_matrix", ranked_params)
+    if objs_ranked is None:
+        objs_ranked = rank_objects_by_distance(objs_filtered, video_data['depth_maps'], video_data['frames_data'])
+        set_pipeline_stage(pipeline_data, out_path, "ranked_obj_matrix", objs_ranked, ranked_params)
+    else:
+        print(f"Loading cached ranked object matrix from: {get_pipeline_data_file(out_path)}")
     
     # ------------ Estimate object motion data and visualize the full scene -----------
-    obj_data = est_obj_motion_data(video_data, ego_data, objs_ranked, video_id, motion_cfg, vis_cfg)
-    print(f"Finished processing video {video_id}. Output saved to {out_path}")
+    obj_data = est_obj_motion_data(video_data, ego_data, objs_ranked, video_id, motion_cfg, vis_cfg, pipeline_data)
+    print(f"Finished processing video {video_id}. Output saved to {get_pipeline_data_file(out_path)}")
     
     
 def main():

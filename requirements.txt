@@ -8,10 +8,14 @@ torchvision
 # Feature extraction and analysis dependencies
 scikit-learn
 scipy
+matplotlib
+seaborn
 
 # Data handling
 pathlib2
 dataclasses-json
+pandas
+PyYAML
 
 # Causal discovery dependencies
 tigramite
@@ -20,6 +24,8 @@ numba
 # Utilities
 tqdm
 kagglehub
+imageio
+imageio-ffmpeg
 
 # Depth Anything 3 dependencies
 omegaconf

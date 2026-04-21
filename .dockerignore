@@ -44,17 +44,18 @@ venv.bak/
 # Output directories (these should be mounted as volumes)
 pipeline_output/*
 logs/*
+output/*
+temp/*
 
 # Test files
 test_*.py
 *_test.py
 tests/
 
-# Demo files (optional - comment out if you want to include them)
-demo_*.py
-
 # Data files (these should be mounted as volumes)
+dataset/
 two_parts/
+external/
 *.zip
 *.tar.gz
 
