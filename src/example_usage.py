@@ -12,7 +12,7 @@ from pathlib import Path
 # Add src to path to import pipeline modules
 sys.path.append(str(Path(__file__).parent / "src"))
 
-from video_pipeline import VideoPipeline, ObjectDetector
+from video_pipeline import VideoPipeline
 import json
 import logging
 import numpy as np
@@ -23,28 +23,32 @@ logger = logging.getLogger(__name__)
 
 
 def run_example():
-    """Run a simple example of the pipeline with advanced feature extraction."""
+    """Run a simple example of the current pipeline."""
     
     # Configuration
     TWO_PARTS_ROOT = "./two_parts"  # Path to the two_parts directory
     OUTPUT_DIR = "./pipeline_output"
     
-    logger.info("Starting CauVid Pipeline Example with Feature Extraction")
+    logger.info("Starting CauVid Pipeline Example")
     
     try:
-        # Initialize the pipeline with circle detector and bond analysis
+        # Initialize the pipeline with circle detector
         pipeline = VideoPipeline(
             TWO_PARTS_ROOT, 
             OUTPUT_DIR, 
             detector_type="circle", 
             position_threshold=20.0,
-            bond_threshold=0.8,  # Bond similarity threshold
             frame_height=480,    # Frame dimensions for normalization
             frame_width=640
         )
         
         # Get pipeline summary
-        summary = pipeline.get_pipeline_summary()
+        summary = {
+            "dataset_root": TWO_PARTS_ROOT,
+            "output_dir": OUTPUT_DIR,
+            "detector_type": "circle",
+            "position_threshold": 20.0,
+        }
         logger.info("Pipeline Configuration:")
         print(json.dumps(summary, indent=2))
         
@@ -55,46 +59,48 @@ def run_example():
             logger.error("No observations found! Please check the two_parts directory.")
             return
         
-        # Process the first observation with full feature extraction
+        # Process the first observation
         example_observation = observation_ids[0]
         logger.info(f"Processing example observation: {example_observation}")
         
-        # Process with feature extraction and bond analysis
         results = pipeline.process_observation(
             example_observation,
             include_ground_truth=True,
-            extract_features=True,
-            analyze_bonds=True
+            extract_features=False,
+            analyze_bonds=False
         )
         
         # Extract results
-        matrix = results['object_centric_matrix']
+        frames_data = results['frames_data']
         time_series_matrix = results['time_series_matrix']
+        overall_metrics = results.get('overall_metrics')
+        stats = results.get('statistics', {})
         object_features = results.get('object_features', {})
         object_bonds = results.get('object_bonds', {})
         video_segments = results.get('video_segments', [])
         
         # Print processing results
         logger.info("Processing Results:")
-        logger.info(f"  - Processed {len(matrix.frames_data)} frames")
-        logger.info(f"  - Detected {len(matrix.object_tracks)} object tracks")
+        logger.info(f"  - Processed {len(frames_data)} frames")
+        logger.info(f"  - Detected {len(time_series_matrix.object_tracks)} object tracks")
         
         # Show precision metrics if available
-        if matrix.overall_metrics:
-            logger.info(f"  - Overall Precision: {matrix.overall_metrics.precision:.3f}")
-            logger.info(f"  - Overall Recall: {matrix.overall_metrics.recall:.3f}")
-            logger.info(f"  - Overall F1-Score: {matrix.overall_metrics.f1_score:.3f}")
-            logger.info(f"  - Mean Position Error: {matrix.overall_metrics.mean_position_error:.2f} pixels")
+        if overall_metrics:
+            logger.info(f"  - Overall Precision: {overall_metrics.precision:.3f}")
+            logger.info(f"  - Overall Recall: {overall_metrics.recall:.3f}")
+            logger.info(f"  - Overall F1-Score: {overall_metrics.f1_score:.3f}")
+            logger.info(f"  - Mean Position Error: {overall_metrics.mean_position_error:.2f} pixels")
         
         # Show time-series matrix information
         logger.info("\nTime-Series Matrix Results:")
         logger.info(f"  - Matrix dimensions: {time_series_matrix.num_frames} frames × {len(time_series_matrix.object_tracks)} objects")
         
         # Show velocity statistics
-        vel_stats = time_series_matrix.get_velocity_statistics()
-        logger.info(f"  - Mean velocity: ({vel_stats['mean_velocity_x']:.2f}, {vel_stats['mean_velocity_y']:.2f}) px/frame")
-        logger.info(f"  - Mean speed: {vel_stats['mean_speed']:.2f} px/frame")
-        logger.info(f"  - Max speed: {vel_stats['max_speed']:.2f} px/frame")
+        if 'mean_velocity' in stats:
+            mean_velocity_x, mean_velocity_y = stats['mean_velocity']
+            logger.info(f"  - Mean velocity: ({mean_velocity_x:.2f}, {mean_velocity_y:.2f}) px/frame")
+            logger.info(f"  - Mean speed: {stats['mean_speed']:.2f} px/frame")
+            logger.info(f"  - Max speed: {stats['max_speed']:.2f} px/frame")
         
         # Show feature extraction results
         if object_features:
@@ -156,17 +162,16 @@ def run_example():
             first_obj_id = list(time_series_matrix.object_tracks.keys())[0]
             trajectory = time_series_matrix.get_object_trajectory(first_obj_id)
             logger.info(f"\nSample trajectory for {first_obj_id}:")
-            logger.info(f"  - Frames tracked: {len(trajectory['frame_indices'])}")
-            logger.info(f"  - Start position: ({trajectory['position_x'][0]:.1f}, {trajectory['position_y'][0]:.1f})")
-            if len(trajectory['position_x']) > 1:
-                logger.info(f"  - End position: ({trajectory['position_x'][-1]:.1f}, {trajectory['position_y'][-1]:.1f})")
-                displacement = np.sqrt((trajectory['position_x'][-1] - trajectory['position_x'][0])**2 + 
-                                     (trajectory['position_y'][-1] - trajectory['position_y'][0])**2)
+            logger.info(f"  - Frames tracked: {len(trajectory)}")
+            logger.info(f"  - Start position: ({trajectory[0]['position_x']:.1f}, {trajectory[0]['position_y']:.1f})")
+            if len(trajectory) > 1:
+                logger.info(f"  - End position: ({trajectory[-1]['position_x']:.1f}, {trajectory[-1]['position_y']:.1f})")
+                displacement = np.sqrt((trajectory[-1]['position_x'] - trajectory[0]['position_x'])**2 + 
+                                     (trajectory[-1]['position_y'] - trajectory[0]['position_y'])**2)
                 logger.info(f"  - Total displacement: {displacement:.2f} px")
         
         # Log output files
         logger.info("\nOutput Files Created:")
-        logger.info(f"  - Object-centric matrix: {OUTPUT_DIR}/{example_observation}_processed.json")
         logger.info(f"  - Time-series matrix: {OUTPUT_DIR}/{example_observation}_timeseries.json")
         logger.info(f"  - Time-series numpy: {OUTPUT_DIR}/{example_observation}_timeseries.npz")
         if object_features:

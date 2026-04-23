@@ -9,6 +9,10 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
+            "args": [
+                "--config",
+                "configs/exp_nuScenes/default.yaml"
+            ],
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"

@@ -1,0 +1,25 @@
+dataroot: dataset/nuScenes/v1.0-mini
+version: v1.0-mini
+
+# Use scene_names for multiple scenes. A single scene can also be written
+# under "scene" and will be treated the same way.
+scene_names:
+  - scene-0061
+
+max_samples: null
+camera: CAM_FRONT
+ego_channel: CAM_FRONT
+
+visualize_ego_motion: true
+ego_motion_fps: 2.0
+include_sweeps: false
+
+output_root: pipeline_output/nuScenes_from_config
+force_recompute: true
+
+motion_segment_params:
+  forward_stop_threshold_mps: 0.25
+  forward_accel_threshold_mps2: 0.5
+  lateral_speed_threshold_mps: 0.1
+  min_segment_frames: 2
+  smoothing_window: 3

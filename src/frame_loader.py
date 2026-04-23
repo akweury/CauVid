@@ -21,6 +21,28 @@ class VideoFrameLoader:
         self.dataset_root = Path(dataset_root)
         self.observation_dir = self.dataset_root / "observation"
         self.intervention_dir = self.dataset_root / "intervention"
+
+    def _resolve_sequence_dir(self, sequence_id: str, obs_type: str = "observation") -> Path:
+        """Resolve flat or variant-nested dataset directories."""
+        if obs_type == "observation":
+            base_dir = self.observation_dir
+            variant_prefix = "observation"
+        elif obs_type == "intervention":
+            base_dir = self.intervention_dir
+            variant_prefix = "intervention"
+        else:
+            raise ValueError(f"Unknown observation type: {obs_type}")
+
+        direct_dir = base_dir / sequence_id
+        if (direct_dir / "frames").exists():
+            return direct_dir
+
+        variant_dir = f"{variant_prefix}_{sequence_id.split('_')[1]}"
+        nested_dir = base_dir / variant_dir / sequence_id
+        if (nested_dir / "frames").exists():
+            return nested_dir
+
+        return direct_dir
         
     
     def get_observation_ids(self) -> List[str]:
@@ -29,6 +51,15 @@ class VideoFrameLoader:
             logger.warning(f"Observation directory not found: {self.observation_dir}")
             return []
         
+        flat_observation_ids = sorted([
+            item.name for item in self.observation_dir.iterdir()
+            if item.is_dir()
+            and item.name.startswith("observation_")
+            and (item / "frames").exists()
+        ])
+        if flat_observation_ids:
+            return flat_observation_ids
+
         obs_in_all_variants = []
         variant_dirs = sorted([d for d in self.observation_dir.iterdir() 
                               if d.is_dir() and not d.name.startswith('.')])
@@ -48,6 +79,15 @@ class VideoFrameLoader:
             logger.warning(f"Observation directory not found: {self.observation_dir}")
             return []
         
+        flat_inv_ids = sorted([
+            item.name for item in self.intervention_dir.iterdir()
+            if item.is_dir()
+            and item.name.startswith("intervention_")
+            and (item / "frames").exists()
+        ])
+        if flat_inv_ids:
+            return flat_inv_ids
+
         all_inv_ids = []
         for variant_inv in sorted([d for d in self.intervention_dir.iterdir() 
                                   if d.is_dir() and not d.name.startswith('.')]):
@@ -66,14 +106,7 @@ class VideoFrameLoader:
     
     def load_frames(self, observation_id: str, obs_type: str ="observation") -> List[FrameData]:
         """Load all frames for a given observation."""
-        variant_dir = f"observation_{observation_id.split('_')[1]}"
-        
-        if obs_type == "observation":
-            frames_dir = self.observation_dir / variant_dir / observation_id / "frames"
-        elif obs_type == "intervention":
-            frames_dir = self.intervention_dir / variant_dir / observation_id / "frames"
-        else:
-            raise ValueError(f"Unknown observation type: {obs_type}")
+        frames_dir = self._resolve_sequence_dir(observation_id, obs_type=obs_type) / "frames"
         
         if not frames_dir.exists():
             raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
@@ -102,7 +135,7 @@ class VideoFrameLoader:
     
     def load_ground_truth(self, observation_id: str) -> Dict[int, List[DetectedObject]]:
         """Load ground truth object annotations for an observation."""
-        meta_file = self.observation_dir / observation_id / "meta.json"
+        meta_file = self._resolve_sequence_dir(observation_id) / "meta.json"
         
         if not meta_file.exists():
             logger.warning(f"No ground truth found: {meta_file}")
@@ -143,13 +176,7 @@ class VideoFrameLoader:
     
     def get_frame_path(self, observation_id: str, frame_idx: int, obs_type: str ="observation") -> Path:
         """Get the file path for a specific frame."""
-        if obs_type == "observation":
-            frames_dir = self.variant_dir / observation_id / "frames"
-        elif obs_type == "intervention":
-            raise NotImplementedError("Intervention frame path retrieval not implemented yet.")
-            frames_dir = self.intervention_dir / observation_id / "frames"
-        else:
-            raise ValueError(f"Unknown observation type: {obs_type}")
+        frames_dir = self._resolve_sequence_dir(observation_id, obs_type=obs_type) / "frames"
         
         # Try common naming patterns
         for ext in ['.jpg', '.png', '.jpeg']:
