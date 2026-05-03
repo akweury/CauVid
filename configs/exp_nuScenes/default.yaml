@@ -5,6 +5,15 @@ version: v1.0-mini
 # under "scene" and will be treated the same way.
 scene_names:
   - scene-0061
+  - scene-0103
+  - scene-0553
+  - scene-0655
+  - scene-0757
+  - scene-0796
+  - scene-0916
+  - scene-1077
+  - scene-1094
+  - scene-1100
 
 max_samples: null
 camera: CAM_FRONT
