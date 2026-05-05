@@ -724,14 +724,25 @@ def render_ego_motion_video(
 
     frame_h, frame_w = first_frame.shape[:2]
     total_h = frame_h + chart_height * 3
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (frame_w, total_h),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open MP4 writer: {output_path}")
+    # Prefer writing H.264 via ffmpeg (imageio) for maximum player compatibility
+    use_imageio_writer = False
+    try:
+        import imageio
+
+        ffmpeg_params = ["-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "18"]
+        writer = imageio.get_writer(
+            str(output_path), fps=fps, codec="libx264", ffmpeg_params=ffmpeg_params
+        )
+        use_imageio_writer = True
+    except Exception:
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (frame_w, total_h),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open MP4 writer: {output_path}")
 
     colors = {
         "x": (40, 90, 235),
@@ -814,7 +825,16 @@ def render_ego_motion_video(
         )
         z_chart = _draw_signal_chart(velocities[:, 2], frame_index, "ego velocity z (up / vertical)", colors["z"], frame_w, chart_height)
 
-        writer.write(np.vstack([frame, x_chart, y_chart, z_chart]))
+        stacked = np.vstack([frame, x_chart, y_chart, z_chart])
+        if use_imageio_writer:
+            # imageio/ffmpeg expects RGB frames
+            stacked_rgb = cv2.cvtColor(stacked, cv2.COLOR_BGR2RGB)
+            writer.append_data(stacked_rgb)
+        else:
+            writer.write(stacked)
 
-    writer.release()
+    if use_imageio_writer:
+        writer.close()
+    else:
+        writer.release()
     return str(output_path)

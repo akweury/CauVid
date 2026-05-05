@@ -2,6 +2,7 @@
 two_parts/
 red_blue_colors/
 pipeline_output/
+logs/
 output/
 dataset_mini/
 dataset/driving-video-with-object-tracking

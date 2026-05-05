@@ -1,6 +1,15 @@
 dataroot: dataset/nuScenes/v1.0-mini
 version: v1.0-mini
 
+dataset_download:
+  # Parent directory where nuScenes archives and extracted content are stored.
+  # For full dataset on server, set to a mounted persistent path such as
+  # /home/your_user/storage/CauVid_Data/nuScenes
+  save_root: dataset/nuScenes
+  # Ordered download list. Fill in official signed URLs from your nuScenes account.
+  # Each entry supports: url, filename (optional), extract (optional), sha256 (optional), extract_to (optional)
+  archives: []
+
 # Use scene_names for multiple scenes. A single scene can also be written
 # under "scene" and will be treated the same way.
 scene_names:
@@ -32,3 +41,8 @@ motion_segment_params:
   lateral_speed_threshold_mps: 0.1
   min_segment_frames: 2
   smoothing_window: 3
+
+# Pattern mining-specific hyperparameters (can be overridden per-run)
+pattern_mining:
+  min_support: 4
+  min_scene_support: 3

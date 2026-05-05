@@ -18,5 +18,41 @@
                 "PYTHONPATH": "${workspaceFolder}"
             }
         }
+        ,
+        {
+            "name": "Python Debugger: exp_nuScenes pipeline (visual MP4)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_nuScenes/pipeline.py",
+            "args": [
+                "--config",
+                "configs/exp_nuScenes/default.yaml",
+                "--visualize-ego-motion"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
+            "name": "Python Debugger: pattern_mining (debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_nuScenes/pattern_mining.py",
+            "args": [
+                "--config",
+                "configs/exp_nuScenes/default.yaml",
+                "--debug",
+                "--extend-iters",
+                "3"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
     ]
 }
