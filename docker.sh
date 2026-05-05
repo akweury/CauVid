@@ -327,13 +327,23 @@ start_dev() {
 download_nuscenes() {
     log "Downloading nuScenes archives from config..."
 
-    local nuscenes_dataset_root logs_dir torch_cache_dir
+    local nuscenes_dataset_root logs_dir torch_cache_dir write_probe
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
     mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir"
 
+    write_probe="$nuscenes_dataset_root/.cauvid_write_test.$$"
+    if ! (: > "$write_probe") 2>/dev/null; then
+        warn "No write permission for nuScenes host directory: $nuscenes_dataset_root"
+        warn "If files were previously created by root, fix ownership with:"
+        warn "  sudo chown -R $(id -u):$(id -g) \"$nuscenes_dataset_root\""
+        error "Cannot continue until host write permissions are fixed."
+    fi
+    rm -f "$write_probe"
+
     docker run --rm \
+        --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
