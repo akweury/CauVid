@@ -60,11 +60,6 @@ RUN mkdir -p temp external
 # Set Python path to include the project root for src.* imports
 ENV PYTHONPATH="${PYTHONPATH}:/app"
 
-# Create a non-root user for security
-RUN useradd --create-home --shell /bin/bash cauvid && \
-    chown -R cauvid:cauvid /app
-USER cauvid
-
 # Expose port if needed (for future web interface)
 EXPOSE 8080
 
