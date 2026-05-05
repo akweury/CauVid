@@ -192,21 +192,21 @@ run_pipeline() {
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
-        -v "$raw_dataset:/app/raw_driving_data:ro" \
-        -v "$prepared_dataset:/app/dataset/driving_mini" \
-        -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
-        -v "$pipeline_output_dir:/app/pipeline_output" \
-        -v "$output_dir:/app/output" \
-        -v "$logs_dir:/app/logs" \
-        -v "$torch_cache_dir:/app/.cache/torch" \
+        -v "$raw_dataset:/raw_driving_data:ro" \
+        -v "$prepared_dataset:/dataset/driving_mini" \
+        -v "$nuscenes_dataset_root:/dataset/nuScenes" \
+        -v "$pipeline_output_dir:/output/pipeline_output" \
+        -v "$output_dir:/output/output" \
+        -v "$logs_dir:/logs" \
+        -v "$torch_cache_dir:/.cache/torch" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
-        -e TORCH_HOME=/app/.cache/torch \
-        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
-        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
-        -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
-        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
-        -e CAUVID_OUTPUT_PATH=/app/output \
+        -e TORCH_HOME=/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+        -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME} \
         ${IMAGE_NAME}:${VERSION} \
         python -m src.exp_driving_videos.pipe_utils.percept2matrix
@@ -229,20 +229,20 @@ prepare_driving_dataset() {
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
-        -v "$raw_dataset:/app/raw_driving_data:ro" \
-        -v "$prepared_dataset:/app/dataset/driving_mini" \
-        -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
+        -v "$raw_dataset:/raw_driving_data:ro" \
+        -v "$prepared_dataset:/dataset/driving_mini" \
+        -v "$nuscenes_dataset_root:/dataset/nuScenes" \
         -v "$(pwd)/external:/app/external:ro" \
-        -v "$output_dir:/app/output" \
-        -v "$logs_dir:/app/logs" \
-        -v "$torch_cache_dir:/app/.cache/torch" \
+        -v "$output_dir:/output/output" \
+        -v "$logs_dir:/logs" \
+        -v "$torch_cache_dir:/.cache/torch" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
-        -e TORCH_HOME=/app/.cache/torch \
-        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
-        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
-        -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
-        -e CAUVID_OUTPUT_PATH=/app/output \
+        -e TORCH_HOME=/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+        -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+        -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME}-prepare \
         ${IMAGE_NAME}:${VERSION} \
         python -m src.exp_driving_videos.prepare_driving_dataset "$@"
@@ -280,21 +280,21 @@ run_demo() {
     docker run --rm \
         --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
-        -v "$raw_dataset:/app/raw_driving_data:ro" \
-        -v "$prepared_dataset:/app/dataset/driving_mini" \
-        -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
-        -v "$pipeline_output_dir:/app/pipeline_output" \
-        -v "$output_dir:/app/output" \
-        -v "$logs_dir:/app/logs" \
-        -v "$torch_cache_dir:/app/.cache/torch" \
+        -v "$raw_dataset:/raw_driving_data:ro" \
+        -v "$prepared_dataset:/dataset/driving_mini" \
+        -v "$nuscenes_dataset_root:/dataset/nuScenes" \
+        -v "$pipeline_output_dir:/output/pipeline_output" \
+        -v "$output_dir:/output/output" \
+        -v "$logs_dir:/logs" \
+        -v "$torch_cache_dir:/.cache/torch" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
-        -e TORCH_HOME=/app/.cache/torch \
-        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
-        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
-        -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
-        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
-        -e CAUVID_OUTPUT_PATH=/app/output \
+        -e TORCH_HOME=/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+        -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME}-demo \
         ${IMAGE_NAME}:${VERSION} \
         python $demo_script
@@ -323,22 +323,22 @@ start_dev() {
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
-        -v "$raw_dataset:/app/raw_driving_data:ro" \
-        -v "$prepared_dataset:/app/dataset/driving_mini" \
-        -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
+        -v "$raw_dataset:/raw_driving_data:ro" \
+        -v "$prepared_dataset:/dataset/driving_mini" \
+        -v "$nuscenes_dataset_root:/dataset/nuScenes" \
         -v "$(pwd)/external:/app/external:ro" \
-        -v "$pipeline_output_dir:/app/pipeline_output" \
-        -v "$output_dir:/app/output" \
-        -v "$logs_dir:/app/logs" \
-        -v "$torch_cache_dir:/app/.cache/torch" \
+        -v "$pipeline_output_dir:/output/pipeline_output" \
+        -v "$output_dir:/output/output" \
+        -v "$logs_dir:/logs" \
+        -v "$torch_cache_dir:/.cache/torch" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
-        -e TORCH_HOME=/app/.cache/torch \
-        -e CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data \
-        -e CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini \
-        -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
-        -e CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output \
-        -e CAUVID_OUTPUT_PATH=/app/output \
+        -e TORCH_HOME=/.cache/torch \
+        -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+        -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+        -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+        -e CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output \
+        -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME}-dev \
         ${IMAGE_NAME}:${VERSION} \
         /bin/bash
@@ -356,8 +356,8 @@ download_nuscenes() {
 
     log "Docker context: $(docker context show 2>/dev/null || echo default)"
     log "Storage root: $storage_root"
-    log "nuScenes host path -> container: $nuscenes_dataset_root -> /app/dataset/nuScenes"
-    log "Cache host path -> container: $user_cache_dir -> /app/.cache/user"
+    log "nuScenes host path -> container: $nuscenes_dataset_root -> /dataset/nuScenes"
+    log "Cache host path -> container: $user_cache_dir -> /.cache/user"
     # Pre-create cache subdirs as the current user so the container (run with
     # --user uid:gid) does not need to create them and cannot be blocked by
     # stale root-owned directories from a previous privileged run.
@@ -387,18 +387,18 @@ download_nuscenes() {
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
-        -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
-        -v "$logs_dir:/app/logs" \
-        -v "$torch_cache_dir:/app/.cache/torch" \
-        -v "$user_cache_dir:/app/.cache/user" \
+        -v "$nuscenes_dataset_root:/dataset/nuScenes" \
+        -v "$logs_dir:/logs" \
+        -v "$torch_cache_dir:/.cache/torch" \
+        -v "$user_cache_dir:/.cache/user" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
-        -e TORCH_HOME=/app/.cache/torch \
-        -e HOME=/app/.cache/user \
-        -e MPLCONFIGDIR=/app/.cache/user/matplotlib \
-        -e XDG_CACHE_HOME=/app/.cache/user \
-        -e FONTCONFIG_CACHE=/app/.cache/user/fontconfig \
-        -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
+        -e TORCH_HOME=/.cache/torch \
+        -e HOME=/.cache/user \
+        -e MPLCONFIGDIR=/.cache/user/matplotlib \
+        -e XDG_CACHE_HOME=/.cache/user \
+        -e FONTCONFIG_CACHE=/.cache/user/fontconfig \
+        -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
         --name ${CONTAINER_NAME}-download-nuscenes \
         ${IMAGE_NAME}:${VERSION} \
         python -m src.exp_nuScenes.download_nuscenes_dataset --config configs/exp_nuScenes/default.yaml "$@"

@@ -8,27 +8,27 @@ services:
     container_name: cauvid-pipeline
     volumes:
       # Mount raw server dataset and prepared dataset separately.
-      - ${CAUVID_RAW_DRIVING_DATASET:-/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking}:/app/raw_driving_data:ro
-      - ${CAUVID_DRIVING_MINI_HOST:-/storage-01/ml-jsha/CauVid_Data/driving_mini}:/app/dataset/driving_mini
-      - ${CAUVID_NUSCENES_HOST:-/storage-01/ml-jsha/CauVid_Data/nuScenes}:/app/dataset/nuScenes
+      - ${CAUVID_RAW_DRIVING_DATASET:-/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking}:/raw_driving_data:ro
+      - ${CAUVID_DRIVING_MINI_HOST:-/storage-01/ml-jsha/CauVid_Data/driving_mini}:/dataset/driving_mini
+      - ${CAUVID_NUSCENES_HOST:-/storage-01/ml-jsha/CauVid_Data/nuScenes}:/dataset/nuScenes
       - ./external:/app/external:ro
       # Mount output directories for results and visualizations
-      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/pipeline_output}:/app/pipeline_output
-      - ${CAUVID_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/output}:/app/output
+      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/pipeline_output}:/output/pipeline_output
+      - ${CAUVID_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/output}:/output/output
       # Mount logs directory
-      - ${CAUVID_LOGS_HOST:-/storage-01/ml-jsha/CauVid_output/logs}:/app/logs
+      - ${CAUVID_LOGS_HOST:-/storage-01/ml-jsha/CauVid_output/logs}:/logs
       # Persist downloaded torchvision model weights across runs
-      - ${CAUVID_TORCH_CACHE_HOST:-/storage-01/ml-jsha/CauVid_Data/.cache/torch}:/app/.cache/torch
+      - ${CAUVID_TORCH_CACHE_HOST:-/storage-01/ml-jsha/CauVid_Data/.cache/torch}:/.cache/torch
     environment:
       - PYTHONPATH=/app
       - LOG_LEVEL=INFO
       - MPLBACKEND=Agg
-      - TORCH_HOME=/app/.cache/torch
-      - CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data
-      - CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini
-      - CAUVID_NUSCENES_PATH=/app/dataset/nuScenes
-      - CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output
-      - CAUVID_OUTPUT_PATH=/app/output
+      - TORCH_HOME=/.cache/torch
+      - CAUVID_RAW_DRIVING_DATASET=/raw_driving_data
+      - CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini
+      - CAUVID_NUSCENES_PATH=/dataset/nuScenes
+      - CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output
+      - CAUVID_OUTPUT_PATH=/output/output
     networks:
       - cauvid-network
     restart: "no"
@@ -44,14 +44,14 @@ services:
       # Mount source code for development
       - ./src:/app/src
       - ./configs:/app/configs
-      - ${CAUVID_RAW_DRIVING_DATASET:-/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking}:/app/raw_driving_data:ro
-      - ${CAUVID_DRIVING_MINI_HOST:-/storage-01/ml-jsha/CauVid_Data/driving_mini}:/app/dataset/driving_mini
-      - ${CAUVID_NUSCENES_HOST:-/storage-01/ml-jsha/CauVid_Data/nuScenes}:/app/dataset/nuScenes
+      - ${CAUVID_RAW_DRIVING_DATASET:-/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking}:/raw_driving_data:ro
+      - ${CAUVID_DRIVING_MINI_HOST:-/storage-01/ml-jsha/CauVid_Data/driving_mini}:/dataset/driving_mini
+      - ${CAUVID_NUSCENES_HOST:-/storage-01/ml-jsha/CauVid_Data/nuScenes}:/dataset/nuScenes
       - ./external:/app/external:ro
-      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/pipeline_output}:/app/pipeline_output
-      - ${CAUVID_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/output}:/app/output
-      - ${CAUVID_LOGS_HOST:-/storage-01/ml-jsha/CauVid_output/logs}:/app/logs
-      - ${CAUVID_TORCH_CACHE_HOST:-/storage-01/ml-jsha/CauVid_Data/.cache/torch}:/app/.cache/torch
+      - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/pipeline_output}:/output/pipeline_output
+      - ${CAUVID_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output/output}:/output/output
+      - ${CAUVID_LOGS_HOST:-/storage-01/ml-jsha/CauVid_output/logs}:/logs
+      - ${CAUVID_TORCH_CACHE_HOST:-/storage-01/ml-jsha/CauVid_Data/.cache/torch}:/.cache/torch
     environment:
       - PYTHONPATH=/app
       - LOG_LEVEL=DEBUG

@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MPLBACKEND=Agg
-ENV TORCH_HOME=/app/.cache/torch
+ENV TORCH_HOME=/.cache/torch
 ENV HOME=/tmp
 ENV XDG_CACHE_HOME=/tmp/.cache
 ENV MPLCONFIGDIR=/tmp/matplotlib
@@ -54,8 +54,8 @@ COPY *.py ./
 COPY *.md ./
 COPY LICENSE ./
 
-# Create necessary directories
-RUN mkdir -p pipeline_output logs output temp dataset external .cache/torch
+# Create necessary directories (data/output are mounted externally, not under /app)
+RUN mkdir -p temp external
 
 # Set Python path to include the project root for src.* imports
 ENV PYTHONPATH="${PYTHONPATH}:/app"
