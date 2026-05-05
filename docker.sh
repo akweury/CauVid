@@ -401,6 +401,7 @@ open_shell() {
 # Parse arguments
 VERBOSE=false
 FORCE=false
+PASSTHROUGH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -491,7 +492,7 @@ case $COMMAND in
         ;;
     prepare)
         build_image false
-        prepare_driving_dataset "${PASSTHROUGH_ARGS[@]:-}"
+        prepare_driving_dataset ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
     run)
         build_image false
@@ -499,7 +500,7 @@ case $COMMAND in
         ;;
     download-nuscenes)
         build_image false
-        download_nuscenes "${PASSTHROUGH_ARGS[@]:-}"
+        download_nuscenes ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
     demo)
         build_image false
