@@ -79,17 +79,19 @@ check_dependencies() {
         warn "Docker Compose is not installed. Some features may not work."
     fi
     
-    local storage_root
-    storage_root="$(get_storage_root)"
-    local raw_dataset="${CAUVID_RAW_DRIVING_DATASET:-$storage_root/driving-video-with-object-tracking}"
-    local prepared_dataset="${CAUVID_DRIVING_MINI_HOST:-$storage_root/driving_mini}"
+    if [[ "$COMMAND" != "download-nuscenes" ]]; then
+        local storage_root
+        storage_root="$(get_storage_root)"
+        local raw_dataset="${CAUVID_RAW_DRIVING_DATASET:-$storage_root/driving-video-with-object-tracking}"
+        local prepared_dataset="${CAUVID_DRIVING_MINI_HOST:-$storage_root/driving_mini}"
 
-    if [ ! -d "$raw_dataset" ]; then
-        warn "Raw dataset directory not found: $raw_dataset"
-    fi
+        if [ ! -d "$raw_dataset" ]; then
+            warn "Raw dataset directory not found: $raw_dataset"
+        fi
 
-    if [ ! -d "$prepared_dataset" ]; then
-        warn "Prepared dataset directory not found yet: $prepared_dataset"
+        if [ ! -d "$prepared_dataset" ]; then
+            warn "Prepared dataset directory not found yet: $prepared_dataset"
+        fi
     fi
     
     log "Dependencies check complete"
@@ -327,11 +329,17 @@ start_dev() {
 download_nuscenes() {
     log "Downloading nuScenes archives from config..."
 
-    local nuscenes_dataset_root logs_dir torch_cache_dir user_cache_dir write_probe cache_probe
+    local storage_root nuscenes_dataset_root logs_dir torch_cache_dir user_cache_dir write_probe cache_probe
+    storage_root="$(get_storage_root)"
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
-    user_cache_dir="$(get_storage_root)/.cache/user"
+    user_cache_dir="$storage_root/.cache/user"
+
+    log "Docker context: $(docker context show 2>/dev/null || echo default)"
+    log "Storage root: $storage_root"
+    log "nuScenes host path -> container: $nuscenes_dataset_root -> /app/dataset/nuScenes"
+    log "Cache host path -> container: $user_cache_dir -> /app/.cache/user"
     mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir" "$user_cache_dir"
 
     write_probe="$nuscenes_dataset_root/.cauvid_write_test.$$"
@@ -517,23 +525,23 @@ case $COMMAND in
         build_image $FORCE
         ;;
     prepare)
-        build_image false
+        build_image $FORCE
         prepare_driving_dataset ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
     run)
-        build_image false
+        build_image $FORCE
         run_pipeline
         ;;
     download-nuscenes)
-        build_image false
+        build_image $FORCE
         download_nuscenes ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
     demo)
-        build_image false
+        build_image $FORCE
         run_demo "${DEMO_TYPE:-advanced}"
         ;;
     dev)
-        build_image false
+        build_image $FORCE
         start_dev
         ;;
     stop)

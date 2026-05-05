@@ -106,28 +106,26 @@ def _download_with_resume(url: str, output_path: Path, force: bool = False, time
         return output_path
 
     part_path = Path(str(output_path) + ".part")
+    effective_part_path = part_path
     if force and part_path.exists():
         part_path.unlink()
 
-    # If a previous container run created an unwritable partial file, delete it
-    # and restart the download from byte 0 when the directory itself is writable.
+    # If a previous run left an unwritable partial file, switch to a fresh temp
+    # part file so the download can proceed without resuming that stale file.
     if part_path.exists() and not os.access(part_path, os.W_OK):
         if os.access(output_path.parent, os.W_OK):
-            try:
-                part_path.unlink()
-                print(f"[warn] removed unwritable partial file: {part_path}")
-            except PermissionError:
-                raise PermissionError(
-                    f"Cannot write to '{part_path}'. The file is not writable by the current user. "
-                    "Fix ownership/permissions of the nuScenes download directory and retry."
-                )
+            effective_part_path = Path(f"{output_path}.part.{os.getpid()}")
+            print(
+                f"[warn] partial file is not writable, restarting download with temp file: "
+                f"{effective_part_path.name}"
+            )
         else:
             raise PermissionError(
                 f"Cannot write to '{part_path}'. The file is not writable by the current user. "
                 "Fix ownership/permissions of the nuScenes download directory and retry."
             )
 
-    existing = part_path.stat().st_size if part_path.exists() else 0
+    existing = effective_part_path.stat().st_size if effective_part_path.exists() else 0
     headers = {"User-Agent": "CauVid-nuScenes-downloader/1.0"}
     if existing > 0:
         headers["Range"] = f"bytes={existing}-"
@@ -144,7 +142,7 @@ def _download_with_resume(url: str, output_path: Path, force: bool = False, time
             else:
                 mode = "ab" if existing > 0 else "wb"
 
-            with part_path.open(mode) as out:
+            with effective_part_path.open(mode) as out:
                 while True:
                     chunk = resp.read(DEFAULT_CHUNK_SIZE)
                     if not chunk:
@@ -159,7 +157,7 @@ def _download_with_resume(url: str, output_path: Path, force: bool = False, time
             ) from exc
         raise
 
-    shutil.move(str(part_path), str(output_path))
+    shutil.move(str(effective_part_path), str(output_path))
     print(f"[ok] saved: {output_path}")
     return output_path
 

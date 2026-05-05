@@ -7,6 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MPLBACKEND=Agg
 ENV TORCH_HOME=/app/.cache/torch
+ENV HOME=/tmp
+ENV XDG_CACHE_HOME=/tmp/.cache
+ENV MPLCONFIGDIR=/tmp/matplotlib
+ENV FONTCONFIG_CACHE=/tmp/.cache/fontconfig
 
 # Set working directory
 WORKDIR /app
