@@ -3,7 +3,7 @@ version: v1.0-mini
 
 dataset_download:
   # Parent directory where archives are downloaded and extracted.
-  # Override on server with: CAUVID_NUSCENES_HOST=/home/ml-jsha/storage/CauVid_Data/nuScenes
+  # Override on server with: CAUVID_NUSCENES_HOST=/storage-01/ml-jsha/CauVid_Data/nuScenes
   save_root: dataset/nuScenes
 
   # Full nuScenes v1.0 public release.

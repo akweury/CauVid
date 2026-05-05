@@ -16,7 +16,8 @@ NC='\033[0m' # No Color
 IMAGE_NAME="cauvid-pipeline"
 CONTAINER_NAME="cauvid-app"
 VERSION="latest"
-REMOTE_STORAGE_ROOT="/home/ml-jsha/storage/CauVid_Data"
+REMOTE_STORAGE_ROOT="/storage-01/ml-jsha/CauVid_Data"
+REMOTE_OUTPUT_ROOT="/storage-01/ml-jsha/CauVid_output"
 
 # Functions
 print_help() {
@@ -42,12 +43,13 @@ print_help() {
     echo "Options:"
     echo "  -v, --verbose    Verbose output"
     echo "  -f, --force      Force rebuild/restart"
-    echo "  CAUVID_STORAGE_ROOT defaults outputs to /home/ml-jsha/storage/CauVid_Data when present"
+    echo "  CAUVID_STORAGE_ROOT defaults data to /storage-01/ml-jsha/CauVid_Data when present"
+    echo "  CAUVID_OUTPUT_ROOT defaults outputs to /storage-01/ml-jsha/CauVid_output when present"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" enables GPU access for docker run"
     echo ""
     echo "Examples:"
     echo "  $0 build                    # Build the Docker image"
-    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
+    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
     echo "  $0 run                      # Run driving preprocessing over dataset/driving_mini/videos"
     echo "  $0 preprocess               # Same as run"
     echo "  $0 demo                     # Run advanced features demo"
@@ -121,6 +123,16 @@ get_storage_root() {
     fi
 }
 
+get_output_root() {
+    if [ -n "${CAUVID_OUTPUT_ROOT:-}" ]; then
+        echo "$CAUVID_OUTPUT_ROOT"
+    elif [ -d "$REMOTE_OUTPUT_ROOT" ]; then
+        echo "$REMOTE_OUTPUT_ROOT"
+    else
+        echo "$(get_storage_root)"
+    fi
+}
+
 get_raw_dataset() {
     local storage_root
     storage_root="$(get_storage_root)"
@@ -140,21 +152,21 @@ get_nuscenes_dataset_root() {
 }
 
 get_pipeline_output_dir() {
-    local storage_root
-    storage_root="$(get_storage_root)"
-    echo "${CAUVID_PIPELINE_OUTPUT_HOST:-$storage_root/pipeline_output}"
+    local output_root
+    output_root="$(get_output_root)"
+    echo "${CAUVID_PIPELINE_OUTPUT_HOST:-$output_root/pipeline_output}"
 }
 
 get_output_dir() {
-    local storage_root
-    storage_root="$(get_storage_root)"
-    echo "${CAUVID_OUTPUT_HOST:-$storage_root/output}"
+    local output_root
+    output_root="$(get_output_root)"
+    echo "${CAUVID_OUTPUT_HOST:-$output_root/output}"
 }
 
 get_logs_dir() {
-    local storage_root
-    storage_root="$(get_storage_root)"
-    echo "${CAUVID_LOGS_HOST:-$storage_root/logs}"
+    local output_root
+    output_root="$(get_output_root)"
+    echo "${CAUVID_LOGS_HOST:-$output_root/logs}"
 }
 
 get_torch_cache_dir() {

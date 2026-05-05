@@ -10,8 +10,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.absolute()
 driving_demo_video_id = "0153f03b-8fbdc1ad"
 # driving_demo_video_id = "01118704-e91b1b1c"
-DEFAULT_STORAGE_ROOT = Path("/home/ml-jsha/storage/CauVid_Data")
-DEFAULT_RAW_DRIVING_DATASET = Path("/home/ml-jsha/storage/CauVid_Data/driving-video-with-object-tracking")
+DEFAULT_STORAGE_ROOT = Path("/storage-01/ml-jsha/CauVid_Data")
+DEFAULT_RAW_DRIVING_DATASET = Path("/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking")
 DEFAULT_OUTPUT_ROOT = Path(os.environ.get("CAUVID_OUTPUT_PATH", PROJECT_ROOT / "output"))
 DEFAULT_PIPELINE_OUTPUT_ROOT = Path(os.environ.get("CAUVID_PIPELINE_OUTPUT_PATH", PROJECT_ROOT / "pipeline_output"))
 DEFAULT_TEMP_ROOT = Path(os.environ.get("CAUVID_TEMP_PATH", PROJECT_ROOT / "temp"))
