@@ -327,7 +327,7 @@ start_dev() {
 download_nuscenes() {
     log "Downloading nuScenes archives from config..."
 
-    local nuscenes_dataset_root logs_dir torch_cache_dir user_cache_dir write_probe
+    local nuscenes_dataset_root logs_dir torch_cache_dir user_cache_dir write_probe cache_probe
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
@@ -342,6 +342,15 @@ download_nuscenes() {
         error "Cannot continue until host write permissions are fixed."
     fi
     rm -f "$write_probe"
+
+    cache_probe="$user_cache_dir/.cauvid_cache_write_test.$$"
+    if ! (: > "$cache_probe") 2>/dev/null; then
+        warn "No write permission for cache host directory: $user_cache_dir"
+        warn "Matplotlib/Fontconfig cache creation will fail unless ownership is fixed:"
+        warn "  sudo chown -R $(id -u):$(id -g) \"$user_cache_dir\""
+        error "Cannot continue until host cache permissions are fixed."
+    fi
+    rm -f "$cache_probe"
 
     docker run --rm \
         --user "$(id -u):$(id -g)" \

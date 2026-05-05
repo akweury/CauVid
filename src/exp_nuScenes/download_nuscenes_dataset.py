@@ -109,6 +109,24 @@ def _download_with_resume(url: str, output_path: Path, force: bool = False, time
     if force and part_path.exists():
         part_path.unlink()
 
+    # If a previous container run created an unwritable partial file, delete it
+    # and restart the download from byte 0 when the directory itself is writable.
+    if part_path.exists() and not os.access(part_path, os.W_OK):
+        if os.access(output_path.parent, os.W_OK):
+            try:
+                part_path.unlink()
+                print(f"[warn] removed unwritable partial file: {part_path}")
+            except PermissionError:
+                raise PermissionError(
+                    f"Cannot write to '{part_path}'. The file is not writable by the current user. "
+                    "Fix ownership/permissions of the nuScenes download directory and retry."
+                )
+        else:
+            raise PermissionError(
+                f"Cannot write to '{part_path}'. The file is not writable by the current user. "
+                "Fix ownership/permissions of the nuScenes download directory and retry."
+            )
+
     existing = part_path.stat().st_size if part_path.exists() else 0
     headers = {"User-Agent": "CauVid-nuScenes-downloader/1.0"}
     if existing > 0:
