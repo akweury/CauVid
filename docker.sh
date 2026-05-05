@@ -327,11 +327,12 @@ start_dev() {
 download_nuscenes() {
     log "Downloading nuScenes archives from config..."
 
-    local nuscenes_dataset_root logs_dir torch_cache_dir write_probe
+    local nuscenes_dataset_root logs_dir torch_cache_dir user_cache_dir write_probe
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
-    mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir"
+    user_cache_dir="$(get_storage_root)/.cache/user"
+    mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir" "$user_cache_dir"
 
     write_probe="$nuscenes_dataset_root/.cauvid_write_test.$$"
     if ! (: > "$write_probe") 2>/dev/null; then
@@ -350,9 +351,14 @@ download_nuscenes() {
         -v "$nuscenes_dataset_root:/app/dataset/nuScenes" \
         -v "$logs_dir:/app/logs" \
         -v "$torch_cache_dir:/app/.cache/torch" \
+        -v "$user_cache_dir:/app/.cache/user" \
         -e PYTHONPATH=/app \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/app/.cache/torch \
+        -e HOME=/app/.cache/user \
+        -e MPLCONFIGDIR=/app/.cache/user/matplotlib \
+        -e XDG_CACHE_HOME=/app/.cache/user \
+        -e FONTCONFIG_CACHE=/app/.cache/user/fontconfig \
         -e CAUVID_NUSCENES_PATH=/app/dataset/nuScenes \
         --name ${CONTAINER_NAME}-download-nuscenes \
         ${IMAGE_NAME}:${VERSION} \

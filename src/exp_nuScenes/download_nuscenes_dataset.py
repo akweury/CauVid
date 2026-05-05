@@ -116,21 +116,30 @@ def _download_with_resume(url: str, output_path: Path, force: bool = False, time
 
     req = Request(url, headers=headers)
     print(f"[download] {url}")
-    with urlopen(req, timeout=timeout_sec) as resp:
-        status_code = getattr(resp, "status", 200)
-        supports_resume = status_code == 206
-        if existing > 0 and not supports_resume:
-            existing = 0
-            mode = "wb"
-        else:
-            mode = "ab" if existing > 0 else "wb"
+    try:
+        with urlopen(req, timeout=timeout_sec) as resp:
+            status_code = getattr(resp, "status", 200)
+            supports_resume = status_code == 206
+            if existing > 0 and not supports_resume:
+                existing = 0
+                mode = "wb"
+            else:
+                mode = "ab" if existing > 0 else "wb"
 
-        with part_path.open(mode) as out:
-            while True:
-                chunk = resp.read(DEFAULT_CHUNK_SIZE)
-                if not chunk:
-                    break
-                out.write(chunk)
+            with part_path.open(mode) as out:
+                while True:
+                    chunk = resp.read(DEFAULT_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+    except PermissionError as exc:
+        # Common after a previous root-run download left an unwritable *.part file.
+        if part_path.exists() and not os.access(part_path, os.W_OK):
+            raise PermissionError(
+                f"Cannot write to '{part_path}'. The file is not writable by the current user. "
+                "Fix ownership/permissions of the nuScenes download directory and retry."
+            ) from exc
+        raise
 
     shutil.move(str(part_path), str(output_path))
     print(f"[ok] saved: {output_path}")
