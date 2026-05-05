@@ -2,13 +2,64 @@ dataroot: dataset/nuScenes/v1.0-mini
 version: v1.0-mini
 
 dataset_download:
-  # Parent directory where nuScenes archives and extracted content are stored.
-  # For full dataset on server, set to a mounted persistent path such as
-  # /home/your_user/storage/CauVid_Data/nuScenes
+  # Parent directory where archives are downloaded and extracted.
+  # Override on server with: CAUVID_NUSCENES_HOST=/home/ml-jsha/storage/CauVid_Data/nuScenes
   save_root: dataset/nuScenes
-  # Ordered download list. Fill in official signed URLs from your nuScenes account.
-  # Each entry supports: url, filename (optional), extract (optional), sha256 (optional), extract_to (optional)
-  archives: []
+
+  # Full nuScenes v1.0 public release.
+  # Sensor blobs (trainval): 10 splits x ~30 GB each (~300 GB total).
+  # Metadata: ~3 MB. Test blobs: ~30 GB. Map expansion: ~500 MB.
+  # All archives extract into the same save_root directory.
+  archives:
+    # ── Trainval metadata (annotations, calibrations, maps index) ──────────
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval_meta.tgz"
+      filename: "v1.0-trainval_meta.tgz"
+      extract: true
+
+    # ── Trainval sensor blobs (10 splits) ───────────────────────────────────
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval01_blobs.tgz"
+      filename: "v1.0-trainval01_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval02_blobs.tgz"
+      filename: "v1.0-trainval02_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval03_blobs.tgz"
+      filename: "v1.0-trainval03_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval04_blobs.tgz"
+      filename: "v1.0-trainval04_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval05_blobs.tgz"
+      filename: "v1.0-trainval05_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval06_blobs.tgz"
+      filename: "v1.0-trainval06_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval07_blobs.tgz"
+      filename: "v1.0-trainval07_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval08_blobs.tgz"
+      filename: "v1.0-trainval08_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval09_blobs.tgz"
+      filename: "v1.0-trainval09_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-trainval10_blobs.tgz"
+      filename: "v1.0-trainval10_blobs.tgz"
+      extract: true
+
+    # ── Test set ─────────────────────────────────────────────────────────────
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-test_blobs.tgz"
+      filename: "v1.0-test_blobs.tgz"
+      extract: true
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/v1.0-test_meta.tgz"
+      filename: "v1.0-test_meta.tgz"
+      extract: true
+
+    # ── Map expansion v1.3 ───────────────────────────────────────────────────
+    - url: "https://motional-nuscenes.s3.amazonaws.com/public/v1.0/nuScenes-map-expansion-v1.3.zip"
+      filename: "nuScenes-map-expansion-v1.3.zip"
+      extract: true
 
 # Use scene_names for multiple scenes. A single scene can also be written
 # under "scene" and will be treated the same way.
