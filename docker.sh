@@ -227,6 +227,7 @@ prepare_driving_dataset() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$output_dir" "$logs_dir" "$torch_cache_dir"
 
     docker run --rm \
+        --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$raw_dataset:/app/raw_driving_data:ro" \
         -v "$prepared_dataset:/app/dataset/driving_mini" \
@@ -277,6 +278,7 @@ run_demo() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
+        --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$raw_dataset:/app/raw_driving_data:ro" \
         -v "$prepared_dataset:/app/dataset/driving_mini" \
@@ -317,6 +319,7 @@ start_dev() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run -it --rm \
+        --user "$(id -u):$(id -g)" \
         ${CAUVID_DOCKER_GPU_ARGS:-} \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
