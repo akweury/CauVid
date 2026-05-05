@@ -340,7 +340,11 @@ download_nuscenes() {
     log "Storage root: $storage_root"
     log "nuScenes host path -> container: $nuscenes_dataset_root -> /app/dataset/nuScenes"
     log "Cache host path -> container: $user_cache_dir -> /app/.cache/user"
-    mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir" "$user_cache_dir"
+    # Pre-create cache subdirs as the current user so the container (run with
+    # --user uid:gid) does not need to create them and cannot be blocked by
+    # stale root-owned directories from a previous privileged run.
+    mkdir -p "$nuscenes_dataset_root" "$logs_dir" "$torch_cache_dir" \
+             "$user_cache_dir/matplotlib" "$user_cache_dir/fontconfig"
 
     write_probe="$nuscenes_dataset_root/.cauvid_write_test.$$"
     if ! (: > "$write_probe") 2>/dev/null; then
@@ -460,7 +464,15 @@ while [[ $# -gt 0 ]]; do
         download-nuscenes)
             COMMAND="download-nuscenes"
             shift
-            PASSTHROUGH_ARGS=("$@")
+            # Strip shell-level flags (-f/--force/-v/--verbose) so they are not
+            # forwarded to the Python script, which does not understand them.
+            for _arg in "$@"; do
+                case "$_arg" in
+                    -f|--force)   FORCE=true ;;
+                    -v|--verbose) VERBOSE=true ;;
+                    *)            PASSTHROUGH_ARGS+=("$_arg") ;;
+                esac
+            done
             break
             ;;
         demo)
