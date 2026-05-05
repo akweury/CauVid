@@ -302,7 +302,10 @@ run_demo() {
 
 start_dev() {
     log "Starting development container..."
-    
+
+    # Remove any leftover container with the same name so docker run --rm works cleanly.
+    docker rm -f "${CONTAINER_NAME}-dev" 2>/dev/null || true
+
     local raw_dataset prepared_dataset nuscenes_dataset_root pipeline_output_dir output_dir logs_dir torch_cache_dir
     raw_dataset="$(get_raw_dataset)"
     prepared_dataset="$(get_prepared_dataset)"
