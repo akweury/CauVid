@@ -5,7 +5,7 @@ preprocess:
   enabled: false
   motion:
     save_flow: true
-    smooth_window: 5
+    smooth_window: 8
     stop_threshold: 10.0
     min_stop_duration: 3
     rotation_threshold: 25

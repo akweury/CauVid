@@ -1,0 +1,26 @@
+ego_motion:
+  smoothing_window: 5
+  static_adjustment:
+    enabled: false
+    static_object_keywords: [building, traffic light]
+    blend_weight: 0.7
+    min_static_pixels: 300
+
+temporal_segmentation:
+  forward_stop_threshold: 0.05
+  forward_stop_enter_threshold: 0.05
+  forward_stop_exit_threshold: 0.08
+  stop_total_speed_enter_threshold: 0.09
+  stop_total_speed_exit_threshold: 0.14
+  forward_accel_threshold: 0.03
+  lateral_turn_threshold: 0.03
+  min_stop_duration: 3
+  min_turn_duration: 3
+  min_segment_length: 3
+  visualization_fps: 10
+  symbolic_correction:
+    enabled: true
+    static_object_keywords: [traffic light, building]
+    min_static_objects: 1
+    max_static_rel_vz_abs: 0.03
+    max_static_rel_speed: 0.05

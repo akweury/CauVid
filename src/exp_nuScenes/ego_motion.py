@@ -720,7 +720,7 @@ def render_ego_motion_video(
         if first_frame is not None:
             break
     if first_frame is None:
-        raise FileNotFoundError(f"No readable frames found for channel {channel}.")
+        return None
 
     frame_h, frame_w = first_frame.shape[:2]
     total_h = frame_h + chart_height * 3

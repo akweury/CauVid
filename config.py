@@ -63,6 +63,7 @@ MODEL_PATHS = {
 # Config file paths
 CONFIG_PATHS = {
     "pattern_mining": PROJECT_ROOT / "configs" / "pattern_mining" / "default.yaml",
+    "exp_driving": PROJECT_ROOT / "configs" / "exp_driving" / "default.yaml",
 }
 
 def get_dataset_path(dataset_name: str) -> Path:

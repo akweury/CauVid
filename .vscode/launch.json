@@ -27,6 +27,12 @@
             "args": [
                 "--config",
                 "configs/exp_nuScenes/default.yaml",
+                "--dataroot",
+                "dataset/nuScenes",
+                "--version",
+                "v1.0-trainval_meta",
+                "--media-root",
+                "dataset/nuScenes/v1.0-trainval01_blobs_camera",
                 "--visualize-ego-motion"
             ],
             "console": "integratedTerminal",
@@ -44,9 +50,69 @@
             "args": [
                 "--config",
                 "configs/exp_nuScenes/default.yaml",
+                "--dataroot",
+                "dataset/nuScenes",
+                "--version",
+                "v1.0-trainval_meta",
+                "--media-root",
+                "dataset/nuScenes/v1.0-trainval01_blobs_camera",
                 "--debug",
                 "--extend-iters",
                 "3"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
+            "name": "Python Debugger: driving_mini detection (YOLO-World)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_driving_videos/detect_driving_mini.py",
+            "args": [
+                "--yolo-model",
+                "yolov8s-worldv2.pt"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
+            "name": "Python Debugger: exp_driving_pipeline",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_driving_videos/exp_driving_pipeline.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
+            "name": "Python Debugger: nuScenes detection (YOLO-World)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_nuScenes/detection_pipeline.py",
+            "args": [
+                "--config",
+                "configs/exp_nuScenes/default.yaml",
+                "--dataroot",
+                "dataset/nuScenes",
+                "--version",
+                "v1.0-trainval_meta/v1.0-trainval",
+                "--media-root",
+                "dataset/nuScenes/v1.0-trainval01_blobs_camera",
+                "--camera",
+                "CAM_FRONT",
+                "--yolo-model",
+                "yolov8s-worldv2.pt"
             ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",

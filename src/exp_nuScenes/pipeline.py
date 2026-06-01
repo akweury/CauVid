@@ -3,7 +3,7 @@ nuScenes experiment pipeline skeleton.
 
 This mirrors the high-level flow used by the driving-video experiment:
 
-1. Load local nuScenes mini data.
+1. Load local nuScenes trainval data.
 2. Treat each nuScenes scene as one video.
 3. Iterate through scenes one by one.
 4. Leave perception/primitive/reasoning stages as placeholders for now.
@@ -18,12 +18,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 import config
-from src.exp_driving_videos.pipe_utils.exp_driving_utils import load_pattern_cfg_file
+from config import PROJECT_ROOT
+
+from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 from src.exp_nuScenes.ego_motion import (
     extract_ego_speed_3d,
     render_ego_motion_video,
@@ -56,8 +54,9 @@ PIPELINE_DATA_FILENAME = "pipeline_data.pkl"
 PIPELINE_DATA_VERSION = 1
 
 DEFAULT_PIPELINE_CONFIG = {
-    "dataroot": str(default_dataroot()),
-    "version": "v1.0-mini",
+    "dataroot": "dataset/nuScenes",
+    "version": "v1.0-trainval_meta/v1.0-trainval",
+    "media_root": None,
     "scene_names": [],
     "max_samples": None,
     "camera": "CAM_FRONT",
@@ -122,6 +121,8 @@ def resolve_run_config(args: argparse.Namespace) -> Dict[str, Any]:
         run_cfg["include_sweeps"] = args.include_sweeps
     if getattr(args, "output_root", None) is not None:
         run_cfg["output_root"] = str(args.output_root)
+    if getattr(args, "media_root", None) is not None:
+        run_cfg["media_root"] = str(args.media_root)
     if getattr(args, "force_recompute", None) is not None:
         run_cfg["force_recompute"] = args.force_recompute
 
@@ -299,11 +300,12 @@ def extract_scene_segment_predicates(
 
 def load_dataset(
     dataroot: Optional[Path] = None,
-    version: str = "v1.0-mini",
+    version: str = "v1.0-trainval_meta",
     scene_names: Optional[Sequence[str]] = None,
     max_samples: Optional[int] = None,
     camera: Optional[str] = "CAM_FRONT",
     include_sweeps: bool = False,
+    media_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Load nuScenes data for the pipeline.
@@ -320,6 +322,7 @@ def load_dataset(
         camera=camera,
         include_sweeps=include_sweeps,
         include_annotations=True,
+        media_root=media_root,
     )
 
 
@@ -488,7 +491,7 @@ def process_scene(
 
 def run_pipeline(
     dataroot: Optional[Path] = None,
-    version: str = "v1.0-mini",
+    version: str = "v1.0-trainval_meta/v1.0-trainval",
     scene_names: Optional[Sequence[str]] = None,
     max_samples: Optional[int] = None,
     camera: Optional[str] = "CAM_FRONT",
@@ -499,6 +502,7 @@ def run_pipeline(
     include_sweeps: bool = False,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
+    media_root: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load nuScenes and process each scene/video one by one.
@@ -510,10 +514,13 @@ def run_pipeline(
         max_samples=max_samples,
         camera=camera,
         include_sweeps=include_sweeps,
+        media_root=media_root,
     )
 
     scene_samples = group_samples_by_scene(data["samples"])
     print(f"Loaded nuScenes dataset from {data['dataroot']}")
+    if data.get("media_root") and data["media_root"] != data["dataroot"]:
+        print(f"Media files resolved from {data['media_root']}")
     print(f"Scenes/videos to process: {len(scene_samples)}")
     print(f"Samples loaded: {data['num_samples']}")
     print(f"Annotations loaded: {data['num_annotations']}")
@@ -534,6 +541,7 @@ def run_pipeline(
 
     manifest = {
         "dataroot": data["dataroot"],
+        "media_root": data.get("media_root", data["dataroot"]),
         "version": version,
         "camera": camera,
         "ego_channel": ego_channel or camera,
@@ -572,6 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--motion-smoothing-window", type=int, default=None, help="Odd moving-average window used before labelling.")
     parser.add_argument("--include-sweeps", action="store_true", default=None)
     parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--media-root", type=Path, default=None, help="Root for resolving camera image files when blobs are in a separate folder from metadata.")
     parser.add_argument("--force-recompute", action="store_true", default=None)
     return parser.parse_args()
 
@@ -597,6 +606,7 @@ def main() -> None:
         )
     motion_segment_params = dict(run_cfg["motion_segment_params"])
     output_root = _resolve_project_path(run_cfg.get("output_root"))
+    media_root = _resolve_project_path(run_cfg.get("media_root"))
 
     run_pipeline(
         dataroot=dataroot,
@@ -611,6 +621,7 @@ def main() -> None:
         include_sweeps=bool(run_cfg["include_sweeps"]),
         output_root=output_root,
         force_recompute=bool(run_cfg["force_recompute"]),
+        media_root=media_root,
     )
 
 

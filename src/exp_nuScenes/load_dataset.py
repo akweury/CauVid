@@ -103,6 +103,33 @@ def resolve_path(dataroot: Path, filename: str) -> Path:
     return dataroot.joinpath(*filename.split("/"))
 
 
+def resolve_existing_media_path(media_root: Path, filename: str) -> Path:
+    """
+    Resolve media path robustly across datasets that differ in samples/sweeps layout.
+
+    Resolution order:
+    1) Original filename from nuScenes metadata.
+    2) If original starts with samples/, try sweeps/ variant.
+    3) If original starts with sweeps/, try samples/ variant.
+
+    Returns the first existing path, or the original resolved path if none exist.
+    """
+    original = resolve_path(media_root, filename)
+    if original.exists():
+        return original
+
+    if filename.startswith("samples/"):
+        alt = resolve_path(media_root, filename.replace("samples/", "sweeps/", 1))
+        if alt.exists():
+            return alt
+    elif filename.startswith("sweeps/"):
+        alt = resolve_path(media_root, filename.replace("sweeps/", "samples/", 1))
+        if alt.exists():
+            return alt
+
+    return original
+
+
 def top_category(category_name: str) -> str:
     parts = category_name.split(".")
     if len(parts) >= 2:
@@ -187,7 +214,7 @@ def build_annotation_record(
 
 def build_media_record(
     sample_data: Dict[str, Any],
-    dataroot: Path,
+    media_root: Path,
     calibrated_sensor_by_token: Dict[str, Dict[str, Any]],
     sensor_by_token: Dict[str, Dict[str, Any]],
     ego_pose_by_token: Dict[str, Dict[str, Any]],
@@ -196,7 +223,9 @@ def build_media_record(
     calibrated_sensor = calibrated_sensor_by_token[sample_data["calibrated_sensor_token"]]
     sensor = sensor_by_token[calibrated_sensor["sensor_token"]]
     ego_pose = ego_pose_by_token[sample_data["ego_pose_token"]]
-    path = resolve_path(dataroot, sample_data["filename"])
+    
+    filename = sample_data["filename"]
+    path = resolve_existing_media_path(media_root, filename)
 
     return {
         "sample_data_token": sample_data["token"],
@@ -259,24 +288,30 @@ def load_nuscenes_data(
     camera: Optional[str] = None,
     include_sweeps: bool = False,
     include_annotations: bool = True,
+    media_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Load local nuScenes data into a simple Python dictionary.
 
     Args:
-        dataroot: Path containing samples/, sweeps/, maps/, and v1.0-mini/.
-        version: Metadata table folder, e.g. "v1.0-mini".
+        dataroot: Path to nuScenes root containing the version metadata folder.
+        version: Metadata table folder name, e.g. "v1.0-trainval_meta".
         scene_names: Optional scene names such as ["scene-0061"].
         max_samples: Optional sample/keyframe limit after scene filtering.
         camera: Optional camera channel filter, e.g. "CAM_FRONT".
         include_sweeps: Include non-keyframe sample_data rows if True.
         include_annotations: Include joined sample annotations if True.
+        media_root: Root path for resolving sensor file paths (samples/, sweeps/).
+            Use this when the camera blobs are extracted to a separate folder
+            from the metadata (e.g. v1.0-trainval01_blobs_camera/). Defaults to
+            dataroot when not set.
 
     Returns:
-        Dict with dataroot, version, scenes, samples, classes, class_summary.
+        Dict with dataroot, media_root, version, scenes, samples, classes, class_summary.
     """
     dataroot = Path(dataroot) if dataroot is not None else default_dataroot()
     dataroot = dataroot.resolve()
+    effective_media_root = Path(media_root).resolve() if media_root is not None else dataroot
     tables = load_nuscenes_tables(dataroot, version)
 
     sample_by_token = index_by_token(tables.samples)
@@ -308,7 +343,7 @@ def load_nuscenes_data(
                 continue
             media_record = build_media_record(
                 row,
-                dataroot,
+                effective_media_root,
                 calibrated_sensor_by_token,
                 sensor_by_token,
                 ego_pose_by_token,
@@ -361,6 +396,7 @@ def load_nuscenes_data(
 
     return {
         "dataroot": str(dataroot),
+        "media_root": str(effective_media_root),
         "version": version,
         "num_scenes": len(selected_scene_rows),
         "num_samples": len(loaded_samples),
@@ -387,6 +423,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load local nuScenes data and print a summary.")
     parser.add_argument("--dataroot", type=Path, default=default_dataroot())
     parser.add_argument("--version", default="v1.0-mini")
+    parser.add_argument("--media-root", type=Path, default=None, help="Root for sensor file paths if separate from dataroot (e.g. v1.0-trainval01_blobs_camera/).")
     parser.add_argument("--scene", action="append", default=[])
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--camera", default=None)
@@ -403,8 +440,11 @@ def main() -> None:
         max_samples=args.max_samples,
         camera=args.camera,
         include_sweeps=args.include_sweeps,
+        media_root=args.media_root,
     )
     print(f"Loaded nuScenes from {data['dataroot']}")
+    if data["media_root"] != data["dataroot"]:
+        print(f"Media files resolved from {data['media_root']}")
     print(f"Scenes: {data['num_scenes']}")
     print(f"Samples: {data['num_samples']}")
     print(f"Annotations: {data['num_annotations']}")

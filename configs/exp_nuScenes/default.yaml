@@ -1,5 +1,6 @@
-dataroot: dataset/nuScenes/v1.0-mini
-version: v1.0-mini
+dataroot: dataset/nuScenes
+version: v1.0-trainval_meta/v1.0-trainval
+media_root: dataset/nuScenes/v1.0-trainval01_blobs_camera
 
 dataset_download:
   # Parent directory where archives are downloaded and extracted.
