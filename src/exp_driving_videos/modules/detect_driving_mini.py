@@ -36,7 +36,6 @@ import cv2
 
 
 import config
-PROJECT_ROOT = config.PROJECT_ROOT
 
 # Reuse the shared detector classes from the nuScenes detection pipeline
 from src.exp_nuScenes.detection_pipeline import (
@@ -51,7 +50,7 @@ from src.exp_nuScenes.detection_pipeline import (
 # ---------------------------------------------------------------------------
 
 def get_frames_root() -> Path:
-    return PROJECT_ROOT / "dataset" / "driving_mini" / "frames"
+    return config.get_dataset_path("driving_mini") / "frames"
 
 
 def get_output_root() -> Path:

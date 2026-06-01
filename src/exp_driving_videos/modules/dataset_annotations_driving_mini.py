@@ -36,11 +36,11 @@ import config
 
 
 def get_labels_csv() -> Path:
-    return PROJECT_ROOT / "dataset" / "driving_mini" / "labels.csv"
+    return config.get_dataset_path("driving_mini") / "labels.csv"
 
 
 def get_frames_root() -> Path:
-    return PROJECT_ROOT / "dataset" / "driving_mini" / "frames"
+    return config.get_dataset_path("driving_mini") / "frames"
 
 
 def get_output_root() -> Path:
