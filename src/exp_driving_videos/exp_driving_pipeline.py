@@ -40,6 +40,19 @@ from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
+DRIVING_MINI_OD_MODEL = "yolov8l-worldv2.pt"
+DRIVING_MINI_OD_CLASSES = [
+    "car",
+    "truck",
+    "bus",
+    "motorcycle",
+    "bicycle",
+    "person",
+    "traffic light",
+    "stop sign",
+    "building",
+]
+
 
 def _get_ego_motion_smoothing_window(default: int = 5) -> int:
     """Load ego motion smoothing window from configs/exp_driving/default.yaml."""
@@ -94,16 +107,29 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _run_object_detection_step(force_recompute: bool = False) -> List[Dict[str, Any]]:
+    print("=== Step 1: detect_driving_mini ===")
+    print(f"OD model           : {DRIVING_MINI_OD_MODEL}")
+    print(f"OD classes         : {DRIVING_MINI_OD_CLASSES}")
+    print(f"OD force_recompute : {force_recompute}")
+    detection_results: List[Dict[str, Any]] = detect_driving_mini.run(
+        model_name=DRIVING_MINI_OD_MODEL,
+        classes=DRIVING_MINI_OD_CLASSES,
+        force_recompute=force_recompute,
+    )
+    print(f"Detection complete. Processed {len(detection_results)} video(s).")
+    print("*** Vis Path: ", Path(config.get_output_path("pipeline_output")) / "driving_mini_detection")
+    return detection_results
+
+
 def main() -> None:
     smoothing_window = _get_ego_motion_smoothing_window(default=5)
     static_adjust_cfg = _get_ego_static_adjustment_cfg()
     temporal_seg_cfg = _get_temporal_segmentation_cfg()
 
     # Step 1: object detection over driving_mini frames
-    print("=== Step 1: detect_driving_mini ===")
-    detection_results: List[Dict[str, Any]] = detect_driving_mini.run()
-    print(f"Detection complete. Processed {len(detection_results)} video(s).")
-    print("*** Vis Path: ", Path(config.get_output_path("pipeline_output")) / "driving_mini_detection")
+    detection_results = _run_object_detection_step(force_recompute=True)
+
     # Step 2: multi-object tracking with ByteTrack
     print("\n=== Step 2: tracking_driving_mini ===")
     tracking_results: List[Dict[str, Any]] = tracking_driving_mini.run(detection_results)
