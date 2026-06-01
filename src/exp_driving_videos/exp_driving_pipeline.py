@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
 
 def main(max_step: int = 8) -> None:
     # Step 1: object detection over driving_mini frames
-    detection_results = _run_object_detection_step(force_recompute=True)
+    detection_results = _run_object_detection_step(force_recompute=False)
     if max_step == 1:
         print("\nStopping after step 1 by request.")
         return
