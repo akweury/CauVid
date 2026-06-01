@@ -177,7 +177,14 @@ def render_tracking_video(
 
 def _make_tracker(frame_rate: int = 10, args: Optional[SimpleNamespace] = None) -> BYTETracker:
     """Create a fresh BYTETracker instance."""
-    return BYTETracker(args or _DEFAULT_TRACKER_ARGS, frame_rate=frame_rate)
+    tracker_args = args or _DEFAULT_TRACKER_ARGS
+    try:
+        return BYTETracker(tracker_args, frame_rate=frame_rate)
+    except TypeError as exc:
+        # Newer ultralytics releases removed the frame_rate kwarg.
+        if "frame_rate" not in str(exc):
+            raise
+        return BYTETracker(tracker_args)
 
 
 def _infer_orig_shape(frame_records: List[Dict[str, Any]]) -> tuple[int, int]:
