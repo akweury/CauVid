@@ -50,12 +50,13 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Copy project source code
 COPY src/ ./src/
 COPY configs/ ./configs/
+COPY external/ ./external/
 COPY *.py ./
 COPY *.md ./
 COPY LICENSE ./
 
 # Create necessary directories (data/output are mounted externally, not under /app)
-RUN mkdir -p temp external
+RUN mkdir -p temp
 
 # Set Python path to include the project root for src.* imports
 ENV PYTHONPATH="${PYTHONPATH}:/app"

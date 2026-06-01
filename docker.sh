@@ -215,6 +215,7 @@ run_pipeline() {
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
+        -v "$(pwd)/external:/app/external:ro" \
         -v "$pipeline_output_dir:/output/pipeline_output" \
         -v "$output_dir:/output/output" \
         -v "$logs_dir:/logs" \
