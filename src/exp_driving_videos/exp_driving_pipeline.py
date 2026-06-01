@@ -52,6 +52,8 @@ DRIVING_MINI_OD_CLASSES = [
     "traffic light",
     "stop sign",
     "building",
+    "tree",
+    "crosswalk",
 ]
 
 
