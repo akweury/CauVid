@@ -25,6 +25,7 @@ Steps:
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -122,18 +123,36 @@ def _run_object_detection_step(force_recompute: bool = False) -> List[Dict[str, 
     return detection_results
 
 
-def main() -> None:
-    smoothing_window = _get_ego_motion_smoothing_window(default=5)
-    static_adjust_cfg = _get_ego_static_adjustment_cfg()
-    temporal_seg_cfg = _get_temporal_segmentation_cfg()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the driving_mini experiment pipeline up to a selected step.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "max_step",
+        nargs="?",
+        type=int,
+        default=8,
+        choices=range(1, 9),
+        help="Run the pipeline through this step number.",
+    )
+    return parser.parse_args()
 
+
+def main(max_step: int = 8) -> None:
     # Step 1: object detection over driving_mini frames
     detection_results = _run_object_detection_step(force_recompute=True)
+    if max_step == 1:
+        print("\nStopping after step 1 by request.")
+        return
 
     # Step 2: multi-object tracking with ByteTrack
     print("\n=== Step 2: tracking_driving_mini ===")
     tracking_results: List[Dict[str, Any]] = tracking_driving_mini.run(detection_results)
     print(f"Tracking complete. Processed {len(tracking_results)} video(s).")
+    if max_step == 2:
+        print("\nStopping after step 2 by request.")
+        return
 
     # Step 3: import dataset-provided object annotations/tracks (ground truth)
     print("\n=== Step 3: dataset_annotations_driving_mini ===")
@@ -145,6 +164,9 @@ def main() -> None:
         "Dataset annotation import complete. "
         f"Processed {len(dataset_annotation_results)} video(s)."
     )
+    if max_step == 3:
+        print("\nStopping after step 3 by request.")
+        return
 
     # Step 4: merge GT annotations with detected/tracked results
     print("\n=== Step 4: merge_gt_and_detected_driving_mini ===")
@@ -156,6 +178,9 @@ def main() -> None:
         "Merge complete. "
         f"Processed {len(merged_results)} video(s)."
     )
+    if max_step == 4:
+        print("\nStopping after step 4 by request.")
+        return
 
     # Step 5: prepare per-object 3D positions using depth maps
     print("\n=== Step 5: prepare_3d_positions_driving_mini ===")
@@ -166,8 +191,13 @@ def main() -> None:
         "3D position preparation complete. "
         f"Processed {len(positions_3d_results)} video(s)."
     )
+    if max_step == 5:
+        print("\nStopping after step 5 by request.")
+        return
 
     # Step 6: ego motion estimation from optical flow + background mask + depth
+    smoothing_window = _get_ego_motion_smoothing_window(default=5)
+    static_adjust_cfg = _get_ego_static_adjustment_cfg()
     print("\n=== Step 6: ego_motion_driving_mini ===")
     print(f"Using ego motion smoothing_window={smoothing_window}")
     print(f"Using ego static adjustment cfg={static_adjust_cfg}")
@@ -180,6 +210,9 @@ def main() -> None:
         "Ego motion estimation complete. "
         f"Processed {len(ego_motion_results)} video(s)."
     )
+    if max_step == 6:
+        print("\nStopping after step 6 by request.")
+        return
 
     # Step 7: object motion relative to ego motion in camera 3D frame
     print("\n=== Step 7: relative_object_motion_driving_mini ===")
@@ -191,8 +224,12 @@ def main() -> None:
         "Relative object motion estimation complete. "
         f"Processed {len(relative_motion_results)} video(s)."
     )
+    if max_step == 7:
+        print("\nStopping after step 7 by request.")
+        return
 
     # Step 8: temporal segmentation of ego-motion signals to event spans/cut points
+    temporal_seg_cfg = _get_temporal_segmentation_cfg()
     print("\n=== Step 8: temporal_segmentation_driving_mini ===")
     print(f"Temporal segmentation cfg: {temporal_seg_cfg}")
     temporal_seg_results: List[Dict[str, Any]] = temporal_segmentation_driving_mini.run(
@@ -212,4 +249,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(max_step=args.max_step)

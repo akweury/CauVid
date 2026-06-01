@@ -68,4 +68,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import cv2, imageio, matplotlib, numpy, pandas, sklearn, scipy, torch, torchvision; print('Dependencies OK')" || exit 1
 
 # Default command
-CMD ["python", "-m", "src.exp_driving_videos.pipe_utils.percept2matrix"]
+CMD ["python", "-m", "src.exp_driving_videos.exp_driving_pipeline"]

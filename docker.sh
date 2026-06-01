@@ -51,6 +51,7 @@ print_help() {
     echo "Examples:"
     echo "  $0 build                    # Build the Docker image"
     echo "  $0 run --gpu 0              # Run pipeline on GPU 0"
+    echo "  $0 run --gpu 0 --max-step 4 # Run the pipeline through step 4"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
     echo "  $0 run                      # Run driving preprocessing over dataset/driving_mini/videos"
     echo "  $0 preprocess               # Same as run"
@@ -228,7 +229,7 @@ run_pipeline() {
         -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME} \
         ${IMAGE_NAME}:${VERSION} \
-        python -m src.exp_driving_videos.pipe_utils.percept2matrix
+        python -m src.exp_driving_videos.exp_driving_pipeline "$@"
     
     log "Preprocessing completed. Check $pipeline_output_dir for per-video pipeline_data.pkl files."
 }
@@ -263,7 +264,7 @@ prepare_driving_dataset() {
         -e CAUVID_OUTPUT_PATH=/output/output \
         --name ${CONTAINER_NAME}-prepare \
         ${IMAGE_NAME}:${VERSION} \
-        python -m src.exp_driving_videos.prepare_driving_dataset "$@"
+        python -m src.exp_driving_videos.legacy.prepare_driving_dataset "$@"
 
     log "Dataset preparation completed: $prepared_dataset"
 }
@@ -558,7 +559,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            if [[ "${COMMAND:-}" == "prepare" || "${COMMAND:-}" == "download-nuscenes" ]]; then
+            if [[ "${COMMAND:-}" == "run" || "${COMMAND:-}" == "prepare" || "${COMMAND:-}" == "download-nuscenes" ]]; then
                 PASSTHROUGH_ARGS+=("$1")
                 shift
             else
@@ -589,7 +590,7 @@ case $COMMAND in
         ;;
     run)
         build_image $FORCE
-        run_pipeline
+        run_pipeline ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
         ;;
     download-nuscenes)
         build_image $FORCE

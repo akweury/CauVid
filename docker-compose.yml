@@ -32,7 +32,7 @@ services:
     networks:
       - cauvid-network
     restart: "no"
-    command: ["python", "-m", "src.exp_driving_videos.pipe_utils.percept2matrix"]
+    command: ["python", "-m", "src.exp_driving_videos.exp_driving_pipeline"]
 
   # Development service with interactive shell
   cauvid-dev:
