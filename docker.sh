@@ -43,12 +43,14 @@ print_help() {
     echo "Options:"
     echo "  -v, --verbose    Verbose output"
     echo "  -f, --force      Force rebuild/restart"
+    echo "  -g, --gpu ID     Use a specific GPU device, e.g. 0 or all"
     echo "  CAUVID_STORAGE_ROOT defaults data to /storage-01/ml-jsha/CauVid_Data when present"
     echo "  CAUVID_OUTPUT_ROOT defaults outputs to /storage-01/ml-jsha/CauVid_output when present"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" enables GPU access for docker run"
     echo ""
     echo "Examples:"
     echo "  $0 build                    # Build the Docker image"
+    echo "  $0 run --gpu 0              # Run pipeline on GPU 0"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
     echo "  $0 run                      # Run driving preprocessing over dataset/driving_mini/videos"
     echo "  $0 preprocess               # Same as run"
@@ -68,6 +70,24 @@ warn() {
 error() {
     echo -e "${RED}[ERROR] $1${NC}"
     exit 1
+}
+
+configure_gpu_args() {
+    DOCKER_GPU_ARGS=()
+
+    if [ -n "${CAUVID_DOCKER_GPU_ARGS:-}" ] && [ -n "${GPU_ID:-}" ]; then
+        error "Use either CAUVID_DOCKER_GPU_ARGS or --gpu, not both."
+    fi
+
+    if [ -n "${CAUVID_DOCKER_GPU_ARGS:-}" ]; then
+        # shellcheck disable=SC2206
+        DOCKER_GPU_ARGS=(${CAUVID_DOCKER_GPU_ARGS})
+        return
+    fi
+
+    if [ -n "${GPU_ID:-}" ]; then
+        DOCKER_GPU_ARGS=(--device "nvidia.com/gpu=${GPU_ID}")
+    fi
 }
 
 check_dependencies() {
@@ -190,7 +210,7 @@ run_pipeline() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
-        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        "${DOCKER_GPU_ARGS[@]}" \
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
@@ -226,7 +246,7 @@ prepare_driving_dataset() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$output_dir" "$logs_dir" "$torch_cache_dir"
 
     docker run --rm \
-        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        "${DOCKER_GPU_ARGS[@]}" \
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
@@ -276,7 +296,7 @@ run_demo() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
-        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        "${DOCKER_GPU_ARGS[@]}" \
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
@@ -316,7 +336,7 @@ start_dev() {
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run -it --rm \
-        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        "${DOCKER_GPU_ARGS[@]}" \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
         -v "$raw_dataset:/raw_driving_data:ro" \
@@ -379,7 +399,7 @@ download_nuscenes() {
     rm -f "$cache_probe"
 
     docker run --rm \
-        ${CAUVID_DOCKER_GPU_ARGS:-} \
+        "${DOCKER_GPU_ARGS[@]}" \
         -v "$(pwd)/src:/app/src" \
         -v "$(pwd)/configs:/app/configs" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
@@ -452,6 +472,7 @@ open_shell() {
 # Parse arguments
 VERBOSE=false
 FORCE=false
+GPU_ID=""
 PASSTHROUGH_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -529,8 +550,20 @@ while [[ $# -gt 0 ]]; do
             FORCE=true
             shift
             ;;
+        -g|--gpu)
+            if [ $# -lt 2 ]; then
+                error "Missing value for $1"
+            fi
+            GPU_ID="$2"
+            shift 2
+            ;;
         *)
-            error "Unknown option: $1"
+            if [[ "${COMMAND:-}" == "prepare" || "${COMMAND:-}" == "download-nuscenes" ]]; then
+                PASSTHROUGH_ARGS+=("$1")
+                shift
+            else
+                error "Unknown option: $1"
+            fi
             ;;
     esac
 done
@@ -543,6 +576,7 @@ fi
 
 # Check dependencies
 check_dependencies
+configure_gpu_args
 
 # Execute command
 case $COMMAND in
