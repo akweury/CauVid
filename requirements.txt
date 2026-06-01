@@ -4,6 +4,7 @@ numpy<2
 Pillow
 torch
 torchvision
+ultralytics
 
 # Feature extraction and analysis dependencies
 scikit-learn
