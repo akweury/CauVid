@@ -84,6 +84,10 @@ def generate_depth_maps(
         print("⚠️  CUDA not available, switching to CPU")
         device = "cpu"
         use_fp16 = False
+
+    if device == "cuda" and use_fp16:
+        print("⚠️  Disabling FP16 for Depth Anything V3 due to dtype mismatch in the current inference stack")
+        use_fp16 = False
     
     device = torch.device(device)
     
@@ -125,7 +129,7 @@ def generate_depth_maps(
         model = model.to(device=device)
         model.eval()  # Set to evaluation mode
         
-        # Enable mixed precision if requested
+        # Depth Anything V3 currently runs more reliably in FP32 here.
         if use_fp16 and device.type == "cuda":
             model = model.half()
             print(f"✓ Model loaded successfully (FP16 mode)")

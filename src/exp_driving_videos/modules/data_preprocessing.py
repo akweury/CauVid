@@ -420,7 +420,7 @@ def generate_frame_depth_maps(
                         max_images=max_frames,
                         batch_size=batch_size,
                         device=device,
-                        use_fp16=(device == "cuda"),
+                        use_fp16=False,
                         image_extensions=tuple(f"*{ext}" for ext in image_extensions)
                     )
                     
@@ -446,7 +446,7 @@ def generate_frame_depth_maps(
                     max_images=max_frames,
                     batch_size=batch_size,
                     device=device,
-                    use_fp16=(device == "cuda"),
+                    use_fp16=False,
                     image_extensions=tuple(f"*{ext}" for ext in image_extensions)
                 )
                 
@@ -830,4 +830,3 @@ if __name__ == "__main__":
         print(f"❌ Error: {e}")
         print("Make sure to set up proper video and output folders in your config.")
         print("Also ensure Depth Anything V3 is properly installed and configured.")
-
