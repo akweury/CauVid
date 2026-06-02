@@ -221,6 +221,22 @@ def _combine_axis_events(forward_events: List[str], lateral_events: List[str]) -
     return [f"{forward_events[i]}|{lateral_events[i]}" for i in range(n)]
 
 
+def _centered_moving_mean(values: List[float], window_size: int) -> List[float]:
+    if not values:
+        return []
+    win = max(1, int(window_size))
+    if win <= 1:
+        return [float(v) for v in values]
+
+    arr = np.asarray(values, dtype=np.float32)
+    pad_left = win // 2
+    pad_right = win - 1 - pad_left
+    padded = np.pad(arr, (pad_left, pad_right), mode="edge")
+    kernel = np.ones(win, dtype=np.float32) / float(win)
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return [float(v) for v in smoothed]
+
+
 def _classify_forward_events(
     vz: List[float],
     speed: List[float],
@@ -230,6 +246,7 @@ def _classify_forward_events(
     stop_total_speed_enter: float,
     stop_total_speed_exit: float,
     min_stop_duration: int,
+    stop_window_size: int,
 ) -> Dict[str, Any]:
     """Classify signed forward-axis motion into forward/backward symbolic states."""
     n = len(vz)
@@ -237,11 +254,14 @@ def _classify_forward_events(
     for i in range(1, n):
         forward_accel[i] = vz[i] - vz[i - 1]
 
+    abs_vz_mean = _centered_moving_mean([abs(v) for v in vz], stop_window_size)
+    total_speed_mean = _centered_moving_mean(speed, stop_window_size)
+
     stop_raw: List[bool] = [False] * n
     is_stopped = False
     for i in range(n):
-        abs_vz = abs(vz[i])
-        total_speed = speed[i]
+        abs_vz = abs_vz_mean[i]
+        total_speed = total_speed_mean[i]
         enter_stop = (abs_vz <= stop_enter_threshold) and (total_speed <= stop_total_speed_enter)
         stay_stop = (abs_vz <= stop_exit_threshold) and (total_speed <= stop_total_speed_exit)
         if is_stopped:
@@ -291,6 +311,8 @@ def _classify_forward_events(
 
     return {
         "forward_accel": forward_accel,
+        "abs_vz_mean": abs_vz_mean,
+        "total_speed_mean": total_speed_mean,
         "stop_raw": stop_raw,
         "forward_stop_mask": forward_stop_mask,
         "forward_speedup_mask": forward_speedup_mask,
@@ -842,6 +864,7 @@ def process_video(
     stop_total_speed_exit = float(cfg.get("stop_total_speed_exit_threshold", stop_exit_threshold * 1.8))
     accel_threshold = float(cfg.get("forward_accel_threshold", cfg.get("accel_threshold", 0.03)))
     lateral_turn_threshold = float(cfg.get("lateral_turn_threshold", 0.03))
+    stop_window_size = int(cfg.get("stop_window_size", 5))
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
@@ -888,6 +911,7 @@ def process_video(
             != float(lateral_turn_threshold)
             or float(cache_cfg.get("forward_accel_threshold", cache_cfg.get("accel_threshold", accel_threshold)))
             != float(accel_threshold)
+            or int(cache_cfg.get("stop_window_size", stop_window_size)) != int(stop_window_size)
             or int(cache_cfg.get("min_stop_duration", min_stop_duration)) != int(min_stop_duration)
             or int(cache_cfg.get("min_turn_duration", min_turn_duration)) != int(min_turn_duration)
         )
@@ -945,6 +969,7 @@ def process_video(
         stop_total_speed_enter=stop_total_speed_enter,
         stop_total_speed_exit=stop_total_speed_exit,
         min_stop_duration=min_stop_duration,
+        stop_window_size=stop_window_size,
     )
     forward_accel = forward_axis["forward_accel"]
     stop_raw = forward_axis["stop_raw"]
@@ -1030,6 +1055,7 @@ def process_video(
             stop_total_speed_enter=compare_total_speed_enter,
             stop_total_speed_exit=compare_total_speed_exit,
             min_stop_duration=min_stop_duration,
+            stop_window_size=stop_window_size,
         )
 
         symbolic_cmp = _apply_symbolic_static_correction(
@@ -1100,6 +1126,7 @@ def process_video(
             "accel_threshold": accel_threshold,
             "forward_accel_threshold": accel_threshold,
             "lateral_turn_threshold": lateral_turn_threshold,
+            "stop_window_size": stop_window_size,
             "min_stop_duration": min_stop_duration,
             "min_turn_duration": min_turn_duration,
             "min_segment_length": min_segment_length,
@@ -1107,6 +1134,8 @@ def process_video(
         "signals": {
             "speed": speed,
             "forward_acceleration": forward_accel,
+            "stop_abs_vz_mean": forward_axis["abs_vz_mean"],
+            "stop_total_speed_mean": forward_axis["total_speed_mean"],
             "yaw_rate": yaw,
         },
             "masks": {
