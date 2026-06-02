@@ -869,7 +869,7 @@ def process_video(
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
     compare_forward_stop_thresholds = [
-        float(v) for v in cfg.get("compare_forward_stop_thresholds", [0.04, 0.05, 0.06])
+        float(v) for v in cfg.get("compare_forward_stop_thresholds", [0.05, 0.1, 0.2])
     ]
     compare_min_segment_lengths = [
         int(v) for v in cfg.get("compare_min_segment_lengths", [7])
