@@ -689,7 +689,9 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
          - yaw estimate from the horizontal residual
          - refined lateral estimate after removing yaw
     4. Depth-weighted forward translation on the residual flow:
-         vz = median( |flow_residual_i| * Z_i )   — forward speed proxy (≥ 0)
+         vz_mag = median( |flow_residual_i| * Z_i )
+         vz_sign = sign( median( radial(flow_residual_i) ) )
+         vz = vz_sign * vz_mag                     — forward/backward proxy
          vx = median( dx_no_yaw_i * Z_i )         — lateral component (signed)
        This avoids inflating ``vz`` during turning, where yaw mostly appears as
        a scene-wide horizontal flow bias.
@@ -718,6 +720,7 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
     if valid.sum() == 0:
         return (0.0, 0.0, 0.0) if return_yaw else (0.0, 0.0)
 
+    yy, xx = np.nonzero(valid)
     dx = flow[valid, 0].astype(np.float32)
     dy = flow[valid, 1].astype(np.float32)
     Z  = depth_map[valid]
@@ -727,6 +730,7 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
     moving = mag > min_flow_px
     if moving.sum() < 5:
         return (0.0, 0.0, 0.0) if return_yaw else (0.0, 0.0)
+    xx, yy = xx[moving].astype(np.float32), yy[moving].astype(np.float32)
     dx, dy, Z, mag = dx[moving], dy[moving], Z[moving], mag[moving]
 
     # ── 2. angle consensus → inlier set ──────────────────────────────────────
@@ -750,6 +754,8 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
     dx_in = dx[inliers]
     dy_in = dy[inliers]
     Z_in  = Z[inliers]
+    xx_in = xx[inliers]
+    yy_in = yy[inliers]
 
     # ── 3. remove yaw/lateral leakage before estimating forward speed ────────
     # Initial lateral estimate in image x.
@@ -766,7 +772,32 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
     # Remaining flow after removing lateral translation. This residual is a
     # better proxy for forward motion than the raw flow magnitude during turns.
     dx_forward_residual = dx_no_yaw - (vx / Z_in)
-    vz = float(np.median(np.hypot(dx_forward_residual, dy_in) * Z_in))
+    vz_mag = float(np.median(np.hypot(dx_forward_residual, dy_in) * Z_in))
+
+    h, w = bg_mask.shape[:2]
+    cx = 0.5 * float(w - 1)
+    cy = 0.5 * float(h - 1)
+    radial_x = xx_in - cx
+    radial_y = yy_in - cy
+    radial_norm = np.hypot(radial_x, radial_y)
+    radial_valid = radial_norm > 1e-3
+    if np.any(radial_valid):
+        radial_proj = (
+            (radial_x[radial_valid] * dx_forward_residual[radial_valid])
+            + (radial_y[radial_valid] * dy_in[radial_valid])
+        ) / radial_norm[radial_valid]
+        radial_median = float(np.median(radial_proj))
+    else:
+        radial_median = float(np.median(dy_in))
+
+    if radial_median > 1e-4:
+        vz_sign = 1.0
+    elif radial_median < -1e-4:
+        vz_sign = -1.0
+    else:
+        vz_sign = 1.0 if float(np.median(dy_in)) >= 0.0 else -1.0
+
+    vz = float(vz_sign * vz_mag)
 
     if not return_yaw:
         return vx, vz

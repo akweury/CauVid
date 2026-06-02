@@ -48,7 +48,7 @@ _EVENT_COLORS_BGR: Dict[str, tuple] = {
     "constant_speed": (180, 180, 180),
 }
 
-_SEGMENTATION_VIS_VERSION = 4
+_SEGMENTATION_VIS_VERSION = 5
 
 
 def _event_color_bgr(event_label: str) -> tuple:
@@ -60,6 +60,12 @@ def _event_color_bgr(event_label: str) -> tuple:
 
     base = {
         "stopping": (80, 80, 255),
+        "forward_speedup": (70, 200, 70),
+        "forward_slowdown": (70, 70, 200),
+        "forward_static_moving": (180, 180, 180),
+        "backward_speedup": (40, 170, 255),
+        "backward_slowdown": (190, 120, 255),
+        "backward_static_moving": (120, 150, 190),
         "speedup": (70, 200, 70),
         "slowdown": (70, 70, 200),
         "static_moving": (180, 180, 180),
@@ -213,6 +219,88 @@ def _combine_axis_events(forward_events: List[str], lateral_events: List[str]) -
     """Combine forward/lateral symbolic states into a single per-frame label."""
     n = min(len(forward_events), len(lateral_events))
     return [f"{forward_events[i]}|{lateral_events[i]}" for i in range(n)]
+
+
+def _classify_forward_events(
+    vz: List[float],
+    speed: List[float],
+    accel_threshold: float,
+    stop_enter_threshold: float,
+    stop_exit_threshold: float,
+    stop_total_speed_enter: float,
+    stop_total_speed_exit: float,
+    min_stop_duration: int,
+) -> Dict[str, Any]:
+    """Classify signed forward-axis motion into forward/backward symbolic states."""
+    n = len(vz)
+    forward_accel: List[float] = [0.0] * n
+    for i in range(1, n):
+        forward_accel[i] = vz[i] - vz[i - 1]
+
+    stop_raw: List[bool] = [False] * n
+    is_stopped = False
+    for i in range(n):
+        abs_vz = abs(vz[i])
+        total_speed = speed[i]
+        enter_stop = (abs_vz <= stop_enter_threshold) and (total_speed <= stop_total_speed_enter)
+        stay_stop = (abs_vz <= stop_exit_threshold) and (total_speed <= stop_total_speed_exit)
+        if is_stopped:
+            is_stopped = stay_stop
+        else:
+            is_stopped = enter_stop
+        stop_raw[i] = is_stopped
+
+    stop_runs = _bool_runs(stop_raw, min_len=min_stop_duration)
+    forward_stop_mask = _mask_from_runs(n, stop_runs)
+
+    forward_speedup_mask: List[bool] = [False] * n
+    forward_slowdown_mask: List[bool] = [False] * n
+    forward_static_moving_mask: List[bool] = [False] * n
+    backward_speedup_mask: List[bool] = [False] * n
+    backward_slowdown_mask: List[bool] = [False] * n
+    backward_static_moving_mask: List[bool] = [False] * n
+    forward_event_raw: List[str] = []
+
+    for i in range(n):
+        if forward_stop_mask[i]:
+            forward_event_raw.append("stopping")
+            continue
+
+        moving_forward = vz[i] >= 0.0
+        accel = forward_accel[i]
+        if moving_forward:
+            if accel > accel_threshold:
+                forward_speedup_mask[i] = True
+                forward_event_raw.append("forward_speedup")
+            elif accel < -accel_threshold:
+                forward_slowdown_mask[i] = True
+                forward_event_raw.append("forward_slowdown")
+            else:
+                forward_static_moving_mask[i] = True
+                forward_event_raw.append("forward_static_moving")
+        else:
+            if accel < -accel_threshold:
+                backward_speedup_mask[i] = True
+                forward_event_raw.append("backward_speedup")
+            elif accel > accel_threshold:
+                backward_slowdown_mask[i] = True
+                forward_event_raw.append("backward_slowdown")
+            else:
+                backward_static_moving_mask[i] = True
+                forward_event_raw.append("backward_static_moving")
+
+    return {
+        "forward_accel": forward_accel,
+        "stop_raw": stop_raw,
+        "forward_stop_mask": forward_stop_mask,
+        "forward_speedup_mask": forward_speedup_mask,
+        "forward_slowdown_mask": forward_slowdown_mask,
+        "forward_static_moving_mask": forward_static_moving_mask,
+        "backward_speedup_mask": backward_speedup_mask,
+        "backward_slowdown_mask": backward_slowdown_mask,
+        "backward_static_moving_mask": backward_static_moving_mask,
+        "forward_event_raw": forward_event_raw,
+    }
 
 
 def _build_merged_segments_from_cutpoints(
@@ -374,6 +462,7 @@ def _render_signal_chart_panel(
     color_fn,
     fallback_event: str,
     signal_label: str,
+    footer_prefix: str = "",
 ) -> np.ndarray:
     """Render a line chart with segmentation-colored background and current-frame cursor."""
     try:
@@ -463,9 +552,12 @@ def _render_signal_chart_panel(
         cv2.circle(panel, tuple(points[current_idx]), 4, (0, 255, 255), -1)
 
     current_value = float(vals[min(current_idx, len(vals) - 1)])
+    footer_text = f"{signal_label}: {current_value:+.4f}"
+    if footer_prefix:
+        footer_text = f"{footer_prefix} | {footer_text}"
     cv2.putText(
         panel,
-        f"{signal_label}: {current_value:+.4f}",
+        footer_text,
         (10, height - 8),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -504,7 +596,7 @@ def _render_single_temporal_segmentation_video(
     h, w = first_img.shape[:2]
     if not chart_specs:
         return None
-    panel_h = 160
+    panel_h = max(90, min(160, 900 // max(1, len(chart_specs))))
     timeline_h = panel_h * len(chart_specs)
     out_size = (w, h + timeline_h)
 
@@ -570,6 +662,7 @@ def _render_single_temporal_segmentation_video(
                         color_fn=spec["color_fn"],
                         fallback_event=spec["fallback_event"],
                         signal_label=spec["signal_label"],
+                        footer_prefix=spec.get("footer_prefix", ""),
                     )
                 )
 
@@ -616,38 +709,36 @@ def _render_temporal_segmentation_videos(
     cut_points_lateral = [int(seg.get("start_frame", 0)) for seg in lateral_segments]
     cut_points_processed = [int(v) for v in segmentation_result.get("cut_points", [])]
 
-    forward_compare_specs = [
-        {
-            "title": "forward segmentation | raw",
-            "signal_values": forward_signal,
-            "event_series": forward_events_raw,
-            "cut_points": cut_points_forward_raw,
-            "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
-            "fallback_event": "static_moving",
-            "current_label_prefix": "forward raw",
-            "signal_label": "vz",
-        }
-    ]
-    for compare_len in (5, 10, 15):
-        merged = _merge_short_segments(
-            events=forward_events_raw,
-            frame_indices=frame_indices,
-            min_segment_length=compare_len,
-        )["events"]
-        merged_segments = _segment_from_events(merged, frame_indices) if merged else []
-        merged_cut_points = [int(seg.get("start_frame", 0)) for seg in merged_segments]
-        forward_compare_specs.append(
+    forward_compare_specs = segmentation_result.get("forward_comparison_variants", [])
+    if forward_compare_specs:
+        hydrated_specs = []
+        for spec in forward_compare_specs:
+            hydrated = dict(spec)
+            hydrated["color_fn"] = lambda ev: _event_color_bgr(f"{ev}|straightforward")
+            hydrated.setdefault("fallback_event", "forward_static_moving")
+            hydrated.setdefault("signal_label", "vz")
+            stop_duration = hydrated.get("min_stop_duration")
+            segment_length = hydrated.get("min_segment_length")
+            if stop_duration is not None and segment_length is not None:
+                hydrated.setdefault(
+                    "footer_prefix",
+                    f"min_stop={int(stop_duration)} | min_seg={int(segment_length)}",
+                )
+            hydrated_specs.append(hydrated)
+        forward_compare_specs = hydrated_specs
+    if not forward_compare_specs:
+        forward_compare_specs = [
             {
-                "title": f"forward segmentation | min_segment_length={compare_len}",
+                "title": "forward segmentation | active config",
                 "signal_values": forward_signal,
-                "event_series": merged,
-                "cut_points": merged_cut_points,
+                "event_series": forward_events_processed,
+                "cut_points": cut_points_forward_processed,
                 "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
-                "fallback_event": "static_moving",
-                "current_label_prefix": f"forward@{compare_len}",
+                "fallback_event": "forward_static_moving",
+                "current_label_prefix": "forward",
                 "signal_label": "vz",
             }
-        )
+        ]
 
     vis_specs = [
         (
@@ -689,7 +780,7 @@ def _render_temporal_segmentation_videos(
                     "event_series": forward_events_raw,
                     "cut_points": cut_points_forward_raw,
                     "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
-                    "fallback_event": "static_moving",
+                    "fallback_event": "forward_static_moving",
                     "current_label_prefix": "forward raw",
                     "signal_label": "vz",
                 }
@@ -752,7 +843,7 @@ def process_video(
         int(v) for v in cfg.get("compare_min_stop_durations", [5, 10, 15])
     ]
     compare_min_segment_lengths = [
-        int(v) for v in cfg.get("compare_min_segment_lengths", [5, 10, 15])
+        int(v) for v in cfg.get("compare_min_segment_lengths", [5, 7, 9])
     ]
     compare_min_stop_durations = sorted({max(1, v) for v in compare_min_stop_durations})
     compare_min_segment_lengths = sorted({max(1, v) for v in compare_min_segment_lengths})
@@ -838,51 +929,27 @@ def process_video(
 
     speed = [math.sqrt(vx_i * vx_i + vz_i * vz_i) for vx_i, vz_i in zip(vx, vz)]
 
-    # Forward-axis segmentation (z): stopping / static_moving / speedup / slowdown
-    forward_accel: List[float] = [0.0] * len(vz)
-    for i in range(1, len(vz)):
-        forward_accel[i] = vz[i] - vz[i - 1]
-
-    stop_raw: List[bool] = [False] * len(frames)
-    is_stopped = False
-    for i in range(len(frames)):
-        abs_vz = abs(vz[i])
-        total_speed = speed[i]
-        enter_stop = (abs_vz <= stop_enter_threshold) and (total_speed <= stop_total_speed_enter)
-        stay_stop = (abs_vz <= stop_exit_threshold) and (total_speed <= stop_total_speed_exit)
-        if is_stopped:
-            is_stopped = stay_stop
-        else:
-            is_stopped = enter_stop
-        stop_raw[i] = is_stopped
-    stop_runs = _bool_runs(stop_raw, min_len=min_stop_duration)
-    forward_stop_mask = _mask_from_runs(len(frames), stop_runs)
-
-    forward_speedup_mask = [
-        (forward_accel[i] > accel_threshold) and (not forward_stop_mask[i])
-        for i in range(len(frames))
-    ]
-    forward_slowdown_mask = [
-        (forward_accel[i] < -accel_threshold) and (not forward_stop_mask[i])
-        for i in range(len(frames))
-    ]
-    forward_static_moving_mask = [
-        (not forward_stop_mask[i])
-        and (not forward_speedup_mask[i])
-        and (not forward_slowdown_mask[i])
-        for i in range(len(frames))
-    ]
-
-    forward_event_raw: List[str] = []
-    for i in range(len(frames)):
-        if forward_stop_mask[i]:
-            forward_event_raw.append("stopping")
-        elif forward_speedup_mask[i]:
-            forward_event_raw.append("speedup")
-        elif forward_slowdown_mask[i]:
-            forward_event_raw.append("slowdown")
-        else:
-            forward_event_raw.append("static_moving")
+    # Forward-axis segmentation (z): signed forward/backward motion plus stopping.
+    forward_axis = _classify_forward_events(
+        vz=vz,
+        speed=speed,
+        accel_threshold=accel_threshold,
+        stop_enter_threshold=stop_enter_threshold,
+        stop_exit_threshold=stop_exit_threshold,
+        stop_total_speed_enter=stop_total_speed_enter,
+        stop_total_speed_exit=stop_total_speed_exit,
+        min_stop_duration=min_stop_duration,
+    )
+    forward_accel = forward_axis["forward_accel"]
+    stop_raw = forward_axis["stop_raw"]
+    forward_stop_mask = forward_axis["forward_stop_mask"]
+    forward_speedup_mask = forward_axis["forward_speedup_mask"]
+    forward_slowdown_mask = forward_axis["forward_slowdown_mask"]
+    forward_static_moving_mask = forward_axis["forward_static_moving_mask"]
+    backward_speedup_mask = forward_axis["backward_speedup_mask"]
+    backward_slowdown_mask = forward_axis["backward_slowdown_mask"]
+    backward_static_moving_mask = forward_axis["backward_static_moving_mask"]
+    forward_event_raw = forward_axis["forward_event_raw"]
 
     # Lateral-axis segmentation (x): turning_left / turning_right / straightforward
     lateral_left_raw = [vx_i < -lateral_turn_threshold for vx_i in vx]
@@ -939,30 +1006,21 @@ def process_video(
     cut_points = merged_axis["cut_points"]
 
     comparison_rows: List[Dict[str, Any]] = []
+    forward_comparison_variants: List[Dict[str, Any]] = []
     for compare_stop_duration in compare_min_stop_durations:
-        stop_runs_cmp = _bool_runs(stop_raw, min_len=compare_stop_duration)
-        forward_stop_mask_cmp = _mask_from_runs(len(frames), stop_runs_cmp)
-        forward_speedup_mask_cmp = [
-            (forward_accel[i] > accel_threshold) and (not forward_stop_mask_cmp[i])
-            for i in range(len(frames))
-        ]
-        forward_slowdown_mask_cmp = [
-            (forward_accel[i] < -accel_threshold) and (not forward_stop_mask_cmp[i])
-            for i in range(len(frames))
-        ]
-        forward_event_cmp_raw: List[str] = []
-        for i in range(len(frames)):
-            if forward_stop_mask_cmp[i]:
-                forward_event_cmp_raw.append("stopping")
-            elif forward_speedup_mask_cmp[i]:
-                forward_event_cmp_raw.append("speedup")
-            elif forward_slowdown_mask_cmp[i]:
-                forward_event_cmp_raw.append("slowdown")
-            else:
-                forward_event_cmp_raw.append("static_moving")
+        forward_cmp = _classify_forward_events(
+            vz=vz,
+            speed=speed,
+            accel_threshold=accel_threshold,
+            stop_enter_threshold=stop_enter_threshold,
+            stop_exit_threshold=stop_exit_threshold,
+            stop_total_speed_enter=stop_total_speed_enter,
+            stop_total_speed_exit=stop_total_speed_exit,
+            min_stop_duration=compare_stop_duration,
+        )
 
         symbolic_cmp = _apply_symbolic_static_correction(
-            primary_event=forward_event_cmp_raw,
+            primary_event=forward_cmp["forward_event_raw"],
             frame_indices=frame_indices,
             relative_video_result=relative_motion_video_result,
             cfg=cfg,
@@ -976,6 +1034,7 @@ def process_video(
                 frame_indices=frame_indices,
                 min_segment_length=compare_segment_length,
             )["events"]
+            forward_segments_cmp = _segment_from_events(forward_events_cmp, frame_indices)
             lateral_events_cmp = _merge_short_segments(
                 events=lateral_event_raw,
                 frame_indices=frame_indices,
@@ -984,8 +1043,26 @@ def process_video(
             segment_length_counts.append(
                 {
                     "min_segment_length": compare_segment_length,
-                    "num_forward_segments": len(_segment_from_events(forward_events_cmp, frame_indices)),
+                    "num_forward_segments": len(forward_segments_cmp),
                     "num_lateral_segments": len(_segment_from_events(lateral_events_cmp, frame_indices)),
+                }
+            )
+            forward_comparison_variants.append(
+                {
+                    "title": (
+                        f"forward | stop={compare_stop_duration}, "
+                        f"seg={compare_segment_length}"
+                    ),
+                    "signal_values": vz,
+                    "event_series": forward_events_cmp,
+                    "cut_points": [int(seg.get("start_frame", 0)) for seg in forward_segments_cmp],
+                    "fallback_event": "forward_static_moving",
+                    "current_label_prefix": (
+                        f"stop={compare_stop_duration}, seg={compare_segment_length}"
+                    ),
+                    "min_stop_duration": compare_stop_duration,
+                    "min_segment_length": compare_segment_length,
+                    "signal_label": "vz",
                 }
             )
 
@@ -1018,11 +1095,14 @@ def process_video(
             "forward_acceleration": forward_accel,
             "yaw_rate": yaw,
         },
-        "masks": {
+            "masks": {
             "forward_stopping": forward_stop_mask,
             "forward_speedup": forward_speedup_mask,
             "forward_slowdown": forward_slowdown_mask,
             "forward_static_moving": forward_static_moving_mask,
+            "backward_speedup": backward_speedup_mask,
+            "backward_slowdown": backward_slowdown_mask,
+            "backward_static_moving": backward_static_moving_mask,
             "lateral_turning_left": lateral_left_mask,
             "lateral_turning_right": lateral_right_mask,
             "lateral_straightforward": lateral_straight_mask,
@@ -1055,6 +1135,7 @@ def process_video(
             "compare_min_segment_lengths": compare_min_segment_lengths,
             "rows": comparison_rows,
         },
+        "forward_comparison_variants": forward_comparison_variants,
         "segments": segments,
         "cut_points": cut_points,
         "num_segments": len(segments),
@@ -1077,11 +1158,15 @@ def process_video(
         with out_file.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
 
-    print(
-        f"  {video_id} | min_stop_duration={min_stop_duration} | "
-        f"min_segment_length={min_segment_length} | "
-        f"vz={len(forward_segments_final)}"
-    )
+    print(f"  {video_id}")
+    for row in comparison_rows:
+        stop_duration = int(row["min_stop_duration"])
+        for counts in row["segment_length_counts"]:
+            print(
+                f"    min_stop_duration={stop_duration} | "
+                f"min_segment_length={int(counts['min_segment_length'])} | "
+                f"vz={int(counts['num_forward_segments'])}"
+            )
     return result
 
 
