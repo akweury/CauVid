@@ -925,6 +925,8 @@ def process_video(
         lateral_events=lateral_event_raw,
     )
 
+    forward_segments_final = _segment_from_events(symbolic["events"], frame_indices)
+    lateral_segments_final = _segment_from_events(lateral_event_raw, frame_indices)
     segments = _segment_from_events(primary_event_corrected, frame_indices)
     cut_points = merged_axis["cut_points"]
 
@@ -978,6 +980,10 @@ def process_video(
             "num_merged_segments": short_merge["num_merged_segments"],
             "min_segment_length": short_merge["min_segment_length"],
         },
+        "forward_segments": forward_segments_final,
+        "lateral_segments": lateral_segments_final,
+        "num_forward_segments": len(forward_segments_final),
+        "num_lateral_segments": len(lateral_segments_final),
         "segments": segments,
         "cut_points": cut_points,
         "num_segments": len(segments),
@@ -999,10 +1005,11 @@ def process_video(
         result["visualization_path"] = rendered.get("primary", "")
         with out_file.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
-        print("    visualizations saved -> " + ", ".join(Path(p).name for p in rendered.values()))
 
     print(
-        f"  {video_id}: {len(segments)} segments, "
+        f"  {video_id}: vz={len(forward_segments_final)} segments, "
+        f"vx={len(lateral_segments_final)} segments, "
+        f"combined={len(segments)} segments, "
         f"{len(cut_points)} cut points"
     )
     return result
