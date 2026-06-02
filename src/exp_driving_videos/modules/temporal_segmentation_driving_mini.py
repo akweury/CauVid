@@ -717,9 +717,15 @@ def _render_temporal_segmentation_videos(
             hydrated["color_fn"] = lambda ev: _event_color_bgr(f"{ev}|straightforward")
             hydrated.setdefault("fallback_event", "forward_static_moving")
             hydrated.setdefault("signal_label", "vz")
+            stop_threshold = hydrated.get("stop_threshold")
             stop_duration = hydrated.get("min_stop_duration")
             segment_length = hydrated.get("min_segment_length")
-            if stop_duration is not None and segment_length is not None:
+            if stop_threshold is not None and stop_duration is not None and segment_length is not None:
+                hydrated.setdefault(
+                    "footer_prefix",
+                    f"stop_th={float(stop_threshold):.3f} | min_stop={int(stop_duration)} | min_seg={int(segment_length)}",
+                )
+            elif stop_duration is not None and segment_length is not None:
                 hydrated.setdefault(
                     "footer_prefix",
                     f"min_stop={int(stop_duration)} | min_seg={int(segment_length)}",
@@ -839,13 +845,13 @@ def process_video(
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
-    compare_min_stop_durations = [
-        int(v) for v in cfg.get("compare_min_stop_durations", [3, 5, 7])
+    compare_forward_stop_thresholds = [
+        float(v) for v in cfg.get("compare_forward_stop_thresholds", [0.04, 0.05, 0.06])
     ]
     compare_min_segment_lengths = [
         int(v) for v in cfg.get("compare_min_segment_lengths", [7])
     ]
-    compare_min_stop_durations = sorted({max(1, v) for v in compare_min_stop_durations})
+    compare_forward_stop_thresholds = sorted({max(1e-6, v) for v in compare_forward_stop_thresholds})
     compare_min_segment_lengths = sorted({max(1, v) for v in compare_min_segment_lengths})
 
     video_id = ego_video_result["video_id"]
@@ -1005,18 +1011,25 @@ def process_video(
     segments = _segment_from_events(primary_event_corrected, frame_indices)
     cut_points = merged_axis["cut_points"]
 
+    stop_exit_ratio = stop_exit_threshold / max(1e-6, stop_enter_threshold)
+    total_enter_ratio = stop_total_speed_enter / max(1e-6, stop_enter_threshold)
+    total_exit_ratio = stop_total_speed_exit / max(1e-6, stop_exit_threshold)
+
     comparison_rows: List[Dict[str, Any]] = []
     forward_comparison_variants: List[Dict[str, Any]] = []
-    for compare_stop_duration in compare_min_stop_durations:
+    for compare_stop_threshold in compare_forward_stop_thresholds:
+        compare_stop_exit_threshold = compare_stop_threshold * stop_exit_ratio
+        compare_total_speed_enter = compare_stop_threshold * total_enter_ratio
+        compare_total_speed_exit = compare_stop_exit_threshold * total_exit_ratio
         forward_cmp = _classify_forward_events(
             vz=vz,
             speed=speed,
             accel_threshold=accel_threshold,
-            stop_enter_threshold=stop_enter_threshold,
-            stop_exit_threshold=stop_exit_threshold,
-            stop_total_speed_enter=stop_total_speed_enter,
-            stop_total_speed_exit=stop_total_speed_exit,
-            min_stop_duration=compare_stop_duration,
+            stop_enter_threshold=compare_stop_threshold,
+            stop_exit_threshold=compare_stop_exit_threshold,
+            stop_total_speed_enter=compare_total_speed_enter,
+            stop_total_speed_exit=compare_total_speed_exit,
+            min_stop_duration=min_stop_duration,
         )
 
         symbolic_cmp = _apply_symbolic_static_correction(
@@ -1050,7 +1063,7 @@ def process_video(
             forward_comparison_variants.append(
                 {
                     "title": (
-                        f"forward | stop={compare_stop_duration}, "
+                        f"forward | stop_th={compare_stop_threshold:.3f}, "
                         f"seg={compare_segment_length}"
                     ),
                     "signal_values": vz,
@@ -1058,9 +1071,10 @@ def process_video(
                     "cut_points": [int(seg.get("start_frame", 0)) for seg in forward_segments_cmp],
                     "fallback_event": "forward_static_moving",
                     "current_label_prefix": (
-                        f"stop={compare_stop_duration}, seg={compare_segment_length}"
+                        f"stop_th={compare_stop_threshold:.3f}, seg={compare_segment_length}"
                     ),
-                    "min_stop_duration": compare_stop_duration,
+                    "stop_threshold": compare_stop_threshold,
+                    "min_stop_duration": min_stop_duration,
                     "min_segment_length": compare_segment_length,
                     "signal_label": "vz",
                 }
@@ -1068,7 +1082,7 @@ def process_video(
 
         comparison_rows.append(
             {
-                "min_stop_duration": compare_stop_duration,
+                "stop_threshold": compare_stop_threshold,
                 "segment_length_counts": segment_length_counts,
             }
         )
@@ -1131,7 +1145,7 @@ def process_video(
         "num_forward_segments": len(forward_segments_final),
         "num_lateral_segments": len(lateral_segments_final),
         "segment_count_comparison": {
-            "compare_min_stop_durations": compare_min_stop_durations,
+            "compare_forward_stop_thresholds": compare_forward_stop_thresholds,
             "compare_min_segment_lengths": compare_min_segment_lengths,
             "rows": comparison_rows,
         },
@@ -1160,10 +1174,11 @@ def process_video(
 
     print(f"  {video_id}")
     for row in comparison_rows:
-        stop_duration = int(row["min_stop_duration"])
+        stop_threshold = float(row["stop_threshold"])
         for counts in row["segment_length_counts"]:
             print(
-                f"    min_stop_duration={stop_duration} | "
+                f"    stop_threshold={stop_threshold:.3f} | "
+                f"min_stop_duration={min_stop_duration} | "
                 f"min_segment_length={int(counts['min_segment_length'])} | "
                 f"vz={int(counts['num_forward_segments'])}"
             )

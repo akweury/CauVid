@@ -98,7 +98,7 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
         "min_stop_duration": 5,
         "min_turn_duration": 3,
         "min_segment_length": 7,
-        "compare_min_stop_durations": [3, 5, 7],
+        "compare_forward_stop_thresholds": [0.04, 0.05, 0.06],
         "compare_min_segment_lengths": [7],
     }
     try:
