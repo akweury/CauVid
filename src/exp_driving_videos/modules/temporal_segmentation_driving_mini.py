@@ -247,12 +247,15 @@ def _classify_forward_events(
     stop_total_speed_exit: float,
     min_stop_duration: int,
     stop_window_size: int,
+    motion_window_size: int,
+    direction_epsilon: float,
 ) -> Dict[str, Any]:
     """Classify signed forward-axis motion into forward/backward symbolic states."""
     n = len(vz)
+    vz_trend = _centered_moving_mean(vz, motion_window_size)
     forward_accel: List[float] = [0.0] * n
     for i in range(1, n):
-        forward_accel[i] = vz[i] - vz[i - 1]
+        forward_accel[i] = vz_trend[i] - vz_trend[i - 1]
 
     abs_vz_mean = _centered_moving_mean([abs(v) for v in vz], stop_window_size)
     total_speed_mean = _centered_moving_mean(speed, stop_window_size)
@@ -280,13 +283,21 @@ def _classify_forward_events(
     backward_slowdown_mask: List[bool] = [False] * n
     backward_static_moving_mask: List[bool] = [False] * n
     forward_event_raw: List[str] = []
+    last_direction = 1
 
     for i in range(n):
         if forward_stop_mask[i]:
             forward_event_raw.append("stopping")
             continue
 
-        moving_forward = vz[i] >= 0.0
+        if vz_trend[i] > direction_epsilon:
+            moving_forward = True
+            last_direction = 1
+        elif vz_trend[i] < -direction_epsilon:
+            moving_forward = False
+            last_direction = -1
+        else:
+            moving_forward = last_direction >= 0
         accel = forward_accel[i]
         if moving_forward:
             if accel > accel_threshold:
@@ -310,6 +321,7 @@ def _classify_forward_events(
                 forward_event_raw.append("backward_static_moving")
 
     return {
+        "vz_trend": vz_trend,
         "forward_accel": forward_accel,
         "abs_vz_mean": abs_vz_mean,
         "total_speed_mean": total_speed_mean,
@@ -870,6 +882,8 @@ def process_video(
     accel_threshold = float(cfg.get("forward_accel_threshold", cfg.get("accel_threshold", 0.03)))
     lateral_turn_threshold = float(cfg.get("lateral_turn_threshold", 0.03))
     stop_window_size = int(cfg.get("stop_window_size", 5))
+    motion_window_size = int(cfg.get("motion_window_size", 5))
+    direction_epsilon = float(cfg.get("forward_direction_epsilon", max(1e-3, stop_enter_threshold * 0.5)))
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
@@ -917,6 +931,8 @@ def process_video(
             or float(cache_cfg.get("forward_accel_threshold", cache_cfg.get("accel_threshold", accel_threshold)))
             != float(accel_threshold)
             or int(cache_cfg.get("stop_window_size", stop_window_size)) != int(stop_window_size)
+            or int(cache_cfg.get("motion_window_size", motion_window_size)) != int(motion_window_size)
+            or float(cache_cfg.get("forward_direction_epsilon", direction_epsilon)) != float(direction_epsilon)
             or int(cache_cfg.get("min_stop_duration", min_stop_duration)) != int(min_stop_duration)
             or int(cache_cfg.get("min_turn_duration", min_turn_duration)) != int(min_turn_duration)
         )
@@ -975,6 +991,8 @@ def process_video(
         stop_total_speed_exit=stop_total_speed_exit,
         min_stop_duration=min_stop_duration,
         stop_window_size=stop_window_size,
+        motion_window_size=motion_window_size,
+        direction_epsilon=direction_epsilon,
     )
     forward_accel = forward_axis["forward_accel"]
     stop_raw = forward_axis["stop_raw"]
@@ -1061,6 +1079,8 @@ def process_video(
             stop_total_speed_exit=compare_total_speed_exit,
             min_stop_duration=min_stop_duration,
             stop_window_size=stop_window_size,
+            motion_window_size=motion_window_size,
+            direction_epsilon=direction_epsilon,
         )
 
         symbolic_cmp = _apply_symbolic_static_correction(
@@ -1132,12 +1152,15 @@ def process_video(
             "forward_accel_threshold": accel_threshold,
             "lateral_turn_threshold": lateral_turn_threshold,
             "stop_window_size": stop_window_size,
+            "motion_window_size": motion_window_size,
+            "forward_direction_epsilon": direction_epsilon,
             "min_stop_duration": min_stop_duration,
             "min_turn_duration": min_turn_duration,
             "min_segment_length": min_segment_length,
         },
         "signals": {
             "speed": speed,
+            "vz_trend": forward_axis["vz_trend"],
             "forward_acceleration": forward_accel,
             "stop_abs_vz_mean": forward_axis["abs_vz_mean"],
             "stop_total_speed_mean": forward_axis["total_speed_mean"],
