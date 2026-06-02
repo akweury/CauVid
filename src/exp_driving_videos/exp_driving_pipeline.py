@@ -97,7 +97,7 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
         "lateral_turn_threshold": 0.03,
         "min_stop_duration": 20,
         "min_turn_duration": 3,
-        "min_segment_length": 3,
+        "min_segment_length": 10,
     }
     try:
         cfg_path = config.get_config_path("exp_driving")

@@ -16,7 +16,7 @@ temporal_segmentation:
   lateral_turn_threshold: 0.03
   min_stop_duration: 20
   min_turn_duration: 3
-  min_segment_length: 3
+  min_segment_length: 10
   visualization_fps: 10
   symbolic_correction:
     enabled: true
