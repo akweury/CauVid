@@ -616,10 +616,21 @@ def _render_temporal_segmentation_videos(
     cut_points_lateral = [int(seg.get("start_frame", 0)) for seg in lateral_segments]
     cut_points_processed = [int(v) for v in segmentation_result.get("cut_points", [])]
 
-    forward_compare_specs = []
+    forward_compare_specs = [
+        {
+            "title": "forward segmentation | raw",
+            "signal_values": forward_signal,
+            "event_series": forward_events_raw,
+            "cut_points": cut_points_forward_raw,
+            "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+            "fallback_event": "static_moving",
+            "current_label_prefix": "forward raw",
+            "signal_label": "vz",
+        }
+    ]
     for compare_len in (20, 40, 60):
         merged = _merge_short_segments(
-            events=forward_events_processed,
+            events=forward_events_raw,
             frame_indices=frame_indices,
             min_segment_length=compare_len,
         )["events"]
