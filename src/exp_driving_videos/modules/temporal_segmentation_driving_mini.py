@@ -453,8 +453,8 @@ def _render_signal_chart_panel(
         cv2.circle(panel, tuple(points[0]), 2, (255, 255, 255), -1)
 
     for j, fidx in enumerate(frame_indices):
-        x = left_pad + int(round((j + 0.5) * chart_w / n))
         if fidx in cut_points_set:
+            x = left_pad + int(round((j + 0.5) * chart_w / n))
             cv2.line(panel, (x, chart_y0 - 4), (x, chart_y1 + 4), (180, 180, 180), 1)
 
     cursor_x = left_pad + int(round((min(current_idx, n - 1) + 0.5) * chart_w / n))
@@ -480,15 +480,8 @@ def _render_signal_chart_panel(
 def _render_single_temporal_segmentation_video(
     video_id: str,
     ego_frames: List[Dict[str, Any]],
-    event_series: List[str],
-    signal_values: List[float],
-    cut_points: List[int],
-    title: str,
     output_path: Path,
-    color_fn,
-    fallback_event: str,
-    current_label_prefix: str,
-    signal_label: str,
+    chart_specs: List[Dict[str, Any]],
     fps: float = 10.0,
 ) -> Optional[str]:
     """Render one timeline segmentation stream as a standalone MP4."""
@@ -509,7 +502,10 @@ def _render_single_temporal_segmentation_video(
         return None
 
     h, w = first_img.shape[:2]
-    timeline_h = 160
+    if not chart_specs:
+        return None
+    panel_h = 160
+    timeline_h = panel_h * len(chart_specs)
     out_size = (w, h + timeline_h)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -532,9 +528,6 @@ def _render_single_temporal_segmentation_video(
             else:
                 img = cv2.resize(img, (w, h))
 
-            event = event_series[i] if i < len(event_series) else fallback_event
-            color = color_fn(event)
-
             cv2.putText(
                 img,
                 f"{video_id} | frame {frame_indices[i]:04d}",
@@ -545,31 +538,42 @@ def _render_single_temporal_segmentation_video(
                 2,
                 cv2.LINE_AA,
             )
-            cv2.putText(
-                img,
-                f"{current_label_prefix}: {event}",
-                (10, 54),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+            if len(chart_specs) == 1:
+                spec = chart_specs[0]
+                event_series = spec["event_series"]
+                fallback_event = spec["fallback_event"]
+                event = event_series[i] if i < len(event_series) else fallback_event
+                color = spec["color_fn"](event)
+                cv2.putText(
+                    img,
+                    f"{spec['current_label_prefix']}: {event}",
+                    (10, 54),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
 
-            panel = _render_signal_chart_panel(
-                width=w,
-                height=timeline_h,
-                title=title,
-                signal_values=signal_values,
-                event_series=event_series,
-                frame_indices=frame_indices,
-                current_idx=i,
-                cut_points=cut_points,
-                color_fn=color_fn,
-                fallback_event=fallback_event,
-                signal_label=signal_label,
-            )
+            panels = []
+            for spec in chart_specs:
+                panels.append(
+                    _render_signal_chart_panel(
+                        width=w,
+                        height=panel_h,
+                        title=spec["title"],
+                        signal_values=spec["signal_values"],
+                        event_series=spec["event_series"],
+                        frame_indices=frame_indices,
+                        current_idx=i,
+                        cut_points=spec["cut_points"],
+                        color_fn=spec["color_fn"],
+                        fallback_event=spec["fallback_event"],
+                        signal_label=spec["signal_label"],
+                    )
+                )
 
+            panel = np.vstack(panels)
             out_frame = np.vstack([img, panel])
             writer.write(out_frame)
     finally:
@@ -612,79 +616,103 @@ def _render_temporal_segmentation_videos(
     cut_points_lateral = [int(seg.get("start_frame", 0)) for seg in lateral_segments]
     cut_points_processed = [int(v) for v in segmentation_result.get("cut_points", [])]
 
+    forward_compare_specs = []
+    for compare_len in (20, 40, 60):
+        merged = _merge_short_segments(
+            events=forward_events_processed,
+            frame_indices=frame_indices,
+            min_segment_length=compare_len,
+        )["events"]
+        merged_segments = _segment_from_events(merged, frame_indices) if merged else []
+        merged_cut_points = [int(seg.get("start_frame", 0)) for seg in merged_segments]
+        forward_compare_specs.append(
+            {
+                "title": f"forward segmentation | min_segment_length={compare_len}",
+                "signal_values": forward_signal,
+                "event_series": merged,
+                "cut_points": merged_cut_points,
+                "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+                "fallback_event": "static_moving",
+                "current_label_prefix": f"forward@{compare_len}",
+                "signal_label": "vz",
+            }
+        )
+
     vis_specs = [
         (
             "primary_raw",
-            events_raw,
-            cut_points_raw,
-            "raw primary segmentation",
-            lambda ev: _event_color_bgr(ev),
-            "constant_speed",
-            "raw",
-            "speed",
-            speed_values,
+            [
+                {
+                    "title": "raw primary segmentation",
+                    "signal_values": speed_values,
+                    "event_series": events_raw,
+                    "cut_points": cut_points_raw,
+                    "color_fn": lambda ev: _event_color_bgr(ev),
+                    "fallback_event": "constant_speed",
+                    "current_label_prefix": "raw",
+                    "signal_label": "speed",
+                }
+            ],
         ),
         (
             "primary",
-            events_processed,
-            cut_points_processed,
-            "processed primary segmentation",
-            lambda ev: _event_color_bgr(ev),
-            "constant_speed",
-            "processed",
-            "speed",
-            speed_values,
+            [
+                {
+                    "title": "processed primary segmentation",
+                    "signal_values": speed_values,
+                    "event_series": events_processed,
+                    "cut_points": cut_points_processed,
+                    "color_fn": lambda ev: _event_color_bgr(ev),
+                    "fallback_event": "constant_speed",
+                    "current_label_prefix": "processed",
+                    "signal_label": "speed",
+                }
+            ],
         ),
         (
             "forward_raw",
-            forward_events_raw,
-            cut_points_forward_raw,
-            "forward raw segmentation",
-            lambda ev: _event_color_bgr(f"{ev}|straightforward"),
-            "static_moving",
-            "forward raw",
-            "vz",
-            forward_signal,
+            [
+                {
+                    "title": "forward raw segmentation",
+                    "signal_values": forward_signal,
+                    "event_series": forward_events_raw,
+                    "cut_points": cut_points_forward_raw,
+                    "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+                    "fallback_event": "static_moving",
+                    "current_label_prefix": "forward raw",
+                    "signal_label": "vz",
+                }
+            ],
         ),
         (
             "forward",
-            forward_events_processed,
-            cut_points_forward_processed,
-            "forward processed segmentation",
-            lambda ev: _event_color_bgr(f"{ev}|straightforward"),
-            "static_moving",
-            "forward",
-            "vz",
-            forward_signal,
+            forward_compare_specs,
         ),
         (
             "lateral",
-            lateral_events,
-            cut_points_lateral,
-            "lateral segmentation",
-            lambda ev: _event_color_bgr(f"static_moving|{ev}"),
-            "straightforward",
-            "lateral",
-            "vx",
-            lateral_signal,
+            [
+                {
+                    "title": "lateral segmentation",
+                    "signal_values": lateral_signal,
+                    "event_series": lateral_events,
+                    "cut_points": cut_points_lateral,
+                    "color_fn": lambda ev: _event_color_bgr(f"static_moving|{ev}"),
+                    "fallback_event": "straightforward",
+                    "current_label_prefix": "lateral",
+                    "signal_label": "vx",
+                }
+            ],
         ),
     ]
 
     rendered: Dict[str, str] = {}
-    for stem, event_series, cut_points, title, color_fn, fallback, prefix, signal_label, signal_values in vis_specs:
+    for stem, chart_specs in vis_specs:
         single_path = output_path.parent / f"temporal_segmentation_{stem}_vis.mp4"
         out = _render_single_temporal_segmentation_video(
             video_id=video_id,
             ego_frames=ego_frames,
-            event_series=event_series,
-            signal_values=signal_values,
-            cut_points=cut_points,
-            title=title,
             output_path=single_path,
-            color_fn=color_fn,
-            fallback_event=fallback,
-            current_label_prefix=prefix,
-            signal_label=signal_label,
+            chart_specs=chart_specs,
             fps=fps,
         )
         if out:
