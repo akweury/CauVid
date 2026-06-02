@@ -95,7 +95,7 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
         "stop_total_speed_exit_threshold": 0.14,
         "forward_accel_threshold": 0.03,
         "lateral_turn_threshold": 0.03,
-        "min_stop_duration": 3,
+        "min_stop_duration": 20,
         "min_turn_duration": 3,
         "min_segment_length": 3,
     }
@@ -205,7 +205,7 @@ def main(max_step: int = 8) -> None:
     print(f"Using ego static adjustment cfg={static_adjust_cfg}")
     ego_motion_results: List[Dict[str, Any]] = ego_motion_driving_mini.run(
         merged_results=merged_results,
-        force_recompute=True,
+        force_recompute=False,
         smoothing_window=smoothing_window,
         static_adjust_cfg=static_adjust_cfg,
     )
@@ -222,7 +222,7 @@ def main(max_step: int = 8) -> None:
     relative_motion_results: List[Dict[str, Any]] = relative_object_motion_driving_mini.run(
         positions_3d_results=positions_3d_results,
         ego_motion_results=ego_motion_results,
-        force_recompute=True,
+        force_recompute=False,
     )
     print(
         "Relative object motion estimation complete. "
