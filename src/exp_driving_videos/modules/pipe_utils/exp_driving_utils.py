@@ -683,14 +683,16 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
          which shifts the consensus direction but preserves angular coherence;
          independently-moving foreground objects scatter in random directions
          and are rejected by this step without any spatial mask.
-    3. Depth-weighted translation on the inlier set:
-         vz = median( |flow_i| * Z_i )   — forward / total speed (≥ 0)
-         vx = median(  dx_i   * Z_i )   — lateral component (signed)
-    4. Yaw residual (only when ``return_yaw=True``):
-       The translational lateral prediction at pixel i is  vx / Z_i.
-       The horizontal residual  dx_i - vx/Z_i  is depth-independent for pure
-       yaw (≈ -f * ω_y), so its median gives the yaw rate estimate:
-         yaw_rate = -median(dx_residual) / focal_length
+    3. Estimate and remove the dominant horizontal components before computing
+       forward motion:
+         - initial lateral estimate from dx * Z
+         - yaw estimate from the horizontal residual
+         - refined lateral estimate after removing yaw
+    4. Depth-weighted forward translation on the residual flow:
+         vz = median( |flow_residual_i| * Z_i )   — forward speed proxy (≥ 0)
+         vx = median( dx_no_yaw_i * Z_i )         — lateral component (signed)
+       This avoids inflating ``vz`` during turning, where yaw mostly appears as
+       a scene-wide horizontal flow bias.
 
     Parameters
     ----------
@@ -749,18 +751,25 @@ def estimate_ego_motion(flow, bg_mask, depth_map,
     dy_in = dy[inliers]
     Z_in  = Z[inliers]
 
-    # ── 3. depth-weighted translation ────────────────────────────────────────
-    vz = float(np.median(np.hypot(dx_in, dy_in) * Z_in))   # forward speed ≥ 0
-    vx = float(np.median(dx_in * Z_in))                     # lateral (signed)
+    # ── 3. remove yaw/lateral leakage before estimating forward speed ────────
+    # Initial lateral estimate in image x.
+    vx_initial = float(np.median(dx_in * Z_in))
+
+    # Estimate yaw from the horizontal residual after removing lateral shift.
+    dx_lat_residual = dx_in - (vx_initial / Z_in)
+    yaw_rate = float(-np.median(dx_lat_residual) / focal_length)
+
+    # Remove the global horizontal yaw bias and refine lateral motion.
+    dx_no_yaw = dx_in + (focal_length * yaw_rate)
+    vx = float(np.median(dx_no_yaw * Z_in))
+
+    # Remaining flow after removing lateral translation. This residual is a
+    # better proxy for forward motion than the raw flow magnitude during turns.
+    dx_forward_residual = dx_no_yaw - (vx / Z_in)
+    vz = float(np.median(np.hypot(dx_forward_residual, dy_in) * Z_in))
 
     if not return_yaw:
         return vx, vz
-
-    # ── 4. yaw from horizontal residual ──────────────────────────────────────
-    # translational prediction of horizontal flow at each inlier: vx / Z_i
-    dx_trans_pred = vx / Z_in
-    dx_residual   = dx_in - dx_trans_pred
-    yaw_rate = float(-np.median(dx_residual) / focal_length)
 
     return vx, vz, yaw_rate
 

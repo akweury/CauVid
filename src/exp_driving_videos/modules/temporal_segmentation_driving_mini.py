@@ -48,7 +48,7 @@ _EVENT_COLORS_BGR: Dict[str, tuple] = {
     "constant_speed": (180, 180, 180),
 }
 
-_SEGMENTATION_VIS_VERSION = 3
+_SEGMENTATION_VIS_VERSION = 4
 
 
 def _event_color_bgr(event_label: str) -> tuple:
@@ -338,14 +338,160 @@ def _apply_symbolic_static_correction(
     }
 
 
-def _render_temporal_segmentation_video(
+def _resolve_local_image_path(image_path: str) -> str:
+    """Map container-saved driving_mini frame paths to the current local dataset root."""
+    if not image_path:
+        return image_path
+
+    path = Path(image_path)
+    if path.exists():
+        return str(path)
+
+    parts = list(path.parts)
+    if "frames" not in parts:
+        return image_path
+
+    frames_idx = parts.index("frames")
+    rel_parts = parts[frames_idx + 1 :]
+    if not rel_parts:
+        return image_path
+
+    candidate = config.get_dataset_path("driving_mini") / "frames"
+    for part in rel_parts:
+        candidate = candidate / part
+    return str(candidate)
+
+
+def _render_signal_chart_panel(
+    width: int,
+    height: int,
+    title: str,
+    signal_values: List[float],
+    event_series: List[str],
+    frame_indices: List[int],
+    current_idx: int,
+    cut_points: List[int],
+    color_fn,
+    fallback_event: str,
+    signal_label: str,
+) -> np.ndarray:
+    """Render a line chart with segmentation-colored background and current-frame cursor."""
+    try:
+        import cv2
+    except ModuleNotFoundError:
+        return np.zeros((height, width, 3), dtype=np.uint8)
+
+    panel = np.zeros((height, width, 3), dtype=np.uint8)
+    panel[:] = (20, 20, 20)
+    cv2.putText(
+        panel,
+        title,
+        (10, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+
+    if not signal_values:
+        return panel
+
+    top_pad = 34
+    bottom_pad = 26
+    left_pad = 18
+    right_pad = 12
+    chart_y0 = top_pad
+    chart_y1 = max(chart_y0 + 20, height - bottom_pad)
+    chart_h = chart_y1 - chart_y0
+    chart_w = max(1, width - left_pad - right_pad)
+
+    n = max(1, len(signal_values), len(event_series), len(frame_indices))
+    cut_points_set = set(int(v) for v in cut_points)
+
+    overlay = panel.copy()
+    for j in range(n):
+        x0 = left_pad + int(round(j * chart_w / n))
+        x1 = left_pad + int(round((j + 1) * chart_w / n))
+        ev = event_series[j] if j < len(event_series) else fallback_event
+        cv2.rectangle(
+            overlay,
+            (x0, chart_y0),
+            (max(x0 + 1, x1), chart_y1),
+            color_fn(ev),
+            thickness=-1,
+        )
+    panel = cv2.addWeighted(overlay, 0.22, panel, 0.78, 0.0)
+
+    vals = np.asarray(signal_values, dtype=np.float32)
+    vmin = float(np.min(vals))
+    vmax = float(np.max(vals))
+    if abs(vmax - vmin) < 1e-6:
+        vmax += 1.0
+        vmin -= 1.0
+    margin = 0.08 * (vmax - vmin)
+    vmin -= margin
+    vmax += margin
+
+    def _to_y(v: float) -> int:
+        alpha = (float(v) - vmin) / max(1e-6, (vmax - vmin))
+        alpha = min(1.0, max(0.0, alpha))
+        return int(round(chart_y1 - alpha * chart_h))
+
+    if vmin < 0.0 < vmax:
+        zero_y = _to_y(0.0)
+        cv2.line(panel, (left_pad, zero_y), (left_pad + chart_w, zero_y), (80, 80, 80), 1)
+
+    points = []
+    for j, v in enumerate(vals):
+        x = left_pad + int(round((j + 0.5) * chart_w / n))
+        y = _to_y(float(v))
+        points.append([x, y])
+    if len(points) >= 2:
+        cv2.polylines(panel, [np.asarray(points, dtype=np.int32)], isClosed=False, color=(255, 255, 255), thickness=2)
+    elif points:
+        cv2.circle(panel, tuple(points[0]), 2, (255, 255, 255), -1)
+
+    for j, fidx in enumerate(frame_indices):
+        x = left_pad + int(round((j + 0.5) * chart_w / n))
+        if fidx in cut_points_set:
+            cv2.line(panel, (x, chart_y0 - 4), (x, chart_y1 + 4), (180, 180, 180), 1)
+
+    cursor_x = left_pad + int(round((min(current_idx, n - 1) + 0.5) * chart_w / n))
+    cv2.line(panel, (cursor_x, chart_y0 - 6), (cursor_x, chart_y1 + 6), (0, 255, 255), 2)
+    if current_idx < len(points):
+        cv2.circle(panel, tuple(points[current_idx]), 4, (0, 255, 255), -1)
+
+    current_value = float(vals[min(current_idx, len(vals) - 1)])
+    cv2.putText(
+        panel,
+        f"{signal_label}: {current_value:+.4f}",
+        (10, height - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (230, 230, 230),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return panel
+
+
+def _render_single_temporal_segmentation_video(
     video_id: str,
     ego_frames: List[Dict[str, Any]],
-    segmentation_result: Dict[str, Any],
+    event_series: List[str],
+    signal_values: List[float],
+    cut_points: List[int],
+    title: str,
     output_path: Path,
+    color_fn,
+    fallback_event: str,
+    current_label_prefix: str,
+    signal_label: str,
     fps: float = 10.0,
 ) -> Optional[str]:
-    """Render side-by-side segmentation visualization as MP4."""
+    """Render one timeline segmentation stream as a standalone MP4."""
     try:
         import cv2
     except ModuleNotFoundError:
@@ -356,14 +502,14 @@ def _render_temporal_segmentation_video(
 
     first_img = None
     for frame in ego_frames:
-        first_img = cv2.imread(frame.get("image_path", ""))
+        first_img = cv2.imread(_resolve_local_image_path(frame.get("image_path", "")))
         if first_img is not None:
             break
     if first_img is None:
         return None
 
     h, w = first_img.shape[:2]
-    timeline_h = 180
+    timeline_h = 160
     out_size = (w, h + timeline_h)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -376,59 +522,18 @@ def _render_temporal_segmentation_video(
     if not writer.isOpened():
         return None
 
-    forward_events_raw = segmentation_result.get(
-        "forward_event_raw",
-        segmentation_result.get("forward_event", []),
-    )
-    forward_events_processed = segmentation_result.get(
-        "forward_event",
-        forward_events_raw,
-    )
-    lateral_events = segmentation_result.get("lateral_event", [])
-    events_raw = segmentation_result.get("primary_event_raw", segmentation_result.get("primary_event", []))
-    events_processed = segmentation_result.get("primary_event", [])
-    cut_points_processed = set(int(v) for v in segmentation_result.get("cut_points", []))
     frame_indices = [int(f.get("frame_index", i)) for i, f in enumerate(ego_frames)]
-    n = max(
-        1,
-        len(forward_events_raw),
-        len(forward_events_processed),
-        len(lateral_events),
-        len(events_raw),
-        len(events_processed),
-    )
-
-    raw_segments = _segment_from_events(events_raw, frame_indices) if events_raw else []
-    cut_points_raw = set(int(seg.get("start_frame", 0)) for seg in raw_segments)
-    forward_raw_segments = _segment_from_events(forward_events_raw, frame_indices) if forward_events_raw else []
-    cut_points_forward_raw = set(int(seg.get("start_frame", 0)) for seg in forward_raw_segments)
-    forward_processed_segments = _segment_from_events(forward_events_processed, frame_indices) if forward_events_processed else []
-    cut_points_forward_processed = set(int(seg.get("start_frame", 0)) for seg in forward_processed_segments)
-    lateral_segments = _segment_from_events(lateral_events, frame_indices) if lateral_events else []
-    cut_points_lateral = set(int(seg.get("start_frame", 0)) for seg in lateral_segments)
 
     try:
         for i, frame in enumerate(ego_frames):
-            img = cv2.imread(frame.get("image_path", ""))
+            img = cv2.imread(_resolve_local_image_path(frame.get("image_path", "")))
             if img is None:
                 img = np.zeros((h, w, 3), dtype=np.uint8)
             else:
                 img = cv2.resize(img, (w, h))
 
-            forward_raw = forward_events_raw[i] if i < len(forward_events_raw) else "static_moving"
-            forward_processed = (
-                forward_events_processed[i] if i < len(forward_events_processed) else forward_raw
-            )
-            lateral_event = lateral_events[i] if i < len(lateral_events) else "straightforward"
-            event_raw = events_raw[i] if i < len(events_raw) else f"{forward_raw}|{lateral_event}"
-            event_processed = (
-                events_processed[i] if i < len(events_processed) else f"{forward_processed}|{lateral_event}"
-            )
-            color_raw = _event_color_bgr(event_raw)
-            color_processed = _event_color_bgr(event_processed)
-            color_forward_raw = _event_color_bgr(f"{forward_raw}|straightforward")
-            color_forward_processed = _event_color_bgr(f"{forward_processed}|straightforward")
-            color_lateral = _event_color_bgr(f"static_moving|{lateral_event}")
+            event = event_series[i] if i < len(event_series) else fallback_event
+            color = color_fn(event)
 
             cv2.putText(
                 img,
@@ -442,64 +547,28 @@ def _render_temporal_segmentation_video(
             )
             cv2.putText(
                 img,
-                f"raw: {event_raw}",
+                f"{current_label_prefix}: {event}",
                 (10, 54),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
-                color_raw,
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                img,
-                f"processed: {event_processed}",
-                (10, 78),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                color_processed,
+                color,
                 2,
                 cv2.LINE_AA,
             )
 
-            # Timeline panel
-            panel = np.zeros((timeline_h, w, 3), dtype=np.uint8)
-            panel[:] = (20, 20, 20)
-
-            raw_events = events_raw
-            bar_specs = [
-                ("raw timeline (gray ticks=cut points)", raw_events, cut_points_raw, 18, 34, lambda ev: _event_color_bgr(ev), (170, 170, 170)),
-                ("processed timeline (white ticks=cut points)", events_processed, cut_points_processed, 50, 66, lambda ev: _event_color_bgr(ev), (255, 255, 255)),
-                ("forward raw (gray ticks=cut points)", forward_events_raw, cut_points_forward_raw, 82, 98, lambda ev: _event_color_bgr(f"{ev}|straightforward"), (170, 170, 170)),
-                ("forward processed (white ticks=cut points)", forward_events_processed, cut_points_forward_processed, 114, 130, lambda ev: _event_color_bgr(f"{ev}|straightforward"), (255, 255, 255)),
-                ("lateral axis (amber ticks=cut points)", lateral_events, cut_points_lateral, 146, 162, lambda ev: _event_color_bgr(f"static_moving|{ev}"), (255, 210, 120)),
-            ]
-
-            for label, event_series, cut_points, y0, y1, color_fn, tick_color in bar_specs:
-                cv2.putText(
-                    panel,
-                    label,
-                    (10, max(14, y0 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.42,
-                    (220, 220, 220),
-                    1,
-                    cv2.LINE_AA,
-                )
-                for j in range(n):
-                    x0 = int(round(j * w / n))
-                    x1 = int(round((j + 1) * w / n))
-                    if event_series is raw_events:
-                        fallback = "constant_speed"
-                    elif event_series is lateral_events:
-                        fallback = "straightforward"
-                    else:
-                        fallback = "static_moving"
-                    ev = event_series[j] if j < len(event_series) else fallback
-                    cv2.rectangle(panel, (x0, y0), (max(x0 + 1, x1), y1), color_fn(ev), thickness=-1)
-                for j, fidx in enumerate(frame_indices):
-                    if fidx in cut_points:
-                        x = int(round(j * w / n))
-                        cv2.line(panel, (x, y0 - 4), (x, y1 + 4), tick_color, 1)
+            panel = _render_signal_chart_panel(
+                width=w,
+                height=timeline_h,
+                title=title,
+                signal_values=signal_values,
+                event_series=event_series,
+                frame_indices=frame_indices,
+                current_idx=i,
+                cut_points=cut_points,
+                color_fn=color_fn,
+                fallback_event=fallback_event,
+                signal_label=signal_label,
+            )
 
             out_frame = np.vstack([img, panel])
             writer.write(out_frame)
@@ -507,6 +576,120 @@ def _render_temporal_segmentation_video(
         writer.release()
 
     return str(output_path)
+
+
+def _render_temporal_segmentation_videos(
+    video_id: str,
+    ego_frames: List[Dict[str, Any]],
+    segmentation_result: Dict[str, Any],
+    output_path: Path,
+    fps: float = 10.0,
+) -> Dict[str, str]:
+    """Render separate MP4 files for each segmentation stream."""
+    forward_events_raw = segmentation_result.get(
+        "forward_event_raw",
+        segmentation_result.get("forward_event", []),
+    )
+    forward_events_processed = segmentation_result.get(
+        "forward_event",
+        forward_events_raw,
+    )
+    lateral_events = segmentation_result.get("lateral_event", [])
+    events_raw = segmentation_result.get("primary_event_raw", segmentation_result.get("primary_event", []))
+    events_processed = segmentation_result.get("primary_event", [])
+    frame_indices = [int(f.get("frame_index", i)) for i, f in enumerate(ego_frames)]
+    speed_values = [float(v) for v in segmentation_result.get("signals", {}).get("speed", [])]
+    forward_signal = [float(f.get("ego_vz_smoothed", f.get("ego_vz", 0.0))) for f in ego_frames]
+    lateral_signal = [float(f.get("ego_vx_smoothed", f.get("ego_vx", 0.0))) for f in ego_frames]
+
+    raw_segments = _segment_from_events(events_raw, frame_indices) if events_raw else []
+    cut_points_raw = [int(seg.get("start_frame", 0)) for seg in raw_segments]
+    forward_raw_segments = _segment_from_events(forward_events_raw, frame_indices) if forward_events_raw else []
+    cut_points_forward_raw = [int(seg.get("start_frame", 0)) for seg in forward_raw_segments]
+    forward_processed_segments = _segment_from_events(forward_events_processed, frame_indices) if forward_events_processed else []
+    cut_points_forward_processed = [int(seg.get("start_frame", 0)) for seg in forward_processed_segments]
+    lateral_segments = _segment_from_events(lateral_events, frame_indices) if lateral_events else []
+    cut_points_lateral = [int(seg.get("start_frame", 0)) for seg in lateral_segments]
+    cut_points_processed = [int(v) for v in segmentation_result.get("cut_points", [])]
+
+    vis_specs = [
+        (
+            "primary_raw",
+            events_raw,
+            cut_points_raw,
+            "raw primary segmentation",
+            lambda ev: _event_color_bgr(ev),
+            "constant_speed",
+            "raw",
+            "speed",
+            speed_values,
+        ),
+        (
+            "primary",
+            events_processed,
+            cut_points_processed,
+            "processed primary segmentation",
+            lambda ev: _event_color_bgr(ev),
+            "constant_speed",
+            "processed",
+            "speed",
+            speed_values,
+        ),
+        (
+            "forward_raw",
+            forward_events_raw,
+            cut_points_forward_raw,
+            "forward raw segmentation",
+            lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+            "static_moving",
+            "forward raw",
+            "vz",
+            forward_signal,
+        ),
+        (
+            "forward",
+            forward_events_processed,
+            cut_points_forward_processed,
+            "forward processed segmentation",
+            lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+            "static_moving",
+            "forward",
+            "vz",
+            forward_signal,
+        ),
+        (
+            "lateral",
+            lateral_events,
+            cut_points_lateral,
+            "lateral segmentation",
+            lambda ev: _event_color_bgr(f"static_moving|{ev}"),
+            "straightforward",
+            "lateral",
+            "vx",
+            lateral_signal,
+        ),
+    ]
+
+    rendered: Dict[str, str] = {}
+    for stem, event_series, cut_points, title, color_fn, fallback, prefix, signal_label, signal_values in vis_specs:
+        single_path = output_path.parent / f"temporal_segmentation_{stem}_vis.mp4"
+        out = _render_single_temporal_segmentation_video(
+            video_id=video_id,
+            ego_frames=ego_frames,
+            event_series=event_series,
+            signal_values=signal_values,
+            cut_points=cut_points,
+            title=title,
+            output_path=single_path,
+            color_fn=color_fn,
+            fallback_event=fallback,
+            current_label_prefix=prefix,
+            signal_label=signal_label,
+            fps=fps,
+        )
+        if out:
+            rendered[stem] = out
+    return rendered
 
 def process_video(
     ego_video_result: Dict[str, Any],
@@ -576,19 +759,24 @@ def process_video(
         elif cache_stale_for_vis_version:
             print(f"  [cache] {video_id} - cache visualization is stale; rerendering comparison view")
         else:
-            vis_path = out_dir / "temporal_segmentation_vis.mp4"
-            if vis_path.exists():
+            cached_vis_paths = cached.get("visualization_paths", {})
+            if (
+                isinstance(cached_vis_paths, dict)
+                and cached_vis_paths
+                and all(Path(p).exists() for p in cached_vis_paths.values())
+            ):
                 return cached
 
-            rendered_cached = _render_temporal_segmentation_video(
+            rendered_cached = _render_temporal_segmentation_videos(
                 video_id=video_id,
                 ego_frames=ego_video_result.get("frames", []),
                 segmentation_result=cached,
-                output_path=vis_path,
+                output_path=out_dir / "temporal_segmentation_vis.mp4",
                 fps=float(cfg.get("visualization_fps", 10.0)),
             )
             if rendered_cached:
-                cached["visualization_path"] = rendered_cached
+                cached["visualization_paths"] = rendered_cached
+                cached["visualization_path"] = rendered_cached.get("primary", "")
                 cached["visualization_version"] = _SEGMENTATION_VIS_VERSION
                 with out_file.open("w", encoding="utf-8") as fh:
                     json.dump(cached, fh, indent=2)
@@ -760,19 +948,19 @@ def process_video(
     with out_file.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
 
-    vis_path = out_dir / "temporal_segmentation_vis.mp4"
-    rendered = _render_temporal_segmentation_video(
+    rendered = _render_temporal_segmentation_videos(
         video_id=video_id,
         ego_frames=frames,
         segmentation_result=result,
-        output_path=vis_path,
+        output_path=out_dir / "temporal_segmentation_vis.mp4",
         fps=float(cfg.get("visualization_fps", 10.0)),
     )
     if rendered:
-        result["visualization_path"] = rendered
+        result["visualization_paths"] = rendered
+        result["visualization_path"] = rendered.get("primary", "")
         with out_file.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
-        print(f"    visualization saved -> {vis_path.name}")
+        print("    visualizations saved -> " + ", ".join(Path(p).name for p in rendered.values()))
 
     print(
         f"  {video_id}: {len(segments)} segments, "

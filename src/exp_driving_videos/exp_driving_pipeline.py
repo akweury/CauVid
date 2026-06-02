@@ -205,6 +205,7 @@ def main(max_step: int = 8) -> None:
     print(f"Using ego static adjustment cfg={static_adjust_cfg}")
     ego_motion_results: List[Dict[str, Any]] = ego_motion_driving_mini.run(
         merged_results=merged_results,
+        force_recompute=True,
         smoothing_window=smoothing_window,
         static_adjust_cfg=static_adjust_cfg,
     )
@@ -221,6 +222,7 @@ def main(max_step: int = 8) -> None:
     relative_motion_results: List[Dict[str, Any]] = relative_object_motion_driving_mini.run(
         positions_3d_results=positions_3d_results,
         ego_motion_results=ego_motion_results,
+        force_recompute=True,
     )
     print(
         "Relative object motion estimation complete. "
@@ -238,6 +240,7 @@ def main(max_step: int = 8) -> None:
         ego_motion_results=ego_motion_results,
         relative_motion_results=relative_motion_results,
         seg_cfg=temporal_seg_cfg,
+        force_recompute=True,
     )
     print(
         "Temporal segmentation complete. "
