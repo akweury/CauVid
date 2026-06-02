@@ -628,7 +628,7 @@ def _render_temporal_segmentation_videos(
             "signal_label": "vz",
         }
     ]
-    for compare_len in (20, 40, 60):
+    for compare_len in (5, 10, 15):
         merged = _merge_short_segments(
             events=forward_events_raw,
             frame_indices=frame_indices,
