@@ -840,10 +840,10 @@ def process_video(
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
     compare_min_stop_durations = [
-        int(v) for v in cfg.get("compare_min_stop_durations", [5, 10, 15])
+        int(v) for v in cfg.get("compare_min_stop_durations", [3, 5, 7])
     ]
     compare_min_segment_lengths = [
-        int(v) for v in cfg.get("compare_min_segment_lengths", [5, 7, 9])
+        int(v) for v in cfg.get("compare_min_segment_lengths", [7])
     ]
     compare_min_stop_durations = sorted({max(1, v) for v in compare_min_stop_durations})
     compare_min_segment_lengths = sorted({max(1, v) for v in compare_min_segment_lengths})

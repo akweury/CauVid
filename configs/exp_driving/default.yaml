@@ -14,9 +14,11 @@ temporal_segmentation:
   stop_total_speed_exit_threshold: 0.14
   forward_accel_threshold: 0.03
   lateral_turn_threshold: 0.03
-  min_stop_duration: 10
+  min_stop_duration: 5
   min_turn_duration: 3
-  min_segment_length: 10
+  min_segment_length: 7
+  compare_min_stop_durations: [3, 5, 7]
+  compare_min_segment_lengths: [7]
   visualization_fps: 10
   symbolic_correction:
     enabled: true
