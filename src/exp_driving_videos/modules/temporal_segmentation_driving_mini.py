@@ -748,6 +748,14 @@ def process_video(
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
+    compare_min_stop_durations = [
+        int(v) for v in cfg.get("compare_min_stop_durations", [5, 10, 15])
+    ]
+    compare_min_segment_lengths = [
+        int(v) for v in cfg.get("compare_min_segment_lengths", [5, 10, 15])
+    ]
+    compare_min_stop_durations = sorted({max(1, v) for v in compare_min_stop_durations})
+    compare_min_segment_lengths = sorted({max(1, v) for v in compare_min_segment_lengths})
 
     video_id = ego_video_result["video_id"]
     out_dir = (output_root or get_output_root()) / video_id
@@ -930,6 +938,64 @@ def process_video(
     segments = _segment_from_events(primary_event_corrected, frame_indices)
     cut_points = merged_axis["cut_points"]
 
+    comparison_rows: List[Dict[str, Any]] = []
+    for compare_stop_duration in compare_min_stop_durations:
+        stop_runs_cmp = _bool_runs(stop_raw, min_len=compare_stop_duration)
+        forward_stop_mask_cmp = _mask_from_runs(len(frames), stop_runs_cmp)
+        forward_speedup_mask_cmp = [
+            (forward_accel[i] > accel_threshold) and (not forward_stop_mask_cmp[i])
+            for i in range(len(frames))
+        ]
+        forward_slowdown_mask_cmp = [
+            (forward_accel[i] < -accel_threshold) and (not forward_stop_mask_cmp[i])
+            for i in range(len(frames))
+        ]
+        forward_event_cmp_raw: List[str] = []
+        for i in range(len(frames)):
+            if forward_stop_mask_cmp[i]:
+                forward_event_cmp_raw.append("stopping")
+            elif forward_speedup_mask_cmp[i]:
+                forward_event_cmp_raw.append("speedup")
+            elif forward_slowdown_mask_cmp[i]:
+                forward_event_cmp_raw.append("slowdown")
+            else:
+                forward_event_cmp_raw.append("static_moving")
+
+        symbolic_cmp = _apply_symbolic_static_correction(
+            primary_event=forward_event_cmp_raw,
+            frame_indices=frame_indices,
+            relative_video_result=relative_motion_video_result,
+            cfg=cfg,
+            stop_label="stopping",
+        )
+
+        segment_length_counts: List[Dict[str, int]] = []
+        for compare_segment_length in compare_min_segment_lengths:
+            forward_events_cmp = _merge_short_segments(
+                events=symbolic_cmp["events"],
+                frame_indices=frame_indices,
+                min_segment_length=compare_segment_length,
+            )["events"]
+            lateral_events_cmp = _merge_short_segments(
+                events=lateral_event_raw,
+                frame_indices=frame_indices,
+                min_segment_length=compare_segment_length,
+            )["events"]
+            segment_length_counts.append(
+                {
+                    "min_segment_length": compare_segment_length,
+                    "num_forward_segments": len(_segment_from_events(forward_events_cmp, frame_indices)),
+                    "num_lateral_segments": len(_segment_from_events(lateral_events_cmp, frame_indices)),
+                }
+            )
+
+        comparison_rows.append(
+            {
+                "min_stop_duration": compare_stop_duration,
+                "segment_length_counts": segment_length_counts,
+            }
+        )
+
     result: Dict[str, Any] = {
         "video_id": video_id,
         "num_frames": len(frames),
@@ -984,6 +1050,11 @@ def process_video(
         "lateral_segments": lateral_segments_final,
         "num_forward_segments": len(forward_segments_final),
         "num_lateral_segments": len(lateral_segments_final),
+        "segment_count_comparison": {
+            "compare_min_stop_durations": compare_min_stop_durations,
+            "compare_min_segment_lengths": compare_min_segment_lengths,
+            "rows": comparison_rows,
+        },
         "segments": segments,
         "cut_points": cut_points,
         "num_segments": len(segments),
@@ -1007,10 +1078,9 @@ def process_video(
             json.dump(result, fh, indent=2)
 
     print(
-        f"  {video_id}: vz={len(forward_segments_final)} segments, "
-        f"vx={len(lateral_segments_final)} segments, "
-        f"combined={len(segments)} segments, "
-        f"{len(cut_points)} cut points"
+        f"  {video_id} | min_stop_duration={min_stop_duration} | "
+        f"min_segment_length={min_segment_length} | "
+        f"vz={len(forward_segments_final)}"
     )
     return result
 
@@ -1031,7 +1101,6 @@ def run(
     results: List[Dict[str, Any]] = []
     for ego_video_result in ego_motion_results:
         video_id = ego_video_result.get("video_id", "unknown")
-        print(f"  Processing temporal segmentation: {video_id}")
         result = process_video(
             ego_video_result=ego_video_result,
             relative_motion_video_result=relative_by_video.get(video_id),
