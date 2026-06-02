@@ -574,7 +574,12 @@ def _render_signal_chart_panel(
         cv2.circle(panel, tuple(points[current_idx]), 4, (0, 255, 255), -1)
 
     current_value = float(vals[min(current_idx, len(vals) - 1)])
+    current_event = (
+        event_series[min(current_idx, len(event_series) - 1)]
+        if event_series else fallback_event
+    )
     footer_text = f"{signal_label}: {current_value:+.4f}"
+    footer_text = f"{footer_text} | label={current_event}"
     if footer_prefix:
         footer_text = f"{footer_prefix} | {footer_text}"
     cv2.putText(
