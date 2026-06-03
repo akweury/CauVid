@@ -48,7 +48,7 @@ _EVENT_COLORS_BGR: Dict[str, tuple] = {
     "constant_speed": (180, 180, 180),
 }
 
-_SEGMENTATION_VIS_VERSION = 5
+_SEGMENTATION_VIS_VERSION = 6
 
 
 def _event_color_bgr(event_label: str) -> tuple:
@@ -77,9 +77,9 @@ def _event_color_bgr(event_label: str) -> tuple:
 
     # Slight hue cue for lateral state.
     b, g, r = base
-    if lateral == "turning_left":
+    if lateral in {"turning_left", "left"}:
         b = min(255, b + 35)
-    elif lateral == "turning_right":
+    elif lateral in {"turning_right", "right"}:
         g = min(255, g + 35)
     return (b, g, r)
 
@@ -334,6 +334,47 @@ def _classify_forward_events(
         "backward_slowdown_mask": backward_slowdown_mask,
         "backward_static_moving_mask": backward_static_moving_mask,
         "forward_event_raw": forward_event_raw,
+    }
+
+
+def _classify_lateral_events(
+    vx: List[float],
+    lateral_turn_threshold: float,
+    min_turn_duration: int,
+    motion_window_size: int,
+    direction_epsilon: float,
+) -> Dict[str, Any]:
+    """Classify lateral motion into left/right/straightforward using a smoothed trend."""
+    vx_trend = _centered_moving_mean(vx, motion_window_size)
+    threshold = max(float(lateral_turn_threshold), float(direction_epsilon))
+
+    lateral_left_raw = [vx_i < -threshold for vx_i in vx_trend]
+    lateral_right_raw = [vx_i > threshold for vx_i in vx_trend]
+
+    left_runs = _bool_runs(lateral_left_raw, min_len=min_turn_duration)
+    right_runs = _bool_runs(lateral_right_raw, min_len=min_turn_duration)
+    lateral_left_mask = _mask_from_runs(len(vx), left_runs)
+    lateral_right_mask = _mask_from_runs(len(vx), right_runs)
+    lateral_straight_mask = [
+        (not lateral_left_mask[i]) and (not lateral_right_mask[i])
+        for i in range(len(vx))
+    ]
+
+    lateral_event_raw: List[str] = []
+    for i in range(len(vx)):
+        if lateral_left_mask[i]:
+            lateral_event_raw.append("left")
+        elif lateral_right_mask[i]:
+            lateral_event_raw.append("right")
+        else:
+            lateral_event_raw.append("straightforward")
+
+    return {
+        "vx_trend": vx_trend,
+        "lateral_left_mask": lateral_left_mask,
+        "lateral_right_mask": lateral_right_mask,
+        "lateral_straight_mask": lateral_straight_mask,
+        "lateral_event_raw": lateral_event_raw,
     }
 
 
@@ -736,7 +777,14 @@ def _render_temporal_segmentation_videos(
     frame_indices = [int(f.get("frame_index", i)) for i, f in enumerate(ego_frames)]
     speed_values = [float(v) for v in segmentation_result.get("signals", {}).get("speed", [])]
     forward_signal = [float(f.get("ego_vz_smoothed", f.get("ego_vz", 0.0))) for f in ego_frames]
-    lateral_signal = [float(f.get("ego_vx_smoothed", f.get("ego_vx", 0.0))) for f in ego_frames]
+    lateral_signal = [
+        float(v) for v in segmentation_result.get(
+            "signals", {}
+        ).get(
+            "vx_trend",
+            [float(f.get("ego_vx_smoothed", f.get("ego_vx", 0.0))) for f in ego_frames],
+        )
+    ]
 
     raw_segments = _segment_from_events(events_raw, frame_indices) if events_raw else []
     cut_points_raw = [int(seg.get("start_frame", 0)) for seg in raw_segments]
@@ -843,10 +891,14 @@ def _render_temporal_segmentation_videos(
                     "signal_values": lateral_signal,
                     "event_series": lateral_events,
                     "cut_points": cut_points_lateral,
-                    "color_fn": lambda ev: _event_color_bgr(f"static_moving|{ev}"),
+                    "color_fn": lambda ev: _event_color_bgr(f"forward_static_moving|{ev}"),
                     "fallback_event": "straightforward",
                     "current_label_prefix": "lateral",
                     "signal_label": "vx",
+                    "footer_prefix": (
+                        f"lat_eps={float(segmentation_result.get('config', {}).get('lateral_direction_epsilon', 0.0)):.3f} | "
+                        f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
+                    ),
                 }
             ],
         ),
@@ -884,11 +936,13 @@ def process_video(
     stop_window_size = int(cfg.get("stop_window_size", 5))
     motion_window_size = int(cfg.get("motion_window_size", 5))
     direction_epsilon = float(cfg.get("forward_direction_epsilon", max(1e-3, stop_enter_threshold * 0.5)))
+    lateral_motion_window_size = int(cfg.get("lateral_motion_window_size", motion_window_size))
+    lateral_direction_epsilon = float(cfg.get("lateral_direction_epsilon", max(1e-3, lateral_turn_threshold)))
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
     compare_forward_stop_thresholds = [
-        float(v) for v in cfg.get("compare_forward_stop_thresholds", [1, 2.5, 5])
+        float(v) for v in cfg.get("compare_forward_stop_thresholds", [1.0])
     ]
     compare_min_segment_lengths = [
         int(v) for v in cfg.get("compare_min_segment_lengths", [7])
@@ -933,6 +987,8 @@ def process_video(
             or int(cache_cfg.get("stop_window_size", stop_window_size)) != int(stop_window_size)
             or int(cache_cfg.get("motion_window_size", motion_window_size)) != int(motion_window_size)
             or float(cache_cfg.get("forward_direction_epsilon", direction_epsilon)) != float(direction_epsilon)
+            or int(cache_cfg.get("lateral_motion_window_size", lateral_motion_window_size)) != int(lateral_motion_window_size)
+            or float(cache_cfg.get("lateral_direction_epsilon", lateral_direction_epsilon)) != float(lateral_direction_epsilon)
             or int(cache_cfg.get("min_stop_duration", min_stop_duration)) != int(min_stop_duration)
             or int(cache_cfg.get("min_turn_duration", min_turn_duration)) != int(min_turn_duration)
         )
@@ -1005,28 +1061,18 @@ def process_video(
     backward_static_moving_mask = forward_axis["backward_static_moving_mask"]
     forward_event_raw = forward_axis["forward_event_raw"]
 
-    # Lateral-axis segmentation (x): turning_left / turning_right / straightforward
-    lateral_left_raw = [vx_i < -lateral_turn_threshold for vx_i in vx]
-    lateral_right_raw = [vx_i > lateral_turn_threshold for vx_i in vx]
-
-    # Optional run filtering for turns to suppress flicker.
-    left_runs = _bool_runs(lateral_left_raw, min_len=min_turn_duration)
-    right_runs = _bool_runs(lateral_right_raw, min_len=min_turn_duration)
-    lateral_left_mask = _mask_from_runs(len(frames), left_runs)
-    lateral_right_mask = _mask_from_runs(len(frames), right_runs)
-    lateral_straight_mask = [
-        (not lateral_left_mask[i]) and (not lateral_right_mask[i])
-        for i in range(len(frames))
-    ]
-
-    lateral_event_raw: List[str] = []
-    for i in range(len(frames)):
-        if lateral_left_mask[i]:
-            lateral_event_raw.append("turning_left")
-        elif lateral_right_mask[i]:
-            lateral_event_raw.append("turning_right")
-        else:
-            lateral_event_raw.append("straightforward")
+    # Lateral-axis segmentation (x): left / right / straightforward
+    lateral_axis = _classify_lateral_events(
+        vx=vx,
+        lateral_turn_threshold=lateral_turn_threshold,
+        min_turn_duration=min_turn_duration,
+        motion_window_size=lateral_motion_window_size,
+        direction_epsilon=lateral_direction_epsilon,
+    )
+    lateral_left_mask = lateral_axis["lateral_left_mask"]
+    lateral_right_mask = lateral_axis["lateral_right_mask"]
+    lateral_straight_mask = lateral_axis["lateral_straight_mask"]
+    lateral_event_raw = lateral_axis["lateral_event_raw"]
 
     # Symbolic correction is applied to forward axis only.
     symbolic = _apply_symbolic_static_correction(
@@ -1154,6 +1200,8 @@ def process_video(
             "stop_window_size": stop_window_size,
             "motion_window_size": motion_window_size,
             "forward_direction_epsilon": direction_epsilon,
+            "lateral_motion_window_size": lateral_motion_window_size,
+            "lateral_direction_epsilon": lateral_direction_epsilon,
             "min_stop_duration": min_stop_duration,
             "min_turn_duration": min_turn_duration,
             "min_segment_length": min_segment_length,
@@ -1161,6 +1209,7 @@ def process_video(
         "signals": {
             "speed": speed,
             "vz_trend": forward_axis["vz_trend"],
+            "vx_trend": lateral_axis["vx_trend"],
             "forward_acceleration": forward_accel,
             "stop_abs_vz_mean": forward_axis["abs_vz_mean"],
             "stop_total_speed_mean": forward_axis["total_speed_mean"],
@@ -1174,9 +1223,11 @@ def process_video(
             "backward_speedup": backward_speedup_mask,
             "backward_slowdown": backward_slowdown_mask,
             "backward_static_moving": backward_static_moving_mask,
+            "lateral_left": lateral_left_mask,
+            "lateral_right": lateral_right_mask,
+            "lateral_straightforward": lateral_straight_mask,
             "lateral_turning_left": lateral_left_mask,
             "lateral_turning_right": lateral_right_mask,
-            "lateral_straightforward": lateral_straight_mask,
         },
         "forward_event_raw": forward_event_raw,
         "forward_event": symbolic["events"],
