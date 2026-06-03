@@ -965,7 +965,7 @@ def process_video(
     lateral_direction_epsilon = float(cfg.get("lateral_direction_epsilon", max(1e-3, lateral_turn_threshold)))
     lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", lateral_turn_threshold * 0.5))
     compare_lateral_straight_thresholds = [
-        float(v) for v in cfg.get("compare_lateral_straight_thresholds", [5, 10, 15])
+        float(v) for v in cfg.get("compare_lateral_straight_thresholds", [10, 50, 100])
     ]
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
