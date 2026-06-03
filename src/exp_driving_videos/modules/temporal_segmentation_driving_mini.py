@@ -887,30 +887,78 @@ def _render_temporal_segmentation_videos(
             "primary_raw",
             [
                 {
-                    "title": "raw primary segmentation",
+                    "title": "raw forward axis",
+                    "signal_values": forward_signal,
+                    "event_series": forward_events_raw,
+                    "cut_points": cut_points_forward_raw,
+                    "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+                    "fallback_event": "forward_static_moving",
+                    "current_label_prefix": "forward raw",
+                    "signal_label": "vz",
+                },
+                {
+                    "title": "lateral axis",
+                    "signal_values": lateral_signal,
+                    "event_series": lateral_events,
+                    "cut_points": cut_points_lateral,
+                    "color_fn": _lateral_event_color_bgr,
+                    "fallback_event": "straightforward",
+                    "current_label_prefix": "lateral",
+                    "signal_label": "vx",
+                    "footer_prefix": (
+                        f"lat_straight={float(segmentation_result.get('config', {}).get('lateral_straight_threshold', 0.0)):.3f} | "
+                        f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
+                    ),
+                },
+                {
+                    "title": "raw merged segmentation",
                     "signal_values": speed_values,
                     "event_series": events_raw,
                     "cut_points": cut_points_raw,
                     "color_fn": lambda ev: _event_color_bgr(ev),
-                    "fallback_event": "constant_speed",
-                    "current_label_prefix": "raw",
+                    "fallback_event": "forward_static_moving|straightforward",
+                    "current_label_prefix": "merged raw",
                     "signal_label": "speed",
-                }
+                },
             ],
         ),
         (
             "primary",
             [
                 {
-                    "title": "processed primary segmentation",
+                    "title": "processed forward axis",
+                    "signal_values": forward_signal,
+                    "event_series": forward_events_processed,
+                    "cut_points": cut_points_forward_processed,
+                    "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
+                    "fallback_event": "forward_static_moving",
+                    "current_label_prefix": "forward",
+                    "signal_label": "vz",
+                },
+                {
+                    "title": "lateral axis",
+                    "signal_values": lateral_signal,
+                    "event_series": lateral_events,
+                    "cut_points": cut_points_lateral,
+                    "color_fn": _lateral_event_color_bgr,
+                    "fallback_event": "straightforward",
+                    "current_label_prefix": "lateral",
+                    "signal_label": "vx",
+                    "footer_prefix": (
+                        f"lat_straight={float(segmentation_result.get('config', {}).get('lateral_straight_threshold', 0.0)):.3f} | "
+                        f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
+                    ),
+                },
+                {
+                    "title": "processed merged segmentation",
                     "signal_values": speed_values,
                     "event_series": events_processed,
                     "cut_points": cut_points_processed,
                     "color_fn": lambda ev: _event_color_bgr(ev),
-                    "fallback_event": "constant_speed",
-                    "current_label_prefix": "processed",
+                    "fallback_event": "forward_static_moving|straightforward",
+                    "current_label_prefix": "merged",
                     "signal_label": "speed",
-                }
+                },
             ],
         ),
         (
