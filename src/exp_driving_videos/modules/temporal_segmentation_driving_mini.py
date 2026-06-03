@@ -340,16 +340,18 @@ def _classify_forward_events(
 def _classify_lateral_events(
     vx: List[float],
     lateral_turn_threshold: float,
+    lateral_straight_threshold: float,
     min_turn_duration: int,
     motion_window_size: int,
     direction_epsilon: float,
 ) -> Dict[str, Any]:
     """Classify lateral motion into left/right/straightforward using a smoothed trend."""
     vx_trend = _centered_moving_mean(vx, motion_window_size)
-    threshold = max(float(lateral_turn_threshold), float(direction_epsilon))
+    straight_threshold = max(0.0, float(lateral_straight_threshold))
+    turn_threshold = max(float(lateral_turn_threshold), float(direction_epsilon), straight_threshold + 1e-6)
 
-    lateral_left_raw = [vx_i < -threshold for vx_i in vx_trend]
-    lateral_right_raw = [vx_i > threshold for vx_i in vx_trend]
+    lateral_left_raw = [vx_i < -turn_threshold for vx_i in vx_trend]
+    lateral_right_raw = [vx_i > turn_threshold for vx_i in vx_trend]
 
     left_runs = _bool_runs(lateral_left_raw, min_len=min_turn_duration)
     right_runs = _bool_runs(lateral_right_raw, min_len=min_turn_duration)
@@ -362,7 +364,9 @@ def _classify_lateral_events(
 
     lateral_event_raw: List[str] = []
     for i in range(len(vx)):
-        if lateral_left_mask[i]:
+        if abs(vx_trend[i]) <= straight_threshold:
+            lateral_event_raw.append("straightforward")
+        elif lateral_left_mask[i]:
             lateral_event_raw.append("left")
         elif lateral_right_mask[i]:
             lateral_event_raw.append("right")
@@ -833,6 +837,42 @@ def _render_temporal_segmentation_videos(
             }
         ]
 
+    lateral_compare_specs = segmentation_result.get("lateral_comparison_variants", [])
+    if lateral_compare_specs:
+        hydrated_specs = []
+        for spec in lateral_compare_specs:
+            hydrated = dict(spec)
+            hydrated["color_fn"] = lambda ev: _event_color_bgr(f"forward_static_moving|{ev}")
+            hydrated.setdefault("fallback_event", "straightforward")
+            hydrated.setdefault("signal_label", "vx")
+            straight_threshold = hydrated.get("lateral_straight_threshold")
+            motion_window_size = hydrated.get("lateral_motion_window_size")
+            if straight_threshold is not None and motion_window_size is not None:
+                hydrated.setdefault(
+                    "footer_prefix",
+                    f"lat_straight={float(straight_threshold):.3f} | lat_win={int(motion_window_size)}",
+                )
+            hydrated_specs.append(hydrated)
+        lateral_compare_specs = hydrated_specs
+    if not lateral_compare_specs:
+        lateral_compare_specs = [
+            {
+                "title": "lateral segmentation",
+                "signal_values": lateral_signal,
+                "event_series": lateral_events,
+                "cut_points": cut_points_lateral,
+                "color_fn": lambda ev: _event_color_bgr(f"forward_static_moving|{ev}"),
+                "fallback_event": "straightforward",
+                "current_label_prefix": "lateral",
+                "signal_label": "vx",
+                "footer_prefix": (
+                    f"lat_eps={float(segmentation_result.get('config', {}).get('lateral_direction_epsilon', 0.0)):.3f} | "
+                    f"lat_straight={float(segmentation_result.get('config', {}).get('lateral_straight_threshold', 0.0)):.3f} | "
+                    f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
+                ),
+            }
+        ]
+
     vis_specs = [
         (
             "primary_raw",
@@ -885,22 +925,7 @@ def _render_temporal_segmentation_videos(
         ),
         (
             "lateral",
-            [
-                {
-                    "title": "lateral segmentation",
-                    "signal_values": lateral_signal,
-                    "event_series": lateral_events,
-                    "cut_points": cut_points_lateral,
-                    "color_fn": lambda ev: _event_color_bgr(f"forward_static_moving|{ev}"),
-                    "fallback_event": "straightforward",
-                    "current_label_prefix": "lateral",
-                    "signal_label": "vx",
-                    "footer_prefix": (
-                        f"lat_eps={float(segmentation_result.get('config', {}).get('lateral_direction_epsilon', 0.0)):.3f} | "
-                        f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
-                    ),
-                }
-            ],
+            lateral_compare_specs,
         ),
     ]
 
@@ -938,6 +963,10 @@ def process_video(
     direction_epsilon = float(cfg.get("forward_direction_epsilon", max(1e-3, stop_enter_threshold * 0.5)))
     lateral_motion_window_size = int(cfg.get("lateral_motion_window_size", motion_window_size))
     lateral_direction_epsilon = float(cfg.get("lateral_direction_epsilon", max(1e-3, lateral_turn_threshold)))
+    lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", lateral_turn_threshold * 0.5))
+    compare_lateral_straight_thresholds = [
+        float(v) for v in cfg.get("compare_lateral_straight_thresholds", [1, 3, 5])
+    ]
     min_stop_duration = int(cfg.get("min_stop_duration", 3))
     min_turn_duration = int(cfg.get("min_turn_duration", 3))
     min_segment_length = int(cfg.get("min_segment_length", 1))
@@ -949,6 +978,7 @@ def process_video(
     ]
     compare_forward_stop_thresholds = sorted({max(1e-6, v) for v in compare_forward_stop_thresholds})
     compare_min_segment_lengths = sorted({max(1, v) for v in compare_min_segment_lengths})
+    compare_lateral_straight_thresholds = sorted({max(0.0, v) for v in compare_lateral_straight_thresholds})
 
     video_id = ego_video_result["video_id"]
     out_dir = (output_root or get_output_root()) / video_id
@@ -989,6 +1019,7 @@ def process_video(
             or float(cache_cfg.get("forward_direction_epsilon", direction_epsilon)) != float(direction_epsilon)
             or int(cache_cfg.get("lateral_motion_window_size", lateral_motion_window_size)) != int(lateral_motion_window_size)
             or float(cache_cfg.get("lateral_direction_epsilon", lateral_direction_epsilon)) != float(lateral_direction_epsilon)
+            or float(cache_cfg.get("lateral_straight_threshold", lateral_straight_threshold)) != float(lateral_straight_threshold)
             or int(cache_cfg.get("min_stop_duration", min_stop_duration)) != int(min_stop_duration)
             or int(cache_cfg.get("min_turn_duration", min_turn_duration)) != int(min_turn_duration)
         )
@@ -1065,6 +1096,7 @@ def process_video(
     lateral_axis = _classify_lateral_events(
         vx=vx,
         lateral_turn_threshold=lateral_turn_threshold,
+        lateral_straight_threshold=lateral_straight_threshold,
         min_turn_duration=min_turn_duration,
         motion_window_size=lateral_motion_window_size,
         direction_epsilon=lateral_direction_epsilon,
@@ -1111,6 +1143,7 @@ def process_video(
 
     comparison_rows: List[Dict[str, Any]] = []
     forward_comparison_variants: List[Dict[str, Any]] = []
+    lateral_comparison_variants: List[Dict[str, Any]] = []
     for compare_stop_threshold in compare_forward_stop_thresholds:
         compare_stop_exit_threshold = compare_stop_threshold * stop_exit_ratio
         compare_total_speed_enter = compare_stop_threshold * total_enter_ratio
@@ -1184,6 +1217,30 @@ def process_video(
             }
         )
 
+    for compare_lateral_straight_threshold in compare_lateral_straight_thresholds:
+        lateral_cmp = _classify_lateral_events(
+            vx=vx,
+            lateral_turn_threshold=lateral_turn_threshold,
+            lateral_straight_threshold=compare_lateral_straight_threshold,
+            min_turn_duration=min_turn_duration,
+            motion_window_size=lateral_motion_window_size,
+            direction_epsilon=lateral_direction_epsilon,
+        )
+        lateral_segments_cmp = _segment_from_events(lateral_cmp["lateral_event_raw"], frame_indices)
+        lateral_comparison_variants.append(
+            {
+                "title": f"lateral | straight_th={compare_lateral_straight_threshold:.3f}",
+                "signal_values": lateral_cmp["vx_trend"],
+                "event_series": lateral_cmp["lateral_event_raw"],
+                "cut_points": [int(seg.get("start_frame", 0)) for seg in lateral_segments_cmp],
+                "fallback_event": "straightforward",
+                "current_label_prefix": f"straight_th={compare_lateral_straight_threshold:.3f}",
+                "signal_label": "vx",
+                "lateral_straight_threshold": compare_lateral_straight_threshold,
+                "lateral_motion_window_size": lateral_motion_window_size,
+            }
+        )
+
     result: Dict[str, Any] = {
         "video_id": video_id,
         "num_frames": len(frames),
@@ -1202,6 +1259,7 @@ def process_video(
             "forward_direction_epsilon": direction_epsilon,
             "lateral_motion_window_size": lateral_motion_window_size,
             "lateral_direction_epsilon": lateral_direction_epsilon,
+            "lateral_straight_threshold": lateral_straight_threshold,
             "min_stop_duration": min_stop_duration,
             "min_turn_duration": min_turn_duration,
             "min_segment_length": min_segment_length,
@@ -1258,6 +1316,7 @@ def process_video(
             "rows": comparison_rows,
         },
         "forward_comparison_variants": forward_comparison_variants,
+        "lateral_comparison_variants": lateral_comparison_variants,
         "segments": segments,
         "cut_points": cut_points,
         "num_segments": len(segments),
