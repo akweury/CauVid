@@ -100,7 +100,7 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
         "forward_direction_epsilon": 0.025,
         "lateral_motion_window_size": 10,
         "lateral_direction_epsilon": 0.03,
-        "lateral_straight_threshold": 15.0,
+        "lateral_straight_threshold": 45.0,
         "compare_lateral_straight_thresholds": [15, 25, 35, 45],
         "min_stop_duration": 5,
         "min_turn_duration": 3,

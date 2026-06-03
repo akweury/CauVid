@@ -84,6 +84,15 @@ def _event_color_bgr(event_label: str) -> tuple:
     return (b, g, r)
 
 
+def _lateral_event_color_bgr(event_label: str) -> tuple:
+    text = str(event_label or "").strip().lower()
+    return {
+        "left": (30, 140, 255),            # orange
+        "right": (255, 200, 40),           # cyan/yellow
+        "straightforward": (150, 150, 150) # gray
+    }.get(text, (150, 150, 150))
+
+
 def get_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "driving_mini_temporal_segmentation"
     out.mkdir(parents=True, exist_ok=True)
@@ -350,8 +359,8 @@ def _classify_lateral_events(
     straight_threshold = max(0.0, float(lateral_straight_threshold))
     turn_threshold = max(float(lateral_turn_threshold), float(direction_epsilon), straight_threshold + 1e-6)
 
-    lateral_left_raw = [vx_i < -turn_threshold for vx_i in vx_trend]
-    lateral_right_raw = [vx_i > turn_threshold for vx_i in vx_trend]
+    lateral_left_raw = [vx_i > turn_threshold for vx_i in vx_trend]
+    lateral_right_raw = [vx_i < -turn_threshold for vx_i in vx_trend]
 
     left_runs = _bool_runs(lateral_left_raw, min_len=min_turn_duration)
     right_runs = _bool_runs(lateral_right_raw, min_len=min_turn_duration)
@@ -842,7 +851,7 @@ def _render_temporal_segmentation_videos(
         hydrated_specs = []
         for spec in lateral_compare_specs:
             hydrated = dict(spec)
-            hydrated["color_fn"] = lambda ev: _event_color_bgr(f"forward_static_moving|{ev}")
+            hydrated["color_fn"] = _lateral_event_color_bgr
             hydrated.setdefault("fallback_event", "straightforward")
             hydrated.setdefault("signal_label", "vx")
             straight_threshold = hydrated.get("lateral_straight_threshold")
@@ -861,7 +870,7 @@ def _render_temporal_segmentation_videos(
                 "signal_values": lateral_signal,
                 "event_series": lateral_events,
                 "cut_points": cut_points_lateral,
-                "color_fn": lambda ev: _event_color_bgr(f"forward_static_moving|{ev}"),
+                "color_fn": _lateral_event_color_bgr,
                 "fallback_event": "straightforward",
                 "current_label_prefix": "lateral",
                 "signal_label": "vx",
@@ -963,7 +972,7 @@ def process_video(
     direction_epsilon = float(cfg.get("forward_direction_epsilon", max(1e-3, stop_enter_threshold * 0.5)))
     lateral_motion_window_size = int(cfg.get("lateral_motion_window_size", motion_window_size))
     lateral_direction_epsilon = float(cfg.get("lateral_direction_epsilon", max(1e-3, lateral_turn_threshold)))
-    lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", lateral_turn_threshold * 0.5))
+    lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", 45.0))
     compare_lateral_straight_thresholds = [
         float(v) for v in cfg.get("compare_lateral_straight_thresholds", [15, 25, 35, 45])
     ]
