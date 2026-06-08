@@ -230,6 +230,20 @@ def _combine_axis_events(forward_events: List[str], lateral_events: List[str]) -
     return [f"{forward_events[i]}|{lateral_events[i]}" for i in range(n)]
 
 
+def _split_combined_axis_events(events: List[str]) -> Dict[str, List[str]]:
+    forward_events: List[str] = []
+    lateral_events: List[str] = []
+    for event in events:
+        text = str(event or "")
+        if "|" in text:
+            forward, lateral = text.split("|", 1)
+        else:
+            forward, lateral = text, "straightforward"
+        forward_events.append(forward)
+        lateral_events.append(lateral)
+    return {"forward": forward_events, "lateral": lateral_events}
+
+
 def _centered_moving_mean(values: List[float], window_size: int) -> List[float]:
     if not values:
         return []
@@ -787,6 +801,8 @@ def _render_temporal_segmentation_videos(
     lateral_events = segmentation_result.get("lateral_event", [])
     events_raw = segmentation_result.get("primary_event_raw", segmentation_result.get("primary_event", []))
     events_processed = segmentation_result.get("primary_event", [])
+    split_raw = _split_combined_axis_events(events_raw)
+    split_processed = _split_combined_axis_events(events_processed)
     frame_indices = [int(f.get("frame_index", i)) for i, f in enumerate(ego_frames)]
     speed_values = [float(v) for v in segmentation_result.get("signals", {}).get("speed", [])]
     forward_signal = [float(f.get("ego_vz_smoothed", f.get("ego_vz", 0.0))) for f in ego_frames]
@@ -801,6 +817,14 @@ def _render_temporal_segmentation_videos(
 
     raw_segments = _segment_from_events(events_raw, frame_indices) if events_raw else []
     cut_points_raw = [int(seg.get("start_frame", 0)) for seg in raw_segments]
+    cut_points_forward_raw_from_primary = [
+        int(seg.get("start_frame", 0))
+        for seg in (_segment_from_events(split_raw["forward"], frame_indices) if split_raw["forward"] else [])
+    ]
+    cut_points_lateral_raw_from_primary = [
+        int(seg.get("start_frame", 0))
+        for seg in (_segment_from_events(split_raw["lateral"], frame_indices) if split_raw["lateral"] else [])
+    ]
     forward_raw_segments = _segment_from_events(forward_events_raw, frame_indices) if forward_events_raw else []
     cut_points_forward_raw = [int(seg.get("start_frame", 0)) for seg in forward_raw_segments]
     forward_processed_segments = _segment_from_events(forward_events_processed, frame_indices) if forward_events_processed else []
@@ -808,6 +832,14 @@ def _render_temporal_segmentation_videos(
     lateral_segments = _segment_from_events(lateral_events, frame_indices) if lateral_events else []
     cut_points_lateral = [int(seg.get("start_frame", 0)) for seg in lateral_segments]
     cut_points_processed = [int(v) for v in segmentation_result.get("cut_points", [])]
+    cut_points_forward_processed_from_primary = [
+        int(seg.get("start_frame", 0))
+        for seg in (_segment_from_events(split_processed["forward"], frame_indices) if split_processed["forward"] else [])
+    ]
+    cut_points_lateral_processed_from_primary = [
+        int(seg.get("start_frame", 0))
+        for seg in (_segment_from_events(split_processed["lateral"], frame_indices) if split_processed["lateral"] else [])
+    ]
 
     forward_compare_specs = segmentation_result.get("forward_comparison_variants", [])
     if forward_compare_specs:
@@ -846,41 +878,25 @@ def _render_temporal_segmentation_videos(
             }
         ]
 
-    lateral_compare_specs = segmentation_result.get("lateral_comparison_variants", [])
-    if lateral_compare_specs:
-        hydrated_specs = []
-        for spec in lateral_compare_specs:
-            hydrated = dict(spec)
-            hydrated["color_fn"] = _lateral_event_color_bgr
-            hydrated.setdefault("fallback_event", "straightforward")
-            hydrated.setdefault("signal_label", "vx")
-            straight_threshold = hydrated.get("lateral_straight_threshold")
-            motion_window_size = hydrated.get("lateral_motion_window_size")
-            if straight_threshold is not None and motion_window_size is not None:
-                hydrated.setdefault(
-                    "footer_prefix",
-                    f"lat_straight={float(straight_threshold):.3f} | lat_win={int(motion_window_size)}",
-                )
-            hydrated_specs.append(hydrated)
-        lateral_compare_specs = hydrated_specs
-    if not lateral_compare_specs:
-        lateral_compare_specs = [
-            {
-                "title": "lateral segmentation",
-                "signal_values": lateral_signal,
-                "event_series": lateral_events,
-                "cut_points": cut_points_lateral,
-                "color_fn": _lateral_event_color_bgr,
-                "fallback_event": "straightforward",
-                "current_label_prefix": "lateral",
-                "signal_label": "vx",
-                "footer_prefix": (
-                    f"lat_eps={float(segmentation_result.get('config', {}).get('lateral_direction_epsilon', 0.0)):.3f} | "
-                    f"lat_straight={float(segmentation_result.get('config', {}).get('lateral_straight_threshold', 0.0)):.3f} | "
-                    f"lat_win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))}"
-                ),
-            }
-        ]
+    lateral_vis_specs = [
+        {
+            "title": "lateral segmentation",
+            "signal_values": lateral_signal,
+            "event_series": lateral_events,
+            "cut_points": cut_points_lateral,
+            "color_fn": _lateral_event_color_bgr,
+            "fallback_event": "straightforward",
+            "current_label_prefix": "lateral",
+            "signal_label": "vx",
+            "footer_prefix": (
+                f"turn_th={float(segmentation_result.get('config', {}).get('lateral_turn_threshold', 0.0)):.3f} | "
+                f"lat_eps={float(segmentation_result.get('config', {}).get('lateral_direction_epsilon', 0.0)):.3f} | "
+                f"straight_th={float(segmentation_result.get('config', {}).get('lateral_straight_threshold', 0.0)):.3f} | "
+                f"win={int(segmentation_result.get('config', {}).get('lateral_motion_window_size', 1))} | "
+                f"min_turn={int(segmentation_result.get('config', {}).get('min_turn_duration', 1))}"
+            ),
+        }
+    ]
 
     vis_specs = [
         (
@@ -889,8 +905,8 @@ def _render_temporal_segmentation_videos(
                 {
                     "title": "raw forward axis",
                     "signal_values": forward_signal,
-                    "event_series": forward_events_raw,
-                    "cut_points": cut_points_forward_raw,
+                    "event_series": split_raw["forward"],
+                    "cut_points": cut_points_forward_raw_from_primary,
                     "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
                     "fallback_event": "forward_static_moving",
                     "current_label_prefix": "forward raw",
@@ -899,8 +915,8 @@ def _render_temporal_segmentation_videos(
                 {
                     "title": "lateral axis",
                     "signal_values": lateral_signal,
-                    "event_series": lateral_events,
-                    "cut_points": cut_points_lateral,
+                    "event_series": split_raw["lateral"],
+                    "cut_points": cut_points_lateral_raw_from_primary,
                     "color_fn": _lateral_event_color_bgr,
                     "fallback_event": "straightforward",
                     "current_label_prefix": "lateral",
@@ -928,8 +944,8 @@ def _render_temporal_segmentation_videos(
                 {
                     "title": "processed forward axis",
                     "signal_values": forward_signal,
-                    "event_series": forward_events_processed,
-                    "cut_points": cut_points_forward_processed,
+                    "event_series": split_processed["forward"],
+                    "cut_points": cut_points_forward_processed_from_primary,
                     "color_fn": lambda ev: _event_color_bgr(f"{ev}|straightforward"),
                     "fallback_event": "forward_static_moving",
                     "current_label_prefix": "forward",
@@ -938,8 +954,8 @@ def _render_temporal_segmentation_videos(
                 {
                     "title": "lateral axis",
                     "signal_values": lateral_signal,
-                    "event_series": lateral_events,
-                    "cut_points": cut_points_lateral,
+                    "event_series": split_processed["lateral"],
+                    "cut_points": cut_points_lateral_processed_from_primary,
                     "color_fn": _lateral_event_color_bgr,
                     "fallback_event": "straightforward",
                     "current_label_prefix": "lateral",
@@ -982,7 +998,7 @@ def _render_temporal_segmentation_videos(
         ),
         (
             "lateral",
-            lateral_compare_specs,
+            lateral_vis_specs,
         ),
     ]
 
@@ -1020,7 +1036,7 @@ def process_video(
     direction_epsilon = float(cfg.get("forward_direction_epsilon", max(1e-3, stop_enter_threshold * 0.5)))
     lateral_motion_window_size = int(cfg.get("lateral_motion_window_size", motion_window_size))
     lateral_direction_epsilon = float(cfg.get("lateral_direction_epsilon", max(1e-3, lateral_turn_threshold)))
-    lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", 45.0))
+    lateral_straight_threshold = float(cfg.get("lateral_straight_threshold", 35.0))
     compare_lateral_straight_thresholds = [
         float(v) for v in cfg.get("compare_lateral_straight_thresholds", [15, 25, 35, 45])
     ]
@@ -1172,26 +1188,37 @@ def process_video(
         stop_label="stopping",
     )
 
-    combined_raw = _combine_axis_events(forward_event_raw, lateral_event_raw)
-    combined_symbolic = _combine_axis_events(symbolic["events"], lateral_event_raw)
-
-    short_merge = _merge_short_segments(
-        events=combined_symbolic,
+    forward_short_merge = _merge_short_segments(
+        events=symbolic["events"],
         frame_indices=frame_indices,
         min_segment_length=min_segment_length,
     )
-    primary_event_corrected = short_merge["events"]
+    forward_event_processed = forward_short_merge["events"]
+
+    lateral_short_merge = _merge_short_segments(
+        events=lateral_event_raw,
+        frame_indices=frame_indices,
+        min_segment_length=min_segment_length,
+    )
+    lateral_event_processed = lateral_short_merge["events"]
+
+    combined_raw = _combine_axis_events(forward_event_raw, lateral_event_raw)
+    combined_symbolic = _combine_axis_events(symbolic["events"], lateral_event_raw)
+    primary_event_corrected = _combine_axis_events(
+        forward_event_processed,
+        lateral_event_processed,
+    )
 
     # Merge cut points from forward + lateral axis segmentations.
     merged_axis = _build_merged_segments_from_cutpoints(
         frame_indices=frame_indices,
-        forward_events=symbolic["events"],
-        lateral_events=lateral_event_raw,
+        forward_events=forward_event_processed,
+        lateral_events=lateral_event_processed,
     )
 
-    forward_segments_final = _segment_from_events(symbolic["events"], frame_indices)
-    lateral_segments_final = _segment_from_events(lateral_event_raw, frame_indices)
-    segments = _segment_from_events(primary_event_corrected, frame_indices)
+    forward_segments_final = _segment_from_events(forward_event_processed, frame_indices)
+    lateral_segments_final = _segment_from_events(lateral_event_processed, frame_indices)
+    segments = merged_axis["segments"]
     cut_points = merged_axis["cut_points"]
 
     stop_exit_ratio = stop_exit_threshold / max(1e-6, stop_enter_threshold)
@@ -1345,8 +1372,8 @@ def process_video(
             "lateral_turning_right": lateral_right_mask,
         },
         "forward_event_raw": forward_event_raw,
-        "forward_event": symbolic["events"],
-        "lateral_event": lateral_event_raw,
+        "forward_event": forward_event_processed,
+        "lateral_event": lateral_event_processed,
         "primary_event_raw": combined_raw,
         "primary_event_symbolic": combined_symbolic,
         "primary_event": primary_event_corrected,
@@ -1360,9 +1387,13 @@ def process_video(
             "segments": merged_axis["segments"],
         },
         "short_segment_merge": {
-            "num_merged_segments": short_merge["num_merged_segments"],
-            "min_segment_length": short_merge["min_segment_length"],
+            "forward_num_merged_segments": forward_short_merge["num_merged_segments"],
+            "lateral_num_merged_segments": lateral_short_merge["num_merged_segments"],
+            "min_segment_length": min_segment_length,
         },
+        "forward_event_processed": forward_event_processed,
+        "lateral_event_raw": lateral_event_raw,
+        "lateral_event_processed": lateral_event_processed,
         "forward_segments": forward_segments_final,
         "lateral_segments": lateral_segments_final,
         "num_forward_segments": len(forward_segments_final),

@@ -15,29 +15,50 @@ Steps:
     6. ego_motion_driving_mini — estimate per-frame ego motion (vx, vz, yaw_rate)
                                     from successive-frame optical flow (RAFT) filtered
                                     to background/static pixels using bg_mask.
-        7. relative_object_motion_driving_mini — estimate per-object motion relative
-                                        to ego using 3D object trajectories and ego motion.
-        8. temporal_segmentation_driving_mini — segment ego-motion signals into
-                        event spans and cut points.
-        9. (future) pattern_mining_driving_mini: beam search rules;
-        
+    7. relative_object_motion_driving_mini — estimate per-object motion relative
+                                    to ego using 3D object trajectories and ego motion.
+    8. temporal_segmentation_driving_mini — segment ego-motion signals into
+                    event spans and cut points.
+    9. segment_object_motion_driving_mini — summarize per-object relative
+                    motion symbolically for each merged temporal segment.
+    10. important_objects_driving_mini — analyze/filter important objects per
+                    segment. Strategy placeholder for now.
+    11. logic_atoms_driving_mini — convert filtered segment-level symbolic facts
+                    into logic atoms for downstream reasoning.
+    12. target_head_atoms_driving_mini — derive future-action target/head atoms
+                    for rule learning from consecutive segments.
+    13. temporal_rule_examples_driving_mini — combine current-segment symbolic
+                    atoms with target/head atoms into final rule-learning examples.
+    14. candidate_rules_driving_mini — generate unary-body temporal initial
+                    rules whose head is the target predicate.
+    15. merge_initial_rules — flatten all per-video initial rules into a
+                    single persisted list for downstream scoring/selection.
+
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import config
 from src.exp_driving_videos.modules import detect_driving_mini
+from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
 from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
 from src.exp_driving_videos.modules import ego_motion_driving_mini
+from src.exp_driving_videos.modules import important_objects_driving_mini
+from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
+from src.exp_driving_videos.modules import segment_object_motion_driving_mini
+from src.exp_driving_videos.modules import target_head_atoms_driving_mini
+from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
@@ -100,7 +121,7 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
         "forward_direction_epsilon": 0.025,
         "lateral_motion_window_size": 10,
         "lateral_direction_epsilon": 0.03,
-        "lateral_straight_threshold": 45.0,
+        "lateral_straight_threshold": 35.0,
         "compare_lateral_straight_thresholds": [15, 25, 35, 45],
         "min_stop_duration": 5,
         "min_turn_duration": 3,
@@ -119,12 +140,291 @@ def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
     return defaults
 
 
-def _run_object_detection_step(force_recompute: bool = False) -> List[Dict[str, Any]]:
+def _get_segment_object_motion_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "rel_vz_threshold": 0.2,
+        "rel_vx_threshold": 0.2,
+        "compare_rel_vx_thresholds": [10.0, 20.0, 50.0],
+        "rel_speed_threshold": 0.3,
+        "dominance_ratio_threshold": 0.6,
+        "distance_near_threshold": 15.0,
+        "distance_medium_threshold": 30.0,
+        "top_k_visualized_objects": 20,
+        "visualization_fps": 10.0,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("segment_object_motion", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load segment object motion config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_important_objects_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "selection_strategy": "not_implemented",
+        "passthrough_selected_objects": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("important_objects", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load important objects config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_logic_atoms_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "lateral_position_threshold": 2.0,
+        "visibility_persistent_threshold": 0.8,
+        "visibility_present_threshold": 0.3,
+        "include_segment_boundary_atoms": True,
+        "include_object_identity_atoms": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("logic_atoms", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load logic atoms config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_target_head_atoms_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "target_predicate": "brake_next",
+        "negative_target_predicate": "not_brake_next",
+        "positive_forward_states": ["forward_slowdown", "stopping"],
+        "include_negative_examples": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("target_head_atoms", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load target head atoms config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_temporal_rule_examples_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "deduplicate_body_atoms": True,
+        "sort_body_atoms": True,
+        "include_clause_text": True,
+        "include_negative_examples": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("temporal_rule_examples", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load temporal rule examples config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_candidate_rules_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "target_predicate": "brake_next",
+        "use_only_positive_examples": True,
+        "min_positive_support": 1,
+        "include_example_ids": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("candidate_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load candidate rules config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_merged_candidate_rules_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "driving_mini_merged_initial_rules"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out_root = _get_merged_candidate_rules_output_root()
+    json_path = out_root / "merged_initial_rules.json"
+    csv_path = out_root / "merged_initial_rules.csv"
+    manifest_path = out_root / "merged_initial_rules_manifest.json"
+
+    merged_rule_map: Dict[str, Dict[str, Any]] = {}
+    video_summaries: List[Dict[str, Any]] = []
+    target_predicates: set[str] = set()
+
+    for video_result in sorted(candidate_rule_results, key=lambda item: str(item.get("video_id", ""))):
+        video_id = str(video_result.get("video_id", "unknown"))
+        target_predicate = str(video_result.get("target_predicate", ""))
+        if target_predicate:
+            target_predicates.add(target_predicate)
+
+        candidate_rules = list(video_result.get("initial_rules", video_result.get("candidate_rules", [])))
+        video_summaries.append(
+            {
+                "video_id": video_id,
+                "target_predicate": target_predicate,
+                "num_initial_rules": len(candidate_rules),
+            }
+        )
+
+        for rule in candidate_rules:
+            clause = str(rule.get("clause", "")).strip()
+            if not clause:
+                continue
+
+            merged_rule = merged_rule_map.get(clause)
+            if merged_rule is None:
+                merged_rule = {
+                    "merged_rule_index": -1,
+                    "rule_id": f"merged_rule_{len(merged_rule_map):04d}",
+                    "head_predicate": rule.get("head_predicate", ""),
+                    "head_atom_template": rule.get("head_atom_template", ""),
+                    "body_atom_template": rule.get("body_atom_template", ""),
+                    "clause": clause,
+                    "positive_support": 0,
+                    "negative_support": 0,
+                    "total_support": 0,
+                    "confidence": 0.0,
+                    "positive_example_ids": [],
+                    "negative_example_ids": [],
+                    "source_video_ids": [],
+                    "source_rule_ids": [],
+                    "source_rule_indices": [],
+                    "num_source_rules": 0,
+                }
+                merged_rule_map[clause] = merged_rule
+
+            merged_rule["positive_support"] += int(rule.get("positive_support", 0))
+            merged_rule["negative_support"] += int(rule.get("negative_support", 0))
+            merged_rule["total_support"] += int(rule.get("total_support", 0))
+            merged_rule["positive_example_ids"].extend(rule.get("positive_example_ids", []))
+            merged_rule["negative_example_ids"].extend(rule.get("negative_example_ids", []))
+            merged_rule["source_video_ids"].append(video_id)
+            merged_rule["source_rule_ids"].append(rule.get("rule_id", ""))
+            merged_rule["source_rule_indices"].append(rule.get("rule_index"))
+            merged_rule["num_source_rules"] += 1
+
+    merged_rules = sorted(merged_rule_map.values(), key=lambda item: str(item.get("clause", "")))
+    for idx, merged_rule in enumerate(merged_rules):
+        merged_rule["merged_rule_index"] = idx
+        merged_rule["confidence"] = float(
+            merged_rule["positive_support"] / max(1, merged_rule["total_support"])
+        )
+        merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
+        merged_rule["source_rule_ids"] = sorted(
+            set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
+        )
+        merged_rule["source_rule_indices"] = [
+            idx for idx in merged_rule["source_rule_indices"] if idx is not None
+        ]
+
+    merged_result: Dict[str, Any] = {
+        "num_videos": len(candidate_rule_results),
+        "num_rules": len(merged_rules),
+        "target_predicates": sorted(target_predicates),
+        "rules": merged_rules,
+    }
+
+    manifest: Dict[str, Any] = {
+        "num_videos": len(candidate_rule_results),
+        "num_rules": len(merged_rules),
+        "target_predicates": sorted(target_predicates),
+        "videos": video_summaries,
+        "json_path": str(json_path),
+        "csv_path": str(csv_path),
+    }
+
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(merged_result, fh, indent=2)
+
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "merged_rule_index",
+                "rule_id",
+                "head_predicate",
+                "head_atom_template",
+                "body_atom_template",
+                "clause",
+                "positive_support",
+                "negative_support",
+                "total_support",
+                "confidence",
+                "positive_example_ids",
+                "negative_example_ids",
+                "source_video_ids",
+                "source_rule_ids",
+                "source_rule_indices",
+                "num_source_rules",
+            ],
+        )
+        writer.writeheader()
+        for rule in merged_rules:
+            writer.writerow(
+                {
+                    "merged_rule_index": rule.get("merged_rule_index", ""),
+                    "rule_id": rule.get("rule_id", ""),
+                    "head_predicate": rule.get("head_predicate", ""),
+                    "head_atom_template": rule.get("head_atom_template", ""),
+                    "body_atom_template": rule.get("body_atom_template", ""),
+                    "clause": rule.get("clause", ""),
+                    "positive_support": rule.get("positive_support", 0),
+                    "negative_support": rule.get("negative_support", 0),
+                    "total_support": rule.get("total_support", 0),
+                    "confidence": rule.get("confidence", 0.0),
+                    "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
+                    "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
+                    "source_video_ids": json.dumps(rule.get("source_video_ids", [])),
+                    "source_rule_ids": json.dumps(rule.get("source_rule_ids", [])),
+                    "source_rule_indices": json.dumps(rule.get("source_rule_indices", [])),
+                    "num_source_rules": rule.get("num_source_rules", 0),
+                }
+            )
+
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    print(f"Merged initial rule JSON written to {json_path}")
+    print(f"Merged initial rule CSV written to {csv_path}")
+    print(f"Merged initial rule manifest written to {manifest_path}")
+    return merged_result
+
+
+def _resolve_video_ids(video_ids: List[str] | None = None) -> List[str] | None:
+    if video_ids:
+        return list(video_ids)
+    return None
+
+
+def _run_object_detection_step(
+    force_recompute: bool = False,
+    video_ids: List[str] | None = None,
+) -> List[Dict[str, Any]]:
     print("=== Step 1: detect_driving_mini ===")
     print(f"OD model           : {DRIVING_MINI_OD_MODEL}")
     print(f"OD classes         : {DRIVING_MINI_OD_CLASSES}")
     print(f"OD force_recompute : {force_recompute}")
+    if video_ids:
+        print(f"OD video_ids       : {video_ids}")
     detection_results: List[Dict[str, Any]] = detect_driving_mini.run(
+        video_ids=video_ids,
         model_name=DRIVING_MINI_OD_MODEL,
         classes=DRIVING_MINI_OD_CLASSES,
         force_recompute=force_recompute,
@@ -143,16 +443,32 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=8,
-        choices=range(1, 9),
+        default=15,
+        choices=range(1, 16),
         help="Run the pipeline through this step number.",
+    )
+    parser.add_argument(
+        "--video-id",
+        dest="video_ids",
+        action="append",
+        help=(
+            "Restrict the pipeline to one or more video IDs. "
+            "If omitted, the pipeline processes all available videos."
+        ),
     )
     return parser.parse_args()
 
 
-def main(max_step: int = 8) -> None:
+def main(max_step: int = 15, video_ids: List[str] | None = None) -> None:
+    effective_video_ids = _resolve_video_ids(video_ids)
+    if effective_video_ids:
+        print(f"Video filter: {effective_video_ids}")
+
     # Step 1: object detection over driving_mini frames
-    detection_results = _run_object_detection_step(force_recompute=False)
+    detection_results = _run_object_detection_step(
+        force_recompute=False,
+        video_ids=effective_video_ids,
+    )
     if max_step == 1:
         print("\nStopping after step 1 by request.")
         return
@@ -249,19 +565,145 @@ def main(max_step: int = 8) -> None:
         ego_motion_results=ego_motion_results,
         relative_motion_results=relative_motion_results,
         seg_cfg=temporal_seg_cfg,
-        force_recompute=True,
+        force_recompute=False,
     )
     print(
         "Temporal segmentation complete. "
         f"Processed {len(temporal_seg_results)} video(s)."
     )
+    if max_step == 8:
+        print("\nStopping after step 8 by request.")
+        return
+
+    # Step 9: summarize object relative motion per merged temporal segment
+    segment_object_cfg = _get_segment_object_motion_cfg()
+    print("\n=== Step 9: segment_object_motion_driving_mini ===")
+    print(f"Segment object motion cfg: {segment_object_cfg}")
+    segment_object_results: List[Dict[str, Any]] = segment_object_motion_driving_mini.run(
+        relative_motion_results=relative_motion_results,
+        temporal_segmentation_results=temporal_seg_results,
+        cfg=segment_object_cfg,
+        force_recompute=False,
+    )
+    print(
+        "Segment object motion summary complete. "
+        f"Processed {len(segment_object_results)} video(s)."
+    )
+    if max_step == 9:
+        print("\nStopping after step 9 by request.")
+        return
+
+    # Step 10: analyze/select important objects per merged temporal segment
+    important_objects_cfg = _get_important_objects_cfg()
+    print("\n=== Step 10: important_objects_driving_mini ===")
+    print(f"Important objects cfg: {important_objects_cfg}")
+    important_object_results: List[Dict[str, Any]] = important_objects_driving_mini.run(
+        segment_object_motion_results=segment_object_results,
+        cfg=important_objects_cfg,
+        force_recompute=False,
+    )
+    print(
+        "Important object analysis complete. "
+        f"Processed {len(important_object_results)} video(s)."
+    )
+    if max_step == 10:
+        print("\nStopping after step 10 by request.")
+        return
+
+    # Step 11: convert filtered symbolic segment facts into logic atoms
+    logic_atoms_cfg = _get_logic_atoms_cfg()
+    print("\n=== Step 11: logic_atoms_driving_mini ===")
+    print(f"Logic atoms cfg: {logic_atoms_cfg}")
+    logic_atom_results: List[Dict[str, Any]] = logic_atoms_driving_mini.run(
+        segment_object_motion_results=important_object_results,
+        cfg=logic_atoms_cfg,
+        force_recompute=False,
+    )
+    print(
+        "Logic atom conversion complete. "
+        f"Processed {len(logic_atom_results)} video(s)."
+    )
+    if max_step == 11:
+        print("\nStopping after step 11 by request.")
+        return
+
+    # Step 12: derive temporal target/head atoms for rule learning
+    target_head_cfg = _get_target_head_atoms_cfg()
+    print("\n=== Step 12: target_head_atoms_driving_mini ===")
+    print(f"Target head atoms cfg: {target_head_cfg}")
+    target_head_results: List[Dict[str, Any]] = target_head_atoms_driving_mini.run(
+        logic_atom_results=logic_atom_results,
+        cfg=target_head_cfg,
+        force_recompute=False,
+    )
+    print(
+        "Target head atom derivation complete. "
+        f"Processed {len(target_head_results)} video(s)."
+    )
+    if max_step == 12:
+        print("\nStopping after step 12 by request.")
+        return
+
+    # Step 13: build final temporal rule-learning examples
+    rule_examples_cfg = _get_temporal_rule_examples_cfg()
+    print("\n=== Step 13: temporal_rule_examples_driving_mini ===")
+    print(f"Temporal rule examples cfg: {rule_examples_cfg}")
+    temporal_rule_results: List[Dict[str, Any]] = temporal_rule_examples_driving_mini.run(
+        target_head_results=target_head_results,
+        cfg=rule_examples_cfg,
+        force_recompute=False,
+    )
+    print(
+        "Temporal rule-learning example build complete. "
+        f"Processed {len(temporal_rule_results)} video(s)."
+    )
+    if max_step == 13:
+        print("\nStopping after step 13 by request.")
+        return
+
+    # Step 14: generate short unary-body initial temporal rules
+    candidate_rules_cfg = _get_candidate_rules_cfg()
+    print("\n=== Step 14: candidate_rules_driving_mini ===")
+    print(f"Initial rules cfg: {candidate_rules_cfg}")
+    candidate_rule_results: List[Dict[str, Any]] = candidate_rules_driving_mini.run(
+        temporal_rule_results=temporal_rule_results,
+        cfg=candidate_rules_cfg,
+        force_recompute=True,
+    )
+    print(
+        "Initial rule generation complete. "
+        f"Processed {len(candidate_rule_results)} video(s)."
+    )
+    if max_step == 14:
+        print("\nStopping after step 14 by request.")
+        return
+
+    # Step 15: Merge all the initial rules into a single list for downstream processing
+    print("\n=== Step 15: merge_initial_rules ===")
+    merged_candidate_rules = _merge_candidate_rules(candidate_rule_results)
+    print(
+        "Initial rule merge complete. "
+        f"Merged {merged_candidate_rules['num_rules']} rule(s) from "
+        f"{merged_candidate_rules['num_videos']} video(s)."
+    )
+    if max_step == 15:
+        print("\nStopping after step 15 by request.")
+        return
     
-    # TODO: segmentation should also be 
-    # TODO: generate atom rules based on the symbolized segments
-    
-    # TODO: rule mining based on the atom rules
+   # Step 16: rule scoring
+   
+   # Step 17: top-k rule selection
+   
+   # Step 18: rule based prediction and evaluation
+   
+   # Step 19: rule extension
+   
+   # 
+
+
+
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(max_step=args.max_step)
+    main(max_step=args.max_step, video_ids=args.video_ids)
