@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 2
+_INITIAL_RULES_VERSION = 6
 
 
 def get_output_root() -> Path:
@@ -46,9 +46,11 @@ def get_output_root() -> Path:
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
         "target_predicate",
+        "negative_target_predicate",
         "use_only_positive_examples",
         "min_positive_support",
         "include_example_ids",
+        "ignored_body_predicates",
     ]
     return {k: cfg.get(k) for k in keys}
 
@@ -102,6 +104,109 @@ def _build_clause(head_predicate: str, body_atom_template: str) -> str:
     return f"{head_no_dot} :- {body_atom_template}"
 
 
+def _extract_bindings(
+    body_atom_template: str,
+    concrete_atom: str,
+) -> Optional[Dict[str, str]]:
+    template_parsed = _parse_atom(body_atom_template)
+    concrete_parsed = _parse_atom(concrete_atom)
+    if template_parsed is None or concrete_parsed is None:
+        return None
+
+    template_predicate, template_args = template_parsed
+    concrete_predicate, concrete_args = concrete_parsed
+    if template_predicate != concrete_predicate or len(template_args) != len(concrete_args):
+        return None
+
+    bindings: Dict[str, str] = {}
+    for template_arg, concrete_arg in zip(template_args, concrete_args):
+        if template_arg in {"S", "O", "T", "F"}:
+            existing = bindings.get(template_arg)
+            if existing is not None and existing != concrete_arg:
+                return None
+            bindings[template_arg] = concrete_arg
+            continue
+        if template_arg != concrete_arg:
+            return None
+    return bindings
+
+
+def _make_evidence_entry(
+    video_id: str,
+    example: Dict[str, Any],
+    body_atom_template: str,
+    concrete_atom: str,
+) -> Optional[Dict[str, Any]]:
+    bindings = _extract_bindings(body_atom_template, concrete_atom)
+    if bindings is None:
+        return None
+
+    return {
+        "video_id": video_id,
+        "example_id": str(example.get("example_id", "")),
+        "current_segment_id": str(example.get("current_segment_id", "")),
+        "next_segment_id": str(example.get("next_segment_id", "")),
+        "target_predicate": str(example.get("target_predicate", "")),
+        "label": bool(example.get("label", False)),
+        "body_atom_template": body_atom_template,
+        "matched_atom": str(concrete_atom),
+        "bindings": bindings,
+    }
+
+
+def _dedupe_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, Tuple[Tuple[str, str], ...]]] = set()
+    for entry in evidence_entries:
+        key = (
+            str(entry.get("example_id", "")),
+            str(entry.get("matched_atom", "")),
+            tuple(sorted((str(k), str(v)) for k, v in dict(entry.get("bindings", {})).items())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def _summarize_evidence(
+    evidence_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    total_firings = len(evidence_entries)
+    positive_firings = sum(1 for entry in evidence_entries if bool(entry.get("label", False)))
+    negative_firings = total_firings - positive_firings
+
+    positive_example_ids = sorted(
+        {
+            str(entry.get("example_id", ""))
+            for entry in evidence_entries
+            if bool(entry.get("label", False)) and str(entry.get("example_id", ""))
+        }
+    )
+    negative_example_ids = sorted(
+        {
+            str(entry.get("example_id", ""))
+            for entry in evidence_entries
+            if not bool(entry.get("label", False)) and str(entry.get("example_id", ""))
+        }
+    )
+    total_example_ids = sorted(set(positive_example_ids) | set(negative_example_ids))
+    confidence = float(positive_firings / max(1, total_firings))
+
+    return {
+        "positive_support": len(positive_example_ids),
+        "negative_support": len(negative_example_ids),
+        "total_support": len(total_example_ids),
+        "positive_firings": positive_firings,
+        "negative_firings": negative_firings,
+        "total_firings": total_firings,
+        "confidence": confidence,
+        "positive_example_ids": positive_example_ids,
+        "negative_example_ids": negative_example_ids,
+    }
+
+
 def process_video(
     temporal_rule_examples_video_result: Dict[str, Any],
     cfg: Optional[Dict[str, Any]] = None,
@@ -110,9 +215,24 @@ def process_video(
 ) -> Dict[str, Any]:
     cfg = cfg or {}
     target_predicate = str(cfg.get("target_predicate", "brake_next"))
+    negative_target_predicate = str(cfg.get("negative_target_predicate", f"not_{target_predicate}"))
     use_only_positive_examples = bool(cfg.get("use_only_positive_examples", True))
     min_positive_support = int(cfg.get("min_positive_support", 1))
     include_example_ids = bool(cfg.get("include_example_ids", True))
+    ignored_body_predicates = {
+        str(name).strip()
+        for name in cfg.get(
+            "ignored_body_predicates",
+            [
+                "segment",
+                "segment_start_frame",
+                "segment_end_frame",
+                "object_in_segment",
+                "object_track",
+            ],
+        )
+        if str(name).strip()
+    }
 
     video_id = str(temporal_rule_examples_video_result["video_id"])
     out_dir = (output_root or get_output_root()) / video_id
@@ -129,9 +249,11 @@ def process_video(
             and _cfg_key_subset(cache_cfg) == _cfg_key_subset(
                 {
                     "target_predicate": target_predicate,
+                    "negative_target_predicate": negative_target_predicate,
                     "use_only_positive_examples": use_only_positive_examples,
                     "min_positive_support": min_positive_support,
                     "include_example_ids": include_example_ids,
+                    "ignored_body_predicates": sorted(ignored_body_predicates),
                 }
             )
         ):
@@ -140,53 +262,57 @@ def process_video(
             return cached
 
     examples = list(temporal_rule_examples_video_result.get("examples", []))
-    stats: Dict[str, Dict[str, Any]] = defaultdict(
-        lambda: {
-            "positive_support": 0,
-            "negative_support": 0,
-            "total_support": 0,
-            "positive_example_ids": [],
-            "negative_example_ids": [],
-        }
-    )
+    stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"evidence_set": []})
+    candidate_body_templates: set[str] = set()
+    total_positive_examples = sum(1 for example in examples if bool(example.get("label", False)))
+    total_negative_examples = sum(1 for example in examples if not bool(example.get("label", False)))
 
     for example in examples:
-        if str(example.get("target_predicate", "")) != target_predicate:
-            continue
-        is_positive = bool(example.get("label", False))
-        if use_only_positive_examples and not is_positive:
+        example_target_predicate = str(example.get("target_predicate", ""))
+        if example_target_predicate not in {target_predicate, negative_target_predicate}:
             continue
 
+        is_positive = bool(example.get("label", False))
         example_id = str(example.get("example_id", ""))
         body_atoms = list(example.get("body_atoms", []))
         seen_templates: set[str] = set()
         for body_atom in body_atoms:
+            parsed_body_atom = _parse_atom(str(body_atom))
+            if parsed_body_atom is None:
+                continue
+            body_predicate, _ = parsed_body_atom
+            if body_predicate in ignored_body_predicates:
+                continue
             body_template = _abstract_atom(str(body_atom))
             if not body_template or body_template in seen_templates:
                 continue
             seen_templates.add(body_template)
+            evidence_entry = _make_evidence_entry(
+                video_id=video_id,
+                example=example,
+                body_atom_template=body_template,
+                concrete_atom=str(body_atom),
+            )
+            if evidence_entry is not None:
+                stats[body_template]["evidence_set"].append(evidence_entry)
 
-            stat = stats[body_template]
-            stat["total_support"] += 1
-            if is_positive:
-                stat["positive_support"] += 1
-                if include_example_ids:
-                    stat["positive_example_ids"].append(example_id)
-            else:
-                stat["negative_support"] += 1
-                if include_example_ids:
-                    stat["negative_example_ids"].append(example_id)
+        if is_positive or not use_only_positive_examples:
+            candidate_body_templates.update(seen_templates)
 
     initial_rules: List[Dict[str, Any]] = []
     for idx, body_template in enumerate(sorted(stats.keys())):
-        stat = stats[body_template]
-        positive_support = int(stat["positive_support"])
-        negative_support = int(stat["negative_support"])
-        total_support = int(stat["total_support"])
+        if body_template not in candidate_body_templates:
+            continue
+
+        evidence_set = _dedupe_evidence_entries(list(stats[body_template].get("evidence_set", [])))
+        evidence_summary = _summarize_evidence(evidence_set)
+        positive_support = int(evidence_summary["positive_support"])
+        negative_support = int(evidence_summary["negative_support"])
+        total_support = int(evidence_summary["total_support"])
         if positive_support < min_positive_support:
             continue
 
-        confidence = float(positive_support / max(1, total_support))
+        confidence = float(evidence_summary["confidence"])
         clause = _build_clause(target_predicate, body_template)
         initial_rules.append(
             {
@@ -199,9 +325,17 @@ def process_video(
                 "positive_support": positive_support,
                 "negative_support": negative_support,
                 "total_support": total_support,
+                "positive_firings": int(evidence_summary["positive_firings"]),
+                "negative_firings": int(evidence_summary["negative_firings"]),
+                "total_firings": int(evidence_summary["total_firings"]),
                 "confidence": confidence,
-                "positive_example_ids": stat["positive_example_ids"] if include_example_ids else [],
-                "negative_example_ids": stat["negative_example_ids"] if include_example_ids else [],
+                "positive_example_ids": (
+                    evidence_summary["positive_example_ids"] if include_example_ids else []
+                ),
+                "negative_example_ids": (
+                    evidence_summary["negative_example_ids"] if include_example_ids else []
+                ),
+                "evidence_set": evidence_set,
             }
         )
 
@@ -210,11 +344,16 @@ def process_video(
         "video_id": video_id,
         "target_predicate": target_predicate,
         "num_initial_rules": len(initial_rules),
+        "num_examples": len(examples),
+        "num_positive_examples": total_positive_examples,
+        "num_negative_examples": total_negative_examples,
         "config": {
             "target_predicate": target_predicate,
+            "negative_target_predicate": negative_target_predicate,
             "use_only_positive_examples": use_only_positive_examples,
             "min_positive_support": min_positive_support,
             "include_example_ids": include_example_ids,
+            "ignored_body_predicates": sorted(ignored_body_predicates),
         },
         "initial_rules": initial_rules,
     }
@@ -235,6 +374,9 @@ def process_video(
                 "positive_support",
                 "negative_support",
                 "total_support",
+                "positive_firings",
+                "negative_firings",
+                "total_firings",
                 "confidence",
                 "positive_example_ids",
                 "negative_example_ids",
@@ -253,6 +395,9 @@ def process_video(
                     "positive_support": rule.get("positive_support", 0),
                     "negative_support": rule.get("negative_support", 0),
                     "total_support": rule.get("total_support", 0),
+                    "positive_firings": rule.get("positive_firings", 0),
+                    "negative_firings": rule.get("negative_firings", 0),
+                    "total_firings": rule.get("total_firings", 0),
                     "confidence": rule.get("confidence", 0.0),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
@@ -288,6 +433,9 @@ def run(
                 "video_id": r["video_id"],
                 "target_predicate": r.get("target_predicate", ""),
                 "num_initial_rules": r.get("num_initial_rules", r.get("num_candidate_rules", 0)),
+                "num_examples": r.get("num_examples", 0),
+                "num_positive_examples": r.get("num_positive_examples", 0),
+                "num_negative_examples": r.get("num_negative_examples", 0),
             }
             for r in results
         ],

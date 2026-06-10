@@ -33,6 +33,10 @@ Steps:
                     rules whose head is the target predicate.
     15. merge_initial_rules — flatten all per-video initial rules into a
                     single persisted list for downstream scoring/selection.
+    16. extended_rules_driving_mini — iteratively extend merged rules with
+                    initial-rule body atoms for a fixed number of rounds.
+    17. final_rules_driving_mini — rank all kept rules by confidence and keep
+                    the top-k as the final rule set.
 
 """
 
@@ -49,6 +53,8 @@ import config
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
+from src.exp_driving_videos.modules import extended_rules_driving_mini
+from src.exp_driving_videos.modules import final_rules_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
 from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
@@ -237,9 +243,17 @@ def _get_temporal_rule_examples_cfg() -> Dict[str, Any]:
 def _get_candidate_rules_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "target_predicate": "brake_next",
+        "negative_target_predicate": "not_brake_next",
         "use_only_positive_examples": True,
         "min_positive_support": 1,
         "include_example_ids": True,
+        "ignored_body_predicates": [
+            "segment",
+            "segment_start_frame",
+            "segment_end_frame",
+            "object_in_segment",
+            "object_track",
+        ],
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -252,10 +266,99 @@ def _get_candidate_rules_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_extended_rules_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "num_rounds": 3,
+        "evaluation_strategy": "binding_aware_intersection",
+        "prune_strategies": [
+            "low_evidence",
+            "empty_evidence",
+            "same_firings_as_parent",
+            "same_confidence_smaller_evidence",
+        ],
+        "min_positive_support_to_extend": 2,
+        "same_confidence_smaller_evidence_enabled": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("extended_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load extended rules config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_final_rules_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_k": 50,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("final_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load final rules config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_merged_candidate_rules_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "driving_mini_merged_initial_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    for entry in evidence_entries:
+        bindings = dict(entry.get("bindings", {}))
+        key = (
+            str(entry.get("example_id", "")),
+            str(entry.get("matched_atom", "")),
+            tuple(sorted((str(k), str(v)) for k, v in bindings.items())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def _summarize_rule_evidence(evidence_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_firings = len(evidence_entries)
+    positive_firings = sum(1 for entry in evidence_entries if bool(entry.get("label", False)))
+    negative_firings = total_firings - positive_firings
+    positive_example_ids = sorted(
+        {
+            str(entry.get("example_id", ""))
+            for entry in evidence_entries
+            if bool(entry.get("label", False)) and str(entry.get("example_id", ""))
+        }
+    )
+    negative_example_ids = sorted(
+        {
+            str(entry.get("example_id", ""))
+            for entry in evidence_entries
+            if not bool(entry.get("label", False)) and str(entry.get("example_id", ""))
+        }
+    )
+    total_support = len(set(positive_example_ids) | set(negative_example_ids))
+    confidence = float(positive_firings / max(1, total_firings))
+    return {
+        "positive_support": len(positive_example_ids),
+        "negative_support": len(negative_example_ids),
+        "total_support": total_support,
+        "positive_firings": positive_firings,
+        "negative_firings": negative_firings,
+        "total_firings": total_firings,
+        "confidence": confidence,
+        "positive_example_ids": positive_example_ids,
+        "negative_example_ids": negative_example_ids,
+    }
 
 
 def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -267,12 +370,18 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
     merged_rule_map: Dict[str, Dict[str, Any]] = {}
     video_summaries: List[Dict[str, Any]] = []
     target_predicates: set[str] = set()
+    total_examples = 0
+    total_positive_examples = 0
+    total_negative_examples = 0
 
     for video_result in sorted(candidate_rule_results, key=lambda item: str(item.get("video_id", ""))):
         video_id = str(video_result.get("video_id", "unknown"))
         target_predicate = str(video_result.get("target_predicate", ""))
         if target_predicate:
             target_predicates.add(target_predicate)
+        total_examples += int(video_result.get("num_examples", 0))
+        total_positive_examples += int(video_result.get("num_positive_examples", 0))
+        total_negative_examples += int(video_result.get("num_negative_examples", 0))
 
         candidate_rules = list(video_result.get("initial_rules", video_result.get("candidate_rules", [])))
         video_summaries.append(
@@ -280,6 +389,9 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
                 "video_id": video_id,
                 "target_predicate": target_predicate,
                 "num_initial_rules": len(candidate_rules),
+                "num_examples": int(video_result.get("num_examples", 0)),
+                "num_positive_examples": int(video_result.get("num_positive_examples", 0)),
+                "num_negative_examples": int(video_result.get("num_negative_examples", 0)),
             }
         )
 
@@ -300,9 +412,13 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
                     "positive_support": 0,
                     "negative_support": 0,
                     "total_support": 0,
+                    "positive_firings": 0,
+                    "negative_firings": 0,
+                    "total_firings": 0,
                     "confidence": 0.0,
                     "positive_example_ids": [],
                     "negative_example_ids": [],
+                    "evidence_set": [],
                     "source_video_ids": [],
                     "source_rule_ids": [],
                     "source_rule_indices": [],
@@ -310,11 +426,7 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
                 }
                 merged_rule_map[clause] = merged_rule
 
-            merged_rule["positive_support"] += int(rule.get("positive_support", 0))
-            merged_rule["negative_support"] += int(rule.get("negative_support", 0))
-            merged_rule["total_support"] += int(rule.get("total_support", 0))
-            merged_rule["positive_example_ids"].extend(rule.get("positive_example_ids", []))
-            merged_rule["negative_example_ids"].extend(rule.get("negative_example_ids", []))
+            merged_rule["evidence_set"].extend(list(rule.get("evidence_set", [])))
             merged_rule["source_video_ids"].append(video_id)
             merged_rule["source_rule_ids"].append(rule.get("rule_id", ""))
             merged_rule["source_rule_indices"].append(rule.get("rule_index"))
@@ -323,9 +435,17 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
     merged_rules = sorted(merged_rule_map.values(), key=lambda item: str(item.get("clause", "")))
     for idx, merged_rule in enumerate(merged_rules):
         merged_rule["merged_rule_index"] = idx
-        merged_rule["confidence"] = float(
-            merged_rule["positive_support"] / max(1, merged_rule["total_support"])
-        )
+        merged_rule["evidence_set"] = _dedupe_rule_evidence_entries(list(merged_rule.get("evidence_set", [])))
+        evidence_summary = _summarize_rule_evidence(list(merged_rule.get("evidence_set", [])))
+        merged_rule["positive_support"] = int(evidence_summary["positive_support"])
+        merged_rule["negative_support"] = int(evidence_summary["negative_support"])
+        merged_rule["total_support"] = int(evidence_summary["total_support"])
+        merged_rule["positive_firings"] = int(evidence_summary["positive_firings"])
+        merged_rule["negative_firings"] = int(evidence_summary["negative_firings"])
+        merged_rule["total_firings"] = int(evidence_summary["total_firings"])
+        merged_rule["confidence"] = float(evidence_summary["confidence"])
+        merged_rule["positive_example_ids"] = list(evidence_summary["positive_example_ids"])
+        merged_rule["negative_example_ids"] = list(evidence_summary["negative_example_ids"])
         merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
         merged_rule["source_rule_ids"] = sorted(
             set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
@@ -336,6 +456,9 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
 
     merged_result: Dict[str, Any] = {
         "num_videos": len(candidate_rule_results),
+        "num_examples": total_examples,
+        "num_positive_examples": total_positive_examples,
+        "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
         "target_predicates": sorted(target_predicates),
         "rules": merged_rules,
@@ -343,6 +466,9 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
 
     manifest: Dict[str, Any] = {
         "num_videos": len(candidate_rule_results),
+        "num_examples": total_examples,
+        "num_positive_examples": total_positive_examples,
+        "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
         "target_predicates": sorted(target_predicates),
         "videos": video_summaries,
@@ -366,6 +492,9 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
                 "positive_support",
                 "negative_support",
                 "total_support",
+                "positive_firings",
+                "negative_firings",
+                "total_firings",
                 "confidence",
                 "positive_example_ids",
                 "negative_example_ids",
@@ -388,6 +517,9 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
                     "positive_support": rule.get("positive_support", 0),
                     "negative_support": rule.get("negative_support", 0),
                     "total_support": rule.get("total_support", 0),
+                    "positive_firings": rule.get("positive_firings", 0),
+                    "negative_firings": rule.get("negative_firings", 0),
+                    "total_firings": rule.get("total_firings", 0),
                     "confidence": rule.get("confidence", 0.0),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
@@ -443,8 +575,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=15,
-        choices=range(1, 16),
+        default=17,
+        choices=range(1, 18),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -459,7 +591,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int = 15, video_ids: List[str] | None = None) -> None:
+def main(max_step: int = 17, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
@@ -690,17 +822,41 @@ def main(max_step: int = 15, video_ids: List[str] | None = None) -> None:
         print("\nStopping after step 15 by request.")
         return
     
-   # Step 16: rule scoring
-   
-   # Step 17: top-k rule selection
-   
-   # Step 18: rule based prediction and evaluation
-   
-   # Step 19: rule extension
-   
-   # 
+    # Step 16: iteratively extend merged initial rules for N rounds
+    extended_rules_cfg = _get_extended_rules_cfg()
+    print("\n=== Step 16: extended_rules_driving_mini ===")
+    print(f"Extended rules cfg: {extended_rules_cfg}")
+    extended_rule_results: Dict[str, Any] = extended_rules_driving_mini.run(
+        merged_initial_rules=merged_candidate_rules,
+        cfg=extended_rules_cfg,
+        force_recompute=True,
+    )
+    print(
+        "Extended rule generation complete. "
+        f"Completed {extended_rule_results.get('num_rounds_completed', 0)} round(s)."
+    )
+    if max_step == 16:
+        print("\nStopping after step 16 by request.")
+        return
 
+    # Step 17: rank all kept rules by confidence and keep top-k
+    final_rules_cfg = _get_final_rules_cfg()
+    print("\n=== Step 17: final_rules_driving_mini ===")
+    print(f"Final rules cfg: {final_rules_cfg}")
+    final_rule_results: Dict[str, Any] = final_rules_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        cfg=final_rules_cfg,
+        force_recompute=True,
+    )
+    print(
+        "Final rule selection complete. "
+        f"Selected {final_rule_results.get('num_final_rules', 0)} rule(s)."
+    )
+    if max_step == 17:
+        print("\nStopping after step 17 by request.")
+        return
 
+    # Step 18
 
 
 

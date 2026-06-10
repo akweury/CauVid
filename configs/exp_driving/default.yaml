@@ -73,3 +73,19 @@ candidate_rules:
   use_only_positive_examples: true
   min_positive_support: 1
   include_example_ids: true
+  ignored_body_predicates:
+    - segment
+    - segment_start_frame
+    - segment_end_frame
+    - object_in_segment
+    - object_track
+
+extended_rules:
+  num_rounds: 3
+  evaluation_strategy: binding_aware_intersection
+  prune_strategies: [low_evidence, empty_evidence, same_firings_as_parent, same_confidence_smaller_evidence]
+  min_positive_support_to_extend: 2
+  same_confidence_smaller_evidence_enabled: true
+
+final_rules:
+  top_k: 50
