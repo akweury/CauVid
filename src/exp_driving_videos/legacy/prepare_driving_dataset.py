@@ -131,7 +131,7 @@ def extract_video_frames(
     skip_existing: bool,
 ) -> dict[int, int]:
     import cv2
-    from exp_driving_videos.modules.data_preprocessing import get_video_rotation, rotate_frame
+    from src.exp_driving_videos.modules.data_preprocessing import get_video_rotation, rotate_frame
 
     existing = sorted(frame_output_dir.glob("frame_*.jpg"))
     if skip_existing and existing:
@@ -215,7 +215,7 @@ def generate_depth_for_videos(
     batch_size: int,
     device: str,
 ) -> None:
-    from exp_driving_videos.modules.data_preprocessing import generate_frame_depth_maps
+    from src.exp_driving_videos.modules.data_preprocessing import generate_frame_depth_maps
 
     for video_id in video_ids:
         video_frame_dir = frames_root / video_id
