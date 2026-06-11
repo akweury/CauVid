@@ -232,38 +232,11 @@ def _save_evaluation_pdf(
 
     overall = dict(result.get("overall_metrics", {}))
     per_video = list(result.get("per_video_metrics", []))
-    split = dict(result.get("split", {}))
 
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8.5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
     fig.suptitle("Driving Mini Rule Evaluation", fontsize=16, fontweight="bold")
 
-    summary_ax = axes[0, 0]
-    summary_ax.axis("off")
-    summary_lines = [
-        f"Target predicate: {result.get('target_predicate', 'brake_next')}",
-        f"Eval videos: {int(result.get('num_eval_videos', 0))}",
-        f"Eval examples: {int(result.get('num_eval_examples', 0))}",
-        f"Positive examples: {int(result.get('num_eval_positive_examples', 0))}",
-        f"Negative examples: {int(result.get('num_eval_negative_examples', 0))}",
-        f"Final rules: {int(result.get('num_final_rules', 0))}",
-        f"Rules fired: {int(result.get('num_rules_fired', 0))}",
-        "",
-        f"Train split: {', '.join(split.get('train_video_ids', []))}",
-        f"Eval split: {', '.join(split.get('eval_video_ids', []))}",
-    ]
-    summary_ax.text(
-        0.0,
-        1.0,
-        "\n".join(summary_lines),
-        va="top",
-        ha="left",
-        fontsize=10,
-        family="monospace",
-        wrap=True,
-    )
-    summary_ax.set_title("Summary", loc="left", fontweight="bold")
-
-    confusion_ax = axes[0, 1]
+    confusion_ax = axes[0]
     tp = int(overall.get("true_positive", 0))
     fp = int(overall.get("false_positive", 0))
     fn = int(overall.get("false_negative", 0))
@@ -278,28 +251,28 @@ def _save_evaluation_pdf(
         for col_index, value in enumerate(row):
             confusion_ax.text(col_index, row_index, str(value), ha="center", va="center", color="black")
 
-    metrics_ax = axes[1, 0]
+    metrics_ax = axes[1]
     metric_names = ["accuracy", "precision", "recall", "f1"]
     metric_values = [float(overall.get(name, 0.0)) for name in metric_names]
     metric_colors = ["#2a9d8f", "#457b9d", "#e76f51", "#264653"]
     metrics_ax.bar(metric_names, metric_values, color=metric_colors)
-    metrics_ax.set_ylim(0.0, 1.0)
+    metrics_ax.set_ylim(0.0, 1.1)
     metrics_ax.set_title("Overall Metrics", loc="left", fontweight="bold")
     metrics_ax.set_ylabel("Score")
     for idx, value in enumerate(metric_values):
-        metrics_ax.text(idx, min(value + 0.03, 1.0), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+        metrics_ax.text(idx, min(value + 0.03, 1.06), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
 
-    per_video_ax = axes[1, 1]
+    per_video_ax = axes[2]
     video_ids = [str(item.get("video_id", "")) for item in per_video]
     video_scores = [float(item.get("accuracy", 0.0)) for item in per_video]
     if video_ids:
         per_video_ax.bar(video_ids, video_scores, color="#8d99ae")
-        per_video_ax.set_ylim(0.0, 1.0)
+        per_video_ax.set_ylim(0.0, 1.1)
         per_video_ax.set_ylabel("Accuracy")
         per_video_ax.set_title("Per-Video Accuracy", loc="left", fontweight="bold")
         per_video_ax.tick_params(axis="x", rotation=25, labelsize=8)
         for idx, value in enumerate(video_scores):
-            per_video_ax.text(idx, min(value + 0.03, 1.0), f"{value:.3f}", ha="center", va="bottom", fontsize=8)
+            per_video_ax.text(idx, min(value + 0.03, 1.06), f"{value:.3f}", ha="center", va="bottom", fontsize=8)
     else:
         per_video_ax.axis("off")
         per_video_ax.text(0.5, 0.5, "No eval videos", ha="center", va="center")
