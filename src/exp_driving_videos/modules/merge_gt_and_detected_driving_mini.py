@@ -7,7 +7,7 @@ Rule:
 - Keep unmatched detected/tracked objects to maximize object coverage.
 
 Output layout:
-    pipeline_output/driving_mini_merged_annotations/
+    pipeline_output/04_driving_mini_merged_annotations/
         merged_annotations_manifest.json
         <video_id>/
             merged_annotations.json
@@ -30,7 +30,7 @@ import config
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_merged_annotations"
+    out = config.get_output_path("pipeline_output") / "04_driving_mini_merged_annotations"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

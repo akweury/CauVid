@@ -6,7 +6,7 @@ Consumes the Step 4 merged annotations and enriches each frame/object with:
 - positions_3d: [x, y, z] camera-frame centers inferred from Depth Anything
 
 Output layout:
-    pipeline_output/driving_mini_3d_positions/
+    pipeline_output/05_driving_mini_3d_positions/
         positions_3d_manifest.json
         <video_id>/
             positions_3d.json
@@ -25,7 +25,7 @@ from src.exp_driving_videos.modules import data_preprocessing
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_3d_positions"
+    out = config.get_output_path("pipeline_output") / "05_driving_mini_3d_positions"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

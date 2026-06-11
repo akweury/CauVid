@@ -155,7 +155,7 @@ def _get_detection_cfg(cfg=None):
     det_cfg = {
         "enabled": True,
         "prepare_frame_adapter": False,
-        "detection_output_root": str(config.get_output_path("pipeline_output") / "driving_mini_detection"),
+        "detection_output_root": str(config.get_output_path("pipeline_output") / "01_driving_mini_detection"),
         "strict": False,
     }
     det_cfg.update(preprocess_cfg.get("detection_annotations", {}))

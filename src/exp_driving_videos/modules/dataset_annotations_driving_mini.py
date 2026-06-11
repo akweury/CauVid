@@ -8,7 +8,7 @@ The CSV includes per-object rows with fields such as:
     videoName, frameIndex, id, category, box2d.x1, box2d.x2, box2d.y1, box2d.y2
 
 Output layout:
-    pipeline_output/driving_mini_dataset_annotations/
+    pipeline_output/03_driving_mini_dataset_annotations/
         dataset_annotations_manifest.json
         <video_id>/
             dataset_annotations.json
@@ -44,7 +44,7 @@ def get_frames_root() -> Path:
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_dataset_annotations"
+    out = config.get_output_path("pipeline_output") / "03_driving_mini_dataset_annotations"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

@@ -37,6 +37,8 @@ Steps:
                     initial-rule body atoms for a fixed number of rounds.
     17. final_rules_driving_mini — rank all kept rules by confidence and keep
                     the top-k as the final rule set.
+    18. evaluate_rules_driving_mini — evaluate the learned final rules on the
+                    held-out evaluation split.
 
 """
 
@@ -53,6 +55,7 @@ import config
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
+from src.exp_driving_videos.modules import evaluate_rules_driving_mini
 from src.exp_driving_videos.modules import extended_rules_driving_mini
 from src.exp_driving_videos.modules import final_rules_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
@@ -69,6 +72,8 @@ from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
 DRIVING_MINI_OD_MODEL = "yolov8l-worldv2.pt"
+DEFAULT_TRAIN_VIDEO_COUNT = 8
+DEFAULT_EVAL_VIDEO_COUNT = 2
 DRIVING_MINI_OD_CLASSES = [
     "car",
     "truck",
@@ -305,8 +310,45 @@ def _get_final_rules_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_data_split_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "train_video_count": DEFAULT_TRAIN_VIDEO_COUNT,
+        "eval_video_count": DEFAULT_EVAL_VIDEO_COUNT,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("data_split", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load data split config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_rule_evaluation_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "prediction_mode": "any_rule_positive",
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("rule_evaluation", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load rule evaluation config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_merged_candidate_rules_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_merged_initial_rules"
+    out = config.get_output_path("pipeline_output") / "15_driving_mini_merged_initial_rules"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_split_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "driving_mini_split"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -539,10 +581,93 @@ def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict
     return merged_result
 
 
+def _select_video_results(
+    video_results: List[Dict[str, Any]],
+    selected_video_ids: List[str],
+) -> List[Dict[str, Any]]:
+    selected_video_id_set = {str(video_id) for video_id in selected_video_ids}
+    return [
+        result
+        for result in video_results
+        if str(result.get("video_id", "")) in selected_video_id_set
+    ]
+
+
+def _build_train_eval_split(
+    video_ids: List[str],
+    train_video_count: int,
+    eval_video_count: int,
+) -> Dict[str, Any]:
+    unique_video_ids = sorted({str(video_id) for video_id in video_ids if str(video_id)})
+    total_videos = len(unique_video_ids)
+    if total_videos < 2:
+        raise ValueError(
+            "At least 2 videos are required to create train/evaluation splits. "
+            f"Found {total_videos}."
+        )
+
+    if total_videos == train_video_count + eval_video_count:
+        effective_train_count = train_video_count
+        effective_eval_count = eval_video_count
+        strategy = f"fixed_{train_video_count}_{eval_video_count}"
+    elif total_videos > train_video_count + eval_video_count:
+        effective_eval_count = min(eval_video_count, total_videos - 1)
+        effective_train_count = total_videos - effective_eval_count
+        strategy = "all_but_last_eval_videos"
+    else:
+        effective_train_count = max(1, total_videos - 1)
+        effective_eval_count = total_videos - effective_train_count
+        strategy = "fallback_last_video_eval"
+
+    train_video_ids = unique_video_ids[:effective_train_count]
+    eval_video_ids = unique_video_ids[effective_train_count : effective_train_count + effective_eval_count]
+    if not eval_video_ids:
+        raise ValueError("Failed to assign evaluation videos for the train/eval split.")
+
+    split_manifest = {
+        "num_total_videos": total_videos,
+        "num_train_videos": len(train_video_ids),
+        "num_eval_videos": len(eval_video_ids),
+        "requested_train_video_count": train_video_count,
+        "requested_eval_video_count": eval_video_count,
+        "strategy": strategy,
+        "train_video_ids": train_video_ids,
+        "eval_video_ids": eval_video_ids,
+    }
+
+    out_root = _get_split_output_root()
+    manifest_path = out_root / "train_eval_split.json"
+    split_manifest["manifest_path"] = str(manifest_path)
+    with manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(split_manifest, fh, indent=2)
+    print(
+        "Train/eval split: "
+        f"train={train_video_ids} | "
+        f"eval={eval_video_ids}"
+    )
+    print(f"Split manifest written to {manifest_path}")
+    return split_manifest
+
+
+def _get_default_driving_mini_video_ids() -> List[str]:
+    dataset_root = config.get_dataset_path("driving_mini")
+    frames_root = dataset_root / "frames"
+    if frames_root.exists():
+        video_ids = sorted(path.name for path in frames_root.iterdir() if path.is_dir())
+        if video_ids:
+            return video_ids
+
+    videos_root = dataset_root / "videos"
+    if videos_root.exists():
+        return sorted(path.stem for path in videos_root.glob("*.mov"))
+    return []
+
+
 def _resolve_video_ids(video_ids: List[str] | None = None) -> List[str] | None:
     if video_ids:
         return list(video_ids)
-    return None
+    default_video_ids = _get_default_driving_mini_video_ids()
+    return default_video_ids or None
 
 
 def _run_object_detection_step(
@@ -562,7 +687,7 @@ def _run_object_detection_step(
         force_recompute=force_recompute,
     )
     print(f"Detection complete. Processed {len(detection_results)} video(s).")
-    print("*** Vis Path: ", Path(config.get_output_path("pipeline_output")) / "driving_mini_detection")
+    print("*** Vis Path: ", Path(config.get_output_path("pipeline_output")) / "01_driving_mini_detection")
     return detection_results
 
 
@@ -575,8 +700,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=17,
-        choices=range(1, 18),
+        default=18,
+        choices=range(1, 19),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -591,7 +716,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int = 17, video_ids: List[str] | None = None) -> None:
+def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
@@ -793,12 +918,29 @@ def main(max_step: int = 17, video_ids: List[str] | None = None) -> None:
         print("\nStopping after step 13 by request.")
         return
 
+    split_cfg = _get_data_split_cfg()
+    split_manifest = _build_train_eval_split(
+        video_ids=[str(result.get("video_id", "")) for result in temporal_rule_results],
+        train_video_count=int(split_cfg.get("train_video_count", DEFAULT_TRAIN_VIDEO_COUNT)),
+        eval_video_count=int(split_cfg.get("eval_video_count", DEFAULT_EVAL_VIDEO_COUNT)),
+    )
+    train_temporal_rule_results = _select_video_results(
+        temporal_rule_results,
+        selected_video_ids=list(split_manifest.get("train_video_ids", [])),
+    )
+    eval_temporal_rule_results = _select_video_results(
+        temporal_rule_results,
+        selected_video_ids=list(split_manifest.get("eval_video_ids", [])),
+    )
+    if not train_temporal_rule_results:
+        raise RuntimeError("Train split is empty; cannot continue with rule learning.")
+
     # Step 14: generate short unary-body initial temporal rules
     candidate_rules_cfg = _get_candidate_rules_cfg()
     print("\n=== Step 14: candidate_rules_driving_mini ===")
     print(f"Initial rules cfg: {candidate_rules_cfg}")
     candidate_rule_results: List[Dict[str, Any]] = candidate_rules_driving_mini.run(
-        temporal_rule_results=temporal_rule_results,
+        temporal_rule_results=train_temporal_rule_results,
         cfg=candidate_rules_cfg,
         force_recompute=True,
     )
@@ -856,9 +998,28 @@ def main(max_step: int = 17, video_ids: List[str] | None = None) -> None:
         print("\nStopping after step 17 by request.")
         return
 
-    # Step 18
-
-
+    # Step 18: evaluate final rules on held-out evaluation videos
+    rule_evaluation_cfg = _get_rule_evaluation_cfg()
+    print("\n=== Step 18: evaluate_rules_driving_mini ===")
+    print(f"Rule evaluation cfg: {rule_evaluation_cfg}")
+    evaluation_results: Dict[str, Any] = evaluate_rules_driving_mini.run(
+        final_rule_results=final_rule_results,
+        temporal_rule_results=eval_temporal_rule_results,
+        eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
+        split_manifest=split_manifest,
+        cfg=rule_evaluation_cfg,
+        force_recompute=True,
+    )
+    overall_metrics = dict(evaluation_results.get("overall_metrics", {}))
+    print(
+        "Held-out evaluation complete. "
+        f"Precision={float(overall_metrics.get('precision', 0.0)):.3f} | "
+        f"Recall={float(overall_metrics.get('recall', 0.0)):.3f} | "
+        f"F1={float(overall_metrics.get('f1', 0.0)):.3f}"
+    )
+    if max_step == 18:
+        print("\nStopping after step 18 by request.")
+        return
 
 if __name__ == "__main__":
     args = parse_args()

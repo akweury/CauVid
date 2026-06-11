@@ -6,7 +6,7 @@ Consumes:
   - Step 8 output: merged temporal segmentation
 
 Output layout:
-    pipeline_output/driving_mini_segment_object_motion/
+    pipeline_output/09_driving_mini_segment_object_motion/
         segment_object_motion_manifest.json
         <video_id>/
             segment_object_motion.json
@@ -37,7 +37,7 @@ _SEGMENT_OBJECT_MOTION_VERSION = 4
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_segment_object_motion"
+    out = config.get_output_path("pipeline_output") / "09_driving_mini_segment_object_motion"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

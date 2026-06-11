@@ -5,7 +5,7 @@ Takes the per-video detection records produced by detect_driving_mini.run() and
 runs ByteTracker (via ultralytics) to assign persistent track IDs across frames.
 
 Output layout:
-    pipeline_output/driving_mini_detection/<video_id>/
+    pipeline_output/02_driving_mini_tracking/<video_id>/
         tracks.json          — per-frame tracking results with track IDs
         tracks_manifest.json — summary manifest (written by run())
 
@@ -86,7 +86,7 @@ _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
 # ---------------------------------------------------------------------------
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_detection"
+    out = config.get_output_path("pipeline_output") / "02_driving_mini_tracking"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

@@ -62,6 +62,10 @@ target_head_atoms:
   positive_forward_states: [forward_slowdown, stopping]
   include_negative_examples: true
 
+data_split:
+  train_video_count: 8
+  eval_video_count: 2
+
 temporal_rule_examples:
   deduplicate_body_atoms: true
   sort_body_atoms: true
@@ -89,3 +93,6 @@ extended_rules:
 
 final_rules:
   top_k: 50
+
+rule_evaluation:
+  prediction_mode: any_rule_positive

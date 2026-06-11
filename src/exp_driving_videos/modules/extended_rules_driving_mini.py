@@ -9,7 +9,7 @@ Current scope:
   - Pruning is dispatched through a strategy interface.
 
 Output layout:
-    pipeline_output/driving_mini_extended_rules/
+    pipeline_output/16_driving_mini_extended_rules/
         extended_rules_manifest.json
         extended_rules_round_<n>.json
         extended_rules_round_<n>.csv
@@ -41,7 +41,7 @@ _EXTENDED_RULES_VERSION = 2
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_extended_rules"
+    out = config.get_output_path("pipeline_output") / "16_driving_mini_extended_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

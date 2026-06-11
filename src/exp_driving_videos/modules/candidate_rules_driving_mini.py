@@ -7,7 +7,7 @@ Current scope:
   - Rules are intended as short seed clauses for later extension steps.
 
 Output layout:
-    pipeline_output/driving_mini_initial_rules/
+    pipeline_output/14_driving_mini_initial_rules/
         initial_rules_manifest.json
         <video_id>/
             initial_rules.json
@@ -38,7 +38,7 @@ _INITIAL_RULES_VERSION = 6
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_initial_rules"
+    out = config.get_output_path("pipeline_output") / "14_driving_mini_initial_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

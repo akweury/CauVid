@@ -5,7 +5,7 @@ Consumes:
   - Step 11 output: head atoms + current-segment body atoms
 
 Output layout:
-    pipeline_output/driving_mini_temporal_rule_examples/
+    pipeline_output/13_driving_mini_temporal_rule_examples/
         temporal_rule_examples_manifest.json
         <video_id>/
             temporal_rule_examples.json
@@ -34,7 +34,7 @@ _TEMPORAL_RULE_EXAMPLES_VERSION = 1
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_temporal_rule_examples"
+    out = config.get_output_path("pipeline_output") / "13_driving_mini_temporal_rule_examples"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

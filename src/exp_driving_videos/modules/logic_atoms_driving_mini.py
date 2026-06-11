@@ -5,7 +5,7 @@ Consumes:
   - Step 10 output: per-segment important-object selection results
 
 Output layout:
-    pipeline_output/driving_mini_logic_atoms/
+    pipeline_output/11_driving_mini_logic_atoms/
         logic_atoms_manifest.json
         <video_id>/
             logic_atoms.json
@@ -34,7 +34,7 @@ _LOGIC_ATOMS_VERSION = 1
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_logic_atoms"
+    out = config.get_output_path("pipeline_output") / "11_driving_mini_logic_atoms"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

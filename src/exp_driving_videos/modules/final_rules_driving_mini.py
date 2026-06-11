@@ -5,7 +5,7 @@ Consumes:
   - Step 16 output: aggregated kept rules from initial + extended rounds
 
 Output layout:
-    pipeline_output/driving_mini_final_rules/
+    pipeline_output/17_driving_mini_final_rules/
         final_rules.json
         final_rules.csv
 """
@@ -32,7 +32,7 @@ _FINAL_RULES_VERSION = 1
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_final_rules"
+    out = config.get_output_path("pipeline_output") / "17_driving_mini_final_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

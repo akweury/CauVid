@@ -8,7 +8,7 @@ This script runs YOLO-World on every frame of every video clip and writes
 per-video JSON results alongside a summary manifest.
 
 Output layout:
-    pipeline_output/driving_mini_detection/
+    pipeline_output/01_driving_mini_detection/
         detection_manifest.json
         <video_id>/
             detections.json
@@ -54,7 +54,7 @@ def get_frames_root() -> Path:
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_detection"
+    out = config.get_output_path("pipeline_output") / "01_driving_mini_detection"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

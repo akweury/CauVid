@@ -11,7 +11,7 @@ Consumes:
   - Step 9 output: segment-level object motion summaries
 
 Output layout:
-    pipeline_output/driving_mini_important_objects/
+    pipeline_output/10_driving_mini_important_objects/
         important_objects_manifest.json
         <video_id>/
             important_objects.json
@@ -38,7 +38,7 @@ _IMPORTANT_OBJECTS_VERSION = 1
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_important_objects"
+    out = config.get_output_path("pipeline_output") / "10_driving_mini_important_objects"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

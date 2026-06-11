@@ -6,7 +6,7 @@ Current use:
     state of the next segment S_t+1.
 
 Output layout:
-    pipeline_output/driving_mini_target_head_atoms/
+    pipeline_output/12_driving_mini_target_head_atoms/
         target_head_atoms_manifest.json
         <video_id>/
             target_head_atoms.json
@@ -36,7 +36,7 @@ _TARGET_HEAD_ATOMS_VERSION = 1
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_target_head_atoms"
+    out = config.get_output_path("pipeline_output") / "12_driving_mini_target_head_atoms"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

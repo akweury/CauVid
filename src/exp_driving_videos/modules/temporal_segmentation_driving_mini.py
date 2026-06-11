@@ -13,7 +13,7 @@ Consumes:
   - Step 6 output from ego_motion_driving_mini.run(...)
 
 Output layout:
-    pipeline_output/driving_mini_temporal_segmentation/
+    pipeline_output/08_driving_mini_temporal_segmentation/
         temporal_segmentation_manifest.json
         <video_id>/
             temporal_segmentation.json
@@ -94,7 +94,7 @@ def _lateral_event_color_bgr(event_label: str) -> tuple:
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_temporal_segmentation"
+    out = config.get_output_path("pipeline_output") / "08_driving_mini_temporal_segmentation"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

@@ -10,7 +10,7 @@ For each tracked object (track_id):
   2. Subtract ego motion to obtain relative-to-ego motion.
 
 Output layout:
-    pipeline_output/driving_mini_relative_object_motion/
+    pipeline_output/07_driving_mini_relative_object_motion/
         relative_object_motion_manifest.json
         <video_id>/
             relative_object_motion.json
@@ -36,7 +36,7 @@ import config
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_relative_object_motion"
+    out = config.get_output_path("pipeline_output") / "07_driving_mini_relative_object_motion"
     out.mkdir(parents=True, exist_ok=True)
     return out
 

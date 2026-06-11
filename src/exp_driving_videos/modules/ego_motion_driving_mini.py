@@ -10,10 +10,10 @@ For each consecutive frame pair:
 
 Consumes:
   - Step 4 merged annotations (image_path, boxes per frame)
-  - Depth maps from pipeline_output/driving_mini_3d_positions (or depth_maps root)
+  - Depth maps from pipeline_output/05_driving_mini_3d_positions (or depth_maps root)
 
 Output layout:
-    pipeline_output/driving_mini_ego_motion/
+    pipeline_output/06_driving_mini_ego_motion/
         ego_motion_manifest.json
         <video_id>/
             ego_motion.json          — raw + smoothed per-frame ego motion signals
@@ -49,7 +49,7 @@ from src.exp_driving_videos.modules.data_preprocessing import get_depth_maps_roo
 
 
 def get_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_ego_motion"
+    out = config.get_output_path("pipeline_output") / "06_driving_mini_ego_motion"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
