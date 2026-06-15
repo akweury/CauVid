@@ -66,6 +66,12 @@ data_split:
   strategy: eval_fraction
   eval_fraction: 0.2
 
+pipeline_recompute:
+  candidate_rules: false
+  extended_rules: true
+  final_rules: true
+  rule_evaluation: true
+
 temporal_rule_examples:
   deduplicate_body_atoms: true
   sort_body_atoms: true

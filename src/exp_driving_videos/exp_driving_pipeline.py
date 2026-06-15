@@ -344,6 +344,26 @@ def _get_rule_evaluation_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        # Step 14 is per-video and safe to load from cache after split changes.
+        "candidate_rules": False,
+        # Steps 16-18 depend on the selected train/eval split and should refresh.
+        "extended_rules": True,
+        "final_rules": True,
+        "rule_evaluation": True,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("pipeline_recompute", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load pipeline recompute config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_merged_candidate_rules_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "15_driving_mini_merged_initial_rules"
     out.mkdir(parents=True, exist_ok=True)
@@ -955,6 +975,8 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     )
     if not train_temporal_rule_results:
         raise RuntimeError("Train split is empty; cannot continue with rule learning.")
+    recompute_cfg = _get_pipeline_recompute_cfg()
+    print(f"Pipeline recompute cfg: {recompute_cfg}")
 
     # Step 14: generate short unary-body initial temporal rules
     candidate_rules_cfg = _get_candidate_rules_cfg()
@@ -963,7 +985,7 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     candidate_rule_results: List[Dict[str, Any]] = candidate_rules_driving_mini.run(
         temporal_rule_results=train_temporal_rule_results,
         cfg=candidate_rules_cfg,
-        force_recompute=False,
+        force_recompute=bool(recompute_cfg.get("candidate_rules", False)),
     )
     print(
         "Initial rule generation complete. "
@@ -992,7 +1014,7 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     extended_rule_results: Dict[str, Any] = extended_rules_driving_mini.run(
         merged_initial_rules=merged_candidate_rules,
         cfg=extended_rules_cfg,
-        force_recompute=True,
+        force_recompute=bool(recompute_cfg.get("extended_rules", True)),
     )
     print(
         "Extended rule generation complete. "
@@ -1009,7 +1031,7 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     final_rule_results: Dict[str, Any] = final_rules_driving_mini.run(
         extended_rule_results=extended_rule_results,
         cfg=final_rules_cfg,
-        force_recompute=True,
+        force_recompute=bool(recompute_cfg.get("final_rules", True)),
     )
     print(
         "Final rule selection complete. "
@@ -1029,7 +1051,7 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
         eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
         split_manifest=split_manifest,
         cfg=rule_evaluation_cfg,
-        force_recompute=True,
+        force_recompute=bool(recompute_cfg.get("rule_evaluation", True)),
     )
     overall_metrics = dict(evaluation_results.get("overall_metrics", {}))
     print(
