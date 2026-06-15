@@ -63,8 +63,8 @@ target_head_atoms:
   include_negative_examples: true
 
 data_split:
-  train_video_count: 8
-  eval_video_count: 2
+  strategy: eval_fraction
+  eval_fraction: 0.2
 
 temporal_rule_examples:
   deduplicate_body_atoms: true

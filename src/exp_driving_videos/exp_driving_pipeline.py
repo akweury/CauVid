@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
@@ -314,6 +315,8 @@ def _get_data_split_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "train_video_count": DEFAULT_TRAIN_VIDEO_COUNT,
         "eval_video_count": DEFAULT_EVAL_VIDEO_COUNT,
+        "strategy": "eval_fraction",
+        "eval_fraction": 0.2,
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -597,6 +600,8 @@ def _build_train_eval_split(
     video_ids: List[str],
     train_video_count: int,
     eval_video_count: int,
+    strategy: str = "eval_fraction",
+    eval_fraction: float = 0.2,
 ) -> Dict[str, Any]:
     unique_video_ids = sorted({str(video_id) for video_id in video_ids if str(video_id)})
     total_videos = len(unique_video_ids)
@@ -605,19 +610,31 @@ def _build_train_eval_split(
             "At least 2 videos are required to create train/evaluation splits. "
             f"Found {total_videos}."
         )
+    if train_video_count < 1:
+        raise ValueError(f"train_video_count must be >= 1. Found {train_video_count}.")
+    if eval_video_count < 1:
+        raise ValueError(f"eval_video_count must be >= 1. Found {eval_video_count}.")
 
-    if total_videos == train_video_count + eval_video_count:
-        effective_train_count = train_video_count
-        effective_eval_count = eval_video_count
-        strategy = f"fixed_{train_video_count}_{eval_video_count}"
-    elif total_videos > train_video_count + eval_video_count:
-        effective_eval_count = min(eval_video_count, total_videos - 1)
+    strategy = str(strategy or "eval_fraction")
+    if strategy == "fixed_counts":
+        requested_total = train_video_count + eval_video_count
+        if total_videos >= requested_total:
+            effective_train_count = train_video_count
+            effective_eval_count = eval_video_count
+            resolved_strategy = f"fixed_counts_first_{train_video_count}_train_{eval_video_count}_eval"
+        else:
+            effective_train_count = max(1, total_videos - 1)
+            effective_eval_count = total_videos - effective_train_count
+            resolved_strategy = "fallback_last_video_eval"
+    elif strategy == "eval_fraction":
+        eval_fraction = float(eval_fraction)
+        if not 0.0 < eval_fraction < 1.0:
+            raise ValueError(f"eval_fraction must be between 0 and 1. Found {eval_fraction}.")
+        effective_eval_count = max(1, min(total_videos - 1, int(math.ceil(total_videos * eval_fraction))))
         effective_train_count = total_videos - effective_eval_count
-        strategy = "all_but_last_eval_videos"
+        resolved_strategy = f"eval_fraction_{eval_fraction:g}"
     else:
-        effective_train_count = max(1, total_videos - 1)
-        effective_eval_count = total_videos - effective_train_count
-        strategy = "fallback_last_video_eval"
+        raise ValueError(f"Unsupported data split strategy: {strategy}")
 
     train_video_ids = unique_video_ids[:effective_train_count]
     eval_video_ids = unique_video_ids[effective_train_count : effective_train_count + effective_eval_count]
@@ -630,9 +647,11 @@ def _build_train_eval_split(
         "num_eval_videos": len(eval_video_ids),
         "requested_train_video_count": train_video_count,
         "requested_eval_video_count": eval_video_count,
-        "strategy": strategy,
+        "requested_eval_fraction": eval_fraction if strategy == "eval_fraction" else None,
+        "strategy": resolved_strategy,
         "train_video_ids": train_video_ids,
         "eval_video_ids": eval_video_ids,
+        "unused_video_ids": unique_video_ids[effective_train_count + effective_eval_count :],
     }
 
     out_root = _get_split_output_root()
@@ -923,6 +942,8 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
         video_ids=[str(result.get("video_id", "")) for result in temporal_rule_results],
         train_video_count=int(split_cfg.get("train_video_count", DEFAULT_TRAIN_VIDEO_COUNT)),
         eval_video_count=int(split_cfg.get("eval_video_count", DEFAULT_EVAL_VIDEO_COUNT)),
+        strategy=str(split_cfg.get("strategy", "eval_fraction")),
+        eval_fraction=float(split_cfg.get("eval_fraction", 0.2)),
     )
     train_temporal_rule_results = _select_video_results(
         temporal_rule_results,
@@ -942,7 +963,7 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     candidate_rule_results: List[Dict[str, Any]] = candidate_rules_driving_mini.run(
         temporal_rule_results=train_temporal_rule_results,
         cfg=candidate_rules_cfg,
-        force_recompute=True,
+        force_recompute=False,
     )
     print(
         "Initial rule generation complete. "
