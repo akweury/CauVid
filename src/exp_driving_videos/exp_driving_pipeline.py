@@ -1073,7 +1073,7 @@ def main(max_step: int = 19, video_ids: List[str] | None = None) -> None:
         eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
         split_manifest=split_manifest,
         cfg=rule_evaluation_cfg,
-        force_recompute=bool(recompute_cfg.get("rule_evaluation", True)),
+        force_recompute=False,
     )
     overall_metrics = dict(evaluation_results.get("overall_metrics", {}))
     print(
