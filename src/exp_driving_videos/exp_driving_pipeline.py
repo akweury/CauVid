@@ -39,6 +39,9 @@ Steps:
                     the top-k as the final rule set.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
+    19. error_and_explainability_analysis_driving_mini — summarize false
+                    negatives / false positives and generate explainability-
+                    oriented diagnostics for held-out evaluation examples.
 
 """
 
@@ -57,6 +60,7 @@ from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
 from src.exp_driving_videos.modules import evaluate_rules_driving_mini
+from src.exp_driving_videos.modules import error_and_explainability_analysis_driving_mini
 from src.exp_driving_videos.modules import extended_rules_driving_mini
 from src.exp_driving_videos.modules import final_rules_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
@@ -352,6 +356,7 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         "extended_rules": True,
         "final_rules": True,
         "rule_evaluation": True,
+        "error_and_explainability_analysis": True,
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -374,6 +379,23 @@ def _get_split_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "driving_mini_split"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _get_error_and_explainability_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
+        "dense_context_min_objects": 2,
+        "overlap_rule_threshold": 10,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("error_and_explainability_analysis", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load error analysis config: {exc}. Using defaults.")
+    return defaults
 
 
 def _dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -739,8 +761,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=18,
-        choices=range(1, 19),
+        default=19,
+        choices=range(1, 20),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -755,7 +777,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
+def main(max_step: int = 19, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
@@ -1062,6 +1084,26 @@ def main(max_step: int = 18, video_ids: List[str] | None = None) -> None:
     )
     if max_step == 18:
         print("\nStopping after step 18 by request.")
+        return
+
+    # Step 19: error analysis + explainability diagnostics on held-out examples
+    error_analysis_cfg = _get_error_and_explainability_cfg()
+    print("\n=== Step 19: error_and_explainability_analysis_driving_mini ===")
+    print(f"Error analysis cfg: {error_analysis_cfg}")
+    error_analysis_results: Dict[str, Any] = error_and_explainability_analysis_driving_mini.run(
+        final_rule_results=final_rule_results,
+        temporal_rule_results=eval_temporal_rule_results,
+        evaluation_results=evaluation_results,
+        cfg=error_analysis_cfg,
+        force_recompute=bool(recompute_cfg.get("error_and_explainability_analysis", True)),
+    )
+    print(
+        "Held-out error analysis complete. "
+        f"FN={int(error_analysis_results.get('num_fn_examples', 0))} | "
+        f"FP={int(error_analysis_results.get('num_fp_examples', 0))}"
+    )
+    if max_step == 19:
+        print("\nStopping after step 19 by request.")
         return
 
 if __name__ == "__main__":

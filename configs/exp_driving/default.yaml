@@ -71,6 +71,7 @@ pipeline_recompute:
   extended_rules: true
   final_rules: true
   rule_evaluation: true
+  error_and_explainability_analysis: true
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -102,3 +103,8 @@ final_rules:
 
 rule_evaluation:
   prediction_mode: any_rule_positive
+
+error_and_explainability_analysis:
+  vehicle_classes: [car, truck, bus, motorcycle, bicycle]
+  dense_context_min_objects: 2
+  overlap_rule_threshold: 10
