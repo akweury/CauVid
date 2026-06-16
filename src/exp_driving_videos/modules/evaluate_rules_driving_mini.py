@@ -32,7 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RULE_EVALUATION_VERSION = 1
+_RULE_EVALUATION_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -44,6 +44,7 @@ def get_output_root() -> Path:
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "prediction_mode": str(cfg.get("prediction_mode", "any_rule_positive")),
+        "evaluated_rule_set_name": str(cfg.get("evaluated_rule_set_name", "")),
     }
 
 
@@ -293,6 +294,7 @@ def process_rules(
 ) -> Dict[str, Any]:
     cfg = cfg or {}
     prediction_mode = str(cfg.get("prediction_mode", "any_rule_positive"))
+    evaluated_rule_set_name = str(cfg.get("evaluated_rule_set_name", ""))
     if prediction_mode != "any_rule_positive":
         raise ValueError(f"Unsupported prediction_mode: {prediction_mode}")
 
@@ -308,7 +310,12 @@ def process_rules(
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _RULE_EVALUATION_VERSION and _cfg_key_subset(
             cached.get("config", {})
-        ) == _cfg_key_subset({"prediction_mode": prediction_mode}):
+        ) == _cfg_key_subset(
+            {
+                "prediction_mode": prediction_mode,
+                "evaluated_rule_set_name": evaluated_rule_set_name,
+            }
+        ):
             print(f"  [cache] loading {json_path.name}")
             return cached
 
@@ -462,6 +469,7 @@ def process_rules(
         "version": _RULE_EVALUATION_VERSION,
         "config": {
             "prediction_mode": prediction_mode,
+            "evaluated_rule_set_name": evaluated_rule_set_name,
         },
         "target_predicate": "brake_next",
         "split": split_manifest or {},
@@ -475,6 +483,7 @@ def process_rules(
         "overall_metrics": overall_metrics,
         "per_video_metrics": per_video_metrics,
         "rule_evaluations": rule_evaluations,
+        "example_predictions_csv_path": str(example_csv_path),
         "pdf_path": str(pdf_path),
     }
 

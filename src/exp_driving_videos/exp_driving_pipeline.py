@@ -37,11 +37,17 @@ Steps:
                     initial-rule body atoms for a fixed number of rounds.
     17. final_rules_driving_mini — rank all kept rules by confidence and keep
                     the top-k as the final rule set.
+    17B. diverse_final_rules_driving_mini — greedily choose a diverse final
+                    rule set that expands positive coverage while penalizing
+                    overlap and repeated rule families.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
+    20. vehicle_rule_diagnostic_driving_mini — audit whether vehicle-centered
+                    rules were generated, pruned/scored out, or missed due to
+                    predicate representation.
 
 """
 
@@ -59,6 +65,7 @@ import config
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
+from src.exp_driving_videos.modules import diverse_final_rules_driving_mini
 from src.exp_driving_videos.modules import evaluate_rules_driving_mini
 from src.exp_driving_videos.modules import error_and_explainability_analysis_driving_mini
 from src.exp_driving_videos.modules import extended_rules_driving_mini
@@ -74,6 +81,7 @@ from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
 from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
+from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
 DRIVING_MINI_OD_MODEL = "yolov8l-worldv2.pt"
@@ -315,6 +323,26 @@ def _get_final_rules_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_diverse_final_rules_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_k": 50,
+        "new_positive_weight": 1.0,
+        "confidence_weight": 0.25,
+        "overlap_penalty": 0.35,
+        "family_penalty": 0.75,
+        "negative_support_penalty": 0.1,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("diverse_final_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load diverse final rules config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_data_split_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "train_video_count": DEFAULT_TRAIN_VIDEO_COUNT,
@@ -336,6 +364,8 @@ def _get_data_split_cfg() -> Dict[str, Any]:
 def _get_rule_evaluation_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "prediction_mode": "any_rule_positive",
+        "rule_set_mode": "both",
+        "primary_rule_set": "original",
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -355,8 +385,10 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         # Steps 16-18 depend on the selected train/eval split and should refresh.
         "extended_rules": True,
         "final_rules": True,
+        "diverse_final_rules": True,
         "rule_evaluation": True,
         "error_and_explainability_analysis": True,
+        "vehicle_rule_diagnostic": True,
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -396,6 +428,42 @@ def _get_error_and_explainability_cfg() -> Dict[str, Any]:
     except Exception as exc:
         print(f"[warn] Could not load error analysis config: {exc}. Using defaults.")
     return defaults
+
+
+def _get_vehicle_rule_diagnostic_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+        "near_states": ["near"],
+        "center_states": ["centered"],
+        "primary_rule_set": "original",
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("vehicle_rule_diagnostic", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load vehicle rule diagnostic config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_rule_evaluation_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "18_driving_mini_rule_evaluation"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_error_and_explainability_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "19_driving_mini_error_and_explainability_analysis"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_vehicle_rule_diagnostic_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "20_driving_mini_vehicle_rule_diagnostic"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 def _dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -761,8 +829,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=19,
-        choices=range(1, 20),
+        default=20,
+        choices=range(1, 21),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -777,7 +845,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int = 19, video_ids: List[str] | None = None) -> None:
+def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
@@ -1063,21 +1131,115 @@ def main(max_step: int = 19, video_ids: List[str] | None = None) -> None:
         print("\nStopping after step 17 by request.")
         return
 
+    # Step 17B: greedy diverse post-mining rule selection
+    diverse_final_rules_cfg = _get_diverse_final_rules_cfg()
+    print("\n=== Step 17B: diverse_final_rules_driving_mini ===")
+    print(f"Diverse final rules cfg: {diverse_final_rules_cfg}")
+    diverse_final_rule_results: Dict[str, Any] = diverse_final_rules_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        cfg=diverse_final_rules_cfg,
+        force_recompute=bool(recompute_cfg.get("diverse_final_rules", True)),
+    )
+    print(
+        "Diverse final rule selection complete. "
+        f"Selected {diverse_final_rule_results.get('num_final_rules', 0)} rule(s)."
+    )
+
     # Step 18: evaluate final rules on held-out evaluation videos
     rule_evaluation_cfg = _get_rule_evaluation_cfg()
     print("\n=== Step 18: evaluate_rules_driving_mini ===")
     print(f"Rule evaluation cfg: {rule_evaluation_cfg}")
-    evaluation_results: Dict[str, Any] = evaluate_rules_driving_mini.run(
-        final_rule_results=final_rule_results,
-        temporal_rule_results=eval_temporal_rule_results,
-        eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
-        split_manifest=split_manifest,
-        cfg=rule_evaluation_cfg,
-        force_recompute=False,
-    )
+    rule_set_mode = str(rule_evaluation_cfg.get("rule_set_mode", "both"))
+    primary_rule_set = str(rule_evaluation_cfg.get("primary_rule_set", "original"))
+    if rule_set_mode not in {"original", "diverse", "both"}:
+        raise ValueError(f"Unsupported rule_evaluation.rule_set_mode: {rule_set_mode}")
+    if primary_rule_set not in {"original", "diverse"}:
+        raise ValueError(f"Unsupported rule_evaluation.primary_rule_set: {primary_rule_set}")
+    if rule_set_mode != "both" and primary_rule_set != rule_set_mode:
+        primary_rule_set = rule_set_mode
+
+    rule_results_by_name: Dict[str, Dict[str, Any]] = {
+        "original": final_rule_results,
+        "diverse": diverse_final_rule_results,
+    }
+    if rule_set_mode == "both":
+        evaluation_rule_sets = ["original", "diverse"]
+    else:
+        evaluation_rule_sets = [rule_set_mode]
+
+    evaluation_output_root = _get_rule_evaluation_output_root()
+    evaluation_results_by_name: Dict[str, Dict[str, Any]] = {}
+    for rule_set_name in evaluation_rule_sets:
+        evaluation_cfg_for_run = dict(rule_evaluation_cfg)
+        evaluation_cfg_for_run["evaluated_rule_set_name"] = rule_set_name
+        output_root = (
+            evaluation_output_root
+            if rule_set_name == primary_rule_set
+            else evaluation_output_root / rule_set_name
+        )
+        evaluation_result = evaluate_rules_driving_mini.run(
+            final_rule_results=rule_results_by_name[rule_set_name],
+            temporal_rule_results=eval_temporal_rule_results,
+            eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
+            split_manifest=split_manifest,
+            cfg=evaluation_cfg_for_run,
+            output_root=output_root,
+            force_recompute=bool(recompute_cfg.get("rule_evaluation", True)),
+        )
+        evaluation_result["evaluated_rule_set_name"] = rule_set_name
+        evaluation_results_by_name[rule_set_name] = evaluation_result
+
+    if rule_set_mode == "both":
+        comparison_rows: List[Dict[str, Any]] = []
+        for rule_set_name in evaluation_rule_sets:
+            overall = dict(evaluation_results_by_name[rule_set_name].get("overall_metrics", {}))
+            comparison_rows.append(
+                {
+                    "rule_set_name": rule_set_name,
+                    "selection_method": str(rule_results_by_name[rule_set_name].get("selection_method", "score_top_k")),
+                    "num_final_rules": int(rule_results_by_name[rule_set_name].get("num_final_rules", 0)),
+                    "precision": float(overall.get("precision", 0.0)),
+                    "recall": float(overall.get("recall", 0.0)),
+                    "f1": float(overall.get("f1", 0.0)),
+                    "accuracy": float(overall.get("accuracy", 0.0)),
+                }
+            )
+        comparison_json_path = evaluation_output_root / "rule_set_comparison_summary.json"
+        comparison_csv_path = evaluation_output_root / "rule_set_comparison_summary.csv"
+        with comparison_json_path.open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "primary_rule_set": primary_rule_set,
+                    "rule_set_mode": rule_set_mode,
+                    "rows": comparison_rows,
+                },
+                fh,
+                indent=2,
+            )
+        with comparison_csv_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "rule_set_name",
+                    "selection_method",
+                    "num_final_rules",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "accuracy",
+                ],
+            )
+            writer.writeheader()
+            for row in comparison_rows:
+                writer.writerow(row)
+        print(f"Rule-set evaluation comparison JSON written to {comparison_json_path}")
+        print(f"Rule-set evaluation comparison CSV written to {comparison_csv_path}")
+
+    evaluation_results = evaluation_results_by_name[primary_rule_set]
     overall_metrics = dict(evaluation_results.get("overall_metrics", {}))
     print(
         "Held-out evaluation complete. "
+        f"rule_set={primary_rule_set} | "
         f"Precision={float(overall_metrics.get('precision', 0.0)):.3f} | "
         f"Recall={float(overall_metrics.get('recall', 0.0)):.3f} | "
         f"F1={float(overall_metrics.get('f1', 0.0)):.3f}"
@@ -1090,20 +1252,118 @@ def main(max_step: int = 19, video_ids: List[str] | None = None) -> None:
     error_analysis_cfg = _get_error_and_explainability_cfg()
     print("\n=== Step 19: error_and_explainability_analysis_driving_mini ===")
     print(f"Error analysis cfg: {error_analysis_cfg}")
-    error_analysis_results: Dict[str, Any] = error_and_explainability_analysis_driving_mini.run(
-        final_rule_results=final_rule_results,
-        temporal_rule_results=eval_temporal_rule_results,
-        evaluation_results=evaluation_results,
-        cfg=error_analysis_cfg,
-        force_recompute=bool(recompute_cfg.get("error_and_explainability_analysis", True)),
-    )
+    error_analysis_output_root = _get_error_and_explainability_output_root()
+    error_analysis_results_by_name: Dict[str, Dict[str, Any]] = {}
+    for rule_set_name in evaluation_rule_sets:
+        error_cfg_for_run = dict(error_analysis_cfg)
+        error_cfg_for_run["rule_set_name"] = rule_set_name
+        output_root = (
+            error_analysis_output_root
+            if rule_set_name == primary_rule_set
+            else error_analysis_output_root / rule_set_name
+        )
+        error_analysis_result = error_and_explainability_analysis_driving_mini.run(
+            final_rule_results=rule_results_by_name[rule_set_name],
+            temporal_rule_results=eval_temporal_rule_results,
+            evaluation_results=evaluation_results_by_name[rule_set_name],
+            cfg=error_cfg_for_run,
+            output_root=output_root,
+            force_recompute=bool(recompute_cfg.get("error_and_explainability_analysis", True)),
+        )
+        error_analysis_results_by_name[rule_set_name] = error_analysis_result
+
+    if rule_set_mode == "both":
+        comparison_rows = []
+        for rule_set_name in evaluation_rule_sets:
+            overall = dict(evaluation_results_by_name[rule_set_name].get("overall_metrics", {}))
+            analysis_manifest = dict(error_analysis_results_by_name[rule_set_name])
+            comparison_rows.append(
+                {
+                    "rule_set_name": rule_set_name,
+                    "selection_method": str(rule_results_by_name[rule_set_name].get("selection_method", "score_top_k")),
+                    "num_rules": int(analysis_manifest.get("num_rules", 0)),
+                    "num_rule_families": int(analysis_manifest.get("num_rule_families", 0)),
+                    "max_rules_in_family": int(analysis_manifest.get("max_rules_in_family", 0)),
+                    "redundancy_ratio": float(analysis_manifest.get("redundancy_ratio", 0.0)),
+                    "precision": float(overall.get("precision", 0.0)),
+                    "recall": float(overall.get("recall", 0.0)),
+                    "f1": float(overall.get("f1", 0.0)),
+                    "accuracy": float(overall.get("accuracy", 0.0)),
+                    "num_fn_examples": int(analysis_manifest.get("num_fn_examples", 0)),
+                    "num_fp_examples": int(analysis_manifest.get("num_fp_examples", 0)),
+                    "num_uncovered_positive_patterns": int(analysis_manifest.get("num_uncovered_positive_patterns", 0)),
+                }
+            )
+        comparison_json_path = error_analysis_output_root / "rule_set_comparison_summary.json"
+        comparison_csv_path = error_analysis_output_root / "rule_set_comparison_summary.csv"
+        with comparison_json_path.open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "primary_rule_set": primary_rule_set,
+                    "rule_set_mode": rule_set_mode,
+                    "rows": comparison_rows,
+                },
+                fh,
+                indent=2,
+            )
+        with comparison_csv_path.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "rule_set_name",
+                    "selection_method",
+                    "num_rules",
+                    "num_rule_families",
+                    "max_rules_in_family",
+                    "redundancy_ratio",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "accuracy",
+                    "num_fn_examples",
+                    "num_fp_examples",
+                    "num_uncovered_positive_patterns",
+                ],
+            )
+            writer.writeheader()
+            for row in comparison_rows:
+                writer.writerow(row)
+        print(f"Rule-set error comparison JSON written to {comparison_json_path}")
+        print(f"Rule-set error comparison CSV written to {comparison_csv_path}")
+
+    error_analysis_results = error_analysis_results_by_name[primary_rule_set]
     print(
         "Held-out error analysis complete. "
+        f"rule_set={primary_rule_set} | "
         f"FN={int(error_analysis_results.get('num_fn_examples', 0))} | "
         f"FP={int(error_analysis_results.get('num_fp_examples', 0))}"
     )
     if max_step == 19:
         print("\nStopping after step 19 by request.")
+        return
+
+    # Step 20: diagnose vehicle-centered rule coverage through the rule pool
+    vehicle_rule_diagnostic_cfg = _get_vehicle_rule_diagnostic_cfg()
+    vehicle_rule_diagnostic_cfg["primary_rule_set"] = primary_rule_set
+    print("\n=== Step 20: vehicle_rule_diagnostic_driving_mini ===")
+    print(f"Vehicle rule diagnostic cfg: {vehicle_rule_diagnostic_cfg}")
+    vehicle_rule_diagnostic_results: Dict[str, Any] = vehicle_rule_diagnostic_driving_mini.run(
+        merged_initial_rules=merged_candidate_rules,
+        extended_rule_results=extended_rule_results,
+        original_final_rule_results=final_rule_results,
+        diverse_final_rule_results=diverse_final_rule_results,
+        eval_temporal_rule_results=eval_temporal_rule_results,
+        evaluation_results_by_name=evaluation_results_by_name,
+        cfg=vehicle_rule_diagnostic_cfg,
+        output_root=_get_vehicle_rule_diagnostic_output_root(),
+        force_recompute=bool(recompute_cfg.get("vehicle_rule_diagnostic", True)),
+    )
+    print(
+        "Vehicle-centered rule diagnostic complete. "
+        f"diagnosis={vehicle_rule_diagnostic_results.get('primary_diagnosis', 'unknown')}"
+    )
+    if max_step == 20:
+        print("\nStopping after step 20 by request.")
         return
 
 if __name__ == "__main__":

@@ -70,8 +70,10 @@ pipeline_recompute:
   candidate_rules: false
   extended_rules: true
   final_rules: true
+  diverse_final_rules: true
   rule_evaluation: true
   error_and_explainability_analysis: true
+  vehicle_rule_diagnostic: true
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -101,10 +103,25 @@ extended_rules:
 final_rules:
   top_k: 50
 
+diverse_final_rules:
+  top_k: 50
+  new_positive_weight: 1.0
+  confidence_weight: 0.25
+  overlap_penalty: 0.35
+  family_penalty: 0.75
+  negative_support_penalty: 0.1
+
 rule_evaluation:
   prediction_mode: any_rule_positive
+  rule_set_mode: both
+  primary_rule_set: original
 
 error_and_explainability_analysis:
   vehicle_classes: [car, truck, bus, motorcycle, bicycle]
   dense_context_min_objects: 2
   overlap_rule_threshold: 10
+
+vehicle_rule_diagnostic:
+  vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
+  near_states: [near]
+  center_states: [centered]

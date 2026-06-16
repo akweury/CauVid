@@ -54,6 +54,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "vehicle_classes": sorted(str(v) for v in cfg.get("vehicle_classes", [])),
         "dense_context_min_objects": int(cfg.get("dense_context_min_objects", 2)),
         "overlap_rule_threshold": int(cfg.get("overlap_rule_threshold", 10)),
+        "rule_set_name": str(cfg.get("rule_set_name", "")),
     }
 
 
@@ -418,6 +419,7 @@ def process_analysis(
             family["representative_clauses"].append(str(rule.get("clause", "")))
 
     rule_family_rows: List[Dict[str, Any]] = []
+    max_rules_in_family = 0
     for idx, family in enumerate(
         sorted(
             family_map.values(),
@@ -428,6 +430,7 @@ def process_analysis(
         ),
         start=1,
     ):
+        max_rules_in_family = max(max_rules_in_family, int(family["num_rules"]))
         rule_family_rows.append(
             {
                 "family_id": f"family_{idx:03d}",
@@ -549,10 +552,16 @@ def process_analysis(
     manifest = {
         "version": _ANALYSIS_VERSION,
         "config": _cfg_key_subset(cfg),
+        "rule_set_name": str(cfg.get("rule_set_name", "")),
+        "num_rules": int(final_rule_results.get("num_final_rules", len(final_rules))),
         "num_fn_examples": len(fn_rows),
         "num_fp_examples": len(fp_rows),
         "num_videos": len(per_video_rows),
         "num_rule_families": len(rule_family_rows),
+        "max_rules_in_family": int(max_rules_in_family),
+        "redundancy_ratio": float(
+            max(0.0, 1.0 - (len(rule_family_rows) / max(1, int(final_rule_results.get("num_final_rules", len(final_rules))))))
+        ),
         "num_uncovered_positive_patterns": len(uncovered_rows),
         "fn_examples_path": str(fn_path),
         "fp_examples_path": str(fp_path),
