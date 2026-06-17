@@ -71,6 +71,7 @@ pipeline_recompute:
   extended_rules: true
   final_rules: true
   diverse_final_rules: true
+  coverage_family_aware_final_rules: true
   rule_evaluation: true
   error_and_explainability_analysis: true
   vehicle_rule_diagnostic: true
@@ -104,6 +105,9 @@ final_rules:
   top_k: 50
 
 diverse_final_rules:
+  score_mode: legacy_diverse_positive_coverage
+  selection_method_name: greedy_diverse_positive_coverage
+  output_prefix: diverse_final_rules
   top_k: 50
   new_positive_weight: 1.0
   confidence_weight: 0.25
@@ -111,9 +115,21 @@ diverse_final_rules:
   family_penalty: 0.75
   negative_support_penalty: 0.1
 
+coverage_family_aware_final_rules:
+  score_mode: coverage_family_aware
+  selection_method_name: greedy_coverage_family_aware
+  output_prefix: coverage_family_aware_final_rules
+  top_k: 50
+  coverage_weight: 1.0
+  quality_weight: 1.0
+  overlap_penalty: 0.5
+  family_penalty: 0.6
+  family_diversity_bonus: 0.75
+  negative_support_penalty: 0.1
+
 rule_evaluation:
   prediction_mode: any_rule_positive
-  rule_set_mode: both
+  rule_set_mode: all
   primary_rule_set: original
 
 error_and_explainability_analysis:

@@ -227,6 +227,7 @@ def process_diagnostic(
     extended_rule_results: Dict[str, Any],
     original_final_rule_results: Dict[str, Any],
     diverse_final_rule_results: Dict[str, Any],
+    coverage_family_aware_final_rule_results: Optional[Dict[str, Any]],
     eval_temporal_rule_results: List[Dict[str, Any]],
     evaluation_results_by_name: Dict[str, Dict[str, Any]],
     cfg: Optional[Dict[str, Any]] = None,
@@ -254,12 +255,17 @@ def process_diagnostic(
     original_rank_map = {str(rule.get("rule_id", "")): idx for idx, rule in enumerate(original_ranked_rules)}
     selected_original_ids = {str(rule.get("rule_id", "")) for rule in list(original_final_rule_results.get("final_rules", []))}
     selected_diverse_ids = {str(rule.get("rule_id", "")) for rule in list(diverse_final_rule_results.get("final_rules", []))}
+    selected_coverage_family_aware_ids = {
+        str(rule.get("rule_id", ""))
+        for rule in list((coverage_family_aware_final_rule_results or {}).get("final_rules", []))
+    }
 
     pools = [
         ("merged_initial", list(merged_initial_rules.get("rules", []))),
         ("scored_all_kept", list(extended_rule_results.get("all_kept_rules", []))),
         ("selected_original", list(original_final_rule_results.get("final_rules", []))),
         ("selected_diverse", list(diverse_final_rule_results.get("final_rules", []))),
+        ("selected_coverage_family_aware", list((coverage_family_aware_final_rule_results or {}).get("final_rules", []))),
     ]
 
     pool_report_rows: List[Dict[str, Any]] = []
@@ -286,6 +292,7 @@ def process_diagnostic(
                 "original_rank": original_rank_map.get(str(rule.get("rule_id", "")), ""),
                 "selected_original": str(rule.get("rule_id", "")) in selected_original_ids,
                 "selected_diverse": str(rule.get("rule_id", "")) in selected_diverse_ids,
+                "selected_coverage_family_aware": str(rule.get("rule_id", "")) in selected_coverage_family_aware_ids,
             }
             pool_report_rows.append(row)
 
@@ -325,6 +332,7 @@ def process_diagnostic(
             "original_rank",
             "selected_original",
             "selected_diverse",
+            "selected_coverage_family_aware",
         ],
         sorted(pool_report_rows, key=lambda row: (row["pool_name"], row["match_level"], row["original_rank"] if row["original_rank"] != "" else 10**9)),
     )
@@ -360,15 +368,18 @@ def process_diagnostic(
         name: _predicted_positive_ids(results)
         for name, results in evaluation_results_by_name.items()
     }
+    comparison_rule_sets = [name for name in ["original", "diverse", "coverage_family_aware"] if name in evaluation_results_by_name]
 
-    context_groups: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(
-        lambda: {
+    def _new_context_group() -> Dict[str, Any]:
+        group: Dict[str, Any] = {
             "num_positive_examples": 0,
             "num_vehicle_near_centered_positive_examples": 0,
-            "predicted_positive_original": 0,
-            "predicted_positive_diverse": 0,
         }
-    )
+        for rule_set_name in comparison_rule_sets:
+            group[f"predicted_positive_{rule_set_name}"] = 0
+        return group
+
+    context_groups: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(_new_context_group)
     vehicle_centered_positive_ids: Set[str] = set()
     for row in eval_examples:
         if not bool(row["label"]):
@@ -382,52 +393,53 @@ def process_diagnostic(
         if bool(row["has_vehicle_near_centered"]):
             group["num_vehicle_near_centered_positive_examples"] += 1
             vehicle_centered_positive_ids.add(str(row["example_id"]))
-        if str(row["example_id"]) in predicted_ids_by_name.get("original", set()):
-            group["predicted_positive_original"] += 1
-        if str(row["example_id"]) in predicted_ids_by_name.get("diverse", set()):
-            group["predicted_positive_diverse"] += 1
+        for rule_set_name in comparison_rule_sets:
+            if str(row["example_id"]) in predicted_ids_by_name.get(rule_set_name, set()):
+                group[f"predicted_positive_{rule_set_name}"] += 1
 
     eval_context_rows = []
     for group in sorted(
         context_groups.values(),
         key=lambda item: (-int(item["num_vehicle_near_centered_positive_examples"]), -int(item["num_positive_examples"]), str(item["ego_motion_state"])),
     ):
-        eval_context_rows.append(
-            {
-                "ego_forward_state": group["ego_forward_state"],
-                "ego_lateral_state": group["ego_lateral_state"],
-                "ego_motion_state": group["ego_motion_state"],
-                "num_positive_examples": int(group["num_positive_examples"]),
-                "num_vehicle_near_centered_positive_examples": int(group["num_vehicle_near_centered_positive_examples"]),
-                "predicted_positive_original": int(group["predicted_positive_original"]),
-                "predicted_positive_diverse": int(group["predicted_positive_diverse"]),
-                "recall_original": float(
-                    group["predicted_positive_original"] / max(1, group["num_vehicle_near_centered_positive_examples"])
-                ),
-                "recall_diverse": float(
-                    group["predicted_positive_diverse"] / max(1, group["num_vehicle_near_centered_positive_examples"])
-                ),
-            }
-        )
+        row = {
+            "ego_forward_state": group["ego_forward_state"],
+            "ego_lateral_state": group["ego_lateral_state"],
+            "ego_motion_state": group["ego_motion_state"],
+            "num_positive_examples": int(group["num_positive_examples"]),
+            "num_vehicle_near_centered_positive_examples": int(group["num_vehicle_near_centered_positive_examples"]),
+        }
+        for rule_set_name in comparison_rule_sets:
+            row[f"predicted_positive_{rule_set_name}"] = int(group[f"predicted_positive_{rule_set_name}"])
+            row[f"recall_{rule_set_name}"] = float(
+                group[f"predicted_positive_{rule_set_name}"] / max(1, group["num_vehicle_near_centered_positive_examples"])
+            )
+        eval_context_rows.append(row)
+
+    eval_context_fieldnames = [
+        "ego_forward_state",
+        "ego_lateral_state",
+        "ego_motion_state",
+        "num_positive_examples",
+        "num_vehicle_near_centered_positive_examples",
+    ]
+    for rule_set_name in comparison_rule_sets:
+        eval_context_fieldnames.extend([
+            f"predicted_positive_{rule_set_name}",
+            f"recall_{rule_set_name}",
+        ])
     _write_csv(
         eval_context_path,
-        [
-            "ego_forward_state",
-            "ego_lateral_state",
-            "ego_motion_state",
-            "num_positive_examples",
-            "num_vehicle_near_centered_positive_examples",
-            "predicted_positive_original",
-            "predicted_positive_diverse",
-            "recall_original",
-            "recall_diverse",
-        ],
+        eval_context_fieldnames,
         eval_context_rows,
     )
 
     exact_scored_count = sum(1 for row in pool_report_rows if row["pool_name"] == "scored_all_kept" and row["match_level"] == "exact_vehicle_near_centered")
     exact_selected_original_count = sum(1 for row in pool_report_rows if row["pool_name"] == "selected_original" and row["match_level"] == "exact_vehicle_near_centered")
     exact_selected_diverse_count = sum(1 for row in pool_report_rows if row["pool_name"] == "selected_diverse" and row["match_level"] == "exact_vehicle_near_centered")
+    exact_selected_coverage_family_aware_count = sum(
+        1 for row in pool_report_rows if row["pool_name"] == "selected_coverage_family_aware" and row["match_level"] == "exact_vehicle_near_centered"
+    )
     initial_vehicle_count = sum(1 for row in pool_report_rows if row["pool_name"] == "merged_initial" and row["match_level"] == "vehicle_only")
     initial_near_count = sum(1 for row in pool_report_rows if row["pool_name"] == "merged_initial" and row["match_level"] == "near_only")
     initial_centered_count = sum(1 for row in pool_report_rows if row["pool_name"] == "merged_initial" and row["match_level"] == "centered_only")
@@ -435,6 +447,7 @@ def process_diagnostic(
     vehicle_centered_positive_count = len(vehicle_centered_positive_ids)
     fn_original = vehicle_centered_positive_ids - predicted_ids_by_name.get("original", set())
     fn_diverse = vehicle_centered_positive_ids - predicted_ids_by_name.get("diverse", set())
+    fn_coverage_family_aware = vehicle_centered_positive_ids - predicted_ids_by_name.get("coverage_family_aware", set())
     best_exact_original_rank = min(
         [int(row["original_rank"]) for row in exact_scored_rules if row["original_rank"] != ""],
         default=None,
@@ -479,9 +492,11 @@ def process_diagnostic(
         "vehicle_centered_positive_eval_examples": vehicle_centered_positive_count,
         "vehicle_centered_fn_original": len(fn_original),
         "vehicle_centered_fn_diverse": len(fn_diverse),
+        "vehicle_centered_fn_coverage_family_aware": len(fn_coverage_family_aware),
         "exact_scored_rule_count": exact_scored_count,
         "exact_selected_original_rule_count": exact_selected_original_count,
         "exact_selected_diverse_rule_count": exact_selected_diverse_count,
+        "exact_selected_coverage_family_aware_rule_count": exact_selected_coverage_family_aware_count,
         "best_exact_original_rank": best_exact_original_rank,
         "initial_vehicle_unary_rule_count": initial_vehicle_count,
         "initial_near_unary_rule_count": initial_near_count,
@@ -500,7 +515,8 @@ def process_diagnostic(
         f"vehicle_centered_positive_eval_examples={vehicle_centered_positive_count} | "
         f"exact_scored_rules={exact_scored_count} | "
         f"exact_selected_original={exact_selected_original_count} | "
-        f"exact_selected_diverse={exact_selected_diverse_count}"
+        f"exact_selected_diverse={exact_selected_diverse_count} | "
+        f"exact_selected_coverage_family_aware={exact_selected_coverage_family_aware_count}"
     )
     print(f"Vehicle-centered rule pool report written to {pool_report_path}")
     print(f"Vehicle-centered pool summary written to {pool_summary_path}")
@@ -516,6 +532,7 @@ def run(
     diverse_final_rule_results: Dict[str, Any],
     eval_temporal_rule_results: List[Dict[str, Any]],
     evaluation_results_by_name: Dict[str, Dict[str, Any]],
+    coverage_family_aware_final_rule_results: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -525,6 +542,7 @@ def run(
         extended_rule_results=extended_rule_results,
         original_final_rule_results=original_final_rule_results,
         diverse_final_rule_results=diverse_final_rule_results,
+        coverage_family_aware_final_rule_results=coverage_family_aware_final_rule_results,
         eval_temporal_rule_results=eval_temporal_rule_results,
         evaluation_results_by_name=evaluation_results_by_name,
         cfg=cfg,

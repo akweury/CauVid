@@ -32,7 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RULE_EVALUATION_VERSION = 2
+_RULE_EVALUATION_VERSION = 3
 
 
 def get_output_root() -> Path:
@@ -403,11 +403,18 @@ def process_rules(
     predicted_positive_example_ids = {
         example_id for example_id, rule_ids in triggered_rules_by_example.items() if rule_ids
     }
+    covered_positive_example_ids = {
+        str(example.get("example_id", ""))
+        for example in eval_examples
+        if bool(example.get("label", False)) and str(example.get("example_id", "")) in predicted_positive_example_ids
+    }
     true_positive = 0
     false_positive = 0
     false_negative = 0
     true_negative = 0
     example_prediction_rows: List[Dict[str, Any]] = []
+    false_negative_example_ids: List[str] = []
+    false_positive_example_ids: List[str] = []
 
     for example in eval_examples:
         example_id = str(example.get("example_id", ""))
@@ -417,8 +424,10 @@ def process_rules(
             true_positive += 1
         elif predicted_positive and not label:
             false_positive += 1
+            false_positive_example_ids.append(example_id)
         elif not predicted_positive and label:
             false_negative += 1
+            false_negative_example_ids.append(example_id)
         else:
             true_negative += 1
 
@@ -480,6 +489,10 @@ def process_rules(
         "num_eval_negative_examples": len(eval_examples) - total_positive_examples,
         "num_final_rules": len(final_rules),
         "num_rules_fired": sum(1 for rule in rule_evaluations if int(rule.get("eval_total_firings", 0)) > 0),
+        "predicted_positive_example_ids": sorted(predicted_positive_example_ids),
+        "covered_positive_example_ids": sorted(covered_positive_example_ids),
+        "false_negative_example_ids": sorted(false_negative_example_ids),
+        "false_positive_example_ids": sorted(false_positive_example_ids),
         "overall_metrics": overall_metrics,
         "per_video_metrics": per_video_metrics,
         "rule_evaluations": rule_evaluations,

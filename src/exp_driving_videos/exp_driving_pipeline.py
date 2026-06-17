@@ -40,6 +40,10 @@ Steps:
     17B. diverse_final_rules_driving_mini — greedily choose a diverse final
                     rule set that expands positive coverage while penalizing
                     overlap and repeated rule families.
+    17C. coverage_family_aware_final_rules_driving_mini — greedily choose a
+                    coverage-aware final rule set using rule quality
+                    confidence * log(1 + positive_support) together with
+                    redundancy and family-diversity penalties.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
     19. error_and_explainability_analysis_driving_mini — summarize false
@@ -326,6 +330,9 @@ def _get_final_rules_cfg() -> Dict[str, Any]:
 def _get_diverse_final_rules_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "top_k": 50,
+        "score_mode": "legacy_diverse_positive_coverage",
+        "selection_method_name": "greedy_diverse_positive_coverage",
+        "output_prefix": "diverse_final_rules",
         "new_positive_weight": 1.0,
         "confidence_weight": 0.25,
         "overlap_penalty": 0.35,
@@ -340,6 +347,30 @@ def _get_diverse_final_rules_cfg() -> Dict[str, Any]:
             defaults.update(override)
     except Exception as exc:
         print(f"[warn] Could not load diverse final rules config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_k": 50,
+        "score_mode": "coverage_family_aware",
+        "selection_method_name": "greedy_coverage_family_aware",
+        "output_prefix": "coverage_family_aware_final_rules",
+        "coverage_weight": 1.0,
+        "quality_weight": 1.0,
+        "overlap_penalty": 0.5,
+        "family_penalty": 0.6,
+        "family_diversity_bonus": 0.75,
+        "negative_support_penalty": 0.1,
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("coverage_family_aware_final_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load coverage-aware final rules config: {exc}. Using defaults.")
     return defaults
 
 
@@ -364,7 +395,7 @@ def _get_data_split_cfg() -> Dict[str, Any]:
 def _get_rule_evaluation_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "prediction_mode": "any_rule_positive",
-        "rule_set_mode": "both",
+        "rule_set_mode": "all",
         "primary_rule_set": "original",
     }
     try:
@@ -386,6 +417,7 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         "extended_rules": True,
         "final_rules": True,
         "diverse_final_rules": True,
+        "coverage_family_aware_final_rules": True,
         "rule_evaluation": True,
         "error_and_explainability_analysis": True,
         "vehicle_rule_diagnostic": True,
@@ -456,6 +488,12 @@ def _get_rule_evaluation_output_root() -> Path:
 
 def _get_error_and_explainability_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "19_driving_mini_error_and_explainability_analysis"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_coverage_family_aware_final_rules_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "17c_driving_mini_coverage_family_aware_final_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -1145,27 +1183,47 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
         f"Selected {diverse_final_rule_results.get('num_final_rules', 0)} rule(s)."
     )
 
+    # Step 17C: coverage-aware / family-aware post-mining rule selection
+    coverage_family_aware_cfg = _get_coverage_family_aware_final_rules_cfg()
+    print("\n=== Step 17C: coverage_family_aware_final_rules_driving_mini ===")
+    print(f"Coverage-aware final rules cfg: {coverage_family_aware_cfg}")
+    coverage_family_aware_rule_results: Dict[str, Any] = diverse_final_rules_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        cfg=coverage_family_aware_cfg,
+        output_root=_get_coverage_family_aware_final_rules_output_root(),
+        force_recompute=bool(recompute_cfg.get("coverage_family_aware_final_rules", True)),
+    )
+    print(
+        "Coverage-aware final rule selection complete. "
+        f"Selected {coverage_family_aware_rule_results.get('num_final_rules', 0)} rule(s)."
+    )
+
     # Step 18: evaluate final rules on held-out evaluation videos
     rule_evaluation_cfg = _get_rule_evaluation_cfg()
     print("\n=== Step 18: evaluate_rules_driving_mini ===")
     print(f"Rule evaluation cfg: {rule_evaluation_cfg}")
-    rule_set_mode = str(rule_evaluation_cfg.get("rule_set_mode", "both"))
+    rule_set_mode = str(rule_evaluation_cfg.get("rule_set_mode", "all"))
     primary_rule_set = str(rule_evaluation_cfg.get("primary_rule_set", "original"))
-    if rule_set_mode not in {"original", "diverse", "both"}:
+    if rule_set_mode not in {"original", "diverse", "coverage_family_aware", "both", "all"}:
         raise ValueError(f"Unsupported rule_evaluation.rule_set_mode: {rule_set_mode}")
-    if primary_rule_set not in {"original", "diverse"}:
+    if primary_rule_set not in {"original", "diverse", "coverage_family_aware"}:
         raise ValueError(f"Unsupported rule_evaluation.primary_rule_set: {primary_rule_set}")
-    if rule_set_mode != "both" and primary_rule_set != rule_set_mode:
+    if rule_set_mode not in {"both", "all"} and primary_rule_set != rule_set_mode:
         primary_rule_set = rule_set_mode
 
     rule_results_by_name: Dict[str, Dict[str, Any]] = {
         "original": final_rule_results,
         "diverse": diverse_final_rule_results,
+        "coverage_family_aware": coverage_family_aware_rule_results,
     }
     if rule_set_mode == "both":
         evaluation_rule_sets = ["original", "diverse"]
+    elif rule_set_mode == "all":
+        evaluation_rule_sets = ["original", "diverse", "coverage_family_aware"]
     else:
         evaluation_rule_sets = [rule_set_mode]
+    if primary_rule_set not in evaluation_rule_sets:
+        primary_rule_set = evaluation_rule_sets[0]
 
     evaluation_output_root = _get_rule_evaluation_output_root()
     evaluation_results_by_name: Dict[str, Dict[str, Any]] = {}
@@ -1189,15 +1247,22 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
         evaluation_result["evaluated_rule_set_name"] = rule_set_name
         evaluation_results_by_name[rule_set_name] = evaluation_result
 
-    if rule_set_mode == "both":
+    if rule_set_mode in {"both", "all"}:
         comparison_rows: List[Dict[str, Any]] = []
+        original_fn_ids = set(evaluation_results_by_name.get("original", {}).get("false_negative_example_ids", []))
         for rule_set_name in evaluation_rule_sets:
             overall = dict(evaluation_results_by_name[rule_set_name].get("overall_metrics", {}))
+            rule_eval_result = evaluation_results_by_name[rule_set_name]
+            predicted_positive_ids = set(rule_eval_result.get("predicted_positive_example_ids", []))
+            covered_original_fn_ids = original_fn_ids & predicted_positive_ids
             comparison_rows.append(
                 {
                     "rule_set_name": rule_set_name,
                     "selection_method": str(rule_results_by_name[rule_set_name].get("selection_method", "score_top_k")),
                     "num_final_rules": int(rule_results_by_name[rule_set_name].get("num_final_rules", 0)),
+                    "covered_eval_positive_examples": len(rule_eval_result.get("covered_positive_example_ids", [])),
+                    "num_fn_examples": len(rule_eval_result.get("false_negative_example_ids", [])),
+                    "fn_coverage_vs_original": float(len(covered_original_fn_ids) / max(1, len(original_fn_ids))),
                     "precision": float(overall.get("precision", 0.0)),
                     "recall": float(overall.get("recall", 0.0)),
                     "f1": float(overall.get("f1", 0.0)),
@@ -1223,6 +1288,9 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
                     "rule_set_name",
                     "selection_method",
                     "num_final_rules",
+                    "covered_eval_positive_examples",
+                    "num_fn_examples",
+                    "fn_coverage_vs_original",
                     "precision",
                     "recall",
                     "f1",
@@ -1272,11 +1340,15 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
         )
         error_analysis_results_by_name[rule_set_name] = error_analysis_result
 
-    if rule_set_mode == "both":
+    if rule_set_mode in {"both", "all"}:
         comparison_rows = []
+        original_fn_ids = set(evaluation_results_by_name.get("original", {}).get("false_negative_example_ids", []))
         for rule_set_name in evaluation_rule_sets:
             overall = dict(evaluation_results_by_name[rule_set_name].get("overall_metrics", {}))
             analysis_manifest = dict(error_analysis_results_by_name[rule_set_name])
+            rule_eval_result = evaluation_results_by_name[rule_set_name]
+            predicted_positive_ids = set(rule_eval_result.get("predicted_positive_example_ids", []))
+            covered_original_fn_ids = original_fn_ids & predicted_positive_ids
             comparison_rows.append(
                 {
                     "rule_set_name": rule_set_name,
@@ -1285,11 +1357,13 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
                     "num_rule_families": int(analysis_manifest.get("num_rule_families", 0)),
                     "max_rules_in_family": int(analysis_manifest.get("max_rules_in_family", 0)),
                     "redundancy_ratio": float(analysis_manifest.get("redundancy_ratio", 0.0)),
+                    "covered_eval_positive_examples": len(rule_eval_result.get("covered_positive_example_ids", [])),
                     "precision": float(overall.get("precision", 0.0)),
                     "recall": float(overall.get("recall", 0.0)),
                     "f1": float(overall.get("f1", 0.0)),
                     "accuracy": float(overall.get("accuracy", 0.0)),
                     "num_fn_examples": int(analysis_manifest.get("num_fn_examples", 0)),
+                    "fn_coverage_vs_original": float(len(covered_original_fn_ids) / max(1, len(original_fn_ids))),
                     "num_fp_examples": int(analysis_manifest.get("num_fp_examples", 0)),
                     "num_uncovered_positive_patterns": int(analysis_manifest.get("num_uncovered_positive_patterns", 0)),
                 }
@@ -1316,11 +1390,13 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
                     "num_rule_families",
                     "max_rules_in_family",
                     "redundancy_ratio",
+                    "covered_eval_positive_examples",
                     "precision",
                     "recall",
                     "f1",
                     "accuracy",
                     "num_fn_examples",
+                    "fn_coverage_vs_original",
                     "num_fp_examples",
                     "num_uncovered_positive_patterns",
                 ],
@@ -1352,6 +1428,7 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
         extended_rule_results=extended_rule_results,
         original_final_rule_results=final_rule_results,
         diverse_final_rule_results=diverse_final_rule_results,
+        coverage_family_aware_final_rule_results=coverage_family_aware_rule_results,
         eval_temporal_rule_results=eval_temporal_rule_results,
         evaluation_results_by_name=evaluation_results_by_name,
         cfg=vehicle_rule_diagnostic_cfg,
