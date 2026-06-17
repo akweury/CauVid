@@ -477,6 +477,7 @@ def _get_rule_selection_visualization_cfg() -> Dict[str, Any]:
 
 def _get_fn_categorization_diagnostic_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
+        "enabled": False,
         "vehicle_context_match_levels": [
             "exact_vehicle_near_centered",
             "vehicle_near_partial",
@@ -1577,23 +1578,27 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
 
     # Step 20B: categorize selector false negatives using rule-pool and context diagnostics
     fn_categorization_cfg = _get_fn_categorization_diagnostic_cfg()
-    print("\n=== Step 20B: fn_categorization_diagnostic_driving_mini ===")
-    print(f"FN categorization cfg: {fn_categorization_cfg}")
-    fn_categorization_results: Dict[str, Any] = fn_categorization_diagnostic_driving_mini.run(
-        extended_rule_results=extended_rule_results,
-        rule_results_by_name=rule_results_by_name,
-        evaluation_results_by_name=evaluation_results_by_name,
-        error_analysis_results_by_name=error_analysis_results_by_name,
-        temporal_rule_results=eval_temporal_rule_results,
-        vehicle_rule_diagnostic_results=vehicle_rule_diagnostic_results,
-        cfg=fn_categorization_cfg,
-        output_root=_get_fn_categorization_diagnostic_output_root(),
-        force_recompute=bool(recompute_cfg.get("fn_categorization_diagnostic", True)),
-    )
-    print(
-        "FN categorization diagnostic complete. "
-        f"summary={fn_categorization_results.get('summary_path', '')}"
-    )
+    if bool(fn_categorization_cfg.get("enabled", False)):
+        print("\n=== Step 20B: fn_categorization_diagnostic_driving_mini ===")
+        print(f"FN categorization cfg: {fn_categorization_cfg}")
+        fn_categorization_results: Dict[str, Any] = fn_categorization_diagnostic_driving_mini.run(
+            extended_rule_results=extended_rule_results,
+            rule_results_by_name=rule_results_by_name,
+            evaluation_results_by_name=evaluation_results_by_name,
+            error_analysis_results_by_name=error_analysis_results_by_name,
+            temporal_rule_results=eval_temporal_rule_results,
+            vehicle_rule_diagnostic_results=vehicle_rule_diagnostic_results,
+            cfg=fn_categorization_cfg,
+            output_root=_get_fn_categorization_diagnostic_output_root(),
+            force_recompute=bool(recompute_cfg.get("fn_categorization_diagnostic", True)),
+        )
+        print(
+            "FN categorization diagnostic complete. "
+            f"summary={fn_categorization_results.get('summary_path', '')}"
+        )
+    else:
+        print("\n=== Step 20B: fn_categorization_diagnostic_driving_mini ===")
+        print("FN categorization diagnostic disabled by config. Skipping Step 20B.")
 
     # Step 21: generate rule-selection visualization figures from summary artifacts
     rule_selection_visualization_cfg = _get_rule_selection_visualization_cfg()

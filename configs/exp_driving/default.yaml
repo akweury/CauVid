@@ -165,6 +165,7 @@ rule_selection_visualization:
   figure_format: png
 
 fn_categorization_diagnostic:
+  enabled: false
   vehicle_context_match_levels:
     - exact_vehicle_near_centered
     - vehicle_near_partial
