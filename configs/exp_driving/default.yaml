@@ -68,15 +68,15 @@ data_split:
 
 pipeline_recompute:
   candidate_rules: false
-  extended_rules: true
-  final_rules: true
-  diverse_final_rules: true
-  semantic_constrained_diverse_final_rules: true
-  coverage_family_aware_final_rules: true
-  rule_evaluation: true
-  error_and_explainability_analysis: true
-  vehicle_rule_diagnostic: true
-  fn_categorization_diagnostic: true
+  extended_rules: false
+  final_rules: false
+  diverse_final_rules: false
+  semantic_constrained_diverse_final_rules: false
+  coverage_family_aware_final_rules: false
+  rule_evaluation: false
+  error_and_explainability_analysis: false
+  vehicle_rule_diagnostic: false
+  fn_categorization_diagnostic: false
   rule_selection_visualization: true
 
 temporal_rule_examples:
