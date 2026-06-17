@@ -75,6 +75,8 @@ pipeline_recompute:
   rule_evaluation: true
   error_and_explainability_analysis: true
   vehicle_rule_diagnostic: true
+  fn_categorization_diagnostic: true
+  rule_selection_visualization: true
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -131,6 +133,24 @@ rule_evaluation:
   prediction_mode: any_rule_positive
   rule_set_mode: all
   primary_rule_set: original
+
+rule_selection_visualization:
+  top_rule_families: 8
+  dpi: 160
+  figure_format: png
+
+fn_categorization_diagnostic:
+  vehicle_context_match_levels:
+    - exact_vehicle_near_centered
+    - vehicle_near_partial
+    - vehicle_centered_partial
+  predicate_gap_levels:
+    - missing_rule_or_predicate_dense_context
+    - missing_rule_or_predicate_sparse_context
+    - unexplained_noise_or_symbol_gap
+  noisy_levels:
+    - unexplained_noise_no_objects
+    - unexplained_noise_or_symbol_gap
 
 error_and_explainability_analysis:
   vehicle_classes: [car, truck, bus, motorcycle, bicycle]

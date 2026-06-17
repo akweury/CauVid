@@ -52,6 +52,13 @@ Steps:
     20. vehicle_rule_diagnostic_driving_mini — audit whether vehicle-centered
                     rules were generated, pruned/scored out, or missed due to
                     predicate representation.
+    20B. fn_categorization_diagnostic_driving_mini — categorize false
+                    negatives for each selector using the step 16 rule pool,
+                    step 18 predictions, step 19 FN examples, and step 20
+                    vehicle-context diagnostics.
+    21. rule_selection_visualization_driving_mini — generate comparison plots
+                    from the step 18/19/20 selector summaries and save a
+                    visualization manifest.
 
 """
 
@@ -74,6 +81,7 @@ from src.exp_driving_videos.modules import evaluate_rules_driving_mini
 from src.exp_driving_videos.modules import error_and_explainability_analysis_driving_mini
 from src.exp_driving_videos.modules import extended_rules_driving_mini
 from src.exp_driving_videos.modules import final_rules_driving_mini
+from src.exp_driving_videos.modules import fn_categorization_diagnostic_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
 from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
@@ -81,6 +89,7 @@ from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
+from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
 from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
 from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
@@ -409,6 +418,51 @@ def _get_rule_evaluation_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_rule_selection_visualization_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_rule_families": 8,
+        "dpi": 160,
+        "figure_format": "png",
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("rule_selection_visualization", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load rule selection visualization config: {exc}. Using defaults.")
+    return defaults
+
+
+def _get_fn_categorization_diagnostic_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "vehicle_context_match_levels": [
+            "exact_vehicle_near_centered",
+            "vehicle_near_partial",
+            "vehicle_centered_partial",
+        ],
+        "predicate_gap_levels": [
+            "missing_rule_or_predicate_dense_context",
+            "missing_rule_or_predicate_sparse_context",
+            "unexplained_noise_or_symbol_gap",
+        ],
+        "noisy_levels": [
+            "unexplained_noise_no_objects",
+            "unexplained_noise_or_symbol_gap",
+        ],
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("fn_categorization_diagnostic", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load FN categorization diagnostic config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         # Step 14 is per-video and safe to load from cache after split changes.
@@ -421,6 +475,8 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         "rule_evaluation": True,
         "error_and_explainability_analysis": True,
         "vehicle_rule_diagnostic": True,
+        "fn_categorization_diagnostic": True,
+        "rule_selection_visualization": True,
     }
     try:
         cfg_path = config.get_config_path("exp_driving")
@@ -500,6 +556,18 @@ def _get_coverage_family_aware_final_rules_output_root() -> Path:
 
 def _get_vehicle_rule_diagnostic_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "20_driving_mini_vehicle_rule_diagnostic"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_rule_selection_visualization_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "21_rule_selection_visualization"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_fn_categorization_diagnostic_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "20b_rule_selection_fn_diagnostic"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -867,8 +935,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=20,
-        choices=range(1, 21),
+        default=21,
+        choices=range(1, 22),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -883,7 +951,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
+def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
@@ -1441,6 +1509,43 @@ def main(max_step: int = 20, video_ids: List[str] | None = None) -> None:
     )
     if max_step == 20:
         print("\nStopping after step 20 by request.")
+        return
+
+    # Step 20B: categorize selector false negatives using rule-pool and context diagnostics
+    fn_categorization_cfg = _get_fn_categorization_diagnostic_cfg()
+    print("\n=== Step 20B: fn_categorization_diagnostic_driving_mini ===")
+    print(f"FN categorization cfg: {fn_categorization_cfg}")
+    fn_categorization_results: Dict[str, Any] = fn_categorization_diagnostic_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        rule_results_by_name=rule_results_by_name,
+        evaluation_results_by_name=evaluation_results_by_name,
+        error_analysis_results_by_name=error_analysis_results_by_name,
+        temporal_rule_results=eval_temporal_rule_results,
+        vehicle_rule_diagnostic_results=vehicle_rule_diagnostic_results,
+        cfg=fn_categorization_cfg,
+        output_root=_get_fn_categorization_diagnostic_output_root(),
+        force_recompute=bool(recompute_cfg.get("fn_categorization_diagnostic", True)),
+    )
+    print(
+        "FN categorization diagnostic complete. "
+        f"summary={fn_categorization_results.get('summary_path', '')}"
+    )
+
+    # Step 21: generate rule-selection visualization figures from summary artifacts
+    rule_selection_visualization_cfg = _get_rule_selection_visualization_cfg()
+    print("\n=== Step 21: rule_selection_visualization_driving_mini ===")
+    print(f"Rule selection visualization cfg: {rule_selection_visualization_cfg}")
+    rule_selection_visualization_results: Dict[str, Any] = rule_selection_visualization_driving_mini.run(
+        cfg=rule_selection_visualization_cfg,
+        output_root=_get_rule_selection_visualization_output_root(),
+        force_recompute=bool(recompute_cfg.get("rule_selection_visualization", True)),
+    )
+    print(
+        "Rule selection visualization complete. "
+        f"manifest={rule_selection_visualization_results.get('figure_paths', {})}"
+    )
+    if max_step == 21:
+        print("\nStopping after step 21 by request.")
         return
 
 if __name__ == "__main__":
