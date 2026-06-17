@@ -227,6 +227,7 @@ def process_diagnostic(
     extended_rule_results: Dict[str, Any],
     original_final_rule_results: Dict[str, Any],
     diverse_final_rule_results: Dict[str, Any],
+    semantic_constrained_diverse_final_rule_results: Optional[Dict[str, Any]],
     coverage_family_aware_final_rule_results: Optional[Dict[str, Any]],
     eval_temporal_rule_results: List[Dict[str, Any]],
     evaluation_results_by_name: Dict[str, Dict[str, Any]],
@@ -255,6 +256,10 @@ def process_diagnostic(
     original_rank_map = {str(rule.get("rule_id", "")): idx for idx, rule in enumerate(original_ranked_rules)}
     selected_original_ids = {str(rule.get("rule_id", "")) for rule in list(original_final_rule_results.get("final_rules", []))}
     selected_diverse_ids = {str(rule.get("rule_id", "")) for rule in list(diverse_final_rule_results.get("final_rules", []))}
+    selected_semantic_constrained_diverse_ids = {
+        str(rule.get("rule_id", ""))
+        for rule in list((semantic_constrained_diverse_final_rule_results or {}).get("final_rules", []))
+    }
     selected_coverage_family_aware_ids = {
         str(rule.get("rule_id", ""))
         for rule in list((coverage_family_aware_final_rule_results or {}).get("final_rules", []))
@@ -265,6 +270,7 @@ def process_diagnostic(
         ("scored_all_kept", list(extended_rule_results.get("all_kept_rules", []))),
         ("selected_original", list(original_final_rule_results.get("final_rules", []))),
         ("selected_diverse", list(diverse_final_rule_results.get("final_rules", []))),
+        ("selected_semantic_constrained_diverse", list((semantic_constrained_diverse_final_rule_results or {}).get("final_rules", []))),
         ("selected_coverage_family_aware", list((coverage_family_aware_final_rule_results or {}).get("final_rules", []))),
     ]
 
@@ -292,6 +298,7 @@ def process_diagnostic(
                 "original_rank": original_rank_map.get(str(rule.get("rule_id", "")), ""),
                 "selected_original": str(rule.get("rule_id", "")) in selected_original_ids,
                 "selected_diverse": str(rule.get("rule_id", "")) in selected_diverse_ids,
+                "selected_semantic_constrained_diverse": str(rule.get("rule_id", "")) in selected_semantic_constrained_diverse_ids,
                 "selected_coverage_family_aware": str(rule.get("rule_id", "")) in selected_coverage_family_aware_ids,
             }
             pool_report_rows.append(row)
@@ -332,6 +339,7 @@ def process_diagnostic(
             "original_rank",
             "selected_original",
             "selected_diverse",
+            "selected_semantic_constrained_diverse",
             "selected_coverage_family_aware",
         ],
         sorted(pool_report_rows, key=lambda row: (row["pool_name"], row["match_level"], row["original_rank"] if row["original_rank"] != "" else 10**9)),
@@ -368,7 +376,7 @@ def process_diagnostic(
         name: _predicted_positive_ids(results)
         for name, results in evaluation_results_by_name.items()
     }
-    comparison_rule_sets = [name for name in ["original", "diverse", "coverage_family_aware"] if name in evaluation_results_by_name]
+    comparison_rule_sets = [name for name in ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"] if name in evaluation_results_by_name]
 
     def _new_context_group() -> Dict[str, Any]:
         group: Dict[str, Any] = {
@@ -437,8 +445,23 @@ def process_diagnostic(
     exact_scored_count = sum(1 for row in pool_report_rows if row["pool_name"] == "scored_all_kept" and row["match_level"] == "exact_vehicle_near_centered")
     exact_selected_original_count = sum(1 for row in pool_report_rows if row["pool_name"] == "selected_original" and row["match_level"] == "exact_vehicle_near_centered")
     exact_selected_diverse_count = sum(1 for row in pool_report_rows if row["pool_name"] == "selected_diverse" and row["match_level"] == "exact_vehicle_near_centered")
+    exact_selected_semantic_constrained_diverse_count = sum(
+        1 for row in pool_report_rows if row["pool_name"] == "selected_semantic_constrained_diverse" and row["match_level"] == "exact_vehicle_near_centered"
+    )
     exact_selected_coverage_family_aware_count = sum(
         1 for row in pool_report_rows if row["pool_name"] == "selected_coverage_family_aware" and row["match_level"] == "exact_vehicle_near_centered"
+    )
+    explicit_match_levels = {
+        "vehicle_centered_partial",
+        "near_centered_partial",
+        "vehicle_near_partial",
+        "exact_vehicle_near_centered",
+    }
+    diverse_explicit_vehicle_rule_count = sum(
+        1 for row in pool_report_rows if row["pool_name"] == "selected_diverse" and row["match_level"] in explicit_match_levels
+    )
+    semantic_explicit_vehicle_rule_count = sum(
+        1 for row in pool_report_rows if row["pool_name"] == "selected_semantic_constrained_diverse" and row["match_level"] in explicit_match_levels
     )
     initial_vehicle_count = sum(1 for row in pool_report_rows if row["pool_name"] == "merged_initial" and row["match_level"] == "vehicle_only")
     initial_near_count = sum(1 for row in pool_report_rows if row["pool_name"] == "merged_initial" and row["match_level"] == "near_only")
@@ -447,11 +470,18 @@ def process_diagnostic(
     vehicle_centered_positive_count = len(vehicle_centered_positive_ids)
     fn_original = vehicle_centered_positive_ids - predicted_ids_by_name.get("original", set())
     fn_diverse = vehicle_centered_positive_ids - predicted_ids_by_name.get("diverse", set())
+    fn_semantic_constrained_diverse = vehicle_centered_positive_ids - predicted_ids_by_name.get("semantic_constrained_diverse", set())
     fn_coverage_family_aware = vehicle_centered_positive_ids - predicted_ids_by_name.get("coverage_family_aware", set())
     best_exact_original_rank = min(
         [int(row["original_rank"]) for row in exact_scored_rules if row["original_rank"] != ""],
         default=None,
     )
+
+    diverse_metrics = dict(evaluation_results_by_name.get("diverse", {}).get("overall_metrics", {}))
+    semantic_metrics = dict(evaluation_results_by_name.get("semantic_constrained_diverse", {}).get("overall_metrics", {}))
+    semantic_preserves_recall_vs_diverse = float(semantic_metrics.get("recall", 0.0)) >= float(diverse_metrics.get("recall", 0.0))
+    semantic_preserves_f1_vs_diverse = float(semantic_metrics.get("f1", 0.0)) >= float(diverse_metrics.get("f1", 0.0))
+    semantic_more_explicit_vehicle_rules_vs_diverse = semantic_explicit_vehicle_rule_count > diverse_explicit_vehicle_rule_count
 
     if vehicle_centered_positive_count == 0:
         primary_diagnosis = "insufficient_vehicle_centered_eval_signal"
@@ -492,11 +522,18 @@ def process_diagnostic(
         "vehicle_centered_positive_eval_examples": vehicle_centered_positive_count,
         "vehicle_centered_fn_original": len(fn_original),
         "vehicle_centered_fn_diverse": len(fn_diverse),
+        "vehicle_centered_fn_semantic_constrained_diverse": len(fn_semantic_constrained_diverse),
         "vehicle_centered_fn_coverage_family_aware": len(fn_coverage_family_aware),
         "exact_scored_rule_count": exact_scored_count,
         "exact_selected_original_rule_count": exact_selected_original_count,
         "exact_selected_diverse_rule_count": exact_selected_diverse_count,
+        "exact_selected_semantic_constrained_diverse_rule_count": exact_selected_semantic_constrained_diverse_count,
         "exact_selected_coverage_family_aware_rule_count": exact_selected_coverage_family_aware_count,
+        "diverse_explicit_vehicle_rule_count": diverse_explicit_vehicle_rule_count,
+        "semantic_constrained_diverse_explicit_vehicle_rule_count": semantic_explicit_vehicle_rule_count,
+        "semantic_constrained_diverse_preserves_recall_vs_diverse": semantic_preserves_recall_vs_diverse,
+        "semantic_constrained_diverse_preserves_f1_vs_diverse": semantic_preserves_f1_vs_diverse,
+        "semantic_constrained_diverse_more_explicit_vehicle_rules_vs_diverse": semantic_more_explicit_vehicle_rules_vs_diverse,
         "best_exact_original_rank": best_exact_original_rank,
         "initial_vehicle_unary_rule_count": initial_vehicle_count,
         "initial_near_unary_rule_count": initial_near_count,
@@ -516,7 +553,15 @@ def process_diagnostic(
         f"exact_scored_rules={exact_scored_count} | "
         f"exact_selected_original={exact_selected_original_count} | "
         f"exact_selected_diverse={exact_selected_diverse_count} | "
+        f"exact_selected_semantic_constrained_diverse={exact_selected_semantic_constrained_diverse_count} | "
         f"exact_selected_coverage_family_aware={exact_selected_coverage_family_aware_count}"
+    )
+    print(
+        "  semantic_constrained_diverse_vs_diverse: "
+        f"preserves_recall={semantic_preserves_recall_vs_diverse} | "
+        f"preserves_f1={semantic_preserves_f1_vs_diverse} | "
+        f"diverse_explicit_vehicle_rules={diverse_explicit_vehicle_rule_count} | "
+        f"semantic_explicit_vehicle_rules={semantic_explicit_vehicle_rule_count}"
     )
     print(f"Vehicle-centered rule pool report written to {pool_report_path}")
     print(f"Vehicle-centered pool summary written to {pool_summary_path}")
@@ -532,6 +577,7 @@ def run(
     diverse_final_rule_results: Dict[str, Any],
     eval_temporal_rule_results: List[Dict[str, Any]],
     evaluation_results_by_name: Dict[str, Dict[str, Any]],
+    semantic_constrained_diverse_final_rule_results: Optional[Dict[str, Any]] = None,
     coverage_family_aware_final_rule_results: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
@@ -542,6 +588,7 @@ def run(
         extended_rule_results=extended_rule_results,
         original_final_rule_results=original_final_rule_results,
         diverse_final_rule_results=diverse_final_rule_results,
+        semantic_constrained_diverse_final_rule_results=semantic_constrained_diverse_final_rule_results,
         coverage_family_aware_final_rule_results=coverage_family_aware_final_rule_results,
         eval_temporal_rule_results=eval_temporal_rule_results,
         evaluation_results_by_name=evaluation_results_by_name,

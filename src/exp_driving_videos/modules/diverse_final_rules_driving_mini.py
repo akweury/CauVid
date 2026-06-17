@@ -31,7 +31,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_DIVERSE_FINAL_RULES_VERSION = 2
+_DIVERSE_FINAL_RULES_VERSION = 3
 
 
 def get_output_root() -> Path:
@@ -41,6 +41,7 @@ def get_output_root() -> Path:
 
 
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    semantic_min_family_counts = cfg.get("semantic_min_family_counts", {})
     return {
         "top_k": int(cfg.get("top_k", 50)),
         "score_mode": str(cfg.get("score_mode", "legacy_diverse_positive_coverage")),
@@ -54,6 +55,16 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "family_penalty": float(cfg.get("family_penalty", 0.75)),
         "family_diversity_bonus": float(cfg.get("family_diversity_bonus", 0.75)),
         "negative_support_penalty": float(cfg.get("negative_support_penalty", 0.1)),
+        "semantic_hard_constraints": bool(cfg.get("semantic_hard_constraints", False)),
+        "semantic_bonus_weight": float(cfg.get("semantic_bonus_weight", 1.0)),
+        "semantic_min_family_counts": {
+            str(key): int(value)
+            for key, value in sorted(dict(semantic_min_family_counts).items())
+            if int(value) > 0
+        },
+        "vehicle_classes": sorted(str(v) for v in cfg.get("vehicle_classes", [])),
+        "near_states": sorted(str(v) for v in cfg.get("near_states", [])),
+        "center_states": sorted(str(v) for v in cfg.get("center_states", [])),
     }
 
 
@@ -111,6 +122,46 @@ def _base_quality_score(rule: Dict[str, Any]) -> float:
     confidence = max(0.0, float(rule.get("confidence", 0.0)))
     positive_support = max(0, int(rule.get("positive_support", 0)))
     return confidence * math.log1p(positive_support)
+
+
+def _rule_vehicle_match_level(rule: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    vehicle_classes = {
+        str(v)
+        for v in cfg.get("vehicle_classes", ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"])
+    }
+    near_states = {str(v) for v in cfg.get("near_states", ["near"])}
+    center_states = {str(v) for v in cfg.get("center_states", ["centered"])}
+
+    has_vehicle = False
+    has_near = False
+    has_centered = False
+    for atom in _get_rule_body_atom_templates(rule):
+        parsed = _parse_atom(atom)
+        if parsed is None:
+            continue
+        predicate, args = parsed
+        if predicate == "object_class" and len(args) >= 3 and str(args[2]) in vehicle_classes:
+            has_vehicle = True
+        elif predicate == "object_distance_state" and len(args) >= 3 and str(args[2]) in near_states:
+            has_near = True
+        elif predicate == "object_x_position_state" and len(args) >= 3 and str(args[2]) in center_states:
+            has_centered = True
+
+    if has_vehicle and has_near and has_centered:
+        return "exact_vehicle_near_centered"
+    if has_vehicle and has_near:
+        return "vehicle_near_partial"
+    if has_vehicle and has_centered:
+        return "vehicle_centered_partial"
+    if has_near and has_centered:
+        return "near_centered_partial"
+    if has_vehicle:
+        return "vehicle_only"
+    if has_near:
+        return "near_only"
+    if has_centered:
+        return "centered_only"
+    return "no_match"
 
 
 def _legacy_diverse_utility(
@@ -191,10 +242,60 @@ def _coverage_family_aware_utility(
     }
 
 
+def _semantic_family_deficits(
+    selected_semantic_families: Dict[str, Set[str]],
+    cfg: Dict[str, Any],
+) -> Dict[str, int]:
+    raw_counts = dict(cfg.get("semantic_min_family_counts", {}))
+    deficits: Dict[str, int] = {}
+    for match_level, min_count in raw_counts.items():
+        required = max(0, int(min_count))
+        if required <= 0:
+            continue
+        selected_count = len(selected_semantic_families.get(str(match_level), set()))
+        deficits[str(match_level)] = max(0, required - selected_count)
+    return deficits
+
+
+def _semantic_constrained_diverse_utility(
+    rule: Dict[str, Any],
+    covered_positive_ids: Set[str],
+    family_counts: Dict[str, int],
+    selected_semantic_families: Dict[str, Set[str]],
+    remaining_slots: int,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    base = _legacy_diverse_utility(rule, covered_positive_ids, family_counts, cfg)
+    family_signature = str(base["family_signature"])
+    semantic_match_level = _rule_vehicle_match_level(rule, cfg)
+    deficits = _semantic_family_deficits(selected_semantic_families, cfg)
+    total_remaining_deficits = sum(deficits.values())
+    already_selected_for_level = family_signature in selected_semantic_families.get(semantic_match_level, set())
+    semantic_deficit_reduction = 0
+    if semantic_match_level in deficits and deficits[semantic_match_level] > 0 and not already_selected_for_level:
+        semantic_deficit_reduction = 1
+
+    hard_constraint_active = bool(cfg.get("semantic_hard_constraints", False)) and remaining_slots <= total_remaining_deficits and total_remaining_deficits > 0
+    if hard_constraint_active and semantic_deficit_reduction == 0:
+        utility = -1e12
+    else:
+        utility = float(base["utility"]) + float(cfg.get("semantic_bonus_weight", 1.0)) * semantic_deficit_reduction
+
+    result = dict(base)
+    result["utility"] = utility
+    result["semantic_match_level"] = semantic_match_level
+    result["semantic_deficit_reduction"] = semantic_deficit_reduction
+    result["semantic_hard_constraint_active"] = hard_constraint_active
+    result["semantic_total_remaining_deficits"] = total_remaining_deficits
+    return result
+
+
 def _rule_utility(
     rule: Dict[str, Any],
     covered_positive_ids: Set[str],
     family_counts: Dict[str, int],
+    selected_semantic_families: Dict[str, Set[str]],
+    remaining_slots: int,
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
     score_mode = str(cfg.get("score_mode", "legacy_diverse_positive_coverage"))
@@ -202,6 +303,15 @@ def _rule_utility(
         return _legacy_diverse_utility(rule, covered_positive_ids, family_counts, cfg)
     if score_mode == "coverage_family_aware":
         return _coverage_family_aware_utility(rule, covered_positive_ids, family_counts, cfg)
+    if score_mode == "semantic_constrained_diverse":
+        return _semantic_constrained_diverse_utility(
+            rule,
+            covered_positive_ids,
+            family_counts,
+            selected_semantic_families,
+            remaining_slots,
+            cfg,
+        )
     raise ValueError(f"Unsupported diverse final rule score_mode: {score_mode}")
 
 
@@ -236,16 +346,25 @@ def process_rules(
     selected_rule_ids: Set[str] = set()
     covered_positive_ids: Set[str] = set()
     family_counts: Dict[str, int] = {}
+    selected_semantic_families: Dict[str, Set[str]] = {}
 
     while len(selected_rules) < max(0, top_k):
         best_rule: Optional[Dict[str, Any]] = None
         best_trace: Optional[Dict[str, Any]] = None
+        remaining_slots = max(0, top_k - len(selected_rules))
 
         for rule in candidate_rules:
             rule_id = str(rule.get("rule_id", ""))
             if rule_id in selected_rule_ids:
                 continue
-            utility = _rule_utility(rule, covered_positive_ids, family_counts, cfg)
+            utility = _rule_utility(
+                rule,
+                covered_positive_ids,
+                family_counts,
+                selected_semantic_families,
+                remaining_slots,
+                cfg,
+            )
             trace = {
                 "rule_id": rule_id,
                 "clause": str(rule.get("clause", "")),
@@ -259,6 +378,10 @@ def process_rules(
                 "overlap_penalty_value": float(utility["overlap_penalty_value"]),
                 "family_penalty_value": float(utility["family_penalty_value"]),
                 "negative_support_penalty_value": float(utility["negative_support_penalty"]),
+                "semantic_match_level": str(utility.get("semantic_match_level", "no_match")),
+                "semantic_deficit_reduction": int(utility.get("semantic_deficit_reduction", 0)),
+                "semantic_hard_constraint_active": bool(utility.get("semantic_hard_constraint_active", False)),
+                "semantic_total_remaining_deficits": int(utility.get("semantic_total_remaining_deficits", 0)),
                 "confidence": float(rule.get("confidence", 0.0)),
                 "positive_support": int(rule.get("positive_support", 0)),
                 "negative_support": int(rule.get("negative_support", 0)),
@@ -305,12 +428,17 @@ def process_rules(
         selected_rule["selection_overlap_penalty_value"] = float(best_trace["overlap_penalty_value"])
         selected_rule["selection_family_penalty_value"] = float(best_trace["family_penalty_value"])
         selected_rule["selection_negative_support_penalty_value"] = float(best_trace["negative_support_penalty_value"])
+        selected_rule["selection_semantic_match_level"] = str(best_trace["semantic_match_level"])
+        selected_rule["selection_semantic_deficit_reduction"] = int(best_trace["semantic_deficit_reduction"])
         selected_rules.append(selected_rule)
 
         selected_rule_ids.add(str(best_rule.get("rule_id", "")))
         covered_positive_ids.update(best_trace["new_positive_ids"])
         family_signature = str(best_trace["family_signature"])
         family_counts[family_signature] = family_counts.get(family_signature, 0) + 1
+        semantic_match_level = str(best_trace["semantic_match_level"])
+        if semantic_match_level != "no_match":
+            selected_semantic_families.setdefault(semantic_match_level, set()).add(family_signature)
 
         selection_trace.append(
             {
@@ -327,6 +455,8 @@ def process_rules(
                 "overlap_penalty_value": float(best_trace["overlap_penalty_value"]),
                 "family_penalty_value": float(best_trace["family_penalty_value"]),
                 "negative_support_penalty_value": float(best_trace["negative_support_penalty_value"]),
+                "semantic_match_level": semantic_match_level,
+                "semantic_deficit_reduction": int(best_trace["semantic_deficit_reduction"]),
                 "cumulative_positive_coverage": len(covered_positive_ids),
             }
         )
@@ -339,6 +469,10 @@ def process_rules(
         "num_final_rules": len(selected_rules),
         "num_distinct_families": len(family_counts),
         "covered_training_positive_examples": len(covered_positive_ids),
+        "selected_semantic_family_counts": {
+            match_level: len(families)
+            for match_level, families in sorted(selected_semantic_families.items())
+        },
         "final_rules": selected_rules,
         "selection_trace": selection_trace,
     }
@@ -369,6 +503,8 @@ def process_rules(
                 "selection_overlap_penalty_value",
                 "selection_family_penalty_value",
                 "selection_negative_support_penalty_value",
+                "selection_semantic_match_level",
+                "selection_semantic_deficit_reduction",
             ],
         )
         writer.writeheader()
@@ -394,6 +530,8 @@ def process_rules(
                     "selection_overlap_penalty_value": rule.get("selection_overlap_penalty_value", 0.0),
                     "selection_family_penalty_value": rule.get("selection_family_penalty_value", 0.0),
                     "selection_negative_support_penalty_value": rule.get("selection_negative_support_penalty_value", 0.0),
+                    "selection_semantic_match_level": rule.get("selection_semantic_match_level", ""),
+                    "selection_semantic_deficit_reduction": rule.get("selection_semantic_deficit_reduction", 0),
                 }
             )
 

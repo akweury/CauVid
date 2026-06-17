@@ -37,7 +37,7 @@ from src.exp_driving_videos.modules.vehicle_rule_diagnostic_driving_mini import 
 
 
 _FN_DIAGNOSTIC_VERSION = 1
-_SELECTOR_ORDER = ["original", "diverse", "coverage_family_aware"]
+_SELECTOR_ORDER = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
 _CATEGORY_ORDER = [
     "covered_by_unselected_candidate_rule",
     "vehicle_context_but_no_selected_rule",

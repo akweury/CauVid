@@ -40,6 +40,9 @@ Steps:
     17B. diverse_final_rules_driving_mini — greedily choose a diverse final
                     rule set that expands positive coverage while penalizing
                     overlap and repeated rule families.
+    17B2. semantic_constrained_diverse_final_rules_driving_mini — greedy
+                    positive-coverage selection with semantic minimums for
+                    vehicle/near/centered-related rule families.
     17C. coverage_family_aware_final_rules_driving_mini — greedily choose a
                     coverage-aware final rule set using rule quality
                     confidence * log(1 + positive_support) together with
@@ -359,6 +362,40 @@ def _get_diverse_final_rules_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_semantic_constrained_diverse_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_k": 50,
+        "score_mode": "semantic_constrained_diverse",
+        "selection_method_name": "semantic_constrained_diverse",
+        "output_prefix": "semantic_constrained_diverse_final_rules",
+        "new_positive_weight": 1.0,
+        "confidence_weight": 0.25,
+        "overlap_penalty": 0.35,
+        "family_penalty": 0.75,
+        "negative_support_penalty": 0.1,
+        "semantic_bonus_weight": 1.5,
+        "semantic_hard_constraints": True,
+        "semantic_min_family_counts": {
+            "vehicle_centered_partial": 2,
+            "near_centered_partial": 2,
+            "vehicle_near_partial": 2,
+            "exact_vehicle_near_centered": 1,
+        },
+        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+        "near_states": ["near"],
+        "center_states": ["centered"],
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("semantic_constrained_diverse_final_rules", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load semantic constrained diverse config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "top_k": 50,
@@ -471,6 +508,7 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         "extended_rules": True,
         "final_rules": True,
         "diverse_final_rules": True,
+        "semantic_constrained_diverse_final_rules": True,
         "coverage_family_aware_final_rules": True,
         "rule_evaluation": True,
         "error_and_explainability_analysis": True,
@@ -550,6 +588,12 @@ def _get_error_and_explainability_output_root() -> Path:
 
 def _get_coverage_family_aware_final_rules_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "17c_driving_mini_coverage_family_aware_final_rules"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_semantic_constrained_diverse_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "17b2_driving_mini_semantic_constrained_diverse_final_rules"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -1251,6 +1295,21 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"Selected {diverse_final_rule_results.get('num_final_rules', 0)} rule(s)."
     )
 
+    # Step 17B2: semantic constrained diverse rule selection
+    semantic_constrained_diverse_cfg = _get_semantic_constrained_diverse_cfg()
+    print("\n=== Step 17B2: semantic_constrained_diverse_final_rules_driving_mini ===")
+    print(f"Semantic constrained diverse cfg: {semantic_constrained_diverse_cfg}")
+    semantic_constrained_diverse_rule_results: Dict[str, Any] = diverse_final_rules_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        cfg=semantic_constrained_diverse_cfg,
+        output_root=_get_semantic_constrained_diverse_output_root(),
+        force_recompute=bool(recompute_cfg.get("semantic_constrained_diverse_final_rules", True)),
+    )
+    print(
+        "Semantic constrained diverse rule selection complete. "
+        f"Selected {semantic_constrained_diverse_rule_results.get('num_final_rules', 0)} rule(s)."
+    )
+
     # Step 17C: coverage-aware / family-aware post-mining rule selection
     coverage_family_aware_cfg = _get_coverage_family_aware_final_rules_cfg()
     print("\n=== Step 17C: coverage_family_aware_final_rules_driving_mini ===")
@@ -1272,9 +1331,9 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print(f"Rule evaluation cfg: {rule_evaluation_cfg}")
     rule_set_mode = str(rule_evaluation_cfg.get("rule_set_mode", "all"))
     primary_rule_set = str(rule_evaluation_cfg.get("primary_rule_set", "original"))
-    if rule_set_mode not in {"original", "diverse", "coverage_family_aware", "both", "all"}:
+    if rule_set_mode not in {"original", "diverse", "semantic_constrained_diverse", "coverage_family_aware", "both", "all"}:
         raise ValueError(f"Unsupported rule_evaluation.rule_set_mode: {rule_set_mode}")
-    if primary_rule_set not in {"original", "diverse", "coverage_family_aware"}:
+    if primary_rule_set not in {"original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"}:
         raise ValueError(f"Unsupported rule_evaluation.primary_rule_set: {primary_rule_set}")
     if rule_set_mode not in {"both", "all"} and primary_rule_set != rule_set_mode:
         primary_rule_set = rule_set_mode
@@ -1282,12 +1341,13 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     rule_results_by_name: Dict[str, Dict[str, Any]] = {
         "original": final_rule_results,
         "diverse": diverse_final_rule_results,
+        "semantic_constrained_diverse": semantic_constrained_diverse_rule_results,
         "coverage_family_aware": coverage_family_aware_rule_results,
     }
     if rule_set_mode == "both":
         evaluation_rule_sets = ["original", "diverse"]
     elif rule_set_mode == "all":
-        evaluation_rule_sets = ["original", "diverse", "coverage_family_aware"]
+        evaluation_rule_sets = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
     else:
         evaluation_rule_sets = [rule_set_mode]
     if primary_rule_set not in evaluation_rule_sets:
@@ -1496,6 +1556,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         extended_rule_results=extended_rule_results,
         original_final_rule_results=final_rule_results,
         diverse_final_rule_results=diverse_final_rule_results,
+        semantic_constrained_diverse_final_rule_results=semantic_constrained_diverse_rule_results,
         coverage_family_aware_final_rule_results=coverage_family_aware_rule_results,
         eval_temporal_rule_results=eval_temporal_rule_results,
         evaluation_results_by_name=evaluation_results_by_name,

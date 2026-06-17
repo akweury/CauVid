@@ -30,15 +30,17 @@ import config
 
 
 _VISUALIZATION_VERSION = 1
-_SELECTOR_ORDER = ["original", "diverse", "coverage_family_aware"]
+_SELECTOR_ORDER = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
 _SELECTOR_LABELS = {
     "original": "Original",
     "diverse": "Diverse",
+    "semantic_constrained_diverse": "Semantic Constrained",
     "coverage_family_aware": "Coverage/Family Aware",
 }
 _SELECTOR_COLORS = {
     "original": "#264653",
     "diverse": "#2a9d8f",
+    "semantic_constrained_diverse": "#e9c46a",
     "coverage_family_aware": "#e76f51",
 }
 _MATCH_LEVEL_ORDER = [
@@ -336,6 +338,7 @@ def _plot_vehicle_family_coverage(
     selector_pool_names = {
         "original": "selected_original",
         "diverse": "selected_diverse",
+        "semantic_constrained_diverse": "selected_semantic_constrained_diverse",
         "coverage_family_aware": "selected_coverage_family_aware",
     }
 

@@ -71,6 +71,7 @@ pipeline_recompute:
   extended_rules: true
   final_rules: true
   diverse_final_rules: true
+  semantic_constrained_diverse_final_rules: true
   coverage_family_aware_final_rules: true
   rule_evaluation: true
   error_and_explainability_analysis: true
@@ -116,6 +117,27 @@ diverse_final_rules:
   overlap_penalty: 0.35
   family_penalty: 0.75
   negative_support_penalty: 0.1
+
+semantic_constrained_diverse_final_rules:
+  score_mode: semantic_constrained_diverse
+  selection_method_name: semantic_constrained_diverse
+  output_prefix: semantic_constrained_diverse_final_rules
+  top_k: 50
+  new_positive_weight: 1.0
+  confidence_weight: 0.25
+  overlap_penalty: 0.35
+  family_penalty: 0.75
+  negative_support_penalty: 0.1
+  semantic_bonus_weight: 1.5
+  semantic_hard_constraints: true
+  semantic_min_family_counts:
+    vehicle_centered_partial: 2
+    near_centered_partial: 2
+    vehicle_near_partial: 2
+    exact_vehicle_near_centered: 1
+  vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
+  near_states: [near]
+  center_states: [centered]
 
 coverage_family_aware_final_rules:
   score_mode: coverage_family_aware
