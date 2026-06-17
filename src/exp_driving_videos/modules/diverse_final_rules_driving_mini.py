@@ -31,7 +31,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_DIVERSE_FINAL_RULES_VERSION = 3
+_DIVERSE_FINAL_RULES_VERSION = 4
 
 
 def get_output_root() -> Path:
@@ -57,6 +57,9 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "negative_support_penalty": float(cfg.get("negative_support_penalty", 0.1)),
         "semantic_hard_constraints": bool(cfg.get("semantic_hard_constraints", False)),
         "semantic_bonus_weight": float(cfg.get("semantic_bonus_weight", 1.0)),
+        "semantic_min_positive_support": int(cfg.get("semantic_min_positive_support", 1)),
+        "semantic_min_total_support": int(cfg.get("semantic_min_total_support", 1)),
+        "semantic_min_confidence": float(cfg.get("semantic_min_confidence", 0.0)),
         "semantic_min_family_counts": {
             str(key): int(value)
             for key, value in sorted(dict(semantic_min_family_counts).items())
@@ -244,11 +247,10 @@ def _coverage_family_aware_utility(
 
 def _semantic_family_deficits(
     selected_semantic_families: Dict[str, Set[str]],
-    cfg: Dict[str, Any],
+    effective_semantic_min_family_counts: Dict[str, int],
 ) -> Dict[str, int]:
-    raw_counts = dict(cfg.get("semantic_min_family_counts", {}))
     deficits: Dict[str, int] = {}
-    for match_level, min_count in raw_counts.items():
+    for match_level, min_count in effective_semantic_min_family_counts.items():
         required = max(0, int(min_count))
         if required <= 0:
             continue
@@ -257,22 +259,64 @@ def _semantic_family_deficits(
     return deficits
 
 
+def _rule_is_semantic_quota_qualified(rule: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    positive_support = max(0, int(rule.get("positive_support", 0)))
+    total_support = max(0, int(rule.get("total_support", positive_support + max(0, int(rule.get("negative_support", 0))))))
+    confidence = max(0.0, float(rule.get("confidence", 0.0)))
+    return (
+        positive_support >= int(cfg.get("semantic_min_positive_support", 1))
+        and total_support >= int(cfg.get("semantic_min_total_support", 1))
+        and confidence >= float(cfg.get("semantic_min_confidence", 0.0))
+    )
+
+
+def _effective_semantic_min_family_counts(
+    candidate_rules: Sequence[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, int]:
+    requested_counts = {
+        str(match_level): max(0, int(min_count))
+        for match_level, min_count in dict(cfg.get("semantic_min_family_counts", {})).items()
+        if int(min_count) > 0
+    }
+    qualified_families_by_level: Dict[str, Set[str]] = {}
+    for rule in candidate_rules:
+        if not _rule_is_semantic_quota_qualified(rule, cfg):
+            continue
+        semantic_match_level = _rule_vehicle_match_level(rule, cfg)
+        if semantic_match_level == "no_match":
+            continue
+        qualified_families_by_level.setdefault(semantic_match_level, set()).add(_rule_family_signature(rule))
+
+    return {
+        match_level: min(requested_count, len(qualified_families_by_level.get(match_level, set())))
+        for match_level, requested_count in requested_counts.items()
+    }
+
+
 def _semantic_constrained_diverse_utility(
     rule: Dict[str, Any],
     covered_positive_ids: Set[str],
     family_counts: Dict[str, int],
-    selected_semantic_families: Dict[str, Set[str]],
+    selected_qualified_semantic_families: Dict[str, Set[str]],
+    effective_semantic_min_family_counts: Dict[str, int],
     remaining_slots: int,
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
     base = _legacy_diverse_utility(rule, covered_positive_ids, family_counts, cfg)
     family_signature = str(base["family_signature"])
     semantic_match_level = _rule_vehicle_match_level(rule, cfg)
-    deficits = _semantic_family_deficits(selected_semantic_families, cfg)
+    semantic_is_quota_qualified = _rule_is_semantic_quota_qualified(rule, cfg)
+    deficits = _semantic_family_deficits(selected_qualified_semantic_families, effective_semantic_min_family_counts)
     total_remaining_deficits = sum(deficits.values())
-    already_selected_for_level = family_signature in selected_semantic_families.get(semantic_match_level, set())
+    already_selected_for_level = family_signature in selected_qualified_semantic_families.get(semantic_match_level, set())
     semantic_deficit_reduction = 0
-    if semantic_match_level in deficits and deficits[semantic_match_level] > 0 and not already_selected_for_level:
+    if (
+        semantic_is_quota_qualified
+        and semantic_match_level in deficits
+        and deficits[semantic_match_level] > 0
+        and not already_selected_for_level
+    ):
         semantic_deficit_reduction = 1
 
     hard_constraint_active = bool(cfg.get("semantic_hard_constraints", False)) and remaining_slots <= total_remaining_deficits and total_remaining_deficits > 0
@@ -284,6 +328,7 @@ def _semantic_constrained_diverse_utility(
     result = dict(base)
     result["utility"] = utility
     result["semantic_match_level"] = semantic_match_level
+    result["semantic_is_quota_qualified"] = semantic_is_quota_qualified
     result["semantic_deficit_reduction"] = semantic_deficit_reduction
     result["semantic_hard_constraint_active"] = hard_constraint_active
     result["semantic_total_remaining_deficits"] = total_remaining_deficits
@@ -294,7 +339,8 @@ def _rule_utility(
     rule: Dict[str, Any],
     covered_positive_ids: Set[str],
     family_counts: Dict[str, int],
-    selected_semantic_families: Dict[str, Set[str]],
+    selected_qualified_semantic_families: Dict[str, Set[str]],
+    effective_semantic_min_family_counts: Dict[str, int],
     remaining_slots: int,
     cfg: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -308,7 +354,8 @@ def _rule_utility(
             rule,
             covered_positive_ids,
             family_counts,
-            selected_semantic_families,
+            selected_qualified_semantic_families,
+            effective_semantic_min_family_counts,
             remaining_slots,
             cfg,
         )
@@ -347,6 +394,8 @@ def process_rules(
     covered_positive_ids: Set[str] = set()
     family_counts: Dict[str, int] = {}
     selected_semantic_families: Dict[str, Set[str]] = {}
+    selected_qualified_semantic_families: Dict[str, Set[str]] = {}
+    effective_semantic_min_family_counts = _effective_semantic_min_family_counts(candidate_rules, cfg)
 
     while len(selected_rules) < max(0, top_k):
         best_rule: Optional[Dict[str, Any]] = None
@@ -361,7 +410,8 @@ def process_rules(
                 rule,
                 covered_positive_ids,
                 family_counts,
-                selected_semantic_families,
+                selected_qualified_semantic_families,
+                effective_semantic_min_family_counts,
                 remaining_slots,
                 cfg,
             )
@@ -379,6 +429,7 @@ def process_rules(
                 "family_penalty_value": float(utility["family_penalty_value"]),
                 "negative_support_penalty_value": float(utility["negative_support_penalty"]),
                 "semantic_match_level": str(utility.get("semantic_match_level", "no_match")),
+                "semantic_is_quota_qualified": bool(utility.get("semantic_is_quota_qualified", False)),
                 "semantic_deficit_reduction": int(utility.get("semantic_deficit_reduction", 0)),
                 "semantic_hard_constraint_active": bool(utility.get("semantic_hard_constraint_active", False)),
                 "semantic_total_remaining_deficits": int(utility.get("semantic_total_remaining_deficits", 0)),
@@ -429,6 +480,7 @@ def process_rules(
         selected_rule["selection_family_penalty_value"] = float(best_trace["family_penalty_value"])
         selected_rule["selection_negative_support_penalty_value"] = float(best_trace["negative_support_penalty_value"])
         selected_rule["selection_semantic_match_level"] = str(best_trace["semantic_match_level"])
+        selected_rule["selection_semantic_is_quota_qualified"] = bool(best_trace["semantic_is_quota_qualified"])
         selected_rule["selection_semantic_deficit_reduction"] = int(best_trace["semantic_deficit_reduction"])
         selected_rules.append(selected_rule)
 
@@ -439,6 +491,8 @@ def process_rules(
         semantic_match_level = str(best_trace["semantic_match_level"])
         if semantic_match_level != "no_match":
             selected_semantic_families.setdefault(semantic_match_level, set()).add(family_signature)
+            if bool(best_trace["semantic_is_quota_qualified"]):
+                selected_qualified_semantic_families.setdefault(semantic_match_level, set()).add(family_signature)
 
         selection_trace.append(
             {
@@ -456,6 +510,7 @@ def process_rules(
                 "family_penalty_value": float(best_trace["family_penalty_value"]),
                 "negative_support_penalty_value": float(best_trace["negative_support_penalty_value"]),
                 "semantic_match_level": semantic_match_level,
+                "semantic_is_quota_qualified": bool(best_trace["semantic_is_quota_qualified"]),
                 "semantic_deficit_reduction": int(best_trace["semantic_deficit_reduction"]),
                 "cumulative_positive_coverage": len(covered_positive_ids),
             }
@@ -469,9 +524,14 @@ def process_rules(
         "num_final_rules": len(selected_rules),
         "num_distinct_families": len(family_counts),
         "covered_training_positive_examples": len(covered_positive_ids),
+        "effective_semantic_min_family_counts": effective_semantic_min_family_counts,
         "selected_semantic_family_counts": {
             match_level: len(families)
             for match_level, families in sorted(selected_semantic_families.items())
+        },
+        "selected_qualified_semantic_family_counts": {
+            match_level: len(families)
+            for match_level, families in sorted(selected_qualified_semantic_families.items())
         },
         "final_rules": selected_rules,
         "selection_trace": selection_trace,
@@ -504,6 +564,7 @@ def process_rules(
                 "selection_family_penalty_value",
                 "selection_negative_support_penalty_value",
                 "selection_semantic_match_level",
+                "selection_semantic_is_quota_qualified",
                 "selection_semantic_deficit_reduction",
             ],
         )
@@ -531,6 +592,7 @@ def process_rules(
                     "selection_family_penalty_value": rule.get("selection_family_penalty_value", 0.0),
                     "selection_negative_support_penalty_value": rule.get("selection_negative_support_penalty_value", 0.0),
                     "selection_semantic_match_level": rule.get("selection_semantic_match_level", ""),
+                    "selection_semantic_is_quota_qualified": rule.get("selection_semantic_is_quota_qualified", False),
                     "selection_semantic_deficit_reduction": rule.get("selection_semantic_deficit_reduction", 0),
                 }
             )

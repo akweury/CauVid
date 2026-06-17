@@ -375,6 +375,9 @@ def _get_semantic_constrained_diverse_cfg() -> Dict[str, Any]:
         "negative_support_penalty": 0.1,
         "semantic_bonus_weight": 1.5,
         "semantic_hard_constraints": True,
+        "semantic_min_positive_support": 2,
+        "semantic_min_total_support": 2,
+        "semantic_min_confidence": 0.6,
         "semantic_min_family_counts": {
             "vehicle_centered_partial": 2,
             "near_centered_partial": 2,
