@@ -1,13 +1,19 @@
 """
-Generate rule-selection comparison plots from step 18/19/20 summary artifacts.
+Generate publication-style rule-selection comparison plots from step 18/19/20
+summary artifacts.
 
 Outputs:
     pipeline_output/21_rule_selection_visualization/
-        selector_metrics.png
-        fn_comparison.png
-        rule_family_composition.png
-        confidence_vs_positive_support.png
-        vehicle_family_coverage.png
+        selector_metrics.png/.pdf
+        selector_metrics_data.csv
+        fn_comparison.png/.pdf
+        fn_comparison_data.csv
+        rule_family_composition.png/.pdf
+        rule_family_composition_data.csv
+        confidence_vs_positive_support.png/.pdf
+        confidence_vs_positive_support_data.csv
+        vehicle_family_coverage.png/.pdf
+        vehicle_family_coverage_data.csv
         rule_selection_visualization_manifest.json
 """
 
@@ -15,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -29,7 +36,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_VISUALIZATION_VERSION = 1
+_VISUALIZATION_VERSION = 2
 _SELECTOR_ORDER = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
 _SELECTOR_LABELS = {
     "original": "Original",
@@ -61,6 +68,34 @@ _MATCH_LEVEL_LABELS = {
     "near_only": "near",
     "centered_only": "centered",
 }
+_COARSE_FAMILY_ORDER = [
+    "centered",
+    "near",
+    "vehicle",
+    "near+centered",
+    "vehicle+centered",
+    "vehicle+near",
+    "vehicle+near+centered",
+    "generic motion/object",
+    "other",
+]
+_COARSE_FAMILY_COLORS = {
+    "centered": "#90be6d",
+    "near": "#43aa8b",
+    "vehicle": "#4d908e",
+    "near+centered": "#577590",
+    "vehicle+centered": "#277da1",
+    "vehicle+near": "#f8961e",
+    "vehicle+near+centered": "#f3722c",
+    "generic motion/object": "#8d99ae",
+    "other": "#ced4da",
+}
+_EXPLICIT_MATCH_LEVELS = {
+    "vehicle_centered_partial",
+    "near_centered_partial",
+    "vehicle_near_partial",
+    "exact_vehicle_near_centered",
+}
 
 
 def get_output_root() -> Path:
@@ -85,6 +120,14 @@ def _read_json(path: Path) -> Dict[str, Any]:
 def _read_csv(path: Path) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8", newline="") as fh:
         return [dict(row) for row in csv.DictReader(fh)]
+
+
+def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -139,21 +182,71 @@ def _selector_rule_eval_rows(step18_root: Path, primary_rule_set: str, selector_
     return _read_csv(path)
 
 
-def _load_vehicle_context_totals(eval_context_rows: Sequence[Dict[str, Any]], selector_name: str) -> Tuple[int, int]:
-    total_positive = 0
-    predicted_positive = 0
-    predicted_field = f"predicted_positive_{selector_name}"
-    for row in eval_context_rows:
-        total_positive += _safe_int(row.get("num_vehicle_near_centered_positive_examples", 0))
-        predicted_positive += _safe_int(row.get(predicted_field, 0))
-    return total_positive, predicted_positive
+def _figure_paths(out_root: Path, figure_name: str) -> Dict[str, Path]:
+    return {
+        "png": out_root / f"{figure_name}.png",
+        "pdf": out_root / f"{figure_name}.pdf",
+        "csv": out_root / f"{figure_name}_data.csv",
+    }
+
+
+def _save_figure(fig: Any, output_paths: Dict[str, Path], dpi: int) -> None:
+    fig.savefig(output_paths["png"], dpi=dpi, bbox_inches="tight")
+    fig.savefig(output_paths["pdf"], bbox_inches="tight")
+
+
+def _coarse_semantic_family(predicate_signature: str) -> str:
+    predicates = {part.strip() for part in str(predicate_signature).split("|") if part.strip()}
+    has_vehicle = "object_class" in predicates
+    has_near = "object_distance_state" in predicates
+    has_centered = "object_x_position_state" in predicates
+    if has_vehicle and has_near and has_centered:
+        return "vehicle+near+centered"
+    if has_vehicle and has_near:
+        return "vehicle+near"
+    if has_vehicle and has_centered:
+        return "vehicle+centered"
+    if has_near and has_centered:
+        return "near+centered"
+    if has_vehicle:
+        return "vehicle"
+    if has_near:
+        return "near"
+    if has_centered:
+        return "centered"
+    if any(predicate.startswith("object_") or predicate.startswith("segment_") for predicate in predicates):
+        return "generic motion/object"
+    return "other"
+
+
+def _vehicle_centered_fn_count(vehicle_manifest: Dict[str, Any], selector_name: str) -> int:
+    key = f"vehicle_centered_fn_{selector_name}"
+    return _safe_int(vehicle_manifest.get(key, 0))
+
+
+def _explicit_vehicle_rule_count(
+    pool_summary_rows: Sequence[Dict[str, Any]],
+    selector_name: str,
+) -> int:
+    selector_pool_names = {
+        "original": "selected_original",
+        "diverse": "selected_diverse",
+        "semantic_constrained_diverse": "selected_semantic_constrained_diverse",
+        "coverage_family_aware": "selected_coverage_family_aware",
+    }
+    pool_name = selector_pool_names[selector_name]
+    return sum(
+        _safe_int(row.get("num_rules", 0))
+        for row in pool_summary_rows
+        if str(row.get("pool_name", "")) == pool_name and str(row.get("match_level", "")) in _EXPLICIT_MATCH_LEVELS
+    )
 
 
 def _plot_selector_metrics(
     comparison_rows: Sequence[Dict[str, Any]],
-    figure_path: Path,
+    output_paths: Dict[str, Path],
     dpi: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -164,7 +257,17 @@ def _plot_selector_metrics(
     width = 0.22
     metric_names = ["precision", "recall", "f1"]
     metric_offsets = [-width, 0.0, width]
-    metric_colors = ["#457b9d", "#2a9d8f", "#e76f51"]
+    metric_colors = ["#355070", "#43aa8b", "#bc4749"]
+    data_rows = [
+        {
+            "selector_name": row["rule_set_name"],
+            "selector_label": _SELECTOR_LABELS.get(row["rule_set_name"], row["rule_set_name"]),
+            "precision": _safe_float(row.get("precision", 0.0)),
+            "recall": _safe_float(row.get("recall", 0.0)),
+            "f1": _safe_float(row.get("f1", 0.0)),
+        }
+        for row in comparison_rows
+    ]
 
     fig, ax = plt.subplots(figsize=(10, 5.5))
     for metric_name, offset, metric_color in zip(metric_names, metric_offsets, metric_colors):
@@ -172,24 +275,26 @@ def _plot_selector_metrics(
         positions = [x + offset for x in x_positions]
         bars = ax.bar(positions, values, width=width, color=metric_color, label=metric_name.upper())
         for bar, value in zip(bars, values):
-            ax.text(bar.get_x() + bar.get_width() / 2.0, min(1.02, value + 0.02), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+            ax.text(bar.get_x() + bar.get_width() / 2.0, min(1.015, value + 0.018), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
 
     ax.set_xticks(x_positions, [_SELECTOR_LABELS.get(name, name) for name in selectors])
-    ax.set_ylim(0.0, 1.08)
+    ax.set_ylim(0.0, 1.06)
     ax.set_ylabel("Score")
-    ax.set_title("Selector Comparison: Precision / Recall / F1", loc="left", fontweight="bold")
-    ax.legend(frameon=False)
+    ax.set_title("Held-Out Rule-Selection Performance", loc="left", fontweight="bold")
+    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.08))
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    fig.savefig(figure_path, dpi=dpi, bbox_inches="tight")
+    _save_figure(fig, output_paths, dpi)
     plt.close(fig)
+    _write_csv(output_paths["csv"], ["selector_name", "selector_label", "precision", "recall", "f1"], data_rows)
+    return data_rows
 
 
 def _plot_fn_metrics(
     comparison_rows: Sequence[Dict[str, Any]],
-    figure_path: Path,
+    output_paths: Dict[str, Path],
     dpi: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -198,137 +303,205 @@ def _plot_fn_metrics(
     selectors = [row["rule_set_name"] for row in comparison_rows]
     labels = [_SELECTOR_LABELS.get(name, name) for name in selectors]
     fn_counts = [_safe_int(row.get("num_fn_examples", 0)) for row in comparison_rows]
+    fp_counts = [_safe_int(row.get("num_fp_examples", 0)) for row in comparison_rows]
     fn_recovery = [_safe_float(row.get("fn_coverage_vs_original", 0.0)) for row in comparison_rows]
     colors = [_SELECTOR_COLORS.get(name, "#888888") for name in selectors]
+    data_rows = [
+        {
+            "selector_name": selector_name,
+            "selector_label": label,
+            "num_fn_examples": fn_count,
+            "num_fp_examples": fp_count,
+            "fn_recovery_vs_original": recovery,
+        }
+        for selector_name, label, fn_count, fp_count, recovery in zip(selectors, labels, fn_counts, fp_counts, fn_recovery)
+    ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.9))
+    x_positions = list(range(len(labels)))
+    width = 0.34
 
-    bars = axes[0].bar(labels, fn_counts, color=colors)
-    axes[0].set_title("False Negatives", loc="left", fontweight="bold")
+    fn_bars = axes[0].bar([x - width / 2.0 for x in x_positions], fn_counts, width=width, color="#bc4749", label="FN")
+    fp_bars = axes[0].bar([x + width / 2.0 for x in x_positions], fp_counts, width=width, color="#577590", label="FP")
+    axes[0].set_xticks(x_positions, labels)
     axes[0].set_ylabel("Count")
+    axes[0].set_title("False-Negative and False-Positive Counts", loc="left", fontweight="bold")
+    axes[0].legend(frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.08))
     axes[0].grid(axis="y", alpha=0.2)
-    for bar, value in zip(bars, fn_counts):
-        axes[0].text(bar.get_x() + bar.get_width() / 2.0, value + 0.2, str(value), ha="center", va="bottom", fontsize=9)
+    for bars in [fn_bars, fp_bars]:
+        for bar in bars:
+            value = int(round(bar.get_height()))
+            axes[0].text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() + 0.2, str(value), ha="center", va="bottom", fontsize=9)
 
     bars = axes[1].bar(labels, fn_recovery, color=colors)
-    axes[1].set_title("FN Recovery Vs Original", loc="left", fontweight="bold")
+    axes[1].set_title("False-Negative Recovery Relative to Original", loc="left", fontweight="bold")
     axes[1].set_ylabel("Recovered Fraction")
-    axes[1].set_ylim(0.0, 1.08)
+    axes[1].set_ylim(0.0, 1.06)
     axes[1].grid(axis="y", alpha=0.2)
     for bar, value in zip(bars, fn_recovery):
-        axes[1].text(bar.get_x() + bar.get_width() / 2.0, min(1.02, value + 0.02), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+        axes[1].text(bar.get_x() + bar.get_width() / 2.0, min(1.015, value + 0.018), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
 
     fig.tight_layout()
-    fig.savefig(figure_path, dpi=dpi, bbox_inches="tight")
+    _save_figure(fig, output_paths, dpi)
     plt.close(fig)
+    _write_csv(
+        output_paths["csv"],
+        ["selector_name", "selector_label", "num_fn_examples", "num_fp_examples", "fn_recovery_vs_original"],
+        data_rows,
+    )
+    return data_rows
 
 
 def _plot_rule_family_composition(
     family_rows_by_selector: Dict[str, List[Dict[str, Any]]],
-    figure_path: Path,
+    output_paths: Dict[str, Path],
     dpi: int,
-    top_rule_families: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    aggregate_counts: Dict[str, int] = {}
-    for rows in family_rows_by_selector.values():
-        for row in rows:
-            signature = str(row.get("predicate_signature", "unknown"))
-            aggregate_counts[signature] = aggregate_counts.get(signature, 0) + _safe_int(row.get("num_rules", 0))
-
-    top_signatures = [
-        signature
-        for signature, _count in sorted(aggregate_counts.items(), key=lambda item: (-item[1], item[0]))[: max(1, top_rule_families)]
-    ]
-    if not top_signatures:
-        top_signatures = ["no_families"]
-
     selectors = [name for name in _SELECTOR_ORDER if name in family_rows_by_selector]
     labels = [_SELECTOR_LABELS.get(name, name) for name in selectors]
-    colors = list(plt.cm.tab20.colors)
+    data_rows: List[Dict[str, Any]] = []
+    coarse_counts_by_selector: Dict[str, Dict[str, int]] = {}
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    for selector_name in selectors:
+        coarse_counts = {family_name: 0 for family_name in _COARSE_FAMILY_ORDER}
+        for row in family_rows_by_selector.get(selector_name, []):
+            coarse_family = _coarse_semantic_family(str(row.get("predicate_signature", "")))
+            coarse_counts[coarse_family] = coarse_counts.get(coarse_family, 0) + _safe_int(row.get("num_rules", 0))
+        coarse_counts_by_selector[selector_name] = coarse_counts
+        for coarse_family in _COARSE_FAMILY_ORDER:
+            data_rows.append(
+                {
+                    "selector_name": selector_name,
+                    "selector_label": _SELECTOR_LABELS.get(selector_name, selector_name),
+                    "coarse_family": coarse_family,
+                    "num_rules": coarse_counts.get(coarse_family, 0),
+                }
+            )
+
+    fig, ax = plt.subplots(figsize=(11.5, 5.8))
     bottoms = [0 for _ in selectors]
-    for idx, signature in enumerate(top_signatures):
-        values: List[int] = []
-        for selector_name in selectors:
-            rows = family_rows_by_selector.get(selector_name, [])
-            value = 0
-            for row in rows:
-                if str(row.get("predicate_signature", "")) == signature:
-                    value = _safe_int(row.get("num_rules", 0))
-                    break
-            values.append(value)
-        ax.bar(labels, values, bottom=bottoms, color=colors[idx % len(colors)], label=signature)
+    for coarse_family in _COARSE_FAMILY_ORDER:
+        values = [coarse_counts_by_selector[selector_name].get(coarse_family, 0) for selector_name in selectors]
+        ax.bar(
+            labels,
+            values,
+            bottom=bottoms,
+            color=_COARSE_FAMILY_COLORS.get(coarse_family, "#cccccc"),
+            label=coarse_family,
+        )
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
 
-    other_values: List[int] = []
-    for selector_name in selectors:
-        rows = family_rows_by_selector.get(selector_name, [])
-        total_rules = sum(_safe_int(row.get("num_rules", 0)) for row in rows)
-        top_rules = sum(
-            _safe_int(row.get("num_rules", 0))
-            for row in rows
-            if str(row.get("predicate_signature", "")) in top_signatures
-        )
-        other_values.append(max(0, total_rules - top_rules))
-    ax.bar(labels, other_values, bottom=bottoms, color="#d9d9d9", label="other")
-
-    ax.set_title("Selected Rule-Family Composition", loc="left", fontweight="bold")
+    ax.set_title("Selected Rule Composition by Coarse Semantic Family", loc="left", fontweight="bold")
     ax.set_ylabel("Selected Rules")
     ax.grid(axis="y", alpha=0.2)
-    ax.legend(frameon=False, fontsize=8, bbox_to_anchor=(1.02, 1.0), loc="upper left")
+    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.14))
     fig.tight_layout()
-    fig.savefig(figure_path, dpi=dpi, bbox_inches="tight")
+    _save_figure(fig, output_paths, dpi)
     plt.close(fig)
+    _write_csv(output_paths["csv"], ["selector_name", "selector_label", "coarse_family", "num_rules"], data_rows)
+    return data_rows
 
 
 def _plot_confidence_support_scatter(
     rule_eval_rows_by_selector: Dict[str, List[Dict[str, Any]]],
-    figure_path: Path,
+    output_paths: Dict[str, Path],
     dpi: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     selectors = [name for name in _SELECTOR_ORDER if name in rule_eval_rows_by_selector]
-    fig, axes = plt.subplots(1, max(1, len(selectors)), figsize=(5.2 * max(1, len(selectors)), 4.8), squeeze=False)
+    data_rows: List[Dict[str, Any]] = []
+    x_max = 0.0
+    y_min = 0.0
+    y_max = 1.0
+    size_max_source = 1
+
+    for selector_name in selectors:
+        for row in rule_eval_rows_by_selector.get(selector_name, []):
+            positive_support = max(0, _safe_int(row.get("positive_support", 0)))
+            confidence = _safe_float(row.get("confidence", 0.0))
+            eval_positive_support = max(0, _safe_int(row.get("eval_positive_support", 0)))
+            log_positive_support = math.log10(1.0 + positive_support)
+            size_max_source = max(size_max_source, eval_positive_support)
+            x_max = max(x_max, log_positive_support)
+            y_max = max(y_max, confidence)
+            data_rows.append(
+                {
+                    "selector_name": selector_name,
+                    "selector_label": _SELECTOR_LABELS.get(selector_name, selector_name),
+                    "rule_id": str(row.get("rule_id", "")),
+                    "positive_support": positive_support,
+                    "log10_positive_support": log_positive_support,
+                    "confidence": confidence,
+                    "eval_positive_support": eval_positive_support,
+                }
+            )
+
+    for row in data_rows:
+        bubble_size = 26.0 + 18.0 * math.sqrt(float(row["eval_positive_support"]))
+        row["bubble_size"] = min(220.0, bubble_size)
+
+    fig, axes = plt.subplots(1, max(1, len(selectors)), figsize=(5.0 * max(1, len(selectors)), 4.8), squeeze=False, sharex=True, sharey=True)
     axes_row = axes[0]
+    x_upper = max(0.2, x_max + 0.08)
+    y_upper = max(1.0, y_max + 0.03)
 
     for axis, selector_name in zip(axes_row, selectors):
-        rows = rule_eval_rows_by_selector.get(selector_name, [])
-        x_values = [_safe_int(row.get("positive_support", 0)) for row in rows]
-        y_values = [_safe_float(row.get("confidence", 0.0)) for row in rows]
-        sizes = [30 + 12 * _safe_int(row.get("eval_positive_support", 0)) for row in rows]
-        color = _SELECTOR_COLORS.get(selector_name, "#888888")
-        axis.scatter(x_values, y_values, s=sizes, alpha=0.55, color=color, edgecolors="white", linewidths=0.5)
+        rows = [row for row in data_rows if row["selector_name"] == selector_name]
+        axis.scatter(
+            [float(row["log10_positive_support"]) for row in rows],
+            [float(row["confidence"]) for row in rows],
+            s=[float(row["bubble_size"]) for row in rows],
+            alpha=0.58,
+            color=_SELECTOR_COLORS.get(selector_name, "#888888"),
+            edgecolors="white",
+            linewidths=0.5,
+        )
         axis.set_title(_SELECTOR_LABELS.get(selector_name, selector_name), loc="left", fontweight="bold")
-        axis.set_xlabel("Positive Support")
+        axis.set_xlabel(r"$\log_{10}(1 + \mathrm{positive\ support})$")
         axis.set_ylabel("Confidence")
-        axis.set_ylim(0.0, 1.05)
+        axis.set_xlim(0.0, x_upper)
+        axis.set_ylim(y_min, y_upper)
         axis.grid(alpha=0.2)
 
     for axis in axes_row[len(selectors):]:
         axis.axis("off")
 
-    fig.suptitle("Confidence Vs Positive Support", fontsize=14, fontweight="bold")
+    fig.suptitle("Selected Rule Confidence vs Training Support", fontsize=14, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    fig.savefig(figure_path, dpi=dpi, bbox_inches="tight")
+    _save_figure(fig, output_paths, dpi)
     plt.close(fig)
+    _write_csv(
+        output_paths["csv"],
+        [
+            "selector_name",
+            "selector_label",
+            "rule_id",
+            "positive_support",
+            "log10_positive_support",
+            "confidence",
+            "eval_positive_support",
+            "bubble_size",
+        ],
+        data_rows,
+    )
+    return data_rows
 
 
 def _plot_vehicle_family_coverage(
     pool_summary_rows: Sequence[Dict[str, Any]],
-    eval_context_rows: Sequence[Dict[str, Any]],
-    figure_path: Path,
+    vehicle_manifest: Dict[str, Any],
+    output_paths: Dict[str, Path],
     dpi: int,
-) -> None:
+) -> List[Dict[str, Any]]:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -341,12 +514,13 @@ def _plot_vehicle_family_coverage(
         "semantic_constrained_diverse": "selected_semantic_constrained_diverse",
         "coverage_family_aware": "selected_coverage_family_aware",
     }
+    labels = [_SELECTOR_LABELS.get(name, name) for name in selectors]
+    colors = list(plt.cm.Set2.colors) + list(plt.cm.Set3.colors)
+    data_rows: List[Dict[str, Any]] = []
 
     fig, axes = plt.subplots(1, 2, figsize=(13.5, 5.2))
 
-    labels = [_SELECTOR_LABELS.get(name, name) for name in selectors]
     bottoms = [0 for _ in selectors]
-    colors = list(plt.cm.Set2.colors) + list(plt.cm.Set3.colors)
     for idx, match_level in enumerate(_MATCH_LEVEL_ORDER):
         values: List[int] = []
         for selector_name in selectors:
@@ -357,29 +531,71 @@ def _plot_vehicle_family_coverage(
                     value = _safe_int(row.get("num_rules", 0))
                     break
             values.append(value)
+            data_rows.append(
+                {
+                    "selector_name": selector_name,
+                    "selector_label": _SELECTOR_LABELS.get(selector_name, selector_name),
+                    "series": "match_level_coverage",
+                    "category": match_level,
+                    "category_label": _MATCH_LEVEL_LABELS.get(match_level, match_level),
+                    "value": value,
+                }
+            )
         axes[0].bar(labels, values, bottom=bottoms, color=colors[idx % len(colors)], label=_MATCH_LEVEL_LABELS.get(match_level, match_level))
         bottoms = [bottom + value for bottom, value in zip(bottoms, values)]
 
     axes[0].set_title("Vehicle/Near/Centered Rule Coverage", loc="left", fontweight="bold")
     axes[0].set_ylabel("Selected Rules")
     axes[0].grid(axis="y", alpha=0.2)
-    axes[0].legend(frameon=False, fontsize=8, bbox_to_anchor=(1.02, 1.0), loc="upper left")
+    axes[0].legend(frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.14))
 
-    vehicle_recalls: List[float] = []
-    for selector_name in selectors:
-        total_positive, predicted_positive = _load_vehicle_context_totals(eval_context_rows, selector_name)
-        vehicle_recalls.append(float(predicted_positive / max(1, total_positive)))
-    bars = axes[1].bar(labels, vehicle_recalls, color=[_SELECTOR_COLORS.get(name, "#888888") for name in selectors])
-    axes[1].set_title("Vehicle-Centered Positive Recall", loc="left", fontweight="bold")
-    axes[1].set_ylabel("Recall")
-    axes[1].set_ylim(0.0, 1.08)
+    vehicle_centered_fn_counts = [_vehicle_centered_fn_count(vehicle_manifest, selector_name) for selector_name in selectors]
+    explicit_vehicle_rule_counts = [_explicit_vehicle_rule_count(pool_summary_rows, selector_name) for selector_name in selectors]
+    x_positions = list(range(len(labels)))
+    width = 0.34
+    fn_bars = axes[1].bar([x - width / 2.0 for x in x_positions], vehicle_centered_fn_counts, width=width, color="#bc4749", label="Vehicle-centered FN")
+    explicit_bars = axes[1].bar([x + width / 2.0 for x in x_positions], explicit_vehicle_rule_counts, width=width, color="#355070", label="Explicit vehicle rules")
+    axes[1].set_xticks(x_positions, labels)
+    axes[1].set_ylabel("Count")
+    axes[1].set_title("Vehicle-Centered Errors vs Explicit Rule Coverage", loc="left", fontweight="bold")
+    axes[1].legend(frameon=False, ncol=2, loc="upper center", bbox_to_anchor=(0.5, 1.08))
     axes[1].grid(axis="y", alpha=0.2)
-    for bar, value in zip(bars, vehicle_recalls):
-        axes[1].text(bar.get_x() + bar.get_width() / 2.0, min(1.02, value + 0.02), f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+    for bars in [fn_bars, explicit_bars]:
+        for bar in bars:
+            value = int(round(bar.get_height()))
+            axes[1].text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() + 0.2, str(value), ha="center", va="bottom", fontsize=9)
+
+    for selector_name, label, fn_count, explicit_count in zip(selectors, labels, vehicle_centered_fn_counts, explicit_vehicle_rule_counts):
+        data_rows.append(
+            {
+                "selector_name": selector_name,
+                "selector_label": label,
+                "series": "vehicle_centered_diagnostic",
+                "category": "vehicle_centered_fn_count",
+                "category_label": "Vehicle-centered FN count",
+                "value": fn_count,
+            }
+        )
+        data_rows.append(
+            {
+                "selector_name": selector_name,
+                "selector_label": label,
+                "series": "vehicle_centered_diagnostic",
+                "category": "explicit_vehicle_rule_count",
+                "category_label": "Explicit vehicle-rule count",
+                "value": explicit_count,
+            }
+        )
 
     fig.tight_layout()
-    fig.savefig(figure_path, dpi=dpi, bbox_inches="tight")
+    _save_figure(fig, output_paths, dpi)
     plt.close(fig)
+    _write_csv(
+        output_paths["csv"],
+        ["selector_name", "selector_label", "series", "category", "category_label", "value"],
+        data_rows,
+    )
+    return data_rows
 
 
 def process_visualization(
@@ -391,17 +607,14 @@ def process_visualization(
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    figure_format = str(cfg.get("figure_format", "png")).strip().lower() or "png"
     dpi = int(cfg.get("dpi", 160))
-    top_rule_families = int(cfg.get("top_rule_families", 8))
-
     manifest_path = out_root / "rule_selection_visualization_manifest.json"
-    figure_paths = {
-        "selector_metrics": out_root / f"selector_metrics.{figure_format}",
-        "fn_comparison": out_root / f"fn_comparison.{figure_format}",
-        "rule_family_composition": out_root / f"rule_family_composition.{figure_format}",
-        "confidence_vs_positive_support": out_root / f"confidence_vs_positive_support.{figure_format}",
-        "vehicle_family_coverage": out_root / f"vehicle_family_coverage.{figure_format}",
+    figure_outputs = {
+        "selector_metrics": _figure_paths(out_root, "selector_metrics"),
+        "fn_comparison": _figure_paths(out_root, "fn_comparison"),
+        "rule_family_composition": _figure_paths(out_root, "rule_family_composition"),
+        "confidence_vs_positive_support": _figure_paths(out_root, "confidence_vs_positive_support"),
+        "vehicle_family_coverage": _figure_paths(out_root, "vehicle_family_coverage"),
     }
 
     if not force_recompute and manifest_path.exists():
@@ -425,7 +638,6 @@ def process_visualization(
         "rule_set_comparison_summary.csv",
     )
     pool_summary_rows = _read_csv(step20_root / "vehicle_centered_pool_summary.csv")
-    eval_context_rows = _read_csv(step20_root / "vehicle_centered_eval_context_summary.csv")
     vehicle_manifest = _read_json(step20_root / "vehicle_centered_diagnostic_summary.json")
 
     family_rows_by_selector = {
@@ -437,11 +649,13 @@ def process_visualization(
         for selector_name in _SELECTOR_ORDER
     }
 
-    _plot_selector_metrics(step18_rows, figure_paths["selector_metrics"], dpi)
-    _plot_fn_metrics(step19_rows, figure_paths["fn_comparison"], dpi)
-    _plot_rule_family_composition(family_rows_by_selector, figure_paths["rule_family_composition"], dpi, top_rule_families)
-    _plot_confidence_support_scatter(rule_eval_rows_by_selector, figure_paths["confidence_vs_positive_support"], dpi)
-    _plot_vehicle_family_coverage(pool_summary_rows, eval_context_rows, figure_paths["vehicle_family_coverage"], dpi)
+    figure_data = {
+        "selector_metrics": _plot_selector_metrics(step18_rows, figure_outputs["selector_metrics"], dpi),
+        "fn_comparison": _plot_fn_metrics(step19_rows, figure_outputs["fn_comparison"], dpi),
+        "rule_family_composition": _plot_rule_family_composition(family_rows_by_selector, figure_outputs["rule_family_composition"], dpi),
+        "confidence_vs_positive_support": _plot_confidence_support_scatter(rule_eval_rows_by_selector, figure_outputs["confidence_vs_positive_support"], dpi),
+        "vehicle_family_coverage": _plot_vehicle_family_coverage(pool_summary_rows, vehicle_manifest, figure_outputs["vehicle_family_coverage"], dpi),
+    }
 
     manifest: Dict[str, Any] = {
         "version": _VISUALIZATION_VERSION,
@@ -457,10 +671,13 @@ def process_visualization(
             "step18_summary_json": str(step18_root / "rule_set_comparison_summary.json"),
             "step19_summary_json": str(step19_root / "rule_set_comparison_summary.json"),
             "step20_pool_summary_csv": str(step20_root / "vehicle_centered_pool_summary.csv"),
-            "step20_eval_context_csv": str(step20_root / "vehicle_centered_eval_context_summary.csv"),
             "step20_manifest_json": str(step20_root / "vehicle_centered_diagnostic_summary.json"),
         },
-        "figure_paths": {name: str(path) for name, path in figure_paths.items()},
+        "figure_paths": {
+            figure_name: {suffix: str(path) for suffix, path in paths.items()}
+            for figure_name, paths in figure_outputs.items()
+        },
+        "figure_data_row_counts": {figure_name: len(rows) for figure_name, rows in figure_data.items()},
         "step18_rows": step18_rows,
         "step19_rows": step19_rows,
     }
@@ -471,12 +688,14 @@ def process_visualization(
     print(
         "  rule_selection_visualization: "
         f"selectors={len(_SELECTOR_ORDER)} | "
-        f"figures={len(figure_paths)} | "
+        f"figures={len(figure_outputs)} | "
         f"diagnosis={vehicle_manifest.get('primary_diagnosis', 'unknown')}"
     )
     print(f"Rule selection visualization manifest written to {manifest_path}")
-    for figure_path in figure_paths.values():
-        print(f"Figure written to {figure_path}")
+    for figure_name, paths in figure_outputs.items():
+        print(f"Figure written to {paths['png']}")
+        print(f"Figure written to {paths['pdf']}")
+        print(f"Figure data written to {paths['csv']}")
     return manifest
 
 
