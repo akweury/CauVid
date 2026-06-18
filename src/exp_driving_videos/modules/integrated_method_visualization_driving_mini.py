@@ -61,6 +61,12 @@ _METHOD_COLORS = {
     "learned_rule_aggregation": "#bc4749",
     "oracle_upper_bound": "#6d597a",
 }
+_METHOD_LINESTYLES = {
+    "nesy_selector": "--",
+    "neural_symbolic": "-.",
+    "learned_rule_aggregation": ":",
+    "oracle_upper_bound": "-",
+}
 _METHOD_MARKERS = {
     "nesy_selector": "o",
     "neural_symbolic": "s",
@@ -456,7 +462,14 @@ def _plot_oracle_gap_curve(
     fig, ax = plt.subplots(figsize=(10.8, 5.8))
     x_values = [int(row["selection_rank"]) for row in curve_rows]
     f1_values = [float(row["f1"]) for row in curve_rows]
-    ax.plot(x_values, f1_values, color=_METHOD_COLORS["oracle_upper_bound"], linewidth=2.4, label="Oracle F1 Curve")
+    ax.plot(
+        x_values,
+        f1_values,
+        color=_METHOD_COLORS["oracle_upper_bound"],
+        linestyle=_METHOD_LINESTYLES["oracle_upper_bound"],
+        linewidth=2.4,
+        label="Oracle F1 Curve",
+    )
 
     target_k = _safe_int(step17e_summary.get("oracle_target_k", 0))
     target_f1 = _safe_float(step17e_summary.get("oracle_target_f1", 0.0))
@@ -472,18 +485,10 @@ def _plot_oracle_gap_curve(
         ax.axhline(
             method_f1,
             color=_METHOD_COLORS.get(method_family, "#888888"),
-            linestyle="--",
+            linestyle=_METHOD_LINESTYLES.get(method_family, "--"),
             linewidth=1.3,
             alpha=0.7,
-        )
-        ax.text(
-            x_values[-1] + max(1, int(0.02 * max(x_values[-1], 1))),
-            method_f1,
-            method_label,
-            va="center",
-            ha="left",
-            fontsize=8.5,
-            color=_METHOD_COLORS.get(method_family, "#888888"),
+            label=method_label,
         )
         data_rows.append(
             {
@@ -503,9 +508,28 @@ def _plot_oracle_gap_curve(
     ax.set_ylabel("Held-Out F1")
     ax.set_title("Oracle Gap Curve vs Real Methods", loc="left", fontweight="bold")
     ax.grid(alpha=0.2)
-    ax.set_xlim(1, max(x_values[-1], target_k) + max(4, int(0.15 * max(x_values[-1], 1))))
+    ax.set_xlim(1, max(x_values[-1], target_k))
     ax.set_ylim(0.0, max(0.85, max(f1_values + [_safe_float(row.get("f1", 0.0)) for row in method_rows]) + 0.05))
-    ax.legend(frameon=False, loc="lower right")
+    handles, labels = ax.get_legend_handles_labels()
+    dedup_handles = []
+    dedup_labels = []
+    seen_labels = set()
+    for handle, label in zip(handles, labels):
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        dedup_handles.append(handle)
+        dedup_labels.append(label)
+    ax.legend(
+        dedup_handles,
+        dedup_labels,
+        frameon=True,
+        fancybox=False,
+        edgecolor="#dddddd",
+        facecolor="white",
+        loc="lower right",
+        ncol=1,
+    )
     fig.tight_layout()
     _save_figure(fig, output_paths, dpi)
     plt.close(fig)
