@@ -439,6 +439,17 @@ def get_rule_selection_visualization_cfg() -> Dict[str, Any]:
     )
 
 
+def get_integrated_method_visualization_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "dpi": 170,
+            "figure_format": "png",
+        },
+        path=("integrated_method_visualization",),
+        warn_label="integrated method visualization",
+    )
+
+
 def get_fn_categorization_diagnostic_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -481,6 +492,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "vehicle_rule_diagnostic": True,
             "fn_categorization_diagnostic": True,
             "rule_selection_visualization": True,
+            "integrated_method_visualization": True,
         },
         path=("pipeline_recompute",),
         warn_label="pipeline recompute",
@@ -558,6 +570,10 @@ def get_vehicle_rule_diagnostic_output_root() -> Path:
 
 def get_rule_selection_visualization_output_root() -> Path:
     return _load_output_root("21_rule_selection_visualization")
+
+
+def get_integrated_method_visualization_output_root() -> Path:
+    return _load_output_root("22_driving_mini_integrated_method_visualization")
 
 
 def get_fn_categorization_diagnostic_output_root() -> Path:

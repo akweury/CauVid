@@ -76,6 +76,10 @@ Steps:
     21. rule_selection_visualization_driving_mini — generate comparison plots
                     from the step 18/19/20 selector summaries and save a
                     visualization manifest.
+    22. integrated_method_visualization_driving_mini — generate integrated
+                    publication-style figures comparing NeSy selectors,
+                    neural symbolic baselines, learned rule aggregation, and
+                    the oracle rule-pool upper bound.
 
 """
 
@@ -110,6 +114,7 @@ from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_aggregation_baseline_driving_mini
+from src.exp_driving_videos.modules import integrated_method_visualization_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
 from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
@@ -143,6 +148,7 @@ _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
+_get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrated_method_visualization_cfg
 _get_fn_categorization_diagnostic_cfg = driving_pipeline_config.get_fn_categorization_diagnostic_cfg
 _get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
 _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
@@ -157,6 +163,7 @@ _get_rule_pool_upper_bound_diagnostic_output_root = driving_pipeline_config.get_
 _get_oracle_rule_selection_gap_diagnostic_output_root = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_output_root
 _get_vehicle_rule_diagnostic_output_root = driving_pipeline_config.get_vehicle_rule_diagnostic_output_root
 _get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule_selection_visualization_output_root
+_get_integrated_method_visualization_output_root = driving_pipeline_config.get_integrated_method_visualization_output_root
 _get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
 
 _merge_candidate_rules = driving_pipeline_data.merge_candidate_rules
@@ -195,8 +202,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=int,
-        default=21,
-        choices=range(1, 22),
+        default=22,
+        choices=range(1, 23),
         help="Run the pipeline through this step number.",
     )
     parser.add_argument(
@@ -917,6 +924,23 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     )
     if max_step == 21:
         print("\nStopping after step 21 by request.")
+        return
+
+    # Step 22: integrated cross-method visualization over selectors and baselines
+    integrated_method_visualization_cfg = _get_integrated_method_visualization_cfg()
+    print("\n=== Step 22: integrated_method_visualization_driving_mini ===")
+    print(f"Integrated method visualization cfg: {integrated_method_visualization_cfg}")
+    integrated_method_visualization_results: Dict[str, Any] = integrated_method_visualization_driving_mini.run(
+        cfg=integrated_method_visualization_cfg,
+        output_root=_get_integrated_method_visualization_output_root(),
+        force_recompute=bool(recompute_cfg.get("integrated_method_visualization", True)),
+    )
+    print(
+        "Integrated method visualization complete. "
+        f"manifest={integrated_method_visualization_results.get('figure_paths', {})}"
+    )
+    if max_step == 22:
+        print("\nStopping after step 22 by request.")
         return
 
 if __name__ == "__main__":

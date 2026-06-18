@@ -82,6 +82,7 @@ pipeline_recompute:
   vehicle_rule_diagnostic: false
   fn_categorization_diagnostic: false
   rule_selection_visualization: true
+  integrated_method_visualization: false
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -230,6 +231,10 @@ neural_symbolic_baseline:
 rule_selection_visualization:
   top_rule_families: 8
   dpi: 160
+  figure_format: png
+
+integrated_method_visualization:
+  dpi: 170
   figure_format: png
 
 fn_categorization_diagnostic:
