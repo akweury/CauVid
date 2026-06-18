@@ -12,7 +12,10 @@ Output layout:
         rule_aggregation_baseline_metrics.csv
         per_video_metrics.csv
         prediction_examples.csv
-        top_weighted_rules.csv
+        top_weighted_rules_with_clauses.csv
+        rule_aggregation_ablation_metrics.csv
+        top_k_weighted_rule_sets.csv
+        split_leakage_check.json
 """
 
 from __future__ import annotations
@@ -44,7 +47,8 @@ from src.exp_driving_videos.modules.rule_pool_upper_bound_diagnostic_driving_min
 from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
 
 
-_RULE_AGGREGATION_BASELINE_VERSION = 1
+_RULE_AGGREGATION_BASELINE_VERSION = 2
+_TOP_WEIGHT_ABLATION_SIZES: Tuple[Any, ...] = (1, 3, 5, 10, 20, 50, "all_nonzero")
 
 
 def get_output_root() -> Path:
@@ -413,6 +417,151 @@ def _prediction_rows(
     return rows
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values.astype(np.float64), -50.0, 50.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+def _split_separation_checks(
+    train_examples_all: Sequence[Dict[str, Any]],
+    train_examples: Sequence[Dict[str, Any]],
+    val_examples: Sequence[Dict[str, Any]],
+    eval_examples: Sequence[Dict[str, Any]],
+    validation_split: Dict[str, Any],
+    split_manifest: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    train_all_video_ids = {str(example.get("video_id", "")) for example in train_examples_all}
+    train_video_ids = {str(example.get("video_id", "")) for example in train_examples}
+    validation_video_ids = {str(example.get("video_id", "")) for example in val_examples}
+    eval_video_ids = {str(example.get("video_id", "")) for example in eval_examples}
+
+    train_example_ids = {str(example.get("example_id", "")) for example in train_examples}
+    validation_example_ids = {str(example.get("example_id", "")) for example in val_examples}
+    eval_example_ids = {str(example.get("example_id", "")) for example in eval_examples}
+
+    train_manifest_video_ids = {str(value) for value in list((split_manifest or {}).get("train_video_ids", []))}
+    eval_manifest_video_ids = {str(value) for value in list((split_manifest or {}).get("eval_video_ids", []))}
+
+    train_eval_video_overlap = sorted(train_all_video_ids & eval_video_ids)
+    validation_eval_video_overlap = sorted(validation_video_ids & eval_video_ids)
+    train_validation_video_overlap = sorted(train_video_ids & validation_video_ids)
+    train_eval_example_overlap = sorted(train_example_ids & eval_example_ids)
+    validation_eval_example_overlap = sorted(validation_example_ids & eval_example_ids)
+    train_validation_example_overlap = sorted(train_example_ids & validation_example_ids)
+
+    return {
+        "validation_strategy": str(validation_split.get("strategy", "")),
+        "train_manifest_video_count": len(train_manifest_video_ids),
+        "eval_manifest_video_count": len(eval_manifest_video_ids),
+        "train_video_count_all": len(train_all_video_ids),
+        "train_video_count_after_split": len(train_video_ids),
+        "validation_video_count": len(validation_video_ids),
+        "eval_video_count": len(eval_video_ids),
+        "train_eval_video_overlap_count": len(train_eval_video_overlap),
+        "validation_eval_video_overlap_count": len(validation_eval_video_overlap),
+        "train_validation_video_overlap_count": len(train_validation_video_overlap),
+        "train_eval_example_overlap_count": len(train_eval_example_overlap),
+        "validation_eval_example_overlap_count": len(validation_eval_example_overlap),
+        "train_validation_example_overlap_count": len(train_validation_example_overlap),
+        "train_eval_video_overlap_ids": train_eval_video_overlap,
+        "validation_eval_video_overlap_ids": validation_eval_video_overlap,
+        "train_validation_video_overlap_ids": train_validation_video_overlap,
+        "eval_video_ids_match_manifest": sorted(eval_video_ids) == sorted(eval_manifest_video_ids) if eval_manifest_video_ids else None,
+        "train_video_ids_subset_of_manifest": sorted(train_all_video_ids - train_manifest_video_ids) == [] if train_manifest_video_ids else None,
+        "validation_video_ids_subset_of_manifest": sorted(validation_video_ids - train_manifest_video_ids) == [] if train_manifest_video_ids else None,
+        "eval_examples_seen_in_train_or_validation": len((train_example_ids | validation_example_ids) & eval_example_ids),
+        "train_validation_overlap_expected_due_to_fallback": str(validation_split.get("strategy", "")) != "video_level",
+        "eval_is_disjoint_from_train_and_validation": not train_eval_video_overlap
+        and not validation_eval_video_overlap
+        and not train_eval_example_overlap
+        and not validation_eval_example_overlap,
+        "notes": [
+            "Validation examples are drawn only from the train-side split before any model selection.",
+            "Train/validation overlap may appear in fallback modes when the train side contains too few videos to hold out a separate validation video set.",
+        ],
+    }
+
+
+def _top_weight_subset_ablation_rows(
+    eval_matrix: Any,
+    eval_examples: Sequence[Dict[str, Any]],
+    y_eval: np.ndarray,
+    active_rules: Sequence[Dict[str, Any]],
+    coefficients: np.ndarray,
+    intercept: float,
+    best_threshold: float,
+    average_precision_score_fn: Any,
+    roc_auc_score_fn: Any,
+    confusion_matrix_fn: Any,
+) -> List[Dict[str, Any]]:
+    nonzero_indices = np.flatnonzero(np.abs(coefficients) > 1e-12)
+    ordered_nonzero_indices = sorted(
+        nonzero_indices.tolist(),
+        key=lambda index: (-abs(coefficients[index]), -coefficients[index], str(active_rules[index].get("rule_id", ""))),
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for subset_spec in _TOP_WEIGHT_ABLATION_SIZES:
+        if subset_spec == "all_nonzero":
+            selected_indices = list(ordered_nonzero_indices)
+            subset_label = "all_nonzero"
+        else:
+            subset_k = int(subset_spec)
+            selected_indices = list(ordered_nonzero_indices[: min(subset_k, len(ordered_nonzero_indices))])
+            subset_label = str(subset_k)
+        if not selected_indices:
+            continue
+
+        subset_logits = np.full(shape=(eval_matrix.shape[0],), fill_value=float(intercept), dtype=np.float64)
+        subset_logits += np.asarray(eval_matrix[:, selected_indices].dot(coefficients[selected_indices])).reshape(-1)
+        subset_probabilities = _sigmoid(subset_logits).tolist()
+
+        threshold_05_metrics = _compute_threshold_metrics(
+            y_eval.tolist(),
+            subset_probabilities,
+            0.5,
+            average_precision_score_fn,
+            roc_auc_score_fn,
+            confusion_matrix_fn,
+        )
+        tuned_metrics = _compute_threshold_metrics(
+            y_eval.tolist(),
+            subset_probabilities,
+            best_threshold,
+            average_precision_score_fn,
+            roc_auc_score_fn,
+            confusion_matrix_fn,
+        )
+        selected_rules = [dict(active_rules[index]) for index in selected_indices]
+        selected_rule_ids = [str(rule.get("rule_id", "")) for rule in selected_rules]
+        selected_rule_clauses = [str(rule.get("clause", "")) for rule in selected_rules]
+        rows.append(
+            {
+                "subset_k": subset_label,
+                "subset_size": len(selected_indices),
+                "threshold_name": "best_validation_threshold",
+                "threshold_value": float(best_threshold),
+                "threshold_0_5_precision": float(threshold_05_metrics.get("precision", 0.0)),
+                "threshold_0_5_recall": float(threshold_05_metrics.get("recall", 0.0)),
+                "threshold_0_5_f1": float(threshold_05_metrics.get("f1", 0.0)),
+                "precision": float(tuned_metrics.get("precision", 0.0)),
+                "recall": float(tuned_metrics.get("recall", 0.0)),
+                "f1": float(tuned_metrics.get("f1", 0.0)),
+                "accuracy": float(tuned_metrics.get("accuracy", 0.0)),
+                "auroc": float(tuned_metrics.get("auroc", float("nan"))),
+                "auprc": float(tuned_metrics.get("auprc", float("nan"))),
+                "true_positive": int(tuned_metrics.get("true_positive", 0)),
+                "false_positive": int(tuned_metrics.get("false_positive", 0)),
+                "false_negative": int(tuned_metrics.get("false_negative", 0)),
+                "true_negative": int(tuned_metrics.get("true_negative", 0)),
+                "selected_rule_ids": " || ".join(selected_rule_ids),
+                "selected_rule_clauses": " || ".join(selected_rule_clauses),
+                "selected_rule_families": " || ".join(str(rule.get("semantic_family", "")) for rule in selected_rules),
+            }
+        )
+    return rows
+
+
 def process_baseline(
     extended_rule_results: Dict[str, Any],
     train_temporal_rule_results: Sequence[Dict[str, Any]],
@@ -430,7 +579,10 @@ def process_baseline(
     metrics_csv_path = out_root / "rule_aggregation_baseline_metrics.csv"
     per_video_csv_path = out_root / "per_video_metrics.csv"
     prediction_csv_path = out_root / "prediction_examples.csv"
-    top_rules_csv_path = out_root / "top_weighted_rules.csv"
+    top_rules_csv_path = out_root / "top_weighted_rules_with_clauses.csv"
+    ablation_csv_path = out_root / "rule_aggregation_ablation_metrics.csv"
+    top_k_rule_sets_csv_path = out_root / "top_k_weighted_rule_sets.csv"
+    split_leakage_json_path = out_root / "split_leakage_check.json"
 
     if not force_recompute and summary_path.exists():
         with summary_path.open("r", encoding="utf-8") as fh:
@@ -461,6 +613,18 @@ def process_baseline(
     )
     if not train_examples or not val_examples:
         raise RuntimeError("Rule aggregation baseline could not create non-empty train/validation subsets.")
+    split_checks = _split_separation_checks(
+        train_examples_all=train_examples_all,
+        train_examples=train_examples,
+        val_examples=val_examples,
+        eval_examples=eval_examples,
+        validation_split=validation_split,
+        split_manifest=split_manifest,
+    )
+    if not bool(split_checks.get("eval_is_disjoint_from_train_and_validation", False)):
+        raise RuntimeError(
+            "Rule aggregation baseline detected train/eval or validation/eval overlap; aborting to avoid eval leakage."
+        )
 
     prepared_rules = _prepare_rules(extended_rule_results, cfg)
     if not prepared_rules:
@@ -625,6 +789,7 @@ def process_baseline(
     prediction_rows = _prediction_rows(eval_examples, eval_probabilities, threshold_05, best_threshold)
 
     coefficients = np.asarray(best_model.coef_[0], dtype=np.float64)
+    intercept = float(np.asarray(best_model.intercept_, dtype=np.float64).reshape(-1)[0])
     nonzero_indices = np.flatnonzero(np.abs(coefficients) > 1e-12)
     top_k_rules = max(1, int(cfg.get("top_weighted_rules", 30)))
     top_weight_rows: List[Dict[str, Any]] = []
@@ -649,6 +814,19 @@ def process_baseline(
                 "semantic_family": str(rule.get("semantic_family", "")),
             }
         )
+
+    subset_ablation_rows = _top_weight_subset_ablation_rows(
+        eval_matrix=eval_matrix,
+        eval_examples=eval_examples,
+        y_eval=y_eval,
+        active_rules=active_rules,
+        coefficients=coefficients,
+        intercept=intercept,
+        best_threshold=best_threshold,
+        average_precision_score_fn=average_precision_score,
+        roc_auc_score_fn=roc_auc_score,
+        confusion_matrix_fn=confusion_matrix,
+    )
 
     _write_csv(
         metrics_csv_path,
@@ -725,6 +903,84 @@ def process_baseline(
         ],
         top_weight_rows,
     )
+    _write_csv(
+        ablation_csv_path,
+        [
+            "subset_k",
+            "subset_size",
+            "threshold_name",
+            "threshold_value",
+            "threshold_0_5_precision",
+            "threshold_0_5_recall",
+            "threshold_0_5_f1",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "auroc",
+            "auprc",
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+            "selected_rule_ids",
+            "selected_rule_clauses",
+            "selected_rule_families",
+        ],
+        subset_ablation_rows,
+    )
+    top_k_rule_set_rows = [
+        {
+            "subset_k": row.get("subset_k", ""),
+            "subset_size": row.get("subset_size", 0),
+            "threshold_name": row.get("threshold_name", ""),
+            "threshold_value": row.get("threshold_value", 0.0),
+            "selected_rule_ids": row.get("selected_rule_ids", ""),
+            "selected_rule_clauses": row.get("selected_rule_clauses", ""),
+            "selected_rule_families": row.get("selected_rule_families", ""),
+        }
+        for row in subset_ablation_rows
+    ]
+    _write_csv(
+        top_k_rule_sets_csv_path,
+        [
+            "subset_k",
+            "subset_size",
+            "threshold_name",
+            "threshold_value",
+            "selected_rule_ids",
+            "selected_rule_clauses",
+            "selected_rule_families",
+        ],
+        top_k_rule_set_rows,
+    )
+
+    tuning_checks = {
+        "regularization_tuned_on": "train_validation_only",
+        "threshold_tuned_on": "validation_only",
+        "eval_used_for_regularization_search": False,
+        "eval_used_for_threshold_search": False,
+        "best_model_selected_from_validation_search": True,
+        "validation_candidate_count": len(candidate_rows),
+        "validation_search_fields": [
+            "best_validation_f1",
+            "best_validation_precision",
+            "best_validation_recall",
+            "best_validation_threshold",
+        ],
+        "held_out_eval_applied_only_after_model_selection": True,
+        "notes": [
+            "Each C candidate is fit on the train subset only.",
+            "Best C and decision threshold are selected using validation metrics only.",
+            "Held-out eval probabilities are computed only after best C and threshold are fixed.",
+        ],
+    }
+    split_leakage_payload = {
+        "split_separation_checks": split_checks,
+        "tuning_checks": tuning_checks,
+    }
+    with split_leakage_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(split_leakage_payload, fh, indent=2)
 
     summary: Dict[str, Any] = {
         "version": _RULE_AGGREGATION_BASELINE_VERSION,
@@ -739,15 +995,21 @@ def process_baseline(
         "num_pool_rules": len(prepared_rules),
         "num_active_train_rules": len(active_rules),
         "num_nonzero_rules": int(nonzero_indices.size),
+        "tuning_checks": tuning_checks,
+        "split_separation_checks": split_checks,
         "metrics_by_split": metrics_by_split,
         "validation_search": candidate_rows,
         "top_weighted_rules": top_weight_rows,
+        "top_weight_rule_subset_ablations": subset_ablation_rows,
         "output_paths": {
             "summary_json": str(summary_path),
             "metrics_csv": str(metrics_csv_path),
             "per_video_metrics_csv": str(per_video_csv_path),
             "prediction_examples_csv": str(prediction_csv_path),
-            "top_weighted_rules_csv": str(top_rules_csv_path),
+            "top_weighted_rules_with_clauses_csv": str(top_rules_csv_path),
+            "rule_aggregation_ablation_metrics_csv": str(ablation_csv_path),
+            "top_k_weighted_rule_sets_csv": str(top_k_rule_sets_csv_path),
+            "split_leakage_check_json": str(split_leakage_json_path),
         },
     }
 
@@ -765,6 +1027,9 @@ def process_baseline(
     )
     print(f"Rule aggregation baseline summary JSON written to {summary_path}")
     print(f"Rule aggregation baseline top weighted rules CSV written to {top_rules_csv_path}")
+    print(f"Rule aggregation baseline subset ablations CSV written to {ablation_csv_path}")
+    print(f"Rule aggregation baseline top-K weighted rule sets CSV written to {top_k_rule_sets_csv_path}")
+    print(f"Rule aggregation baseline split leakage check JSON written to {split_leakage_json_path}")
     return summary
 
 

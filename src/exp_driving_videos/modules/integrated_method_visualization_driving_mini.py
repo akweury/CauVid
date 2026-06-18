@@ -18,6 +18,8 @@ Outputs:
         method_precision_recall_f1_data.csv
         oracle_gap_curve.png/.pdf
         oracle_gap_curve_data.csv
+        top_weighted_rule_contributions.png/.pdf
+        top_weighted_rule_contributions_data.csv
         method_characteristics_table.csv
         integrated_visualization_manifest.json
 """
@@ -41,7 +43,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_VISUALIZATION_VERSION = 1
+_VISUALIZATION_VERSION = 2
 _SELECTOR_ORDER = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
 _SELECTOR_LABELS = {
     "original": "Original Rules",
@@ -56,19 +58,19 @@ _SELECTOR_COLORS = {
     "coverage_family_aware": "#e76f51",
 }
 _METHOD_COLORS = {
-    "nesy_selector": "#355070",
+    "hard_or_rule_selector": "#355070",
     "neural_symbolic": "#43aa8b",
     "learned_rule_aggregation": "#bc4749",
     "oracle_upper_bound": "#6d597a",
 }
 _METHOD_LINESTYLES = {
-    "nesy_selector": "--",
+    "hard_or_rule_selector": "--",
     "neural_symbolic": "-.",
     "learned_rule_aggregation": ":",
     "oracle_upper_bound": "-",
 }
 _METHOD_MARKERS = {
-    "nesy_selector": "o",
+    "hard_or_rule_selector": "o",
     "neural_symbolic": "s",
     "learned_rule_aggregation": "D",
     "oracle_upper_bound": "*",
@@ -83,6 +85,7 @@ _SHORT_METHOD_LABELS = {
     "Temporal Mlp": "Temp-MLP",
     "Rule Aggregation LR": "RuleAgg-LR",
     "Oracle Pool Upper Bound": "Oracle",
+    "Oracle Pool Upper Bound (Diagnostic Only)": "Oracle",
 }
 
 
@@ -179,7 +182,7 @@ def _method_rows_from_step18(
             {
                 "method_id": selector_name,
                 "method_label": _SELECTOR_LABELS.get(selector_name, selector_name),
-                "method_family": "nesy_selector",
+                "method_family": "hard_or_rule_selector",
                 "precision": _safe_float(row.get("precision", 0.0)),
                 "recall": _safe_float(row.get("recall", 0.0)),
                 "f1": _safe_float(row.get("f1", 0.0)),
@@ -259,7 +262,7 @@ def _method_row_from_rule_aggregation(summary: Dict[str, Any]) -> Dict[str, Any]
 def _oracle_method_row(step17e_summary: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "method_id": "oracle_rule_pool_upper_bound",
-        "method_label": "Oracle Pool Upper Bound",
+        "method_label": "Oracle Pool Upper Bound (Diagnostic Only)",
         "method_family": "oracle_upper_bound",
         "precision": _safe_float(step17e_summary.get("oracle_target_precision", 0.0)),
         "recall": _safe_float(step17e_summary.get("oracle_target_recall", 0.0)),
@@ -275,6 +278,9 @@ def _oracle_method_row(step17e_summary: Dict[str, Any]) -> Dict[str, Any]:
         "uses_symbolic_rules": True,
         "uses_learned_weights": False,
         "uses_eval_labels": True,
+        "diagnostic_only": True,
+        "legal_model_result": False,
+        "eval_label_usage_note": "Uses eval labels for oracle upper-bound diagnosis only; not a legal deployable model result.",
     }
 
 
@@ -283,7 +289,7 @@ def _method_order(method_rows: Sequence[Dict[str, Any]]) -> List[str]:
         "oracle_upper_bound": 0,
         "learned_rule_aggregation": 1,
         "neural_symbolic": 2,
-        "nesy_selector": 3,
+        "hard_or_rule_selector": 3,
     }
     ordered_rows = sorted(
         method_rows,
@@ -551,6 +557,121 @@ def _plot_oracle_gap_curve(
     return data_rows
 
 
+def _plot_top_weighted_rule_contributions(
+    top_weight_rows: Sequence[Dict[str, Any]],
+    output_paths: Dict[str, Path],
+    dpi: int,
+) -> List[Dict[str, Any]]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not top_weight_rows:
+        _write_csv(
+            output_paths["csv"],
+            [
+                "rank",
+                "rule_id",
+                "clause",
+                "weight",
+                "abs_weight",
+                "sign",
+                "confidence",
+                "train_positive_support",
+                "train_negative_support",
+                "semantic_family",
+                "short_clause",
+            ],
+            [],
+        )
+        fig, ax = plt.subplots(figsize=(9.2, 4.6))
+        ax.text(0.5, 0.5, "No nonzero learned rule weights available.", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        ax.set_title("Top Weighted Rule Contributions", loc="left", fontweight="bold")
+        fig.tight_layout()
+        _save_figure(fig, output_paths, dpi)
+        plt.close(fig)
+        return []
+
+    ordered_rows = sorted(
+        [dict(row) for row in top_weight_rows],
+        key=lambda row: _safe_int(row.get("rank", 0)),
+    )
+    display_rows = ordered_rows[: min(12, len(ordered_rows))]
+    data_rows: List[Dict[str, Any]] = []
+    for row in display_rows:
+        clause = str(row.get("clause", ""))
+        short_clause = clause if len(clause) <= 88 else f"{clause[:85]}..."
+        data_rows.append(
+            {
+                **row,
+                "short_clause": short_clause,
+            }
+        )
+
+    fig, ax = plt.subplots(figsize=(11.4, 6.6))
+    y_positions = list(range(len(data_rows)))
+    weights = [_safe_float(row.get("weight", 0.0)) for row in data_rows]
+    colors = ["#bc4749" if weight >= 0.0 else "#577590" for weight in weights]
+    bars = ax.barh(y_positions, weights, color=colors)
+    ax.set_yticks(y_positions, [str(row.get("short_clause", "")) for row in data_rows], fontsize=8.5)
+    ax.invert_yaxis()
+    ax.axvline(0.0, color="#444444", linewidth=1.0, alpha=0.7)
+    max_abs_weight = max(abs(weight) for weight in weights) if weights else 1.0
+    ax.set_xlim(-max_abs_weight * 1.18, max_abs_weight * 1.18)
+    ax.set_xlabel("Learned Logistic Weight")
+    ax.set_title("Top Weighted Rule Contributions", loc="left", fontweight="bold")
+    ax.grid(axis="x", alpha=0.2)
+    for bar, row in zip(bars, data_rows):
+        weight = _safe_float(row.get("weight", 0.0))
+        family = str(row.get("semantic_family", ""))
+        anchor_x = weight + (0.015 * max_abs_weight if weight >= 0.0 else -0.015 * max_abs_weight)
+        ax.text(
+            anchor_x,
+            bar.get_y() + bar.get_height() / 2.0,
+            f"{weight:+.3f} | {family}",
+            va="center",
+            ha="left" if weight >= 0.0 else "right",
+            fontsize=8.5,
+        )
+    from matplotlib.patches import Patch
+
+    legend_handles = [
+        Patch(facecolor="#bc4749", label="Positive contribution toward brake_next"),
+        Patch(facecolor="#577590", label="Negative contribution against brake_next"),
+    ]
+    ax.legend(
+        handles=legend_handles,
+        loc="lower right",
+        frameon=True,
+        fancybox=False,
+        edgecolor="#dddddd",
+        facecolor="white",
+    )
+    fig.tight_layout()
+    _save_figure(fig, output_paths, dpi)
+    plt.close(fig)
+    _write_csv(
+        output_paths["csv"],
+        [
+            "rank",
+            "rule_id",
+            "clause",
+            "weight",
+            "abs_weight",
+            "sign",
+            "confidence",
+            "train_positive_support",
+            "train_negative_support",
+            "semantic_family",
+            "short_clause",
+        ],
+        data_rows,
+    )
+    return data_rows
+
+
 def process_visualization(
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
@@ -566,6 +687,7 @@ def process_visualization(
         "method_f1_ladder": _figure_paths(out_root, "method_f1_ladder"),
         "method_precision_recall_f1": _figure_paths(out_root, "method_precision_recall_f1"),
         "oracle_gap_curve": _figure_paths(out_root, "oracle_gap_curve"),
+        "top_weighted_rule_contributions": _figure_paths(out_root, "top_weighted_rule_contributions"),
     }
     dpi = int(cfg.get("dpi", 170))
 
@@ -589,6 +711,7 @@ def process_visualization(
     step18b_summary = _read_json(step18b_root / "neural_baseline_summary.json")
     step18c_summary = _read_json(step18c_root / "rule_aggregation_baseline_summary.json")
     oracle_curve_rows = _read_csv(step17d_root / "oracle_greedy_rule_set_curve.csv")
+    step18c_top_weight_rows = list(step18c_summary.get("top_weighted_rules", []))
 
     method_rows: List[Dict[str, Any]] = []
     method_rows.extend(_method_rows_from_step18(step18_rows, step17e_overlap_rows))
@@ -604,8 +727,11 @@ def process_visualization(
             "uses_symbolic_rules": bool(row.get("uses_symbolic_rules", False)),
             "uses_learned_weights": bool(row.get("uses_learned_weights", False)),
             "uses_eval_labels": bool(row.get("uses_eval_labels", False)),
+            "diagnostic_only": bool(row.get("diagnostic_only", False)),
+            "legal_model_result": bool(row.get("legal_model_result", True)),
             "selection_method": str(row.get("selection_method", "")),
             "threshold_name": str(row.get("threshold_name", "")),
+            "eval_label_usage_note": str(row.get("eval_label_usage_note", "")),
         }
         for row in method_rows
     ]
@@ -618,8 +744,11 @@ def process_visualization(
             "uses_symbolic_rules",
             "uses_learned_weights",
             "uses_eval_labels",
+            "diagnostic_only",
+            "legal_model_result",
             "selection_method",
             "threshold_name",
+            "eval_label_usage_note",
         ],
         characteristics_rows,
     )
@@ -628,6 +757,11 @@ def process_visualization(
         "method_f1_ladder": _plot_method_f1_ladder(method_rows, figure_outputs["method_f1_ladder"], dpi),
         "method_precision_recall_f1": _plot_method_precision_recall_f1(method_rows, figure_outputs["method_precision_recall_f1"], dpi),
         "oracle_gap_curve": _plot_oracle_gap_curve(oracle_curve_rows, method_rows, step17e_summary, figure_outputs["oracle_gap_curve"], dpi),
+        "top_weighted_rule_contributions": _plot_top_weighted_rule_contributions(
+            step18c_top_weight_rows,
+            figure_outputs["top_weighted_rule_contributions"],
+            dpi,
+        ),
     }
 
     manifest: Dict[str, Any] = {
@@ -642,6 +776,10 @@ def process_visualization(
             "step18_summary_json": str(step18_root / "rule_set_comparison_summary.json"),
             "step18b_summary_json": str(step18b_root / "neural_baseline_summary.json"),
             "step18c_summary_json": str(step18c_root / "rule_aggregation_baseline_summary.json"),
+            "step18c_top_weighted_rules_csv": str(step18c_root / "top_weighted_rules_with_clauses.csv"),
+            "step18c_subset_ablations_csv": str(step18c_root / "rule_aggregation_ablation_metrics.csv"),
+            "step18c_top_k_rule_sets_csv": str(step18c_root / "top_k_weighted_rule_sets.csv"),
+            "step18c_split_leakage_json": str(step18c_root / "split_leakage_check.json"),
         },
         "figure_paths": {
             figure_name: {suffix: str(path) for suffix, path in paths.items()}
@@ -653,6 +791,9 @@ def process_visualization(
         "method_rows": method_rows,
         "oracle_target_f1": _safe_float(step17e_summary.get("oracle_target_f1", 0.0)),
         "best_actual_selector_f1": _safe_float(step17d_summary.get("best_actual_selector_f1", 0.0)),
+        "diagnostic_notes": {
+            "oracle_upper_bound": "Oracle upper bound uses eval labels for diagnostic analysis only and is not a legal model result."
+        },
         "figure_data_row_counts": {name: len(rows) for name, rows in figure_data.items()},
     }
 
