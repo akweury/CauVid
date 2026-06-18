@@ -75,6 +75,7 @@ pipeline_recompute:
   coverage_family_aware_final_rules: false
   rule_pool_upper_bound_diagnostic: false
   rule_evaluation: false
+  neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
   fn_categorization_diagnostic: false
@@ -177,6 +178,32 @@ rule_evaluation:
   prediction_mode: any_rule_positive
   rule_set_mode: all
   primary_rule_set: original
+
+neural_symbolic_baseline:
+  min_feature_count: 1
+  probability_threshold: 0.5
+  random_seed: 0
+  device: auto
+  single_segment_mlp:
+    hidden_dims: [128, 64]
+    dropout: 0.1
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    batch_size: 32
+    num_epochs: 100
+    early_stopping_patience: 12
+  temporal_model:
+    architecture: gru
+    history_window: 4
+    hidden_dims: [128, 64]
+    gru_hidden_dim: 128
+    gru_num_layers: 1
+    dropout: 0.1
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    batch_size: 32
+    num_epochs: 100
+    early_stopping_patience: 12
 
 rule_selection_visualization:
   top_rule_families: 8

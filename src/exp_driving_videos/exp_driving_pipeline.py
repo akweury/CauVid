@@ -52,6 +52,10 @@ Steps:
                     single-rule and oracle-greedy upper bounds.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
+    18B. neural_symbolic_baseline_driving_mini — train single-segment and
+                    short-history symbolic neural baselines on the same
+                    train/eval split and compare held-out classification
+                    metrics.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
@@ -73,12 +77,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
-import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import config
+from src.exp_driving_videos import pipeline_config as driving_pipeline_config
+from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
@@ -89,6 +93,7 @@ from src.exp_driving_videos.modules import extended_rules_driving_mini
 from src.exp_driving_videos.modules import final_rules_driving_mini
 from src.exp_driving_videos.modules import fn_categorization_diagnostic_driving_mini
 from src.exp_driving_videos.modules import merge_gt_and_detected_driving_mini
+from src.exp_driving_videos.modules import neural_symbolic_baseline_driving_mini
 from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
 from src.exp_driving_videos.modules import ego_motion_driving_mini
@@ -102,896 +107,49 @@ from src.exp_driving_videos.modules import target_head_atoms_driving_mini
 from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
-from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
-DRIVING_MINI_OD_MODEL = "yolov8l-worldv2.pt"
-DEFAULT_TRAIN_VIDEO_COUNT = 8
-DEFAULT_EVAL_VIDEO_COUNT = 2
-DRIVING_MINI_OD_CLASSES = [
-    "car",
-    "truck",
-    "bus",
-    "motorcycle",
-    "bicycle",
-    "person",
-    "traffic light",
-    "stop sign",
-    "building",
-    "tree",
-    "crosswalk",
-]
-
-
-def _get_ego_motion_smoothing_window(default: int = 5) -> int:
-    """Load ego motion smoothing window from configs/exp_driving/default.yaml."""
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        return int(cfg.get("ego_motion", {}).get("smoothing_window", default))
-    except Exception as exc:
-        print(f"[warn] Could not load exp_driving config: {exc}. Using default={default}.")
-        return default
-
-
-def _get_ego_static_adjustment_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "enabled": True,
-        "static_object_keywords": ["building", "traffic light"],
-        "blend_weight": 0.7,
-        "min_static_pixels": 300,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("ego_motion", {}).get("static_adjustment", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load ego static adjustment config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_temporal_segmentation_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "forward_stop_threshold": 0.05,
-        "forward_stop_enter_threshold": 0.05,
-        "forward_stop_exit_threshold": 0.08,
-        "stop_total_speed_enter_threshold": 0.09,
-        "stop_total_speed_exit_threshold": 0.14,
-        "forward_accel_threshold": 0.03,
-        "lateral_turn_threshold": 0.03,
-        "stop_window_size": 5,
-        "motion_window_size": 5,
-        "forward_direction_epsilon": 0.025,
-        "lateral_motion_window_size": 10,
-        "lateral_direction_epsilon": 0.03,
-        "lateral_straight_threshold": 35.0,
-        "compare_lateral_straight_thresholds": [15, 25, 35, 45],
-        "min_stop_duration": 5,
-        "min_turn_duration": 3,
-        "min_segment_length": 7,
-        "compare_forward_stop_thresholds": [1.0],
-        "compare_min_segment_lengths": [7],
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("temporal_segmentation", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load temporal segmentation config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_segment_object_motion_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "rel_vz_threshold": 0.2,
-        "rel_vx_threshold": 0.2,
-        "compare_rel_vx_thresholds": [10.0, 20.0, 50.0],
-        "rel_speed_threshold": 0.3,
-        "dominance_ratio_threshold": 0.6,
-        "distance_near_threshold": 15.0,
-        "distance_medium_threshold": 30.0,
-        "top_k_visualized_objects": 20,
-        "visualization_fps": 10.0,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("segment_object_motion", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load segment object motion config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_important_objects_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "selection_strategy": "not_implemented",
-        "passthrough_selected_objects": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("important_objects", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load important objects config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_logic_atoms_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "lateral_position_threshold": 2.0,
-        "visibility_persistent_threshold": 0.8,
-        "visibility_present_threshold": 0.3,
-        "include_segment_boundary_atoms": True,
-        "include_object_identity_atoms": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("logic_atoms", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load logic atoms config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_target_head_atoms_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "target_predicate": "brake_next",
-        "negative_target_predicate": "not_brake_next",
-        "positive_forward_states": ["forward_slowdown", "stopping"],
-        "include_negative_examples": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("target_head_atoms", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load target head atoms config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_temporal_rule_examples_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "deduplicate_body_atoms": True,
-        "sort_body_atoms": True,
-        "include_clause_text": True,
-        "include_negative_examples": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("temporal_rule_examples", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load temporal rule examples config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_candidate_rules_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "target_predicate": "brake_next",
-        "negative_target_predicate": "not_brake_next",
-        "use_only_positive_examples": True,
-        "min_positive_support": 1,
-        "include_example_ids": True,
-        "ignored_body_predicates": [
-            "segment",
-            "segment_start_frame",
-            "segment_end_frame",
-            "object_in_segment",
-            "object_track",
-        ],
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("candidate_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load candidate rules config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_extended_rules_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "num_rounds": 3,
-        "evaluation_strategy": "binding_aware_intersection",
-        "prune_strategies": [
-            "low_evidence",
-            "empty_evidence",
-            "same_firings_as_parent",
-            "same_confidence_smaller_evidence",
-        ],
-        "min_positive_support_to_extend": 2,
-        "same_confidence_smaller_evidence_enabled": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("extended_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load extended rules config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_final_rules_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_k": 50,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("final_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load final rules config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_diverse_final_rules_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_k": 50,
-        "score_mode": "legacy_diverse_positive_coverage",
-        "selection_method_name": "greedy_diverse_positive_coverage",
-        "output_prefix": "diverse_final_rules",
-        "new_positive_weight": 1.0,
-        "confidence_weight": 0.25,
-        "overlap_penalty": 0.35,
-        "family_penalty": 0.75,
-        "negative_support_penalty": 0.1,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("diverse_final_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load diverse final rules config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_semantic_constrained_diverse_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_k": 50,
-        "score_mode": "semantic_constrained_diverse",
-        "selection_method_name": "semantic_constrained_diverse",
-        "output_prefix": "semantic_constrained_diverse_final_rules",
-        "new_positive_weight": 1.0,
-        "confidence_weight": 0.25,
-        "overlap_penalty": 0.35,
-        "family_penalty": 0.75,
-        "negative_support_penalty": 0.1,
-        "semantic_bonus_weight": 1.5,
-        "semantic_hard_constraints": True,
-        "semantic_min_positive_support": 2,
-        "semantic_min_total_support": 2,
-        "semantic_min_confidence": 0.6,
-        "semantic_min_family_counts": {
-            "vehicle_centered_partial": 2,
-            "near_centered_partial": 2,
-            "vehicle_near_partial": 2,
-            "exact_vehicle_near_centered": 1,
-        },
-        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
-        "near_states": ["near"],
-        "center_states": ["centered"],
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("semantic_constrained_diverse_final_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load semantic constrained diverse config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_k": 50,
-        "score_mode": "coverage_family_aware",
-        "selection_method_name": "greedy_coverage_family_aware",
-        "output_prefix": "coverage_family_aware_final_rules",
-        "coverage_weight": 1.0,
-        "quality_weight": 1.0,
-        "overlap_penalty": 0.5,
-        "family_penalty": 0.6,
-        "family_diversity_bonus": 0.75,
-        "negative_support_penalty": 0.1,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("coverage_family_aware_final_rules", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load coverage-aware final rules config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_rule_pool_upper_bound_diagnostic_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_single_rules": 100,
-        "precision_thresholds": [0.5, 0.7, 0.9],
-        "f1_thresholds": [0.1, 0.2, 0.3, 0.4],
-        "min_recall_thresholds": [0.02, 0.05, 0.1, 0.15, 0.2, 0.3],
-        "oracle_k_values": [1, 5, 10, 20, 50, 100],
-        "selection_gap_threshold": 0.05,
-        "selection_pool_min_f1": 0.35,
-        "low_pool_f1_threshold": 0.35,
-        "low_single_rule_f1_threshold": 0.2,
-        "high_precision_threshold": 0.8,
-        "low_recall_threshold": 0.1,
-        "high_recall_threshold": 0.2,
-        "low_precision_threshold": 0.5,
-        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
-        "near_states": ["near"],
-        "center_states": ["centered"],
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("rule_pool_upper_bound_diagnostic", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load rule-pool upper-bound diagnostic config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_data_split_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "train_video_count": DEFAULT_TRAIN_VIDEO_COUNT,
-        "eval_video_count": DEFAULT_EVAL_VIDEO_COUNT,
-        "strategy": "eval_fraction",
-        "eval_fraction": 0.2,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("data_split", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load data split config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_rule_evaluation_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "prediction_mode": "any_rule_positive",
-        "rule_set_mode": "all",
-        "primary_rule_set": "original",
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("rule_evaluation", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load rule evaluation config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_rule_selection_visualization_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "top_rule_families": 8,
-        "dpi": 160,
-        "figure_format": "png",
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("rule_selection_visualization", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load rule selection visualization config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_fn_categorization_diagnostic_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "enabled": False,
-        "vehicle_context_match_levels": [
-            "exact_vehicle_near_centered",
-            "vehicle_near_partial",
-            "vehicle_centered_partial",
-        ],
-        "predicate_gap_levels": [
-            "missing_rule_or_predicate_dense_context",
-            "missing_rule_or_predicate_sparse_context",
-            "unexplained_noise_or_symbol_gap",
-        ],
-        "noisy_levels": [
-            "unexplained_noise_no_objects",
-            "unexplained_noise_or_symbol_gap",
-        ],
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("fn_categorization_diagnostic", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load FN categorization diagnostic config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        # Step 14 is per-video and safe to load from cache after split changes.
-        "candidate_rules": False,
-        # Steps 16-18 depend on the selected train/eval split and should refresh.
-        "extended_rules": True,
-        "final_rules": True,
-        "diverse_final_rules": True,
-        "semantic_constrained_diverse_final_rules": True,
-        "coverage_family_aware_final_rules": True,
-        "rule_pool_upper_bound_diagnostic": True,
-        "rule_evaluation": True,
-        "error_and_explainability_analysis": True,
-        "vehicle_rule_diagnostic": True,
-        "fn_categorization_diagnostic": True,
-        "rule_selection_visualization": True,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("pipeline_recompute", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load pipeline recompute config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_merged_candidate_rules_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "15_driving_mini_merged_initial_rules"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_split_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "driving_mini_split"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_error_and_explainability_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
-        "dense_context_min_objects": 2,
-        "overlap_rule_threshold": 10,
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("error_and_explainability_analysis", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load error analysis config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_vehicle_rule_diagnostic_cfg() -> Dict[str, Any]:
-    defaults: Dict[str, Any] = {
-        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
-        "near_states": ["near"],
-        "center_states": ["centered"],
-        "primary_rule_set": "original",
-    }
-    try:
-        cfg_path = config.get_config_path("exp_driving")
-        cfg = load_pattern_cfg_file(cfg_path)
-        override = cfg.get("vehicle_rule_diagnostic", {})
-        if isinstance(override, dict):
-            defaults.update(override)
-    except Exception as exc:
-        print(f"[warn] Could not load vehicle rule diagnostic config: {exc}. Using defaults.")
-    return defaults
-
-
-def _get_rule_evaluation_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "18_driving_mini_rule_evaluation"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_error_and_explainability_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "19_driving_mini_error_and_explainability_analysis"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_coverage_family_aware_final_rules_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "17c_driving_mini_coverage_family_aware_final_rules"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_semantic_constrained_diverse_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "17b2_driving_mini_semantic_constrained_diverse_final_rules"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_rule_pool_upper_bound_diagnostic_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "17d_driving_mini_rule_pool_upper_bound_diagnostic"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_vehicle_rule_diagnostic_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "20_driving_mini_vehicle_rule_diagnostic"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_rule_selection_visualization_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "21_rule_selection_visualization"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _get_fn_categorization_diagnostic_output_root() -> Path:
-    out = config.get_output_path("pipeline_output") / "20b_rule_selection_fn_diagnostic"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def _dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
-    for entry in evidence_entries:
-        bindings = dict(entry.get("bindings", {}))
-        key = (
-            str(entry.get("example_id", "")),
-            str(entry.get("matched_atom", "")),
-            tuple(sorted((str(k), str(v)) for k, v in bindings.items())),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(entry)
-    return deduped
-
-
-def _summarize_rule_evidence(evidence_entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total_firings = len(evidence_entries)
-    positive_firings = sum(1 for entry in evidence_entries if bool(entry.get("label", False)))
-    negative_firings = total_firings - positive_firings
-    positive_example_ids = sorted(
-        {
-            str(entry.get("example_id", ""))
-            for entry in evidence_entries
-            if bool(entry.get("label", False)) and str(entry.get("example_id", ""))
-        }
-    )
-    negative_example_ids = sorted(
-        {
-            str(entry.get("example_id", ""))
-            for entry in evidence_entries
-            if not bool(entry.get("label", False)) and str(entry.get("example_id", ""))
-        }
-    )
-    total_support = len(set(positive_example_ids) | set(negative_example_ids))
-    confidence = float(positive_firings / max(1, total_firings))
-    return {
-        "positive_support": len(positive_example_ids),
-        "negative_support": len(negative_example_ids),
-        "total_support": total_support,
-        "positive_firings": positive_firings,
-        "negative_firings": negative_firings,
-        "total_firings": total_firings,
-        "confidence": confidence,
-        "positive_example_ids": positive_example_ids,
-        "negative_example_ids": negative_example_ids,
-    }
-
-
-def _merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out_root = _get_merged_candidate_rules_output_root()
-    json_path = out_root / "merged_initial_rules.json"
-    csv_path = out_root / "merged_initial_rules.csv"
-    manifest_path = out_root / "merged_initial_rules_manifest.json"
-
-    merged_rule_map: Dict[str, Dict[str, Any]] = {}
-    video_summaries: List[Dict[str, Any]] = []
-    target_predicates: set[str] = set()
-    total_examples = 0
-    total_positive_examples = 0
-    total_negative_examples = 0
-
-    for video_result in sorted(candidate_rule_results, key=lambda item: str(item.get("video_id", ""))):
-        video_id = str(video_result.get("video_id", "unknown"))
-        target_predicate = str(video_result.get("target_predicate", ""))
-        if target_predicate:
-            target_predicates.add(target_predicate)
-        total_examples += int(video_result.get("num_examples", 0))
-        total_positive_examples += int(video_result.get("num_positive_examples", 0))
-        total_negative_examples += int(video_result.get("num_negative_examples", 0))
-
-        candidate_rules = list(video_result.get("initial_rules", video_result.get("candidate_rules", [])))
-        video_summaries.append(
-            {
-                "video_id": video_id,
-                "target_predicate": target_predicate,
-                "num_initial_rules": len(candidate_rules),
-                "num_examples": int(video_result.get("num_examples", 0)),
-                "num_positive_examples": int(video_result.get("num_positive_examples", 0)),
-                "num_negative_examples": int(video_result.get("num_negative_examples", 0)),
-            }
-        )
-
-        for rule in candidate_rules:
-            clause = str(rule.get("clause", "")).strip()
-            if not clause:
-                continue
-
-            merged_rule = merged_rule_map.get(clause)
-            if merged_rule is None:
-                merged_rule = {
-                    "merged_rule_index": -1,
-                    "rule_id": f"merged_rule_{len(merged_rule_map):04d}",
-                    "head_predicate": rule.get("head_predicate", ""),
-                    "head_atom_template": rule.get("head_atom_template", ""),
-                    "body_atom_template": rule.get("body_atom_template", ""),
-                    "clause": clause,
-                    "positive_support": 0,
-                    "negative_support": 0,
-                    "total_support": 0,
-                    "positive_firings": 0,
-                    "negative_firings": 0,
-                    "total_firings": 0,
-                    "confidence": 0.0,
-                    "positive_example_ids": [],
-                    "negative_example_ids": [],
-                    "evidence_set": [],
-                    "source_video_ids": [],
-                    "source_rule_ids": [],
-                    "source_rule_indices": [],
-                    "num_source_rules": 0,
-                }
-                merged_rule_map[clause] = merged_rule
-
-            merged_rule["evidence_set"].extend(list(rule.get("evidence_set", [])))
-            merged_rule["source_video_ids"].append(video_id)
-            merged_rule["source_rule_ids"].append(rule.get("rule_id", ""))
-            merged_rule["source_rule_indices"].append(rule.get("rule_index"))
-            merged_rule["num_source_rules"] += 1
-
-    merged_rules = sorted(merged_rule_map.values(), key=lambda item: str(item.get("clause", "")))
-    for idx, merged_rule in enumerate(merged_rules):
-        merged_rule["merged_rule_index"] = idx
-        merged_rule["evidence_set"] = _dedupe_rule_evidence_entries(list(merged_rule.get("evidence_set", [])))
-        evidence_summary = _summarize_rule_evidence(list(merged_rule.get("evidence_set", [])))
-        merged_rule["positive_support"] = int(evidence_summary["positive_support"])
-        merged_rule["negative_support"] = int(evidence_summary["negative_support"])
-        merged_rule["total_support"] = int(evidence_summary["total_support"])
-        merged_rule["positive_firings"] = int(evidence_summary["positive_firings"])
-        merged_rule["negative_firings"] = int(evidence_summary["negative_firings"])
-        merged_rule["total_firings"] = int(evidence_summary["total_firings"])
-        merged_rule["confidence"] = float(evidence_summary["confidence"])
-        merged_rule["positive_example_ids"] = list(evidence_summary["positive_example_ids"])
-        merged_rule["negative_example_ids"] = list(evidence_summary["negative_example_ids"])
-        merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
-        merged_rule["source_rule_ids"] = sorted(
-            set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
-        )
-        merged_rule["source_rule_indices"] = [
-            idx for idx in merged_rule["source_rule_indices"] if idx is not None
-        ]
-
-    merged_result: Dict[str, Any] = {
-        "num_videos": len(candidate_rule_results),
-        "num_examples": total_examples,
-        "num_positive_examples": total_positive_examples,
-        "num_negative_examples": total_negative_examples,
-        "num_rules": len(merged_rules),
-        "target_predicates": sorted(target_predicates),
-        "rules": merged_rules,
-    }
-
-    manifest: Dict[str, Any] = {
-        "num_videos": len(candidate_rule_results),
-        "num_examples": total_examples,
-        "num_positive_examples": total_positive_examples,
-        "num_negative_examples": total_negative_examples,
-        "num_rules": len(merged_rules),
-        "target_predicates": sorted(target_predicates),
-        "videos": video_summaries,
-        "json_path": str(json_path),
-        "csv_path": str(csv_path),
-    }
-
-    with json_path.open("w", encoding="utf-8") as fh:
-        json.dump(merged_result, fh, indent=2)
-
-    with csv_path.open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=[
-                "merged_rule_index",
-                "rule_id",
-                "head_predicate",
-                "head_atom_template",
-                "body_atom_template",
-                "clause",
-                "positive_support",
-                "negative_support",
-                "total_support",
-                "positive_firings",
-                "negative_firings",
-                "total_firings",
-                "confidence",
-                "positive_example_ids",
-                "negative_example_ids",
-                "source_video_ids",
-                "source_rule_ids",
-                "source_rule_indices",
-                "num_source_rules",
-            ],
-        )
-        writer.writeheader()
-        for rule in merged_rules:
-            writer.writerow(
-                {
-                    "merged_rule_index": rule.get("merged_rule_index", ""),
-                    "rule_id": rule.get("rule_id", ""),
-                    "head_predicate": rule.get("head_predicate", ""),
-                    "head_atom_template": rule.get("head_atom_template", ""),
-                    "body_atom_template": rule.get("body_atom_template", ""),
-                    "clause": rule.get("clause", ""),
-                    "positive_support": rule.get("positive_support", 0),
-                    "negative_support": rule.get("negative_support", 0),
-                    "total_support": rule.get("total_support", 0),
-                    "positive_firings": rule.get("positive_firings", 0),
-                    "negative_firings": rule.get("negative_firings", 0),
-                    "total_firings": rule.get("total_firings", 0),
-                    "confidence": rule.get("confidence", 0.0),
-                    "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
-                    "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
-                    "source_video_ids": json.dumps(rule.get("source_video_ids", [])),
-                    "source_rule_ids": json.dumps(rule.get("source_rule_ids", [])),
-                    "source_rule_indices": json.dumps(rule.get("source_rule_indices", [])),
-                    "num_source_rules": rule.get("num_source_rules", 0),
-                }
-            )
-
-    with manifest_path.open("w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
-
-    print(f"Merged initial rule JSON written to {json_path}")
-    print(f"Merged initial rule CSV written to {csv_path}")
-    print(f"Merged initial rule manifest written to {manifest_path}")
-    return merged_result
-
-
-def _select_video_results(
-    video_results: List[Dict[str, Any]],
-    selected_video_ids: List[str],
-) -> List[Dict[str, Any]]:
-    selected_video_id_set = {str(video_id) for video_id in selected_video_ids}
-    return [
-        result
-        for result in video_results
-        if str(result.get("video_id", "")) in selected_video_id_set
-    ]
-
-
-def _build_train_eval_split(
-    video_ids: List[str],
-    train_video_count: int,
-    eval_video_count: int,
-    strategy: str = "eval_fraction",
-    eval_fraction: float = 0.2,
-) -> Dict[str, Any]:
-    unique_video_ids = sorted({str(video_id) for video_id in video_ids if str(video_id)})
-    total_videos = len(unique_video_ids)
-    if total_videos < 2:
-        raise ValueError(
-            "At least 2 videos are required to create train/evaluation splits. "
-            f"Found {total_videos}."
-        )
-    if train_video_count < 1:
-        raise ValueError(f"train_video_count must be >= 1. Found {train_video_count}.")
-    if eval_video_count < 1:
-        raise ValueError(f"eval_video_count must be >= 1. Found {eval_video_count}.")
-
-    strategy = str(strategy or "eval_fraction")
-    if strategy == "fixed_counts":
-        requested_total = train_video_count + eval_video_count
-        if total_videos >= requested_total:
-            effective_train_count = train_video_count
-            effective_eval_count = eval_video_count
-            resolved_strategy = f"fixed_counts_first_{train_video_count}_train_{eval_video_count}_eval"
-        else:
-            effective_train_count = max(1, total_videos - 1)
-            effective_eval_count = total_videos - effective_train_count
-            resolved_strategy = "fallback_last_video_eval"
-    elif strategy == "eval_fraction":
-        eval_fraction = float(eval_fraction)
-        if not 0.0 < eval_fraction < 1.0:
-            raise ValueError(f"eval_fraction must be between 0 and 1. Found {eval_fraction}.")
-        effective_eval_count = max(1, min(total_videos - 1, int(math.ceil(total_videos * eval_fraction))))
-        effective_train_count = total_videos - effective_eval_count
-        resolved_strategy = f"eval_fraction_{eval_fraction:g}"
-    else:
-        raise ValueError(f"Unsupported data split strategy: {strategy}")
-
-    train_video_ids = unique_video_ids[:effective_train_count]
-    eval_video_ids = unique_video_ids[effective_train_count : effective_train_count + effective_eval_count]
-    if not eval_video_ids:
-        raise ValueError("Failed to assign evaluation videos for the train/eval split.")
-
-    split_manifest = {
-        "num_total_videos": total_videos,
-        "num_train_videos": len(train_video_ids),
-        "num_eval_videos": len(eval_video_ids),
-        "requested_train_video_count": train_video_count,
-        "requested_eval_video_count": eval_video_count,
-        "requested_eval_fraction": eval_fraction if strategy == "eval_fraction" else None,
-        "strategy": resolved_strategy,
-        "train_video_ids": train_video_ids,
-        "eval_video_ids": eval_video_ids,
-        "unused_video_ids": unique_video_ids[effective_train_count + effective_eval_count :],
-    }
-
-    out_root = _get_split_output_root()
-    manifest_path = out_root / "train_eval_split.json"
-    split_manifest["manifest_path"] = str(manifest_path)
-    with manifest_path.open("w", encoding="utf-8") as fh:
-        json.dump(split_manifest, fh, indent=2)
-    print(
-        "Train/eval split: "
-        f"train={train_video_ids} | "
-        f"eval={eval_video_ids}"
-    )
-    print(f"Split manifest written to {manifest_path}")
-    return split_manifest
-
-
-def _get_default_driving_mini_video_ids() -> List[str]:
-    dataset_root = config.get_dataset_path("driving_mini")
-    frames_root = dataset_root / "frames"
-    if frames_root.exists():
-        video_ids = sorted(path.name for path in frames_root.iterdir() if path.is_dir())
-        if video_ids:
-            return video_ids
-
-    videos_root = dataset_root / "videos"
-    if videos_root.exists():
-        return sorted(path.stem for path in videos_root.glob("*.mov"))
-    return []
-
-
-def _resolve_video_ids(video_ids: List[str] | None = None) -> List[str] | None:
-    if video_ids:
-        return list(video_ids)
-    default_video_ids = _get_default_driving_mini_video_ids()
-    return default_video_ids or None
+DRIVING_MINI_OD_MODEL = driving_pipeline_config.DRIVING_MINI_OD_MODEL
+DEFAULT_TRAIN_VIDEO_COUNT = driving_pipeline_config.DEFAULT_TRAIN_VIDEO_COUNT
+DEFAULT_EVAL_VIDEO_COUNT = driving_pipeline_config.DEFAULT_EVAL_VIDEO_COUNT
+DRIVING_MINI_OD_CLASSES = driving_pipeline_config.DRIVING_MINI_OD_CLASSES
+
+_get_ego_motion_smoothing_window = driving_pipeline_config.get_ego_motion_smoothing_window
+_get_ego_static_adjustment_cfg = driving_pipeline_config.get_ego_static_adjustment_cfg
+_get_temporal_segmentation_cfg = driving_pipeline_config.get_temporal_segmentation_cfg
+_get_segment_object_motion_cfg = driving_pipeline_config.get_segment_object_motion_cfg
+_get_important_objects_cfg = driving_pipeline_config.get_important_objects_cfg
+_get_logic_atoms_cfg = driving_pipeline_config.get_logic_atoms_cfg
+_get_target_head_atoms_cfg = driving_pipeline_config.get_target_head_atoms_cfg
+_get_temporal_rule_examples_cfg = driving_pipeline_config.get_temporal_rule_examples_cfg
+_get_candidate_rules_cfg = driving_pipeline_config.get_candidate_rules_cfg
+_get_extended_rules_cfg = driving_pipeline_config.get_extended_rules_cfg
+_get_final_rules_cfg = driving_pipeline_config.get_final_rules_cfg
+_get_diverse_final_rules_cfg = driving_pipeline_config.get_diverse_final_rules_cfg
+_get_semantic_constrained_diverse_cfg = driving_pipeline_config.get_semantic_constrained_diverse_cfg
+_get_coverage_family_aware_final_rules_cfg = driving_pipeline_config.get_coverage_family_aware_final_rules_cfg
+_get_rule_pool_upper_bound_diagnostic_cfg = driving_pipeline_config.get_rule_pool_upper_bound_diagnostic_cfg
+_get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
+_get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
+_get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
+_get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
+_get_fn_categorization_diagnostic_cfg = driving_pipeline_config.get_fn_categorization_diagnostic_cfg
+_get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
+_get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
+_get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diagnostic_cfg
+_get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
+_get_neural_symbolic_baseline_output_root = driving_pipeline_config.get_neural_symbolic_baseline_output_root
+_get_error_and_explainability_output_root = driving_pipeline_config.get_error_and_explainability_output_root
+_get_coverage_family_aware_final_rules_output_root = driving_pipeline_config.get_coverage_family_aware_final_rules_output_root
+_get_semantic_constrained_diverse_output_root = driving_pipeline_config.get_semantic_constrained_diverse_output_root
+_get_rule_pool_upper_bound_diagnostic_output_root = driving_pipeline_config.get_rule_pool_upper_bound_diagnostic_output_root
+_get_vehicle_rule_diagnostic_output_root = driving_pipeline_config.get_vehicle_rule_diagnostic_output_root
+_get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule_selection_visualization_output_root
+_get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
+
+_merge_candidate_rules = driving_pipeline_data.merge_candidate_rules
+_select_video_results = driving_pipeline_data.select_video_results
+_build_train_eval_split = driving_pipeline_data.build_train_eval_split
+_resolve_video_ids = driving_pipeline_data.resolve_video_ids
 
 
 def _run_object_detection_step(
@@ -1504,6 +662,30 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"Recall={float(overall_metrics.get('recall', 0.0)):.3f} | "
         f"F1={float(overall_metrics.get('f1', 0.0)):.3f}"
     )
+
+    # Step 18B: symbolic neural baselines on the same train/eval split
+    neural_symbolic_baseline_cfg = _get_neural_symbolic_baseline_cfg()
+    print("\n=== Step 18B: neural_symbolic_baseline_driving_mini ===")
+    print(f"Neural symbolic baseline cfg: {neural_symbolic_baseline_cfg}")
+    neural_symbolic_baseline_results: Dict[str, Any] = neural_symbolic_baseline_driving_mini.run(
+        train_temporal_rule_results=train_temporal_rule_results,
+        eval_temporal_rule_results=eval_temporal_rule_results,
+        split_manifest=split_manifest,
+        cfg=neural_symbolic_baseline_cfg,
+        output_root=_get_neural_symbolic_baseline_output_root(),
+        force_recompute=bool(recompute_cfg.get("neural_symbolic_baseline", True)),
+    )
+    comparison_rows = list(neural_symbolic_baseline_results.get("comparison", []))
+    if comparison_rows:
+        comparison_parts = []
+        for row in comparison_rows:
+            comparison_parts.append(
+                f"{str(row.get('model_name', 'model'))}: "
+                f"F1={float(row.get('f1', 0.0)):.3f}, "
+                f"AUROC={float(row.get('auroc', 0.0)):.3f}, "
+                f"AUPRC={float(row.get('auprc', 0.0)):.3f}"
+            )
+        print("Neural symbolic baselines complete. " + " | ".join(comparison_parts))
     if max_step == 18:
         print("\nStopping after step 18 by request.")
         return

@@ -17,6 +17,7 @@ import csv
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -28,11 +29,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import config
-from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _find_rule_matches_for_example
 from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
 
 
-_POOL_UPPER_BOUND_VERSION = 1
+_POOL_UPPER_BOUND_VERSION = 2
+_VARIABLE_NAMES = {"S", "O", "T", "F"}
 
 
 def get_output_root() -> Path:
@@ -128,6 +129,76 @@ def _compute_binary_metrics(
     }
 
 
+def _bindings_compatible(left: Dict[str, str], right: Dict[str, str]) -> bool:
+    for key, value in left.items():
+        if key in right and str(right[key]) != str(value):
+            return False
+    return True
+
+
+def _merge_bindings(left: Dict[str, str], right: Dict[str, str]) -> Dict[str, str]:
+    merged = {str(key): str(value) for key, value in left.items()}
+    for key, value in right.items():
+        merged[str(key)] = str(value)
+    return merged
+
+
+def _extract_bindings_from_args(
+    template_args: Sequence[str],
+    concrete_args: Sequence[str],
+) -> Optional[Dict[str, str]]:
+    if len(template_args) != len(concrete_args):
+        return None
+    bindings: Dict[str, str] = {}
+    for template_arg, concrete_arg in zip(template_args, concrete_args):
+        if template_arg in _VARIABLE_NAMES:
+            existing = bindings.get(template_arg)
+            if existing is not None and existing != concrete_arg:
+                return None
+            bindings[template_arg] = str(concrete_arg)
+            continue
+        if str(template_arg) != str(concrete_arg):
+            return None
+    return bindings
+
+
+def _rule_matches_example_fast(
+    rule_templates: Sequence[Tuple[str, Tuple[str, ...]]],
+    rule_predicate_counts: Dict[str, int],
+    example_atoms_by_predicate: Dict[str, List[Tuple[str, ...]]],
+    example_predicate_counts: Dict[str, int],
+) -> bool:
+    for predicate, required_count in rule_predicate_counts.items():
+        if int(example_predicate_counts.get(predicate, 0)) < int(required_count):
+            return False
+
+    candidate_binding_lists: List[List[Dict[str, str]]] = []
+    for predicate, template_args in rule_templates:
+        concrete_atoms = example_atoms_by_predicate.get(predicate, [])
+        candidate_bindings: List[Dict[str, str]] = []
+        for concrete_args in concrete_atoms:
+            bindings = _extract_bindings_from_args(template_args, concrete_args)
+            if bindings is not None:
+                candidate_bindings.append(bindings)
+        if not candidate_bindings:
+            return False
+        candidate_binding_lists.append(candidate_bindings)
+
+    ordered_candidate_binding_lists = sorted(candidate_binding_lists, key=len)
+
+    def _backtrack(candidate_index: int, current_bindings: Dict[str, str]) -> bool:
+        if candidate_index >= len(ordered_candidate_binding_lists):
+            return True
+        for candidate_bindings in ordered_candidate_binding_lists[candidate_index]:
+            if not _bindings_compatible(current_bindings, candidate_bindings):
+                continue
+            if _backtrack(candidate_index + 1, _merge_bindings(current_bindings, candidate_bindings)):
+                return True
+        return False
+
+    return _backtrack(0, {})
+
+
 def _rule_semantic_family(rule: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     vehicle_classes = {
         str(v)
@@ -176,22 +247,23 @@ def _rule_semantic_family(rule: Dict[str, Any], cfg: Dict[str, Any]) -> str:
 
 def _evaluate_selected_rule_set(
     selected_rule_ids: Sequence[str],
-    rule_matches_by_id: Dict[str, Dict[str, Set[str]]],
-    positive_example_ids: Set[str],
-    negative_example_ids: Set[str],
+    rule_matches_by_id: Dict[str, Dict[str, Any]],
+    positive_mask: int,
+    negative_mask: int,
+    total_positive_examples: int,
+    total_negative_examples: int,
 ) -> Dict[str, Any]:
-    predicted_positive_ids: Set[str] = set()
+    predicted_positive_mask = 0
     for rule_id in selected_rule_ids:
         match_info = rule_matches_by_id.get(str(rule_id), {})
-        predicted_positive_ids.update(match_info.get("matched_example_ids", set()))
+        predicted_positive_mask |= int(match_info.get("matched_mask", 0))
 
-    tp = len(predicted_positive_ids & positive_example_ids)
-    fp = len(predicted_positive_ids & negative_example_ids)
-    fn = len(positive_example_ids - predicted_positive_ids)
-    tn = len(negative_example_ids - predicted_positive_ids)
+    tp = int((predicted_positive_mask & positive_mask).bit_count())
+    fp = int((predicted_positive_mask & negative_mask).bit_count())
+    fn = int(total_positive_examples - tp)
+    tn = int(total_negative_examples - fp)
     metrics = _compute_binary_metrics(tp, fp, fn, tn)
     metrics["num_rules"] = len([rule_id for rule_id in selected_rule_ids if str(rule_id) in rule_matches_by_id])
-    metrics["predicted_positive_example_ids"] = sorted(predicted_positive_ids)
     return metrics
 
 
@@ -271,63 +343,89 @@ def process_diagnostic(
     ]
 
     eval_examples: List[Dict[str, Any]] = []
-    positive_example_ids: Set[str] = set()
-    negative_example_ids: Set[str] = set()
+    positive_mask = 0
+    negative_mask = 0
     for example in _iter_eval_examples(filtered_results):
         example_id = str(example.get("example_id", ""))
         if not example_id:
             continue
+        example_index = len(eval_examples)
+        body_atoms_by_predicate: Dict[str, List[Tuple[str, ...]]] = {}
+        predicate_counts: Counter[str] = Counter()
+        for atom in list(example.get("body_atoms", [])):
+            parsed = _parse_atom(str(atom))
+            if parsed is None:
+                continue
+            predicate, args = parsed
+            predicate_counts[predicate] += 1
+            body_atoms_by_predicate.setdefault(predicate, []).append(tuple(str(arg) for arg in args))
         eval_examples.append(
             {
+                "example_index": example_index,
                 "video_id": str(example.get("video_id", "")),
                 "example_id": example_id,
                 "label": bool(example.get("label", False)),
-                "body_atoms": list(example.get("body_atoms", [])),
+                "body_atoms_by_predicate": body_atoms_by_predicate,
+                "predicate_counts": dict(predicate_counts),
             }
         )
         if bool(example.get("label", False)):
-            positive_example_ids.add(example_id)
+            positive_mask |= 1 << example_index
         else:
-            negative_example_ids.add(example_id)
+            negative_mask |= 1 << example_index
 
-    total_positive_examples = len(positive_example_ids)
-    total_negative_examples = len(negative_example_ids)
+    total_positive_examples = int(positive_mask.bit_count())
+    total_negative_examples = int(negative_mask.bit_count())
     all_kept_rules = list(extended_rule_results.get("all_kept_rules", []))
     oracle_k_values = sorted({max(1, int(v)) for v in cfg.get("oracle_k_values", [1, 5, 10, 20, 50, 100])})
     max_oracle_k = max(oracle_k_values, default=1)
 
     rule_rows: List[Dict[str, Any]] = []
-    rule_matches_by_id: Dict[str, Dict[str, Set[str]]] = {}
+    rule_matches_by_id: Dict[str, Dict[str, Any]] = {}
 
     for rule in all_kept_rules:
         rule_id = str(rule.get("rule_id", ""))
-        matched_positive_ids: Set[str] = set()
-        matched_negative_ids: Set[str] = set()
+        matched_positive_mask = 0
+        matched_negative_mask = 0
+        matched_mask = 0
         body_atom_templates = _get_rule_body_atom_templates(rule)
-        for example in eval_examples:
-            match_states = _find_rule_matches_for_example(
-                body_atom_templates=body_atom_templates,
-                body_atoms=list(example.get("body_atoms", [])),
-            )
-            if not match_states:
+        parsed_rule_templates: List[Tuple[str, Tuple[str, ...]]] = []
+        rule_predicate_counts: Counter[str] = Counter()
+        for atom in body_atom_templates:
+            parsed = _parse_atom(str(atom))
+            if parsed is None:
                 continue
-            example_id = str(example.get("example_id", ""))
+            predicate, args = parsed
+            rule_predicate_counts[predicate] += 1
+            parsed_rule_templates.append((predicate, tuple(str(arg) for arg in args)))
+        if not parsed_rule_templates:
+            continue
+        rule_predicate_count_map = dict(rule_predicate_counts)
+        for example in eval_examples:
+            if not _rule_matches_example_fast(
+                rule_templates=parsed_rule_templates,
+                rule_predicate_counts=rule_predicate_count_map,
+                example_atoms_by_predicate=example.get("body_atoms_by_predicate", {}),
+                example_predicate_counts=example.get("predicate_counts", {}),
+            ):
+                continue
+            example_mask = 1 << int(example.get("example_index", 0))
+            matched_mask |= example_mask
             if bool(example.get("label", False)):
-                matched_positive_ids.add(example_id)
+                matched_positive_mask |= example_mask
             else:
-                matched_negative_ids.add(example_id)
+                matched_negative_mask |= example_mask
 
-        tp = len(matched_positive_ids)
-        fp = len(matched_negative_ids)
+        tp = int(matched_positive_mask.bit_count())
+        fp = int(matched_negative_mask.bit_count())
         fn = total_positive_examples - tp
         tn = total_negative_examples - fp
         metrics = _compute_binary_metrics(tp, fp, fn, tn)
         semantic_family = _rule_semantic_family(rule, cfg)
-        matched_example_ids = matched_positive_ids | matched_negative_ids
         rule_matches_by_id[rule_id] = {
-            "positive_example_ids": set(matched_positive_ids),
-            "negative_example_ids": set(matched_negative_ids),
-            "matched_example_ids": set(matched_example_ids),
+            "positive_mask": matched_positive_mask,
+            "negative_mask": matched_negative_mask,
+            "matched_mask": matched_mask,
         }
         rule_rows.append(
             {
@@ -339,7 +437,7 @@ def process_diagnostic(
                 "train_total_support": int(rule.get("total_support", int(rule.get("positive_support", 0)) + int(rule.get("negative_support", 0)))),
                 "eval_positive_support": tp,
                 "eval_negative_support": fp,
-                "eval_total_support": len(matched_example_ids),
+                "eval_total_support": int(matched_mask.bit_count()),
                 "precision": float(metrics["precision"]),
                 "recall": float(metrics["recall"]),
                 "f1": float(metrics["f1"]),
@@ -408,22 +506,23 @@ def process_diagnostic(
 
     oracle_curve_rows: List[Dict[str, Any]] = []
     selected_rule_ids: Set[str] = set()
-    predicted_positive_ids: Set[str] = set()
+    predicted_positive_mask = 0
     current_tp = 0
     current_fp = 0
+    oracle_candidate_rows = [row for row in rule_rows if int(row.get("eval_total_support", 0)) > 0]
 
-    for rank in range(1, min(max_oracle_k, len(rule_rows)) + 1):
+    for rank in range(1, min(max_oracle_k, len(oracle_candidate_rows)) + 1):
         best_candidate: Optional[Dict[str, Any]] = None
         best_candidate_metrics: Optional[Dict[str, Any]] = None
-        for row in rule_rows:
+        for row in oracle_candidate_rows:
             rule_id = str(row.get("rule_id", ""))
             if rule_id in selected_rule_ids:
                 continue
             match_info = rule_matches_by_id.get(rule_id, {})
-            candidate_pos_ids = set(match_info.get("positive_example_ids", set()))
-            candidate_neg_ids = set(match_info.get("negative_example_ids", set()))
-            additional_tp = len(candidate_pos_ids - predicted_positive_ids)
-            additional_fp = len(candidate_neg_ids - predicted_positive_ids)
+            candidate_positive_mask = int(match_info.get("positive_mask", 0))
+            candidate_negative_mask = int(match_info.get("negative_mask", 0))
+            additional_tp = int((candidate_positive_mask & ~predicted_positive_mask).bit_count())
+            additional_fp = int((candidate_negative_mask & ~predicted_positive_mask).bit_count())
             tp = current_tp + additional_tp
             fp = current_fp + additional_fp
             fn = total_positive_examples - tp
@@ -471,8 +570,7 @@ def process_diagnostic(
 
         best_rule_id = str(best_candidate["rule_id"])
         selected_rule_ids.add(best_rule_id)
-        predicted_positive_ids.update(best_candidate_metrics.get("positive_example_ids", set()))
-        predicted_positive_ids.update(best_candidate_metrics.get("negative_example_ids", set()))
+        predicted_positive_mask |= int(best_candidate_metrics.get("matched_mask", 0))
         current_tp = int(best_candidate["true_positive"])
         current_fp = int(best_candidate["false_positive"])
 
@@ -508,8 +606,10 @@ def process_diagnostic(
             selector_metrics_by_name[selector_name] = _evaluate_selected_rule_set(
                 selected_rule_ids=selected_ids,
                 rule_matches_by_id=rule_matches_by_id,
-                positive_example_ids=positive_example_ids,
-                negative_example_ids=negative_example_ids,
+                positive_mask=positive_mask,
+                negative_mask=negative_mask,
+                total_positive_examples=total_positive_examples,
+                total_negative_examples=total_negative_examples,
             )
 
     selection_reference_k = max((int(metrics.get("num_rules", 0)) for metrics in selector_metrics_by_name.values()), default=max(oracle_k_values, default=0))
