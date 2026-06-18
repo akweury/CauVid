@@ -362,6 +362,26 @@ def get_rule_evaluation_cfg() -> Dict[str, Any]:
     )
 
 
+def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "validation_fraction": 0.25,
+            "class_weight": "balanced",
+            "c_values": [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0],
+            "solver": "liblinear",
+            "max_iter": 2000,
+            "random_seed": 0,
+            "active_rule_min_train_support": 1,
+            "top_weighted_rules": 30,
+            "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+            "near_states": ["near"],
+            "center_states": ["centered"],
+        },
+        path=("rule_aggregation_baseline",),
+        warn_label="rule aggregation baseline",
+    )
+
+
 def get_neural_symbolic_baseline_cfg() -> Dict[str, Any]:
     defaults = {
         "min_feature_count": 1,
@@ -455,6 +475,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "rule_pool_upper_bound_diagnostic": True,
             "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,
+            "rule_aggregation_baseline": True,
             "neural_symbolic_baseline": True,
             "error_and_explainability_analysis": True,
             "vehicle_rule_diagnostic": True,
@@ -501,6 +522,10 @@ def get_split_output_root() -> Path:
 
 def get_rule_evaluation_output_root() -> Path:
     return _load_output_root("18_driving_mini_rule_evaluation")
+
+
+def get_rule_aggregation_baseline_output_root() -> Path:
+    return _load_output_root("18c_driving_mini_rule_aggregation_baseline")
 
 
 def get_error_and_explainability_output_root() -> Path:

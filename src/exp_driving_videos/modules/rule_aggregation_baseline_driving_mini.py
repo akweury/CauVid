@@ -1,0 +1,788 @@
+"""
+Train a learned rule-aggregation baseline over Step 16 rule firings.
+
+The baseline builds a binary rule-firing matrix from the Step 16 rule pool,
+trains an L1-sparse logistic regression on train videos, tunes regularization
+and decision threshold on validation videos, and evaluates on the held-out
+evaluation split.
+
+Output layout:
+    pipeline_output/18c_driving_mini_rule_aggregation_baseline/
+        rule_aggregation_baseline_summary.json
+        rule_aggregation_baseline_metrics.csv
+        per_video_metrics.csv
+        prediction_examples.csv
+        top_weighted_rules.csv
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import random
+import sys
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+import config
+from src.exp_driving_videos.modules.rule_pool_upper_bound_diagnostic_driving_mini import (
+    _compute_binary_metrics,
+    _parse_atom,
+    _rule_matches_example_fast,
+    _rule_semantic_family,
+)
+from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
+
+
+_RULE_AGGREGATION_BASELINE_VERSION = 1
+
+
+def get_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "18c_driving_mini_rule_aggregation_baseline"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "validation_fraction": float(cfg.get("validation_fraction", 0.25)),
+        "class_weight": str(cfg.get("class_weight", "balanced")),
+        "c_values": [float(v) for v in cfg.get("c_values", [])],
+        "solver": str(cfg.get("solver", "liblinear")),
+        "max_iter": int(cfg.get("max_iter", 2000)),
+        "random_seed": int(cfg.get("random_seed", 0)),
+        "active_rule_min_train_support": int(cfg.get("active_rule_min_train_support", 1)),
+        "top_weighted_rules": int(cfg.get("top_weighted_rules", 30)),
+        "vehicle_classes": sorted(str(v) for v in cfg.get("vehicle_classes", [])),
+        "near_states": sorted(str(v) for v in cfg.get("near_states", [])),
+        "center_states": sorted(str(v) for v in cfg.get("center_states", [])),
+    }
+
+
+def _write_csv(path: Path, fieldnames: Sequence[str], rows: Sequence[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(fieldnames))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _prepare_examples(temporal_rule_results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    examples: List[Dict[str, Any]] = []
+    for video_result in temporal_rule_results:
+        video_id = str(video_result.get("video_id", ""))
+        for example in list(video_result.get("examples", [])):
+            example_id = str(example.get("example_id", ""))
+            if not example_id:
+                continue
+            predicate_counts: Dict[str, int] = {}
+            atoms_by_predicate: Dict[str, List[Tuple[str, ...]]] = {}
+            for atom in list(example.get("body_atoms", [])):
+                parsed = _parse_atom(str(atom))
+                if parsed is None:
+                    continue
+                predicate, args = parsed
+                predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
+                atoms_by_predicate.setdefault(predicate, []).append(tuple(str(arg) for arg in args))
+            examples.append(
+                {
+                    "video_id": video_id,
+                    "example_id": example_id,
+                    "label": bool(example.get("label", False)),
+                    "current_segment_index": int(example.get("current_segment_index", -1)),
+                    "current_segment_label": str(example.get("current_segment_label", "")),
+                    "num_body_atoms": int(example.get("num_body_atoms", len(example.get("body_atoms", [])))),
+                    "predicate_counts": predicate_counts,
+                    "atoms_by_predicate": atoms_by_predicate,
+                }
+            )
+    return examples
+
+
+def _group_examples_by_video(examples: Sequence[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for example in examples:
+        grouped.setdefault(str(example.get("video_id", "")), []).append(example)
+    for video_id in grouped:
+        grouped[video_id] = sorted(
+            grouped[video_id],
+            key=lambda row: (
+                int(row.get("current_segment_index", -1)),
+                str(row.get("example_id", "")),
+            ),
+        )
+    return grouped
+
+
+def _split_train_validation(
+    train_examples: Sequence[Dict[str, Any]],
+    validation_fraction: float,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    grouped = _group_examples_by_video(train_examples)
+    video_ids = sorted(grouped)
+    rng = random.Random(int(seed))
+    shuffled_video_ids = list(video_ids)
+    rng.shuffle(shuffled_video_ids)
+
+    if len(shuffled_video_ids) > 1:
+        requested = int(round(len(shuffled_video_ids) * float(validation_fraction)))
+        val_video_count = min(len(shuffled_video_ids) - 1, max(1, requested))
+        val_video_ids = set(shuffled_video_ids[:val_video_count])
+        train_subset = [example for example in train_examples if str(example.get("video_id", "")) not in val_video_ids]
+        val_subset = [example for example in train_examples if str(example.get("video_id", "")) in val_video_ids]
+        return train_subset, val_subset, {
+            "strategy": "video_level",
+            "train_video_ids": sorted({str(example.get("video_id", "")) for example in train_subset}),
+            "validation_video_ids": sorted(val_video_ids),
+            "num_train_examples": len(train_subset),
+            "num_validation_examples": len(val_subset),
+        }
+
+    ordered = sorted(
+        train_examples,
+        key=lambda row: (
+            int(row.get("current_segment_index", -1)),
+            str(row.get("example_id", "")),
+        ),
+    )
+    if len(ordered) <= 1:
+        return list(ordered), list(ordered), {
+            "strategy": "single_example_fallback",
+            "train_video_ids": list(video_ids),
+            "validation_video_ids": list(video_ids),
+            "num_train_examples": len(ordered),
+            "num_validation_examples": len(ordered),
+        }
+    val_count = min(len(ordered) - 1, max(1, int(round(len(ordered) * float(validation_fraction)))))
+    train_subset = ordered[:-val_count]
+    val_subset = ordered[-val_count:]
+    return train_subset, val_subset, {
+        "strategy": "example_level_fallback",
+        "train_video_ids": list(video_ids),
+        "validation_video_ids": list(video_ids),
+        "num_train_examples": len(train_subset),
+        "num_validation_examples": len(val_subset),
+    }
+
+
+def _prepare_rules(extended_rule_results: Dict[str, Any], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rules: List[Dict[str, Any]] = []
+    for rule in list(extended_rule_results.get("all_kept_rules", [])):
+        rule_id = str(rule.get("rule_id", ""))
+        if not rule_id:
+            continue
+        templates: List[Tuple[str, Tuple[str, ...]]] = []
+        predicate_counts: Dict[str, int] = {}
+        for atom in _get_rule_body_atom_templates(rule):
+            parsed = _parse_atom(atom)
+            if parsed is None:
+                continue
+            predicate, args = parsed
+            templates.append((predicate, tuple(str(arg) for arg in args)))
+            predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
+        if not templates:
+            continue
+        rules.append(
+            {
+                "rule_id": rule_id,
+                "clause": str(rule.get("clause", "")),
+                "confidence": float(rule.get("confidence", 0.0)),
+                "positive_support": int(rule.get("positive_support", 0)),
+                "negative_support": int(rule.get("negative_support", 0)),
+                "total_support": int(rule.get("total_support", 0)),
+                "semantic_family": _rule_semantic_family(rule, cfg),
+                "rule_templates": templates,
+                "rule_predicate_counts": predicate_counts,
+            }
+        )
+    return rules
+
+
+def _import_ml_dependencies() -> Tuple[Any, Any, Any, Any, Any]:
+    try:
+        from scipy import sparse
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import average_precision_score, confusion_matrix, roc_auc_score
+    except Exception as exc:  # pragma: no cover - runtime dependency guard
+        raise RuntimeError(
+            "Rule aggregation baseline requires scipy and scikit-learn in the runtime environment."
+        ) from exc
+    return sparse, LogisticRegression, average_precision_score, roc_auc_score, confusion_matrix
+
+
+def _build_rule_firing_matrix(
+    examples: Sequence[Dict[str, Any]],
+    prepared_rules: Sequence[Dict[str, Any]],
+    sparse_module: Any,
+) -> Any:
+    row_indices: List[int] = []
+    col_indices: List[int] = []
+    data: List[int] = []
+    for col_index, rule in enumerate(prepared_rules):
+        rule_templates = list(rule.get("rule_templates", []))
+        rule_predicate_counts = dict(rule.get("rule_predicate_counts", {}))
+        for row_index, example in enumerate(examples):
+            if _rule_matches_example_fast(
+                rule_templates=rule_templates,
+                rule_predicate_counts=rule_predicate_counts,
+                example_atoms_by_predicate=dict(example.get("atoms_by_predicate", {})),
+                example_predicate_counts=dict(example.get("predicate_counts", {})),
+            ):
+                row_indices.append(row_index)
+                col_indices.append(col_index)
+                data.append(1)
+    return sparse_module.csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(len(examples), len(prepared_rules)),
+        dtype=np.float32,
+    )
+
+
+def _compute_threshold_metrics(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    threshold: float,
+    average_precision_score_fn: Any,
+    roc_auc_score_fn: Any,
+    confusion_matrix_fn: Any,
+) -> Dict[str, Any]:
+    predicted = [1 if float(probability) >= float(threshold) else 0 for probability in probabilities]
+    confusion = confusion_matrix_fn(labels, predicted, labels=[0, 1])
+    tn, fp, fn, tp = [int(value) for value in confusion.ravel()]
+    metrics = _compute_binary_metrics(tp, fp, fn, tn)
+    try:
+        auroc = float(roc_auc_score_fn(labels, probabilities))
+    except Exception:
+        auroc = float("nan")
+    try:
+        auprc = float(average_precision_score_fn(labels, probabilities))
+    except Exception:
+        auprc = float("nan")
+    metrics["auroc"] = auroc
+    metrics["auprc"] = auprc
+    metrics["threshold"] = float(threshold)
+    metrics["predicted_labels"] = predicted
+    return metrics
+
+
+def _select_best_threshold(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    average_precision_score_fn: Any,
+    roc_auc_score_fn: Any,
+    confusion_matrix_fn: Any,
+    default_threshold: float = 0.5,
+) -> Tuple[float, Dict[str, Any]]:
+    candidates = {0.0, 1.0, float(default_threshold)}
+    for probability in probabilities:
+        p = float(probability)
+        candidates.add(p)
+        candidates.add(min(1.0, max(0.0, p + 1e-8)))
+        candidates.add(min(1.0, max(0.0, p - 1e-8)))
+
+    best_threshold = float(default_threshold)
+    best_metrics = _compute_threshold_metrics(
+        labels,
+        probabilities,
+        best_threshold,
+        average_precision_score_fn,
+        roc_auc_score_fn,
+        confusion_matrix_fn,
+    )
+    best_key = (
+        float(best_metrics.get("f1", 0.0)),
+        float(best_metrics.get("precision", 0.0)),
+        float(best_metrics.get("recall", 0.0)),
+        -abs(best_threshold - default_threshold),
+        -best_threshold,
+    )
+    for threshold in sorted(candidates):
+        metrics = _compute_threshold_metrics(
+            labels,
+            probabilities,
+            float(threshold),
+            average_precision_score_fn,
+            roc_auc_score_fn,
+            confusion_matrix_fn,
+        )
+        key = (
+            float(metrics.get("f1", 0.0)),
+            float(metrics.get("precision", 0.0)),
+            float(metrics.get("recall", 0.0)),
+            -abs(float(threshold) - default_threshold),
+            -float(threshold),
+        )
+        if key > best_key:
+            best_threshold = float(threshold)
+            best_metrics = metrics
+            best_key = key
+    return best_threshold, best_metrics
+
+
+def _per_video_metrics(
+    model_name: str,
+    examples: Sequence[Dict[str, Any]],
+    probabilities: Sequence[float],
+    threshold_name: str,
+    threshold_value: float,
+    average_precision_score_fn: Any,
+    roc_auc_score_fn: Any,
+    confusion_matrix_fn: Any,
+) -> List[Dict[str, Any]]:
+    grouped = _group_examples_by_video(examples)
+    probability_lookup = {
+        str(example.get("example_id", "")): float(probability)
+        for example, probability in zip(examples, probabilities)
+    }
+    rows: List[Dict[str, Any]] = []
+    for video_id in sorted(grouped):
+        video_examples = grouped[video_id]
+        labels = [1 if bool(example.get("label", False)) else 0 for example in video_examples]
+        video_probabilities = [probability_lookup[str(example.get("example_id", ""))] for example in video_examples]
+        metrics = _compute_threshold_metrics(
+            labels,
+            video_probabilities,
+            threshold_value,
+            average_precision_score_fn,
+            roc_auc_score_fn,
+            confusion_matrix_fn,
+        )
+        rows.append(
+            {
+                "model_name": model_name,
+                "video_id": video_id,
+                "num_examples": len(video_examples),
+                "threshold_name": threshold_name,
+                "threshold_value": float(threshold_value),
+                "precision": float(metrics.get("precision", 0.0)),
+                "recall": float(metrics.get("recall", 0.0)),
+                "f1": float(metrics.get("f1", 0.0)),
+                "accuracy": float(metrics.get("accuracy", 0.0)),
+                "auroc": float(metrics.get("auroc", float("nan"))),
+                "auprc": float(metrics.get("auprc", float("nan"))),
+                "true_positive": int(metrics.get("true_positive", 0)),
+                "false_positive": int(metrics.get("false_positive", 0)),
+                "false_negative": int(metrics.get("false_negative", 0)),
+                "true_negative": int(metrics.get("true_negative", 0)),
+            }
+        )
+    return rows
+
+
+def _prediction_rows(
+    examples: Sequence[Dict[str, Any]],
+    probabilities: Sequence[float],
+    threshold_05: float,
+    best_threshold: float,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for example, probability in zip(examples, probabilities):
+        rows.append(
+            {
+                "video_id": str(example.get("video_id", "")),
+                "example_id": str(example.get("example_id", "")),
+                "current_segment_index": int(example.get("current_segment_index", -1)),
+                "label": bool(example.get("label", False)),
+                "predicted_probability": float(probability),
+                "threshold_at_0_5": float(threshold_05),
+                "best_validation_threshold": float(best_threshold),
+                "predicted_label_at_0_5": bool(float(probability) >= float(threshold_05)),
+                "predicted_label_at_best_validation_threshold": bool(float(probability) >= float(best_threshold)),
+                "current_segment_label": str(example.get("current_segment_label", "")),
+                "num_body_atoms": int(example.get("num_body_atoms", 0)),
+            }
+        )
+    return rows
+
+
+def process_baseline(
+    extended_rule_results: Dict[str, Any],
+    train_temporal_rule_results: Sequence[Dict[str, Any]],
+    eval_temporal_rule_results: Sequence[Dict[str, Any]],
+    split_manifest: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    output_root: Optional[Path] = None,
+    force_recompute: bool = False,
+) -> Dict[str, Any]:
+    cfg = cfg or {}
+    out_root = output_root or get_output_root()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    summary_path = out_root / "rule_aggregation_baseline_summary.json"
+    metrics_csv_path = out_root / "rule_aggregation_baseline_metrics.csv"
+    per_video_csv_path = out_root / "per_video_metrics.csv"
+    prediction_csv_path = out_root / "prediction_examples.csv"
+    top_rules_csv_path = out_root / "top_weighted_rules.csv"
+
+    if not force_recompute and summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if int(cached.get("version", 0)) == _RULE_AGGREGATION_BASELINE_VERSION and _cfg_key_subset(
+            cached.get("config", {})
+        ) == _cfg_key_subset(cfg):
+            print(f"  [cache] loading {summary_path.name}")
+            return cached
+
+    sparse, LogisticRegression, average_precision_score, roc_auc_score, confusion_matrix = _import_ml_dependencies()
+
+    random_seed = int(cfg.get("random_seed", 0))
+    np.random.seed(random_seed)
+    random.seed(random_seed)
+
+    train_examples_all = _prepare_examples(train_temporal_rule_results)
+    eval_examples = _prepare_examples(eval_temporal_rule_results)
+    if not train_examples_all:
+        raise RuntimeError("Rule aggregation baseline received an empty training split.")
+    if not eval_examples:
+        raise RuntimeError("Rule aggregation baseline received an empty evaluation split.")
+
+    train_examples, val_examples, validation_split = _split_train_validation(
+        train_examples_all,
+        validation_fraction=float(cfg.get("validation_fraction", 0.25)),
+        seed=random_seed,
+    )
+    if not train_examples or not val_examples:
+        raise RuntimeError("Rule aggregation baseline could not create non-empty train/validation subsets.")
+
+    prepared_rules = _prepare_rules(extended_rule_results, cfg)
+    if not prepared_rules:
+        raise RuntimeError("Rule aggregation baseline found no valid rules in the Step 16 rule pool.")
+
+    train_matrix_full = _build_rule_firing_matrix(train_examples, prepared_rules, sparse)
+    val_matrix_full = _build_rule_firing_matrix(val_examples, prepared_rules, sparse)
+    eval_matrix_full = _build_rule_firing_matrix(eval_examples, prepared_rules, sparse)
+
+    min_train_support = max(1, int(cfg.get("active_rule_min_train_support", 1)))
+    active_rule_mask = np.asarray(train_matrix_full.getnnz(axis=0)).reshape(-1) >= min_train_support
+    active_rule_indices = np.flatnonzero(active_rule_mask)
+    if active_rule_indices.size == 0:
+        raise RuntimeError("Rule aggregation baseline found no active train-time rule features.")
+
+    train_matrix = train_matrix_full[:, active_rule_indices]
+    val_matrix = val_matrix_full[:, active_rule_indices]
+    eval_matrix = eval_matrix_full[:, active_rule_indices]
+    active_rules = [prepared_rules[int(index)] for index in active_rule_indices.tolist()]
+
+    y_train = np.asarray([1 if bool(example.get("label", False)) else 0 for example in train_examples], dtype=np.int64)
+    y_val = np.asarray([1 if bool(example.get("label", False)) else 0 for example in val_examples], dtype=np.int64)
+    y_eval = np.asarray([1 if bool(example.get("label", False)) else 0 for example in eval_examples], dtype=np.int64)
+
+    c_values = [float(v) for v in cfg.get("c_values", [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0])]
+    solver = str(cfg.get("solver", "liblinear"))
+    class_weight_cfg = str(cfg.get("class_weight", "balanced")).strip().lower()
+    class_weight = "balanced" if class_weight_cfg == "balanced" else None
+    max_iter = int(cfg.get("max_iter", 2000))
+
+    candidate_rows: List[Dict[str, Any]] = []
+    best_model: Optional[Any] = None
+    best_threshold = 0.5
+    best_key: Optional[Tuple[float, float, float, float, float]] = None
+    best_val_metrics_best: Dict[str, Any] = {}
+    best_val_metrics_05: Dict[str, Any] = {}
+    best_c = c_values[0] if c_values else 1.0
+
+    for c_value in c_values:
+        model = LogisticRegression(
+            penalty="l1",
+            solver=solver,
+            C=float(c_value),
+            max_iter=max_iter,
+            random_state=random_seed,
+            class_weight=class_weight,
+        )
+        model.fit(train_matrix, y_train)
+        val_probabilities = model.predict_proba(val_matrix)[:, 1].astype(np.float64).tolist()
+        threshold_05 = _compute_threshold_metrics(
+            y_val.tolist(),
+            val_probabilities,
+            0.5,
+            average_precision_score,
+            roc_auc_score,
+            confusion_matrix,
+        )
+        tuned_threshold, tuned_metrics = _select_best_threshold(
+            y_val.tolist(),
+            val_probabilities,
+            average_precision_score,
+            roc_auc_score,
+            confusion_matrix,
+            default_threshold=0.5,
+        )
+        nonzero_rule_count = int(np.count_nonzero(np.abs(model.coef_[0]) > 1e-12))
+        candidate_rows.append(
+            {
+                "c_value": float(c_value),
+                "validation_threshold_at_0_5_f1": float(threshold_05.get("f1", 0.0)),
+                "validation_threshold_at_0_5_precision": float(threshold_05.get("precision", 0.0)),
+                "validation_threshold_at_0_5_recall": float(threshold_05.get("recall", 0.0)),
+                "best_validation_threshold": float(tuned_threshold),
+                "best_validation_f1": float(tuned_metrics.get("f1", 0.0)),
+                "best_validation_precision": float(tuned_metrics.get("precision", 0.0)),
+                "best_validation_recall": float(tuned_metrics.get("recall", 0.0)),
+                "nonzero_rule_count": nonzero_rule_count,
+            }
+        )
+        key = (
+            float(tuned_metrics.get("f1", 0.0)),
+            float(tuned_metrics.get("precision", 0.0)),
+            float(tuned_metrics.get("recall", 0.0)),
+            -float(nonzero_rule_count),
+            -float(c_value),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_model = model
+            best_threshold = float(tuned_threshold)
+            best_val_metrics_best = tuned_metrics
+            best_val_metrics_05 = threshold_05
+            best_c = float(c_value)
+
+    if best_model is None:
+        raise RuntimeError("Rule aggregation baseline could not fit any logistic-regression model.")
+
+    train_probabilities = best_model.predict_proba(train_matrix)[:, 1].astype(np.float64).tolist()
+    val_probabilities = best_model.predict_proba(val_matrix)[:, 1].astype(np.float64).tolist()
+    eval_probabilities = best_model.predict_proba(eval_matrix)[:, 1].astype(np.float64).tolist()
+
+    threshold_05 = 0.5
+    metric_rows: List[Dict[str, Any]] = []
+    split_payloads = [
+        ("train", train_examples, y_train.tolist(), train_probabilities),
+        ("validation", val_examples, y_val.tolist(), val_probabilities),
+        ("eval", eval_examples, y_eval.tolist(), eval_probabilities),
+    ]
+    metrics_by_split: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for split_name, split_examples, labels, probabilities in split_payloads:
+        metrics_by_split[split_name] = {}
+        for threshold_name, threshold_value in [
+            ("threshold_0_5", threshold_05),
+            ("best_validation_threshold", best_threshold),
+        ]:
+            metrics = _compute_threshold_metrics(
+                labels,
+                probabilities,
+                threshold_value,
+                average_precision_score,
+                roc_auc_score,
+                confusion_matrix,
+            )
+            row = {
+                "model_name": "rule_aggregation_logistic_regression",
+                "split_name": split_name,
+                "threshold_name": threshold_name,
+                "threshold_value": float(threshold_value),
+                "num_examples": len(split_examples),
+                "precision": float(metrics.get("precision", 0.0)),
+                "recall": float(metrics.get("recall", 0.0)),
+                "f1": float(metrics.get("f1", 0.0)),
+                "accuracy": float(metrics.get("accuracy", 0.0)),
+                "auroc": float(metrics.get("auroc", float("nan"))),
+                "auprc": float(metrics.get("auprc", float("nan"))),
+                "true_positive": int(metrics.get("true_positive", 0)),
+                "false_positive": int(metrics.get("false_positive", 0)),
+                "false_negative": int(metrics.get("false_negative", 0)),
+                "true_negative": int(metrics.get("true_negative", 0)),
+            }
+            metric_rows.append(row)
+            metrics_by_split[split_name][threshold_name] = dict(row)
+
+    per_video_rows: List[Dict[str, Any]] = []
+    for threshold_name, threshold_value in [
+        ("threshold_0_5", threshold_05),
+        ("best_validation_threshold", best_threshold),
+    ]:
+        per_video_rows.extend(
+            _per_video_metrics(
+                "rule_aggregation_logistic_regression",
+                eval_examples,
+                eval_probabilities,
+                threshold_name,
+                threshold_value,
+                average_precision_score,
+                roc_auc_score,
+                confusion_matrix,
+            )
+        )
+
+    prediction_rows = _prediction_rows(eval_examples, eval_probabilities, threshold_05, best_threshold)
+
+    coefficients = np.asarray(best_model.coef_[0], dtype=np.float64)
+    nonzero_indices = np.flatnonzero(np.abs(coefficients) > 1e-12)
+    top_k_rules = max(1, int(cfg.get("top_weighted_rules", 30)))
+    top_weight_rows: List[Dict[str, Any]] = []
+    ordered_nonzero_indices = sorted(
+        nonzero_indices.tolist(),
+        key=lambda index: (-abs(coefficients[index]), -coefficients[index], active_rules[index].get("rule_id", "")),
+    )
+    for rank, feature_index in enumerate(ordered_nonzero_indices[:top_k_rules], start=1):
+        rule = dict(active_rules[feature_index])
+        weight = float(coefficients[feature_index])
+        top_weight_rows.append(
+            {
+                "rank": rank,
+                "rule_id": str(rule.get("rule_id", "")),
+                "clause": str(rule.get("clause", "")),
+                "weight": weight,
+                "abs_weight": abs(weight),
+                "sign": "positive" if weight >= 0.0 else "negative",
+                "confidence": float(rule.get("confidence", 0.0)),
+                "train_positive_support": int(rule.get("positive_support", 0)),
+                "train_negative_support": int(rule.get("negative_support", 0)),
+                "semantic_family": str(rule.get("semantic_family", "")),
+            }
+        )
+
+    _write_csv(
+        metrics_csv_path,
+        [
+            "model_name",
+            "split_name",
+            "threshold_name",
+            "threshold_value",
+            "num_examples",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "auroc",
+            "auprc",
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+        ],
+        metric_rows,
+    )
+    _write_csv(
+        per_video_csv_path,
+        [
+            "model_name",
+            "video_id",
+            "num_examples",
+            "threshold_name",
+            "threshold_value",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "auroc",
+            "auprc",
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+        ],
+        per_video_rows,
+    )
+    _write_csv(
+        prediction_csv_path,
+        [
+            "video_id",
+            "example_id",
+            "current_segment_index",
+            "label",
+            "predicted_probability",
+            "threshold_at_0_5",
+            "best_validation_threshold",
+            "predicted_label_at_0_5",
+            "predicted_label_at_best_validation_threshold",
+            "current_segment_label",
+            "num_body_atoms",
+        ],
+        prediction_rows,
+    )
+    _write_csv(
+        top_rules_csv_path,
+        [
+            "rank",
+            "rule_id",
+            "clause",
+            "weight",
+            "abs_weight",
+            "sign",
+            "confidence",
+            "train_positive_support",
+            "train_negative_support",
+            "semantic_family",
+        ],
+        top_weight_rows,
+    )
+
+    summary: Dict[str, Any] = {
+        "version": _RULE_AGGREGATION_BASELINE_VERSION,
+        "config": _cfg_key_subset(cfg),
+        "split": split_manifest or {},
+        "validation_split": validation_split,
+        "model_type": "sparse_l1_logistic_regression",
+        "solver": solver,
+        "class_weight": class_weight if class_weight is not None else "none",
+        "best_c": best_c,
+        "best_validation_threshold": float(best_threshold),
+        "num_pool_rules": len(prepared_rules),
+        "num_active_train_rules": len(active_rules),
+        "num_nonzero_rules": int(nonzero_indices.size),
+        "metrics_by_split": metrics_by_split,
+        "validation_search": candidate_rows,
+        "top_weighted_rules": top_weight_rows,
+        "output_paths": {
+            "summary_json": str(summary_path),
+            "metrics_csv": str(metrics_csv_path),
+            "per_video_metrics_csv": str(per_video_csv_path),
+            "prediction_examples_csv": str(prediction_csv_path),
+            "top_weighted_rules_csv": str(top_rules_csv_path),
+        },
+    }
+
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+
+    selected_eval = dict(metrics_by_split["eval"]["best_validation_threshold"])
+    print(
+        "  rule_aggregation_baseline: "
+        f"pool_rules={len(prepared_rules)} | "
+        f"active_train_rules={len(active_rules)} | "
+        f"nonzero_rules={int(nonzero_indices.size)} | "
+        f"best_c={best_c:.4g} | "
+        f"eval_f1={float(selected_eval.get('f1', 0.0)):.3f}"
+    )
+    print(f"Rule aggregation baseline summary JSON written to {summary_path}")
+    print(f"Rule aggregation baseline top weighted rules CSV written to {top_rules_csv_path}")
+    return summary
+
+
+def run(
+    extended_rule_results: Dict[str, Any],
+    train_temporal_rule_results: Sequence[Dict[str, Any]],
+    eval_temporal_rule_results: Sequence[Dict[str, Any]],
+    split_manifest: Optional[Dict[str, Any]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    output_root: Optional[Path] = None,
+    force_recompute: bool = False,
+) -> Dict[str, Any]:
+    return process_baseline(
+        extended_rule_results=extended_rule_results,
+        train_temporal_rule_results=train_temporal_rule_results,
+        eval_temporal_rule_results=eval_temporal_rule_results,
+        split_manifest=split_manifest,
+        cfg=cfg,
+        output_root=output_root,
+        force_recompute=force_recompute,
+    )

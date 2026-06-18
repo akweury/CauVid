@@ -60,6 +60,9 @@ Steps:
                     short-history symbolic neural baselines on the same
                     train/eval split and compare held-out classification
                     metrics.
+    18C. rule_aggregation_baseline_driving_mini — train a sparse logistic
+                    regression over Step 16 rule firings, tuned on
+                    validation data, and evaluate on the held-out split.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
@@ -106,6 +109,7 @@ from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
+from src.exp_driving_videos.modules import rule_aggregation_baseline_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
 from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
@@ -136,6 +140,7 @@ _get_rule_pool_upper_bound_diagnostic_cfg = driving_pipeline_config.get_rule_poo
 _get_oracle_rule_selection_gap_diagnostic_cfg = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_cfg
 _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
+_get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
 _get_fn_categorization_diagnostic_cfg = driving_pipeline_config.get_fn_categorization_diagnostic_cfg
@@ -143,6 +148,7 @@ _get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
 _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
 _get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diagnostic_cfg
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
+_get_rule_aggregation_baseline_output_root = driving_pipeline_config.get_rule_aggregation_baseline_output_root
 _get_neural_symbolic_baseline_output_root = driving_pipeline_config.get_neural_symbolic_baseline_output_root
 _get_error_and_explainability_output_root = driving_pipeline_config.get_error_and_explainability_output_root
 _get_coverage_family_aware_final_rules_output_root = driving_pipeline_config.get_coverage_family_aware_final_rules_output_root
@@ -714,6 +720,32 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
                 f"AUPRC={float(row.get('auprc', 0.0)):.3f}"
             )
         print("Neural symbolic baselines complete. " + " | ".join(comparison_parts))
+
+    # Step 18C: learned sparse logistic aggregation over Step 16 rule firings
+    rule_aggregation_baseline_cfg = _get_rule_aggregation_baseline_cfg()
+    print("\n=== Step 18C: rule_aggregation_baseline_driving_mini ===")
+    print(f"Rule aggregation baseline cfg: {rule_aggregation_baseline_cfg}")
+    rule_aggregation_baseline_results: Dict[str, Any] = rule_aggregation_baseline_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        train_temporal_rule_results=train_temporal_rule_results,
+        eval_temporal_rule_results=eval_temporal_rule_results,
+        split_manifest=split_manifest,
+        cfg=rule_aggregation_baseline_cfg,
+        output_root=_get_rule_aggregation_baseline_output_root(),
+        force_recompute=bool(recompute_cfg.get("rule_aggregation_baseline", True)),
+    )
+    rule_aggregation_eval_best = dict(
+        rule_aggregation_baseline_results.get("metrics_by_split", {})
+        .get("eval", {})
+        .get("best_validation_threshold", {})
+    )
+    print(
+        "Rule aggregation baseline complete. "
+        f"F1={float(rule_aggregation_eval_best.get('f1', 0.0)):.3f} | "
+        f"AUROC={float(rule_aggregation_eval_best.get('auroc', 0.0)):.3f} | "
+        f"AUPRC={float(rule_aggregation_eval_best.get('auprc', 0.0)):.3f} | "
+        f"nonzero_rules={int(rule_aggregation_baseline_results.get('num_nonzero_rules', 0))}"
+    )
     if max_step == 18:
         print("\nStopping after step 18 by request.")
         return
