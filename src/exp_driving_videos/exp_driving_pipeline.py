@@ -47,6 +47,9 @@ Steps:
                     coverage-aware final rule set using rule quality
                     confidence * log(1 + positive_support) together with
                     redundancy and family-diversity penalties.
+    17D. rule_pool_upper_bound_diagnostic_driving_mini — evaluate the full
+                    extended-rule pool on held-out examples and estimate
+                    single-rule and oracle-greedy upper bounds.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
     19. error_and_explainability_analysis_driving_mini — summarize false
@@ -92,6 +95,7 @@ from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
+from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
 from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
@@ -423,6 +427,36 @@ def _get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
     return defaults
 
 
+def _get_rule_pool_upper_bound_diagnostic_cfg() -> Dict[str, Any]:
+    defaults: Dict[str, Any] = {
+        "top_single_rules": 100,
+        "precision_thresholds": [0.5, 0.7, 0.9],
+        "f1_thresholds": [0.1, 0.2, 0.3, 0.4],
+        "min_recall_thresholds": [0.02, 0.05, 0.1, 0.15, 0.2, 0.3],
+        "oracle_k_values": [1, 5, 10, 20, 50, 100],
+        "selection_gap_threshold": 0.05,
+        "selection_pool_min_f1": 0.35,
+        "low_pool_f1_threshold": 0.35,
+        "low_single_rule_f1_threshold": 0.2,
+        "high_precision_threshold": 0.8,
+        "low_recall_threshold": 0.1,
+        "high_recall_threshold": 0.2,
+        "low_precision_threshold": 0.5,
+        "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+        "near_states": ["near"],
+        "center_states": ["centered"],
+    }
+    try:
+        cfg_path = config.get_config_path("exp_driving")
+        cfg = load_pattern_cfg_file(cfg_path)
+        override = cfg.get("rule_pool_upper_bound_diagnostic", {})
+        if isinstance(override, dict):
+            defaults.update(override)
+    except Exception as exc:
+        print(f"[warn] Could not load rule-pool upper-bound diagnostic config: {exc}. Using defaults.")
+    return defaults
+
+
 def _get_data_split_cfg() -> Dict[str, Any]:
     defaults: Dict[str, Any] = {
         "train_video_count": DEFAULT_TRAIN_VIDEO_COUNT,
@@ -514,6 +548,7 @@ def _get_pipeline_recompute_cfg() -> Dict[str, Any]:
         "diverse_final_rules": True,
         "semantic_constrained_diverse_final_rules": True,
         "coverage_family_aware_final_rules": True,
+        "rule_pool_upper_bound_diagnostic": True,
         "rule_evaluation": True,
         "error_and_explainability_analysis": True,
         "vehicle_rule_diagnostic": True,
@@ -598,6 +633,12 @@ def _get_coverage_family_aware_final_rules_output_root() -> Path:
 
 def _get_semantic_constrained_diverse_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "17b2_driving_mini_semantic_constrained_diverse_final_rules"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _get_rule_pool_upper_bound_diagnostic_output_root() -> Path:
+    out = config.get_output_path("pipeline_output") / "17d_driving_mini_rule_pool_upper_bound_diagnostic"
     out.mkdir(parents=True, exist_ok=True)
     return out
 
@@ -1329,6 +1370,31 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"Selected {coverage_family_aware_rule_results.get('num_final_rules', 0)} rule(s)."
     )
 
+    # Step 17D: diagnose held-out upper bounds of the mined rule pool
+    rule_results_by_name: Dict[str, Dict[str, Any]] = {
+        "original": final_rule_results,
+        "diverse": diverse_final_rule_results,
+        "semantic_constrained_diverse": semantic_constrained_diverse_rule_results,
+        "coverage_family_aware": coverage_family_aware_rule_results,
+    }
+    rule_pool_upper_bound_cfg = _get_rule_pool_upper_bound_diagnostic_cfg()
+    print("\n=== Step 17D: rule_pool_upper_bound_diagnostic_driving_mini ===")
+    print(f"Rule-pool upper-bound cfg: {rule_pool_upper_bound_cfg}")
+    rule_pool_upper_bound_results: Dict[str, Any] = rule_pool_upper_bound_diagnostic_driving_mini.run(
+        extended_rule_results=extended_rule_results,
+        temporal_rule_results=eval_temporal_rule_results,
+        eval_video_ids=list(split_manifest.get("eval_video_ids", [])),
+        split_manifest=split_manifest,
+        rule_results_by_name=rule_results_by_name,
+        cfg=rule_pool_upper_bound_cfg,
+        output_root=_get_rule_pool_upper_bound_diagnostic_output_root(),
+        force_recompute=bool(recompute_cfg.get("rule_pool_upper_bound_diagnostic", True)),
+    )
+    print(
+        "Rule-pool upper-bound diagnostic complete. "
+        f"bottleneck={rule_pool_upper_bound_results.get('bottleneck_label', 'unknown')}"
+    )
+
     # Step 18: evaluate final rules on held-out evaluation videos
     rule_evaluation_cfg = _get_rule_evaluation_cfg()
     print("\n=== Step 18: evaluate_rules_driving_mini ===")
@@ -1342,12 +1408,6 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     if rule_set_mode not in {"both", "all"} and primary_rule_set != rule_set_mode:
         primary_rule_set = rule_set_mode
 
-    rule_results_by_name: Dict[str, Dict[str, Any]] = {
-        "original": final_rule_results,
-        "diverse": diverse_final_rule_results,
-        "semantic_constrained_diverse": semantic_constrained_diverse_rule_results,
-        "coverage_family_aware": coverage_family_aware_rule_results,
-    }
     if rule_set_mode == "both":
         evaluation_rule_sets = ["original", "diverse"]
     elif rule_set_mode == "all":
