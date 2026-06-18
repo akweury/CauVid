@@ -679,8 +679,10 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     if comparison_rows:
         comparison_parts = []
         for row in comparison_rows:
+            threshold_name = str(row.get("threshold_name", "")).strip()
+            threshold_suffix = f" [{threshold_name}]" if threshold_name else ""
             comparison_parts.append(
-                f"{str(row.get('model_name', 'model'))}: "
+                f"{str(row.get('model_name', 'model'))}{threshold_suffix}: "
                 f"F1={float(row.get('f1', 0.0)):.3f}, "
                 f"AUROC={float(row.get('auroc', 0.0)):.3f}, "
                 f"AUPRC={float(row.get('auprc', 0.0)):.3f}"

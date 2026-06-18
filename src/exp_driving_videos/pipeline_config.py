@@ -354,6 +354,8 @@ def get_neural_symbolic_baseline_cfg() -> Dict[str, Any]:
     defaults = {
         "min_feature_count": 1,
         "probability_threshold": 0.5,
+        "validation_fraction": 0.25,
+        "imbalance_strategy": "pos_weight",
         "random_seed": 0,
         "device": "auto",
         "single_segment_mlp": {

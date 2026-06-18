@@ -11,22 +11,22 @@ Consumes:
 
 Output layout:
     pipeline_output/neural_baselines_driving_mini/
-        neural_baselines_summary.json
-        model_comparison.csv
-        model_comparison.json
+        neural_baseline_summary.json
+        neural_baseline_metrics.csv
+        per_video_metrics.csv
+        prediction_examples.csv
+        training_curves.csv
         feature_vocab.json
         single_segment_mlp/
-            baseline_result.json
-            metrics.csv
+            neural_baseline_summary.json
+            neural_baseline_metrics.csv
             per_video_metrics.csv
-            example_predictions.csv
-            training_history.csv
+            prediction_examples.csv
+            training_curves.csv
+            best_model_checkpoint.pt
+            final_model_checkpoint.pt
         temporal_gru/ or temporal_mlp/
-            baseline_result.json
-            metrics.csv
-            per_video_metrics.csv
-            example_predictions.csv
-            training_history.csv
+            ...
 """
 
 from __future__ import annotations
@@ -55,8 +55,9 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_BASELINE_VERSION = 2
+_BASELINE_VERSION = 3
 _VARIABLE_NAMES = {"S", "O", "T", "F"}
+_DEFAULT_THRESHOLD = 0.5
 
 
 def get_output_root() -> Path:
@@ -69,6 +70,8 @@ def _default_cfg() -> Dict[str, Any]:
     return {
         "min_feature_count": 1,
         "probability_threshold": 0.5,
+        "validation_fraction": 0.25,
+        "imbalance_strategy": "pos_weight",
         "random_seed": 0,
         "device": "auto",
         "single_segment_mlp": {
@@ -101,6 +104,8 @@ def _normalize_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {
         "min_feature_count": int(cfg.get("min_feature_count", defaults["min_feature_count"])),
         "probability_threshold": float(cfg.get("probability_threshold", defaults["probability_threshold"])),
+        "validation_fraction": float(cfg.get("validation_fraction", defaults["validation_fraction"])),
+        "imbalance_strategy": str(cfg.get("imbalance_strategy", defaults["imbalance_strategy"])).strip().lower(),
         "random_seed": int(cfg.get("random_seed", defaults["random_seed"])),
         "device": str(cfg.get("device", defaults["device"])),
     }
@@ -108,9 +113,6 @@ def _normalize_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     single_cfg = dict(defaults["single_segment_mlp"])
     if isinstance(cfg.get("single_segment_mlp"), dict):
         single_cfg.update(cfg["single_segment_mlp"])
-    for key in list(defaults["single_segment_mlp"].keys()):
-        if key in cfg:
-            single_cfg[key] = cfg[key]
     single_cfg["hidden_dims"] = [int(v) for v in single_cfg.get("hidden_dims", [])]
     single_cfg["dropout"] = float(single_cfg.get("dropout", 0.1))
     single_cfg["learning_rate"] = float(single_cfg.get("learning_rate", 1e-3))
@@ -143,6 +145,8 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "min_feature_count": normalized["min_feature_count"],
         "probability_threshold": normalized["probability_threshold"],
+        "validation_fraction": normalized["validation_fraction"],
+        "imbalance_strategy": normalized["imbalance_strategy"],
         "random_seed": normalized["random_seed"],
         "device": normalized["device"],
         "single_segment_mlp": dict(normalized["single_segment_mlp"]),
@@ -194,6 +198,24 @@ def _prepare_examples(video_results: Sequence[Dict[str, Any]]) -> List[Dict[str,
     return examples
 
 
+def _choose_device(device_name: str) -> torch.device:
+    requested = str(device_name or "auto").strip().lower()
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("[warn] CUDA requested for neural baselines but is unavailable. Falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device(requested)
+
+
+def _set_random_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _compute_binary_metrics(
     true_positive: int,
     false_positive: int,
@@ -205,10 +227,10 @@ def _compute_binary_metrics(
     f1 = float(2 * precision * recall / max(1e-12, precision + recall))
     accuracy = float((true_positive + true_negative) / max(1, true_positive + false_positive + false_negative + true_negative))
     return {
-        "true_positive": true_positive,
-        "false_positive": false_positive,
-        "false_negative": false_negative,
-        "true_negative": true_negative,
+        "true_positive": int(true_positive),
+        "false_positive": int(false_positive),
+        "false_negative": int(false_negative),
+        "true_negative": int(true_negative),
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -261,11 +283,7 @@ def _compute_average_precision(y_true: Sequence[int], y_score: Sequence[float]) 
     return float(average_precision)
 
 
-def _evaluate_scores(
-    labels: Sequence[int],
-    probabilities: Sequence[float],
-    threshold: float,
-) -> Dict[str, Any]:
+def _evaluate_scores(labels: Sequence[int], probabilities: Sequence[float], threshold: float) -> Dict[str, Any]:
     predicted_labels = [1 if float(probability) >= float(threshold) else 0 for probability in probabilities]
     true_positive = sum(1 for label, pred in zip(labels, predicted_labels) if int(label) == 1 and int(pred) == 1)
     false_positive = sum(1 for label, pred in zip(labels, predicted_labels) if int(label) == 0 and int(pred) == 1)
@@ -275,7 +293,47 @@ def _evaluate_scores(
     metrics["auroc"] = _compute_roc_auc(labels, probabilities)
     metrics["auprc"] = _compute_average_precision(labels, probabilities)
     metrics["predicted_labels"] = predicted_labels
+    metrics["threshold"] = float(threshold)
     return metrics
+
+
+def _select_best_f1_threshold(
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    default_threshold: float = _DEFAULT_THRESHOLD,
+) -> Tuple[float, Dict[str, Any]]:
+    if not labels:
+        metrics = _evaluate_scores([], [], default_threshold)
+        return float(default_threshold), metrics
+
+    candidates = {0.0, 1.0, float(default_threshold)}
+    for probability in probabilities:
+        p = float(probability)
+        candidates.add(p)
+        candidates.add(min(1.0, max(0.0, p + 1e-8)))
+        candidates.add(min(1.0, max(0.0, p - 1e-8)))
+
+    best_threshold = float(default_threshold)
+    best_metrics = _evaluate_scores(labels, probabilities, best_threshold)
+    best_key = (
+        float(best_metrics.get("f1", 0.0)),
+        float(best_metrics.get("precision", 0.0)),
+        -abs(best_threshold - default_threshold),
+        best_threshold,
+    )
+    for threshold in sorted(candidates):
+        metrics = _evaluate_scores(labels, probabilities, float(threshold))
+        key = (
+            float(metrics.get("f1", 0.0)),
+            float(metrics.get("precision", 0.0)),
+            -abs(float(threshold) - default_threshold),
+            float(threshold),
+        )
+        if key > best_key:
+            best_key = key
+            best_threshold = float(threshold)
+            best_metrics = metrics
+    return best_threshold, best_metrics
 
 
 def _example_feature_counts(example: Dict[str, Any]) -> Dict[str, float]:
@@ -293,8 +351,8 @@ def _example_feature_counts(example: Dict[str, Any]) -> Dict[str, float]:
         if args:
             state_value = str(args[-1]).strip()
             if state_value and state_value not in _VARIABLE_NAMES:
-                key = f"state::{predicate}::{state_value}"
-                counts[key] = counts.get(key, 0.0) + 1.0
+                state_key = f"state::{predicate}::{state_value}"
+                counts[state_key] = counts.get(state_key, 0.0) + 1.0
 
             if predicate == "segment_forward_state" and len(args) >= 2 and args[-1] not in _VARIABLE_NAMES:
                 counts[f"segment_forward_state::{args[-1]}"] = 1.0
@@ -339,6 +397,54 @@ def _group_examples_by_video(examples: Sequence[Dict[str, Any]]) -> Dict[str, Li
     return grouped
 
 
+def _split_train_validation(
+    train_examples: Sequence[Dict[str, Any]],
+    validation_fraction: float,
+    seed: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    grouped = _group_examples_by_video(train_examples)
+    video_ids = sorted(grouped)
+    rng = random.Random(int(seed))
+    shuffled_video_ids = list(video_ids)
+    rng.shuffle(shuffled_video_ids)
+
+    if len(shuffled_video_ids) > 1:
+        requested = int(round(len(shuffled_video_ids) * float(validation_fraction)))
+        val_video_count = min(len(shuffled_video_ids) - 1, max(1, requested))
+        val_video_ids = set(shuffled_video_ids[:val_video_count])
+        train_subset = [example for example in train_examples if str(example.get("video_id", "")) not in val_video_ids]
+        val_subset = [example for example in train_examples if str(example.get("video_id", "")) in val_video_ids]
+        return train_subset, val_subset, {
+            "strategy": "video_level",
+            "train_video_ids": sorted({str(example.get("video_id", "")) for example in train_subset}),
+            "validation_video_ids": sorted(val_video_ids),
+            "num_train_examples": len(train_subset),
+            "num_validation_examples": len(val_subset),
+        }
+
+    ordered_examples = sorted(train_examples, key=_example_sort_key)
+    if len(ordered_examples) <= 1:
+        return list(ordered_examples), list(ordered_examples), {
+            "strategy": "single_example_fallback",
+            "train_video_ids": list(video_ids),
+            "validation_video_ids": list(video_ids),
+            "num_train_examples": len(ordered_examples),
+            "num_validation_examples": len(ordered_examples),
+        }
+
+    val_count = min(len(ordered_examples) - 1, max(1, int(round(len(ordered_examples) * float(validation_fraction)))))
+    val_indices = set(range(len(ordered_examples) - val_count, len(ordered_examples)))
+    train_subset = [example for idx, example in enumerate(ordered_examples) if idx not in val_indices]
+    val_subset = [example for idx, example in enumerate(ordered_examples) if idx in val_indices]
+    return train_subset, val_subset, {
+        "strategy": "example_level_fallback",
+        "train_video_ids": list(video_ids),
+        "validation_video_ids": list(video_ids),
+        "num_train_examples": len(train_subset),
+        "num_validation_examples": len(val_subset),
+    }
+
+
 def _build_temporal_sequences(
     examples: Sequence[Dict[str, Any]],
     feature_matrix: np.ndarray,
@@ -348,33 +454,58 @@ def _build_temporal_sequences(
     sequences = np.zeros((len(examples), sequence_length, feature_matrix.shape[1]), dtype=np.float32)
     available_history = [0 for _ in examples]
     grouped = _group_examples_by_video(examples)
+    row_lookup = {str(example.get("example_id", "")): idx for idx, example in enumerate(examples)}
 
     for video_examples in grouped.values():
         for local_index, example in enumerate(video_examples):
-            row_index = int(example["_row_index"])
+            example_id = str(example.get("example_id", ""))
+            row_index = row_lookup[example_id]
             start_index = max(0, local_index - int(history_window))
             history_examples = video_examples[start_index : local_index + 1]
             available_history[row_index] = len(history_examples) - 1
             dest_start = sequence_length - len(history_examples)
             for offset, history_example in enumerate(history_examples):
-                source_row = int(history_example["_row_index"])
+                source_row = row_lookup[str(history_example.get("example_id", ""))]
                 sequences[row_index, dest_start + offset, :] = feature_matrix[source_row]
 
     return sequences, available_history
 
 
+def _serialize_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _serialize_json(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_serialize_json(item) for item in value]
+    if isinstance(value, tuple):
+        return [_serialize_json(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _format_metric(value: Any) -> str:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return "nan"
+    if math.isnan(numeric):
+        return "nan"
+    return f"{numeric:.3f}"
+
+
 class SymbolicMLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: Sequence[int], dropout: float) -> None:
         super().__init__()
-        dims = [input_dim] + [int(dim) for dim in hidden_dims if int(dim) > 0]
+        dims = [int(input_dim)] + [int(dim) for dim in hidden_dims if int(dim) > 0]
         layers: List[nn.Module] = []
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
             if float(dropout) > 0.0:
                 layers.append(nn.Dropout(float(dropout)))
-        final_input_dim = dims[-1] if dims else input_dim
-        layers.append(nn.Linear(final_input_dim, 1))
+        layers.append(nn.Linear(dims[-1], 1))
         self.network = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -393,7 +524,8 @@ class TemporalMLPClassifier(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(x.reshape(x.shape[0], self.sequence_length * self.input_dim))
+        flattened = x.reshape(x.shape[0], self.sequence_length * self.input_dim)
+        return self.classifier(flattened)
 
 
 class TemporalGRUClassifier(nn.Module):
@@ -427,44 +559,84 @@ class TemporalGRUClassifier(nn.Module):
         return self.head(final_hidden)
 
 
-def _choose_device(device_name: str) -> torch.device:
-    requested = str(device_name or "auto").strip().lower()
-    if requested == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
-    if requested == "cuda" and not torch.cuda.is_available():
-        print("[warn] CUDA requested for neural baselines but is unavailable. Falling back to CPU.")
-        return torch.device("cpu")
-    return torch.device(requested)
+def _build_sampling_probabilities(labels: Sequence[int]) -> np.ndarray:
+    label_array = np.asarray(labels, dtype=np.int64)
+    class_counts = {
+        0: max(1, int(np.sum(label_array == 0))),
+        1: max(1, int(np.sum(label_array == 1))),
+    }
+    weights = np.asarray([1.0 / class_counts[int(label)] for label in label_array], dtype=np.float64)
+    weights /= max(np.sum(weights), 1e-12)
+    return weights
 
 
-def _set_random_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _batch_indices(num_examples: int, batch_size: int) -> Iterable[np.ndarray]:
-    permutation = np.random.permutation(num_examples)
+def _batch_indices(num_examples: int, batch_size: int, sample_probabilities: Optional[np.ndarray]) -> Iterable[np.ndarray]:
+    if sample_probabilities is None:
+        permutation = np.random.permutation(num_examples)
+    else:
+        permutation = np.random.choice(
+            num_examples,
+            size=num_examples,
+            replace=True,
+            p=sample_probabilities,
+        )
     for start in range(0, num_examples, batch_size):
         yield permutation[start : start + batch_size]
 
 
-def _train_model(
+def _save_checkpoint(
+    path: Path,
+    *,
     model: nn.Module,
+    epoch: int,
+    model_name: str,
+    config_dict: Dict[str, Any],
+    train_summary: Dict[str, Any],
+) -> None:
+    torch.save(
+        {
+            "epoch": int(epoch),
+            "model_name": str(model_name),
+            "config": _serialize_json(config_dict),
+            "train_summary": _serialize_json(train_summary),
+            "state_dict": model.state_dict(),
+        },
+        path,
+    )
+
+
+def _train_model(
+    *,
+    model: nn.Module,
+    model_name: str,
     train_inputs: torch.Tensor,
     train_targets: torch.Tensor,
+    val_inputs: torch.Tensor,
+    val_targets: torch.Tensor,
     train_cfg: Dict[str, Any],
+    global_cfg: Dict[str, Any],
     device: torch.device,
-) -> List[Dict[str, Any]]:
-    train_labels_cpu = train_targets.detach().cpu().numpy().astype(np.float32)
-    num_positive = int(train_labels_cpu.sum())
-    num_negative = int(len(train_labels_cpu) - num_positive)
-    pos_weight_value = float(num_negative / max(1, num_positive)) if num_positive > 0 else 1.0
-    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight_value, device=device))
+    model_dir: Path,
+) -> Dict[str, Any]:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = model_dir / "best_model_checkpoint.pt"
+    final_checkpoint_path = model_dir / "final_model_checkpoint.pt"
+
+    train_labels = train_targets.detach().cpu().numpy().astype(np.int64)
+    val_labels = val_targets.detach().cpu().numpy().astype(np.int64)
+    imbalance_strategy = str(global_cfg.get("imbalance_strategy", "pos_weight")).strip().lower()
+
+    pos_weight_value = 1.0
+    sample_probabilities: Optional[np.ndarray] = None
+    if imbalance_strategy == "balanced_sampling":
+        criterion = nn.BCEWithLogitsLoss()
+        sample_probabilities = _build_sampling_probabilities(train_labels.tolist())
+    else:
+        num_positive = int(np.sum(train_labels == 1))
+        num_negative = int(np.sum(train_labels == 0))
+        pos_weight_value = float(num_negative / max(1, num_positive)) if num_positive > 0 else 1.0
+        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight_value, device=device))
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=float(train_cfg.get("learning_rate", 1e-3)),
@@ -476,14 +648,15 @@ def _train_model(
     early_stopping_patience = max(1, int(train_cfg.get("early_stopping_patience", 12)))
 
     best_state: Optional[Dict[str, torch.Tensor]] = None
-    best_loss = float("inf")
+    best_epoch = 0
+    best_monitor_loss = float("inf")
     epochs_without_improvement = 0
-    epoch_history: List[Dict[str, Any]] = []
+    history: List[Dict[str, Any]] = []
 
     for epoch in range(1, num_epochs + 1):
         model.train()
         batch_losses: List[float] = []
-        for batch_index in _batch_indices(len(train_labels_cpu), batch_size):
+        for batch_index in _batch_indices(len(train_labels), batch_size, sample_probabilities):
             batch_tensor = torch.as_tensor(batch_index, dtype=torch.long, device=device)
             batch_inputs = train_inputs.index_select(0, batch_tensor)
             batch_targets = train_targets.index_select(0, batch_tensor)
@@ -497,27 +670,82 @@ def _train_model(
         model.eval()
         with torch.no_grad():
             train_logits = model(train_inputs)
+            val_logits = model(val_inputs)
             train_loss = float(criterion(train_logits, train_targets).detach().cpu().item())
-        epoch_history.append(
+            val_loss = float(criterion(val_logits, val_targets).detach().cpu().item())
+            train_probabilities = torch.sigmoid(train_logits).detach().cpu().numpy().astype(np.float64)
+            val_probabilities = torch.sigmoid(val_logits).detach().cpu().numpy().astype(np.float64)
+
+        train_metrics_05 = _evaluate_scores(train_labels.tolist(), train_probabilities.tolist(), _DEFAULT_THRESHOLD)
+        val_metrics_05 = _evaluate_scores(val_labels.tolist(), val_probabilities.tolist(), _DEFAULT_THRESHOLD)
+        tuned_threshold, val_metrics_best = _select_best_f1_threshold(val_labels.tolist(), val_probabilities.tolist(), _DEFAULT_THRESHOLD)
+
+        history.append(
             {
-                "epoch": epoch,
+                "model_name": model_name,
+                "epoch": int(epoch),
                 "avg_batch_loss": float(sum(batch_losses) / max(1, len(batch_losses))),
                 "train_loss": train_loss,
+                "validation_loss": val_loss,
+                "train_precision_at_0_5": float(train_metrics_05.get("precision", 0.0)),
+                "train_recall_at_0_5": float(train_metrics_05.get("recall", 0.0)),
+                "train_f1_at_0_5": float(train_metrics_05.get("f1", 0.0)),
+                "validation_precision_at_0_5": float(val_metrics_05.get("precision", 0.0)),
+                "validation_recall_at_0_5": float(val_metrics_05.get("recall", 0.0)),
+                "validation_f1_at_0_5": float(val_metrics_05.get("f1", 0.0)),
+                "best_validation_threshold": float(tuned_threshold),
+                "validation_precision_at_best_threshold": float(val_metrics_best.get("precision", 0.0)),
+                "validation_recall_at_best_threshold": float(val_metrics_best.get("recall", 0.0)),
+                "validation_f1_at_best_threshold": float(val_metrics_best.get("f1", 0.0)),
             }
         )
 
-        if train_loss + 1e-8 < best_loss:
-            best_loss = train_loss
+        if val_loss + 1e-8 < best_monitor_loss:
+            best_monitor_loss = val_loss
+            best_epoch = epoch
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
             epochs_without_improvement = 0
+            _save_checkpoint(
+                best_checkpoint_path,
+                model=model,
+                epoch=epoch,
+                model_name=model_name,
+                config_dict=train_cfg,
+                train_summary={
+                    "imbalance_strategy": imbalance_strategy,
+                    "pos_weight": pos_weight_value,
+                },
+            )
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= early_stopping_patience:
                 break
 
+    _save_checkpoint(
+        final_checkpoint_path,
+        model=model,
+        epoch=len(history),
+        model_name=model_name,
+        config_dict=train_cfg,
+        train_summary={
+            "imbalance_strategy": imbalance_strategy,
+            "pos_weight": pos_weight_value,
+        },
+    )
+
     if best_state is not None:
         model.load_state_dict(best_state)
-    return epoch_history
+
+    return {
+        "history": history,
+        "best_epoch": int(best_epoch),
+        "best_validation_loss": float(best_monitor_loss),
+        "best_checkpoint_path": str(best_checkpoint_path),
+        "final_checkpoint_path": str(final_checkpoint_path),
+        "imbalance_strategy": imbalance_strategy,
+        "pos_weight": float(pos_weight_value),
+        "used_balanced_sampling": imbalance_strategy == "balanced_sampling",
+    }
 
 
 def _predict_probabilities(model: nn.Module, inputs: torch.Tensor) -> np.ndarray:
@@ -527,78 +755,93 @@ def _predict_probabilities(model: nn.Module, inputs: torch.Tensor) -> np.ndarray
     return probabilities
 
 
-def _compute_per_video_metrics(eval_rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows_by_video: Dict[str, List[Dict[str, Any]]] = {}
-    for row in eval_rows:
-        rows_by_video.setdefault(str(row["video_id"]), []).append(row)
-
-    per_video_metrics: List[Dict[str, Any]] = []
-    for video_id in sorted(rows_by_video):
-        rows = rows_by_video[video_id]
-        tp = sum(1 for row in rows if bool(row["label"]) and bool(row["predicted_label"]))
-        fp = sum(1 for row in rows if (not bool(row["label"])) and bool(row["predicted_label"]))
-        fn = sum(1 for row in rows if bool(row["label"]) and (not bool(row["predicted_label"])))
-        tn = sum(1 for row in rows if (not bool(row["label"])) and (not bool(row["predicted_label"])))
-        metrics = _compute_binary_metrics(tp, fp, fn, tn)
-        metrics["video_id"] = video_id
-        metrics["num_examples"] = len(rows)
-        metrics["auroc"] = _compute_roc_auc(
-            [1 if bool(row["label"]) else 0 for row in rows],
-            [float(row["predicted_probability"]) for row in rows],
-        )
-        metrics["auprc"] = _compute_average_precision(
-            [1 if bool(row["label"]) else 0 for row in rows],
-            [float(row["predicted_probability"]) for row in rows],
-        )
-        per_video_metrics.append(metrics)
-    return per_video_metrics
+def _compute_thresholded_metrics(
+    split_name: str,
+    labels: Sequence[int],
+    probabilities: Sequence[float],
+    threshold_name: str,
+    threshold_value: float,
+) -> Dict[str, Any]:
+    metrics = _evaluate_scores(labels, probabilities, threshold_value)
+    return {
+        "split_name": split_name,
+        "threshold_name": threshold_name,
+        "threshold_value": float(threshold_value),
+        "precision": float(metrics.get("precision", 0.0)),
+        "recall": float(metrics.get("recall", 0.0)),
+        "f1": float(metrics.get("f1", 0.0)),
+        "accuracy": float(metrics.get("accuracy", 0.0)),
+        "auroc": float(metrics.get("auroc", float("nan"))),
+        "auprc": float(metrics.get("auprc", float("nan"))),
+        "true_positive": int(metrics.get("true_positive", 0)),
+        "false_positive": int(metrics.get("false_positive", 0)),
+        "false_negative": int(metrics.get("false_negative", 0)),
+        "true_negative": int(metrics.get("true_negative", 0)),
+    }
 
 
-def _temporal_model_name(architecture: str) -> str:
-    return "temporal_mlp" if str(architecture).strip().lower() == "temporal_mlp" else "temporal_gru"
-
-
-def _serialize_json(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _serialize_json(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_serialize_json(item) for item in value]
-    if isinstance(value, tuple):
-        return [_serialize_json(item) for item in value]
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, float) and math.isnan(value):
-        return None
-    return value
-
-
-def _format_metric(value: Any) -> str:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return "nan"
-    if math.isnan(numeric):
-        return "nan"
-    return f"{numeric:.3f}"
-
-
-def _build_eval_rows(
+def _compute_per_video_metrics(
+    *,
+    model_name: str,
     examples: Sequence[Dict[str, Any]],
     probabilities: Sequence[float],
-    predicted_labels: Sequence[int],
+    threshold_name: str,
+    threshold_value: float,
+) -> List[Dict[str, Any]]:
+    grouped = _group_examples_by_video(examples)
+    probability_lookup = {
+        str(example.get("example_id", "")): float(probability)
+        for example, probability in zip(examples, probabilities)
+    }
+
+    rows: List[Dict[str, Any]] = []
+    for video_id in sorted(grouped):
+        video_examples = grouped[video_id]
+        labels = [1 if bool(example.get("label", False)) else 0 for example in video_examples]
+        video_probabilities = [probability_lookup[str(example.get("example_id", ""))] for example in video_examples]
+        metrics = _compute_thresholded_metrics(
+            "eval",
+            labels,
+            video_probabilities,
+            threshold_name,
+            threshold_value,
+        )
+        rows.append(
+            {
+                "model_name": model_name,
+                "video_id": video_id,
+                "num_examples": len(video_examples),
+                **metrics,
+            }
+        )
+    return rows
+
+
+def _build_prediction_rows(
     *,
+    model_name: str,
+    examples: Sequence[Dict[str, Any]],
+    probabilities: Sequence[float],
+    threshold_05: float,
+    best_threshold: float,
     available_history: Optional[Sequence[int]] = None,
     sequence_length: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    predicted_05 = [1 if float(probability) >= float(threshold_05) else 0 for probability in probabilities]
+    predicted_best = [1 if float(probability) >= float(best_threshold) else 0 for probability in probabilities]
     rows: List[Dict[str, Any]] = []
-    for index, (example, probability, predicted_label) in enumerate(zip(examples, probabilities, predicted_labels)):
+    for index, example in enumerate(examples):
         row: Dict[str, Any] = {
+            "model_name": model_name,
             "video_id": str(example.get("video_id", "")),
             "example_id": str(example.get("example_id", "")),
             "current_segment_index": int(example.get("current_segment_index", -1)),
             "label": bool(example.get("label", False)),
-            "predicted_probability": float(probability),
-            "predicted_label": bool(predicted_label),
+            "predicted_probability": float(probabilities[index]),
+            "threshold_at_0_5": float(threshold_05),
+            "best_validation_threshold": float(best_threshold),
+            "predicted_label_at_0_5": bool(predicted_05[index]),
+            "predicted_label_at_best_validation_threshold": bool(predicted_best[index]),
             "current_segment_label": str(example.get("current_segment_label", "")),
             "num_body_atoms": int(example.get("num_body_atoms", len(example.get("body_atoms", [])))),
         }
@@ -610,28 +853,31 @@ def _build_eval_rows(
 
 
 def _write_model_outputs(
+    *,
     model_dir: Path,
-    result: Dict[str, Any],
-    train_metrics: Dict[str, Any],
-    overall_metrics: Dict[str, Any],
-    per_video_metrics: Sequence[Dict[str, Any]],
-    eval_rows: Sequence[Dict[str, Any]],
-    training_history: Sequence[Dict[str, Any]],
+    summary: Dict[str, Any],
+    metrics_rows: Sequence[Dict[str, Any]],
+    per_video_rows: Sequence[Dict[str, Any]],
+    prediction_rows: Sequence[Dict[str, Any]],
+    training_curves: Sequence[Dict[str, Any]],
 ) -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
-    result_json_path = model_dir / "baseline_result.json"
-    metrics_csv_path = model_dir / "metrics.csv"
+    summary_json_path = model_dir / "neural_baseline_summary.json"
+    metrics_csv_path = model_dir / "neural_baseline_metrics.csv"
     per_video_csv_path = model_dir / "per_video_metrics.csv"
-    example_csv_path = model_dir / "example_predictions.csv"
-    history_csv_path = model_dir / "training_history.csv"
+    prediction_csv_path = model_dir / "prediction_examples.csv"
+    curves_csv_path = model_dir / "training_curves.csv"
 
-    with result_json_path.open("w", encoding="utf-8") as fh:
-        json.dump(_serialize_json(result), fh, indent=2)
+    with summary_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(_serialize_json(summary), fh, indent=2)
 
     _write_csv(
         metrics_csv_path,
         [
+            "model_name",
             "split_name",
+            "threshold_name",
+            "threshold_value",
             "num_examples",
             "precision",
             "recall",
@@ -644,24 +890,17 @@ def _write_model_outputs(
             "false_negative",
             "true_negative",
         ],
-        [
-            {
-                "split_name": "train",
-                "num_examples": int(result.get("num_train_examples", 0)),
-                **{key: value for key, value in train_metrics.items() if key != "predicted_labels"},
-            },
-            {
-                "split_name": "eval",
-                "num_examples": int(result.get("num_eval_examples", 0)),
-                **{key: value for key, value in overall_metrics.items() if key != "predicted_labels"},
-            },
-        ],
+        metrics_rows,
     )
     _write_csv(
         per_video_csv_path,
         [
+            "model_name",
             "video_id",
             "num_examples",
+            "split_name",
+            "threshold_name",
+            "threshold_value",
             "precision",
             "recall",
             "f1",
@@ -673,35 +912,206 @@ def _write_model_outputs(
             "false_negative",
             "true_negative",
         ],
-        per_video_metrics,
+        per_video_rows,
     )
 
-    example_fieldnames = [
+    prediction_fieldnames = [
+        "model_name",
         "video_id",
         "example_id",
         "current_segment_index",
         "label",
         "predicted_probability",
-        "predicted_label",
+        "threshold_at_0_5",
+        "best_validation_threshold",
+        "predicted_label_at_0_5",
+        "predicted_label_at_best_validation_threshold",
         "current_segment_label",
         "num_body_atoms",
     ]
-    if eval_rows and "available_history" in eval_rows[0]:
-        example_fieldnames.extend(["available_history", "sequence_length"])
-    _write_csv(example_csv_path, example_fieldnames, eval_rows)
+    if prediction_rows and "available_history" in prediction_rows[0]:
+        prediction_fieldnames.extend(["available_history", "sequence_length"])
+    _write_csv(prediction_csv_path, prediction_fieldnames, prediction_rows)
+    _write_csv(
+        curves_csv_path,
+        [
+            "model_name",
+            "epoch",
+            "avg_batch_loss",
+            "train_loss",
+            "validation_loss",
+            "train_precision_at_0_5",
+            "train_recall_at_0_5",
+            "train_f1_at_0_5",
+            "validation_precision_at_0_5",
+            "validation_recall_at_0_5",
+            "validation_f1_at_0_5",
+            "best_validation_threshold",
+            "validation_precision_at_best_threshold",
+            "validation_recall_at_best_threshold",
+            "validation_f1_at_best_threshold",
+        ],
+        training_curves,
+    )
 
-    _write_csv(history_csv_path, ["epoch", "avg_batch_loss", "train_loss"], training_history)
+
+def _run_model(
+    *,
+    model: nn.Module,
+    model_name: str,
+    architecture: str,
+    train_array: np.ndarray,
+    val_array: np.ndarray,
+    eval_array: np.ndarray,
+    train_examples: Sequence[Dict[str, Any]],
+    val_examples: Sequence[Dict[str, Any]],
+    eval_examples: Sequence[Dict[str, Any]],
+    train_cfg: Dict[str, Any],
+    global_cfg: Dict[str, Any],
+    device: torch.device,
+    model_dir: Path,
+    eval_available_history: Optional[Sequence[int]] = None,
+    sequence_length: Optional[int] = None,
+    extra_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    train_inputs = torch.from_numpy(train_array).to(device)
+    val_inputs = torch.from_numpy(val_array).to(device)
+    eval_inputs = torch.from_numpy(eval_array).to(device)
+    train_labels = [1 if bool(example.get("label", False)) else 0 for example in train_examples]
+    val_labels = [1 if bool(example.get("label", False)) else 0 for example in val_examples]
+    eval_labels = [1 if bool(example.get("label", False)) else 0 for example in eval_examples]
+    train_targets = torch.from_numpy(np.asarray(train_labels, dtype=np.float32)).to(device)
+    val_targets = torch.from_numpy(np.asarray(val_labels, dtype=np.float32)).to(device)
+
+    training_info = _train_model(
+        model=model,
+        model_name=model_name,
+        train_inputs=train_inputs,
+        train_targets=train_targets,
+        val_inputs=val_inputs,
+        val_targets=val_targets,
+        train_cfg=train_cfg,
+        global_cfg=global_cfg,
+        device=device,
+        model_dir=model_dir,
+    )
+
+    train_probabilities = _predict_probabilities(model, train_inputs).tolist()
+    val_probabilities = _predict_probabilities(model, val_inputs).tolist()
+    eval_probabilities = _predict_probabilities(model, eval_inputs).tolist()
+
+    threshold_05 = float(global_cfg.get("probability_threshold", _DEFAULT_THRESHOLD))
+    best_threshold, best_val_metrics = _select_best_f1_threshold(val_labels, val_probabilities, threshold_05)
+    thresholds = {
+        "threshold_0_5": threshold_05,
+        "best_validation_threshold": float(best_threshold),
+    }
+
+    metrics_rows: List[Dict[str, Any]] = []
+    metrics_by_split: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    split_payloads = [
+        ("train", train_examples, train_labels, train_probabilities),
+        ("validation", val_examples, val_labels, val_probabilities),
+        ("eval", eval_examples, eval_labels, eval_probabilities),
+    ]
+    for split_name, split_examples, split_labels, split_probabilities in split_payloads:
+        metrics_by_split[split_name] = {}
+        for threshold_name, threshold_value in thresholds.items():
+            row = _compute_thresholded_metrics(
+                split_name,
+                split_labels,
+                split_probabilities,
+                threshold_name,
+                threshold_value,
+            )
+            row["model_name"] = model_name
+            row["num_examples"] = len(split_examples)
+            metrics_rows.append(row)
+            metrics_by_split[split_name][threshold_name] = dict(row)
+
+    per_video_rows: List[Dict[str, Any]] = []
+    for threshold_name, threshold_value in thresholds.items():
+        per_video_rows.extend(
+            _compute_per_video_metrics(
+                model_name=model_name,
+                examples=eval_examples,
+                probabilities=eval_probabilities,
+                threshold_name=threshold_name,
+                threshold_value=threshold_value,
+            )
+        )
+
+    prediction_rows = _build_prediction_rows(
+        model_name=model_name,
+        examples=eval_examples,
+        probabilities=eval_probabilities,
+        threshold_05=threshold_05,
+        best_threshold=best_threshold,
+        available_history=eval_available_history,
+        sequence_length=sequence_length,
+    )
+
+    summary: Dict[str, Any] = {
+        "version": _BASELINE_VERSION,
+        "model_name": model_name,
+        "architecture": architecture,
+        "device": str(device),
+        "config": dict(train_cfg),
+        "global_baseline_config": {
+            "probability_threshold": threshold_05,
+            "validation_fraction": float(global_cfg.get("validation_fraction", 0.25)),
+            "imbalance_strategy": str(global_cfg.get("imbalance_strategy", "pos_weight")),
+        },
+        "thresholds": thresholds,
+        "validation_threshold_tuning": {
+            "selected_threshold": float(best_threshold),
+            "validation_metrics_at_selected_threshold": {
+                key: value for key, value in best_val_metrics.items() if key != "predicted_labels"
+            },
+        },
+        "num_train_examples": len(train_examples),
+        "num_validation_examples": len(val_examples),
+        "num_eval_examples": len(eval_examples),
+        "metrics_by_split": metrics_by_split,
+        "training": training_info,
+        "checkpoint_paths": {
+            "best_model_checkpoint": training_info["best_checkpoint_path"],
+            "final_model_checkpoint": training_info["final_checkpoint_path"],
+        },
+    }
+    if extra_summary:
+        summary.update(extra_summary)
+
+    _write_model_outputs(
+        model_dir=model_dir,
+        summary=summary,
+        metrics_rows=metrics_rows,
+        per_video_rows=per_video_rows,
+        prediction_rows=prediction_rows,
+        training_curves=training_info["history"],
+    )
+
+    return {
+        **summary,
+        "metrics_rows": metrics_rows,
+        "per_video_rows": per_video_rows,
+        "prediction_rows": prediction_rows,
+        "training_curves": training_info["history"],
+        "selected_eval_metrics": metrics_by_split["eval"]["best_validation_threshold"],
+    }
 
 
 def _run_single_segment_model(
     *,
     train_matrix: np.ndarray,
+    val_matrix: np.ndarray,
     eval_matrix: np.ndarray,
     train_examples: Sequence[Dict[str, Any]],
+    val_examples: Sequence[Dict[str, Any]],
     eval_examples: Sequence[Dict[str, Any]],
     cfg: Dict[str, Any],
+    global_cfg: Dict[str, Any],
     device: torch.device,
-    probability_threshold: float,
     model_dir: Path,
 ) -> Dict[str, Any]:
     model = SymbolicMLP(
@@ -709,62 +1119,44 @@ def _run_single_segment_model(
         hidden_dims=cfg.get("hidden_dims", []),
         dropout=float(cfg.get("dropout", 0.1)),
     ).to(device)
+    return _run_model(
+        model=model,
+        model_name="single_segment_mlp",
+        architecture="mlp",
+        train_array=train_matrix,
+        val_array=val_matrix,
+        eval_array=eval_matrix,
+        train_examples=train_examples,
+        val_examples=val_examples,
+        eval_examples=eval_examples,
+        train_cfg=cfg,
+        global_cfg=global_cfg,
+        device=device,
+        model_dir=model_dir,
+    )
 
-    train_inputs = torch.from_numpy(train_matrix).to(device)
-    eval_inputs = torch.from_numpy(eval_matrix).to(device)
-    train_targets = torch.from_numpy(
-        np.asarray([1 if bool(example.get("label", False)) else 0 for example in train_examples], dtype=np.float32)
-    ).to(device)
-    eval_labels = [1 if bool(example.get("label", False)) else 0 for example in eval_examples]
 
-    training_history = _train_model(model, train_inputs, train_targets, cfg, device)
-    train_probabilities = _predict_probabilities(model, train_inputs)
-    eval_probabilities = _predict_probabilities(model, eval_inputs)
-    train_metrics = _evaluate_scores(train_targets.detach().cpu().numpy().astype(int).tolist(), train_probabilities.tolist(), probability_threshold)
-    overall_metrics = _evaluate_scores(eval_labels, eval_probabilities.tolist(), probability_threshold)
-    eval_rows = _build_eval_rows(eval_examples, eval_probabilities.tolist(), overall_metrics["predicted_labels"])
-    per_video_metrics = _compute_per_video_metrics(eval_rows)
-
-    result = {
-        "model_name": "single_segment_mlp",
-        "architecture": "mlp",
-        "device": str(device),
-        "num_train_examples": len(train_examples),
-        "num_eval_examples": len(eval_examples),
-        "num_input_features": int(train_matrix.shape[1]),
-        "config": dict(cfg),
-        "train_metrics": {key: value for key, value in train_metrics.items() if key != "predicted_labels"},
-        "overall_metrics": {key: value for key, value in overall_metrics.items() if key != "predicted_labels"},
-        "confusion_matrix": {
-            "true_positive": int(overall_metrics["true_positive"]),
-            "false_positive": int(overall_metrics["false_positive"]),
-            "false_negative": int(overall_metrics["false_negative"]),
-            "true_negative": int(overall_metrics["true_negative"]),
-        },
-        "per_video_metrics": list(per_video_metrics),
-        "training_history": list(training_history),
-    }
-    _write_model_outputs(model_dir, result, train_metrics, overall_metrics, per_video_metrics, eval_rows, training_history)
-    return result
+def _temporal_model_name(architecture: str) -> str:
+    return "temporal_mlp" if str(architecture).strip().lower() == "temporal_mlp" else "temporal_gru"
 
 
 def _run_temporal_model(
     *,
     train_sequences: np.ndarray,
+    val_sequences: np.ndarray,
     eval_sequences: np.ndarray,
     train_examples: Sequence[Dict[str, Any]],
+    val_examples: Sequence[Dict[str, Any]],
     eval_examples: Sequence[Dict[str, Any]],
-    train_available_history: Sequence[int],
     eval_available_history: Sequence[int],
     cfg: Dict[str, Any],
+    global_cfg: Dict[str, Any],
     device: torch.device,
-    probability_threshold: float,
     model_dir: Path,
 ) -> Dict[str, Any]:
     architecture = str(cfg.get("architecture", "gru")).strip().lower()
     sequence_length = int(train_sequences.shape[1])
     input_dim = int(train_sequences.shape[2])
-
     if architecture == "temporal_mlp":
         model = TemporalMLPClassifier(
             sequence_length=sequence_length,
@@ -781,54 +1173,28 @@ def _run_temporal_model(
             dropout=float(cfg.get("dropout", 0.1)),
         ).to(device)
 
-    train_inputs = torch.from_numpy(train_sequences).to(device)
-    eval_inputs = torch.from_numpy(eval_sequences).to(device)
-    train_targets = torch.from_numpy(
-        np.asarray([1 if bool(example.get("label", False)) else 0 for example in train_examples], dtype=np.float32)
-    ).to(device)
-    eval_labels = [1 if bool(example.get("label", False)) else 0 for example in eval_examples]
-
-    training_history = _train_model(model, train_inputs, train_targets, cfg, device)
-    train_probabilities = _predict_probabilities(model, train_inputs)
-    eval_probabilities = _predict_probabilities(model, eval_inputs)
-    train_metrics = _evaluate_scores(train_targets.detach().cpu().numpy().astype(int).tolist(), train_probabilities.tolist(), probability_threshold)
-    overall_metrics = _evaluate_scores(eval_labels, eval_probabilities.tolist(), probability_threshold)
-    eval_rows = _build_eval_rows(
-        eval_examples,
-        eval_probabilities.tolist(),
-        overall_metrics["predicted_labels"],
-        available_history=eval_available_history,
+    return _run_model(
+        model=model,
+        model_name=_temporal_model_name(architecture),
+        architecture=architecture,
+        train_array=train_sequences,
+        val_array=val_sequences,
+        eval_array=eval_sequences,
+        train_examples=train_examples,
+        val_examples=val_examples,
+        eval_examples=eval_examples,
+        train_cfg=cfg,
+        global_cfg=global_cfg,
+        device=device,
+        model_dir=model_dir,
+        eval_available_history=eval_available_history,
         sequence_length=sequence_length,
+        extra_summary={
+            "history_window": int(cfg.get("history_window", sequence_length - 1)),
+            "sequence_length": sequence_length,
+            "num_input_features": input_dim,
+        },
     )
-    per_video_metrics = _compute_per_video_metrics(eval_rows)
-
-    result = {
-        "model_name": _temporal_model_name(architecture),
-        "architecture": architecture,
-        "device": str(device),
-        "history_window": int(cfg.get("history_window", sequence_length - 1)),
-        "sequence_length": sequence_length,
-        "num_train_examples": len(train_examples),
-        "num_eval_examples": len(eval_examples),
-        "num_input_features": input_dim,
-        "config": dict(cfg),
-        "train_metrics": {key: value for key, value in train_metrics.items() if key != "predicted_labels"},
-        "overall_metrics": {key: value for key, value in overall_metrics.items() if key != "predicted_labels"},
-        "confusion_matrix": {
-            "true_positive": int(overall_metrics["true_positive"]),
-            "false_positive": int(overall_metrics["false_positive"]),
-            "false_negative": int(overall_metrics["false_negative"]),
-            "true_negative": int(overall_metrics["true_negative"]),
-        },
-        "history_summary": {
-            "avg_train_available_history": float(sum(train_available_history) / max(1, len(train_available_history))),
-            "avg_eval_available_history": float(sum(eval_available_history) / max(1, len(eval_available_history))),
-        },
-        "per_video_metrics": list(per_video_metrics),
-        "training_history": list(training_history),
-    }
-    _write_model_outputs(model_dir, result, train_metrics, overall_metrics, per_video_metrics, eval_rows, training_history)
-    return result
 
 
 def process_baseline(
@@ -843,9 +1209,11 @@ def process_baseline(
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    summary_json_path = out_root / "neural_baselines_summary.json"
-    comparison_csv_path = out_root / "model_comparison.csv"
-    comparison_json_path = out_root / "model_comparison.json"
+    summary_json_path = out_root / "neural_baseline_summary.json"
+    metrics_csv_path = out_root / "neural_baseline_metrics.csv"
+    per_video_csv_path = out_root / "per_video_metrics.csv"
+    prediction_csv_path = out_root / "prediction_examples.csv"
+    training_curves_csv_path = out_root / "training_curves.csv"
     feature_vocab_path = out_root / "feature_vocab.json"
 
     if not force_recompute and summary_json_path.exists():
@@ -855,30 +1223,41 @@ def process_baseline(
             print(f"  [cache] loading {summary_json_path.name}")
             return cached
 
-    train_examples = _prepare_examples(train_temporal_rule_results)
+    _set_random_seed(int(normalized_cfg["random_seed"]))
+
+    full_train_examples = _prepare_examples(train_temporal_rule_results)
     eval_examples = _prepare_examples(eval_temporal_rule_results)
-    if not train_examples:
+    if not full_train_examples:
         raise RuntimeError("Neural baselines received an empty training split.")
     if not eval_examples:
         raise RuntimeError("Neural baselines received an empty evaluation split.")
 
-    _set_random_seed(int(normalized_cfg["random_seed"]))
+    train_examples, val_examples, validation_split = _split_train_validation(
+        full_train_examples,
+        validation_fraction=float(normalized_cfg.get("validation_fraction", 0.25)),
+        seed=int(normalized_cfg.get("random_seed", 0)),
+    )
+    if not train_examples or not val_examples:
+        raise RuntimeError("Neural baselines could not create non-empty train/validation subsets.")
 
     feature_vocab = _build_feature_vocab(train_examples, min_feature_count=int(normalized_cfg["min_feature_count"]))
     if not feature_vocab:
         raise RuntimeError("Neural baselines feature vocabulary is empty.")
 
-    train_matrix = _vectorize_examples(train_examples, feature_vocab)
-    eval_matrix = _vectorize_examples(eval_examples, feature_vocab)
-
-    feature_mean = train_matrix.mean(axis=0, keepdims=True)
-    feature_std = train_matrix.std(axis=0, keepdims=True)
+    train_raw = _vectorize_examples(train_examples, feature_vocab)
+    val_raw = _vectorize_examples(val_examples, feature_vocab)
+    eval_raw = _vectorize_examples(eval_examples, feature_vocab)
+    feature_mean = train_raw.mean(axis=0, keepdims=True)
+    feature_std = train_raw.std(axis=0, keepdims=True)
     feature_std = np.where(feature_std < 1e-6, 1.0, feature_std)
-    train_matrix = (train_matrix - feature_mean) / feature_std
-    eval_matrix = (eval_matrix - feature_mean) / feature_std
+
+    train_matrix = (train_raw - feature_mean) / feature_std
+    val_matrix = (val_raw - feature_mean) / feature_std
+    eval_matrix = (eval_raw - feature_mean) / feature_std
 
     history_window = int(normalized_cfg["temporal_model"].get("history_window", 4))
-    train_sequences, train_available_history = _build_temporal_sequences(train_examples, train_matrix, history_window)
+    train_sequences, _ = _build_temporal_sequences(train_examples, train_matrix, history_window)
+    val_sequences, _ = _build_temporal_sequences(val_examples, val_matrix, history_window)
     eval_sequences, eval_available_history = _build_temporal_sequences(eval_examples, eval_matrix, history_window)
 
     with feature_vocab_path.open("w", encoding="utf-8") as fh:
@@ -895,57 +1274,46 @@ def process_baseline(
         )
 
     device = _choose_device(str(normalized_cfg.get("device", "auto")))
-    probability_threshold = float(normalized_cfg.get("probability_threshold", 0.5))
-
     single_result = _run_single_segment_model(
         train_matrix=train_matrix,
+        val_matrix=val_matrix,
         eval_matrix=eval_matrix,
         train_examples=train_examples,
+        val_examples=val_examples,
         eval_examples=eval_examples,
         cfg=normalized_cfg["single_segment_mlp"],
+        global_cfg=normalized_cfg,
         device=device,
-        probability_threshold=probability_threshold,
         model_dir=out_root / "single_segment_mlp",
     )
-
+    temporal_model_dir = out_root / _temporal_model_name(str(normalized_cfg["temporal_model"].get("architecture", "gru")))
     temporal_result = _run_temporal_model(
         train_sequences=train_sequences,
+        val_sequences=val_sequences,
         eval_sequences=eval_sequences,
         train_examples=train_examples,
+        val_examples=val_examples,
         eval_examples=eval_examples,
-        train_available_history=train_available_history,
         eval_available_history=eval_available_history,
         cfg=normalized_cfg["temporal_model"],
+        global_cfg=normalized_cfg,
         device=device,
-        probability_threshold=probability_threshold,
-        model_dir=out_root / _temporal_model_name(str(normalized_cfg["temporal_model"].get("architecture", "gru"))),
+        model_dir=temporal_model_dir,
     )
 
-    comparison_rows: List[Dict[str, Any]] = []
-    for model_result in [single_result, temporal_result]:
-        overall_metrics = dict(model_result.get("overall_metrics", {}))
-        comparison_rows.append(
-            {
-                "model_name": str(model_result.get("model_name", "")),
-                "architecture": str(model_result.get("architecture", "")),
-                "precision": overall_metrics.get("precision", 0.0),
-                "recall": overall_metrics.get("recall", 0.0),
-                "f1": overall_metrics.get("f1", 0.0),
-                "accuracy": overall_metrics.get("accuracy", 0.0),
-                "auroc": overall_metrics.get("auroc", float("nan")),
-                "auprc": overall_metrics.get("auprc", float("nan")),
-                "true_positive": overall_metrics.get("true_positive", 0),
-                "false_positive": overall_metrics.get("false_positive", 0),
-                "false_negative": overall_metrics.get("false_negative", 0),
-                "true_negative": overall_metrics.get("true_negative", 0),
-            }
-        )
+    all_metrics_rows = list(single_result["metrics_rows"]) + list(temporal_result["metrics_rows"])
+    all_per_video_rows = list(single_result["per_video_rows"]) + list(temporal_result["per_video_rows"])
+    all_prediction_rows = list(single_result["prediction_rows"]) + list(temporal_result["prediction_rows"])
+    all_training_curves = list(single_result["training_curves"]) + list(temporal_result["training_curves"])
 
     _write_csv(
-        comparison_csv_path,
+        metrics_csv_path,
         [
             "model_name",
-            "architecture",
+            "split_name",
+            "threshold_name",
+            "threshold_value",
+            "num_examples",
             "precision",
             "recall",
             "f1",
@@ -957,26 +1325,103 @@ def process_baseline(
             "false_negative",
             "true_negative",
         ],
-        comparison_rows,
+        all_metrics_rows,
     )
-    with comparison_json_path.open("w", encoding="utf-8") as fh:
-        json.dump(_serialize_json({"models": comparison_rows}), fh, indent=2)
+    _write_csv(
+        per_video_csv_path,
+        [
+            "model_name",
+            "video_id",
+            "num_examples",
+            "split_name",
+            "threshold_name",
+            "threshold_value",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "auroc",
+            "auprc",
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+        ],
+        all_per_video_rows,
+    )
+    prediction_fieldnames = [
+        "model_name",
+        "video_id",
+        "example_id",
+        "current_segment_index",
+        "label",
+        "predicted_probability",
+        "threshold_at_0_5",
+        "best_validation_threshold",
+        "predicted_label_at_0_5",
+        "predicted_label_at_best_validation_threshold",
+        "current_segment_label",
+        "num_body_atoms",
+        "available_history",
+        "sequence_length",
+    ]
+    _write_csv(prediction_csv_path, prediction_fieldnames, all_prediction_rows)
+    _write_csv(
+        training_curves_csv_path,
+        [
+            "model_name",
+            "epoch",
+            "avg_batch_loss",
+            "train_loss",
+            "validation_loss",
+            "train_precision_at_0_5",
+            "train_recall_at_0_5",
+            "train_f1_at_0_5",
+            "validation_precision_at_0_5",
+            "validation_recall_at_0_5",
+            "validation_f1_at_0_5",
+            "best_validation_threshold",
+            "validation_precision_at_best_threshold",
+            "validation_recall_at_best_threshold",
+            "validation_f1_at_best_threshold",
+        ],
+        all_training_curves,
+    )
+
+    comparison_rows = [
+        row
+        for row in all_metrics_rows
+        if str(row.get("split_name", "")) == "eval"
+    ]
 
     result = {
         "version": _BASELINE_VERSION,
         "config": dict(normalized_cfg),
         "split": split_manifest or {},
+        "validation_split": validation_split,
         "output_root": str(out_root),
         "feature_vocab_path": str(feature_vocab_path),
-        "comparison_csv_path": str(comparison_csv_path),
-        "comparison_json_path": str(comparison_json_path),
+        "metrics_csv_path": str(metrics_csv_path),
+        "per_video_csv_path": str(per_video_csv_path),
+        "prediction_csv_path": str(prediction_csv_path),
+        "training_curves_csv_path": str(training_curves_csv_path),
+        "num_full_train_examples": len(full_train_examples),
         "num_train_examples": len(train_examples),
+        "num_validation_examples": len(val_examples),
         "num_eval_examples": len(eval_examples),
         "num_features": len(feature_vocab),
         "temporal_sequence_length": int(history_window + 1),
         "model_results": {
-            "single_segment_mlp": single_result,
-            _temporal_model_name(str(normalized_cfg["temporal_model"].get("architecture", "gru"))): temporal_result,
+            "single_segment_mlp": {
+                key: value
+                for key, value in single_result.items()
+                if key not in {"metrics_rows", "per_video_rows", "prediction_rows", "training_curves"}
+            },
+            str(temporal_result.get("model_name", "temporal_model")): {
+                key: value
+                for key, value in temporal_result.items()
+                if key not in {"metrics_rows", "per_video_rows", "prediction_rows", "training_curves"}
+            },
         },
         "comparison": comparison_rows,
     }
@@ -987,13 +1432,14 @@ def process_baseline(
     print(
         "  neural_baselines: "
         f"train_examples={len(train_examples)} | "
+        f"val_examples={len(val_examples)} | "
         f"eval_examples={len(eval_examples)} | "
         f"features={len(feature_vocab)} | "
-        f"single_f1={_format_metric(single_result.get('overall_metrics', {}).get('f1'))} | "
-        f"{temporal_result.get('model_name', 'temporal_model')}_f1={_format_metric(temporal_result.get('overall_metrics', {}).get('f1'))}"
+        f"single_f1_best={_format_metric(single_result['selected_eval_metrics'].get('f1'))} | "
+        f"{temporal_result.get('model_name', 'temporal_model')}_f1_best={_format_metric(temporal_result['selected_eval_metrics'].get('f1'))}"
     )
     print(f"Neural baselines summary JSON written to {summary_json_path}")
-    print(f"Neural baselines comparison CSV written to {comparison_csv_path}")
+    print(f"Neural baselines metrics CSV written to {metrics_csv_path}")
     return result
 
 
