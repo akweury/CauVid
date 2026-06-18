@@ -74,6 +74,7 @@ pipeline_recompute:
   semantic_constrained_diverse_final_rules: false
   coverage_family_aware_final_rules: false
   rule_pool_upper_bound_diagnostic: false
+  oracle_rule_selection_gap_diagnostic: false
   rule_evaluation: false
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
@@ -173,6 +174,11 @@ rule_pool_upper_bound_diagnostic:
   vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
   near_states: [near]
   center_states: [centered]
+
+oracle_rule_selection_gap_diagnostic:
+  oracle_target_mode: peak_f1
+  max_missing_rules_per_selector: 20
+  max_extra_rules_per_selector: 20
 
 rule_evaluation:
   prediction_mode: any_rule_positive

@@ -50,6 +50,10 @@ Steps:
     17D. rule_pool_upper_bound_diagnostic_driving_mini — evaluate the full
                     extended-rule pool on held-out examples and estimate
                     single-rule and oracle-greedy upper bounds.
+    17E. oracle_rule_selection_gap_diagnostic_driving_mini — inspect the
+                    oracle top-K pool rules from step 17D, compare them
+                    against actual selector outputs, and summarize why the
+                    current selectors missed oracle rules.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
     18B. neural_symbolic_baseline_driving_mini — train single-segment and
@@ -100,6 +104,7 @@ from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
+from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
 from src.exp_driving_videos.modules import segment_object_motion_driving_mini
@@ -128,6 +133,7 @@ _get_diverse_final_rules_cfg = driving_pipeline_config.get_diverse_final_rules_c
 _get_semantic_constrained_diverse_cfg = driving_pipeline_config.get_semantic_constrained_diverse_cfg
 _get_coverage_family_aware_final_rules_cfg = driving_pipeline_config.get_coverage_family_aware_final_rules_cfg
 _get_rule_pool_upper_bound_diagnostic_cfg = driving_pipeline_config.get_rule_pool_upper_bound_diagnostic_cfg
+_get_oracle_rule_selection_gap_diagnostic_cfg = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_cfg
 _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
@@ -142,6 +148,7 @@ _get_error_and_explainability_output_root = driving_pipeline_config.get_error_an
 _get_coverage_family_aware_final_rules_output_root = driving_pipeline_config.get_coverage_family_aware_final_rules_output_root
 _get_semantic_constrained_diverse_output_root = driving_pipeline_config.get_semantic_constrained_diverse_output_root
 _get_rule_pool_upper_bound_diagnostic_output_root = driving_pipeline_config.get_rule_pool_upper_bound_diagnostic_output_root
+_get_oracle_rule_selection_gap_diagnostic_output_root = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_output_root
 _get_vehicle_rule_diagnostic_output_root = driving_pipeline_config.get_vehicle_rule_diagnostic_output_root
 _get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule_selection_visualization_output_root
 _get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
@@ -551,6 +558,25 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print(
         "Rule-pool upper-bound diagnostic complete. "
         f"bottleneck={rule_pool_upper_bound_results.get('bottleneck_label', 'unknown')}"
+    )
+
+    # Step 17E: compare oracle top-K rules against actual selector outputs
+    oracle_rule_selection_gap_cfg = _get_oracle_rule_selection_gap_diagnostic_cfg()
+    print("\n=== Step 17E: oracle_rule_selection_gap_diagnostic_driving_mini ===")
+    print(f"Oracle rule-selection gap cfg: {oracle_rule_selection_gap_cfg}")
+    oracle_rule_selection_gap_results: Dict[str, Any] = (
+        oracle_rule_selection_gap_diagnostic_driving_mini.run(
+            extended_rule_results=extended_rule_results,
+            rule_pool_upper_bound_results=rule_pool_upper_bound_results,
+            rule_results_by_name=rule_results_by_name,
+            cfg=oracle_rule_selection_gap_cfg,
+            output_root=_get_oracle_rule_selection_gap_diagnostic_output_root(),
+            force_recompute=bool(recompute_cfg.get("oracle_rule_selection_gap_diagnostic", True)),
+        )
+    )
+    print(
+        "Oracle rule-selection gap diagnostic complete. "
+        f"oracle_target_f1={float(oracle_rule_selection_gap_results.get('oracle_target_f1', 0.0)):.3f}"
     )
 
     # Step 18: evaluate final rules on held-out evaluation videos

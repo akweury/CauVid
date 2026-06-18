@@ -325,6 +325,18 @@ def get_rule_pool_upper_bound_diagnostic_cfg() -> Dict[str, Any]:
     )
 
 
+def get_oracle_rule_selection_gap_diagnostic_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "oracle_target_mode": "peak_f1",
+            "max_missing_rules_per_selector": 20,
+            "max_extra_rules_per_selector": 20,
+        },
+        path=("oracle_rule_selection_gap_diagnostic",),
+        warn_label="oracle rule-selection gap diagnostic",
+    )
+
+
 def get_data_split_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -441,6 +453,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "semantic_constrained_diverse_final_rules": True,
             "coverage_family_aware_final_rules": True,
             "rule_pool_upper_bound_diagnostic": True,
+            "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,
             "neural_symbolic_baseline": True,
             "error_and_explainability_analysis": True,
@@ -508,6 +521,10 @@ def get_semantic_constrained_diverse_output_root() -> Path:
 
 def get_rule_pool_upper_bound_diagnostic_output_root() -> Path:
     return _load_output_root("17d_driving_mini_rule_pool_upper_bound_diagnostic")
+
+
+def get_oracle_rule_selection_gap_diagnostic_output_root() -> Path:
+    return _load_output_root("17e_driving_mini_oracle_rule_selection_gap_diagnostic")
 
 
 def get_vehicle_rule_diagnostic_output_root() -> Path:
