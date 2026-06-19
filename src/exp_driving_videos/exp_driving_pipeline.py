@@ -94,8 +94,9 @@ import argparse
 import csv
 import io
 import json
+import re
 import sys
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -236,6 +237,53 @@ class _PipelineStopRequested(RuntimeError):
 
 
 class _FilteredStepWriter(io.TextIOBase):
+    _UUIDISH_LINE_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{8}(?::|\b)")
+    _VIDEO_SUMMARY_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{8}: .*"
+    )
+    _NOISY_PREFIXES = (
+        "processing ",
+        "videos to process:",
+        "videos to track:",
+        "dataset annotation videos to process:",
+        "videos to prepare 3d positions for:",
+        "rendered ",
+        "saved boxed video:",
+        "saved tracked video:",
+        "saved merged video:",
+        "visualization saved",
+        "stop_threshold=",
+    )
+    _NOISY_SUBSTRINGS = (
+        " [cache] ",
+        "[cache]",
+        "cache is stale",
+        "cache visualization is missing",
+        "cache visualization is stale",
+        "frames tracked,",
+        "with ego motion estimates",
+        "segment-object summaries",
+        "objects=",
+    )
+    _ALLOW_SUBSTRINGS = (
+        "[warn]",
+        "[error]",
+        "traceback",
+        "manifest written",
+        "json written",
+        "csv written",
+        "pdf written",
+        "report written",
+        "summary written",
+        "table written",
+        "figure written",
+        "figure data written",
+        "written to ",
+        "total detections",
+        "top classes",
+        "total unique tracks",
+    )
+
     def __init__(
         self,
         base_stream: Any,
@@ -264,7 +312,19 @@ class _FilteredStepWriter(io.TextIOBase):
         stripped = str(line).strip()
         if not stripped:
             return
+        lowered = stripped.lower()
         if any(token in stripped for token in self._suppressed_substrings):
+            return
+        if any(token in lowered for token in self._ALLOW_SUBSTRINGS):
+            self._base_stream.write(f"[Step {self._step_tag}] {stripped}\n")
+            return
+        if self._UUIDISH_LINE_RE.match(stripped):
+            return
+        if self._VIDEO_SUMMARY_RE.match(stripped):
+            return
+        if any(lowered.startswith(prefix) for prefix in self._NOISY_PREFIXES):
+            return
+        if any(token in lowered for token in self._NOISY_SUBSTRINGS):
             return
         self._base_stream.write(f"[Step {self._step_tag}] {stripped}\n")
 
@@ -346,7 +406,7 @@ class StepRunner:
     @contextmanager
     def module_output(self, tag: str) -> Any:
         writer = _FilteredStepWriter(sys.stdout, step_tag=tag)
-        with redirect_stdout(writer):
+        with redirect_stdout(writer), redirect_stderr(writer):
             yield
         writer.flush()
 
