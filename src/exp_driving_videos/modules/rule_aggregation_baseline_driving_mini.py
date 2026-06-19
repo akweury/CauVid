@@ -14,7 +14,10 @@ Output layout:
         prediction_examples.csv
         top_weighted_rules_with_clauses.csv
         rule_aggregation_ablation_metrics.csv
+        rule_aggregation_subset_threshold_metrics.csv
         top_k_weighted_rule_sets.csv
+        rule_aggregation_family_summary.json
+        rule_aggregation_family_summary.csv
         split_leakage_check.json
 """
 
@@ -47,8 +50,16 @@ from src.exp_driving_videos.modules.rule_pool_upper_bound_diagnostic_driving_min
 from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
 
 
-_RULE_AGGREGATION_BASELINE_VERSION = 2
+_RULE_AGGREGATION_BASELINE_VERSION = 3
 _TOP_WEIGHT_ABLATION_SIZES: Tuple[Any, ...] = (1, 3, 5, 10, 20, 50, "all_nonzero")
+_SUMMARY_FAMILY_ORDER: Tuple[str, ...] = (
+    "transition",
+    "ego-motion",
+    "vehicle-centered",
+    "near/centered object",
+    "suppressor",
+    "other",
+)
 
 
 def get_output_root() -> Path:
@@ -86,6 +97,16 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
 
 
 def _prepare_examples(temporal_rule_results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -482,25 +503,182 @@ def _split_separation_checks(
     }
 
 
+def _subset_probabilities(
+    feature_matrix: Any,
+    selected_indices: Sequence[int],
+    coefficients: np.ndarray,
+    intercept: float,
+) -> List[float]:
+    subset_logits = np.full(shape=(feature_matrix.shape[0],), fill_value=float(intercept), dtype=np.float64)
+    if selected_indices:
+        subset_logits += np.asarray(feature_matrix[:, list(selected_indices)].dot(coefficients[list(selected_indices)])).reshape(-1)
+    return _sigmoid(subset_logits).tolist()
+
+
+def _summary_family_labels(
+    rule: Dict[str, Any],
+    weight: float,
+    cfg: Dict[str, Any],
+) -> List[str]:
+    vehicle_classes = {
+        str(v)
+        for v in cfg.get("vehicle_classes", ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"])
+    }
+    near_states = {str(v) for v in cfg.get("near_states", ["near"])}
+    center_states = {str(v) for v in cfg.get("center_states", ["centered"])}
+
+    has_transition = False
+    has_ego_motion = False
+    has_vehicle = False
+    has_near = False
+    has_centered = False
+
+    for predicate, args in list(rule.get("rule_templates", [])):
+        predicate_text = str(predicate).strip().lower()
+        lowered_args = [str(arg).strip().lower() for arg in args]
+        if "transition" in predicate_text or any("transition" in arg for arg in lowered_args):
+            has_transition = True
+        if predicate_text.startswith("ego_") or "ego_" in predicate_text or "ego" in lowered_args:
+            has_ego_motion = True
+        if predicate_text == "object_class" and len(args) >= 3 and str(args[2]) in vehicle_classes:
+            has_vehicle = True
+        if predicate_text == "object_distance_state" and len(args) >= 3 and str(args[2]) in near_states:
+            has_near = True
+        if predicate_text == "object_x_position_state" and len(args) >= 3 and str(args[2]) in center_states:
+            has_centered = True
+
+    labels: List[str] = []
+    if has_transition:
+        labels.append("transition")
+    if has_ego_motion:
+        labels.append("ego-motion")
+    if has_vehicle and has_centered:
+        labels.append("vehicle-centered")
+    if has_near or has_centered:
+        labels.append("near/centered object")
+    if float(weight) < 0.0:
+        labels.append("suppressor")
+    if not labels:
+        labels.append("other")
+    return labels
+
+
+def _signed_weight_sort_key(row: Dict[str, Any], sign: str) -> Tuple[float, float, str]:
+    weight = float(row.get("weight", 0.0))
+    rule_id = str(row.get("rule_id", ""))
+    if sign == "positive":
+        return (-weight, -abs(weight), rule_id)
+    return (weight, -abs(weight), rule_id)
+
+
+def _family_summary_rule_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "rank": _safe_int(row.get("rank", 0)),
+        "rule_id": str(row.get("rule_id", "")),
+        "weight": float(row.get("weight", 0.0)),
+        "abs_weight": float(row.get("abs_weight", abs(float(row.get("weight", 0.0))))),
+        "semantic_family": str(row.get("semantic_family", "")),
+        "summary_families": list(row.get("summary_families_list", [])),
+        "confidence": float(row.get("confidence", 0.0)),
+        "train_positive_support": int(row.get("train_positive_support", 0)),
+        "train_negative_support": int(row.get("train_negative_support", 0)),
+        "clause": str(row.get("clause", "")),
+    }
+
+
+def _build_family_summary(
+    weighted_rule_rows: Sequence[Dict[str, Any]],
+    top_rules_per_family: int = 5,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    discovered_families: List[str] = []
+    for row in weighted_rule_rows:
+        for family in list(row.get("summary_families_list", [])):
+            if family not in _SUMMARY_FAMILY_ORDER and family not in discovered_families:
+                discovered_families.append(family)
+    family_names = list(_SUMMARY_FAMILY_ORDER) + discovered_families
+
+    payload: Dict[str, Any] = {
+        "top_rules_per_family": int(top_rules_per_family),
+        "family_order": family_names,
+        "positive": {},
+        "negative": {},
+    }
+    csv_rows: List[Dict[str, Any]] = []
+
+    for sign in ("positive", "negative"):
+        signed_rows = [
+            dict(row)
+            for row in weighted_rule_rows
+            if (float(row.get("weight", 0.0)) > 0.0 if sign == "positive" else float(row.get("weight", 0.0)) < 0.0)
+        ]
+        signed_rows = sorted(signed_rows, key=lambda row: _signed_weight_sort_key(row, sign))
+        sign_payload = {
+            "num_rules": len(signed_rows),
+            "overall_top_rules": [_family_summary_rule_row(row) for row in signed_rows[:top_rules_per_family]],
+            "families": [],
+        }
+        for family_name in family_names:
+            family_rows = [
+                dict(row) for row in signed_rows if family_name in list(row.get("summary_families_list", []))
+            ]
+            ordered_family_rows = sorted(family_rows, key=lambda row: _signed_weight_sort_key(row, sign))
+            net_weight = float(sum(float(row.get("weight", 0.0)) for row in ordered_family_rows))
+            total_abs_weight = float(sum(abs(float(row.get("weight", 0.0))) for row in ordered_family_rows))
+            top_family_rows = ordered_family_rows[:top_rules_per_family]
+            sign_payload["families"].append(
+                {
+                    "family": family_name,
+                    "num_rules": len(ordered_family_rows),
+                    "net_weight": net_weight,
+                    "total_abs_weight": total_abs_weight,
+                    "top_rules": [_family_summary_rule_row(row) for row in top_family_rows],
+                }
+            )
+            for family_rank, row in enumerate(top_family_rows, start=1):
+                csv_rows.append(
+                    {
+                        "sign": sign,
+                        "family": family_name,
+                        "family_rank": family_rank,
+                        "num_rules_in_family": len(ordered_family_rows),
+                        "net_weight": net_weight,
+                        "total_abs_weight": total_abs_weight,
+                        "rule_id": str(row.get("rule_id", "")),
+                        "weight": float(row.get("weight", 0.0)),
+                        "abs_weight": float(row.get("abs_weight", abs(float(row.get("weight", 0.0))))),
+                        "semantic_family": str(row.get("semantic_family", "")),
+                        "summary_families": " || ".join(str(v) for v in list(row.get("summary_families_list", []))),
+                        "confidence": float(row.get("confidence", 0.0)),
+                        "train_positive_support": int(row.get("train_positive_support", 0)),
+                        "train_negative_support": int(row.get("train_negative_support", 0)),
+                        "clause": str(row.get("clause", "")),
+                    }
+                )
+        payload[sign] = sign_payload
+    return payload, csv_rows
+
+
 def _top_weight_subset_ablation_rows(
+    val_matrix: Any,
     eval_matrix: Any,
-    eval_examples: Sequence[Dict[str, Any]],
+    y_val: np.ndarray,
     y_eval: np.ndarray,
     active_rules: Sequence[Dict[str, Any]],
     coefficients: np.ndarray,
     intercept: float,
-    best_threshold: float,
+    shared_threshold: float,
     average_precision_score_fn: Any,
     roc_auc_score_fn: Any,
     confusion_matrix_fn: Any,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     nonzero_indices = np.flatnonzero(np.abs(coefficients) > 1e-12)
     ordered_nonzero_indices = sorted(
         nonzero_indices.tolist(),
         key=lambda index: (-abs(coefficients[index]), -coefficients[index], str(active_rules[index].get("rule_id", ""))),
     )
 
-    rows: List[Dict[str, Any]] = []
+    summary_rows: List[Dict[str, Any]] = []
+    metric_rows: List[Dict[str, Any]] = []
     for subset_spec in _TOP_WEIGHT_ABLATION_SIZES:
         if subset_spec == "all_nonzero":
             selected_indices = list(ordered_nonzero_indices)
@@ -512,54 +690,128 @@ def _top_weight_subset_ablation_rows(
         if not selected_indices:
             continue
 
-        subset_logits = np.full(shape=(eval_matrix.shape[0],), fill_value=float(intercept), dtype=np.float64)
-        subset_logits += np.asarray(eval_matrix[:, selected_indices].dot(coefficients[selected_indices])).reshape(-1)
-        subset_probabilities = _sigmoid(subset_logits).tolist()
-
-        threshold_05_metrics = _compute_threshold_metrics(
-            y_eval.tolist(),
-            subset_probabilities,
-            0.5,
-            average_precision_score_fn,
-            roc_auc_score_fn,
-            confusion_matrix_fn,
+        val_probabilities = _subset_probabilities(
+            feature_matrix=val_matrix,
+            selected_indices=selected_indices,
+            coefficients=coefficients,
+            intercept=intercept,
         )
-        tuned_metrics = _compute_threshold_metrics(
-            y_eval.tolist(),
-            subset_probabilities,
-            best_threshold,
+        eval_probabilities = _subset_probabilities(
+            feature_matrix=eval_matrix,
+            selected_indices=selected_indices,
+            coefficients=coefficients,
+            intercept=intercept,
+        )
+        subset_specific_threshold, subset_specific_validation_metrics = _select_best_threshold(
+            y_val.tolist(),
+            val_probabilities,
             average_precision_score_fn,
             roc_auc_score_fn,
             confusion_matrix_fn,
+            default_threshold=shared_threshold,
         )
         selected_rules = [dict(active_rules[index]) for index in selected_indices]
         selected_rule_ids = [str(rule.get("rule_id", "")) for rule in selected_rules]
         selected_rule_clauses = [str(rule.get("clause", "")) for rule in selected_rules]
-        rows.append(
+        selected_rule_families = [str(rule.get("semantic_family", "")) for rule in selected_rules]
+
+        per_split_metrics: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for split_name, labels, probabilities in [
+            ("validation", y_val.tolist(), val_probabilities),
+            ("eval", y_eval.tolist(), eval_probabilities),
+        ]:
+            per_split_metrics[split_name] = {}
+            for threshold_name, threshold_value in [
+                ("threshold_0_5", 0.5),
+                ("shared_validation_threshold", shared_threshold),
+                ("subset_specific_validation_threshold", subset_specific_threshold),
+            ]:
+                metrics = _compute_threshold_metrics(
+                    labels,
+                    probabilities,
+                    float(threshold_value),
+                    average_precision_score_fn,
+                    roc_auc_score_fn,
+                    confusion_matrix_fn,
+                )
+                per_split_metrics[split_name][threshold_name] = metrics
+                metric_rows.append(
+                    {
+                        "subset_k": subset_label,
+                        "subset_size": len(selected_indices),
+                        "split_name": split_name,
+                        "threshold_name": threshold_name,
+                        "threshold_value": float(threshold_value),
+                        "precision": float(metrics.get("precision", 0.0)),
+                        "recall": float(metrics.get("recall", 0.0)),
+                        "f1": float(metrics.get("f1", 0.0)),
+                        "accuracy": float(metrics.get("accuracy", 0.0)),
+                        "auroc": float(metrics.get("auroc", float("nan"))),
+                        "auprc": float(metrics.get("auprc", float("nan"))),
+                        "true_positive": int(metrics.get("true_positive", 0)),
+                        "false_positive": int(metrics.get("false_positive", 0)),
+                        "false_negative": int(metrics.get("false_negative", 0)),
+                        "true_negative": int(metrics.get("true_negative", 0)),
+                        "selected_rule_ids": " || ".join(selected_rule_ids),
+                        "selected_rule_clauses": " || ".join(selected_rule_clauses),
+                        "selected_rule_families": " || ".join(selected_rule_families),
+                    }
+                )
+
+        threshold_05_eval_metrics = per_split_metrics["eval"]["threshold_0_5"]
+        shared_eval_metrics = per_split_metrics["eval"]["shared_validation_threshold"]
+        shared_validation_metrics = per_split_metrics["validation"]["shared_validation_threshold"]
+        subset_eval_metrics = per_split_metrics["eval"]["subset_specific_validation_threshold"]
+
+        summary_rows.append(
             {
                 "subset_k": subset_label,
                 "subset_size": len(selected_indices),
-                "threshold_name": "best_validation_threshold",
-                "threshold_value": float(best_threshold),
-                "threshold_0_5_precision": float(threshold_05_metrics.get("precision", 0.0)),
-                "threshold_0_5_recall": float(threshold_05_metrics.get("recall", 0.0)),
-                "threshold_0_5_f1": float(threshold_05_metrics.get("f1", 0.0)),
-                "precision": float(tuned_metrics.get("precision", 0.0)),
-                "recall": float(tuned_metrics.get("recall", 0.0)),
-                "f1": float(tuned_metrics.get("f1", 0.0)),
-                "accuracy": float(tuned_metrics.get("accuracy", 0.0)),
-                "auroc": float(tuned_metrics.get("auroc", float("nan"))),
-                "auprc": float(tuned_metrics.get("auprc", float("nan"))),
-                "true_positive": int(tuned_metrics.get("true_positive", 0)),
-                "false_positive": int(tuned_metrics.get("false_positive", 0)),
-                "false_negative": int(tuned_metrics.get("false_negative", 0)),
-                "true_negative": int(tuned_metrics.get("true_negative", 0)),
+                "threshold_name": "shared_validation_threshold",
+                "threshold_value": float(shared_threshold),
+                "threshold_0_5_precision": float(threshold_05_eval_metrics.get("precision", 0.0)),
+                "threshold_0_5_recall": float(threshold_05_eval_metrics.get("recall", 0.0)),
+                "threshold_0_5_f1": float(threshold_05_eval_metrics.get("f1", 0.0)),
+                "precision": float(shared_eval_metrics.get("precision", 0.0)),
+                "recall": float(shared_eval_metrics.get("recall", 0.0)),
+                "f1": float(shared_eval_metrics.get("f1", 0.0)),
+                "accuracy": float(shared_eval_metrics.get("accuracy", 0.0)),
+                "auroc": float(shared_eval_metrics.get("auroc", float("nan"))),
+                "auprc": float(shared_eval_metrics.get("auprc", float("nan"))),
+                "true_positive": int(shared_eval_metrics.get("true_positive", 0)),
+                "false_positive": int(shared_eval_metrics.get("false_positive", 0)),
+                "false_negative": int(shared_eval_metrics.get("false_negative", 0)),
+                "true_negative": int(shared_eval_metrics.get("true_negative", 0)),
+                "shared_threshold_validation_precision": float(shared_validation_metrics.get("precision", 0.0)),
+                "shared_threshold_validation_recall": float(shared_validation_metrics.get("recall", 0.0)),
+                "shared_threshold_validation_f1": float(shared_validation_metrics.get("f1", 0.0)),
+                "shared_threshold_validation_accuracy": float(shared_validation_metrics.get("accuracy", 0.0)),
+                "shared_threshold_validation_auroc": float(shared_validation_metrics.get("auroc", float("nan"))),
+                "shared_threshold_validation_auprc": float(shared_validation_metrics.get("auprc", float("nan"))),
+                "subset_specific_threshold_name": "subset_specific_validation_threshold",
+                "subset_specific_threshold_value": float(subset_specific_threshold),
+                "subset_specific_validation_precision": float(subset_specific_validation_metrics.get("precision", 0.0)),
+                "subset_specific_validation_recall": float(subset_specific_validation_metrics.get("recall", 0.0)),
+                "subset_specific_validation_f1": float(subset_specific_validation_metrics.get("f1", 0.0)),
+                "subset_specific_validation_accuracy": float(subset_specific_validation_metrics.get("accuracy", 0.0)),
+                "subset_specific_validation_auroc": float(subset_specific_validation_metrics.get("auroc", float("nan"))),
+                "subset_specific_validation_auprc": float(subset_specific_validation_metrics.get("auprc", float("nan"))),
+                "subset_specific_precision": float(subset_eval_metrics.get("precision", 0.0)),
+                "subset_specific_recall": float(subset_eval_metrics.get("recall", 0.0)),
+                "subset_specific_f1": float(subset_eval_metrics.get("f1", 0.0)),
+                "subset_specific_accuracy": float(subset_eval_metrics.get("accuracy", 0.0)),
+                "subset_specific_auroc": float(subset_eval_metrics.get("auroc", float("nan"))),
+                "subset_specific_auprc": float(subset_eval_metrics.get("auprc", float("nan"))),
+                "subset_specific_true_positive": int(subset_eval_metrics.get("true_positive", 0)),
+                "subset_specific_false_positive": int(subset_eval_metrics.get("false_positive", 0)),
+                "subset_specific_false_negative": int(subset_eval_metrics.get("false_negative", 0)),
+                "subset_specific_true_negative": int(subset_eval_metrics.get("true_negative", 0)),
                 "selected_rule_ids": " || ".join(selected_rule_ids),
                 "selected_rule_clauses": " || ".join(selected_rule_clauses),
-                "selected_rule_families": " || ".join(str(rule.get("semantic_family", "")) for rule in selected_rules),
+                "selected_rule_families": " || ".join(selected_rule_families),
             }
         )
-    return rows
+    return summary_rows, metric_rows
 
 
 def process_baseline(
@@ -581,7 +833,10 @@ def process_baseline(
     prediction_csv_path = out_root / "prediction_examples.csv"
     top_rules_csv_path = out_root / "top_weighted_rules_with_clauses.csv"
     ablation_csv_path = out_root / "rule_aggregation_ablation_metrics.csv"
+    subset_threshold_metrics_csv_path = out_root / "rule_aggregation_subset_threshold_metrics.csv"
     top_k_rule_sets_csv_path = out_root / "top_k_weighted_rule_sets.csv"
+    family_summary_json_path = out_root / "rule_aggregation_family_summary.json"
+    family_summary_csv_path = out_root / "rule_aggregation_family_summary.csv"
     split_leakage_json_path = out_root / "split_leakage_check.json"
 
     if not force_recompute and summary_path.exists():
@@ -793,40 +1048,45 @@ def process_baseline(
     nonzero_indices = np.flatnonzero(np.abs(coefficients) > 1e-12)
     top_k_rules = max(1, int(cfg.get("top_weighted_rules", 30)))
     top_weight_rows: List[Dict[str, Any]] = []
+    all_weight_rows: List[Dict[str, Any]] = []
     ordered_nonzero_indices = sorted(
         nonzero_indices.tolist(),
         key=lambda index: (-abs(coefficients[index]), -coefficients[index], active_rules[index].get("rule_id", "")),
     )
-    for rank, feature_index in enumerate(ordered_nonzero_indices[:top_k_rules], start=1):
+    for rank, feature_index in enumerate(ordered_nonzero_indices, start=1):
         rule = dict(active_rules[feature_index])
         weight = float(coefficients[feature_index])
-        top_weight_rows.append(
-            {
-                "rank": rank,
-                "rule_id": str(rule.get("rule_id", "")),
-                "clause": str(rule.get("clause", "")),
-                "weight": weight,
-                "abs_weight": abs(weight),
-                "sign": "positive" if weight >= 0.0 else "negative",
-                "confidence": float(rule.get("confidence", 0.0)),
-                "train_positive_support": int(rule.get("positive_support", 0)),
-                "train_negative_support": int(rule.get("negative_support", 0)),
-                "semantic_family": str(rule.get("semantic_family", "")),
-            }
-        )
+        row = {
+            "rank": rank,
+            "rule_id": str(rule.get("rule_id", "")),
+            "clause": str(rule.get("clause", "")),
+            "weight": weight,
+            "abs_weight": abs(weight),
+            "sign": "positive" if weight >= 0.0 else "negative",
+            "confidence": float(rule.get("confidence", 0.0)),
+            "train_positive_support": int(rule.get("positive_support", 0)),
+            "train_negative_support": int(rule.get("negative_support", 0)),
+            "semantic_family": str(rule.get("semantic_family", "")),
+        }
+        row["summary_families_list"] = _summary_family_labels(rule, weight, cfg)
+        row["summary_families"] = " || ".join(row["summary_families_list"])
+        all_weight_rows.append(row)
+    top_weight_rows = [dict(row) for row in all_weight_rows[:top_k_rules]]
 
-    subset_ablation_rows = _top_weight_subset_ablation_rows(
+    subset_ablation_rows, subset_threshold_metric_rows = _top_weight_subset_ablation_rows(
+        val_matrix=val_matrix,
         eval_matrix=eval_matrix,
-        eval_examples=eval_examples,
+        y_val=y_val,
         y_eval=y_eval,
         active_rules=active_rules,
         coefficients=coefficients,
         intercept=intercept,
-        best_threshold=best_threshold,
+        shared_threshold=best_threshold,
         average_precision_score_fn=average_precision_score,
         roc_auc_score_fn=roc_auc_score,
         confusion_matrix_fn=confusion_matrix,
     )
+    family_summary_payload, family_summary_rows = _build_family_summary(all_weight_rows)
 
     _write_csv(
         metrics_csv_path,
@@ -900,6 +1160,7 @@ def process_baseline(
             "train_positive_support",
             "train_negative_support",
             "semantic_family",
+            "summary_families",
         ],
         top_weight_rows,
     )
@@ -923,11 +1184,59 @@ def process_baseline(
             "false_positive",
             "false_negative",
             "true_negative",
+            "shared_threshold_validation_precision",
+            "shared_threshold_validation_recall",
+            "shared_threshold_validation_f1",
+            "shared_threshold_validation_accuracy",
+            "shared_threshold_validation_auroc",
+            "shared_threshold_validation_auprc",
+            "subset_specific_threshold_name",
+            "subset_specific_threshold_value",
+            "subset_specific_validation_precision",
+            "subset_specific_validation_recall",
+            "subset_specific_validation_f1",
+            "subset_specific_validation_accuracy",
+            "subset_specific_validation_auroc",
+            "subset_specific_validation_auprc",
+            "subset_specific_precision",
+            "subset_specific_recall",
+            "subset_specific_f1",
+            "subset_specific_accuracy",
+            "subset_specific_auroc",
+            "subset_specific_auprc",
+            "subset_specific_true_positive",
+            "subset_specific_false_positive",
+            "subset_specific_false_negative",
+            "subset_specific_true_negative",
             "selected_rule_ids",
             "selected_rule_clauses",
             "selected_rule_families",
         ],
         subset_ablation_rows,
+    )
+    _write_csv(
+        subset_threshold_metrics_csv_path,
+        [
+            "subset_k",
+            "subset_size",
+            "split_name",
+            "threshold_name",
+            "threshold_value",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "auroc",
+            "auprc",
+            "true_positive",
+            "false_positive",
+            "false_negative",
+            "true_negative",
+            "selected_rule_ids",
+            "selected_rule_clauses",
+            "selected_rule_families",
+        ],
+        subset_threshold_metric_rows,
     )
     top_k_rule_set_rows = [
         {
@@ -935,6 +1244,8 @@ def process_baseline(
             "subset_size": row.get("subset_size", 0),
             "threshold_name": row.get("threshold_name", ""),
             "threshold_value": row.get("threshold_value", 0.0),
+            "subset_specific_threshold_name": row.get("subset_specific_threshold_name", ""),
+            "subset_specific_threshold_value": row.get("subset_specific_threshold_value", 0.0),
             "selected_rule_ids": row.get("selected_rule_ids", ""),
             "selected_rule_clauses": row.get("selected_rule_clauses", ""),
             "selected_rule_families": row.get("selected_rule_families", ""),
@@ -948,11 +1259,36 @@ def process_baseline(
             "subset_size",
             "threshold_name",
             "threshold_value",
+            "subset_specific_threshold_name",
+            "subset_specific_threshold_value",
             "selected_rule_ids",
             "selected_rule_clauses",
             "selected_rule_families",
         ],
         top_k_rule_set_rows,
+    )
+    with family_summary_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(family_summary_payload, fh, indent=2)
+    _write_csv(
+        family_summary_csv_path,
+        [
+            "sign",
+            "family",
+            "family_rank",
+            "num_rules_in_family",
+            "net_weight",
+            "total_abs_weight",
+            "rule_id",
+            "weight",
+            "abs_weight",
+            "semantic_family",
+            "summary_families",
+            "confidence",
+            "train_positive_support",
+            "train_negative_support",
+            "clause",
+        ],
+        family_summary_rows,
     )
 
     tuning_checks = {
@@ -973,6 +1309,7 @@ def process_baseline(
             "Each C candidate is fit on the train subset only.",
             "Best C and decision threshold are selected using validation metrics only.",
             "Held-out eval probabilities are computed only after best C and threshold are fixed.",
+            "Top-|weight| subset thresholds are also tuned on validation only, then applied to held-out eval.",
         ],
     }
     split_leakage_payload = {
@@ -1000,7 +1337,9 @@ def process_baseline(
         "metrics_by_split": metrics_by_split,
         "validation_search": candidate_rows,
         "top_weighted_rules": top_weight_rows,
+        "weighted_rule_family_summary": family_summary_payload,
         "top_weight_rule_subset_ablations": subset_ablation_rows,
+        "top_weight_rule_subset_threshold_metrics": subset_threshold_metric_rows,
         "output_paths": {
             "summary_json": str(summary_path),
             "metrics_csv": str(metrics_csv_path),
@@ -1008,7 +1347,10 @@ def process_baseline(
             "prediction_examples_csv": str(prediction_csv_path),
             "top_weighted_rules_with_clauses_csv": str(top_rules_csv_path),
             "rule_aggregation_ablation_metrics_csv": str(ablation_csv_path),
+            "rule_aggregation_subset_threshold_metrics_csv": str(subset_threshold_metrics_csv_path),
             "top_k_weighted_rule_sets_csv": str(top_k_rule_sets_csv_path),
+            "rule_aggregation_family_summary_json": str(family_summary_json_path),
+            "rule_aggregation_family_summary_csv": str(family_summary_csv_path),
             "split_leakage_check_json": str(split_leakage_json_path),
         },
     }
@@ -1028,7 +1370,10 @@ def process_baseline(
     print(f"Rule aggregation baseline summary JSON written to {summary_path}")
     print(f"Rule aggregation baseline top weighted rules CSV written to {top_rules_csv_path}")
     print(f"Rule aggregation baseline subset ablations CSV written to {ablation_csv_path}")
+    print(f"Rule aggregation baseline subset threshold metrics CSV written to {subset_threshold_metrics_csv_path}")
     print(f"Rule aggregation baseline top-K weighted rule sets CSV written to {top_k_rule_sets_csv_path}")
+    print(f"Rule aggregation baseline family summary JSON written to {family_summary_json_path}")
+    print(f"Rule aggregation baseline family summary CSV written to {family_summary_csv_path}")
     print(f"Rule aggregation baseline split leakage check JSON written to {split_leakage_json_path}")
     return summary
 

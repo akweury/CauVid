@@ -451,7 +451,7 @@ def _plot_method_precision_recall_f1(
         center = (start + end) / 2.0
         ax.text(
             center,
-            1.03,
+            0.992,
             _METHOD_FAMILY_LABELS.get(family, family),
             ha="center",
             va="bottom",
@@ -459,6 +459,7 @@ def _plot_method_precision_recall_f1(
             fontweight="bold",
             color=band_color,
             transform=ax.get_xaxis_transform(),
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 1.5},
         )
     for metric_name, offset, metric_color in zip(metric_names, metric_offsets, metric_colors):
         values = [_safe_float(row.get(metric_name, 0.0)) for row in ordered_rows]
@@ -475,7 +476,12 @@ def _plot_method_precision_recall_f1(
     )
     ax.set_ylim(0.0, 1.06)
     ax.set_ylabel("Score")
-    ax.set_title("Held-Out Precision, Recall, and F1 by Method", loc="left", fontweight="bold")
+    ax.set_title(
+        "Held-Out Precision, Recall, and F1 by Method",
+        loc="left",
+        fontweight="bold",
+        pad=24,
+    )
     metric_legend = ax.legend(
         frameon=True,
         fancybox=False,
@@ -502,7 +508,7 @@ def _plot_method_precision_recall_f1(
     ax.add_artist(metric_legend)
     ax.add_artist(family_legend)
     ax.grid(axis="y", alpha=0.2)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     _save_figure(fig, output_paths, dpi)
     plt.close(fig)
     _write_csv(

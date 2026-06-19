@@ -76,7 +76,7 @@ pipeline_recompute:
   rule_pool_upper_bound_diagnostic: false
   oracle_rule_selection_gap_diagnostic: false
   rule_evaluation: false
-  rule_aggregation_baseline: false
+  rule_aggregation_baseline: true
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
