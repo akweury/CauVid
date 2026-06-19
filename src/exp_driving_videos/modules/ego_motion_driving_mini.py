@@ -319,9 +319,9 @@ def process_video(
     out_file = out_dir / "ego_motion.json"
 
     if force_recompute:
-        print(f"  [recompute] {video_id} - rebuilding {out_file.name}")
+        print(f"  [recompute] {video_id} - rebuilding {out_file}")
     elif not out_file.exists():
-        print(f"  [build] {video_id} - missing {out_file.name}; computing")
+        print(f"  [build] {video_id} - missing {out_file}; computing")
 
     cfg = static_adjust_cfg or {}
     static_adjust_enabled = bool(cfg.get("enabled", True))
