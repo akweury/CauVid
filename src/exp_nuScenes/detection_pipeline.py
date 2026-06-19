@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -213,16 +214,73 @@ class YOLOWorldDetector(ObjectDetector):
         self.nms_iou_threshold = nms_iou_threshold
         self.device = device
         self._model: Any = None  # loaded lazily in warmup()
+        self._resolved_model_source: Optional[str] = None
+
+    def _model_cache_root(self) -> Path:
+        root = config.get_output_path("output") / "model_cache" / "ultralytics"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _model_cache_path(self) -> Optional[Path]:
+        raw_name = str(self.model_name).strip()
+        if not raw_name:
+            return None
+
+        candidate = Path(raw_name).expanduser()
+        if candidate.exists():
+            return None
+
+        file_name = Path(raw_name).name
+        if not file_name:
+            return None
+        return self._model_cache_root() / file_name
+
+    def _resolve_model_source(self) -> str:
+        cached_path = self._model_cache_path()
+        if cached_path is not None and cached_path.exists():
+            print(f"[YOLOWorldDetector] Model cache hit: {cached_path}")
+            return str(cached_path)
+        return self.model_name
+
+    def _persist_loaded_checkpoint(self) -> None:
+        cached_path = self._model_cache_path()
+        if cached_path is None or cached_path.exists() or self._model is None:
+            return
+
+        checkpoint_candidates = [
+            getattr(self._model, "ckpt_path", None),
+            getattr(self._model, "checkpoint_path", None),
+        ]
+        inner_model = getattr(self._model, "model", None)
+        if inner_model is not None:
+            checkpoint_candidates.extend(
+                [
+                    getattr(inner_model, "pt_path", None),
+                ]
+            )
+
+        for candidate in checkpoint_candidates:
+            if not candidate:
+                continue
+            source_path = Path(str(candidate)).expanduser()
+            if not source_path.exists() or source_path.is_dir():
+                continue
+            cached_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, cached_path)
+            print(f"[YOLOWorldDetector] Cached model checkpoint to {cached_path}")
+            return
 
     def warmup(self) -> None:
         """Load model weights and set vocabulary once before processing starts."""
         from ultralytics import YOLOWorld  # deferred import
 
-        print(f"[YOLOWorldDetector] Loading model: {self.model_name}")
+        self._resolved_model_source = self._resolve_model_source()
+        print(f"[YOLOWorldDetector] Loading model: {self._resolved_model_source}")
         kwargs: Dict[str, Any] = {}
         if self.device is not None:
             kwargs["device"] = self.device
-        self._model = YOLOWorld(self.model_name, **kwargs)
+        self._model = YOLOWorld(self._resolved_model_source, **kwargs)
+        self._persist_loaded_checkpoint()
 
         if self.classes:
             self._model.set_classes(self.classes)
