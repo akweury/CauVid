@@ -359,6 +359,7 @@ def process_video(
             (not static_adjust_enabled) or has_static_adjusted
         )
         if cache_ok:
+            print(f"  [cache-hit] {video_id} - using {out_file}")
             return cached
         if static_adjust_enabled and not has_static_adjusted:
             print(f"  [cache] {video_id} - cache is stale; recomputing with static-object adjustment")
