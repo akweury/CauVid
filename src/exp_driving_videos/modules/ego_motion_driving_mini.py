@@ -318,6 +318,11 @@ def process_video(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / "ego_motion.json"
 
+    if force_recompute:
+        print(f"  [recompute] {video_id} - rebuilding {out_file.name}")
+    elif not out_file.exists():
+        print(f"  [build] {video_id} - missing {out_file.name}; computing")
+
     cfg = static_adjust_cfg or {}
     static_adjust_enabled = bool(cfg.get("enabled", True))
     static_keywords = [
@@ -540,8 +545,6 @@ def run(
     ego_motion_results: List[Dict[str, Any]] = []
 
     for video_result in merged_results:
-        video_id = video_result.get("video_id", "unknown")
-        print(f"  Processing ego motion: {video_id}")
         result = process_video(
             video_result=video_result,
             output_root=out_root,
