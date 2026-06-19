@@ -89,7 +89,12 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+try:
+    from rtpt.rtpt import RTPT
+except Exception:  # pragma: no cover - optional progress monitor dependency
+    RTPT = None
 
 import config
 from src.exp_driving_videos import pipeline_config as driving_pipeline_config
@@ -171,6 +176,69 @@ _select_video_results = driving_pipeline_data.select_video_results
 _build_train_eval_split = driving_pipeline_data.build_train_eval_split
 _resolve_video_ids = driving_pipeline_data.resolve_video_ids
 
+_PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
+    {"tag": "1", "stop_after": 1, "label": "detect_driving_mini"},
+    {"tag": "2", "stop_after": 2, "label": "tracking_driving_mini"},
+    {"tag": "3", "stop_after": 3, "label": "dataset_annotations_driving_mini"},
+    {"tag": "4", "stop_after": 4, "label": "merge_gt_and_detected_driving_mini"},
+    {"tag": "5", "stop_after": 5, "label": "prepare_3d_positions_driving_mini"},
+    {"tag": "6", "stop_after": 6, "label": "ego_motion_driving_mini"},
+    {"tag": "7", "stop_after": 7, "label": "relative_object_motion_driving_mini"},
+    {"tag": "8", "stop_after": 8, "label": "temporal_segmentation_driving_mini"},
+    {"tag": "9", "stop_after": 9, "label": "segment_object_motion_driving_mini"},
+    {"tag": "10", "stop_after": 10, "label": "important_objects_driving_mini"},
+    {"tag": "11", "stop_after": 11, "label": "logic_atoms_driving_mini"},
+    {"tag": "12", "stop_after": 12, "label": "target_head_atoms_driving_mini"},
+    {"tag": "13", "stop_after": 13, "label": "temporal_rule_examples_driving_mini"},
+    {"tag": "14", "stop_after": 14, "label": "candidate_rules_driving_mini"},
+    {"tag": "15", "stop_after": 15, "label": "merge_initial_rules"},
+    {"tag": "16", "stop_after": 16, "label": "extended_rules_driving_mini"},
+    {"tag": "17", "stop_after": 17, "label": "final_rules_driving_mini"},
+    {"tag": "17B", "stop_after": None, "label": "diverse_final_rules_driving_mini"},
+    {"tag": "17B2", "stop_after": None, "label": "semantic_constrained_diverse_final_rules_driving_mini"},
+    {"tag": "17C", "stop_after": None, "label": "coverage_family_aware_final_rules_driving_mini"},
+    {"tag": "17D", "stop_after": None, "label": "rule_pool_upper_bound_diagnostic_driving_mini"},
+    {"tag": "17E", "stop_after": None, "label": "oracle_rule_selection_gap_diagnostic_driving_mini"},
+    {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
+    {"tag": "18B", "stop_after": None, "label": "neural_symbolic_baseline_driving_mini"},
+    {"tag": "18C", "stop_after": 18, "label": "rule_aggregation_baseline_driving_mini"},
+    {"tag": "19", "stop_after": 19, "label": "error_and_explainability_analysis_driving_mini"},
+    {"tag": "20", "stop_after": 20, "label": "vehicle_rule_diagnostic_driving_mini"},
+    {"tag": "20B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
+    {"tag": "21", "stop_after": 21, "label": "rule_selection_visualization_driving_mini"},
+    {"tag": "22", "stop_after": 22, "label": "integrated_method_visualization_driving_mini"},
+]
+
+
+def _rtpt_max_iterations(max_step: int) -> int:
+    return sum(
+        1
+        for stage in _PIPELINE_STAGE_SEQUENCE
+        if stage["stop_after"] is None or int(stage["stop_after"]) <= int(max_step)
+    )
+
+
+def _start_rtpt(max_step: int) -> Optional[Any]:
+    if RTPT is None:
+        print("RTPT unavailable; continuing without remote progress monitor.")
+        return None
+    rtpt = RTPT(
+        name_initials="JI",
+        experiment_name="DrivingMiniPipeline",
+        max_iterations=_rtpt_max_iterations(max_step),
+    )
+    rtpt.start()
+    return rtpt
+
+
+def _rtpt_step(rtpt: Optional[Any], stage_tag: str, subtitle: str = "") -> None:
+    if rtpt is None:
+        return
+    stage_subtitle = f"step={stage_tag}"
+    if subtitle:
+        stage_subtitle = f"{stage_subtitle} | {subtitle}"
+    rtpt.step(subtitle=stage_subtitle)
+
 
 def _run_object_detection_step(
     force_recompute: bool = False,
@@ -222,12 +290,14 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     effective_video_ids = _resolve_video_ids(video_ids)
     if effective_video_ids:
         print(f"Video filter: {effective_video_ids}")
+    rtpt = _start_rtpt(max_step)
 
     # Step 1: object detection over driving_mini frames
     detection_results = _run_object_detection_step(
         force_recompute=False,
         video_ids=effective_video_ids,
     )
+    _rtpt_step(rtpt, "1", subtitle=f"videos={len(detection_results)}")
     if max_step == 1:
         print("\nStopping after step 1 by request.")
         return
@@ -236,6 +306,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print("\n=== Step 2: tracking_driving_mini ===")
     tracking_results: List[Dict[str, Any]] = tracking_driving_mini.run(detection_results)
     print(f"Tracking complete. Processed {len(tracking_results)} video(s).")
+    _rtpt_step(rtpt, "2", subtitle=f"videos={len(tracking_results)}")
     if max_step == 2:
         print("\nStopping after step 2 by request.")
         return
@@ -250,6 +321,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Dataset annotation import complete. "
         f"Processed {len(dataset_annotation_results)} video(s)."
     )
+    _rtpt_step(rtpt, "3", subtitle=f"videos={len(dataset_annotation_results)}")
     if max_step == 3:
         print("\nStopping after step 3 by request.")
         return
@@ -264,6 +336,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Merge complete. "
         f"Processed {len(merged_results)} video(s)."
     )
+    _rtpt_step(rtpt, "4", subtitle=f"videos={len(merged_results)}")
     if max_step == 4:
         print("\nStopping after step 4 by request.")
         return
@@ -277,6 +350,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "3D position preparation complete. "
         f"Processed {len(positions_3d_results)} video(s)."
     )
+    _rtpt_step(rtpt, "5", subtitle=f"videos={len(positions_3d_results)}")
     if max_step == 5:
         print("\nStopping after step 5 by request.")
         return
@@ -297,6 +371,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Ego motion estimation complete. "
         f"Processed {len(ego_motion_results)} video(s)."
     )
+    _rtpt_step(rtpt, "6", subtitle=f"videos={len(ego_motion_results)}")
     if max_step == 6:
         print("\nStopping after step 6 by request.")
         return
@@ -312,6 +387,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Relative object motion estimation complete. "
         f"Processed {len(relative_motion_results)} video(s)."
     )
+    _rtpt_step(rtpt, "7", subtitle=f"videos={len(relative_motion_results)}")
     if max_step == 7:
         print("\nStopping after step 7 by request.")
         return
@@ -330,6 +406,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Temporal segmentation complete. "
         f"Processed {len(temporal_seg_results)} video(s)."
     )
+    _rtpt_step(rtpt, "8", subtitle=f"videos={len(temporal_seg_results)}")
     if max_step == 8:
         print("\nStopping after step 8 by request.")
         return
@@ -348,6 +425,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Segment object motion summary complete. "
         f"Processed {len(segment_object_results)} video(s)."
     )
+    _rtpt_step(rtpt, "9", subtitle=f"videos={len(segment_object_results)}")
     if max_step == 9:
         print("\nStopping after step 9 by request.")
         return
@@ -365,6 +443,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Important object analysis complete. "
         f"Processed {len(important_object_results)} video(s)."
     )
+    _rtpt_step(rtpt, "10", subtitle=f"videos={len(important_object_results)}")
     if max_step == 10:
         print("\nStopping after step 10 by request.")
         return
@@ -382,6 +461,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Logic atom conversion complete. "
         f"Processed {len(logic_atom_results)} video(s)."
     )
+    _rtpt_step(rtpt, "11", subtitle=f"videos={len(logic_atom_results)}")
     if max_step == 11:
         print("\nStopping after step 11 by request.")
         return
@@ -399,6 +479,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Target head atom derivation complete. "
         f"Processed {len(target_head_results)} video(s)."
     )
+    _rtpt_step(rtpt, "12", subtitle=f"videos={len(target_head_results)}")
     if max_step == 12:
         print("\nStopping after step 12 by request.")
         return
@@ -416,6 +497,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Temporal rule-learning example build complete. "
         f"Processed {len(temporal_rule_results)} video(s)."
     )
+    _rtpt_step(rtpt, "13", subtitle=f"videos={len(temporal_rule_results)}")
     if max_step == 13:
         print("\nStopping after step 13 by request.")
         return
@@ -454,6 +536,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Initial rule generation complete. "
         f"Processed {len(candidate_rule_results)} video(s)."
     )
+    _rtpt_step(rtpt, "14", subtitle=f"videos={len(candidate_rule_results)}")
     if max_step == 14:
         print("\nStopping after step 14 by request.")
         return
@@ -466,6 +549,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"Merged {merged_candidate_rules['num_rules']} rule(s) from "
         f"{merged_candidate_rules['num_videos']} video(s)."
     )
+    _rtpt_step(rtpt, "15", subtitle=f"rules={merged_candidate_rules['num_rules']}")
     if max_step == 15:
         print("\nStopping after step 15 by request.")
         return
@@ -482,6 +566,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print(
         "Extended rule generation complete. "
         f"Completed {extended_rule_results.get('num_rounds_completed', 0)} round(s)."
+    )
+    _rtpt_step(
+        rtpt,
+        "16",
+        subtitle=f"kept={int(extended_rule_results.get('num_kept_rules', 0))}",
     )
     if max_step == 16:
         print("\nStopping after step 16 by request.")
@@ -500,6 +589,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Final rule selection complete. "
         f"Selected {final_rule_results.get('num_final_rules', 0)} rule(s)."
     )
+    _rtpt_step(rtpt, "17", subtitle=f"rules={int(final_rule_results.get('num_final_rules', 0))}")
     if max_step == 17:
         print("\nStopping after step 17 by request.")
         return
@@ -517,6 +607,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Diverse final rule selection complete. "
         f"Selected {diverse_final_rule_results.get('num_final_rules', 0)} rule(s)."
     )
+    _rtpt_step(rtpt, "17B", subtitle=f"rules={int(diverse_final_rule_results.get('num_final_rules', 0))}")
 
     # Step 17B2: semantic constrained diverse rule selection
     semantic_constrained_diverse_cfg = _get_semantic_constrained_diverse_cfg()
@@ -532,6 +623,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Semantic constrained diverse rule selection complete. "
         f"Selected {semantic_constrained_diverse_rule_results.get('num_final_rules', 0)} rule(s)."
     )
+    _rtpt_step(
+        rtpt,
+        "17B2",
+        subtitle=f"rules={int(semantic_constrained_diverse_rule_results.get('num_final_rules', 0))}",
+    )
 
     # Step 17C: coverage-aware / family-aware post-mining rule selection
     coverage_family_aware_cfg = _get_coverage_family_aware_final_rules_cfg()
@@ -546,6 +642,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print(
         "Coverage-aware final rule selection complete. "
         f"Selected {coverage_family_aware_rule_results.get('num_final_rules', 0)} rule(s)."
+    )
+    _rtpt_step(
+        rtpt,
+        "17C",
+        subtitle=f"rules={int(coverage_family_aware_rule_results.get('num_final_rules', 0))}",
     )
 
     # Step 17D: diagnose held-out upper bounds of the mined rule pool
@@ -572,6 +673,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Rule-pool upper-bound diagnostic complete. "
         f"bottleneck={rule_pool_upper_bound_results.get('bottleneck_label', 'unknown')}"
     )
+    _rtpt_step(
+        rtpt,
+        "17D",
+        subtitle=f"bottleneck={rule_pool_upper_bound_results.get('bottleneck_label', 'unknown')}",
+    )
 
     # Step 17E: compare oracle top-K rules against actual selector outputs
     oracle_rule_selection_gap_cfg = _get_oracle_rule_selection_gap_diagnostic_cfg()
@@ -590,6 +696,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
     print(
         "Oracle rule-selection gap diagnostic complete. "
         f"oracle_target_f1={float(oracle_rule_selection_gap_results.get('oracle_target_f1', 0.0)):.3f}"
+    )
+    _rtpt_step(
+        rtpt,
+        "17E",
+        subtitle=f"oracle_f1={float(oracle_rule_selection_gap_results.get('oracle_target_f1', 0.0)):.3f}",
     )
 
     # Step 18: evaluate final rules on held-out evaluation videos
@@ -701,6 +812,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"Recall={float(overall_metrics.get('recall', 0.0)):.3f} | "
         f"F1={float(overall_metrics.get('f1', 0.0)):.3f}"
     )
+    _rtpt_step(rtpt, "18", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
 
     # Step 18B: symbolic neural baselines on the same train/eval split
     neural_symbolic_baseline_cfg = _get_neural_symbolic_baseline_cfg()
@@ -727,6 +839,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
                 f"AUPRC={float(row.get('auprc', 0.0)):.3f}"
             )
         print("Neural symbolic baselines complete. " + " | ".join(comparison_parts))
+    _rtpt_step(rtpt, "18B", subtitle=f"models={len(comparison_rows)}")
 
     # Step 18C: learned sparse logistic aggregation over Step 16 rule firings
     rule_aggregation_baseline_cfg = _get_rule_aggregation_baseline_cfg()
@@ -752,6 +865,14 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"AUROC={float(rule_aggregation_eval_best.get('auroc', 0.0)):.3f} | "
         f"AUPRC={float(rule_aggregation_eval_best.get('auprc', 0.0)):.3f} | "
         f"nonzero_rules={int(rule_aggregation_baseline_results.get('num_nonzero_rules', 0))}"
+    )
+    _rtpt_step(
+        rtpt,
+        "18C",
+        subtitle=(
+            f"f1={float(rule_aggregation_eval_best.get('f1', 0.0)):.3f},"
+            f"nonzero={int(rule_aggregation_baseline_results.get('num_nonzero_rules', 0))}"
+        ),
     )
     if max_step == 18:
         print("\nStopping after step 18 by request.")
@@ -855,6 +976,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         f"FN={int(error_analysis_results.get('num_fn_examples', 0))} | "
         f"FP={int(error_analysis_results.get('num_fp_examples', 0))}"
     )
+    _rtpt_step(
+        rtpt,
+        "19",
+        subtitle=f"fn={int(error_analysis_results.get('num_fn_examples', 0))},fp={int(error_analysis_results.get('num_fp_examples', 0))}",
+    )
     if max_step == 19:
         print("\nStopping after step 19 by request.")
         return
@@ -881,6 +1007,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Vehicle-centered rule diagnostic complete. "
         f"diagnosis={vehicle_rule_diagnostic_results.get('primary_diagnosis', 'unknown')}"
     )
+    _rtpt_step(
+        rtpt,
+        "20",
+        subtitle=f"diagnosis={vehicle_rule_diagnostic_results.get('primary_diagnosis', 'unknown')}",
+    )
     if max_step == 20:
         print("\nStopping after step 20 by request.")
         return
@@ -905,9 +1036,11 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
             "FN categorization diagnostic complete. "
             f"summary={fn_categorization_results.get('summary_path', '')}"
         )
+        _rtpt_step(rtpt, "20B", subtitle="enabled")
     else:
         print("\n=== Step 20B: fn_categorization_diagnostic_driving_mini ===")
         print("FN categorization diagnostic disabled by config. Skipping Step 20B.")
+        _rtpt_step(rtpt, "20B", subtitle="skipped")
 
     # Step 21: generate rule-selection visualization figures from summary artifacts
     rule_selection_visualization_cfg = _get_rule_selection_visualization_cfg()
@@ -922,6 +1055,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Rule selection visualization complete. "
         f"manifest={rule_selection_visualization_results.get('figure_paths', {})}"
     )
+    _rtpt_step(rtpt, "21", subtitle="figures=ready")
     if max_step == 21:
         print("\nStopping after step 21 by request.")
         return
@@ -939,6 +1073,7 @@ def main(max_step: int = 21, video_ids: List[str] | None = None) -> None:
         "Integrated method visualization complete. "
         f"manifest={integrated_method_visualization_results.get('figure_paths', {})}"
     )
+    _rtpt_step(rtpt, "22", subtitle="figures=ready")
     if max_step == 22:
         print("\nStopping after step 22 by request.")
         return
