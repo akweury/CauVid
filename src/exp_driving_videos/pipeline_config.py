@@ -73,6 +73,34 @@ def get_ego_motion_smoothing_window(default: int = 5) -> int:
         return default
 
 
+def _get_nested_bool(path: Sequence[str], default: bool) -> bool:
+    try:
+        cfg = _load_exp_driving_cfg()
+        value = _get_nested(cfg, path)
+        if value is None:
+            return bool(default)
+        return bool(value)
+    except Exception as exc:
+        print(f"[warn] Could not load boolean config at {'.'.join(path)}: {exc}. Using default={default}.")
+        return bool(default)
+
+
+def get_detection_render_video_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("detection", "render_video"), default)
+
+
+def get_tracking_render_video_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("tracking", "render_video"), default)
+
+
+def get_merge_render_video_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("merge_annotations", "render_video"), default)
+
+
+def get_ego_motion_render_video_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("ego_motion", "render_video"), default)
+
+
 def get_ego_static_adjustment_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -108,6 +136,7 @@ def get_temporal_segmentation_cfg() -> Dict[str, Any]:
             "min_segment_length": 7,
             "compare_forward_stop_thresholds": [1.0],
             "compare_min_segment_lengths": [7],
+            "render_videos": True,
         },
         path=("temporal_segmentation",),
         warn_label="temporal segmentation",
@@ -126,6 +155,7 @@ def get_segment_object_motion_cfg() -> Dict[str, Any]:
             "distance_medium_threshold": 30.0,
             "top_k_visualized_objects": 20,
             "visualization_fps": 10.0,
+            "render_videos": True,
         },
         path=("segment_object_motion",),
         warn_label="segment object motion",

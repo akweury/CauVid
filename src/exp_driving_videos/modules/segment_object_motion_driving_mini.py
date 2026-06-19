@@ -728,6 +728,7 @@ def process_video(
     distance_medium_threshold = float(cfg.get("distance_medium_threshold", 30.0))
     top_k_visualized_objects = int(cfg.get("top_k_visualized_objects", 20))
     visualization_fps = float(cfg.get("visualization_fps", 10.0))
+    render_videos = bool(cfg.get("render_videos", True))
 
     video_id = temporal_segmentation_video_result["video_id"]
     out_dir = (output_root or get_output_root()) / video_id
@@ -875,16 +876,18 @@ def process_video(
             }
         )
 
-    object_video_paths = _render_top_object_videos(
-        video_id=video_id,
-        frames=frames,
-        segment_summaries=segment_summaries,
-        output_dir=out_dir,
-        top_k=top_k_visualized_objects,
-        fps=visualization_fps,
-        compare_rel_vx_thresholds=compare_rel_vx_thresholds,
-        dominance_ratio_threshold=dominance_ratio_threshold,
-    )
+    object_video_paths: List[Dict[str, Any]] = []
+    if render_videos:
+        object_video_paths = _render_top_object_videos(
+            video_id=video_id,
+            frames=frames,
+            segment_summaries=segment_summaries,
+            output_dir=out_dir,
+            top_k=top_k_visualized_objects,
+            fps=visualization_fps,
+            compare_rel_vx_thresholds=compare_rel_vx_thresholds,
+            dominance_ratio_threshold=dominance_ratio_threshold,
+        )
 
     result: Dict[str, Any] = {
         "version": _SEGMENT_OBJECT_MOTION_VERSION,
@@ -901,6 +904,7 @@ def process_video(
             "distance_medium_threshold": distance_medium_threshold,
             "top_k_visualized_objects": top_k_visualized_objects,
             "visualization_fps": visualization_fps,
+            "render_videos": render_videos,
         },
         "segments": segment_summaries,
         "object_videos": object_video_paths,

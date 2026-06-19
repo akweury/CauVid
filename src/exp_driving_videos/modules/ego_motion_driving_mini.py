@@ -310,6 +310,7 @@ def process_video(
     force_recompute: bool = False,
     smoothing_window: int = 5,
     static_adjust_cfg: Optional[Dict[str, Any]] = None,
+    render_video: bool = True,
 ) -> Dict[str, Any]:
     """Estimate ego motion for a single video and cache the result."""
     video_id = video_result["video_id"]
@@ -347,12 +348,17 @@ def process_video(
             for frame in frames_ego
         )
         vis_path = out_dir / "ego_motion_vis.mp4"
-        cache_ok = has_smoothed and vis_path.exists() and (
+        cache_ok = has_smoothed and (
+            (not render_video) or vis_path.exists()
+        ) and (
             (not static_adjust_enabled) or has_static_adjusted
         )
         if cache_ok:
             return cached
-        print(f"  [cache] {video_id} - cache is stale; recomputing with static-object adjustment")
+        if static_adjust_enabled and not has_static_adjusted:
+            print(f"  [cache] {video_id} - cache is stale; recomputing with static-object adjustment")
+        elif render_video and not vis_path.exists():
+            print(f"  [cache] {video_id} - cache visualization is missing; rerendering")
 
     frames: List[Dict[str, Any]] = video_result.get("frames", [])
     depth_root = get_depth_maps_root() / video_id
@@ -484,16 +490,16 @@ def process_video(
     with out_file.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
 
-    # Render visualization MP4
-    vis_path = out_dir / "ego_motion_vis.mp4"
-    rendered = _render_ego_motion_video(
-        video_id=video_id,
-        frames_ego=per_frame_ego,
-        output_path=vis_path,
-    )
-    if rendered:
-        result["visualization_path"] = rendered
-        print(f"    visualization saved → {vis_path.name}")
+    if render_video:
+        vis_path = out_dir / "ego_motion_vis.mp4"
+        rendered = _render_ego_motion_video(
+            video_id=video_id,
+            frames_ego=per_frame_ego,
+            output_path=vis_path,
+        )
+        if rendered:
+            result["visualization_path"] = rendered
+            print(f"    visualization saved → {vis_path.name}")
 
     print(
         f"  {video_id}: {result['num_frames']} frames, "
@@ -508,6 +514,7 @@ def run(
     force_recompute: bool = False,
     smoothing_window: int = 5,
     static_adjust_cfg: Optional[Dict[str, Any]] = None,
+    render_video: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Run ego motion estimation for all videos.
@@ -541,6 +548,7 @@ def run(
             force_recompute=force_recompute,
             smoothing_window=smoothing_window,
             static_adjust_cfg=static_adjust_cfg,
+            render_video=render_video,
         )
         ego_motion_results.append(result)
 

@@ -169,6 +169,7 @@ def process_video(
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
+    render_video: bool = True,
 ) -> Dict[str, Any]:
     out_dir = (output_root or get_output_root()) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -179,7 +180,7 @@ def process_video(
         print(f"  [cache] {video_id} — loading {detections_file.name}")
         with detections_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        if not boxed_video_file.exists() and cached.get("frames"):
+        if render_video and not boxed_video_file.exists() and cached.get("frames"):
             render_path = render_detection_video(
                 video_id=video_id,
                 frame_records=cached["frames"],
@@ -232,13 +233,15 @@ def process_video(
         "frames": frame_records,
     }
 
-    render_path = render_detection_video(
-        video_id=video_id,
-        frame_records=frame_records,
-        output_path=boxed_video_file,
-    )
-    if render_path:
-        video_result["boxed_video_path"] = render_path
+    render_path: Optional[str] = None
+    if render_video:
+        render_path = render_detection_video(
+            video_id=video_id,
+            frame_records=frame_records,
+            output_path=boxed_video_file,
+        )
+        if render_path:
+            video_result["boxed_video_path"] = render_path
 
     with detections_file.open("w", encoding="utf-8") as fh:
         json.dump(video_result, fh, indent=2)
@@ -269,6 +272,7 @@ def run(
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
+    render_video: bool = True,
 ) -> List[Dict[str, Any]]:
     effective_frames_root = frames_root or get_frames_root()
     effective_output_root = output_root or get_output_root()
@@ -304,6 +308,7 @@ def run(
                 frames_root=effective_frames_root,
                 output_root=effective_output_root,
                 force_recompute=force_recompute,
+                render_video=render_video,
             )
             video_results.append(result)
     finally:

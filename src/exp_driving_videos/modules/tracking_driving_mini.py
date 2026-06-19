@@ -211,6 +211,7 @@ def track_video(
     frame_rate: int = 10,
     tracker_args: Optional[SimpleNamespace] = None,
     force_recompute: bool = False,
+    render_video: bool = True,
 ) -> Dict[str, Any]:
     """Run ByteTrack on a single video's detection records.
 
@@ -234,7 +235,7 @@ def track_video(
         with tracks_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
         tracked_video_file = out_dir / "tracks_boxed.mp4"
-        if not tracked_video_file.exists() and cached.get("frames"):
+        if render_video and not tracked_video_file.exists() and cached.get("frames"):
             render_path = render_tracking_video(
                 video_id=video_id,
                 tracked_frames=cached["frames"],
@@ -330,17 +331,18 @@ def track_video(
 
     # Render annotated video with track IDs
     tracked_video_file = out_dir / "tracks_boxed.mp4"
-    render_path = render_tracking_video(
-        video_id=video_id,
-        tracked_frames=tracked_frames,
-        output_path=tracked_video_file,
-        fps=float(frame_rate),
-    )
-    if render_path:
-        result["tracked_video_path"] = render_path
-        with tracks_file.open("w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
-        print(f"  Saved tracked video: {tracked_video_file.name}")
+    if render_video:
+        render_path = render_tracking_video(
+            video_id=video_id,
+            tracked_frames=tracked_frames,
+            output_path=tracked_video_file,
+            fps=float(frame_rate),
+        )
+        if render_path:
+            result["tracked_video_path"] = render_path
+            with tracks_file.open("w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2)
+            print(f"  Saved tracked video: {tracked_video_file.name}")
 
     print(
         f"  {result['num_frames']} frames tracked, "
@@ -359,6 +361,7 @@ def run(
     frame_rate: int = 10,
     tracker_args: Optional[SimpleNamespace] = None,
     force_recompute: bool = False,
+    render_video: bool = True,
 ) -> List[Dict[str, Any]]:
     """Run ByteTrack over all videos in detection_results.
 
@@ -385,6 +388,7 @@ def run(
             frame_rate=frame_rate,
             tracker_args=tracker_args,
             force_recompute=force_recompute,
+            render_video=render_video,
         )
         tracking_results.append(result)
 

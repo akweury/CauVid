@@ -1024,6 +1024,7 @@ def process_video(
     force_recompute: bool = False,
 ) -> Dict[str, Any]:
     cfg = seg_cfg or {}
+    render_videos = bool(cfg.get("render_videos", True))
     stop_speed_threshold = float(cfg.get("forward_stop_threshold", cfg.get("stop_speed_threshold", 0.05)))
     stop_enter_threshold = float(cfg.get("forward_stop_enter_threshold", stop_speed_threshold))
     stop_exit_threshold = float(cfg.get("forward_stop_exit_threshold", stop_speed_threshold * 1.6))
@@ -1105,9 +1106,11 @@ def process_video(
             print(f"  [cache] {video_id} - cache is stale; recomputing symbolic correction")
         elif cache_stale_for_min_segment:
             print(f"  [cache] {video_id} - cache is stale; recomputing short-segment merge")
-        elif cache_stale_for_vis_version:
+        elif render_videos and cache_stale_for_vis_version:
             print(f"  [cache] {video_id} - cache visualization is stale; rerendering comparison view")
         else:
+            if not render_videos:
+                return cached
             cached_vis_paths = cached.get("visualization_paths", {})
             if (
                 isinstance(cached_vis_paths, dict)
@@ -1347,6 +1350,7 @@ def process_video(
             "min_stop_duration": min_stop_duration,
             "min_turn_duration": min_turn_duration,
             "min_segment_length": min_segment_length,
+            "render_videos": render_videos,
         },
         "signals": {
             "speed": speed,
@@ -1414,18 +1418,19 @@ def process_video(
     with out_file.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
 
-    rendered = _render_temporal_segmentation_videos(
-        video_id=video_id,
-        ego_frames=frames,
-        segmentation_result=result,
-        output_path=out_dir / "temporal_segmentation_vis.mp4",
-        fps=float(cfg.get("visualization_fps", 10.0)),
-    )
-    if rendered:
-        result["visualization_paths"] = rendered
-        result["visualization_path"] = rendered.get("primary", "")
-        with out_file.open("w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
+    if render_videos:
+        rendered = _render_temporal_segmentation_videos(
+            video_id=video_id,
+            ego_frames=frames,
+            segmentation_result=result,
+            output_path=out_dir / "temporal_segmentation_vis.mp4",
+            fps=float(cfg.get("visualization_fps", 10.0)),
+        )
+        if rendered:
+            result["visualization_paths"] = rendered
+            result["visualization_path"] = rendered.get("primary", "")
+            with out_file.open("w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2)
 
     print(f"  {video_id}")
     for row in comparison_rows:

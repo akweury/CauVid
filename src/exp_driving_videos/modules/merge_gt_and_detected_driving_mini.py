@@ -205,6 +205,7 @@ def merge_video(
     iou_threshold: float = 0.5,
     require_label_match: bool = True,
     force_recompute: bool = False,
+    render_video: bool = True,
 ) -> Dict[str, Any]:
     video_id = tracked_video["video_id"]
     out_dir = (output_root or get_output_root()) / video_id
@@ -216,7 +217,7 @@ def merge_video(
         print(f"  [cache] {video_id} - loading {out_file.name}")
         with out_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        if not merged_video_file.exists() and cached.get("frames"):
+        if render_video and not merged_video_file.exists() and cached.get("frames"):
             render_path = render_merged_video(
                 video_id=video_id,
                 merged_frames=cached["frames"],
@@ -346,16 +347,17 @@ def merge_video(
     with out_file.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
 
-    render_path = render_merged_video(
-        video_id=video_id,
-        merged_frames=merged_frames,
-        output_path=merged_video_file,
-    )
-    if render_path:
-        result["merged_video_path"] = render_path
-        with out_file.open("w", encoding="utf-8") as fh:
-            json.dump(result, fh, indent=2)
-        print(f"  Saved merged video: {merged_video_file.name}")
+    if render_video:
+        render_path = render_merged_video(
+            video_id=video_id,
+            merged_frames=merged_frames,
+            output_path=merged_video_file,
+        )
+        if render_path:
+            result["merged_video_path"] = render_path
+            with out_file.open("w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=2)
+            print(f"  Saved merged video: {merged_video_file.name}")
 
     print(
         f"  {video_id}: frames={result['num_frames']} tracks={result['num_tracks']} "
@@ -372,6 +374,7 @@ def run(
     require_label_match: bool = True,
     force_recompute: bool = False,
     keep_tracked_only: bool = True,
+    render_video: bool = True,
 ) -> List[Dict[str, Any]]:
     """Merge tracked results with GT annotations.
 
@@ -407,6 +410,7 @@ def run(
             iou_threshold=iou_threshold,
             require_label_match=require_label_match,
             force_recompute=force_recompute,
+            render_video=render_video,
         )
         merged_results.append(merged)
 

@@ -1,4 +1,14 @@
+detection:
+  render_video: false
+
+tracking:
+  render_video: false
+
+merge_annotations:
+  render_video: false
+
 ego_motion:
+  render_video: false
   smoothing_window: 5
   static_adjustment:
     enabled: false
@@ -27,6 +37,7 @@ temporal_segmentation:
   compare_forward_stop_thresholds: [1.0]
   compare_min_segment_lengths: [7]
   visualization_fps: 10
+  render_videos: false
   symbolic_correction:
     enabled: true
     static_object_keywords: [traffic light, building]
@@ -44,6 +55,7 @@ segment_object_motion:
   distance_medium_threshold: 30.0
   top_k_visualized_objects: 20
   visualization_fps: 10
+  render_videos: false
 
 important_objects:
   selection_strategy: not_implemented
