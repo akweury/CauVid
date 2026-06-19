@@ -43,7 +43,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_VISUALIZATION_VERSION = 2
+_VISUALIZATION_VERSION = 3
 _SELECTOR_ORDER = ["original", "diverse", "semantic_constrained_diverse", "coverage_family_aware"]
 _SELECTOR_LABELS = {
     "original": "Original Rules",
@@ -63,6 +63,18 @@ _METHOD_COLORS = {
     "learned_rule_aggregation": "#bc4749",
     "oracle_upper_bound": "#6d597a",
 }
+_METHOD_FAMILY_LABELS = {
+    "hard_or_rule_selector": "Hard-OR NeSy Rule Selectors",
+    "neural_symbolic": "Neural-Symbolic Baselines",
+    "learned_rule_aggregation": "Learned NeSy Rule Aggregation",
+    "oracle_upper_bound": "Oracle Upper Bound (Diagnostic)",
+}
+_METHOD_FAMILY_BANDS = {
+    "hard_or_rule_selector": "#355070",
+    "neural_symbolic": "#43aa8b",
+    "learned_rule_aggregation": "#bc4749",
+    "oracle_upper_bound": "#6d597a",
+}
 _METHOD_LINESTYLES = {
     "hard_or_rule_selector": "--",
     "neural_symbolic": "-.",
@@ -75,6 +87,18 @@ _METHOD_MARKERS = {
     "learned_rule_aggregation": "D",
     "oracle_upper_bound": "*",
 }
+_REFERENCE_LINE_COLORS = [
+    "#355070",
+    "#2a9d8f",
+    "#bc4749",
+    "#6d597a",
+    "#e76f51",
+    "#577590",
+    "#7f5539",
+    "#43aa8b",
+]
+_REFERENCE_LINESTYLES = ["--", "-.", ":", "-", (0, (3, 1, 1, 1)), (0, (5, 2))]
+_REFERENCE_MARKERS = ["o", "s", "^", "D", "P", "X", "v", "<", ">"]
 _SHORT_METHOD_LABELS = {
     "Original Rules": "Original",
     "Diverse Rules": "Diverse",
@@ -379,17 +403,63 @@ def _plot_method_precision_recall_f1(
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
 
-    ordered_ids = _method_order(method_rows)
-    ordered_rows = [next(row for row in method_rows if str(row.get("method_id", "")) == method_id) for method_id in ordered_ids]
+    family_priority = {
+        "hard_or_rule_selector": 0,
+        "neural_symbolic": 1,
+        "learned_rule_aggregation": 2,
+        "oracle_upper_bound": 3,
+    }
+    selector_priority = {selector_name: index for index, selector_name in enumerate(_SELECTOR_ORDER)}
+    preferred_method_ids = {
+        "single_segment_mlp": 0,
+        "temporal_gru": 1,
+        "temporal_mlp": 2,
+        "rule_aggregation_logistic_regression": 0,
+        "oracle_rule_pool_upper_bound": 0,
+    }
+    ordered_rows = sorted(
+        [dict(row) for row in method_rows],
+        key=lambda row: (
+            family_priority.get(str(row.get("method_family", "")), 99),
+            selector_priority.get(str(row.get("method_id", "")), 99),
+            preferred_method_ids.get(str(row.get("method_id", "")), 99),
+            -_safe_float(row.get("f1", 0.0)),
+            str(row.get("method_label", "")),
+        ),
+    )
     x_positions = list(range(len(ordered_rows)))
     width = 0.22
     metric_names = ["precision", "recall", "f1"]
     metric_offsets = [-width, 0.0, width]
     metric_colors = ["#355070", "#43aa8b", "#bc4749"]
-    data_rows = [dict(row) for row in ordered_rows]
+    data_rows = [dict(row, method_family_label=_METHOD_FAMILY_LABELS.get(str(row.get("method_family", "")), str(row.get("method_family", "")))) for row in ordered_rows]
 
-    fig, ax = plt.subplots(figsize=(12.5, 5.8))
+    fig, ax = plt.subplots(figsize=(14.2, 6.4))
+    family_ranges: List[Tuple[str, int, int]] = []
+    for index, row in enumerate(ordered_rows):
+        family = str(row.get("method_family", ""))
+        if not family_ranges or family_ranges[-1][0] != family:
+            family_ranges.append((family, index, index))
+        else:
+            prev_family, start, _ = family_ranges[-1]
+            family_ranges[-1] = (prev_family, start, index)
+    for family, start, end in family_ranges:
+        band_color = _METHOD_FAMILY_BANDS.get(family, "#cccccc")
+        ax.axvspan(start - 0.6, end + 0.6, color=band_color, alpha=0.08, zorder=0)
+        center = (start + end) / 2.0
+        ax.text(
+            center,
+            1.03,
+            _METHOD_FAMILY_LABELS.get(family, family),
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            fontweight="bold",
+            color=band_color,
+            transform=ax.get_xaxis_transform(),
+        )
     for metric_name, offset, metric_color in zip(metric_names, metric_offsets, metric_colors):
         values = [_safe_float(row.get(metric_name, 0.0)) for row in ordered_rows]
         positions = [x + offset for x in x_positions]
@@ -406,14 +476,31 @@ def _plot_method_precision_recall_f1(
     ax.set_ylim(0.0, 1.06)
     ax.set_ylabel("Score")
     ax.set_title("Held-Out Precision, Recall, and F1 by Method", loc="left", fontweight="bold")
-    ax.legend(
+    metric_legend = ax.legend(
         frameon=True,
         fancybox=False,
         edgecolor="#dddddd",
         facecolor="white",
         ncol=1,
         loc="upper right",
+        title="Metric",
     )
+    family_legend_handles = [
+        Patch(facecolor=_METHOD_FAMILY_BANDS[family], alpha=0.18, edgecolor=_METHOD_FAMILY_BANDS[family], label=_METHOD_FAMILY_LABELS[family])
+        for family in ["hard_or_rule_selector", "neural_symbolic", "learned_rule_aggregation", "oracle_upper_bound"]
+    ]
+    family_legend = ax.legend(
+        handles=family_legend_handles,
+        frameon=True,
+        fancybox=False,
+        edgecolor="#dddddd",
+        facecolor="white",
+        ncol=2,
+        loc="upper left",
+        title="Method Family",
+    )
+    ax.add_artist(metric_legend)
+    ax.add_artist(family_legend)
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     _save_figure(fig, output_paths, dpi)
@@ -424,6 +511,7 @@ def _plot_method_precision_recall_f1(
             "method_id",
             "method_label",
             "method_family",
+            "method_family_label",
             "precision",
             "recall",
             "f1",
@@ -482,18 +570,28 @@ def _plot_oracle_gap_curve(
     if target_k > 0:
         ax.scatter([target_k], [target_f1], color=_METHOD_COLORS["oracle_upper_bound"], s=90, marker="*", zorder=5, label=f"Oracle Peak (K={target_k})")
 
-    for row in method_rows:
+    x_min = 1
+    x_max = max(x_values[-1], target_k)
+    styled_rows = [row for row in method_rows if str(row.get("method_family", "")) != "oracle_upper_bound"]
+    for style_index, row in enumerate(styled_rows):
         method_family = str(row.get("method_family", ""))
-        if method_family == "oracle_upper_bound":
-            continue
         method_label = str(row.get("method_label", ""))
         method_f1 = _safe_float(row.get("f1", 0.0))
-        ax.axhline(
-            method_f1,
-            color=_METHOD_COLORS.get(method_family, "#888888"),
-            linestyle=_METHOD_LINESTYLES.get(method_family, "--"),
-            linewidth=1.3,
-            alpha=0.7,
+        line_color = _REFERENCE_LINE_COLORS[style_index % len(_REFERENCE_LINE_COLORS)]
+        line_style = _REFERENCE_LINESTYLES[style_index % len(_REFERENCE_LINESTYLES)]
+        marker = _REFERENCE_MARKERS[style_index % len(_REFERENCE_MARKERS)]
+        x_line = [x_min, x_max]
+        y_line = [method_f1, method_f1]
+        ax.plot(
+            x_line,
+            y_line,
+            color=line_color,
+            linestyle=line_style,
+            linewidth=1.6,
+            alpha=0.9,
+            marker=marker,
+            markersize=6.0,
+            markevery=[0, 1],
             label=method_label,
         )
         data_rows.append(
@@ -507,6 +605,9 @@ def _plot_oracle_gap_curve(
                 "method_id": str(row.get("method_id", "")),
                 "method_label": method_label,
                 "method_family": method_family,
+                "line_color": line_color,
+                "line_style": str(line_style),
+                "marker": marker,
             }
         )
 
@@ -514,7 +615,7 @@ def _plot_oracle_gap_curve(
     ax.set_ylabel("Held-Out F1")
     ax.set_title("Oracle Gap Curve vs Real Methods", loc="left", fontweight="bold")
     ax.grid(alpha=0.2)
-    ax.set_xlim(1, max(x_values[-1], target_k))
+    ax.set_xlim(x_min, x_max)
     ax.set_ylim(0.0, max(0.85, max(f1_values + [_safe_float(row.get("f1", 0.0)) for row in method_rows]) + 0.05))
     handles, labels = ax.get_legend_handles_labels()
     dedup_handles = []
@@ -533,8 +634,8 @@ def _plot_oracle_gap_curve(
         fancybox=False,
         edgecolor="#dddddd",
         facecolor="white",
-        loc="lower right",
-        ncol=1,
+        loc="lower center",
+        ncol=3,
     )
     fig.tight_layout()
     _save_figure(fig, output_paths, dpi)
@@ -551,6 +652,9 @@ def _plot_oracle_gap_curve(
             "method_id",
             "method_label",
             "method_family",
+            "line_color",
+            "line_style",
+            "marker",
         ],
         data_rows,
     )
@@ -585,8 +689,16 @@ def _plot_top_weighted_rule_contributions(
             ],
             [],
         )
-        fig, ax = plt.subplots(figsize=(9.2, 4.6))
-        ax.text(0.5, 0.5, "No nonzero learned rule weights available.", ha="center", va="center", fontsize=12)
+        fig, ax = plt.subplots(figsize=(13.5, 5.2))
+        ax.text(
+            0.5,
+            0.5,
+            "No nonzero learned rule weights available.",
+            ha="center",
+            va="center",
+            fontsize=13,
+            fontweight="bold",
+        )
         ax.axis("off")
         ax.set_title("Top Weighted Rule Contributions", loc="left", fontweight="bold")
         fig.tight_layout()
@@ -602,7 +714,7 @@ def _plot_top_weighted_rule_contributions(
     data_rows: List[Dict[str, Any]] = []
     for row in display_rows:
         clause = str(row.get("clause", ""))
-        short_clause = clause if len(clause) <= 88 else f"{clause[:85]}..."
+        short_clause = clause if len(clause) <= 150 else f"{clause[:147]}..."
         data_rows.append(
             {
                 **row,
@@ -610,19 +722,22 @@ def _plot_top_weighted_rule_contributions(
             }
         )
 
-    fig, ax = plt.subplots(figsize=(11.4, 6.6))
+    fig, ax = plt.subplots(figsize=(18.5, 7.6))
     y_positions = list(range(len(data_rows)))
     weights = [_safe_float(row.get("weight", 0.0)) for row in data_rows]
     colors = ["#bc4749" if weight >= 0.0 else "#577590" for weight in weights]
     bars = ax.barh(y_positions, weights, color=colors)
-    ax.set_yticks(y_positions, [str(row.get("short_clause", "")) for row in data_rows], fontsize=8.5)
+    ax.set_yticks(y_positions, [str(row.get("short_clause", "")) for row in data_rows], fontsize=10, fontweight="bold")
     ax.invert_yaxis()
     ax.axvline(0.0, color="#444444", linewidth=1.0, alpha=0.7)
     max_abs_weight = max(abs(weight) for weight in weights) if weights else 1.0
     ax.set_xlim(-max_abs_weight * 1.18, max_abs_weight * 1.18)
-    ax.set_xlabel("Learned Logistic Weight")
-    ax.set_title("Top Weighted Rule Contributions", loc="left", fontweight="bold")
+    ax.set_xlabel("Learned Logistic Weight", fontsize=12, fontweight="bold")
+    ax.set_title("Top Weighted Rule Contributions", loc="left", fontweight="bold", fontsize=14)
     ax.grid(axis="x", alpha=0.2)
+    for tick_label in ax.get_xticklabels():
+        tick_label.set_fontweight("bold")
+        tick_label.set_fontsize(10)
     for bar, row in zip(bars, data_rows):
         weight = _safe_float(row.get("weight", 0.0))
         family = str(row.get("semantic_family", ""))
@@ -633,7 +748,8 @@ def _plot_top_weighted_rule_contributions(
             f"{weight:+.3f} | {family}",
             va="center",
             ha="left" if weight >= 0.0 else "right",
-            fontsize=8.5,
+            fontsize=9.5,
+            fontweight="bold",
         )
     from matplotlib.patches import Patch
 
@@ -643,13 +759,16 @@ def _plot_top_weighted_rule_contributions(
     ]
     ax.legend(
         handles=legend_handles,
-        loc="lower right",
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
         frameon=True,
         fancybox=False,
         edgecolor="#dddddd",
         facecolor="white",
+        ncol=2,
+        prop={"weight": "bold", "size": 10},
     )
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.43, right=0.98, top=0.90, bottom=0.20)
     _save_figure(fig, output_paths, dpi)
     plt.close(fig)
     _write_csv(
