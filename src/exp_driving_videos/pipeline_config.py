@@ -173,6 +173,29 @@ def get_important_objects_cfg() -> Dict[str, Any]:
     )
 
 
+def get_traffic_control_attributes_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": True,
+            "min_crop_size": 8,
+            "traffic_light_state_threshold": 0.06,
+            "traffic_light_min_confidence_margin": 0.025,
+            "front_distance_far_threshold": 40.0,
+            "center_x_threshold_meters": 3.0,
+            "relevance_high_threshold": 0.67,
+            "relevance_medium_threshold": 0.4,
+            "relevance_weights": {
+                "visibility": 0.3,
+                "center": 0.2,
+                "size_or_distance": 0.25,
+                "front_center": 0.25,
+            },
+        },
+        path=("traffic_control_attributes",),
+        warn_label="traffic control attributes",
+    )
+
+
 def get_logic_atoms_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -181,6 +204,9 @@ def get_logic_atoms_cfg() -> Dict[str, Any]:
             "visibility_present_threshold": 0.3,
             "include_segment_boundary_atoms": True,
             "include_object_identity_atoms": True,
+            "include_traffic_control_atoms": True,
+            "traffic_control_relevance_threshold": 0.4,
+            "include_unknown_traffic_light_state_atoms": False,
         },
         path=("logic_atoms",),
         warn_label="logic atoms",
@@ -523,12 +549,13 @@ def get_object_to_atom_coverage_diagnostic_cfg() -> Dict[str, Any]:
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
-            "candidate_rules": False,
+            "candidate_rules": True,
             "extended_rules": True,
             "final_rules": True,
             "diverse_final_rules": True,
             "semantic_constrained_diverse_final_rules": True,
             "coverage_family_aware_final_rules": True,
+            "traffic_control_attributes": True,
             "rule_pool_upper_bound_diagnostic": True,
             "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,

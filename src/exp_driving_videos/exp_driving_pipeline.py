@@ -23,6 +23,8 @@ Steps:
                     motion symbolically for each merged temporal segment.
     10. important_objects_driving_mini — analyze/filter important objects per
                     segment. Strategy placeholder for now.
+    10B. traffic_control_attributes_driving_mini — enrich traffic lights and
+                    stop signs with heuristic state and relevance attributes.
     11. logic_atoms_driving_mini — convert filtered segment-level symbolic facts
                     into logic atoms for downstream reasoning.
     12. target_head_atoms_driving_mini — derive future-action target/head atoms
@@ -125,6 +127,7 @@ from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
 from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
+from src.exp_driving_videos.modules import traffic_control_attributes_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
@@ -152,6 +155,7 @@ _get_ego_static_adjustment_cfg = driving_pipeline_config.get_ego_static_adjustme
 _get_temporal_segmentation_cfg = driving_pipeline_config.get_temporal_segmentation_cfg
 _get_segment_object_motion_cfg = driving_pipeline_config.get_segment_object_motion_cfg
 _get_important_objects_cfg = driving_pipeline_config.get_important_objects_cfg
+_get_traffic_control_attributes_cfg = driving_pipeline_config.get_traffic_control_attributes_cfg
 _get_logic_atoms_cfg = driving_pipeline_config.get_logic_atoms_cfg
 _get_target_head_atoms_cfg = driving_pipeline_config.get_target_head_atoms_cfg
 _get_temporal_rule_examples_cfg = driving_pipeline_config.get_temporal_rule_examples_cfg
@@ -204,6 +208,7 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "8", "stop_after": 8, "label": "temporal_segmentation_driving_mini"},
     {"tag": "9", "stop_after": 9, "label": "segment_object_motion_driving_mini"},
     {"tag": "10", "stop_after": 10, "label": "important_objects_driving_mini"},
+    {"tag": "10B", "stop_after": None, "label": "traffic_control_attributes_driving_mini"},
     {"tag": "11", "stop_after": 11, "label": "logic_atoms_driving_mini"},
     {"tag": "12", "stop_after": 12, "label": "target_head_atoms_driving_mini"},
     {"tag": "13", "stop_after": 13, "label": "temporal_rule_examples_driving_mini"},
@@ -342,6 +347,7 @@ class PipelineContext:
     temporal_seg_results: Optional[List[Dict[str, Any]]] = None
     segment_object_results: Optional[List[Dict[str, Any]]] = None
     important_object_results: Optional[List[Dict[str, Any]]] = None
+    traffic_control_attribute_results: Optional[List[Dict[str, Any]]] = None
     logic_atom_results: Optional[List[Dict[str, Any]]] = None
     target_head_results: Optional[List[Dict[str, Any]]] = None
     temporal_rule_results: Optional[List[Dict[str, Any]]] = None
@@ -815,13 +821,32 @@ def run_step_10_important_objects(ctx: PipelineContext, runner: StepRunner) -> N
     runner.complete_step("10", subtitle=f"videos={len(ctx.important_object_results)}")
 
 
+def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRunner) -> None:
+    traffic_control_attributes_cfg = _get_traffic_control_attributes_cfg()
+    runner.announce_step("10B", "traffic_control_attributes_driving_mini")
+    runner.log("10B", f"cfg={traffic_control_attributes_cfg}")
+    runner.log(
+        "10B",
+        f"recompute={bool(ctx.recompute_cfg.get('traffic_control_attributes', False))}",
+    )
+    with runner.module_output("10B"):
+        ctx.traffic_control_attribute_results = traffic_control_attributes_driving_mini.run(
+            important_object_results=ctx.important_object_results or [],
+            relative_motion_results=ctx.relative_motion_results or [],
+            cfg=traffic_control_attributes_cfg,
+            force_recompute=bool(ctx.recompute_cfg.get("traffic_control_attributes", False)),
+        )
+    runner.log("10B", f"completed videos={len(ctx.traffic_control_attribute_results)}")
+    runner.complete_step("10B", subtitle=f"videos={len(ctx.traffic_control_attribute_results)}")
+
+
 def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
     logic_atoms_cfg = _get_logic_atoms_cfg()
     runner.announce_step("11", "logic_atoms_driving_mini")
     runner.log("11", f"cfg={logic_atoms_cfg}")
     with runner.module_output("11"):
         ctx.logic_atom_results = logic_atoms_driving_mini.run(
-            segment_object_motion_results=ctx.important_object_results or [],
+            segment_object_motion_results=ctx.traffic_control_attribute_results or ctx.important_object_results or [],
             cfg=logic_atoms_cfg,
             force_recompute=False,
         )
@@ -1352,6 +1377,7 @@ def main(max_step: int | str = 22, video_ids: Optional[List[str]] = None) -> Non
         run_step_8_temporal_segmentation(ctx, runner)
         run_step_9_segment_object_motion(ctx, runner)
         run_step_10_important_objects(ctx, runner)
+        run_step_10b_traffic_control_attributes(ctx, runner)
 
         # Logic and rule mining
         run_step_11_logic_atoms(ctx, runner)

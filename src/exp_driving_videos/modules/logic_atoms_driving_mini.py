@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 1
+_LOGIC_ATOMS_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -97,6 +97,9 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "visibility_present_threshold",
         "include_segment_boundary_atoms",
         "include_object_identity_atoms",
+        "include_traffic_control_atoms",
+        "traffic_control_relevance_threshold",
+        "include_unknown_traffic_light_state_atoms",
     ]
     return {k: cfg.get(k) for k in keys}
 
@@ -122,6 +125,11 @@ def process_video(
     visibility_present_threshold = float(cfg.get("visibility_present_threshold", 0.3))
     include_segment_boundary_atoms = bool(cfg.get("include_segment_boundary_atoms", True))
     include_object_identity_atoms = bool(cfg.get("include_object_identity_atoms", True))
+    include_traffic_control_atoms = bool(cfg.get("include_traffic_control_atoms", True))
+    traffic_control_relevance_threshold = float(cfg.get("traffic_control_relevance_threshold", 0.4))
+    include_unknown_traffic_light_state_atoms = bool(
+        cfg.get("include_unknown_traffic_light_state_atoms", False)
+    )
 
     video_id = str(segment_object_motion_video_result["video_id"])
     out_dir = (output_root or get_output_root()) / video_id
@@ -142,6 +150,9 @@ def process_video(
                     "visibility_present_threshold": visibility_present_threshold,
                     "include_segment_boundary_atoms": include_segment_boundary_atoms,
                     "include_object_identity_atoms": include_object_identity_atoms,
+                    "include_traffic_control_atoms": include_traffic_control_atoms,
+                    "traffic_control_relevance_threshold": traffic_control_relevance_threshold,
+                    "include_unknown_traffic_light_state_atoms": include_unknown_traffic_light_state_atoms,
                 }
             )
         ):
@@ -222,11 +233,73 @@ def process_video(
             _append_object_atom("object_visibility_state", segment_id, object_id, visibility_state)
             _append_object_atom("object_x_position_state", segment_id, object_id, x_position_state)
 
+            traffic_control_attributes = obj.get("traffic_control_attributes", {})
+            if include_traffic_control_atoms and isinstance(traffic_control_attributes, dict):
+                traffic_control_type = str(
+                    traffic_control_attributes.get("traffic_control_type", "")
+                ).strip()
+                if traffic_control_type:
+                    _append_object_atom(
+                        "traffic_control_type",
+                        segment_id,
+                        object_id,
+                        traffic_control_type,
+                    )
+                    relevance_label = str(
+                        traffic_control_attributes.get("traffic_control_relevance_label", "low")
+                    )
+                    relevance_score = float(
+                        traffic_control_attributes.get("traffic_control_relevance_score", 0.0)
+                    )
+                    _append_object_atom(
+                        "traffic_control_relevance_state",
+                        segment_id,
+                        object_id,
+                        relevance_label,
+                    )
+                    if relevance_score >= traffic_control_relevance_threshold:
+                        _append_object_atom("traffic_control_relevant", segment_id, object_id)
+                        if traffic_control_type == "traffic_light":
+                            _append_object_atom("traffic_light_relevant", segment_id, object_id)
+                        elif traffic_control_type == "stop_sign":
+                            _append_object_atom("stop_sign_relevant", segment_id, object_id)
+                    if bool(traffic_control_attributes.get("is_front_center_region", False)):
+                        _append_object_atom(
+                            "traffic_control_front_center_region",
+                            segment_id,
+                            object_id,
+                        )
+                        if traffic_control_type == "traffic_light":
+                            _append_object_atom(
+                                "traffic_light_position_state",
+                                segment_id,
+                                object_id,
+                                "front_center",
+                            )
+
+                    if traffic_control_type == "traffic_light":
+                        traffic_light_state = str(
+                            traffic_control_attributes.get("traffic_light_state", "unknown")
+                        )
+                        if (
+                            include_unknown_traffic_light_state_atoms
+                            or traffic_light_state != "unknown"
+                        ):
+                            _append_object_atom(
+                                "traffic_light_state",
+                                segment_id,
+                                object_id,
+                                traffic_light_state,
+                            )
+
             objects_out.append(
                 {
                     "track_id": track_id,
                     "object_id": object_id,
                     "object_class": object_class,
+                    "traffic_control_attributes": traffic_control_attributes
+                    if isinstance(traffic_control_attributes, dict)
+                    else {},
                     "atoms": object_atoms,
                     "atom_records": object_atom_records,
                 }
@@ -278,6 +351,9 @@ def process_video(
             "visibility_present_threshold": visibility_present_threshold,
             "include_segment_boundary_atoms": include_segment_boundary_atoms,
             "include_object_identity_atoms": include_object_identity_atoms,
+            "include_traffic_control_atoms": include_traffic_control_atoms,
+            "traffic_control_relevance_threshold": traffic_control_relevance_threshold,
+            "include_unknown_traffic_light_state_atoms": include_unknown_traffic_light_state_atoms,
         },
         "segments": segments_out,
         "all_atoms": all_atoms,

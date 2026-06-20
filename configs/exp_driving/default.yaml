@@ -61,12 +61,30 @@ important_objects:
   selection_strategy: not_implemented
   passthrough_selected_objects: true
 
+traffic_control_attributes:
+  enabled: true
+  min_crop_size: 8
+  traffic_light_state_threshold: 0.06
+  traffic_light_min_confidence_margin: 0.025
+  front_distance_far_threshold: 40.0
+  center_x_threshold_meters: 3.0
+  relevance_high_threshold: 0.67
+  relevance_medium_threshold: 0.4
+  relevance_weights:
+    visibility: 0.3
+    center: 0.2
+    size_or_distance: 0.25
+    front_center: 0.25
+
 logic_atoms:
   lateral_position_threshold: 2.0
   visibility_persistent_threshold: 0.8
   visibility_present_threshold: 0.3
   include_segment_boundary_atoms: true
   include_object_identity_atoms: true
+  include_traffic_control_atoms: true
+  traffic_control_relevance_threshold: 0.4
+  include_unknown_traffic_light_state_atoms: false
 
 target_head_atoms:
   target_predicate: brake_next
@@ -79,12 +97,13 @@ data_split:
   eval_fraction: 0.2
 
 pipeline_recompute:
-  candidate_rules: false
-  extended_rules: false
-  final_rules: false
-  diverse_final_rules: false
-  semantic_constrained_diverse_final_rules: false
-  coverage_family_aware_final_rules: false
+  traffic_control_attributes: true
+  candidate_rules: true
+  extended_rules: true
+  final_rules: true
+  diverse_final_rules: true
+  semantic_constrained_diverse_final_rules: true
+  coverage_family_aware_final_rules: true
   rule_pool_upper_bound_diagnostic: false
   oracle_rule_selection_gap_diagnostic: false
   rule_evaluation: false

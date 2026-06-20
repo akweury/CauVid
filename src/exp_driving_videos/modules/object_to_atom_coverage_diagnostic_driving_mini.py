@@ -6,6 +6,7 @@ Outputs:
         object_to_atom_coverage_summary.json
         object_to_atom_coverage_summary.csv
         object_to_atom_stage_counts.csv
+        traffic_light_state_atom_coverage.csv
 """
 
 from __future__ import annotations
@@ -28,13 +29,14 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_DIAGNOSTIC_VERSION = 1
+_DIAGNOSTIC_VERSION = 2
 _DEFAULT_CLASS_ALIASES = {
     "traffic_light": "traffic_light",
     "traffic_lights": "traffic_light",
     "traffic_signal": "traffic_light",
     "traffic_signals": "traffic_light",
 }
+_TRACKED_TRAFFIC_LIGHT_STATES: Tuple[str, ...] = ("red", "yellow", "green")
 _SELECTOR_ORDER: Tuple[str, ...] = (
     "original",
     "diverse",
@@ -142,6 +144,31 @@ def _extract_rule_classes_from_clause(clause: str, alias_map: Dict[str, str]) ->
     return classes
 
 
+def _extract_rule_traffic_light_states(rule: Dict[str, Any]) -> Set[str]:
+    states: Set[str] = set()
+    for atom in _get_rule_body_atom_templates(rule):
+        parsed = _parse_atom(atom)
+        if parsed is None:
+            continue
+        predicate, args = parsed
+        if predicate == "traffic_light_state" and len(args) >= 3:
+            state = _normalize_token(args[2])
+            if state in _TRACKED_TRAFFIC_LIGHT_STATES:
+                states.add(state)
+    return states
+
+
+def _extract_rule_traffic_light_states_from_clause(clause: str) -> Set[str]:
+    states: Set[str] = set()
+    for match in re.finditer(r"traffic_light_state\(([^)]*)\)", str(clause)):
+        args = [part.strip() for part in match.group(1).split(",")]
+        if len(args) >= 3:
+            state = _normalize_token(args[2])
+            if state in _TRACKED_TRAFFIC_LIGHT_STATES:
+                states.add(state)
+    return states
+
+
 def _make_class_entry() -> Dict[str, Any]:
     return {
         "raw_labels": set(),
@@ -155,6 +182,27 @@ def _make_class_entry() -> Dict[str, Any]:
         "step10_important_object_segments": set(),
         "step11_logic_atom_instances": 0,
         "step11_logic_atom_track_ids": set(),
+        "step11_logic_atom_segments": set(),
+        "step16_rule_pool_rule_ids": set(),
+        "step16_rule_pool_examples": [],
+        "step17_selected_rule_ids": set(),
+        "step17_selected_rule_examples": [],
+        "step17b_selected_rule_ids": set(),
+        "step17b_selected_rule_examples": [],
+        "step17b2_selected_rule_ids": set(),
+        "step17b2_selected_rule_examples": [],
+        "step17c_selected_rule_ids": set(),
+        "step17c_selected_rule_examples": [],
+        "step18c_top_weight_rule_ids": set(),
+        "step18c_top_weight_positive_rule_ids": set(),
+        "step18c_top_weight_negative_rule_ids": set(),
+        "step18c_top_weight_examples": [],
+    }
+
+
+def _make_traffic_light_state_entry() -> Dict[str, Any]:
+    return {
+        "step11_logic_atom_instances": 0,
         "step11_logic_atom_segments": set(),
         "step16_rule_pool_rule_ids": set(),
         "step16_rule_pool_examples": [],
@@ -190,6 +238,12 @@ def _ensure_entry(class_map: Dict[str, Dict[str, Any]], class_name: str) -> Dict
     if class_name not in class_map:
         class_map[class_name] = _make_class_entry()
     return class_map[class_name]
+
+
+def _ensure_state_entry(state_map: Dict[str, Dict[str, Any]], state_name: str) -> Dict[str, Any]:
+    if state_name not in state_map:
+        state_map[state_name] = _make_traffic_light_state_entry()
+    return state_map[state_name]
 
 
 def _collect_detection_stage(
@@ -290,6 +344,32 @@ def _collect_logic_atom_stage(
                 entry["step11_logic_atom_segments"].add((video_id, segment_index))
 
 
+def _collect_traffic_light_state_logic_atom_stage(
+    state_map: Dict[str, Dict[str, Any]],
+    logic_atom_results: Sequence[Dict[str, Any]],
+) -> None:
+    for state_name in _TRACKED_TRAFFIC_LIGHT_STATES:
+        _ensure_state_entry(state_map, state_name)
+    for video_result in logic_atom_results:
+        video_id = str(video_result.get("video_id", ""))
+        for segment in list(video_result.get("segments", [])):
+            segment_index = _safe_int(segment.get("segment_index", -1))
+            for obj in list(segment.get("objects", [])):
+                for atom in list(obj.get("atoms", [])):
+                    parsed = _parse_atom(str(atom))
+                    if parsed is None:
+                        continue
+                    predicate, args = parsed
+                    if predicate != "traffic_light_state" or len(args) < 3:
+                        continue
+                    state_name = _normalize_token(args[2])
+                    if state_name not in _TRACKED_TRAFFIC_LIGHT_STATES:
+                        continue
+                    entry = _ensure_state_entry(state_map, state_name)
+                    entry["step11_logic_atom_instances"] += 1
+                    entry["step11_logic_atom_segments"].add((video_id, segment_index))
+
+
 def _collect_rule_stage(
     class_map: Dict[str, Dict[str, Any]],
     stage_rule_key: str,
@@ -313,6 +393,32 @@ def _collect_rule_stage(
             entry = _ensure_entry(class_map, class_name)
             entry[stage_rule_key].add(str(rule.get("rule_id", "")))
             _append_unique_rule_example(entry[stage_example_key], example, max_rule_examples_per_class)
+
+
+def _collect_traffic_light_state_rule_stage(
+    state_map: Dict[str, Dict[str, Any]],
+    stage_rule_key: str,
+    stage_example_key: str,
+    rules: Sequence[Dict[str, Any]],
+    max_rule_examples_per_state: int,
+) -> None:
+    for state_name in _TRACKED_TRAFFIC_LIGHT_STATES:
+        _ensure_state_entry(state_map, state_name)
+    for rule in rules:
+        matched_states = _extract_rule_traffic_light_states(rule)
+        if not matched_states:
+            continue
+        example = {
+            "rule_id": str(rule.get("rule_id", "")),
+            "clause": str(rule.get("clause", "")),
+            "confidence": _safe_float(rule.get("confidence", 0.0)),
+            "positive_support": _safe_int(rule.get("positive_support", 0)),
+            "negative_support": _safe_int(rule.get("negative_support", 0)),
+        }
+        for state_name in matched_states:
+            entry = _ensure_state_entry(state_map, state_name)
+            entry[stage_rule_key].add(str(rule.get("rule_id", "")))
+            _append_unique_rule_example(entry[stage_example_key], example, max_rule_examples_per_state)
 
 
 def _collect_learned_aggregation_stage(
@@ -352,6 +458,45 @@ def _collect_learned_aggregation_stage(
             else:
                 entry["step18c_top_weight_negative_rule_ids"].add(rule_id)
             _append_unique_rule_example(entry["step18c_top_weight_examples"], example, max_rule_examples_per_class)
+
+
+def _collect_traffic_light_state_learned_aggregation_stage(
+    state_map: Dict[str, Dict[str, Any]],
+    extended_rule_results: Dict[str, Any],
+    rule_aggregation_baseline_results: Dict[str, Any],
+    max_rule_examples_per_state: int,
+) -> None:
+    for state_name in _TRACKED_TRAFFIC_LIGHT_STATES:
+        _ensure_state_entry(state_map, state_name)
+    rule_lookup = {
+        str(rule.get("rule_id", "")): dict(rule)
+        for rule in list(extended_rule_results.get("all_kept_rules", []))
+        if str(rule.get("rule_id", ""))
+    }
+    for row in list(rule_aggregation_baseline_results.get("top_weighted_rules", [])):
+        rule_id = str(row.get("rule_id", ""))
+        matched_states = _extract_rule_traffic_light_states(rule_lookup.get(rule_id, {}))
+        if not matched_states:
+            matched_states = _extract_rule_traffic_light_states_from_clause(str(row.get("clause", "")))
+        if not matched_states:
+            continue
+        example = {
+            "rank": _safe_int(row.get("rank", 0)),
+            "rule_id": rule_id,
+            "clause": str(row.get("clause", "")),
+            "weight": _safe_float(row.get("weight", 0.0)),
+            "sign": str(row.get("sign", "")),
+            "confidence": _safe_float(row.get("confidence", 0.0)),
+            "semantic_family": str(row.get("semantic_family", "")),
+        }
+        for state_name in matched_states:
+            entry = _ensure_state_entry(state_map, state_name)
+            entry["step18c_top_weight_rule_ids"].add(rule_id)
+            if example["weight"] >= 0.0:
+                entry["step18c_top_weight_positive_rule_ids"].add(rule_id)
+            else:
+                entry["step18c_top_weight_negative_rule_ids"].add(rule_id)
+            _append_unique_rule_example(entry["step18c_top_weight_examples"], example, max_rule_examples_per_state)
 
 
 def _finalize_row(class_name: str, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -427,6 +572,29 @@ def _stage_count_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return output_rows
 
 
+def _finalize_traffic_light_state_row(state_name: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "traffic_light_state": state_name,
+        "step11_logic_atom_instances": int(entry["step11_logic_atom_instances"]),
+        "step11_logic_atom_segments": len(entry["step11_logic_atom_segments"]),
+        "appears_in_logic_atoms": bool(entry["step11_logic_atom_instances"] > 0),
+        "step16_rule_pool_rule_count": len(entry["step16_rule_pool_rule_ids"]),
+        "appears_in_step16_rule_pool": bool(entry["step16_rule_pool_rule_ids"]),
+        "step17_original_rule_count": len(entry["step17_selected_rule_ids"]),
+        "appears_in_step17_original_rules": bool(entry["step17_selected_rule_ids"]),
+        "step17b_diverse_rule_count": len(entry["step17b_selected_rule_ids"]),
+        "appears_in_step17b_diverse_rules": bool(entry["step17b_selected_rule_ids"]),
+        "step17b2_semantic_constrained_rule_count": len(entry["step17b2_selected_rule_ids"]),
+        "appears_in_step17b2_semantic_constrained_rules": bool(entry["step17b2_selected_rule_ids"]),
+        "step17c_coverage_family_aware_rule_count": len(entry["step17c_selected_rule_ids"]),
+        "appears_in_step17c_coverage_family_aware_rules": bool(entry["step17c_selected_rule_ids"]),
+        "step18c_top_weight_rule_count": len(entry["step18c_top_weight_rule_ids"]),
+        "step18c_top_weight_positive_rule_count": len(entry["step18c_top_weight_positive_rule_ids"]),
+        "step18c_top_weight_negative_rule_count": len(entry["step18c_top_weight_negative_rule_ids"]),
+        "appears_in_step18c_top_weight_rules": bool(entry["step18c_top_weight_rule_ids"]),
+    }
+
+
 def process_diagnostic(
     detection_results: Sequence[Dict[str, Any]],
     dataset_annotation_results: Sequence[Dict[str, Any]],
@@ -452,6 +620,7 @@ def process_diagnostic(
     summary_json_path = out_root / "object_to_atom_coverage_summary.json"
     summary_csv_path = out_root / "object_to_atom_coverage_summary.csv"
     stage_counts_csv_path = out_root / "object_to_atom_stage_counts.csv"
+    traffic_light_state_csv_path = out_root / "traffic_light_state_atom_coverage.csv"
 
     if not force_recompute and summary_json_path.exists():
         with summary_json_path.open("r", encoding="utf-8") as fh:
@@ -463,11 +632,13 @@ def process_diagnostic(
             return cached
 
     class_map: Dict[str, Dict[str, Any]] = {}
+    traffic_light_state_map: Dict[str, Dict[str, Any]] = {}
     _collect_detection_stage(class_map, detection_results, alias_map)
     _collect_annotation_stage(class_map, dataset_annotation_results, alias_map)
     _collect_merged_stage(class_map, merged_results, alias_map)
     _collect_important_object_stage(class_map, important_object_results, alias_map)
     _collect_logic_atom_stage(class_map, logic_atom_results, alias_map)
+    _collect_traffic_light_state_logic_atom_stage(traffic_light_state_map, logic_atom_results)
     _collect_rule_stage(
         class_map,
         stage_rule_key="step16_rule_pool_rule_ids",
@@ -475,6 +646,13 @@ def process_diagnostic(
         rules=list(extended_rule_results.get("all_kept_rules", [])),
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
+    )
+    _collect_traffic_light_state_rule_stage(
+        traffic_light_state_map,
+        stage_rule_key="step16_rule_pool_rule_ids",
+        stage_example_key="step16_rule_pool_examples",
+        rules=list(extended_rule_results.get("all_kept_rules", [])),
+        max_rule_examples_per_state=max_rule_examples_per_class,
     )
     _collect_rule_stage(
         class_map,
@@ -484,6 +662,13 @@ def process_diagnostic(
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
     )
+    _collect_traffic_light_state_rule_stage(
+        traffic_light_state_map,
+        stage_rule_key="step17_selected_rule_ids",
+        stage_example_key="step17_selected_rule_examples",
+        rules=list(original_final_rule_results.get("final_rules", [])),
+        max_rule_examples_per_state=max_rule_examples_per_class,
+    )
     _collect_rule_stage(
         class_map,
         stage_rule_key="step17b_selected_rule_ids",
@@ -491,6 +676,13 @@ def process_diagnostic(
         rules=list(diverse_final_rule_results.get("final_rules", [])),
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
+    )
+    _collect_traffic_light_state_rule_stage(
+        traffic_light_state_map,
+        stage_rule_key="step17b_selected_rule_ids",
+        stage_example_key="step17b_selected_rule_examples",
+        rules=list(diverse_final_rule_results.get("final_rules", [])),
+        max_rule_examples_per_state=max_rule_examples_per_class,
     )
     _collect_rule_stage(
         class_map,
@@ -500,6 +692,13 @@ def process_diagnostic(
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
     )
+    _collect_traffic_light_state_rule_stage(
+        traffic_light_state_map,
+        stage_rule_key="step17b2_selected_rule_ids",
+        stage_example_key="step17b2_selected_rule_examples",
+        rules=list((semantic_constrained_diverse_final_rule_results or {}).get("final_rules", [])),
+        max_rule_examples_per_state=max_rule_examples_per_class,
+    )
     _collect_rule_stage(
         class_map,
         stage_rule_key="step17c_selected_rule_ids",
@@ -508,6 +707,13 @@ def process_diagnostic(
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
     )
+    _collect_traffic_light_state_rule_stage(
+        traffic_light_state_map,
+        stage_rule_key="step17c_selected_rule_ids",
+        stage_example_key="step17c_selected_rule_examples",
+        rules=list((coverage_family_aware_final_rule_results or {}).get("final_rules", [])),
+        max_rule_examples_per_state=max_rule_examples_per_class,
+    )
     _collect_learned_aggregation_stage(
         class_map=class_map,
         extended_rule_results=extended_rule_results,
@@ -515,9 +721,19 @@ def process_diagnostic(
         alias_map=alias_map,
         max_rule_examples_per_class=max_rule_examples_per_class,
     )
+    _collect_traffic_light_state_learned_aggregation_stage(
+        state_map=traffic_light_state_map,
+        extended_rule_results=extended_rule_results,
+        rule_aggregation_baseline_results=rule_aggregation_baseline_results,
+        max_rule_examples_per_state=max_rule_examples_per_class,
+    )
 
     summary_rows = [_finalize_row(class_name, class_map[class_name]) for class_name in sorted(class_map)]
     stage_count_rows = _stage_count_rows(summary_rows)
+    traffic_light_state_rows = [
+        _finalize_traffic_light_state_row(state_name, traffic_light_state_map[state_name])
+        for state_name in _TRACKED_TRAFFIC_LIGHT_STATES
+    ]
     detail_rows = {
         class_name: {
             "raw_labels": sorted(str(value) for value in entry["raw_labels"]),
@@ -529,6 +745,17 @@ def process_diagnostic(
             "step18c_top_weight_examples": list(entry["step18c_top_weight_examples"]),
         }
         for class_name, entry in sorted(class_map.items())
+    }
+    traffic_light_state_detail_rows = {
+        state_name: {
+            "step16_rule_pool_examples": list(entry["step16_rule_pool_examples"]),
+            "step17_selected_rule_examples": list(entry["step17_selected_rule_examples"]),
+            "step17b_selected_rule_examples": list(entry["step17b_selected_rule_examples"]),
+            "step17b2_selected_rule_examples": list(entry["step17b2_selected_rule_examples"]),
+            "step17c_selected_rule_examples": list(entry["step17c_selected_rule_examples"]),
+            "step18c_top_weight_examples": list(entry["step18c_top_weight_examples"]),
+        }
+        for state_name, entry in sorted(traffic_light_state_map.items())
     }
 
     _write_csv(
@@ -571,17 +798,47 @@ def process_diagnostic(
         ["normalized_class_name", "stage_name", "count_type", "count"],
         stage_count_rows,
     )
+    _write_csv(
+        traffic_light_state_csv_path,
+        [
+            "traffic_light_state",
+            "step11_logic_atom_instances",
+            "step11_logic_atom_segments",
+            "appears_in_logic_atoms",
+            "step16_rule_pool_rule_count",
+            "appears_in_step16_rule_pool",
+            "step17_original_rule_count",
+            "appears_in_step17_original_rules",
+            "step17b_diverse_rule_count",
+            "appears_in_step17b_diverse_rules",
+            "step17b2_semantic_constrained_rule_count",
+            "appears_in_step17b2_semantic_constrained_rules",
+            "step17c_coverage_family_aware_rule_count",
+            "appears_in_step17c_coverage_family_aware_rules",
+            "step18c_top_weight_rule_count",
+            "step18c_top_weight_positive_rule_count",
+            "step18c_top_weight_negative_rule_count",
+            "appears_in_step18c_top_weight_rules",
+        ],
+        traffic_light_state_rows,
+    )
 
     summary = {
         "version": _DIAGNOSTIC_VERSION,
         "config": _cfg_key_subset(cfg),
         "num_classes": len(summary_rows),
+        "traffic_light_state_atom_coverage": {
+            "tracked_states": list(_TRACKED_TRAFFIC_LIGHT_STATES),
+            "rows": traffic_light_state_rows,
+            "details_by_state": traffic_light_state_detail_rows,
+        },
         "rows": summary_rows,
         "details_by_class": detail_rows,
         "output_paths": {
             "summary_json": str(summary_json_path),
             "summary_csv": str(summary_csv_path),
             "stage_counts_csv": str(stage_counts_csv_path),
+            "traffic_light_state_atom_coverage_csv": str(traffic_light_state_csv_path),
         },
     }
     with summary_json_path.open("w", encoding="utf-8") as fh:
@@ -596,6 +853,7 @@ def process_diagnostic(
     print(f"Object-to-atom coverage summary JSON written to {summary_json_path}")
     print(f"Object-to-atom coverage summary CSV written to {summary_csv_path}")
     print(f"Object-to-atom stage-counts CSV written to {stage_counts_csv_path}")
+    print(f"Traffic-light-state atom coverage CSV written to {traffic_light_state_csv_path}")
     return summary
 
 
