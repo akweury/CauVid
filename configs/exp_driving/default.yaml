@@ -109,6 +109,7 @@ pipeline_recompute:
   rule_evaluation: false
   rule_aggregation_baseline: true
   object_to_atom_coverage_diagnostic: true
+  traffic_control_rule_utility_diagnostic: true
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
@@ -239,6 +240,18 @@ object_to_atom_coverage_diagnostic:
     traffic signal: traffic_light
     traffic signals: traffic_light
   max_rule_examples_per_class: 5
+
+traffic_control_rule_utility_diagnostic:
+  highlight_predicates:
+    - traffic_light_state
+    - traffic_light_relevant
+    - stop_sign_relevant
+    - traffic_control_relevant
+  tracked_states: [red, yellow, green]
+  top_rules_per_key: 5
+  vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
+  near_states: [near]
+  center_states: [centered]
 
 neural_symbolic_baseline:
   min_feature_count: 1

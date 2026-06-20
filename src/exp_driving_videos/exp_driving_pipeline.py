@@ -70,6 +70,10 @@ Steps:
                     merged objects, important objects, logic atoms, the
                     extended rule pool, selected hard-OR rule sets, and the
                     top weighted learned aggregation rules.
+    18E. traffic_control_rule_utility_diagnostic_driving_mini — audit
+                    traffic-control predicates and traffic-light states
+                    across the Step 16 pool, hard-OR selectors, and
+                    learned Step 18C aggregation weights.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
@@ -127,6 +131,7 @@ from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
 from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
+from src.exp_driving_videos.modules import traffic_control_rule_utility_diagnostic_driving_mini
 from src.exp_driving_videos.modules import traffic_control_attributes_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
@@ -171,6 +176,9 @@ _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_object_to_atom_coverage_diagnostic_cfg = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_cfg
+_get_traffic_control_rule_utility_diagnostic_cfg = (
+    driving_pipeline_config.get_traffic_control_rule_utility_diagnostic_cfg
+)
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
 _get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrated_method_visualization_cfg
@@ -181,6 +189,9 @@ _get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diag
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
 _get_rule_aggregation_baseline_output_root = driving_pipeline_config.get_rule_aggregation_baseline_output_root
 _get_object_to_atom_coverage_diagnostic_output_root = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_output_root
+_get_traffic_control_rule_utility_diagnostic_output_root = (
+    driving_pipeline_config.get_traffic_control_rule_utility_diagnostic_output_root
+)
 _get_neural_symbolic_baseline_output_root = driving_pipeline_config.get_neural_symbolic_baseline_output_root
 _get_error_and_explainability_output_root = driving_pipeline_config.get_error_and_explainability_output_root
 _get_coverage_family_aware_final_rules_output_root = driving_pipeline_config.get_coverage_family_aware_final_rules_output_root
@@ -225,6 +236,7 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "18B", "stop_after": None, "label": "neural_symbolic_baseline_driving_mini"},
     {"tag": "18C", "stop_after": None, "label": "rule_aggregation_baseline_driving_mini"},
     {"tag": "18D", "stop_after": 18, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
+    {"tag": "18E", "stop_after": None, "label": "traffic_control_rule_utility_diagnostic_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "error_and_explainability_analysis_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "vehicle_rule_diagnostic_driving_mini"},
     {"tag": "20B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
@@ -373,6 +385,7 @@ class PipelineContext:
     neural_symbolic_baseline_results: Dict[str, Any] = field(default_factory=dict)
     rule_aggregation_baseline_results: Dict[str, Any] = field(default_factory=dict)
     object_to_atom_coverage_results: Dict[str, Any] = field(default_factory=dict)
+    traffic_control_rule_utility_results: Dict[str, Any] = field(default_factory=dict)
     error_analysis_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     error_analysis_results: Dict[str, Any] = field(default_factory=dict)
     vehicle_rule_diagnostic_results: Dict[str, Any] = field(default_factory=dict)
@@ -1203,6 +1216,28 @@ def run_step_18d_object_to_atom_coverage(ctx: PipelineContext, runner: StepRunne
     runner.complete_step("18D", subtitle=f"classes={int(ctx.object_to_atom_coverage_results.get('num_classes', 0))}")
 
 
+def run_step_18e_traffic_control_rule_utility(ctx: PipelineContext, runner: StepRunner) -> None:
+    traffic_control_rule_utility_cfg = _get_traffic_control_rule_utility_diagnostic_cfg()
+    runner.announce_step("18E", "traffic_control_rule_utility_diagnostic_driving_mini")
+    runner.log("18E", f"cfg={traffic_control_rule_utility_cfg}")
+    runner.log("18E", f"recompute={bool(ctx.recompute_cfg.get('traffic_control_rule_utility_diagnostic', True))}")
+    with runner.module_output("18E"):
+        ctx.traffic_control_rule_utility_results = traffic_control_rule_utility_diagnostic_driving_mini.run(
+            extended_rule_results=ctx.extended_rule_results,
+            eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            rule_results_by_name=ctx.rule_results_by_name,
+            rule_aggregation_baseline_results=ctx.rule_aggregation_baseline_results,
+            cfg=traffic_control_rule_utility_cfg,
+            output_root=_get_traffic_control_rule_utility_diagnostic_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("traffic_control_rule_utility_diagnostic", True)),
+        )
+    runner.log("18E", f"keys={len(list(ctx.traffic_control_rule_utility_results.get('rows', [])))}")
+    runner.complete_step(
+        "18E",
+        subtitle=f"keys={len(list(ctx.traffic_control_rule_utility_results.get('rows', [])))}",
+    )
+
+
 def run_step_19_error_analysis(ctx: PipelineContext, runner: StepRunner) -> None:
     error_analysis_cfg = _get_error_and_explainability_cfg()
     runner.announce_step("19", "error_and_explainability_analysis_driving_mini")
@@ -1408,6 +1443,7 @@ def main(max_step: int | str = 22, video_ids: Optional[List[str]] = None) -> Non
         run_step_18b_neural_symbolic_baseline(ctx, runner)
         run_step_18c_rule_aggregation_baseline(ctx, runner)
         run_step_18d_object_to_atom_coverage(ctx, runner)
+        run_step_18e_traffic_control_rule_utility(ctx, runner)
 
         # Diagnostics
         run_step_19_error_analysis(ctx, runner)

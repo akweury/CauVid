@@ -546,6 +546,26 @@ def get_object_to_atom_coverage_diagnostic_cfg() -> Dict[str, Any]:
     )
 
 
+def get_traffic_control_rule_utility_diagnostic_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "highlight_predicates": [
+                "traffic_light_state",
+                "traffic_light_relevant",
+                "stop_sign_relevant",
+                "traffic_control_relevant",
+            ],
+            "tracked_states": ["red", "yellow", "green"],
+            "top_rules_per_key": 5,
+            "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+            "near_states": ["near"],
+            "center_states": ["centered"],
+        },
+        path=("traffic_control_rule_utility_diagnostic",),
+        warn_label="traffic-control rule utility diagnostic",
+    )
+
+
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -561,6 +581,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "rule_evaluation": True,
             "rule_aggregation_baseline": True,
             "object_to_atom_coverage_diagnostic": True,
+            "traffic_control_rule_utility_diagnostic": True,
             "neural_symbolic_baseline": True,
             "error_and_explainability_analysis": True,
             "vehicle_rule_diagnostic": True,
@@ -616,6 +637,10 @@ def get_rule_aggregation_baseline_output_root() -> Path:
 
 def get_object_to_atom_coverage_diagnostic_output_root() -> Path:
     return _load_output_root("18d_driving_mini_object_to_atom_coverage_diagnostic")
+
+
+def get_traffic_control_rule_utility_diagnostic_output_root() -> Path:
+    return _load_output_root("18e_driving_mini_traffic_control_rule_utility")
 
 
 def get_error_and_explainability_output_root() -> Path:

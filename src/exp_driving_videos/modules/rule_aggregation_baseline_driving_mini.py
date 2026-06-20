@@ -50,7 +50,7 @@ from src.exp_driving_videos.modules.rule_pool_upper_bound_diagnostic_driving_min
 from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
 
 
-_RULE_AGGREGATION_BASELINE_VERSION = 3
+_RULE_AGGREGATION_BASELINE_VERSION = 4
 _TOP_WEIGHT_ABLATION_SIZES: Tuple[Any, ...] = (1, 3, 5, 10, 20, 50, "all_nonzero")
 _SUMMARY_FAMILY_ORDER: Tuple[str, ...] = (
     "transition",
@@ -832,6 +832,7 @@ def process_baseline(
     per_video_csv_path = out_root / "per_video_metrics.csv"
     prediction_csv_path = out_root / "prediction_examples.csv"
     top_rules_csv_path = out_root / "top_weighted_rules_with_clauses.csv"
+    all_weights_csv_path = out_root / "all_nonzero_weighted_rules_with_clauses.csv"
     ablation_csv_path = out_root / "rule_aggregation_ablation_metrics.csv"
     subset_threshold_metrics_csv_path = out_root / "rule_aggregation_subset_threshold_metrics.csv"
     top_k_rule_sets_csv_path = out_root / "top_k_weighted_rule_sets.csv"
@@ -1148,6 +1149,23 @@ def process_baseline(
         prediction_rows,
     )
     _write_csv(
+        all_weights_csv_path,
+        [
+            "rank",
+            "rule_id",
+            "clause",
+            "weight",
+            "abs_weight",
+            "sign",
+            "confidence",
+            "train_positive_support",
+            "train_negative_support",
+            "semantic_family",
+            "summary_families",
+        ],
+        all_weight_rows,
+    )
+    _write_csv(
         top_rules_csv_path,
         [
             "rank",
@@ -1345,6 +1363,7 @@ def process_baseline(
             "metrics_csv": str(metrics_csv_path),
             "per_video_metrics_csv": str(per_video_csv_path),
             "prediction_examples_csv": str(prediction_csv_path),
+            "all_nonzero_weighted_rules_with_clauses_csv": str(all_weights_csv_path),
             "top_weighted_rules_with_clauses_csv": str(top_rules_csv_path),
             "rule_aggregation_ablation_metrics_csv": str(ablation_csv_path),
             "rule_aggregation_subset_threshold_metrics_csv": str(subset_threshold_metrics_csv_path),
@@ -1368,6 +1387,7 @@ def process_baseline(
         f"eval_f1={float(selected_eval.get('f1', 0.0)):.3f}"
     )
     print(f"Rule aggregation baseline summary JSON written to {summary_path}")
+    print(f"Rule aggregation baseline all nonzero weighted rules CSV written to {all_weights_csv_path}")
     print(f"Rule aggregation baseline top weighted rules CSV written to {top_rules_csv_path}")
     print(f"Rule aggregation baseline subset ablations CSV written to {ablation_csv_path}")
     print(f"Rule aggregation baseline subset threshold metrics CSV written to {subset_threshold_metrics_csv_path}")
