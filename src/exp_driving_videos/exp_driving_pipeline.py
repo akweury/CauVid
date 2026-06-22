@@ -871,11 +871,12 @@ def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
     logic_atoms_cfg = _get_logic_atoms_cfg()
     runner.announce_step("11", "logic_atoms_driving_mini")
     runner.log("11", f"cfg={logic_atoms_cfg}")
+    runner.log("11", f"recompute={bool(ctx.recompute_cfg.get('logic_atoms', False))}")
     with runner.module_output("11"):
         ctx.logic_atom_results = logic_atoms_driving_mini.run(
             segment_object_motion_results=ctx.traffic_control_attribute_results or ctx.important_object_results or [],
             cfg=logic_atoms_cfg,
-            force_recompute=False,
+            force_recompute=bool(ctx.recompute_cfg.get("logic_atoms", False)),
         )
     runner.log("11", f"completed videos={len(ctx.logic_atom_results)}")
     runner.complete_step("11", subtitle=f"videos={len(ctx.logic_atom_results)}")
@@ -885,11 +886,12 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
     target_head_cfg = _get_target_head_atoms_cfg()
     runner.announce_step("12", "target_head_atoms_driving_mini")
     runner.log("12", f"cfg={target_head_cfg}")
+    runner.log("12", f"recompute={bool(ctx.recompute_cfg.get('target_head_atoms', False))}")
     with runner.module_output("12"):
         ctx.target_head_results = target_head_atoms_driving_mini.run(
             logic_atom_results=ctx.logic_atom_results or [],
             cfg=target_head_cfg,
-            force_recompute=False,
+            force_recompute=bool(ctx.recompute_cfg.get("target_head_atoms", False)),
         )
     runner.log("12", f"completed videos={len(ctx.target_head_results)}")
     runner.complete_step("12", subtitle=f"videos={len(ctx.target_head_results)}")
@@ -899,11 +901,12 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
     rule_examples_cfg = _get_temporal_rule_examples_cfg()
     runner.announce_step("13", "temporal_rule_examples_driving_mini")
     runner.log("13", f"cfg={rule_examples_cfg}")
+    runner.log("13", f"recompute={bool(ctx.recompute_cfg.get('temporal_rule_examples', False))}")
     with runner.module_output("13"):
         ctx.temporal_rule_results = temporal_rule_examples_driving_mini.run(
             target_head_results=ctx.target_head_results or [],
             cfg=rule_examples_cfg,
-            force_recompute=False,
+            force_recompute=bool(ctx.recompute_cfg.get("temporal_rule_examples", False)),
         )
     runner.log("13", f"completed videos={len(ctx.temporal_rule_results)}")
     runner.complete_step("13", subtitle=f"videos={len(ctx.temporal_rule_results)}")

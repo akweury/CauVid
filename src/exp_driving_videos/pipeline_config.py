@@ -587,6 +587,9 @@ def get_traffic_control_temporal_alignment_diagnostic_cfg() -> Dict[str, Any]:
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "logic_atoms": True,
+            "target_head_atoms": True,
+            "temporal_rule_examples": True,
             "candidate_rules": True,
             "extended_rules": True,
             "final_rules": True,
