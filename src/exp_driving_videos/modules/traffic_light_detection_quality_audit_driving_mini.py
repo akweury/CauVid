@@ -33,7 +33,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TRAFFIC_LIGHT_DETECTION_QUALITY_AUDIT_VERSION = 3
+_TRAFFIC_LIGHT_DETECTION_QUALITY_AUDIT_VERSION = 4
 _STATE_ORDER: Tuple[str, ...] = ("red", "yellow", "green", "unknown")
 _FUTURE_HORIZONS: Tuple[int, ...] = (1, 2, 3, 5)
 _POSITIVE_FORWARD_STATES: Tuple[str, ...] = ("forward_slowdown", "stopping")
@@ -134,6 +134,13 @@ def _object_id(track_id: int) -> str:
     return f"track_{int(track_id):04d}"
 
 
+def _segment_id(segment: Dict[str, Any]) -> str:
+    raw_segment_id = segment.get("segment_id")
+    if raw_segment_id not in (None, ""):
+        return str(raw_segment_id)
+    return f"seg_{_safe_int(segment.get('segment_index', -1), -1):04d}"
+
+
 def _state_sort_key(state_name: str) -> Tuple[int, str]:
     normalized = _normalize_text(state_name)
     try:
@@ -165,14 +172,12 @@ def _segment_positions_by_video(logic_atom_results: Sequence[Dict[str, Any]]) ->
             list(video_result.get("segments", [])),
             key=lambda segment: (
                 _safe_int(segment.get("segment_index", -1), -1),
-                str(segment.get("segment_id", "")),
+                _segment_id(segment),
             ),
         )
         positions[video_id] = {
             "segments": segments,
-            "position_by_segment_id": {
-                str(segment.get("segment_id", "")): index for index, segment in enumerate(segments)
-            },
+            "position_by_segment_id": {_segment_id(segment): index for index, segment in enumerate(segments)},
         }
     return positions
 
@@ -230,7 +235,7 @@ def _candidate_rows(
         video_id = str(video_result.get("video_id", "unknown"))
         for segment in list(video_result.get("segments", [])):
             segment_index = _safe_int(segment.get("segment_index", -1), -1)
-            segment_id = str(segment.get("segment_id", ""))
+            segment_id = _segment_id(segment)
             brake_meta = brake_lookup.get((video_id, segment_id))
             if restrict_to_eval_segments and brake_meta is None:
                 continue
@@ -483,43 +488,104 @@ def _draw_label_block(
         cv2.putText(image, line, (x0 + 8, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
-def _render_audit_frame(row: Dict[str, Any], output_path: Path) -> bool:
+def _draw_with_pillow(
+    image_path: str,
+    output_path: Path,
+    box: Sequence[float],
+    label_lines: Sequence[str],
+    color_bgr: Tuple[int, int, int],
+) -> bool:
     try:
-        import cv2
+        from PIL import Image, ImageDraw, ImageFont
     except Exception:
         return False
 
-    image_path = _resolve_local_image_path(str(row.get("image_path", "")))
-    frame = cv2.imread(image_path)
-    if frame is None:
+    try:
+        image = Image.open(image_path).convert("RGB")
+    except Exception:
         return False
 
-    h, w = frame.shape[:2]
-    box = list(row.get("box", [0, 0, 0, 0]))
+    draw = ImageDraw.Draw(image)
+    color_rgb = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+    width, height = image.size
     if len(box) != 4:
         return False
     x1, y1, x2, y2 = [int(round(v)) for v in box]
-    x1 = max(0, min(x1, max(0, w - 1)))
-    x2 = max(0, min(x2, w))
-    y1 = max(0, min(y1, max(0, h - 1)))
-    y2 = max(0, min(y2, h))
+    x1 = max(0, min(x1, max(0, width - 1)))
+    x2 = max(0, min(x2, width))
+    y1 = max(0, min(y1, max(0, height - 1)))
+    y2 = max(0, min(y2, height))
     if x2 <= x1 or y2 <= y1:
         return False
 
+    draw.rectangle((x1, y1, x2, y2), outline=color_rgb, width=4)
+
+    font = ImageFont.load_default()
+    x0 = 10
+    y0 = 12
+    padding_x = 8
+    padding_y = 6
+    line_gap = 6
+    line_heights: List[int] = []
+    line_widths: List[int] = []
+    for line in label_lines:
+        left, top, right, bottom = draw.textbbox((0, 0), line, font=font)
+        line_widths.append(int(right - left))
+        line_heights.append(int(bottom - top))
+    block_w = (max(line_widths) if line_widths else 100) + padding_x * 2
+    block_h = sum(line_heights) + (line_gap * max(0, len(label_lines) - 1)) + padding_y * 2
+    draw.rectangle((x0, y0, x0 + block_w, y0 + block_h), fill=(20, 20, 20), outline=color_rgb, width=2)
+
+    y = y0 + padding_y
+    for idx, line in enumerate(label_lines):
+        draw.text((x0 + padding_x, y), line, fill=(255, 255, 255), font=font)
+        y += line_heights[idx] + line_gap
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        image.save(output_path, format="JPEG", quality=95)
+    except Exception:
+        return False
+    return True
+
+
+def _render_audit_frame(row: Dict[str, Any], output_path: Path) -> bool:
+    image_path = _resolve_local_image_path(str(row.get("image_path", "")))
+    box = list(row.get("box", [0, 0, 0, 0]))
+
     state_name = str(row.get("predicted_state", "unknown"))
     color = _state_color_bgr(state_name)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-
     label_lines = [
         f"video={row.get('video_id', 'unknown')} segment={row.get('segment_id', 'unknown')} frame={row.get('frame_id', 'unknown')}",
         f"track={row.get('track_id', -1)} object={row.get('object_id', 'unknown')} brake={row.get('brake_label', 'unknown')}",
         f"state={state_name} conf={_safe_float(row.get('state_confidence', 0.0)):.2f}",
         f"relevance tl={bool(row.get('traffic_light_relevant', False))} tc={bool(row.get('traffic_control_relevant', False))} pos={row.get('position_state', 'unknown')}",
     ]
-    _draw_label_block(frame, label_lines, color)
+    try:
+        import cv2
+    except Exception:
+        cv2 = None
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    return bool(cv2.imwrite(str(output_path), frame))
+    if cv2 is not None:
+        frame = cv2.imread(image_path)
+        if frame is not None:
+            h, w = frame.shape[:2]
+            if len(box) != 4:
+                return False
+            x1, y1, x2, y2 = [int(round(v)) for v in box]
+            x1 = max(0, min(x1, max(0, w - 1)))
+            x2 = max(0, min(x2, w))
+            y1 = max(0, min(y1, max(0, h - 1)))
+            y2 = max(0, min(y2, h))
+            if x2 <= x1 or y2 <= y1:
+                return False
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            _draw_label_block(frame, label_lines, color)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if bool(cv2.imwrite(str(output_path), frame)):
+                return True
+
+    return _draw_with_pillow(image_path, output_path, box, label_lines, color)
 
 
 def _index_fieldnames() -> List[str]:
