@@ -100,6 +100,13 @@ Steps:
                     publication-style figures comparing NeSy selectors,
                     neural symbolic baselines, learned rule aggregation, and
                     the oracle rule-pool upper bound.
+    23A. background_causal_prior_driving_mini — define a fixed background
+                    causal prior for brake_next that is used only to steer
+                    perception re-checks and never as direct rules or facts.
+    23B. reasoning_feedback_signal_driving_mini — combine the background
+                    causal prior with existing diagnostics to surface
+                    perception re-check signals for likely missed causes of
+                    braking.
 
 """
 
@@ -156,6 +163,8 @@ from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules import traffic_light_detection_quality_audit_driving_mini
 from src.exp_driving_videos.modules import traffic_control_temporal_alignment_diagnostic_driving_mini
 from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
+from src.exp_driving_videos.modules import background_causal_prior_driving_mini
+from src.exp_driving_videos.modules import reasoning_feedback_signal_driving_mini
 
 DRIVING_MINI_OD_MODEL = driving_pipeline_config.DRIVING_MINI_OD_MODEL
 DEFAULT_TRAIN_VIDEO_COUNT = driving_pipeline_config.DEFAULT_TRAIN_VIDEO_COUNT
@@ -196,6 +205,8 @@ _get_traffic_control_temporal_alignment_diagnostic_cfg = (
 _get_traffic_light_detection_quality_audit_cfg = (
     driving_pipeline_config.get_traffic_light_detection_quality_audit_cfg
 )
+_get_background_causal_prior_cfg = driving_pipeline_config.get_background_causal_prior_cfg
+_get_reasoning_feedback_signal_cfg = driving_pipeline_config.get_reasoning_feedback_signal_cfg
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
 _get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrated_method_visualization_cfg
@@ -225,6 +236,8 @@ _get_vehicle_rule_diagnostic_output_root = driving_pipeline_config.get_vehicle_r
 _get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule_selection_visualization_output_root
 _get_integrated_method_visualization_output_root = driving_pipeline_config.get_integrated_method_visualization_output_root
 _get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
+_get_background_causal_prior_output_root = driving_pipeline_config.get_background_causal_prior_output_root
+_get_reasoning_feedback_signal_output_root = driving_pipeline_config.get_reasoning_feedback_signal_output_root
 
 _merge_candidate_rules = driving_pipeline_data.merge_candidate_rules
 _select_video_results = driving_pipeline_data.select_video_results
@@ -267,6 +280,8 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "20B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
     {"tag": "21", "stop_after": 21, "label": "rule_selection_visualization_driving_mini"},
     {"tag": "22", "stop_after": 22, "label": "integrated_method_visualization_driving_mini"},
+    {"tag": "23A", "stop_after": None, "label": "background_causal_prior_driving_mini"},
+    {"tag": "23B", "stop_after": 23, "label": "reasoning_feedback_signal_driving_mini"},
 ]
 _PIPELINE_STAGE_TAGS: List[str] = [str(stage["tag"]) for stage in _PIPELINE_STAGE_SEQUENCE]
 _PIPELINE_STAGE_BY_TAG: Dict[str, Dict[str, Any]] = {
@@ -419,6 +434,8 @@ class PipelineContext:
     fn_categorization_results: Dict[str, Any] = field(default_factory=dict)
     rule_selection_visualization_results: Dict[str, Any] = field(default_factory=dict)
     integrated_method_visualization_results: Dict[str, Any] = field(default_factory=dict)
+    background_causal_prior_results: Dict[str, Any] = field(default_factory=dict)
+    reasoning_feedback_signal_results: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -1463,6 +1480,43 @@ def run_step_22_integrated_visualization(ctx: PipelineContext, runner: StepRunne
     runner.complete_step("22", subtitle="figures=ready")
 
 
+def run_step_23a_background_causal_prior(ctx: PipelineContext, runner: StepRunner) -> None:
+    background_causal_prior_cfg = _get_background_causal_prior_cfg()
+    runner.announce_step("23A", "background_causal_prior_driving_mini")
+    runner.log("23A", f"cfg={background_causal_prior_cfg}")
+    runner.log("23A", f"recompute={bool(ctx.recompute_cfg.get('background_causal_prior', True))}")
+    with runner.module_output("23A"):
+        ctx.background_causal_prior_results = background_causal_prior_driving_mini.run(
+            cfg=background_causal_prior_cfg,
+            output_root=_get_background_causal_prior_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("background_causal_prior", True)),
+        )
+    runner.log("23A", f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
+    runner.complete_step("23A", subtitle=f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
+
+
+def run_step_23b_reasoning_feedback_signal(ctx: PipelineContext, runner: StepRunner) -> None:
+    reasoning_feedback_signal_cfg = _get_reasoning_feedback_signal_cfg()
+    runner.announce_step("23B", "reasoning_feedback_signal_driving_mini")
+    runner.log("23B", f"cfg={reasoning_feedback_signal_cfg}")
+    runner.log("23B", f"recompute={bool(ctx.recompute_cfg.get('reasoning_feedback_signal', True))}")
+    with runner.module_output("23B"):
+        ctx.reasoning_feedback_signal_results = reasoning_feedback_signal_driving_mini.run(
+            background_causal_prior_results=ctx.background_causal_prior_results,
+            primary_rule_results=ctx.rule_results_by_name.get(ctx.primary_rule_set, {}),
+            evaluation_results=ctx.evaluation_results,
+            rule_aggregation_baseline_results=ctx.rule_aggregation_baseline_results,
+            error_analysis_results=ctx.error_analysis_results,
+            eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            logic_atom_results=ctx.logic_atom_results or [],
+            cfg=reasoning_feedback_signal_cfg,
+            output_root=_get_reasoning_feedback_signal_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("reasoning_feedback_signal", True)),
+        )
+    runner.log("23B", f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
+    runner.complete_step("23B", subtitle=f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the driving_mini experiment pipeline up to a selected step.",
@@ -1472,7 +1526,7 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=_parse_max_step_arg,
-        default="22",
+        default="23",
         help="Run through this step number or exact step id such as 17E or 18C.",
     )
     parser.add_argument(
@@ -1487,7 +1541,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main(max_step: int | str = 22, video_ids: Optional[List[str]] = None) -> None:
+def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> None:
     ctx = PipelineContext(effective_video_ids=_resolve_video_ids(video_ids))
     runner = StepRunner.create(max_step)
     try:
@@ -1547,6 +1601,8 @@ def main(max_step: int | str = 22, video_ids: Optional[List[str]] = None) -> Non
         # Visualization
         run_step_21_rule_selection_visualization(ctx, runner)
         run_step_22_integrated_visualization(ctx, runner)
+        run_step_23a_background_causal_prior(ctx, runner)
+        run_step_23b_reasoning_feedback_signal(ctx, runner)
     except _PipelineStopRequested:
         return
 

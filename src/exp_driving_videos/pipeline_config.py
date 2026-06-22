@@ -603,6 +603,32 @@ def get_traffic_light_detection_quality_audit_cfg() -> Dict[str, Any]:
     )
 
 
+def get_background_causal_prior_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "target_predicate": "brake_next",
+        },
+        path=("background_causal_prior",),
+        warn_label="background causal prior",
+    )
+
+
+def get_reasoning_feedback_signal_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "target_predicate": "brake_next",
+            "primary_rule_set": "original",
+            "max_feedback_requests": 200,
+            "low_confidence_positive_margin": 0.08,
+            "min_existing_supporting_facts": 2,
+            "max_supporting_facts_per_request": 16,
+            "max_fired_rules_per_request": 6,
+        },
+        path=("reasoning_feedback_signal",),
+        warn_label="reasoning feedback signal",
+    )
+
+
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -630,6 +656,8 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "fn_categorization_diagnostic": True,
             "rule_selection_visualization": True,
             "integrated_method_visualization": True,
+            "background_causal_prior": True,
+            "reasoning_feedback_signal": True,
         },
         path=("pipeline_recompute",),
         warn_label="pipeline recompute",
@@ -727,6 +755,14 @@ def get_rule_selection_visualization_output_root() -> Path:
 
 def get_integrated_method_visualization_output_root() -> Path:
     return _load_output_root("22_driving_mini_integrated_method_visualization")
+
+
+def get_background_causal_prior_output_root() -> Path:
+    return _load_output_root("23a_driving_mini_background_causal_prior")
+
+
+def get_reasoning_feedback_signal_output_root() -> Path:
+    return _load_output_root("23_driving_mini_reasoning_feedback_signal")
 
 
 def get_fn_categorization_diagnostic_output_root() -> Path:

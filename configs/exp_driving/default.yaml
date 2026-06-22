@@ -121,6 +121,8 @@ pipeline_recompute:
   fn_categorization_diagnostic: false
   rule_selection_visualization: false
   integrated_method_visualization: false
+  background_causal_prior: false
+  reasoning_feedback_signal: false
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -279,6 +281,18 @@ traffic_light_detection_quality_audit:
   confidence_split_threshold: 0.75
   max_samples_per_state_per_confidence_band: 0
   frame_path_roots: []
+
+background_causal_prior:
+  target_predicate: brake_next
+
+reasoning_feedback_signal:
+  target_predicate: brake_next
+  primary_rule_set: original
+  max_feedback_requests: 200
+  low_confidence_positive_margin: 0.08
+  min_existing_supporting_facts: 2
+  max_supporting_facts_per_request: 16
+  max_fired_rules_per_request: 6
 
 neural_symbolic_baseline:
   min_feature_count: 1
