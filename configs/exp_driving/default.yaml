@@ -114,6 +114,7 @@ pipeline_recompute:
   object_to_atom_coverage_diagnostic: false
   traffic_control_rule_utility_diagnostic: false
   traffic_control_temporal_alignment_diagnostic: true
+  traffic_light_detection_quality_audit: false
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
@@ -266,6 +267,17 @@ traffic_control_temporal_alignment_diagnostic:
   tracked_states: [red, yellow, green]
   future_horizons: [1, 2, 3, 5]
   positive_forward_states: [forward_slowdown, stopping]
+
+traffic_light_detection_quality_audit:
+  max_samples_total: 0
+  max_samples_per_state: 50
+  max_samples_per_video: 12
+  include_unknown_state: true
+  min_state_confidence: 0.0
+  random_seed: 0
+  separate_confidence_bands: false
+  confidence_split_threshold: 0.75
+  max_samples_per_state_per_confidence_band: 0
 
 neural_symbolic_baseline:
   min_feature_count: 1

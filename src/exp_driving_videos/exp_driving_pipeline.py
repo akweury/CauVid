@@ -79,6 +79,10 @@ Steps:
                     the immediate brake_next target or delayed braking
                     within 2/3/5 future segments using diagnostic-only
                     future labels.
+    18G. traffic_light_detection_quality_audit_driving_mini —
+                    export sampled full-frame visual audits for detected
+                    traffic-light objects with drawn bounding boxes and
+                    predicted state/context overlays for manual review.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
@@ -149,6 +153,7 @@ from src.exp_driving_videos.modules import segment_object_motion_driving_mini
 from src.exp_driving_videos.modules import target_head_atoms_driving_mini
 from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
+from src.exp_driving_videos.modules import traffic_light_detection_quality_audit_driving_mini
 from src.exp_driving_videos.modules import traffic_control_temporal_alignment_diagnostic_driving_mini
 from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
 
@@ -188,6 +193,9 @@ _get_traffic_control_rule_utility_diagnostic_cfg = (
 _get_traffic_control_temporal_alignment_diagnostic_cfg = (
     driving_pipeline_config.get_traffic_control_temporal_alignment_diagnostic_cfg
 )
+_get_traffic_light_detection_quality_audit_cfg = (
+    driving_pipeline_config.get_traffic_light_detection_quality_audit_cfg
+)
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
 _get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrated_method_visualization_cfg
@@ -203,6 +211,9 @@ _get_traffic_control_rule_utility_diagnostic_output_root = (
 )
 _get_traffic_control_temporal_alignment_diagnostic_output_root = (
     driving_pipeline_config.get_traffic_control_temporal_alignment_diagnostic_output_root
+)
+_get_traffic_light_detection_quality_audit_output_root = (
+    driving_pipeline_config.get_traffic_light_detection_quality_audit_output_root
 )
 _get_neural_symbolic_baseline_output_root = driving_pipeline_config.get_neural_symbolic_baseline_output_root
 _get_error_and_explainability_output_root = driving_pipeline_config.get_error_and_explainability_output_root
@@ -249,7 +260,8 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "18C", "stop_after": None, "label": "rule_aggregation_baseline_driving_mini"},
     {"tag": "18D", "stop_after": None, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "18E", "stop_after": None, "label": "traffic_control_rule_utility_diagnostic_driving_mini"},
-    {"tag": "18F", "stop_after": 18, "label": "traffic_control_temporal_alignment_diagnostic_driving_mini"},
+    {"tag": "18F", "stop_after": None, "label": "traffic_control_temporal_alignment_diagnostic_driving_mini"},
+    {"tag": "18G", "stop_after": 18, "label": "traffic_light_detection_quality_audit_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "error_and_explainability_analysis_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "vehicle_rule_diagnostic_driving_mini"},
     {"tag": "20B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
@@ -400,6 +412,7 @@ class PipelineContext:
     object_to_atom_coverage_results: Dict[str, Any] = field(default_factory=dict)
     traffic_control_rule_utility_results: Dict[str, Any] = field(default_factory=dict)
     traffic_control_temporal_alignment_results: Dict[str, Any] = field(default_factory=dict)
+    traffic_light_detection_quality_audit_results: Dict[str, Any] = field(default_factory=dict)
     error_analysis_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     error_analysis_results: Dict[str, Any] = field(default_factory=dict)
     vehicle_rule_diagnostic_results: Dict[str, Any] = field(default_factory=dict)
@@ -1288,6 +1301,35 @@ def run_step_18f_traffic_control_temporal_alignment(ctx: PipelineContext, runner
     )
 
 
+def run_step_18g_traffic_light_detection_quality_audit(ctx: PipelineContext, runner: StepRunner) -> None:
+    detection_quality_audit_cfg = _get_traffic_light_detection_quality_audit_cfg()
+    runner.announce_step("18G", "traffic_light_detection_quality_audit_driving_mini")
+    runner.log("18G", f"cfg={detection_quality_audit_cfg}")
+    runner.log(
+        "18G",
+        f"recompute={bool(ctx.recompute_cfg.get('traffic_light_detection_quality_audit', True))}",
+    )
+    with runner.module_output("18G"):
+        ctx.traffic_light_detection_quality_audit_results = (
+            traffic_light_detection_quality_audit_driving_mini.run(
+                traffic_control_attribute_results=ctx.traffic_control_attribute_results or [],
+                logic_atom_results=ctx.logic_atom_results or [],
+                eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+                cfg=detection_quality_audit_cfg,
+                output_root=_get_traffic_light_detection_quality_audit_output_root(),
+                force_recompute=bool(ctx.recompute_cfg.get("traffic_light_detection_quality_audit", True)),
+            )
+        )
+    runner.log(
+        "18G",
+        f"saved={int(ctx.traffic_light_detection_quality_audit_results.get('num_saved_audit_images', 0))}",
+    )
+    runner.complete_step(
+        "18G",
+        subtitle=f"saved={int(ctx.traffic_light_detection_quality_audit_results.get('num_saved_audit_images', 0))}",
+    )
+
+
 def run_step_19_error_analysis(ctx: PipelineContext, runner: StepRunner) -> None:
     error_analysis_cfg = _get_error_and_explainability_cfg()
     runner.announce_step("19", "error_and_explainability_analysis_driving_mini")
@@ -1495,6 +1537,7 @@ def main(max_step: int | str = 22, video_ids: Optional[List[str]] = None) -> Non
         run_step_18d_object_to_atom_coverage(ctx, runner)
         run_step_18e_traffic_control_rule_utility(ctx, runner)
         run_step_18f_traffic_control_temporal_alignment(ctx, runner)
+        run_step_18g_traffic_light_detection_quality_audit(ctx, runner)
 
         # Diagnostics
         run_step_19_error_analysis(ctx, runner)

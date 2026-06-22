@@ -584,6 +584,24 @@ def get_traffic_control_temporal_alignment_diagnostic_cfg() -> Dict[str, Any]:
     )
 
 
+def get_traffic_light_detection_quality_audit_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "max_samples_total": 0,
+            "max_samples_per_state": 50,
+            "max_samples_per_video": 12,
+            "include_unknown_state": True,
+            "min_state_confidence": 0.0,
+            "random_seed": 0,
+            "separate_confidence_bands": False,
+            "confidence_split_threshold": 0.75,
+            "max_samples_per_state_per_confidence_band": 0,
+        },
+        path=("traffic_light_detection_quality_audit",),
+        warn_label="traffic-light detection quality audit",
+    )
+
+
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -604,6 +622,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "object_to_atom_coverage_diagnostic": True,
             "traffic_control_rule_utility_diagnostic": True,
             "traffic_control_temporal_alignment_diagnostic": True,
+            "traffic_light_detection_quality_audit": True,
             "neural_symbolic_baseline": True,
             "error_and_explainability_analysis": True,
             "vehicle_rule_diagnostic": True,
@@ -667,6 +686,10 @@ def get_traffic_control_rule_utility_diagnostic_output_root() -> Path:
 
 def get_traffic_control_temporal_alignment_diagnostic_output_root() -> Path:
     return _load_output_root("18f_driving_mini_traffic_control_temporal_alignment")
+
+
+def get_traffic_light_detection_quality_audit_output_root() -> Path:
+    return _load_output_root("18g_driving_mini_traffic_light_detection_quality_audit")
 
 
 def get_error_and_explainability_output_root() -> Path:
