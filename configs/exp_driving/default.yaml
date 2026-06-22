@@ -110,6 +110,7 @@ pipeline_recompute:
   rule_aggregation_baseline: true
   object_to_atom_coverage_diagnostic: true
   traffic_control_rule_utility_diagnostic: true
+  traffic_control_temporal_alignment_diagnostic: true
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
@@ -252,6 +253,16 @@ traffic_control_rule_utility_diagnostic:
   vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
   near_states: [near]
   center_states: [centered]
+
+traffic_control_temporal_alignment_diagnostic:
+  highlight_predicates:
+    - traffic_light_state
+    - traffic_light_relevant
+    - stop_sign_relevant
+    - traffic_control_relevant
+  tracked_states: [red, yellow, green]
+  future_horizons: [1, 2, 3, 5]
+  positive_forward_states: [forward_slowdown, stopping]
 
 neural_symbolic_baseline:
   min_feature_count: 1

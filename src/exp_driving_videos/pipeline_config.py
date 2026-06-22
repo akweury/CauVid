@@ -566,6 +566,24 @@ def get_traffic_control_rule_utility_diagnostic_cfg() -> Dict[str, Any]:
     )
 
 
+def get_traffic_control_temporal_alignment_diagnostic_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "highlight_predicates": [
+                "traffic_light_state",
+                "traffic_light_relevant",
+                "traffic_control_relevant",
+                "stop_sign_relevant",
+            ],
+            "tracked_states": ["red", "yellow", "green"],
+            "future_horizons": [1, 2, 3, 5],
+            "positive_forward_states": ["forward_slowdown", "stopping"],
+        },
+        path=("traffic_control_temporal_alignment_diagnostic",),
+        warn_label="traffic-control temporal alignment diagnostic",
+    )
+
+
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -582,6 +600,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "rule_aggregation_baseline": True,
             "object_to_atom_coverage_diagnostic": True,
             "traffic_control_rule_utility_diagnostic": True,
+            "traffic_control_temporal_alignment_diagnostic": True,
             "neural_symbolic_baseline": True,
             "error_and_explainability_analysis": True,
             "vehicle_rule_diagnostic": True,
@@ -641,6 +660,10 @@ def get_object_to_atom_coverage_diagnostic_output_root() -> Path:
 
 def get_traffic_control_rule_utility_diagnostic_output_root() -> Path:
     return _load_output_root("18e_driving_mini_traffic_control_rule_utility")
+
+
+def get_traffic_control_temporal_alignment_diagnostic_output_root() -> Path:
+    return _load_output_root("18f_driving_mini_traffic_control_temporal_alignment")
 
 
 def get_error_and_explainability_output_root() -> Path:
