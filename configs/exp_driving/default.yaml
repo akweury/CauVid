@@ -114,7 +114,7 @@ pipeline_recompute:
   object_to_atom_coverage_diagnostic: false
   traffic_control_rule_utility_diagnostic: false
   traffic_control_temporal_alignment_diagnostic: true
-  traffic_light_detection_quality_audit: false
+  traffic_light_detection_quality_audit: true
   neural_symbolic_baseline: false
   error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
