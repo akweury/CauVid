@@ -59,6 +59,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_samples_per_state_per_confidence_band": int(
             cfg.get("max_samples_per_state_per_confidence_band", 0)
         ),
+        "frame_path_roots": [str(value) for value in cfg.get("frame_path_roots", []) if str(value)],
     }
 
 
@@ -102,20 +103,40 @@ def _sanitize_filename(value: Any) -> str:
     return "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in text) or "unknown"
 
 
-def _resolve_local_image_path(image_path: str) -> str:
+def _resolve_local_image_path(image_path: str, cfg: Optional[Dict[str, Any]] = None) -> str:
     if not image_path:
         return image_path
     path = Path(image_path)
     if path.exists():
         return str(path)
     parts = path.parts
-    try:
-        dataset_idx = parts.index("dataset")
-    except ValueError:
-        return image_path
-    candidate = PROJECT_ROOT.joinpath(*parts[dataset_idx:])
-    if candidate.exists():
-        return str(candidate)
+    roots: List[Path] = [PROJECT_ROOT, PROJECT_ROOT / "dataset"]
+    for root in list((cfg or {}).get("frame_path_roots", [])):
+        if str(root):
+            roots.append(Path(str(root)))
+
+    suffixes: List[Tuple[str, ...]] = []
+    for anchor in ("dataset", "driving_mini", "frames"):
+        try:
+            anchor_idx = parts.index(anchor)
+        except ValueError:
+            continue
+        suffix = tuple(parts[anchor_idx:])
+        if suffix:
+            suffixes.append(suffix)
+        if anchor == "frames" and anchor_idx + 1 < len(parts):
+            suffixes.append(tuple(parts[anchor_idx + 1 :]))
+
+    seen_candidates = set()
+    for root in roots:
+        for suffix in suffixes:
+            candidate = root.joinpath(*suffix)
+            candidate_key = str(candidate)
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
+            if candidate.exists():
+                return str(candidate)
     return image_path
 
 
@@ -550,7 +571,15 @@ def _draw_with_pillow(
 
 
 def _render_audit_frame(row: Dict[str, Any], output_path: Path) -> bool:
-    image_path = _resolve_local_image_path(str(row.get("image_path", "")))
+    return _render_audit_frame_with_cfg(row, output_path, cfg=None)
+
+
+def _render_audit_frame_with_cfg(
+    row: Dict[str, Any],
+    output_path: Path,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    image_path = _resolve_local_image_path(str(row.get("image_path", "")), cfg=cfg)
     box = list(row.get("box", [0, 0, 0, 0]))
 
     state_name = str(row.get("predicted_state", "unknown"))
@@ -661,13 +690,13 @@ def process_audit(
             f"_{_sanitize_filename(row.get('brake_label', 'unknown'))}.jpg"
         )
         output_path = out_root / state_name / file_name
-        if not _render_audit_frame(row, output_path):
+        if not _render_audit_frame_with_cfg(row, output_path, cfg=cfg):
             render_failure_count += 1
             continue
 
         box = list(row.get("box", [0, 0, 0, 0]))
         out_row = dict(row)
-        out_row["resolved_image_path"] = _resolve_local_image_path(str(row.get("image_path", "")))
+        out_row["resolved_image_path"] = _resolve_local_image_path(str(row.get("image_path", "")), cfg=cfg)
         out_row["frame_with_bbox_path"] = str(output_path)
         out_row["bbox_x1"] = _safe_float(box[0] if len(box) > 0 else 0.0)
         out_row["bbox_y1"] = _safe_float(box[1] if len(box) > 1 else 0.0)

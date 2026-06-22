@@ -596,6 +596,7 @@ def get_traffic_light_detection_quality_audit_cfg() -> Dict[str, Any]:
             "separate_confidence_bands": False,
             "confidence_split_threshold": 0.75,
             "max_samples_per_state_per_confidence_band": 0,
+            "frame_path_roots": [],
         },
         path=("traffic_light_detection_quality_audit",),
         warn_label="traffic-light detection quality audit",

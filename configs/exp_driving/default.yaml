@@ -278,6 +278,7 @@ traffic_light_detection_quality_audit:
   separate_confidence_bands: false
   confidence_split_threshold: 0.75
   max_samples_per_state_per_confidence_band: 0
+  frame_path_roots: []
 
 neural_symbolic_baseline:
   min_feature_count: 1
