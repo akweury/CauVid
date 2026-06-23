@@ -795,6 +795,10 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
     runner.log(
         "2",
+        f"tracking_input_candidate_detections={sum(int(row.get('num_tracking_input_candidate_detections', 0)) for row in (ctx.tracking_results or []))}",
+    )
+    runner.log(
+        "2",
         f"raw_candidate_tracks={sum(int(row.get('num_raw_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}",
     )
     runner.log(

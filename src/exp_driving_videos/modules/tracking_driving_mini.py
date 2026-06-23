@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -64,7 +64,7 @@ _DEFAULT_TRACKER_ARGS = SimpleNamespace(
 # ByteTracker needs orig_shape to build Boxes; we use the first available
 # detection to derive it when possible, otherwise fall back to this.
 _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
-_TRACKING_SCHEMA_VERSION = 4
+_TRACKING_SCHEMA_VERSION = 5
 _CANDIDATE_TRACK_ID_OFFSET = 1_000_000
 _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
     "visual_score_weight": 1.0,
@@ -111,6 +111,9 @@ _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
         "candidate_duplicate_mean_iou": 0.55,
         "candidate_duplicate_shared_frame_ratio": 0.5,
         "duplicate_penalty_cap": 1.0,
+        "time_bucket_size": 12,
+        "grid_size": [4, 3],
+        "center_distance_threshold_ratio": 0.12,
     },
     "candidate_track_selection": {
         "visual_score_weight": 0.35,
@@ -120,7 +123,36 @@ _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
         "duplicate_penalty_weight": 0.25,
         "min_selection_score": 0.15,
     },
+    "pre_tracking_gate": {
+        "visual_score_weight": 0.45,
+        "prior_relevance_weight": 0.25,
+        "tracking_priority_weight": 0.15,
+        "spatial_plausibility_weight": 0.1,
+        "accepted_track_suppression_weight": 0.35,
+        "accepted_track_suppression_iou": 0.4,
+        "min_gate_score": 0.2,
+        "max_candidates_per_frame": 18,
+        "max_candidates_per_class_per_frame_default": 3,
+        "max_candidates_per_class_per_frame": {
+            "car": 4,
+            "person": 4,
+            "traffic light": 4,
+        },
+        "max_tracking_inputs_per_video": 320,
+    },
+    "early_fragment_merge": {
+        "enabled": True,
+        "max_frame_gap": 2,
+        "min_end_start_iou": 0.2,
+        "max_center_distance_ratio": 0.1,
+        "time_bucket_size": 12,
+        "grid_size": [4, 3],
+    },
     "selection_budgets": {
+        "max_tracking_inputs_per_video": 320,
+        "max_raw_tracks": 160,
+        "max_deduplicated_tracks": 64,
+        "max_selected_tracks": 24,
         "max_tracks_per_video": 24,
         "max_tracks_per_class_default": 4,
         "max_tracks_per_class": {
@@ -404,6 +436,104 @@ def _candidate_combined_score(detection: Dict[str, Any], policy: Dict[str, Any])
     )
 
 
+def _top_tracking_priority(detection: Dict[str, Any]) -> str:
+    prior_metadata = dict(detection.get("prior_metadata", {}))
+    matched_prior_ids = [str(value) for value in list(prior_metadata.get("matched_prior_ids", [])) if str(value)]
+    matched_priority_map = dict(prior_metadata.get("matched_prior_tracking_priorities", {}))
+    return str(matched_priority_map.get(matched_prior_ids[0], "")) if matched_prior_ids else ""
+
+
+def _tracking_priority_value(priority: str, policy: Dict[str, Any]) -> float:
+    return _safe_float(dict(policy.get("tracking_priority_bonus", {})).get(str(priority), 0.0))
+
+
+def _accepted_frame_detections(accepted_frame: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(accepted_frame, dict):
+        return []
+    detections: List[Dict[str, Any]] = []
+    for box, score, label, track_id, detection_id in zip(
+        accepted_frame.get("boxes", []),
+        accepted_frame.get("scores", []),
+        accepted_frame.get("labels", []),
+        accepted_frame.get("track_ids", []),
+        accepted_frame.get("detection_ids", []),
+    ):
+        detections.append(
+            {
+                "bbox": list(box),
+                "score": _safe_float(score),
+                "class": str(label),
+                "track_id": int(track_id),
+                "detection_id": str(detection_id),
+            }
+        )
+    return detections
+
+
+def _candidate_rejection_payload(
+    detection: Dict[str, Any],
+    reason: str,
+    **extra: Any,
+) -> Dict[str, Any]:
+    return {
+        "detection_id": str(detection.get("detection_id", "")),
+        "bbox": list(detection.get("bbox", [])),
+        "class": str(detection.get("class", "unknown")),
+        "score": _safe_float(detection.get("score", 0.0)),
+        "candidate_source": str(detection.get("candidate_source", "")),
+        "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
+        "pre_tracking_score": _safe_float(detection.get("pre_tracking_score", 0.0)),
+        "matched_prior_ids": list(detection.get("matched_prior_ids", [])),
+        "prior_relevance_score": _safe_float(detection.get("prior_relevance_score", 0.0)),
+        "tracking_priority": str(detection.get("tracking_priority", "")),
+        "accepted_track_suppression_iou": _safe_float(detection.get("accepted_track_suppression_iou", 0.0)),
+        "accepted_track_suppression_track_id": detection.get("accepted_track_suppression_track_id"),
+        "prior_metadata": dict(detection.get("prior_metadata", {})),
+        "rejection_reason": str(reason),
+        **extra,
+    }
+
+
+def _accepted_track_suppression(
+    detection: Dict[str, Any],
+    accepted_frame_detections: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    label = str(detection.get("class", "unknown"))
+    bbox = list(detection.get("bbox", []))
+    best_match: Dict[str, Any] = {}
+    for accepted in accepted_frame_detections:
+        if str(accepted.get("class", "")) != label:
+            continue
+        iou = _match_iou(bbox, list(accepted.get("bbox", [])))
+        if iou > _safe_float(best_match.get("iou", 0.0)):
+            best_match = {
+                "iou": float(iou),
+                "track_id": int(accepted.get("track_id", -1)),
+                "detection_id": str(accepted.get("detection_id", "")),
+            }
+    return best_match
+
+
+def _candidate_pretracking_score(
+    detection: Dict[str, Any],
+    orig_shape: Tuple[int, int],
+    policy: Dict[str, Any],
+) -> float:
+    gate_cfg = dict(policy.get("pre_tracking_gate", {}))
+    spatial_plausibility = 1.0 if _candidate_spatially_plausible(detection, orig_shape, policy) else 0.0
+    accepted_suppression = _safe_float(detection.get("accepted_track_suppression_iou", 0.0))
+    return (
+        _safe_float(gate_cfg.get("visual_score_weight", 0.45), 0.45) * _safe_float(detection.get("score", 0.0))
+        + _safe_float(gate_cfg.get("prior_relevance_weight", 0.25), 0.25) * _safe_float(detection.get("prior_relevance_score", 0.0))
+        + _safe_float(gate_cfg.get("tracking_priority_weight", 0.15), 0.15) * _tracking_priority_value(
+            str(detection.get("tracking_priority", "")),
+            policy,
+        )
+        + _safe_float(gate_cfg.get("spatial_plausibility_weight", 0.1), 0.1) * spatial_plausibility
+        - _safe_float(gate_cfg.get("accepted_track_suppression_weight", 0.35), 0.35) * accepted_suppression
+    )
+
+
 def _candidate_selection_decision(
     detection: Dict[str, Any],
     orig_shape: Tuple[int, int],
@@ -680,6 +810,140 @@ def _candidate_track_rejection_entry(track: Dict[str, Any], reason: str, **extra
     }
 
 
+def _center_distance_ratio(box_a: Sequence[float], box_b: Sequence[float], orig_shape: Tuple[int, int]) -> float:
+    ax, ay = _center_xy(box_a)
+    bx, by = _center_xy(box_b)
+    frame_h, frame_w = orig_shape
+    norm_x = max(1.0, float(frame_w))
+    norm_y = max(1.0, float(frame_h))
+    dx = (ax - bx) / norm_x
+    dy = (ay - by) / norm_y
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _track_prior_signature(track: Dict[str, Any], max_ids: int = 2) -> Tuple[str, ...]:
+    summary = _candidate_summary_from_track(track)
+    prior_ids = [str(value) for value in list(summary.get("matched_prior_ids", [])) if str(value)]
+    return tuple(sorted(prior_ids[:max_ids])) if prior_ids else ("no_prior",)
+
+
+def _track_mean_center(track: Dict[str, Any]) -> Tuple[float, float]:
+    observations = list(track.get("observations", []))
+    if not observations:
+        return (0.0, 0.0)
+    centers = [_center_xy(list(obs.get("bbox", []))) for obs in observations if len(list(obs.get("bbox", []))) >= 4]
+    if not centers:
+        return (0.0, 0.0)
+    return (
+        float(sum(center[0] for center in centers) / len(centers)),
+        float(sum(center[1] for center in centers) / len(centers)),
+    )
+
+
+def _track_bucket_keys(
+    track: Dict[str, Any],
+    orig_shape: Tuple[int, int],
+    time_bucket_size: int,
+    grid_size: Sequence[int],
+) -> List[Tuple[Any, ...]]:
+    summary = _candidate_summary_from_track(track)
+    label = str(summary.get("label", "unknown"))
+    first_frame = int(summary.get("first_frame_index", -1))
+    last_frame = int(summary.get("last_frame_index", -1))
+    midpoint_frame = max(0, (first_frame + last_frame) // 2)
+    time_bucket = midpoint_frame // max(1, time_bucket_size)
+    mean_cx, mean_cy = _track_mean_center(track)
+    frame_h, frame_w = orig_shape
+    grid_w = max(1, _safe_int(grid_size[0] if len(grid_size) > 0 else 4, 4))
+    grid_h = max(1, _safe_int(grid_size[1] if len(grid_size) > 1 else 3, 3))
+    cell_x = min(grid_w - 1, max(0, int((mean_cx / max(1.0, float(frame_w))) * grid_w)))
+    cell_y = min(grid_h - 1, max(0, int((mean_cy / max(1.0, float(frame_h))) * grid_h)))
+    prior_sig = _track_prior_signature(track)
+    keys: List[Tuple[Any, ...]] = []
+    for delta_t in (-1, 0, 1):
+        for delta_x in (-1, 0, 1):
+            for delta_y in (-1, 0, 1):
+                keys.append(
+                    (
+                        label,
+                        prior_sig,
+                        time_bucket + delta_t,
+                        min(grid_w - 1, max(0, cell_x + delta_x)),
+                        min(grid_h - 1, max(0, cell_y + delta_y)),
+                    )
+                )
+    return keys
+
+
+def _merge_track_fragments(
+    tracks: List[Dict[str, Any]],
+    orig_shape: Tuple[int, int],
+    policy: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    merge_cfg = dict(policy.get("early_fragment_merge", {}))
+    if not bool(merge_cfg.get("enabled", True)) or len(tracks) < 2:
+        return tracks
+    max_frame_gap = max(0, _safe_int(merge_cfg.get("max_frame_gap", 2), 2))
+    min_end_start_iou = _safe_float(merge_cfg.get("min_end_start_iou", 0.2), 0.2)
+    max_center_distance = _safe_float(merge_cfg.get("max_center_distance_ratio", 0.1), 0.1)
+    time_bucket_size = max(1, _safe_int(merge_cfg.get("time_bucket_size", 12), 12))
+    grid_size = list(merge_cfg.get("grid_size", [4, 3]))
+
+    sorted_tracks = sorted(
+        tracks,
+        key=lambda track: (
+            str(track.get("label", "unknown")),
+            int(_candidate_summary_from_track(track).get("first_frame_index", -1)),
+            int(track.get("track_id", -1)),
+        ),
+    )
+    bucket_index: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
+    merged_tracks: List[Dict[str, Any]] = []
+    for track in sorted_tracks:
+        summary = _candidate_summary_from_track(track)
+        label = str(summary.get("label", "unknown"))
+        first_frame = int(summary.get("first_frame_index", -1))
+        start_box = list(track.get("observations", [{}])[0].get("bbox", [])) if track.get("observations") else []
+        best_merge_target: Optional[Dict[str, Any]] = None
+        best_merge_score = -1.0
+        for bucket_key in _track_bucket_keys(track, orig_shape, time_bucket_size, grid_size):
+            for existing in bucket_index.get(bucket_key, []):
+                existing_summary = _candidate_summary_from_track(existing)
+                if str(existing_summary.get("label", "unknown")) != label:
+                    continue
+                last_frame = int(existing_summary.get("last_frame_index", -1))
+                frame_gap = first_frame - last_frame
+                if frame_gap < 1 or frame_gap > max_frame_gap:
+                    continue
+                if _track_prior_signature(existing) != _track_prior_signature(track):
+                    continue
+                end_box = list(existing.get("observations", [{}])[-1].get("bbox", [])) if existing.get("observations") else []
+                if len(start_box) < 4 or len(end_box) < 4:
+                    continue
+                end_start_iou = _match_iou(start_box, end_box)
+                center_distance = _center_distance_ratio(start_box, end_box, orig_shape)
+                if end_start_iou < min_end_start_iou and center_distance > max_center_distance:
+                    continue
+                merge_score = end_start_iou - center_distance
+                if merge_score > best_merge_score:
+                    best_merge_target = existing
+                    best_merge_score = merge_score
+        if best_merge_target is None:
+            merged_tracks.append(track)
+            for bucket_key in _track_bucket_keys(track, orig_shape, time_bucket_size, grid_size):
+                bucket_index[bucket_key].append(track)
+            continue
+        best_merge_target["observations"].extend(list(track.get("observations", [])))
+        best_merge_target["observations"].sort(key=lambda obs: int(obs.get("frame_index", -1)))
+        best_merge_target["match_ious"].extend(list(track.get("match_ious", [])))
+        best_merge_target["last_bbox"] = list(best_merge_target.get("observations", [{}])[-1].get("bbox", []))
+        best_merge_target["last_frame_index"] = int(
+            best_merge_target.get("observations", [{}])[-1].get("frame_index", best_merge_target.get("last_frame_index", -1))
+        )
+        best_merge_target.setdefault("merged_fragment_track_ids", []).append(int(track.get("track_id", -1)))
+    return merged_tracks
+
+
 # ---------------------------------------------------------------------------
 # Per-video tracking
 # ---------------------------------------------------------------------------
@@ -758,17 +1022,47 @@ def _run_candidate_tracking(
     completed_tracks: List[Dict[str, Any]] = []
     rejected_frames: List[Dict[str, Any]] = []
     rejection_reason_counts: Counter[str] = Counter()
+    accepted_frame_map = {
+        int(rec.get("frame_index", -1)): rec
+        for rec in accepted_frames
+    }
+    temporal_cfg = dict(policy.get("temporal_consistency_gate", {}))
+    threshold_cfg = dict(policy.get("candidate_selection_thresholds", {}))
+    exploration_cfg = dict(policy.get("exploration_quota", {}))
+    gate_cfg = dict(policy.get("pre_tracking_gate", {}))
+    budget_cfg = dict(policy.get("selection_budgets", {}))
     next_track_id = _CANDIDATE_TRACK_ID_OFFSET
+    total_tracking_inputs = 0
+    tracking_input_frames: List[Dict[str, Any]] = []
+
     for rec in frame_records:
         frame_index = int(rec.get("frame_index", -1))
-        temporal_cfg = dict(policy.get("temporal_consistency_gate", {}))
-        threshold_cfg = dict(policy.get("candidate_selection_thresholds", {}))
-        exploration_cfg = dict(policy.get("exploration_quota", {}))
         max_idle_frames = _safe_int(temporal_cfg.get("max_idle_frames", 2), 2)
         max_frame_gap = _safe_int(temporal_cfg.get("max_frame_gap", 1), 1)
         match_iou_threshold = _safe_float(temporal_cfg.get("match_iou_threshold", 0.3), 0.3)
         exploration_quota = max(0, _safe_int(exploration_cfg.get("non_prior_high_score_candidates_per_frame", 1), 1))
         exploration_min_score = _safe_float(exploration_cfg.get("non_prior_high_score_min_score", 0.35), 0.35)
+        max_candidates_per_frame = max(0, _safe_int(gate_cfg.get("max_candidates_per_frame", 18), 18))
+        max_candidates_per_class_default = max(
+            0,
+            _safe_int(gate_cfg.get("max_candidates_per_class_per_frame_default", 3), 3),
+        )
+        max_tracking_inputs_per_video = max(
+            0,
+            _safe_int(
+                gate_cfg.get(
+                    "max_tracking_inputs_per_video",
+                    budget_cfg.get("max_tracking_inputs_per_video", 320),
+                ),
+                320,
+            ),
+        )
+        per_class_frame_budget_cfg = {
+            str(key): max(0, _safe_int(value, max_candidates_per_class_default))
+            for key, value in dict(gate_cfg.get("max_candidates_per_class_per_frame", {})).items()
+        }
+        accepted_suppression_iou = _safe_float(gate_cfg.get("accepted_track_suppression_iou", 0.4), 0.4)
+        min_gate_score = _safe_float(gate_cfg.get("min_gate_score", 0.2), 0.2)
 
         filtered_active_tracks: Dict[int, Dict[str, Any]] = {}
         for track_id, track in active_tracks.items():
@@ -778,8 +1072,9 @@ def _run_candidate_tracking(
                 completed_tracks.append(track)
         active_tracks = filtered_active_tracks
 
-        candidate_inputs: List[Dict[str, Any]] = []
+        candidate_input_pool: List[Dict[str, Any]] = []
         rejected_candidates: List[Dict[str, Any]] = []
+        accepted_frame_detections = _accepted_frame_detections(accepted_frame_map.get(frame_index))
         for det_index, det in enumerate(_candidate_detection_records(rec)):
             detection = dict(det)
             detection["bbox"] = _coerce_bbox(detection.get("bbox", []))
@@ -797,35 +1092,79 @@ def _run_candidate_tracking(
             detection["prior_relevance_score"] = _safe_float(
                 detection["prior_metadata"].get("prior_relevance_score", 0.0)
             )
+            detection["tracking_priority"] = _top_tracking_priority(detection)
+            accepted_suppression = _accepted_track_suppression(detection, accepted_frame_detections)
+            detection["accepted_track_suppression_iou"] = _safe_float(accepted_suppression.get("iou", 0.0))
+            detection["accepted_track_suppression_track_id"] = accepted_suppression.get("track_id")
+            detection["accepted_track_suppression_detection_id"] = accepted_suppression.get("detection_id")
+            detection["pre_tracking_score"] = _candidate_pretracking_score(detection, orig_shape, policy)
             is_selected, rejection_reason = _candidate_selection_decision(detection, orig_shape, policy)
             detection["exploration_eligible"] = (
                 not detection["matched_prior_ids"]
                 and detection["score"] >= exploration_min_score
             )
-            if is_selected:
-                candidate_inputs.append(detection)
-            else:
-                rejected_candidates.append(
-                    {
-                        "detection_id": str(detection.get("detection_id", "")),
-                        "bbox": list(detection.get("bbox", [])),
-                        "class": str(detection.get("class", "unknown")),
-                        "score": _safe_float(detection.get("score", 0.0)),
-                        "candidate_source": str(detection.get("candidate_source", "")),
-                        "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
-                        "matched_prior_ids": list(detection.get("matched_prior_ids", [])),
-                        "prior_relevance_score": _safe_float(detection.get("prior_relevance_score", 0.0)),
-                        "prior_metadata": dict(detection.get("prior_metadata", {})),
-                        "rejection_reason": rejection_reason,
-                    }
-                )
+            if not is_selected:
+                rejected_candidates.append(_candidate_rejection_payload(detection, rejection_reason))
                 rejection_reason_counts.update([rejection_reason])
+                continue
+            if detection["accepted_track_suppression_iou"] >= accepted_suppression_iou:
+                rejected_candidates.append(
+                    _candidate_rejection_payload(
+                        detection,
+                        "suppressed_by_accepted_track",
+                    )
+                )
+                rejection_reason_counts.update(["suppressed_by_accepted_track"])
+                continue
+            if _safe_float(detection.get("pre_tracking_score", 0.0)) < min_gate_score:
+                rejected_candidates.append(
+                    _candidate_rejection_payload(
+                        detection,
+                        "below_pre_tracking_gate_score",
+                    )
+                )
+                rejection_reason_counts.update(["below_pre_tracking_gate_score"])
+                continue
+            candidate_input_pool.append(detection)
 
-        candidate_inputs.sort(
+        candidate_input_pool.sort(
             key=lambda row: (
+                -_safe_float(row.get("pre_tracking_score", 0.0)),
                 -_safe_float(row.get("combined_tracking_score", 0.0)),
                 -_safe_float(row.get("score", 0.0)),
             )
+        )
+        candidate_inputs: List[Dict[str, Any]] = []
+        selected_per_class: Counter[str] = Counter()
+        for detection in candidate_input_pool:
+            label = str(detection.get("class", "unknown"))
+            class_budget = per_class_frame_budget_cfg.get(label, max_candidates_per_class_default)
+            if class_budget and selected_per_class[label] >= class_budget:
+                rejected_candidates.append(
+                    _candidate_rejection_payload(detection, "frame_class_input_budget_exceeded", class_budget=class_budget)
+                )
+                rejection_reason_counts.update(["frame_class_input_budget_exceeded"])
+                continue
+            if max_candidates_per_frame and len(candidate_inputs) >= max_candidates_per_frame:
+                rejected_candidates.append(_candidate_rejection_payload(detection, "frame_input_budget_exceeded"))
+                rejection_reason_counts.update(["frame_input_budget_exceeded"])
+                continue
+            if max_tracking_inputs_per_video and total_tracking_inputs >= max_tracking_inputs_per_video:
+                rejected_candidates.append(_candidate_rejection_payload(detection, "video_input_budget_exceeded"))
+                rejection_reason_counts.update(["video_input_budget_exceeded"])
+                continue
+            candidate_inputs.append(detection)
+            selected_per_class.update([label])
+            total_tracking_inputs += 1
+
+        tracking_input_frames.append(
+            {
+                "frame": rec.get("frame", ""),
+                "frame_index": frame_index,
+                "image_path": rec.get("image_path", ""),
+                "tracking_input_detection_ids": [str(row.get("detection_id", "")) for row in candidate_inputs],
+                "num_tracking_input_candidates": len(candidate_inputs),
+            }
         )
 
         selected_non_prior_exploration = 0
@@ -836,37 +1175,11 @@ def _run_candidate_tracking(
             bbox = list(detection.get("bbox", []))
             is_non_prior = not bool(detection.get("matched_prior_ids"))
             if is_non_prior and not bool(detection.get("exploration_eligible", False)):
-                rejected_candidates.append(
-                    {
-                        "detection_id": str(detection.get("detection_id", "")),
-                        "bbox": bbox,
-                        "class": label,
-                        "score": _safe_float(detection.get("score", 0.0)),
-                        "candidate_source": str(detection.get("candidate_source", "")),
-                        "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
-                        "matched_prior_ids": [],
-                        "prior_relevance_score": 0.0,
-                        "prior_metadata": dict(detection.get("prior_metadata", {})),
-                        "rejection_reason": "non_prior_not_exploration_eligible",
-                    }
-                )
+                rejected_candidates.append(_candidate_rejection_payload(detection, "non_prior_not_exploration_eligible"))
                 rejection_reason_counts.update(["non_prior_not_exploration_eligible"])
                 continue
             if is_non_prior and selected_non_prior_exploration >= exploration_quota:
-                rejected_candidates.append(
-                    {
-                        "detection_id": str(detection.get("detection_id", "")),
-                        "bbox": bbox,
-                        "class": label,
-                        "score": _safe_float(detection.get("score", 0.0)),
-                        "candidate_source": str(detection.get("candidate_source", "")),
-                        "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
-                        "matched_prior_ids": [],
-                        "prior_relevance_score": 0.0,
-                        "prior_metadata": dict(detection.get("prior_metadata", {})),
-                        "rejection_reason": "exploration_quota_exceeded",
-                    }
-                )
+                rejected_candidates.append(_candidate_rejection_payload(detection, "exploration_quota_exceeded"))
                 rejection_reason_counts.update(["exploration_quota_exceeded"])
                 continue
             best_track: Optional[Dict[str, Any]] = None
@@ -890,20 +1203,7 @@ def _run_candidate_tracking(
                     threshold_cfg.get("min_new_track_combined_score", 0.45),
                     0.45,
                 ):
-                    rejected_candidates.append(
-                        {
-                            "detection_id": str(detection.get("detection_id", "")),
-                            "bbox": bbox,
-                            "class": label,
-                            "score": _safe_float(detection.get("score", 0.0)),
-                            "candidate_source": str(detection.get("candidate_source", "")),
-                            "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
-                            "matched_prior_ids": list(detection.get("matched_prior_ids", [])),
-                            "prior_relevance_score": _safe_float(detection.get("prior_relevance_score", 0.0)),
-                            "prior_metadata": dict(detection.get("prior_metadata", {})),
-                            "rejection_reason": "below_new_track_combined_score",
-                        }
-                    )
+                    rejected_candidates.append(_candidate_rejection_payload(detection, "below_new_track_combined_score"))
                     rejection_reason_counts.update(["below_new_track_combined_score"])
                     continue
                 best_track_id = next_track_id
@@ -918,23 +1218,6 @@ def _run_candidate_tracking(
                 }
                 active_tracks[best_track_id] = best_track
                 best_iou = 1.0
-            elif best_iou < match_iou_threshold:
-                rejected_candidates.append(
-                    {
-                        "detection_id": str(detection.get("detection_id", "")),
-                        "bbox": bbox,
-                        "class": label,
-                        "score": _safe_float(detection.get("score", 0.0)),
-                        "candidate_source": str(detection.get("candidate_source", "")),
-                        "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
-                        "matched_prior_ids": list(detection.get("matched_prior_ids", [])),
-                        "prior_relevance_score": _safe_float(detection.get("prior_relevance_score", 0.0)),
-                        "prior_metadata": dict(detection.get("prior_metadata", {})),
-                        "rejection_reason": "temporal_match_below_threshold",
-                    }
-                )
-                rejection_reason_counts.update(["temporal_match_below_threshold"])
-                continue
 
             used_track_ids.add(int(best_track_id))
             if is_non_prior:
@@ -974,10 +1257,10 @@ def _run_candidate_tracking(
 
     completed_tracks.extend(active_tracks.values())
     raw_tracks = [track for track in completed_tracks if track.get("observations")]
+    raw_tracks = _merge_track_fragments(raw_tracks, orig_shape, policy)
     accepted_track_records = _accepted_track_records(accepted_frames)
     dedupe_cfg = dict(policy.get("candidate_track_deduplication", {}))
     selection_cfg = dict(policy.get("candidate_track_selection", {}))
-    budget_cfg = dict(policy.get("selection_budgets", {}))
 
     candidate_duplicate_threshold = _safe_float(
         dedupe_cfg.get("candidate_duplicate_mean_iou", 0.55),
@@ -994,6 +1277,12 @@ def _run_candidate_tracking(
     accepted_duplicate_shared_ratio = _safe_float(
         dedupe_cfg.get("accepted_duplicate_shared_frame_ratio", 0.5),
         0.5,
+    )
+    dedupe_time_bucket_size = max(1, _safe_int(dedupe_cfg.get("time_bucket_size", 12), 12))
+    dedupe_grid_size = list(dedupe_cfg.get("grid_size", [4, 3]))
+    dedupe_center_distance_threshold = _safe_float(
+        dedupe_cfg.get("center_distance_threshold_ratio", 0.12),
+        0.12,
     )
 
     prefiltered_tracks: List[Dict[str, Any]] = []
@@ -1032,6 +1321,22 @@ def _run_candidate_tracking(
             continue
         prefiltered_tracks.append(track)
 
+    max_raw_tracks = max(0, _safe_int(budget_cfg.get("max_raw_tracks", 160), 160))
+    if max_raw_tracks and len(prefiltered_tracks) > max_raw_tracks:
+        prefiltered_tracks.sort(
+            key=lambda track: (
+                -_safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
+                -len(list(track.get("observations", []))),
+                int(track.get("track_id", -1)),
+            )
+        )
+        kept_prefiltered = prefiltered_tracks[:max_raw_tracks]
+        overflow_prefiltered = prefiltered_tracks[max_raw_tracks:]
+        for track in overflow_prefiltered:
+            rejected_track_entries.append(_candidate_track_rejection_entry(track, "raw_track_budget_exceeded"))
+            rejected_track_reason_counts.update(["raw_track_budget_exceeded"])
+        prefiltered_tracks = kept_prefiltered
+
     prefiltered_tracks.sort(
         key=lambda track: (
             -_safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
@@ -1041,12 +1346,26 @@ def _run_candidate_tracking(
     )
 
     deduplicated_tracks: List[Dict[str, Any]] = []
+    dedupe_bucket_index: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
     for track in prefiltered_tracks:
         best_candidate_overlap: Dict[str, Any] = {}
-        for kept_track in deduplicated_tracks:
+        candidate_neighbors: List[Dict[str, Any]] = []
+        seen_neighbor_ids: set[int] = set()
+        for bucket_key in _track_bucket_keys(track, orig_shape, dedupe_time_bucket_size, dedupe_grid_size):
+            for kept_track in dedupe_bucket_index.get(bucket_key, []):
+                kept_track_id = int(kept_track.get("track_id", -1))
+                if kept_track_id in seen_neighbor_ids:
+                    continue
+                seen_neighbor_ids.add(kept_track_id)
+                candidate_neighbors.append(kept_track)
+        for kept_track in candidate_neighbors:
             if str(kept_track.get("label", "")) != str(track.get("label", "")):
                 continue
             overlap = _track_overlap_metrics(track, kept_track)
+            last_box = list(kept_track.get("observations", [{}])[-1].get("bbox", [])) if kept_track.get("observations") else []
+            current_box = list(track.get("observations", [{}])[0].get("bbox", [])) if track.get("observations") else []
+            center_distance = _center_distance_ratio(last_box, current_box, orig_shape) if len(last_box) >= 4 and len(current_box) >= 4 else 1.0
+            overlap["center_distance_ratio"] = float(center_distance)
             if _safe_float(overlap.get("overlap_score", 0.0)) > _safe_float(
                 best_candidate_overlap.get("overlap_score", 0.0)
             ):
@@ -1060,6 +1379,7 @@ def _run_candidate_tracking(
             best_candidate_overlap
             and _safe_float(best_candidate_overlap.get("mean_iou", 0.0)) >= candidate_duplicate_threshold
             and _safe_float(best_candidate_overlap.get("shared_frame_ratio", 0.0)) >= candidate_duplicate_shared_ratio
+            and _safe_float(best_candidate_overlap.get("center_distance_ratio", 0.0)) <= dedupe_center_distance_threshold
         ):
             rejected_track_entries.append(
                 _candidate_track_rejection_entry(
@@ -1071,6 +1391,24 @@ def _run_candidate_tracking(
             rejected_track_reason_counts.update(["duplicate_of_candidate_track"])
             continue
         deduplicated_tracks.append(track)
+        for bucket_key in _track_bucket_keys(track, orig_shape, dedupe_time_bucket_size, dedupe_grid_size):
+            dedupe_bucket_index[bucket_key].append(track)
+
+    max_deduplicated_tracks = max(0, _safe_int(budget_cfg.get("max_deduplicated_tracks", 64), 64))
+    if max_deduplicated_tracks and len(deduplicated_tracks) > max_deduplicated_tracks:
+        deduplicated_tracks.sort(
+            key=lambda track: (
+                -_safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
+                -_safe_float(dict(track.get("score_breakdown", {})).get("temporal_consistency", 0.0)),
+                int(track.get("track_id", -1)),
+            )
+        )
+        kept_deduplicated = deduplicated_tracks[:max_deduplicated_tracks]
+        overflow_deduplicated = deduplicated_tracks[max_deduplicated_tracks:]
+        for track in overflow_deduplicated:
+            rejected_track_entries.append(_candidate_track_rejection_entry(track, "deduplicated_track_budget_exceeded"))
+            rejected_track_reason_counts.update(["deduplicated_track_budget_exceeded"])
+        deduplicated_tracks = kept_deduplicated
 
     for track in deduplicated_tracks:
         track["score_breakdown"] = _candidate_track_score_breakdown(track, orig_shape, policy)
@@ -1084,7 +1422,13 @@ def _run_candidate_tracking(
         )
     )
 
-    max_tracks_per_video = max(0, _safe_int(budget_cfg.get("max_tracks_per_video", 24), 24))
+    max_tracks_per_video = max(
+        0,
+        _safe_int(
+            budget_cfg.get("max_selected_tracks", budget_cfg.get("max_tracks_per_video", 24)),
+            24,
+        ),
+    )
     max_tracks_per_class_default = max(0, _safe_int(budget_cfg.get("max_tracks_per_class_default", 4), 4))
     per_class_budget_cfg = {
         str(key): max(0, _safe_int(value, max_tracks_per_class_default))
@@ -1132,6 +1476,11 @@ def _run_candidate_tracking(
         )
     )
     return {
+        "num_tracking_input_candidates": total_tracking_inputs,
+        "tracking_input_candidates": {
+            "num_candidates": total_tracking_inputs,
+            "frames": tracking_input_frames,
+        },
         "raw_candidate_tracks": {
             "num_tracks": len(raw_tracks),
             "frames": _tracks_to_frame_records(raw_tracks),
@@ -1162,6 +1511,19 @@ def _run_candidate_tracking(
         "rejected_candidate_detections": rejected_detections_bundle,
         "selection_policy": policy,
         "selection_budgets": {
+            "max_tracking_inputs_per_video": max(
+                0,
+                _safe_int(
+                    gate_cfg.get(
+                        "max_tracking_inputs_per_video",
+                        budget_cfg.get("max_tracking_inputs_per_video", 320),
+                    ),
+                    320,
+                ),
+            ),
+            "max_raw_tracks": max_raw_tracks,
+            "max_deduplicated_tracks": max_deduplicated_tracks,
+            "max_selected_tracks": max_tracks_per_video,
             "max_tracks_per_video": max_tracks_per_video,
             "max_tracks_per_class_default": max_tracks_per_class_default,
             "max_tracks_per_class": dict(sorted(per_class_budget_cfg.items())),
@@ -1239,12 +1601,14 @@ def track_video(
     raw_candidate_tracks = dict(candidate_track_bundle.get("raw_candidate_tracks", {}))
     deduplicated_candidate_tracks = dict(candidate_track_bundle.get("deduplicated_candidate_tracks", {}))
     rejected_candidate_tracks = dict(candidate_track_bundle.get("rejected_candidate_tracks", {}))
+    tracking_input_candidates = dict(candidate_track_bundle.get("tracking_input_candidates", {}))
 
     result: Dict[str, Any] = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
         "num_frames": len(accepted_frames),
         "num_tracks": len(accepted_track_ids),
+        "num_tracking_input_candidate_detections": int(candidate_track_bundle.get("num_tracking_input_candidates", 0)),
         "num_candidate_tracks": int(selected_candidate_tracks.get("num_tracks", 0)),
         "num_raw_candidate_tracks": int(raw_candidate_tracks.get("num_tracks", 0)),
         "num_deduplicated_candidate_tracks": int(deduplicated_candidate_tracks.get("num_tracks", 0)),
@@ -1260,6 +1624,7 @@ def track_video(
             "num_tracks": int(selected_candidate_tracks.get("num_tracks", 0)),
             "frames": list(selected_candidate_tracks.get("frames", [])),
             "track_summaries": list(selected_candidate_tracks.get("track_summaries", [])),
+            "tracking_input_candidates": tracking_input_candidates,
             "raw_candidate_tracks": raw_candidate_tracks,
             "deduplicated_candidate_tracks": deduplicated_candidate_tracks,
             "selected_candidate_tracks": selected_candidate_tracks,
@@ -1342,6 +1707,7 @@ def run(
                 "video_id": r["video_id"],
                 "num_frames": r["num_frames"],
                 "num_tracks": r["num_tracks"],
+                "num_tracking_input_candidate_detections": int(r.get("num_tracking_input_candidate_detections", 0)),
                 "num_candidate_tracks": int(r.get("num_candidate_tracks", 0)),
                 "num_raw_candidate_tracks": int(r.get("num_raw_candidate_tracks", 0)),
                 "num_deduplicated_candidate_tracks": int(r.get("num_deduplicated_candidate_tracks", 0)),
@@ -1356,6 +1722,9 @@ def run(
         json.dump(manifest, fh, indent=2)
 
     total_tracks = sum(r["num_tracks"] for r in tracking_results)
+    total_tracking_input_candidates = sum(
+        int(r.get("num_tracking_input_candidate_detections", 0)) for r in tracking_results
+    )
     total_raw_candidate_tracks = sum(int(r.get("num_raw_candidate_tracks", 0)) for r in tracking_results)
     total_deduplicated_candidate_tracks = sum(
         int(r.get("num_deduplicated_candidate_tracks", 0)) for r in tracking_results
@@ -1370,6 +1739,7 @@ def run(
     )
     print(f"\nSaved tracking manifest to {manifest_path}")
     print(f"Total unique tracks across all videos: {total_tracks}")
+    print(f"Total tracking-input candidate detections across all videos: {total_tracking_input_candidates}")
     print(f"Total raw candidate tracks across all videos: {total_raw_candidate_tracks}")
     print(f"Total deduplicated candidate tracks across all videos: {total_deduplicated_candidate_tracks}")
     print(f"Total selected candidate tracks across all videos: {total_candidate_tracks}")
