@@ -179,6 +179,13 @@ def get_output_root() -> Path:
     return out
 
 
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    tmp_path.replace(path)
+
+
 def _track_color(track_id: int) -> tuple[int, int, int]:
     """Return a stable BGR color for a given track ID."""
     h = (track_id * 37) % 360
@@ -1557,8 +1564,12 @@ def track_video(
     tracks_file = out_dir / "tracks.json"
 
     if not force_recompute and tracks_file.exists():
-        with tracks_file.open("r", encoding="utf-8") as fh:
-            cached = json.load(fh)
+        try:
+            with tracks_file.open("r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            print(f"[warn] Ignoring invalid tracking cache for {video_id}: {exc}")
+            cached = {}
         cache_is_current = (
             int(cached.get("schema_version", 1)) >= _TRACKING_SCHEMA_VERSION
             and isinstance(cached.get("accepted_tracks"), dict)
@@ -1577,8 +1588,7 @@ def track_video(
                 )
                 if render_path:
                     cached["tracked_video_path"] = render_path
-                    with tracks_file.open("w", encoding="utf-8") as fh:
-                        json.dump(cached, fh, indent=2)
+                    _write_json_atomic(tracks_file, cached)
             return cached
 
     frame_records: List[Dict[str, Any]] = video_result.get("frames", [])
@@ -1638,8 +1648,7 @@ def track_video(
         },
     }
 
-    with tracks_file.open("w", encoding="utf-8") as fh:
-        json.dump(result, fh, indent=2)
+    _write_json_atomic(tracks_file, result)
 
     # Render annotated video with track IDs
     tracked_video_file = out_dir / "tracks_boxed.mp4"
@@ -1652,8 +1661,7 @@ def track_video(
         )
         if render_path:
             result["tracked_video_path"] = render_path
-            with tracks_file.open("w", encoding="utf-8") as fh:
-                json.dump(result, fh, indent=2)
+            _write_json_atomic(tracks_file, result)
     return result
 
 
@@ -1718,8 +1726,7 @@ def run(
         ],
     }
     manifest_path = effective_output_root / "tracks_manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
+    _write_json_atomic(manifest_path, manifest)
 
     total_tracks = sum(r["num_tracks"] for r in tracking_results)
     total_tracking_input_candidates = sum(
