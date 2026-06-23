@@ -400,6 +400,7 @@ def render_detection_video(
 def process_video(
     video_id: str,
     detector: ObjectDetector,
+    background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -643,6 +644,7 @@ def run(
             result = process_video(
                 video_id=video_id,
                 detector=detector,
+                background_rule_relevance_prior_results=background_rule_relevance_prior_results,
                 frames_root=effective_frames_root,
                 output_root=effective_output_root,
                 force_recompute=force_recompute,
