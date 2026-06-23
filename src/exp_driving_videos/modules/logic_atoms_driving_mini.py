@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 2
+_LOGIC_ATOMS_VERSION = 3
 
 
 def get_output_root() -> Path:
@@ -56,6 +56,44 @@ def _seg_id(segment_index: int) -> str:
 
 def _obj_id(track_id: int) -> str:
     return f"obj_{int(track_id):04d}"
+
+
+def _candidate_obj_id(candidate_object: Dict[str, Any]) -> str:
+    candidate_object_id = str(candidate_object.get("candidate_object_id", "")).strip()
+    if candidate_object_id:
+        return f"obj_candidate_{_sym(candidate_object_id)}"
+    candidate_track_id = int(candidate_object.get("candidate_track_id", candidate_object.get("track_id", -1)))
+    return f"obj_candidate_track_{candidate_track_id:04d}"
+
+
+def _score_state(value: float, high_threshold: float = 0.67, medium_threshold: float = 0.34) -> str:
+    score = float(value)
+    if score >= high_threshold:
+        return "high"
+    if score >= medium_threshold:
+        return "medium"
+    return "low"
+
+
+def _matched_prior_ids(obj: Dict[str, Any]) -> List[str]:
+    prior_metadata = dict(obj.get("prior_metadata", {}))
+    values = {
+        str(value).strip()
+        for value in list(prior_metadata.get("matched_prior_ids", []))
+        + list(prior_metadata.get("track_matched_prior_ids", []))
+        if str(value).strip()
+    }
+    return sorted(values)
+
+
+def _prior_relevance_score(obj: Dict[str, Any]) -> float:
+    prior_metadata = dict(obj.get("prior_metadata", {}))
+    candidates = [
+        prior_metadata.get("prior_relevance_score", 0.0),
+        prior_metadata.get("prior_relevance_mean", 0.0),
+        prior_metadata.get("prior_relevance_max", 0.0),
+    ]
+    return max(float(value) for value in candidates)
 
 
 def _make_atom(predicate: str, *args: Any) -> str:
@@ -107,10 +145,15 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def _print_video_summary(result: Dict[str, Any]) -> None:
     video_id = str(result.get("video_id", "unknown"))
     num_objects = int(result.get("num_objects", 0))
+    num_candidate_objects = int(result.get("num_candidate_objects", 0))
     object_types = [str(v) for v in result.get("object_types", [])]
     num_atoms = int(result.get("num_atoms", 0))
     object_types_text = ", ".join(object_types) if object_types else "none"
-    print(f"  {video_id}: objects={num_objects} | types=[{object_types_text}] | atoms={num_atoms}")
+    print(
+        f"  {video_id}: objects={num_objects} | "
+        f"candidate_objects={num_candidate_objects} | "
+        f"types=[{object_types_text}] | atoms={num_atoms}"
+    )
 
 
 def process_video(
@@ -192,10 +235,16 @@ def process_video(
             _append_segment_atom("segment_end_frame", segment_id, f"frame_{end_frame}")
 
         selected_objects = list(segment.get("selected_objects", segment.get("objects", [])))
+        selected_candidate_objects = list(
+            segment.get("selected_candidate_objects", segment.get("candidate_objects", []))
+        )
         objects_out: List[Dict[str, Any]] = []
-        for obj in selected_objects:
+        candidate_objects_out: List[Dict[str, Any]] = []
+
+        def _emit_object(obj: Dict[str, Any], *, is_candidate: bool) -> Dict[str, Any]:
             track_id = int(obj.get("track_id", -1))
-            object_id = _obj_id(track_id)
+            candidate_track_id = int(obj.get("candidate_track_id", track_id))
+            object_id = _candidate_obj_id(obj) if is_candidate else _obj_id(track_id)
             object_class = str(obj.get("object_class", "unknown"))
             vz_state = str(obj.get("vz_state", "vz_unknown"))
             vx_state = str(obj.get("vx_state", "vx_unknown"))
@@ -232,6 +281,25 @@ def process_video(
             _append_object_atom("object_distance_state", segment_id, object_id, distance_state)
             _append_object_atom("object_visibility_state", segment_id, object_id, visibility_state)
             _append_object_atom("object_x_position_state", segment_id, object_id, x_position_state)
+
+            if is_candidate:
+                selection_score = float(obj.get("selection_score", 0.0))
+                prior_relevance_score = _prior_relevance_score(obj)
+                source_label = "candidate"
+                _append_object_atom("object_source_type", object_id, source_label)
+                _append_object_atom("object_is_candidate", object_id)
+                _append_object_atom(
+                    "object_candidate_score_state",
+                    object_id,
+                    _score_state(selection_score),
+                )
+                _append_object_atom(
+                    "object_prior_relevance_state",
+                    object_id,
+                    _score_state(prior_relevance_score),
+                )
+                for prior_id in _matched_prior_ids(obj):
+                    _append_object_atom("object_matched_prior", object_id, prior_id)
 
             traffic_control_attributes = obj.get("traffic_control_attributes", {})
             if include_traffic_control_atoms and isinstance(traffic_control_attributes, dict):
@@ -292,18 +360,28 @@ def process_video(
                                 traffic_light_state,
                             )
 
-            objects_out.append(
-                {
-                    "track_id": track_id,
-                    "object_id": object_id,
-                    "object_class": object_class,
-                    "traffic_control_attributes": traffic_control_attributes
-                    if isinstance(traffic_control_attributes, dict)
-                    else {},
-                    "atoms": object_atoms,
-                    "atom_records": object_atom_records,
-                }
-            )
+            return {
+                "track_id": track_id,
+                "candidate_track_id": candidate_track_id if is_candidate else track_id,
+                "object_id": object_id,
+                "candidate_object_id": str(obj.get("candidate_object_id", "")) if is_candidate else "",
+                "object_class": object_class,
+                "accepted": not is_candidate,
+                "source_type": str(obj.get("source_type", "accepted")) if is_candidate else "accepted",
+                "selection_score": float(obj.get("selection_score", 0.0)) if is_candidate else 0.0,
+                "prior_metadata": dict(obj.get("prior_metadata", {})) if is_candidate else {},
+                "track_quality": dict(obj.get("track_quality", {})) if is_candidate else {},
+                "traffic_control_attributes": traffic_control_attributes
+                if isinstance(traffic_control_attributes, dict)
+                else {},
+                "atoms": object_atoms,
+                "atom_records": object_atom_records,
+            }
+
+        for obj in selected_objects:
+            objects_out.append(_emit_object(obj, is_candidate=False))
+        for obj in selected_candidate_objects:
+            candidate_objects_out.append(_emit_object(obj, is_candidate=True))
 
         segments_out.append(
             {
@@ -317,6 +395,7 @@ def process_video(
                 "atoms": segment_atoms,
                 "atom_records": segment_atom_records,
                 "objects": objects_out,
+                "candidate_objects": candidate_objects_out,
             }
         )
 
@@ -324,7 +403,15 @@ def process_video(
         {
             obj.get("object_id", "")
             for segment in segments_out
-            for obj in segment.get("objects", [])
+            for obj in list(segment.get("objects", [])) + list(segment.get("candidate_objects", []))
+            if obj.get("object_id", "")
+        }
+    )
+    unique_candidate_object_ids = sorted(
+        {
+            obj.get("object_id", "")
+            for segment in segments_out
+            for obj in segment.get("candidate_objects", [])
             if obj.get("object_id", "")
         }
     )
@@ -332,7 +419,7 @@ def process_video(
         {
             obj.get("object_class", "")
             for segment in segments_out
-            for obj in segment.get("objects", [])
+            for obj in list(segment.get("objects", [])) + list(segment.get("candidate_objects", []))
             if obj.get("object_class", "")
         }
     )
@@ -342,7 +429,9 @@ def process_video(
         "video_id": video_id,
         "num_segments": len(segments_out),
         "num_objects": len(unique_object_ids),
+        "num_candidate_objects": len(unique_candidate_object_ids),
         "object_ids": unique_object_ids,
+        "candidate_object_ids": unique_candidate_object_ids,
         "object_types": object_types,
         "num_atoms": len(all_atoms),
         "config": {
@@ -415,12 +504,14 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _LOGIC_ATOMS_VERSION,
         "num_videos": len(results),
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_segments": r.get("num_segments", 0),
                 "num_objects": r.get("num_objects", 0),
+                "num_candidate_objects": r.get("num_candidate_objects", 0),
                 "object_types": r.get("object_types", []),
                 "num_atoms": r.get("num_atoms", 0),
             }

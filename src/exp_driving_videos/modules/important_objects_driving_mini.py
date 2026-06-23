@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_IMPORTANT_OBJECTS_VERSION = 1
+_IMPORTANT_OBJECTS_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -54,8 +54,10 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def _print_video_summary(result: Dict[str, Any]) -> None:
     print(
         f"  {result.get('video_id', 'unknown')}: "
+        f"objects={int(result.get('num_objects', 0))} | "
         f"candidate_objects={int(result.get('num_candidate_objects', 0))} | "
         f"selected_objects={int(result.get('num_selected_objects', 0))} | "
+        f"selected_candidate_objects={int(result.get('num_selected_candidate_objects', 0))} | "
         f"strategy_applied={bool(result.get('selection_strategy_applied', False))}"
     )
 
@@ -94,25 +96,37 @@ def process_video(
 
     segments_in = list(segment_object_motion_video_result.get("segments", []))
     segments_out: List[Dict[str, Any]] = []
+    num_objects = 0
     num_candidate_objects = 0
     num_selected_objects = 0
+    num_selected_candidate_objects = 0
 
     for segment in segments_in:
         objects = list(segment.get("objects", []))
+        candidate_objects = list(segment.get("candidate_objects", []))
         selected_objects = list(objects) if passthrough_selected_objects else []
+        selected_candidate_objects = list(candidate_objects) if passthrough_selected_objects else []
         filtered_objects: List[Dict[str, Any]] = []
+        filtered_candidate_objects: List[Dict[str, Any]] = []
 
-        num_candidate_objects += len(objects)
+        num_objects += len(objects)
+        num_candidate_objects += len(candidate_objects)
         num_selected_objects += len(selected_objects)
+        num_selected_candidate_objects += len(selected_candidate_objects)
 
         segment_out = dict(segment)
         segment_out["objects"] = objects
+        segment_out["candidate_objects"] = candidate_objects
         segment_out["selected_objects"] = selected_objects
+        segment_out["selected_candidate_objects"] = selected_candidate_objects
         segment_out["filtered_objects"] = filtered_objects
+        segment_out["filtered_candidate_objects"] = filtered_candidate_objects
         segment_out["selection_strategy"] = selection_strategy
         segment_out["selection_strategy_applied"] = False
-        segment_out["num_candidate_objects"] = len(objects)
+        segment_out["num_objects"] = len(objects)
+        segment_out["num_candidate_objects"] = len(candidate_objects)
         segment_out["num_selected_objects"] = len(selected_objects)
+        segment_out["num_selected_candidate_objects"] = len(selected_candidate_objects)
         segments_out.append(segment_out)
 
     result: Dict[str, Any] = {
@@ -120,8 +134,10 @@ def process_video(
         "video_id": video_id,
         "selection_strategy_applied": False,
         "num_segments": len(segments_out),
+        "num_objects": num_objects,
         "num_candidate_objects": num_candidate_objects,
         "num_selected_objects": num_selected_objects,
+        "num_selected_candidate_objects": num_selected_candidate_objects,
         "config": {
             "selection_strategy": selection_strategy,
             "passthrough_selected_objects": passthrough_selected_objects,
@@ -155,13 +171,16 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _IMPORTANT_OBJECTS_VERSION,
         "num_videos": len(results),
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_segments": r.get("num_segments", 0),
+                "num_objects": r.get("num_objects", 0),
                 "num_candidate_objects": r.get("num_candidate_objects", 0),
                 "num_selected_objects": r.get("num_selected_objects", 0),
+                "num_selected_candidate_objects": r.get("num_selected_candidate_objects", 0),
                 "selection_strategy_applied": r.get("selection_strategy_applied", False),
             }
             for r in results

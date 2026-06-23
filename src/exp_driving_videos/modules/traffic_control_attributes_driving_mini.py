@@ -36,7 +36,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TRAFFIC_CONTROL_ATTRIBUTES_VERSION = 2
+_TRAFFIC_CONTROL_ATTRIBUTES_VERSION = 3
 _TRAFFIC_LIGHT_ALIASES = {"traffic light", "traffic_light", "traffic signal", "traffic signals"}
 _STOP_SIGN_ALIASES = {"stop sign", "stop_sign"}
 _DEBUG_STATES: Tuple[str, ...] = ("red", "yellow", "green", "unknown")
@@ -696,9 +696,21 @@ def process_video(
             _enrich_object(obj, segment, relative_lookup, cfg)
             for obj in list(segment.get("filtered_objects", []))
         ]
+        candidate_objects = [dict(obj) for obj in list(segment.get("candidate_objects", []))]
+        selected_candidate_objects = [
+            dict(obj)
+            for obj in list(segment.get("selected_candidate_objects", segment.get("candidate_objects", [])))
+        ]
+        filtered_candidate_objects = [
+            dict(obj)
+            for obj in list(segment.get("filtered_candidate_objects", []))
+        ]
         segment_out["objects"] = objects
         segment_out["selected_objects"] = selected_objects
         segment_out["filtered_objects"] = filtered_objects
+        segment_out["candidate_objects"] = candidate_objects
+        segment_out["selected_candidate_objects"] = selected_candidate_objects
+        segment_out["filtered_candidate_objects"] = filtered_candidate_objects
 
         traffic_control_objects = []
         for obj in selected_objects:
