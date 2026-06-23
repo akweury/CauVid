@@ -55,7 +55,7 @@ from src.exp_nuScenes.detection_pipeline import (
 )
 
 
-_DETECTION_SCHEMA_VERSION = 4
+_DETECTION_SCHEMA_VERSION = 5
 
 _PREDICTION_CSV_FIELDS: List[str] = [
     "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",

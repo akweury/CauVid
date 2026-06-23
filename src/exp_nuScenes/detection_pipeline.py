@@ -264,6 +264,12 @@ class YOLOWorldDetector(ObjectDetector):
                         "prior_id": prior_id,
                         "prior_relevance_score": prior_score,
                         "tracking_priority": tracking_priority,
+                        "candidate_retention_weights": dict(entry.get("candidate_retention_weights", {})),
+                        "expected_predicates": [
+                            str(value)
+                            for value in list(entry.get("expected_predicates", []))
+                            if str(value)
+                        ],
                     }
                 )
         for matches in index.values():
@@ -289,6 +295,16 @@ class YOLOWorldDetector(ObjectDetector):
             },
             "matched_prior_tracking_priorities": {
                 str(row.get("prior_id", "")): str(row.get("tracking_priority", ""))
+                for row in matches
+                if str(row.get("prior_id", ""))
+            },
+            "matched_prior_retention_weights": {
+                str(row.get("prior_id", "")): dict(row.get("candidate_retention_weights", {}))
+                for row in matches
+                if str(row.get("prior_id", ""))
+            },
+            "matched_prior_expected_predicates": {
+                str(row.get("prior_id", "")): list(row.get("expected_predicates", []))
                 for row in matches
                 if str(row.get("prior_id", ""))
             },
