@@ -619,6 +619,7 @@ def get_reasoning_feedback_signal_cfg() -> Dict[str, Any]:
             "target_predicate": "brake_next",
             "primary_rule_set": "original",
             "max_feedback_requests": 200,
+            "max_prior_requests_per_example": 3,
             "low_confidence_positive_margin": 0.08,
             "min_existing_supporting_facts": 2,
             "max_supporting_facts_per_request": 16,
