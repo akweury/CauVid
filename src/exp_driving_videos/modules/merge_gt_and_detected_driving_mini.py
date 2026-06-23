@@ -29,6 +29,9 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 
+_MERGED_ANNOTATIONS_VERSION = 2
+
+
 def get_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "04_driving_mini_merged_annotations"
     out.mkdir(parents=True, exist_ok=True)
@@ -84,6 +87,172 @@ def _to_frame_map(frames: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     for frame in frames:
         frame_map[int(frame.get("frame_index", -1))] = frame
     return frame_map
+
+
+def _selected_candidate_summary_by_track(tracked_video: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    track_summaries = (
+        tracked_video.get("candidate_tracks", {})
+        .get("selected_candidate_tracks", {})
+        .get("track_summaries", [])
+    )
+    return {
+        int(row.get("track_id", -1)): dict(row)
+        for row in track_summaries
+        if int(row.get("track_id", -1)) >= 0
+    }
+
+
+def _selected_candidate_objects_by_frame_from_tracking(
+    tracked_video: Dict[str, Any],
+) -> Dict[int, List[Dict[str, Any]]]:
+    frame_map: Dict[int, List[Dict[str, Any]]] = {}
+    summary_by_track = _selected_candidate_summary_by_track(tracked_video)
+    candidate_frames = (
+        tracked_video.get("candidate_tracks", {})
+        .get("selected_candidate_tracks", {})
+        .get("frames", [])
+    )
+    for frame in candidate_frames:
+        frame_index = int(frame.get("frame_index", -1))
+        if frame_index < 0:
+            continue
+        boxes = list(frame.get("boxes", []))
+        scores = list(frame.get("scores", []))
+        labels = list(frame.get("labels", []))
+        track_ids = list(frame.get("track_ids", []))
+        detection_ids = list(frame.get("detection_ids", []))
+        candidate_sources = list(frame.get("candidate_sources", []))
+        prior_relevance_scores = list(frame.get("prior_relevance_scores", []))
+        matched_prior_ids = list(frame.get("matched_prior_ids", []))
+        candidate_objects = frame_map.setdefault(frame_index, [])
+        for index, box in enumerate(boxes):
+            candidate_track_id = int(track_ids[index]) if index < len(track_ids) else -1
+            track_summary = dict(summary_by_track.get(candidate_track_id, {}))
+            candidate_objects.append(
+                {
+                    "bbox": list(box),
+                    "score": float(scores[index]) if index < len(scores) else 0.0,
+                    "label": str(labels[index]) if index < len(labels) else "unknown",
+                    "accepted": False,
+                    "source_type": "selected_candidate_track",
+                    "candidate_track_id": candidate_track_id,
+                    "track_id": candidate_track_id,
+                    "frame_detection_id": str(detection_ids[index]) if index < len(detection_ids) else "",
+                    "source_detection_ids": list(track_summary.get("source_detection_ids", [])),
+                    "candidate_source": str(candidate_sources[index]) if index < len(candidate_sources) else "",
+                    "prior_metadata": {
+                        "matched_prior_ids": list(matched_prior_ids[index] if index < len(matched_prior_ids) else []),
+                        "track_matched_prior_ids": list(track_summary.get("matched_prior_ids", [])),
+                        "matched_prior_id_counts": dict(track_summary.get("matched_prior_id_counts", {})),
+                        "prior_relevance_score": float(
+                            prior_relevance_scores[index] if index < len(prior_relevance_scores) else 0.0
+                        ),
+                        "prior_relevance_mean": float(track_summary.get("prior_relevance_mean", 0.0)),
+                        "prior_relevance_max": float(track_summary.get("prior_relevance_max", 0.0)),
+                        "prior_relevance_min": float(track_summary.get("prior_relevance_min", 0.0)),
+                    },
+                    "score_breakdown": dict(track_summary.get("score_breakdown", {})),
+                    "track_quality": {
+                        "mean_score": float(track_summary.get("mean_score", 0.0)),
+                        "max_score": float(track_summary.get("max_score", 0.0)),
+                        "track_length": int(track_summary.get("track_length", 0)),
+                        "temporal_consistency": float(track_summary.get("temporal_consistency", 0.0)),
+                        "selection_score": float(track_summary.get("selection_score", 0.0)),
+                    },
+                }
+            )
+    return frame_map
+
+
+def _candidate_objects_by_frame(
+    gt_video: Optional[Dict[str, Any]],
+    tracked_video: Dict[str, Any],
+) -> Dict[int, List[Dict[str, Any]]]:
+    if isinstance(gt_video, dict):
+        frames = list(gt_video.get("frames", []))
+        if any("candidate_objects" in frame for frame in frames):
+            return {
+                int(frame.get("frame_index", -1)): list(frame.get("candidate_objects", []))
+                for frame in frames
+                if int(frame.get("frame_index", -1)) >= 0
+            }
+    return _selected_candidate_objects_by_frame_from_tracking(tracked_video)
+
+
+def _accepted_object_entry(
+    bbox: List[float],
+    score: float,
+    label: str,
+    track_id: int,
+    source: str,
+) -> Dict[str, Any]:
+    return {
+        "bbox": list(bbox),
+        "score": float(score),
+        "label": str(label),
+        "track_id": int(track_id),
+        "accepted": True,
+        "source": str(source),
+        "source_type": "ground_truth_annotation" if source == "gt" else "accepted_track",
+        "is_ground_truth": bool(source == "gt"),
+    }
+
+
+def _tracked_video_as_merged_result(
+    tracked_video: Dict[str, Any],
+) -> Dict[str, Any]:
+    candidate_objects_by_frame = _selected_candidate_objects_by_frame_from_tracking(tracked_video)
+    frames_out: List[Dict[str, Any]] = []
+    candidate_track_ids: set[int] = set()
+    candidate_objects_total = 0
+    for frame in list(tracked_video.get("frames", [])):
+        frame_index = int(frame.get("frame_index", -1))
+        boxes = list(frame.get("boxes", []))
+        scores = list(frame.get("scores", []))
+        labels = list(frame.get("labels", []))
+        track_ids = list(frame.get("track_ids", []))
+        sources = ["det"] * len(boxes)
+        objects = [
+            _accepted_object_entry(
+                bbox=list(boxes[index]),
+                score=float(scores[index]) if index < len(scores) else 0.0,
+                label=str(labels[index]) if index < len(labels) else "unknown",
+                track_id=int(track_ids[index]) if index < len(track_ids) else -1,
+                source="det",
+            )
+            for index in range(len(boxes))
+        ]
+        candidate_objects = list(candidate_objects_by_frame.get(frame_index, []))
+        for candidate_object in candidate_objects:
+            candidate_track_id = int(candidate_object.get("candidate_track_id", -1))
+            if candidate_track_id >= 0:
+                candidate_track_ids.add(candidate_track_id)
+        candidate_objects_total += len(candidate_objects)
+        frames_out.append(
+            {
+                "frame": frame.get("frame", ""),
+                "frame_index": frame_index,
+                "image_path": frame.get("image_path", ""),
+                "boxes": boxes,
+                "scores": scores,
+                "labels": labels,
+                "track_ids": track_ids,
+                "sources": sources,
+                "objects": objects,
+                "candidate_objects": candidate_objects,
+            }
+        )
+    return {
+        "version": _MERGED_ANNOTATIONS_VERSION,
+        "video_id": tracked_video["video_id"],
+        "num_frames": len(frames_out),
+        "num_tracks": int(tracked_video.get("num_tracks", 0)),
+        "num_objects": sum(len(frame.get("objects", [])) for frame in frames_out),
+        "num_candidate_tracks": len(candidate_track_ids),
+        "num_candidate_objects": candidate_objects_total,
+        "frames": frames_out,
+        "tracked_only": True,
+    }
 
 
 def _track_color(track_id: int) -> tuple[int, int, int]:
@@ -217,21 +386,23 @@ def merge_video(
         print(f"  [cache] {video_id} - loading {out_file.name}")
         with out_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        if render_video and not merged_video_file.exists() and cached.get("frames"):
-            render_path = render_merged_video(
-                video_id=video_id,
-                merged_frames=cached["frames"],
-                output_path=merged_video_file,
-            )
-            if render_path:
-                cached["merged_video_path"] = render_path
-                with out_file.open("w", encoding="utf-8") as fh:
-                    json.dump(cached, fh, indent=2)
-                print(f"  Rendered merged video: {merged_video_file.name}")
-        return cached
+        if int(cached.get("version", 0)) == _MERGED_ANNOTATIONS_VERSION:
+            if render_video and not merged_video_file.exists() and cached.get("frames"):
+                render_path = render_merged_video(
+                    video_id=video_id,
+                    merged_frames=cached["frames"],
+                    output_path=merged_video_file,
+                )
+                if render_path:
+                    cached["merged_video_path"] = render_path
+                    with out_file.open("w", encoding="utf-8") as fh:
+                        json.dump(cached, fh, indent=2)
+                    print(f"  Rendered merged video: {merged_video_file.name}")
+            return cached
 
     tracked_frames = _to_frame_map(tracked_video.get("frames", []))
     gt_frames = _to_frame_map(gt_video.get("frames", []))
+    candidate_objects_by_frame = _candidate_objects_by_frame(gt_video, tracked_video)
     frame_indices = sorted(set(tracked_frames.keys()) | set(gt_frames.keys()))
 
     merged_frames: List[Dict[str, Any]] = []
@@ -248,6 +419,8 @@ def merge_video(
     overlap_count = 0
     carried_det_count = 0
     all_track_ids: set[int] = set()
+    candidate_track_ids: set[int] = set()
+    candidate_objects_total = 0
 
     for frame_index in frame_indices:
         gt_frame = gt_frames.get(frame_index, {})
@@ -270,6 +443,7 @@ def merge_video(
         out_labels: List[str] = []
         out_track_ids: List[int] = []
         out_sources: List[str] = []
+        out_objects: List[Dict[str, Any]] = []
 
         # GT has priority: keep all GT objects, and consume overlapping detections.
         for idx, gt_box in enumerate(gt_boxes):
@@ -295,6 +469,15 @@ def merge_video(
             out_labels.append(gt_label)
             out_track_ids.append(gt_tid)
             out_sources.append("gt")
+            out_objects.append(
+                _accepted_object_entry(
+                    bbox=list(gt_box),
+                    score=gt_score,
+                    label=gt_label,
+                    track_id=gt_tid,
+                    source="gt",
+                )
+            )
             if gt_tid >= 0:
                 all_track_ids.add(gt_tid)
 
@@ -316,11 +499,26 @@ def merge_video(
             out_labels.append(det_label)
             out_track_ids.append(merged_tid)
             out_sources.append("det")
+            out_objects.append(
+                _accepted_object_entry(
+                    bbox=list(det_box),
+                    score=det_score,
+                    label=det_label,
+                    track_id=merged_tid,
+                    source="det",
+                )
+            )
             all_track_ids.add(merged_tid)
             carried_det_count += 1
 
         frame_name = gt_frame.get("frame") or det_frame.get("frame") or f"frame_{frame_index:05d}.jpg"
         image_path = gt_frame.get("image_path") or det_frame.get("image_path", "")
+        candidate_objects = list(candidate_objects_by_frame.get(frame_index, []))
+        for candidate_object in candidate_objects:
+            candidate_track_id = int(candidate_object.get("candidate_track_id", -1))
+            if candidate_track_id >= 0:
+                candidate_track_ids.add(candidate_track_id)
+        candidate_objects_total += len(candidate_objects)
 
         merged_frames.append(
             {
@@ -332,13 +530,19 @@ def merge_video(
                 "labels": out_labels,
                 "track_ids": out_track_ids,
                 "sources": out_sources,
+                "objects": out_objects,
+                "candidate_objects": candidate_objects,
             }
         )
 
     result: Dict[str, Any] = {
+        "version": _MERGED_ANNOTATIONS_VERSION,
         "video_id": video_id,
         "num_frames": len(merged_frames),
         "num_tracks": len(all_track_ids),
+        "num_objects": sum(len(frame.get("objects", [])) for frame in merged_frames),
+        "num_candidate_tracks": len(candidate_track_ids),
+        "num_candidate_objects": candidate_objects_total,
         "num_overlaps_replaced_by_gt": overlap_count,
         "num_unmatched_detections_carried": carried_det_count,
         "frames": merged_frames,
@@ -398,7 +602,7 @@ def run(
         if video_id not in gt_by_video:
             if keep_tracked_only:
                 print(f"  [tracked-only] {video_id} (no GT annotations)")
-                merged_results.append(tracked)
+                merged_results.append(_tracked_video_as_merged_result(tracked))
             else:
                 print(f"  [skip] {video_id} not found in GT annotations")
             continue
@@ -415,9 +619,13 @@ def run(
         merged_results.append(merged)
 
     manifest = {
+        "version": _MERGED_ANNOTATIONS_VERSION,
         "num_videos": len(merged_results),
         "num_frames_total": sum(r["num_frames"] for r in merged_results),
         "num_tracks_total": sum(r["num_tracks"] for r in merged_results),
+        "num_objects_total": sum(r.get("num_objects", 0) for r in merged_results),
+        "num_candidate_tracks_total": sum(r.get("num_candidate_tracks", 0) for r in merged_results),
+        "num_candidate_objects_total": sum(r.get("num_candidate_objects", 0) for r in merged_results),
         "num_overlaps_replaced_by_gt_total": sum(
             r.get("num_overlaps_replaced_by_gt", 0) for r in merged_results
         ),
@@ -429,6 +637,9 @@ def run(
                 "video_id": r["video_id"],
                 "num_frames": r["num_frames"],
                 "num_tracks": r["num_tracks"],
+                "num_objects": r.get("num_objects", 0),
+                "num_candidate_tracks": r.get("num_candidate_tracks", 0),
+                "num_candidate_objects": r.get("num_candidate_objects", 0),
                 "num_overlaps_replaced_by_gt": r.get("num_overlaps_replaced_by_gt", 0),
                 "num_unmatched_detections_carried": r.get("num_unmatched_detections_carried", 0),
                 "is_tracked_only": "num_overlaps_replaced_by_gt" not in r,

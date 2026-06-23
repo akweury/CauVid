@@ -824,9 +824,14 @@ def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> 
     runner.announce_step("3", "dataset_annotations_driving_mini")
     with runner.module_output("3"):
         ctx.dataset_annotation_results = dataset_annotations_driving_mini.run(
-            video_ids=[r["video_id"] for r in (ctx.tracking_results or [])]
+            video_ids=[r["video_id"] for r in (ctx.tracking_results or [])],
+            tracking_results=ctx.tracking_results or [],
         )
     runner.log("3", f"completed videos={len(ctx.dataset_annotation_results)}")
+    runner.log(
+        "3",
+        f"candidate_objects={sum(int(row.get('num_candidate_objects', 0)) for row in (ctx.dataset_annotation_results or []))}",
+    )
     runner.complete_step("3", subtitle=f"videos={len(ctx.dataset_annotation_results)}")
 
 
@@ -841,6 +846,10 @@ def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> No
             render_video=render_video,
         )
     runner.log("4", f"completed videos={len(ctx.merged_results)}")
+    runner.log(
+        "4",
+        f"candidate_objects={sum(int(row.get('num_candidate_objects', 0)) for row in (ctx.merged_results or []))}",
+    )
     runner.complete_step("4", subtitle=f"videos={len(ctx.merged_results)}")
 
 
