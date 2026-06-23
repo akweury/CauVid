@@ -210,6 +210,9 @@ class YOLOWorldDetector(ObjectDetector):
         candidate_confidence_threshold: float = 0.01,
         candidate_nms_iou_threshold: float = 0.99,
         borderline_confidence_margin: float = 0.05,
+        predict_batch_size: Optional[int] = None,
+        inference_imgsz: int = 640,
+        use_half_precision: Optional[bool] = None,
     ) -> None:
         self.model_name = model_name
         self.classes = list(classes) if classes else []
@@ -219,8 +222,15 @@ class YOLOWorldDetector(ObjectDetector):
         self.candidate_confidence_threshold = candidate_confidence_threshold
         self.candidate_nms_iou_threshold = candidate_nms_iou_threshold
         self.borderline_confidence_margin = borderline_confidence_margin
+        self.predict_batch_size = predict_batch_size
+        self.inference_imgsz = int(inference_imgsz)
+        self.use_half_precision = use_half_precision
         self._model: Any = None  # loaded lazily in warmup()
         self._resolved_model_source: Optional[str] = None
+        self._runtime_device: Optional[str] = None
+        self._runtime_gpu_name: Optional[str] = None
+        self._resolved_predict_batch_size: Optional[int] = None
+        self._resolved_half_precision: Optional[bool] = None
 
     @staticmethod
     def _round_box(box: Sequence[float]) -> List[float]:
@@ -253,12 +263,74 @@ class YOLOWorldDetector(ObjectDetector):
     ) -> Any:
         if self._model is None:
             self.warmup()
+        predict_kwargs: Dict[str, Any] = {
+            "source": list(image_paths),
+            "conf": conf_threshold,
+            "iou": nms_iou_threshold,
+            "imgsz": int(self.inference_imgsz),
+            "verbose": False,
+        }
+        if self._resolved_predict_batch_size is not None:
+            predict_kwargs["batch"] = int(self._resolved_predict_batch_size)
+        if self._resolved_half_precision is not None:
+            predict_kwargs["half"] = bool(self._resolved_half_precision)
         return self._model.predict(
-            source=list(image_paths),
-            conf=conf_threshold,
-            iou=nms_iou_threshold,
-            verbose=False,
+            **predict_kwargs,
         )
+
+    def _resolve_runtime_profile(self) -> None:
+        runtime_device = str(self.device).strip() if self.device is not None else ""
+        gpu_name: Optional[str] = None
+        cuda_available = False
+        try:
+            import torch
+
+            cuda_available = bool(torch.cuda.is_available())
+            if not runtime_device:
+                runtime_device = "cuda:0" if cuda_available else "cpu"
+            if runtime_device.startswith("cuda") and cuda_available:
+                device_index = 0
+                if ":" in runtime_device:
+                    try:
+                        device_index = int(runtime_device.split(":", 1)[1])
+                    except ValueError:
+                        device_index = 0
+                gpu_name = str(torch.cuda.get_device_name(device_index))
+        except Exception:
+            if not runtime_device:
+                runtime_device = "cpu"
+
+        is_cuda_runtime = runtime_device.startswith("cuda")
+        normalized_gpu_name = gpu_name.lower() if gpu_name else ""
+        is_a100 = "a100" in normalized_gpu_name
+
+        if self.predict_batch_size is not None:
+            resolved_batch_size = max(1, int(self.predict_batch_size))
+        elif is_a100:
+            resolved_batch_size = 128
+        elif is_cuda_runtime:
+            resolved_batch_size = 32
+        else:
+            resolved_batch_size = 1
+
+        if self.use_half_precision is not None:
+            resolved_half_precision = bool(self.use_half_precision)
+        else:
+            resolved_half_precision = is_cuda_runtime
+
+        self._runtime_device = runtime_device
+        self._runtime_gpu_name = gpu_name
+        self._resolved_predict_batch_size = resolved_batch_size
+        self._resolved_half_precision = resolved_half_precision
+
+    def get_runtime_profile(self) -> Dict[str, Any]:
+        return {
+            "device": self._runtime_device,
+            "gpu_name": self._runtime_gpu_name,
+            "predict_batch_size": self._resolved_predict_batch_size,
+            "inference_imgsz": int(self.inference_imgsz),
+            "half_precision": self._resolved_half_precision,
+        }
 
     def _serialize_result_boxes(self, result: Any) -> List[Dict[str, Any]]:
         serialized: List[Dict[str, Any]] = []
@@ -436,11 +508,12 @@ class YOLOWorldDetector(ObjectDetector):
         """Load model weights and set vocabulary once before processing starts."""
         from ultralytics import YOLOWorld  # deferred import
 
+        self._resolve_runtime_profile()
         self._resolved_model_source = self._resolve_model_source()
         print(f"[YOLOWorldDetector] Loading model: {self._resolved_model_source}")
         kwargs: Dict[str, Any] = {}
-        if self.device is not None:
-            kwargs["device"] = self.device
+        if self._runtime_device is not None:
+            kwargs["device"] = self._runtime_device
         self._model = YOLOWorld(self._resolved_model_source, **kwargs)
         self._persist_loaded_checkpoint()
 
@@ -450,6 +523,14 @@ class YOLOWorldDetector(ObjectDetector):
                   f"{self.classes[:10]}{'...' if len(self.classes) > 10 else ''}")
         else:
             print("[YOLOWorldDetector] Using built-in COCO-80 vocabulary.")
+        print(
+            "[YOLOWorldDetector] Runtime profile: "
+            f"device={self._runtime_device}, "
+            f"gpu={self._runtime_gpu_name or 'n/a'}, "
+            f"batch={self._resolved_predict_batch_size}, "
+            f"imgsz={self.inference_imgsz}, "
+            f"half={self._resolved_half_precision}"
+        )
 
     def teardown(self) -> None:
         self._model = None

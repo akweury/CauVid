@@ -280,6 +280,13 @@ def _build_video_summary_rows(video_results: List[Dict[str, Any]]) -> List[Dict[
     return rows
 
 
+def _format_step_progress(completed: int, total: int) -> str:
+    if total <= 0:
+        return "0/0 videos (0.0%)"
+    percentage = 100.0 * float(completed) / float(total)
+    return f"{completed}/{total} videos ({percentage:.1f}%)"
+
+
 def render_detection_video(
     video_id: str,
     frame_records: List[Dict[str, Any]],
@@ -367,7 +374,6 @@ def process_video(
     boxed_video_file = out_dir / "detections_boxed.mp4"
 
     if not force_recompute and detections_file.exists():
-        print(f"  [cache] {video_id} — loading {detections_file.name}")
         with detections_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
         cached_frames = list(cached.get("frames", []))
@@ -375,9 +381,7 @@ def process_video(
             "accepted_detections" in frame and "candidate_detections" in frame
             for frame in cached_frames
         )
-        if not cache_is_current:
-            print(f"  [cache] {video_id} — schema upgrade required, recomputing detections")
-        else:
+        if cache_is_current:
             prediction_rows = _build_prediction_rows(cached_frames, video_id=video_id)
             class_summary_rows = _build_class_summary_rows(prediction_rows)
             _write_csv(
@@ -421,11 +425,10 @@ def process_video(
                     cached["boxed_video_path"] = render_path
                     with detections_file.open("w", encoding="utf-8") as fh:
                         json.dump(cached, fh, indent=2)
-                    print(f"  Rendered boxed video: {boxed_video_file.name}")
+            cached["from_cache"] = True
             return cached
 
     frames = list_frames(video_id, frames_root)
-    print(f"\n=== {video_id} ({len(frames)} frames) ===")
 
     if not frames:
         result: Dict[str, Any] = {
@@ -442,6 +445,7 @@ def process_video(
                 "detection_predictions_csv": str(predictions_csv_file),
                 "detection_class_summary_csv": str(class_summary_csv_file),
             },
+            "from_cache": False,
         }
         _write_csv(
             predictions_csv_file,
@@ -511,6 +515,7 @@ def process_video(
             "detection_predictions_csv": str(predictions_csv_file),
             "detection_class_summary_csv": str(class_summary_csv_file),
         },
+        "from_cache": False,
     }
 
     render_path: Optional[str] = None
@@ -552,17 +557,6 @@ def process_video(
         class_summary_rows,
     )
 
-    print(
-        f"  {video_result['num_frames']} frames, "
-        f"{video_result['num_detections']} detections, "
-        f"{len(label_counts)} classes: "
-        + ", ".join(f"{k}({v})" for k, v in list(label_counts.items())[:8])
-        + ("..." if len(label_counts) > 8 else "")
-    )
-    if render_path:
-        print(f"  Saved boxed video: {boxed_video_file}")
-    print(f"  Saved prediction CSV: {predictions_csv_file.name}")
-    print(f"  Saved class summary CSV: {class_summary_csv_file.name}")
     return video_result
 
 
@@ -580,6 +574,9 @@ def run(
     candidate_nms_iou_threshold: float = 0.99,
     borderline_confidence_margin: float = 0.05,
     device: Optional[str] = None,
+    predict_batch_size: Optional[int] = None,
+    inference_imgsz: int = 640,
+    use_half_precision: Optional[bool] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -606,13 +603,15 @@ def run(
         candidate_nms_iou_threshold=candidate_nms_iou_threshold,
         borderline_confidence_margin=borderline_confidence_margin,
         device=device,
+        predict_batch_size=predict_batch_size,
+        inference_imgsz=inference_imgsz,
+        use_half_precision=use_half_precision,
     )
 
-    print(f"Videos to process: {target_videos}")
-    print(f"YOLO-World model : {model_name}")
-    print(f"Vocabulary       : {len(effective_classes)} classes")
+    print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
+    print(f"Model: {model_name} | classes: {len(effective_classes)}")
     print(
-        "Detection cfg    : "
+        "Detection cfg: "
         f"accept_conf={confidence_threshold:.3f}, "
         f"candidate_conf={candidate_confidence_threshold:.3f}, "
         f"accept_iou={nms_iou_threshold:.3f}, "
@@ -620,9 +619,19 @@ def run(
     )
 
     detector.warmup()
+    runtime_profile = detector.get_runtime_profile() if isinstance(detector, YOLOWorldDetector) else {}
+    print(
+        "Inference profile: "
+        f"device={runtime_profile.get('device', device)}, "
+        f"gpu={runtime_profile.get('gpu_name', 'n/a')}, "
+        f"batch={runtime_profile.get('predict_batch_size', predict_batch_size)}, "
+        f"imgsz={runtime_profile.get('inference_imgsz', inference_imgsz)}, "
+        f"half={runtime_profile.get('half_precision', use_half_precision)}"
+    )
     video_results: List[Dict[str, Any]] = []
     try:
-        for video_id in target_videos:
+        total_videos = len(target_videos)
+        for index, video_id in enumerate(target_videos, start=1):
             result = process_video(
                 video_id=video_id,
                 detector=detector,
@@ -632,6 +641,8 @@ def run(
                 render_video=render_video,
             )
             video_results.append(result)
+            cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
+            print(f"Progress: {_format_step_progress(index, total_videos)} | {video_id} | {cache_tag}")
     finally:
         detector.teardown()
 
@@ -662,6 +673,7 @@ def run(
             "candidate_nms_iou_threshold": float(candidate_nms_iou_threshold),
             "borderline_confidence_margin": float(borderline_confidence_margin),
         },
+        "inference_profile": runtime_profile,
         "videos": [
             {
                 "video_id": r["video_id"],
@@ -722,16 +734,14 @@ def run(
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
 
-    print(f"\nSaved manifest to {manifest_path}")
-    print(f"Saved aggregate prediction CSV: {aggregate_predictions_csv_path.name}")
-    print(f"Saved aggregate class CSV     : {aggregate_class_summary_csv_path.name}")
-    print(f"Saved video summary CSV      : {video_summary_csv_path.name}")
+    print(f"Step 1 complete: {_format_step_progress(len(video_results), len(target_videos))}")
+    print(f"Outputs: {manifest_path.parent}")
     print(
-        f"Total detections : {manifest['num_detections_total']} accepted + "
+        f"Detections: {manifest['num_detections_total']} accepted + "
         f"{manifest['num_candidate_detections_total']} candidates across "
         f"{manifest['num_frames_total']} frames"
     )
-    print(f"Top classes      : " + ", ".join(
+    print("Top classes: " + ", ".join(
         f"{k}({v})" for k, v in list(manifest["detected_classes_total"].items())[:10]
     ))
     return video_results
@@ -758,6 +768,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--borderline-confidence-margin", type=float, default=0.05, dest="borderline_confidence_margin")
     parser.add_argument("--device", default=None,
                         help="Inference device, e.g. cpu, cuda:0, mps.")
+    parser.add_argument("--predict-batch-size", type=int, default=None, dest="predict_batch_size",
+                        help="Explicit Ultralytics inference batch size. Default auto-tunes: A100=128, other CUDA=32, CPU=1.")
+    parser.add_argument("--imgsz", type=int, default=640, dest="inference_imgsz",
+                        help="Ultralytics inference image size.")
+    parser.add_argument("--half", action=argparse.BooleanOptionalAction, default=None, dest="use_half_precision",
+                        help="Enable or disable FP16 inference. Default auto-enables on CUDA.")
     parser.add_argument("--frames-root", type=Path, default=None, dest="frames_root",
                         help="Override default frames root.")
     parser.add_argument("--output-root", type=Path, default=None, dest="output_root",
@@ -778,6 +794,9 @@ def main() -> None:
         candidate_nms_iou_threshold=args.candidate_nms_iou_threshold,
         borderline_confidence_margin=args.borderline_confidence_margin,
         device=args.device,
+        predict_batch_size=args.predict_batch_size,
+        inference_imgsz=args.inference_imgsz,
+        use_half_precision=args.use_half_precision,
         frames_root=args.frames_root,
         output_root=args.output_root,
         force_recompute=args.force_recompute,
