@@ -32,7 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TARGET_HEAD_ATOMS_VERSION = 2
+_TARGET_HEAD_ATOMS_VERSION = 3
 
 
 def get_output_root() -> Path:
@@ -71,9 +71,11 @@ def _print_video_summary(result: Dict[str, Any]) -> None:
     num_examples = int(result.get("num_examples", 0))
     num_positive = int(result.get("num_positive_examples", 0))
     num_negative = int(result.get("num_negative_examples", 0))
+    candidate_examples = int(result.get("num_examples_with_candidate_atoms", 0))
     print(
         f"  {video_id}: examples={num_examples} | "
-        f"brake_next={num_positive} | not_brake_next={num_negative}"
+        f"brake_next={num_positive} | not_brake_next={num_negative} | "
+        f"with_candidate_atoms={candidate_examples}"
     )
 
 
@@ -118,6 +120,11 @@ def process_video(
     examples: List[Dict[str, Any]] = []
     positive_count = 0
     negative_count = 0
+    examples_with_candidate_atoms = 0
+    positive_examples_with_candidate_atoms = 0
+    negative_examples_with_candidate_atoms = 0
+    positive_candidate_atom_total = 0
+    negative_candidate_atom_total = 0
 
     for idx in range(len(segments) - 1):
         current_seg = segments[idx]
@@ -134,8 +141,17 @@ def process_video(
 
         head_atom = _make_atom(head_predicate, current_segment_id)
         body_atoms = list(current_seg.get("atoms", []))
+        accepted_object_atoms: List[str] = []
         for obj in current_seg.get("objects", []):
-            body_atoms.extend(obj.get("atoms", []))
+            accepted_object_atoms.extend(list(obj.get("atoms", [])))
+        candidate_object_atoms: List[str] = []
+        for obj in current_seg.get("candidate_objects", []):
+            candidate_object_atoms.extend(list(obj.get("atoms", [])))
+        body_atoms.extend(accepted_object_atoms)
+        body_atoms.extend(candidate_object_atoms)
+        has_candidate_atoms = bool(candidate_object_atoms)
+        if has_candidate_atoms:
+            examples_with_candidate_atoms += 1
 
         example = {
             "example_index": idx,
@@ -149,13 +165,24 @@ def process_video(
             "label": bool(is_positive),
             "head_atom": head_atom,
             "body_atoms": body_atoms,
+            "accepted_body_atoms": accepted_object_atoms,
+            "candidate_body_atoms": candidate_object_atoms,
             "num_body_atoms": len(body_atoms),
+            "num_accepted_body_atoms": len(accepted_object_atoms),
+            "num_candidate_body_atoms": len(candidate_object_atoms),
+            "has_candidate_atoms": has_candidate_atoms,
         }
         examples.append(example)
         if is_positive:
             positive_count += 1
+            positive_candidate_atom_total += len(candidate_object_atoms)
+            if has_candidate_atoms:
+                positive_examples_with_candidate_atoms += 1
         else:
             negative_count += 1
+            negative_candidate_atom_total += len(candidate_object_atoms)
+            if has_candidate_atoms:
+                negative_examples_with_candidate_atoms += 1
 
     result: Dict[str, Any] = {
         "version": _TARGET_HEAD_ATOMS_VERSION,
@@ -163,6 +190,15 @@ def process_video(
         "num_examples": len(examples),
         "num_positive_examples": positive_count,
         "num_negative_examples": negative_count,
+        "num_examples_with_candidate_atoms": examples_with_candidate_atoms,
+        "num_positive_examples_with_candidate_atoms": positive_examples_with_candidate_atoms,
+        "num_negative_examples_with_candidate_atoms": negative_examples_with_candidate_atoms,
+        "avg_num_candidate_body_atoms_positive": (
+            float(positive_candidate_atom_total / max(1, positive_count)) if positive_count else 0.0
+        ),
+        "avg_num_candidate_body_atoms_negative": (
+            float(negative_candidate_atom_total / max(1, negative_count)) if negative_count else 0.0
+        ),
         "config": {
             "target_predicate": target_predicate,
             "negative_target_predicate": negative_target_predicate,
@@ -190,7 +226,11 @@ def process_video(
                 "label",
                 "head_atom",
                 "num_body_atoms",
+                "num_accepted_body_atoms",
+                "num_candidate_body_atoms",
+                "has_candidate_atoms",
                 "body_atoms",
+                "candidate_body_atoms",
             ],
         )
         writer.writeheader()
@@ -208,7 +248,11 @@ def process_video(
                     "label": example.get("label", ""),
                     "head_atom": example.get("head_atom", ""),
                     "num_body_atoms": example.get("num_body_atoms", 0),
+                    "num_accepted_body_atoms": example.get("num_accepted_body_atoms", 0),
+                    "num_candidate_body_atoms": example.get("num_candidate_body_atoms", 0),
+                    "has_candidate_atoms": example.get("has_candidate_atoms", False),
                     "body_atoms": json.dumps(example.get("body_atoms", [])),
+                    "candidate_body_atoms": json.dumps(example.get("candidate_body_atoms", [])),
                 }
             )
 
@@ -235,6 +279,7 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _TARGET_HEAD_ATOMS_VERSION,
         "num_videos": len(results),
         "videos": [
             {
@@ -242,6 +287,11 @@ def run(
                 "num_examples": r.get("num_examples", 0),
                 "num_positive_examples": r.get("num_positive_examples", 0),
                 "num_negative_examples": r.get("num_negative_examples", 0),
+                "num_examples_with_candidate_atoms": r.get("num_examples_with_candidate_atoms", 0),
+                "num_positive_examples_with_candidate_atoms": r.get("num_positive_examples_with_candidate_atoms", 0),
+                "num_negative_examples_with_candidate_atoms": r.get("num_negative_examples_with_candidate_atoms", 0),
+                "avg_num_candidate_body_atoms_positive": r.get("avg_num_candidate_body_atoms_positive", 0.0),
+                "avg_num_candidate_body_atoms_negative": r.get("avg_num_candidate_body_atoms_negative", 0.0),
             }
             for r in results
         ],
