@@ -10,8 +10,16 @@ per-video JSON results alongside a summary manifest.
 Output layout:
     pipeline_output/01_driving_mini_detection/
         detection_manifest.json
+        detection_predictions.csv
+        detection_class_summary.csv
+        detection_video_summary.csv
         <video_id>/
             detections.json
+                - legacy accepted boxes in boxes/scores/labels
+                - accepted_detections per frame
+                - candidate_detections per frame
+            detection_predictions.csv
+            detection_class_summary.csv
 
 Usage:
     python src/exp_driving_videos/detect_driving_mini.py
@@ -25,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from collections import Counter
@@ -44,6 +53,9 @@ from src.exp_nuScenes.detection_pipeline import (
     ObjectDetector,
     YOLOWorldDetector,
 )
+
+
+_DETECTION_SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # Dataset paths
@@ -90,6 +102,182 @@ def _label_color(label: str) -> tuple[int, int, int]:
     else:
         r, g, b = c, 0, x
     return (int((b + m) * 255), int((g + m) * 255), int((r + m) * 255))
+
+
+def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _quality_bucket(detection: Dict[str, Any]) -> str:
+    if bool(detection.get("accepted", False)):
+        return "accepted_high_confidence"
+    return str(detection.get("candidate_source", "candidate"))
+
+
+def _detection_quality_rank(quality_bucket: str) -> int:
+    order = {
+        "accepted_high_confidence": 0,
+        "nms_relaxed_candidate": 1,
+        "borderline_confidence": 2,
+        "low_confidence": 3,
+        "discarded_detector_output": 4,
+        "candidate": 5,
+    }
+    return int(order.get(str(quality_bucket), 9))
+
+
+def _build_prediction_rows(frame_records: List[Dict[str, Any]], video_id: str = "") -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for frame_record in frame_records:
+        frame_name = str(frame_record.get("frame", ""))
+        frame_index = int(frame_record.get("frame_index", -1))
+        image_path = str(frame_record.get("image_path", ""))
+        for collection_name in ("accepted_detections", "candidate_detections"):
+            for detection in list(frame_record.get(collection_name, [])):
+                bbox = list(detection.get("bbox", []))
+                threshold_info = dict(detection.get("threshold_info", {}))
+                quality_bucket = _quality_bucket(detection)
+                rows.append(
+                    {
+                        "video_id": video_id,
+                        "frame": frame_name,
+                        "frame_index": frame_index,
+                        "image_path": image_path,
+                        "class_name": str(detection.get("class", "")),
+                        "score": float(detection.get("score", 0.0)),
+                        "accepted": bool(detection.get("accepted", False)),
+                        "candidate_source": str(detection.get("candidate_source", "")),
+                        "quality_bucket": quality_bucket,
+                        "bbox_x1": float(bbox[0]) if len(bbox) > 0 else "",
+                        "bbox_y1": float(bbox[1]) if len(bbox) > 1 else "",
+                        "bbox_x2": float(bbox[2]) if len(bbox) > 2 else "",
+                        "bbox_y2": float(bbox[3]) if len(bbox) > 3 else "",
+                        "bbox_width": float(bbox[2] - bbox[0]) if len(bbox) >= 4 else "",
+                        "bbox_height": float(bbox[3] - bbox[1]) if len(bbox) >= 4 else "",
+                        "bbox_area": float(max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])) if len(bbox) >= 4 else "",
+                        "accepted_confidence_threshold": threshold_info.get("accepted_confidence_threshold", ""),
+                        "candidate_confidence_threshold": threshold_info.get("candidate_confidence_threshold", ""),
+                        "borderline_confidence_threshold": threshold_info.get("borderline_confidence_threshold", ""),
+                        "accepted_nms_iou_threshold": threshold_info.get("accepted_nms_iou_threshold", ""),
+                        "candidate_nms_iou_threshold": threshold_info.get("candidate_nms_iou_threshold", ""),
+                    }
+                )
+    rows.sort(
+        key=lambda row: (
+            int(row.get("frame_index", -1)),
+            int(not bool(row.get("accepted", False))),
+            _detection_quality_rank(str(row.get("quality_bucket", ""))),
+            -float(row.get("score", 0.0)),
+            str(row.get("class_name", "")),
+        )
+    )
+    return rows
+
+
+def _build_class_summary_rows(prediction_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_class: Dict[str, Dict[str, Any]] = {}
+    for row in prediction_rows:
+        class_name = str(row.get("class_name", ""))
+        bucket = by_class.setdefault(
+            class_name,
+            {
+                "class_name": class_name,
+                "num_total_bboxes": 0,
+                "num_accepted_bboxes": 0,
+                "num_candidate_bboxes": 0,
+                "num_videos_with_detections": set(),
+                "num_frames_with_detections": set(),
+                "num_videos_with_accepted": set(),
+                "num_frames_with_accepted": set(),
+                "num_videos_with_candidates": set(),
+                "num_frames_with_candidates": set(),
+                "score_sum_total": 0.0,
+                "score_sum_accepted": 0.0,
+                "score_sum_candidate": 0.0,
+                "bbox_area_sum_total": 0.0,
+                "quality_counts": Counter(),
+            },
+        )
+        bucket["num_total_bboxes"] += 1
+        bucket["num_videos_with_detections"].add(str(row.get("video_id", "")))
+        bucket["num_frames_with_detections"].add(int(row.get("frame_index", -1)))
+        bucket["score_sum_total"] += float(row.get("score", 0.0))
+        bucket["bbox_area_sum_total"] += float(row.get("bbox_area", 0.0) or 0.0)
+        quality_bucket = str(row.get("quality_bucket", ""))
+        bucket["quality_counts"][quality_bucket] += 1
+        if bool(row.get("accepted", False)):
+            bucket["num_accepted_bboxes"] += 1
+            bucket["num_videos_with_accepted"].add(str(row.get("video_id", "")))
+            bucket["num_frames_with_accepted"].add(int(row.get("frame_index", -1)))
+            bucket["score_sum_accepted"] += float(row.get("score", 0.0))
+        else:
+            bucket["num_candidate_bboxes"] += 1
+            bucket["num_videos_with_candidates"].add(str(row.get("video_id", "")))
+            bucket["num_frames_with_candidates"].add(int(row.get("frame_index", -1)))
+            bucket["score_sum_candidate"] += float(row.get("score", 0.0))
+
+    rows: List[Dict[str, Any]] = []
+    for class_name, bucket in sorted(by_class.items()):
+        num_total = int(bucket["num_total_bboxes"])
+        num_accepted = int(bucket["num_accepted_bboxes"])
+        num_candidate = int(bucket["num_candidate_bboxes"])
+        quality_counts = dict(sorted(dict(bucket["quality_counts"]).items()))
+        rows.append(
+            {
+                "class_name": class_name,
+                "num_total_bboxes": num_total,
+                "num_accepted_bboxes": num_accepted,
+                "num_candidate_bboxes": num_candidate,
+                "num_videos_with_detections": len({v for v in bucket["num_videos_with_detections"] if v}),
+                "num_frames_with_detections": len(bucket["num_frames_with_detections"]),
+                "num_videos_with_accepted": len({v for v in bucket["num_videos_with_accepted"] if v}),
+                "num_frames_with_accepted": len(bucket["num_frames_with_accepted"]),
+                "num_videos_with_candidates": len({v for v in bucket["num_videos_with_candidates"] if v}),
+                "num_frames_with_candidates": len(bucket["num_frames_with_candidates"]),
+                "avg_score_total": float(bucket["score_sum_total"] / max(1, num_total)),
+                "avg_score_accepted": float(bucket["score_sum_accepted"] / max(1, num_accepted)),
+                "avg_score_candidate": float(bucket["score_sum_candidate"] / max(1, num_candidate)),
+                "avg_bbox_area_total": float(bucket["bbox_area_sum_total"] / max(1, num_total)),
+                "quality_counts_json": json.dumps(quality_counts),
+                "num_high_quality": int(quality_counts.get("accepted_high_confidence", 0)),
+                "num_borderline_quality": int(quality_counts.get("borderline_confidence", 0)),
+                "num_low_quality": int(quality_counts.get("low_confidence", 0)),
+                "num_nms_relaxed_quality": int(quality_counts.get("nms_relaxed_candidate", 0)),
+                "num_discarded_quality": int(quality_counts.get("discarded_detector_output", 0)),
+            }
+        )
+    rows.sort(key=lambda row: (-int(row["num_total_bboxes"]), str(row["class_name"])))
+    return rows
+
+
+def _build_video_summary_rows(video_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for result in video_results:
+        prediction_rows = _build_prediction_rows(result.get("frames", []), video_id=str(result.get("video_id", "")))
+        quality_counts = Counter(str(row.get("quality_bucket", "")) for row in prediction_rows)
+        rows.append(
+            {
+                "video_id": str(result.get("video_id", "")),
+                "num_frames": int(result.get("num_frames", 0)),
+                "num_classes": len(result.get("detected_classes", {})),
+                "num_accepted_bboxes": int(result.get("num_detections", 0)),
+                "num_candidate_bboxes": int(result.get("num_candidate_detections", 0)),
+                "num_total_bboxes": int(result.get("num_total_saved_detections", result.get("num_detections", 0))),
+                "quality_counts_json": json.dumps(dict(sorted(quality_counts.items()))),
+                "num_high_quality": int(quality_counts.get("accepted_high_confidence", 0)),
+                "num_borderline_quality": int(quality_counts.get("borderline_confidence", 0)),
+                "num_low_quality": int(quality_counts.get("low_confidence", 0)),
+                "num_nms_relaxed_quality": int(quality_counts.get("nms_relaxed_candidate", 0)),
+                "num_discarded_quality": int(quality_counts.get("discarded_detector_output", 0)),
+                "detected_classes_json": json.dumps(result.get("detected_classes", {}), sort_keys=True),
+            }
+        )
+    rows.sort(key=lambda row: str(row["video_id"]))
+    return rows
 
 
 def render_detection_video(
@@ -174,36 +362,113 @@ def process_video(
     out_dir = (output_root or get_output_root()) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
     detections_file = out_dir / "detections.json"
+    predictions_csv_file = out_dir / "detection_predictions.csv"
+    class_summary_csv_file = out_dir / "detection_class_summary.csv"
     boxed_video_file = out_dir / "detections_boxed.mp4"
 
     if not force_recompute and detections_file.exists():
         print(f"  [cache] {video_id} — loading {detections_file.name}")
         with detections_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        if render_video and not boxed_video_file.exists() and cached.get("frames"):
-            render_path = render_detection_video(
-                video_id=video_id,
-                frame_records=cached["frames"],
-                output_path=boxed_video_file,
+        cached_frames = list(cached.get("frames", []))
+        cache_is_current = int(cached.get("schema_version", 1)) >= _DETECTION_SCHEMA_VERSION and all(
+            "accepted_detections" in frame and "candidate_detections" in frame
+            for frame in cached_frames
+        )
+        if not cache_is_current:
+            print(f"  [cache] {video_id} — schema upgrade required, recomputing detections")
+        else:
+            prediction_rows = _build_prediction_rows(cached_frames, video_id=video_id)
+            class_summary_rows = _build_class_summary_rows(prediction_rows)
+            _write_csv(
+                predictions_csv_file,
+                [
+                    "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+                    "candidate_source", "quality_bucket",
+                    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+                    "bbox_width", "bbox_height", "bbox_area",
+                    "accepted_confidence_threshold", "candidate_confidence_threshold",
+                    "borderline_confidence_threshold", "accepted_nms_iou_threshold",
+                    "candidate_nms_iou_threshold",
+                ],
+                prediction_rows,
             )
-            if render_path:
-                cached["boxed_video_path"] = render_path
-                with detections_file.open("w", encoding="utf-8") as fh:
-                    json.dump(cached, fh, indent=2)
-                print(f"  Rendered boxed video: {boxed_video_file.name}")
-        return cached
+            _write_csv(
+                class_summary_csv_file,
+                [
+                    "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
+                    "num_videos_with_detections", "num_frames_with_detections",
+                    "num_videos_with_accepted", "num_frames_with_accepted",
+                    "num_videos_with_candidates", "num_frames_with_candidates",
+                    "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
+                    "quality_counts_json", "num_high_quality", "num_borderline_quality",
+                    "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
+                ],
+                class_summary_rows,
+            )
+            cached.setdefault("output_paths", {})
+            cached["output_paths"]["detection_predictions_csv"] = str(predictions_csv_file)
+            cached["output_paths"]["detection_class_summary_csv"] = str(class_summary_csv_file)
+            with detections_file.open("w", encoding="utf-8") as fh:
+                json.dump(cached, fh, indent=2)
+            if render_video and not boxed_video_file.exists() and cached.get("frames"):
+                render_path = render_detection_video(
+                    video_id=video_id,
+                    frame_records=cached["frames"],
+                    output_path=boxed_video_file,
+                )
+                if render_path:
+                    cached["boxed_video_path"] = render_path
+                    with detections_file.open("w", encoding="utf-8") as fh:
+                        json.dump(cached, fh, indent=2)
+                    print(f"  Rendered boxed video: {boxed_video_file.name}")
+            return cached
 
     frames = list_frames(video_id, frames_root)
     print(f"\n=== {video_id} ({len(frames)} frames) ===")
 
     if not frames:
         result: Dict[str, Any] = {
+            "schema_version": _DETECTION_SCHEMA_VERSION,
             "video_id": video_id,
             "num_frames": 0,
             "num_detections": 0,
+            "num_candidate_detections": 0,
+            "num_total_saved_detections": 0,
             "detected_classes": {},
             "frames": [],
+            "output_paths": {
+                "detections_json": str(detections_file),
+                "detection_predictions_csv": str(predictions_csv_file),
+                "detection_class_summary_csv": str(class_summary_csv_file),
+            },
         }
+        _write_csv(
+            predictions_csv_file,
+            [
+                "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+                "candidate_source", "quality_bucket",
+                "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+                "bbox_width", "bbox_height", "bbox_area",
+                "accepted_confidence_threshold", "candidate_confidence_threshold",
+                "borderline_confidence_threshold", "accepted_nms_iou_threshold",
+                "candidate_nms_iou_threshold",
+            ],
+            [],
+        )
+        _write_csv(
+            class_summary_csv_file,
+            [
+                "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
+                "num_videos_with_detections", "num_frames_with_detections",
+                "num_videos_with_accepted", "num_frames_with_accepted",
+                "num_videos_with_candidates", "num_frames_with_candidates",
+                "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
+                "quality_counts_json", "num_high_quality", "num_borderline_quality",
+                "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
+            ],
+            [],
+        )
         with detections_file.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2)
         return result
@@ -214,23 +479,38 @@ def process_video(
 
     frame_records: List[Dict[str, Any]] = []
     all_labels: List[str] = []
+    total_candidate_detections = 0
+    total_saved_detections = 0
 
     for frame_path, det in zip(frames, results):
         all_labels.extend(det.labels)
-        frame_records.append({
+        frame_record = {
             "frame": frame_path.name,
             "frame_index": int(frame_path.stem.split("_")[-1]),
             **det.to_dict(),
-        })
+        }
+        total_candidate_detections += int(frame_record.get("num_candidate_detections", 0))
+        total_saved_detections += int(frame_record.get("num_total_saved_detections", frame_record.get("num_detections", 0)))
+        frame_records.append(frame_record)
 
     label_counts = dict(Counter(all_labels).most_common())
+    prediction_rows = _build_prediction_rows(frame_records, video_id=video_id)
+    class_summary_rows = _build_class_summary_rows(prediction_rows)
 
     video_result: Dict[str, Any] = {
+        "schema_version": _DETECTION_SCHEMA_VERSION,
         "video_id": video_id,
         "num_frames": len(frame_records),
         "num_detections": sum(len(f["boxes"]) for f in frame_records),
+        "num_candidate_detections": total_candidate_detections,
+        "num_total_saved_detections": total_saved_detections,
         "detected_classes": label_counts,
         "frames": frame_records,
+        "output_paths": {
+            "detections_json": str(detections_file),
+            "detection_predictions_csv": str(predictions_csv_file),
+            "detection_class_summary_csv": str(class_summary_csv_file),
+        },
     }
 
     render_path: Optional[str] = None
@@ -245,6 +525,32 @@ def process_video(
 
     with detections_file.open("w", encoding="utf-8") as fh:
         json.dump(video_result, fh, indent=2)
+    _write_csv(
+        predictions_csv_file,
+        [
+            "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+            "candidate_source", "quality_bucket",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+            "bbox_width", "bbox_height", "bbox_area",
+            "accepted_confidence_threshold", "candidate_confidence_threshold",
+            "borderline_confidence_threshold", "accepted_nms_iou_threshold",
+            "candidate_nms_iou_threshold",
+        ],
+        prediction_rows,
+    )
+    _write_csv(
+        class_summary_csv_file,
+        [
+            "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
+            "num_videos_with_detections", "num_frames_with_detections",
+            "num_videos_with_accepted", "num_frames_with_accepted",
+            "num_videos_with_candidates", "num_frames_with_candidates",
+            "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
+            "quality_counts_json", "num_high_quality", "num_borderline_quality",
+            "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
+        ],
+        class_summary_rows,
+    )
 
     print(
         f"  {video_result['num_frames']} frames, "
@@ -255,6 +561,8 @@ def process_video(
     )
     if render_path:
         print(f"  Saved boxed video: {boxed_video_file}")
+    print(f"  Saved prediction CSV: {predictions_csv_file.name}")
+    print(f"  Saved class summary CSV: {class_summary_csv_file.name}")
     return video_result
 
 
@@ -268,6 +576,9 @@ def run(
     classes: Optional[List[str]] = None,
     confidence_threshold: float = 0.3,
     nms_iou_threshold: float = 0.5,
+    candidate_confidence_threshold: float = 0.01,
+    candidate_nms_iou_threshold: float = 0.99,
+    borderline_confidence_margin: float = 0.05,
     device: Optional[str] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
@@ -291,12 +602,22 @@ def run(
         classes=effective_classes,
         confidence_threshold=confidence_threshold,
         nms_iou_threshold=nms_iou_threshold,
+        candidate_confidence_threshold=candidate_confidence_threshold,
+        candidate_nms_iou_threshold=candidate_nms_iou_threshold,
+        borderline_confidence_margin=borderline_confidence_margin,
         device=device,
     )
 
     print(f"Videos to process: {target_videos}")
     print(f"YOLO-World model : {model_name}")
     print(f"Vocabulary       : {len(effective_classes)} classes")
+    print(
+        "Detection cfg    : "
+        f"accept_conf={confidence_threshold:.3f}, "
+        f"candidate_conf={candidate_confidence_threshold:.3f}, "
+        f"accept_iou={nms_iou_threshold:.3f}, "
+        f"candidate_iou={candidate_nms_iou_threshold:.3f}"
+    )
 
     detector.warmup()
     video_results: List[Dict[str, Any]] = []
@@ -319,28 +640,97 @@ def run(
     for r in video_results:
         total_labels.update(r["detected_classes"])
 
+    all_prediction_rows: List[Dict[str, Any]] = []
+    for r in video_results:
+        all_prediction_rows.extend(_build_prediction_rows(r.get("frames", []), video_id=str(r.get("video_id", ""))))
+    aggregate_class_summary_rows = _build_class_summary_rows(all_prediction_rows)
+    video_summary_rows = _build_video_summary_rows(video_results)
+
     manifest = {
+        "schema_version": _DETECTION_SCHEMA_VERSION,
         "model": model_name,
         "num_videos": len(video_results),
         "num_frames_total": sum(r["num_frames"] for r in video_results),
         "num_detections_total": sum(r["num_detections"] for r in video_results),
+        "num_candidate_detections_total": sum(r.get("num_candidate_detections", 0) for r in video_results),
+        "num_total_saved_detections": sum(r.get("num_total_saved_detections", r["num_detections"]) for r in video_results),
         "detected_classes_total": dict(total_labels.most_common()),
+        "thresholds": {
+            "accepted_confidence_threshold": float(confidence_threshold),
+            "candidate_confidence_threshold": float(candidate_confidence_threshold),
+            "accepted_nms_iou_threshold": float(nms_iou_threshold),
+            "candidate_nms_iou_threshold": float(candidate_nms_iou_threshold),
+            "borderline_confidence_margin": float(borderline_confidence_margin),
+        },
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_frames": r["num_frames"],
                 "num_detections": r["num_detections"],
+                "num_candidate_detections": r.get("num_candidate_detections", 0),
+                "num_total_saved_detections": r.get("num_total_saved_detections", r["num_detections"]),
                 "num_classes": len(r["detected_classes"]),
             }
             for r in video_results
         ],
+        "output_paths": {
+            "detection_predictions_csv": str(effective_output_root / "detection_predictions.csv"),
+            "detection_class_summary_csv": str(effective_output_root / "detection_class_summary.csv"),
+            "detection_video_summary_csv": str(effective_output_root / "detection_video_summary.csv"),
+        },
     }
     manifest_path = effective_output_root / "detection_manifest.json"
+    aggregate_predictions_csv_path = effective_output_root / "detection_predictions.csv"
+    aggregate_class_summary_csv_path = effective_output_root / "detection_class_summary.csv"
+    video_summary_csv_path = effective_output_root / "detection_video_summary.csv"
+    _write_csv(
+        aggregate_predictions_csv_path,
+        [
+            "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+            "candidate_source", "quality_bucket",
+            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+            "bbox_width", "bbox_height", "bbox_area",
+            "accepted_confidence_threshold", "candidate_confidence_threshold",
+            "borderline_confidence_threshold", "accepted_nms_iou_threshold",
+            "candidate_nms_iou_threshold",
+        ],
+        all_prediction_rows,
+    )
+    _write_csv(
+        aggregate_class_summary_csv_path,
+        [
+            "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
+            "num_videos_with_detections", "num_frames_with_detections",
+            "num_videos_with_accepted", "num_frames_with_accepted",
+            "num_videos_with_candidates", "num_frames_with_candidates",
+            "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
+            "quality_counts_json", "num_high_quality", "num_borderline_quality",
+            "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
+        ],
+        aggregate_class_summary_rows,
+    )
+    _write_csv(
+        video_summary_csv_path,
+        [
+            "video_id", "num_frames", "num_classes", "num_accepted_bboxes",
+            "num_candidate_bboxes", "num_total_bboxes", "quality_counts_json",
+            "num_high_quality", "num_borderline_quality", "num_low_quality",
+            "num_nms_relaxed_quality", "num_discarded_quality", "detected_classes_json",
+        ],
+        video_summary_rows,
+    )
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
 
     print(f"\nSaved manifest to {manifest_path}")
-    print(f"Total detections : {manifest['num_detections_total']} across {manifest['num_frames_total']} frames")
+    print(f"Saved aggregate prediction CSV: {aggregate_predictions_csv_path.name}")
+    print(f"Saved aggregate class CSV     : {aggregate_class_summary_csv_path.name}")
+    print(f"Saved video summary CSV      : {video_summary_csv_path.name}")
+    print(
+        f"Total detections : {manifest['num_detections_total']} accepted + "
+        f"{manifest['num_candidate_detections_total']} candidates across "
+        f"{manifest['num_frames_total']} frames"
+    )
     print(f"Top classes      : " + ", ".join(
         f"{k}({v})" for k, v in list(manifest["detected_classes_total"].items())[:10]
     ))
@@ -363,6 +753,9 @@ def parse_args() -> argparse.Namespace:
                         help="Custom class vocabulary. Default: YOLO_WORLD_DEFAULT_CLASSES.")
     parser.add_argument("--confidence-threshold", type=float, default=0.3, dest="confidence_threshold")
     parser.add_argument("--nms-iou-threshold", type=float, default=0.5, dest="nms_iou_threshold")
+    parser.add_argument("--candidate-confidence-threshold", type=float, default=0.01, dest="candidate_confidence_threshold")
+    parser.add_argument("--candidate-nms-iou-threshold", type=float, default=0.99, dest="candidate_nms_iou_threshold")
+    parser.add_argument("--borderline-confidence-margin", type=float, default=0.05, dest="borderline_confidence_margin")
     parser.add_argument("--device", default=None,
                         help="Inference device, e.g. cpu, cuda:0, mps.")
     parser.add_argument("--frames-root", type=Path, default=None, dest="frames_root",
@@ -381,6 +774,9 @@ def main() -> None:
         classes=args.classes,
         confidence_threshold=args.confidence_threshold,
         nms_iou_threshold=args.nms_iou_threshold,
+        candidate_confidence_threshold=args.candidate_confidence_threshold,
+        candidate_nms_iou_threshold=args.candidate_nms_iou_threshold,
+        borderline_confidence_margin=args.borderline_confidence_margin,
         device=args.device,
         frames_root=args.frames_root,
         output_root=args.output_root,

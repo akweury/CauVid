@@ -207,14 +207,176 @@ class YOLOWorldDetector(ObjectDetector):
         confidence_threshold: float = 0.3,
         nms_iou_threshold: float = 0.5,
         device: Optional[str] = None,
+        candidate_confidence_threshold: float = 0.01,
+        candidate_nms_iou_threshold: float = 0.99,
+        borderline_confidence_margin: float = 0.05,
     ) -> None:
         self.model_name = model_name
         self.classes = list(classes) if classes else []
         self.confidence_threshold = confidence_threshold
         self.nms_iou_threshold = nms_iou_threshold
         self.device = device
+        self.candidate_confidence_threshold = candidate_confidence_threshold
+        self.candidate_nms_iou_threshold = candidate_nms_iou_threshold
+        self.borderline_confidence_margin = borderline_confidence_margin
         self._model: Any = None  # loaded lazily in warmup()
         self._resolved_model_source: Optional[str] = None
+
+    @staticmethod
+    def _round_box(box: Sequence[float]) -> List[float]:
+        return [round(float(v), 2) for v in box]
+
+    @staticmethod
+    def _iou_xyxy(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+        ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+        bx1, by1, bx2, by2 = [float(v) for v in box_b]
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = area_a + area_b - inter_area
+        if denom <= 0.0:
+            return 0.0
+        return inter_area / denom
+
+    def _predict_batch(
+        self,
+        image_paths: Sequence[str],
+        *,
+        conf_threshold: float,
+        nms_iou_threshold: float,
+    ) -> Any:
+        if self._model is None:
+            self.warmup()
+        return self._model.predict(
+            source=list(image_paths),
+            conf=conf_threshold,
+            iou=nms_iou_threshold,
+            verbose=False,
+        )
+
+    def _serialize_result_boxes(self, result: Any) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        if result.boxes is None:
+            return serialized
+        names: Dict[int, str] = result.names
+        for box, conf, cls_id in zip(
+            result.boxes.xyxy.cpu().tolist(),
+            result.boxes.conf.cpu().tolist(),
+            result.boxes.cls.cpu().tolist(),
+        ):
+            serialized.append(
+                {
+                    "bbox": self._round_box(box),
+                    "score": round(float(conf), 4),
+                    "class": names.get(int(cls_id), str(int(cls_id))),
+                }
+            )
+        return serialized
+
+    def _match_accepted_to_candidate_indices(
+        self,
+        accepted_detections: Sequence[Dict[str, Any]],
+        high_recall_detections: Sequence[Dict[str, Any]],
+    ) -> List[int]:
+        matched_candidate_indices: List[int] = []
+        used_candidate_indices: set[int] = set()
+        for accepted in accepted_detections:
+            best_index = -1
+            best_iou = -1.0
+            accepted_label = str(accepted.get("class", ""))
+            accepted_box = list(accepted.get("bbox", []))
+            for idx, candidate in enumerate(high_recall_detections):
+                if idx in used_candidate_indices or str(candidate.get("class", "")) != accepted_label:
+                    continue
+                iou = self._iou_xyxy(accepted_box, list(candidate.get("bbox", [])))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_index = idx
+            if best_index >= 0 and best_iou >= 0.95:
+                used_candidate_indices.add(best_index)
+                matched_candidate_indices.append(best_index)
+        return matched_candidate_indices
+
+    def _build_detection_payload(
+        self,
+        *,
+        image_path: str,
+        accepted_result: Any,
+        high_recall_result: Any,
+    ) -> DetectionResult:
+        accepted_detections = self._serialize_result_boxes(accepted_result)
+        high_recall_detections = self._serialize_result_boxes(high_recall_result)
+        matched_candidate_indices = set(
+            self._match_accepted_to_candidate_indices(accepted_detections, high_recall_detections)
+        )
+        borderline_threshold = max(
+            self.candidate_confidence_threshold,
+            float(self.confidence_threshold) - float(self.borderline_confidence_margin),
+        )
+        threshold_info = {
+            "accepted_confidence_threshold": float(self.confidence_threshold),
+            "candidate_confidence_threshold": float(self.candidate_confidence_threshold),
+            "borderline_confidence_threshold": float(borderline_threshold),
+            "accepted_nms_iou_threshold": float(self.nms_iou_threshold),
+            "candidate_nms_iou_threshold": float(self.candidate_nms_iou_threshold),
+        }
+
+        accepted_payload = [
+            {
+                "bbox": list(det["bbox"]),
+                "class": str(det["class"]),
+                "score": float(det["score"]),
+                "accepted": True,
+                "candidate_source": "accepted_high_confidence",
+                "threshold_info": dict(threshold_info),
+            }
+            for det in accepted_detections
+        ]
+
+        candidate_payload: List[Dict[str, Any]] = []
+        for idx, det in enumerate(high_recall_detections):
+            if idx in matched_candidate_indices:
+                continue
+            score = float(det["score"])
+            if score >= float(self.confidence_threshold):
+                candidate_source = "nms_relaxed_candidate"
+            elif score >= float(borderline_threshold):
+                candidate_source = "borderline_confidence"
+            elif score >= float(self.candidate_confidence_threshold):
+                candidate_source = "low_confidence"
+            else:
+                candidate_source = "discarded_detector_output"
+            candidate_payload.append(
+                {
+                    "bbox": list(det["bbox"]),
+                    "class": str(det["class"]),
+                    "score": score,
+                    "accepted": False,
+                    "candidate_source": candidate_source,
+                    "threshold_info": dict(threshold_info),
+                }
+            )
+
+        return DetectionResult(
+            image_path=image_path,
+            boxes=[list(det["bbox"]) for det in accepted_detections],
+            scores=[float(det["score"]) for det in accepted_detections],
+            labels=[str(det["class"]) for det in accepted_detections],
+            extra={
+                "model": self.model_name,
+                "accepted_detections": accepted_payload,
+                "candidate_detections": candidate_payload,
+                "num_candidate_detections": len(candidate_payload),
+                "num_total_saved_detections": len(accepted_payload) + len(candidate_payload),
+                "detection_thresholds": threshold_info,
+            },
+        )
 
     def _model_cache_root(self) -> Path:
         root = config.get_output_path("output") / "model_cache" / "ultralytics"
@@ -293,74 +455,32 @@ class YOLOWorldDetector(ObjectDetector):
         self._model = None
 
     def detect(self, image_path: str) -> DetectionResult:
-        if self._model is None:
-            self.warmup()
-
-        results = self._model.predict(
-            source=image_path,
-            conf=self.confidence_threshold,
-            iou=self.nms_iou_threshold,
-            verbose=False,
-        )
-
-        boxes: List[List[float]] = []
-        scores: List[float] = []
-        labels: List[str] = []
-
-        for r in results:
-            if r.boxes is None:
-                continue
-            names: Dict[int, str] = r.names  # {class_id: class_name}
-            xyxy = r.boxes.xyxy.cpu().tolist()
-            confs = r.boxes.conf.cpu().tolist()
-            cls_ids = r.boxes.cls.cpu().tolist()
-            for box, conf, cls_id in zip(xyxy, confs, cls_ids):
-                boxes.append([round(v, 2) for v in box])
-                scores.append(round(float(conf), 4))
-                labels.append(names.get(int(cls_id), str(int(cls_id))))
-
-        return DetectionResult(
-            image_path=image_path,
-            boxes=boxes,
-            scores=scores,
-            labels=labels,
-            extra={"model": self.model_name},
-        )
+        return self.detect_batch([image_path])[0]
 
     def detect_batch(self, image_paths: List[str]) -> List[DetectionResult]:
         """Run all images in a single model.predict() call for efficiency."""
-        if self._model is None:
-            self.warmup()
-
-        all_results = self._model.predict(
-            source=image_paths,
-            conf=self.confidence_threshold,
-            iou=self.nms_iou_threshold,
-            verbose=False,
+        accepted_results = self._predict_batch(
+            image_paths,
+            conf_threshold=float(self.confidence_threshold),
+            nms_iou_threshold=float(self.nms_iou_threshold),
+        )
+        high_recall_results = self._predict_batch(
+            image_paths,
+            conf_threshold=float(self.candidate_confidence_threshold),
+            nms_iou_threshold=float(self.candidate_nms_iou_threshold),
         )
 
         detection_results: List[DetectionResult] = []
-        for image_path, r in zip(image_paths, all_results):
-            boxes: List[List[float]] = []
-            scores: List[float] = []
-            labels: List[str] = []
-            if r.boxes is not None:
-                names: Dict[int, str] = r.names
-                for box, conf, cls_id in zip(
-                    r.boxes.xyxy.cpu().tolist(),
-                    r.boxes.conf.cpu().tolist(),
-                    r.boxes.cls.cpu().tolist(),
-                ):
-                    boxes.append([round(v, 2) for v in box])
-                    scores.append(round(float(conf), 4))
-                    labels.append(names.get(int(cls_id), str(int(cls_id))))
+        for image_path, accepted_result, high_recall_result in zip(
+            image_paths,
+            accepted_results,
+            high_recall_results,
+        ):
             detection_results.append(
-                DetectionResult(
+                self._build_detection_payload(
                     image_path=image_path,
-                    boxes=boxes,
-                    scores=scores,
-                    labels=labels,
-                    extra={"model": self.model_name},
+                    accepted_result=accepted_result,
+                    high_recall_result=high_recall_result,
                 )
             )
         return detection_results
