@@ -55,7 +55,36 @@ from src.exp_nuScenes.detection_pipeline import (
 )
 
 
-_DETECTION_SCHEMA_VERSION = 3
+_DETECTION_SCHEMA_VERSION = 4
+
+_PREDICTION_CSV_FIELDS: List[str] = [
+    "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+    "candidate_source", "quality_bucket",
+    "matched_prior_ids_json", "top_prior_id", "prior_relevance_score",
+    "matched_prior_scores_json", "matched_prior_tracking_priorities_json",
+    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
+    "bbox_width", "bbox_height", "bbox_area",
+    "accepted_confidence_threshold", "candidate_confidence_threshold",
+    "borderline_confidence_threshold", "accepted_nms_iou_threshold",
+    "candidate_nms_iou_threshold",
+]
+
+_CLASS_SUMMARY_CSV_FIELDS: List[str] = [
+    "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
+    "num_videos_with_detections", "num_frames_with_detections",
+    "num_videos_with_accepted", "num_frames_with_accepted",
+    "num_videos_with_candidates", "num_frames_with_candidates",
+    "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
+    "quality_counts_json", "num_high_quality", "num_borderline_quality",
+    "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
+]
+
+_VIDEO_SUMMARY_CSV_FIELDS: List[str] = [
+    "video_id", "num_frames", "num_classes", "num_accepted_bboxes",
+    "num_candidate_bboxes", "num_total_bboxes", "quality_counts_json",
+    "num_high_quality", "num_borderline_quality", "num_low_quality",
+    "num_nms_relaxed_quality", "num_discarded_quality", "detected_classes_json",
+]
 
 # ---------------------------------------------------------------------------
 # Dataset paths
@@ -140,6 +169,8 @@ def _build_prediction_rows(frame_records: List[Dict[str, Any]], video_id: str = 
             for detection in list(frame_record.get(collection_name, [])):
                 bbox = list(detection.get("bbox", []))
                 threshold_info = dict(detection.get("threshold_info", {}))
+                prior_metadata = dict(detection.get("prior_metadata", {}))
+                matched_prior_ids = [str(value) for value in list(prior_metadata.get("matched_prior_ids", [])) if str(value)]
                 quality_bucket = _quality_bucket(detection)
                 rows.append(
                     {
@@ -152,6 +183,14 @@ def _build_prediction_rows(frame_records: List[Dict[str, Any]], video_id: str = 
                         "accepted": bool(detection.get("accepted", False)),
                         "candidate_source": str(detection.get("candidate_source", "")),
                         "quality_bucket": quality_bucket,
+                        "matched_prior_ids_json": json.dumps(matched_prior_ids),
+                        "top_prior_id": matched_prior_ids[0] if matched_prior_ids else "",
+                        "prior_relevance_score": float(prior_metadata.get("prior_relevance_score", 0.0) or 0.0),
+                        "matched_prior_scores_json": json.dumps(dict(prior_metadata.get("matched_prior_scores", {})), sort_keys=True),
+                        "matched_prior_tracking_priorities_json": json.dumps(
+                            dict(prior_metadata.get("matched_prior_tracking_priorities", {})),
+                            sort_keys=True,
+                        ),
                         "bbox_x1": float(bbox[0]) if len(bbox) > 0 else "",
                         "bbox_y1": float(bbox[1]) if len(bbox) > 1 else "",
                         "bbox_x2": float(bbox[2]) if len(bbox) > 2 else "",
@@ -386,33 +425,20 @@ def process_video(
             class_summary_rows = _build_class_summary_rows(prediction_rows)
             _write_csv(
                 predictions_csv_file,
-                [
-                    "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
-                    "candidate_source", "quality_bucket",
-                    "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-                    "bbox_width", "bbox_height", "bbox_area",
-                    "accepted_confidence_threshold", "candidate_confidence_threshold",
-                    "borderline_confidence_threshold", "accepted_nms_iou_threshold",
-                    "candidate_nms_iou_threshold",
-                ],
+                _PREDICTION_CSV_FIELDS,
                 prediction_rows,
             )
             _write_csv(
                 class_summary_csv_file,
-                [
-                    "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
-                    "num_videos_with_detections", "num_frames_with_detections",
-                    "num_videos_with_accepted", "num_frames_with_accepted",
-                    "num_videos_with_candidates", "num_frames_with_candidates",
-                    "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
-                    "quality_counts_json", "num_high_quality", "num_borderline_quality",
-                    "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
-                ],
+                _CLASS_SUMMARY_CSV_FIELDS,
                 class_summary_rows,
             )
             cached.setdefault("output_paths", {})
             cached["output_paths"]["detection_predictions_csv"] = str(predictions_csv_file)
             cached["output_paths"]["detection_class_summary_csv"] = str(class_summary_csv_file)
+            cached["output_paths"]["background_rule_relevance_prior_json"] = str(
+                background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", "")
+            ) if isinstance(background_rule_relevance_prior_results, dict) else ""
             with detections_file.open("w", encoding="utf-8") as fh:
                 json.dump(cached, fh, indent=2)
             if render_video and not boxed_video_file.exists() and cached.get("frames"):
@@ -444,33 +470,22 @@ def process_video(
                 "detections_json": str(detections_file),
                 "detection_predictions_csv": str(predictions_csv_file),
                 "detection_class_summary_csv": str(class_summary_csv_file),
+                "background_rule_relevance_prior_json": str(
+                    background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", "")
+                )
+                if isinstance(background_rule_relevance_prior_results, dict)
+                else "",
             },
             "from_cache": False,
         }
         _write_csv(
             predictions_csv_file,
-            [
-                "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
-                "candidate_source", "quality_bucket",
-                "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-                "bbox_width", "bbox_height", "bbox_area",
-                "accepted_confidence_threshold", "candidate_confidence_threshold",
-                "borderline_confidence_threshold", "accepted_nms_iou_threshold",
-                "candidate_nms_iou_threshold",
-            ],
+            _PREDICTION_CSV_FIELDS,
             [],
         )
         _write_csv(
             class_summary_csv_file,
-            [
-                "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
-                "num_videos_with_detections", "num_frames_with_detections",
-                "num_videos_with_accepted", "num_frames_with_accepted",
-                "num_videos_with_candidates", "num_frames_with_candidates",
-                "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
-                "quality_counts_json", "num_high_quality", "num_borderline_quality",
-                "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
-            ],
+            _CLASS_SUMMARY_CSV_FIELDS,
             [],
         )
         with detections_file.open("w", encoding="utf-8") as fh:
@@ -514,6 +529,11 @@ def process_video(
             "detections_json": str(detections_file),
             "detection_predictions_csv": str(predictions_csv_file),
             "detection_class_summary_csv": str(class_summary_csv_file),
+            "background_rule_relevance_prior_json": str(
+                background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", "")
+            )
+            if isinstance(background_rule_relevance_prior_results, dict)
+            else "",
         },
         "from_cache": False,
     }
@@ -532,28 +552,12 @@ def process_video(
         json.dump(video_result, fh, indent=2)
     _write_csv(
         predictions_csv_file,
-        [
-            "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
-            "candidate_source", "quality_bucket",
-            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-            "bbox_width", "bbox_height", "bbox_area",
-            "accepted_confidence_threshold", "candidate_confidence_threshold",
-            "borderline_confidence_threshold", "accepted_nms_iou_threshold",
-            "candidate_nms_iou_threshold",
-        ],
+        _PREDICTION_CSV_FIELDS,
         prediction_rows,
     )
     _write_csv(
         class_summary_csv_file,
-        [
-            "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
-            "num_videos_with_detections", "num_frames_with_detections",
-            "num_videos_with_accepted", "num_frames_with_accepted",
-            "num_videos_with_candidates", "num_frames_with_candidates",
-            "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
-            "quality_counts_json", "num_high_quality", "num_borderline_quality",
-            "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
-        ],
+        _CLASS_SUMMARY_CSV_FIELDS,
         class_summary_rows,
     )
 
@@ -577,6 +581,7 @@ def run(
     predict_batch_size: Optional[int] = None,
     inference_imgsz: int = 640,
     use_half_precision: Optional[bool] = None,
+    background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -606,6 +611,9 @@ def run(
         predict_batch_size=predict_batch_size,
         inference_imgsz=inference_imgsz,
         use_half_precision=use_half_precision,
+        background_rule_relevance_prior_entries=list(background_rule_relevance_prior_results.get("entries", []))
+        if isinstance(background_rule_relevance_prior_results, dict)
+        else [],
     )
 
     print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
@@ -674,6 +682,12 @@ def run(
             "borderline_confidence_margin": float(borderline_confidence_margin),
         },
         "inference_profile": runtime_profile,
+        "background_rule_relevance_prior": {
+            "applied": bool(background_rule_relevance_prior_results),
+            "prior_json": str(background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", ""))
+            if isinstance(background_rule_relevance_prior_results, dict)
+            else "",
+        },
         "videos": [
             {
                 "video_id": r["video_id"],
@@ -697,38 +711,17 @@ def run(
     video_summary_csv_path = effective_output_root / "detection_video_summary.csv"
     _write_csv(
         aggregate_predictions_csv_path,
-        [
-            "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
-            "candidate_source", "quality_bucket",
-            "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-            "bbox_width", "bbox_height", "bbox_area",
-            "accepted_confidence_threshold", "candidate_confidence_threshold",
-            "borderline_confidence_threshold", "accepted_nms_iou_threshold",
-            "candidate_nms_iou_threshold",
-        ],
+        _PREDICTION_CSV_FIELDS,
         all_prediction_rows,
     )
     _write_csv(
         aggregate_class_summary_csv_path,
-        [
-            "class_name", "num_total_bboxes", "num_accepted_bboxes", "num_candidate_bboxes",
-            "num_videos_with_detections", "num_frames_with_detections",
-            "num_videos_with_accepted", "num_frames_with_accepted",
-            "num_videos_with_candidates", "num_frames_with_candidates",
-            "avg_score_total", "avg_score_accepted", "avg_score_candidate", "avg_bbox_area_total",
-            "quality_counts_json", "num_high_quality", "num_borderline_quality",
-            "num_low_quality", "num_nms_relaxed_quality", "num_discarded_quality",
-        ],
+        _CLASS_SUMMARY_CSV_FIELDS,
         aggregate_class_summary_rows,
     )
     _write_csv(
         video_summary_csv_path,
-        [
-            "video_id", "num_frames", "num_classes", "num_accepted_bboxes",
-            "num_candidate_bboxes", "num_total_bboxes", "quality_counts_json",
-            "num_high_quality", "num_borderline_quality", "num_low_quality",
-            "num_nms_relaxed_quality", "num_discarded_quality", "detected_classes_json",
-        ],
+        _VIDEO_SUMMARY_CSV_FIELDS,
         video_summary_rows,
     )
     with manifest_path.open("w", encoding="utf-8") as fh:

@@ -1,42 +1,24 @@
 """
-ByteTrack-based multi-object tracking over driving_mini detection results.
+Prior-guided candidate-aware multi-object tracking over driving_mini detections.
 
-Takes the per-video detection records produced by detect_driving_mini.run() and
-runs ByteTracker (via ultralytics) to assign persistent track IDs across frames.
+Accepted detections keep the existing ByteTrack-based tracking behavior.
+Candidate detections are tracked in a separate lightweight branch using detector
+score, Step 0 prior metadata, and simple spatial/temporal plausibility gates.
 
 Output layout:
     pipeline_output/02_driving_mini_tracking/<video_id>/
-        tracks.json          — per-frame tracking results with track IDs
+        tracks.json          — per-frame accepted/candidate tracking results
         tracks_manifest.json — summary manifest (written by run())
-
-Returned structure per video
------------------------------
-{
-    "video_id": str,
-    "num_frames": int,
-    "num_tracks": int,          # unique track IDs seen
-    "frames": [
-        {
-            "frame": str,           # e.g. "frame_00001.jpg"
-            "frame_index": int,
-            "image_path": str,
-            "boxes":    [[x1,y1,x2,y2], ...],
-            "scores":   [float, ...],
-            "labels":   [str, ...],
-            "track_ids":[int, ...],
-        },
-        ...
-    ],
-}
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -79,6 +61,31 @@ _DEFAULT_TRACKER_ARGS = SimpleNamespace(
 # ByteTracker needs orig_shape to build Boxes; we use the first available
 # detection to derive it when possible, otherwise fall back to this.
 _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
+_TRACKING_SCHEMA_VERSION = 2
+_CANDIDATE_TRACK_ID_OFFSET = 1_000_000
+_CANDIDATE_SPATIAL_MIN_SCORE = 0.01
+_CANDIDATE_MIN_COMBINED_SCORE = 0.35
+_CANDIDATE_MIN_SCORE_WITHOUT_PRIOR = 0.12
+_CANDIDATE_NEW_TRACK_MIN_SCORE = 0.45
+_CANDIDATE_MATCH_IOU_THRESHOLD = 0.3
+_CANDIDATE_MAX_FRAME_GAP = 1
+_CANDIDATE_TRACK_MAX_IDLE = 2
+
+_CANDIDATE_SOURCE_BONUS = {
+    "nms_relaxed_candidate": 0.25,
+    "borderline_confidence": 0.18,
+    "low_confidence": 0.08,
+    "discarded_detector_output": 0.0,
+    "candidate": 0.0,
+}
+
+_TRACKING_PRIORITY_BONUS = {
+    "highest": 0.2,
+    "high": 0.15,
+    "medium_high": 0.12,
+    "medium": 0.08,
+    "low": 0.03,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -201,9 +208,405 @@ def _infer_orig_shape(frame_records: List[Dict[str, Any]]) -> tuple[int, int]:
     return _FALLBACK_SHAPE
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _detection_id(frame_index: int, collection_name: str, det_index: int) -> str:
+    return f"{int(frame_index):06d}:{collection_name}:{int(det_index):04d}"
+
+
+def _coerce_bbox(box: Sequence[Any]) -> List[float]:
+    if len(box) < 4:
+        return []
+    return [float(box[0]), float(box[1]), float(box[2]), float(box[3])]
+
+
+def _center_xy(box: Sequence[float]) -> Tuple[float, float]:
+    return ((float(box[0]) + float(box[2])) * 0.5, (float(box[1]) + float(box[3])) * 0.5)
+
+
+def _bbox_area(box: Sequence[float]) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+def _match_iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+    bx1, by1, bx2, by2 = [float(v) for v in box_b]
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0.0:
+        return 0.0
+    area_a = _bbox_area(box_a)
+    area_b = _bbox_area(box_b)
+    denom = area_a + area_b - inter_area
+    return inter_area / denom if denom > 0.0 else 0.0
+
+
+def _accepted_detection_records(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    accepted_detections = list(rec.get("accepted_detections", []))
+    if accepted_detections:
+        return accepted_detections
+    boxes = list(rec.get("boxes", []))
+    scores = list(rec.get("scores", []))
+    labels = list(rec.get("labels", []))
+    fallback: List[Dict[str, Any]] = []
+    for det_index, box in enumerate(boxes):
+        fallback.append(
+            {
+                "bbox": list(box),
+                "score": _safe_float(scores[det_index] if det_index < len(scores) else 0.0),
+                "class": str(labels[det_index] if det_index < len(labels) else "unknown"),
+                "accepted": True,
+                "candidate_source": "accepted_high_confidence",
+                "threshold_info": {},
+                "prior_metadata": {},
+            }
+        )
+    return fallback
+
+
+def _candidate_detection_records(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return list(rec.get("candidate_detections", []))
+
+
+def _candidate_spatially_plausible(detection: Dict[str, Any], orig_shape: Tuple[int, int]) -> bool:
+    bbox = list(detection.get("bbox", []))
+    if len(bbox) < 4:
+        return False
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    if x2 <= x1 or y2 <= y1:
+        return False
+    width = x2 - x1
+    height = y2 - y1
+    if width < 4.0 or height < 4.0:
+        return False
+    if _bbox_area(bbox) < 25.0:
+        return False
+    frame_h, frame_w = orig_shape
+    cx, cy = _center_xy(bbox)
+    return -0.05 * frame_w <= cx <= 1.05 * frame_w and -0.05 * frame_h <= cy <= 1.05 * frame_h
+
+
+def _candidate_combined_score(detection: Dict[str, Any]) -> float:
+    prior_metadata = dict(detection.get("prior_metadata", {}))
+    matched_prior_ids = [str(value) for value in list(prior_metadata.get("matched_prior_ids", [])) if str(value)]
+    matched_priority_map = dict(prior_metadata.get("matched_prior_tracking_priorities", {}))
+    top_priority = matched_priority_map.get(matched_prior_ids[0], "") if matched_prior_ids else ""
+    return (
+        _safe_float(detection.get("score", 0.0))
+        + 0.35 * _safe_float(prior_metadata.get("prior_relevance_score", 0.0))
+        + _safe_float(_CANDIDATE_SOURCE_BONUS.get(str(detection.get("candidate_source", "")), 0.0))
+        + _safe_float(_TRACKING_PRIORITY_BONUS.get(str(top_priority), 0.0))
+    )
+
+
+def _candidate_selected_for_tracking(detection: Dict[str, Any], orig_shape: Tuple[int, int]) -> bool:
+    score = _safe_float(detection.get("score", 0.0))
+    if score < _CANDIDATE_SPATIAL_MIN_SCORE:
+        return False
+    if not _candidate_spatially_plausible(detection, orig_shape):
+        return False
+    prior_metadata = dict(detection.get("prior_metadata", {}))
+    matched_prior_ids = [str(value) for value in list(prior_metadata.get("matched_prior_ids", [])) if str(value)]
+    combined_score = _candidate_combined_score(detection)
+    if combined_score < _CANDIDATE_MIN_COMBINED_SCORE:
+        return False
+    if not matched_prior_ids and score < _CANDIDATE_MIN_SCORE_WITHOUT_PRIOR:
+        return False
+    return True
+
+
+def _candidate_summary_from_track(track: Dict[str, Any]) -> Dict[str, Any]:
+    observations = list(track.get("observations", []))
+    detection_ids = [str(obs.get("detection_id", "")) for obs in observations if str(obs.get("detection_id", ""))]
+    candidate_sources = [str(obs.get("candidate_source", "")) for obs in observations if str(obs.get("candidate_source", ""))]
+    scores = [_safe_float(obs.get("score", 0.0)) for obs in observations]
+    prior_scores = [_safe_float(obs.get("prior_relevance_score", 0.0)) for obs in observations]
+    ious = [_safe_float(value, 0.0) for value in list(track.get("match_ious", []))]
+    matched_prior_ids: set[str] = set()
+    prior_id_frequency: Counter[str] = Counter()
+    for obs in observations:
+        for prior_id in list(obs.get("matched_prior_ids", [])):
+            prior_id_text = str(prior_id)
+            if not prior_id_text:
+                continue
+            matched_prior_ids.add(prior_id_text)
+            prior_id_frequency.update([prior_id_text])
+    label_counts = Counter(str(obs.get("label", "unknown")) for obs in observations)
+    return {
+        "track_id": int(track.get("track_id", -1)),
+        "label": label_counts.most_common(1)[0][0] if label_counts else "unknown",
+        "source_detection_ids": detection_ids,
+        "candidate_sources": sorted(set(candidate_sources)),
+        "candidate_source_counts": dict(sorted(Counter(candidate_sources).items())),
+        "mean_score": float(sum(scores) / max(1, len(scores))),
+        "max_score": float(max(scores) if scores else 0.0),
+        "track_length": len(observations),
+        "temporal_consistency": float(sum(ious) / max(1, len(ious))) if ious else 1.0,
+        "matched_prior_ids": sorted(matched_prior_ids),
+        "matched_prior_id_counts": dict(sorted(prior_id_frequency.items())),
+        "prior_relevance_mean": float(sum(prior_scores) / max(1, len(prior_scores))),
+        "prior_relevance_max": float(max(prior_scores) if prior_scores else 0.0),
+        "prior_relevance_min": float(min(prior_scores) if prior_scores else 0.0),
+        "first_frame_index": int(observations[0].get("frame_index", -1)) if observations else -1,
+        "last_frame_index": int(observations[-1].get("frame_index", -1)) if observations else -1,
+    }
+
+
+def _accepted_track_summaries(tracked_frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    track_rows: Dict[int, Dict[str, Any]] = {}
+    for rec in tracked_frames:
+        frame_index = int(rec.get("frame_index", -1))
+        for box, score, label, track_id in zip(
+            rec.get("boxes", []),
+            rec.get("scores", []),
+            rec.get("labels", []),
+            rec.get("track_ids", []),
+        ):
+            bucket = track_rows.setdefault(
+                int(track_id),
+                {"track_id": int(track_id), "labels": Counter(), "scores": [], "frames": [], "boxes": []},
+            )
+            bucket["labels"].update([str(label)])
+            bucket["scores"].append(_safe_float(score))
+            bucket["frames"].append(frame_index)
+            bucket["boxes"].append(list(box))
+    summaries: List[Dict[str, Any]] = []
+    for track_id, bucket in sorted(track_rows.items()):
+        scores = list(bucket["scores"])
+        frames = list(bucket["frames"])
+        summaries.append(
+            {
+                "track_id": int(track_id),
+                "label": bucket["labels"].most_common(1)[0][0] if bucket["labels"] else "unknown",
+                "mean_score": float(sum(scores) / max(1, len(scores))),
+                "max_score": float(max(scores) if scores else 0.0),
+                "track_length": len(scores),
+                "first_frame_index": min(frames) if frames else -1,
+                "last_frame_index": max(frames) if frames else -1,
+            }
+        )
+    return summaries
+
+
 # ---------------------------------------------------------------------------
 # Per-video tracking
 # ---------------------------------------------------------------------------
+
+def _run_accepted_tracking(
+    frame_records: List[Dict[str, Any]],
+    orig_shape: Tuple[int, int],
+    frame_rate: int,
+    tracker_args: Optional[SimpleNamespace],
+) -> Tuple[List[Dict[str, Any]], set[int]]:
+    tracker = _make_tracker(frame_rate=frame_rate, args=tracker_args)
+    tracked_frames: List[Dict[str, Any]] = []
+    all_track_ids: set[int] = set()
+
+    for rec in frame_records:
+        accepted_detections = _accepted_detection_records(rec)
+        boxes_raw = [list(det.get("bbox", [])) for det in accepted_detections]
+        scores_raw = [_safe_float(det.get("score", 0.0)) for det in accepted_detections]
+        labels_raw = [str(det.get("class", "unknown")) for det in accepted_detections]
+        detection_ids = [
+            _detection_id(int(rec.get("frame_index", -1)), "accepted", det_index)
+            for det_index in range(len(accepted_detections))
+        ]
+
+        if boxes_raw:
+            arr = np.zeros((len(boxes_raw), 6), dtype=np.float32)
+            for det_index, (box, score) in enumerate(zip(boxes_raw, scores_raw)):
+                arr[det_index, :4] = box
+                arr[det_index, 4] = float(score)
+                arr[det_index, 5] = float(det_index)
+            track_output: np.ndarray = tracker.update(Boxes(arr, orig_shape))
+        else:
+            tracker.update(Boxes(np.empty((0, 6), dtype=np.float32), orig_shape))
+            track_output = np.empty((0, 7), dtype=np.float32)
+
+        frame_boxes: List[List[float]] = []
+        frame_scores: List[float] = []
+        frame_labels: List[str] = []
+        frame_track_ids: List[int] = []
+        frame_detection_ids: List[str] = []
+
+        if track_output is not None and len(track_output):
+            for row in track_output:
+                cls_idx = int(round(float(row[6])))
+                track_id = int(row[4])
+                frame_boxes.append([float(row[0]), float(row[1]), float(row[2]), float(row[3])])
+                frame_scores.append(float(row[5]))
+                frame_labels.append(labels_raw[cls_idx] if cls_idx < len(labels_raw) else "unknown")
+                frame_track_ids.append(track_id)
+                frame_detection_ids.append(detection_ids[cls_idx] if cls_idx < len(detection_ids) else "")
+                all_track_ids.add(track_id)
+
+        tracked_frames.append(
+            {
+                "frame": rec.get("frame", ""),
+                "frame_index": rec.get("frame_index", -1),
+                "image_path": rec.get("image_path", ""),
+                "boxes": frame_boxes,
+                "scores": frame_scores,
+                "labels": frame_labels,
+                "track_ids": frame_track_ids,
+                "detection_ids": frame_detection_ids,
+            }
+        )
+
+    return tracked_frames, all_track_ids
+
+
+def _run_candidate_tracking(
+    frame_records: List[Dict[str, Any]],
+    orig_shape: Tuple[int, int],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    active_tracks: Dict[int, Dict[str, Any]] = {}
+    completed_tracks: List[Dict[str, Any]] = []
+    candidate_frames: List[Dict[str, Any]] = []
+    next_track_id = _CANDIDATE_TRACK_ID_OFFSET
+
+    for rec in frame_records:
+        frame_index = int(rec.get("frame_index", -1))
+        filtered_active_tracks: Dict[int, Dict[str, Any]] = {}
+        for track_id, track in active_tracks.items():
+            if frame_index - int(track.get("last_frame_index", frame_index)) <= _CANDIDATE_TRACK_MAX_IDLE:
+                filtered_active_tracks[track_id] = track
+            else:
+                completed_tracks.append(track)
+        active_tracks = filtered_active_tracks
+
+        candidate_inputs: List[Dict[str, Any]] = []
+        for det_index, det in enumerate(_candidate_detection_records(rec)):
+            detection = dict(det)
+            detection["bbox"] = _coerce_bbox(detection.get("bbox", []))
+            detection["score"] = _safe_float(detection.get("score", 0.0))
+            detection["class"] = str(detection.get("class", "unknown"))
+            detection["candidate_source"] = str(detection.get("candidate_source", "candidate"))
+            detection["prior_metadata"] = dict(detection.get("prior_metadata", {}))
+            detection["detection_id"] = _detection_id(frame_index, "candidate", det_index)
+            detection["combined_tracking_score"] = _candidate_combined_score(detection)
+            detection["matched_prior_ids"] = [
+                str(value)
+                for value in list(detection["prior_metadata"].get("matched_prior_ids", []))
+                if str(value)
+            ]
+            detection["prior_relevance_score"] = _safe_float(
+                detection["prior_metadata"].get("prior_relevance_score", 0.0)
+            )
+            if _candidate_selected_for_tracking(detection, orig_shape):
+                candidate_inputs.append(detection)
+
+        candidate_inputs.sort(
+            key=lambda row: (
+                -_safe_float(row.get("combined_tracking_score", 0.0)),
+                -_safe_float(row.get("score", 0.0)),
+            )
+        )
+
+        used_track_ids: set[int] = set()
+        frame_candidate_boxes: List[List[float]] = []
+        frame_candidate_scores: List[float] = []
+        frame_candidate_labels: List[str] = []
+        frame_candidate_track_ids: List[int] = []
+        frame_candidate_detection_ids: List[str] = []
+        frame_candidate_sources: List[str] = []
+        frame_candidate_prior_scores: List[float] = []
+        frame_candidate_prior_ids: List[List[str]] = []
+
+        for detection in candidate_inputs:
+            label = str(detection.get("class", "unknown"))
+            bbox = list(detection.get("bbox", []))
+            best_track: Optional[Dict[str, Any]] = None
+            best_track_id: Optional[int] = None
+            best_iou = 0.0
+            for track_id, track in active_tracks.items():
+                if track_id in used_track_ids:
+                    continue
+                if frame_index - int(track.get("last_frame_index", frame_index)) > _CANDIDATE_MAX_FRAME_GAP:
+                    continue
+                if str(track.get("label", "")) != label:
+                    continue
+                iou = _match_iou(bbox, list(track.get("last_bbox", [])))
+                if iou >= _CANDIDATE_MATCH_IOU_THRESHOLD and iou > best_iou:
+                    best_iou = iou
+                    best_track = track
+                    best_track_id = track_id
+
+            if best_track is None:
+                if _safe_float(detection.get("combined_tracking_score", 0.0)) < _CANDIDATE_NEW_TRACK_MIN_SCORE:
+                    continue
+                best_track_id = next_track_id
+                next_track_id += 1
+                best_track = {
+                    "track_id": best_track_id,
+                    "label": label,
+                    "last_bbox": bbox,
+                    "last_frame_index": frame_index,
+                    "observations": [],
+                    "match_ious": [],
+                }
+                active_tracks[best_track_id] = best_track
+                best_iou = 1.0
+
+            used_track_ids.add(int(best_track_id))
+            observation = {
+                "frame": rec.get("frame", ""),
+                "frame_index": frame_index,
+                "image_path": rec.get("image_path", ""),
+                "bbox": bbox,
+                "score": _safe_float(detection.get("score", 0.0)),
+                "label": label,
+                "detection_id": str(detection.get("detection_id", "")),
+                "candidate_source": str(detection.get("candidate_source", "")),
+                "matched_prior_ids": list(detection.get("matched_prior_ids", [])),
+                "prior_relevance_score": _safe_float(detection.get("prior_relevance_score", 0.0)),
+            }
+            best_track["observations"].append(observation)
+            best_track["match_ious"].append(best_iou)
+            best_track["last_bbox"] = bbox
+            best_track["last_frame_index"] = frame_index
+
+            frame_candidate_boxes.append(bbox)
+            frame_candidate_scores.append(_safe_float(detection.get("score", 0.0)))
+            frame_candidate_labels.append(label)
+            frame_candidate_track_ids.append(int(best_track_id))
+            frame_candidate_detection_ids.append(str(detection.get("detection_id", "")))
+            frame_candidate_sources.append(str(detection.get("candidate_source", "")))
+            frame_candidate_prior_scores.append(_safe_float(detection.get("prior_relevance_score", 0.0)))
+            frame_candidate_prior_ids.append(list(detection.get("matched_prior_ids", [])))
+
+        candidate_frames.append(
+            {
+                "frame": rec.get("frame", ""),
+                "frame_index": frame_index,
+                "image_path": rec.get("image_path", ""),
+                "boxes": frame_candidate_boxes,
+                "scores": frame_candidate_scores,
+                "labels": frame_candidate_labels,
+                "track_ids": frame_candidate_track_ids,
+                "detection_ids": frame_candidate_detection_ids,
+                "candidate_sources": frame_candidate_sources,
+                "prior_relevance_scores": frame_candidate_prior_scores,
+                "matched_prior_ids": frame_candidate_prior_ids,
+            }
+        )
+
+    completed_tracks.extend(active_tracks.values())
+    candidate_track_summaries = sorted(
+        (_candidate_summary_from_track(track) for track in completed_tracks if track.get("observations")),
+        key=lambda row: (int(row.get("track_id", -1))),
+    )
+    return candidate_frames, candidate_track_summaries
 
 def track_video(
     video_result: Dict[str, Any],
@@ -231,99 +634,63 @@ def track_video(
     tracks_file = out_dir / "tracks.json"
 
     if not force_recompute and tracks_file.exists():
-        print(f"  [cache] {video_id} — loading {tracks_file.name}")
         with tracks_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        tracked_video_file = out_dir / "tracks_boxed.mp4"
-        if render_video and not tracked_video_file.exists() and cached.get("frames"):
-            render_path = render_tracking_video(
-                video_id=video_id,
-                tracked_frames=cached["frames"],
-                output_path=tracked_video_file,
-                fps=float(frame_rate),
-            )
-            if render_path:
-                cached["tracked_video_path"] = render_path
-                with tracks_file.open("w", encoding="utf-8") as fh:
-                    json.dump(cached, fh, indent=2)
-                print(f"  Rendered tracked video: {tracked_video_file.name}")
-        return cached
+        cache_is_current = (
+            int(cached.get("schema_version", 1)) >= _TRACKING_SCHEMA_VERSION
+            and isinstance(cached.get("accepted_tracks"), dict)
+            and isinstance(cached.get("candidate_tracks"), dict)
+        )
+        if not cache_is_current:
+            cached = {}
+        else:
+            tracked_video_file = out_dir / "tracks_boxed.mp4"
+            if render_video and not tracked_video_file.exists() and cached.get("frames"):
+                render_path = render_tracking_video(
+                    video_id=video_id,
+                    tracked_frames=cached["frames"],
+                    output_path=tracked_video_file,
+                    fps=float(frame_rate),
+                )
+                if render_path:
+                    cached["tracked_video_path"] = render_path
+                    with tracks_file.open("w", encoding="utf-8") as fh:
+                        json.dump(cached, fh, indent=2)
+            return cached
 
     frame_records: List[Dict[str, Any]] = video_result.get("frames", [])
-    print(f"\n=== Tracking {video_id} ({len(frame_records)} frames) ===")
-
     orig_shape = _infer_orig_shape(frame_records)
-    tracker = _make_tracker(frame_rate=frame_rate, args=tracker_args)
-
-    tracked_frames: List[Dict[str, Any]] = []
-    all_track_ids: set[int] = set()
-
-    for rec in frame_records:
-        boxes_raw: List[List[float]] = rec.get("boxes", [])
-        scores_raw: List[float] = rec.get("scores", [])
-        labels_raw: List[str] = rec.get("labels", [])
-
-        if boxes_raw:
-            # Build (N, 6) array: [x1, y1, x2, y2, conf, cls_id]
-            # BYTETracker only uses coordinates + confidence; class is preserved
-            # so we can map back to label strings after tracking.
-            n = len(boxes_raw)
-            arr = np.zeros((n, 6), dtype=np.float32)
-            for i, (box, score) in enumerate(zip(boxes_raw, scores_raw)):
-                arr[i, :4] = box
-                arr[i, 4] = float(score)
-                arr[i, 5] = float(i)  # use original index as placeholder class
-
-            det_boxes = Boxes(arr, orig_shape)
-            track_output: np.ndarray = tracker.update(det_boxes)
-            # track_output columns: [x1, y1, x2, y2, track_id, conf, cls, ...]
-        else:
-            # No detections — update tracker with empty input to age out tracks
-            empty = np.empty((0, 6), dtype=np.float32)
-            det_boxes = Boxes(empty, orig_shape) if False else None  # skip empty update
-            tracker.update(
-                Boxes(np.empty((0, 6), dtype=np.float32), orig_shape)
-            )
-            track_output = np.empty((0, 7), dtype=np.float32)
-
-        # Build per-frame output, preserving original labels
-        frame_boxes: List[List[float]] = []
-        frame_scores: List[float] = []
-        frame_labels: List[str] = []
-        frame_track_ids: List[int] = []
-
-        if track_output is not None and len(track_output):
-            for row in track_output:
-                # ultralytics BYTETracker returns [x1,y1,x2,y2, track_id, conf, cls]
-                x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-                track_id = int(row[4])
-                conf = float(row[5])
-                cls_idx = int(round(float(row[6])))
-
-                # Recover original label by class index (we stored original index as cls)
-                label = labels_raw[cls_idx] if cls_idx < len(labels_raw) else "unknown"
-
-                frame_boxes.append([x1, y1, x2, y2])
-                frame_scores.append(conf)
-                frame_labels.append(label)
-                frame_track_ids.append(track_id)
-                all_track_ids.add(track_id)
-
-        tracked_frames.append({
-            "frame": rec.get("frame", ""),
-            "frame_index": rec.get("frame_index", -1),
-            "image_path": rec.get("image_path", ""),
-            "boxes": frame_boxes,
-            "scores": frame_scores,
-            "labels": frame_labels,
-            "track_ids": frame_track_ids,
-        })
+    accepted_frames, accepted_track_ids = _run_accepted_tracking(
+        frame_records=frame_records,
+        orig_shape=orig_shape,
+        frame_rate=frame_rate,
+        tracker_args=tracker_args,
+    )
+    candidate_frames, candidate_track_summaries = _run_candidate_tracking(
+        frame_records=frame_records,
+        orig_shape=orig_shape,
+    )
 
     result: Dict[str, Any] = {
+        "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
-        "num_frames": len(tracked_frames),
-        "num_tracks": len(all_track_ids),
-        "frames": tracked_frames,
+        "num_frames": len(accepted_frames),
+        "num_tracks": len(accepted_track_ids),
+        "num_candidate_tracks": len(candidate_track_summaries),
+        "frames": accepted_frames,
+        "accepted_tracks": {
+            "num_tracks": len(accepted_track_ids),
+            "frames": accepted_frames,
+            "track_summaries": _accepted_track_summaries(accepted_frames),
+        },
+        "candidate_tracks": {
+            "num_tracks": len(candidate_track_summaries),
+            "frames": candidate_frames,
+            "track_summaries": candidate_track_summaries,
+        },
+        "output_paths": {
+            "tracks_json": str(tracks_file),
+        },
     }
 
     with tracks_file.open("w", encoding="utf-8") as fh:
@@ -334,7 +701,7 @@ def track_video(
     if render_video:
         render_path = render_tracking_video(
             video_id=video_id,
-            tracked_frames=tracked_frames,
+            tracked_frames=accepted_frames,
             output_path=tracked_video_file,
             fps=float(frame_rate),
         )
@@ -342,12 +709,6 @@ def track_video(
             result["tracked_video_path"] = render_path
             with tracks_file.open("w", encoding="utf-8") as fh:
                 json.dump(result, fh, indent=2)
-            print(f"  Saved tracked video: {tracked_video_file.name}")
-
-    print(
-        f"  {result['num_frames']} frames tracked, "
-        f"{result['num_tracks']} unique tracks"
-    )
     return result
 
 
@@ -394,12 +755,14 @@ def run(
 
     # Write summary manifest
     manifest = {
+        "schema_version": _TRACKING_SCHEMA_VERSION,
         "num_videos": len(tracking_results),
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_frames": r["num_frames"],
                 "num_tracks": r["num_tracks"],
+                "num_candidate_tracks": int(r.get("num_candidate_tracks", 0)),
             }
             for r in tracking_results
         ],
@@ -409,6 +772,8 @@ def run(
         json.dump(manifest, fh, indent=2)
 
     total_tracks = sum(r["num_tracks"] for r in tracking_results)
+    total_candidate_tracks = sum(int(r.get("num_candidate_tracks", 0)) for r in tracking_results)
     print(f"\nSaved tracking manifest to {manifest_path}")
     print(f"Total unique tracks across all videos: {total_tracks}")
+    print(f"Total candidate tracks across all videos: {total_candidate_tracks}")
     return tracking_results

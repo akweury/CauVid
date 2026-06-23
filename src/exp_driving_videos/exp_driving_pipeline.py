@@ -2,6 +2,10 @@
 Experiment pipeline for the driving_mini dataset.
 
 Steps:
+  0. background_rule_relevance_prior_driving_mini — define a manual
+                            task-level brake_next prior table for
+                            candidate-ranking and tracking-priority use only;
+                            never emit it as detections, facts, or rule labels.
   1. detect_driving_mini  — run YOLO-World detection on every video clip and
                             return per-video detection records.
   2. tracking_driving_mini — run ByteTrack on the detection results to assign
@@ -164,6 +168,7 @@ from src.exp_driving_videos.modules import traffic_light_detection_quality_audit
 from src.exp_driving_videos.modules import traffic_control_temporal_alignment_diagnostic_driving_mini
 from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
 from src.exp_driving_videos.modules import background_causal_prior_driving_mini
+from src.exp_driving_videos.modules import background_rule_relevance_prior_driving_mini
 from src.exp_driving_videos.modules import reasoning_feedback_signal_driving_mini
 
 DRIVING_MINI_OD_MODEL = driving_pipeline_config.DRIVING_MINI_OD_MODEL
@@ -206,6 +211,7 @@ _get_traffic_light_detection_quality_audit_cfg = (
     driving_pipeline_config.get_traffic_light_detection_quality_audit_cfg
 )
 _get_background_causal_prior_cfg = driving_pipeline_config.get_background_causal_prior_cfg
+_get_background_rule_relevance_prior_cfg = driving_pipeline_config.get_background_rule_relevance_prior_cfg
 _get_reasoning_feedback_signal_cfg = driving_pipeline_config.get_reasoning_feedback_signal_cfg
 _get_neural_symbolic_baseline_cfg = driving_pipeline_config.get_neural_symbolic_baseline_cfg
 _get_rule_selection_visualization_cfg = driving_pipeline_config.get_rule_selection_visualization_cfg
@@ -237,6 +243,7 @@ _get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule
 _get_integrated_method_visualization_output_root = driving_pipeline_config.get_integrated_method_visualization_output_root
 _get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
 _get_background_causal_prior_output_root = driving_pipeline_config.get_background_causal_prior_output_root
+_get_background_rule_relevance_prior_output_root = driving_pipeline_config.get_background_rule_relevance_prior_output_root
 _get_reasoning_feedback_signal_output_root = driving_pipeline_config.get_reasoning_feedback_signal_output_root
 
 _merge_candidate_rules = driving_pipeline_data.merge_candidate_rules
@@ -245,6 +252,7 @@ _build_train_eval_split = driving_pipeline_data.build_train_eval_split
 _resolve_video_ids = driving_pipeline_data.resolve_video_ids
 
 _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
+    {"tag": "0", "stop_after": 0, "label": "background_rule_relevance_prior_driving_mini"},
     {"tag": "1", "stop_after": 1, "label": "detect_driving_mini"},
     {"tag": "2", "stop_after": 2, "label": "tracking_driving_mini"},
     {"tag": "3", "stop_after": 3, "label": "dataset_annotations_driving_mini"},
@@ -389,6 +397,7 @@ class _FilteredStepWriter(io.TextIOBase):
 @dataclass(slots=True)
 class PipelineContext:
     effective_video_ids: List[str]
+    background_rule_relevance_prior_results: Dict[str, Any] = field(default_factory=dict)
     detection_results: Optional[List[Dict[str, Any]]] = None
     tracking_results: Optional[List[Dict[str, Any]]] = None
     dataset_annotation_results: Optional[List[Dict[str, Any]]] = None
@@ -482,7 +491,7 @@ def _resolve_stop_request(requested_step: int | str) -> Tuple[str, str]:
     normalized = _normalize_requested_step(requested_step)
     if normalized.isdigit():
         step_number = int(normalized)
-        if step_number < 1 or step_number > 22:
+        if step_number < 0 or step_number > 23:
             raise ValueError(f"Unsupported max_step: {requested_step}")
         default_targets = [
             str(stage["tag"])
@@ -535,6 +544,7 @@ def _run_object_detection_step(
     force_recompute: bool = False,
     video_ids: Optional[List[str]] = None,
     render_video: bool = True,
+    background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     return detect_driving_mini.run(
         video_ids=video_ids,
@@ -542,6 +552,7 @@ def _run_object_detection_step(
         classes=DRIVING_MINI_OD_CLASSES,
         force_recompute=force_recompute,
         render_video=render_video,
+        background_rule_relevance_prior_results=background_rule_relevance_prior_results,
     )
 
 
@@ -737,12 +748,28 @@ def _prepare_rule_learning_inputs(ctx: PipelineContext) -> None:
     ctx.recompute_cfg = _get_pipeline_recompute_cfg()
 
 
+def run_step_0_background_rule_relevance_prior(ctx: PipelineContext, runner: StepRunner) -> None:
+    background_rule_relevance_prior_cfg = _get_background_rule_relevance_prior_cfg()
+    runner.announce_step("0", "background_rule_relevance_prior_driving_mini", leading_newline=False)
+    runner.log("0", f"cfg={background_rule_relevance_prior_cfg}")
+    runner.log("0", f"recompute={bool(_get_pipeline_recompute_cfg().get('background_rule_relevance_prior', True))}")
+    with runner.module_output("0"):
+        ctx.background_rule_relevance_prior_results = background_rule_relevance_prior_driving_mini.run(
+            cfg=background_rule_relevance_prior_cfg,
+            output_root=_get_background_rule_relevance_prior_output_root(),
+            force_recompute=bool(_get_pipeline_recompute_cfg().get("background_rule_relevance_prior", True)),
+        )
+    runner.log("0", f"entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
+    runner.complete_step("0", subtitle=f"entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
+
+
 def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_detection_render_video_enabled(default=True)
     runner.announce_step("1", "detect_driving_mini", leading_newline=False)
     runner.log("1", f"model={DRIVING_MINI_OD_MODEL}")
     runner.log("1", f"classes={len(DRIVING_MINI_OD_CLASSES)} configured")
     runner.log("1", f"render_video={render_video}")
+    runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
     if ctx.effective_video_ids:
         runner.log("1", f"video_filter={ctx.effective_video_ids}")
     with runner.module_output("1"):
@@ -750,6 +777,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             force_recompute=False,
             video_ids=ctx.effective_video_ids,
             render_video=render_video,
+            background_rule_relevance_prior_results=ctx.background_rule_relevance_prior_results,
         )
     runner.log("1", f"completed videos={len(ctx.detection_results)}")
     runner.complete_step("1", subtitle=f"videos={len(ctx.detection_results)}")
@@ -765,6 +793,7 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
             render_video=render_video,
         )
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
+    runner.log("2", f"candidate_tracks={sum(int(row.get('num_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}")
     runner.complete_step("2", subtitle=f"videos={len(ctx.tracking_results)}")
 
 
@@ -1545,6 +1574,8 @@ def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> Non
     ctx = PipelineContext(effective_video_ids=_resolve_video_ids(video_ids))
     runner = StepRunner.create(max_step)
     try:
+        run_step_0_background_rule_relevance_prior(ctx, runner)
+
         # Perception
         run_step_1_detection(ctx, runner)
         run_step_2_tracking(ctx, runner)

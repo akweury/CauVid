@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 from abc import ABC, abstractmethod
@@ -213,6 +214,7 @@ class YOLOWorldDetector(ObjectDetector):
         predict_batch_size: Optional[int] = None,
         inference_imgsz: int = 640,
         use_half_precision: Optional[bool] = None,
+        background_rule_relevance_prior_entries: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self.model_name = model_name
         self.classes = list(classes) if classes else []
@@ -225,16 +227,72 @@ class YOLOWorldDetector(ObjectDetector):
         self.predict_batch_size = predict_batch_size
         self.inference_imgsz = int(inference_imgsz)
         self.use_half_precision = use_half_precision
+        self.background_rule_relevance_prior_entries = list(background_rule_relevance_prior_entries or [])
         self._model: Any = None  # loaded lazily in warmup()
         self._resolved_model_source: Optional[str] = None
         self._runtime_device: Optional[str] = None
         self._runtime_gpu_name: Optional[str] = None
         self._resolved_predict_batch_size: Optional[int] = None
         self._resolved_half_precision: Optional[bool] = None
+        self._prior_class_index = self._build_prior_class_index(self.background_rule_relevance_prior_entries)
 
     @staticmethod
     def _round_box(box: Sequence[float]) -> List[float]:
         return [round(float(v), 2) for v in box]
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+    def _build_prior_class_index(
+        self,
+        prior_entries: Sequence[Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        index: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in prior_entries:
+            prior_id = str(entry.get("prior_id", ""))
+            if not prior_id:
+                continue
+            prior_score = float(entry.get("candidate_ranking_priority", 0.0))
+            tracking_priority = str(entry.get("tracking_priority", ""))
+            for class_name in list(entry.get("rule_relevant_object_classes", [])) or list(entry.get("candidate_classes", [])):
+                normalized_class_name = self._normalize_text(class_name)
+                if not normalized_class_name:
+                    continue
+                index.setdefault(normalized_class_name, []).append(
+                    {
+                        "prior_id": prior_id,
+                        "prior_relevance_score": prior_score,
+                        "tracking_priority": tracking_priority,
+                    }
+                )
+        for matches in index.values():
+            matches.sort(
+                key=lambda row: (
+                    -float(row.get("prior_relevance_score", 0.0)),
+                    str(row.get("prior_id", "")),
+                )
+            )
+        return index
+
+    def _prior_metadata_for_class(self, class_name: str) -> Dict[str, Any]:
+        normalized_class_name = self._normalize_text(class_name)
+        matches = list(self._prior_class_index.get(normalized_class_name, []))
+        matched_prior_ids = [str(row.get("prior_id", "")) for row in matches if str(row.get("prior_id", ""))]
+        return {
+            "matched_prior_ids": matched_prior_ids,
+            "prior_relevance_score": float(matches[0].get("prior_relevance_score", 0.0)) if matches else 0.0,
+            "matched_prior_scores": {
+                str(row.get("prior_id", "")): float(row.get("prior_relevance_score", 0.0))
+                for row in matches
+                if str(row.get("prior_id", ""))
+            },
+            "matched_prior_tracking_priorities": {
+                str(row.get("prior_id", "")): str(row.get("tracking_priority", ""))
+                for row in matches
+                if str(row.get("prior_id", ""))
+            },
+        }
 
     @staticmethod
     def _iou_xyxy(box_a: Sequence[float], box_b: Sequence[float]) -> float:
@@ -409,6 +467,7 @@ class YOLOWorldDetector(ObjectDetector):
                 "accepted": True,
                 "candidate_source": "accepted_high_confidence",
                 "threshold_info": dict(threshold_info),
+                "prior_metadata": self._prior_metadata_for_class(str(det["class"])),
             }
             for det in accepted_detections
         ]
@@ -434,6 +493,7 @@ class YOLOWorldDetector(ObjectDetector):
                     "accepted": False,
                     "candidate_source": candidate_source,
                     "threshold_info": dict(threshold_info),
+                    "prior_metadata": self._prior_metadata_for_class(str(det["class"])),
                 }
             )
 
@@ -449,6 +509,7 @@ class YOLOWorldDetector(ObjectDetector):
                 "num_candidate_detections": len(candidate_payload),
                 "num_total_saved_detections": len(accepted_payload) + len(candidate_payload),
                 "detection_thresholds": threshold_info,
+                "background_rule_relevance_prior_applied": bool(self._prior_class_index),
             },
         )
 

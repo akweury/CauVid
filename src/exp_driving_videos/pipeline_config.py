@@ -613,6 +613,16 @@ def get_background_causal_prior_cfg() -> Dict[str, Any]:
     )
 
 
+def get_background_rule_relevance_prior_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "target_predicate": "brake_next",
+        },
+        path=("background_rule_relevance_prior",),
+        warn_label="background rule relevance prior",
+    )
+
+
 def get_reasoning_feedback_signal_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -657,6 +667,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "fn_categorization_diagnostic": True,
             "rule_selection_visualization": True,
             "integrated_method_visualization": True,
+            "background_rule_relevance_prior": True,
             "background_causal_prior": True,
             "reasoning_feedback_signal": True,
         },
@@ -756,6 +767,10 @@ def get_rule_selection_visualization_output_root() -> Path:
 
 def get_integrated_method_visualization_output_root() -> Path:
     return _load_output_root("22_driving_mini_integrated_method_visualization")
+
+
+def get_background_rule_relevance_prior_output_root() -> Path:
+    return _load_output_root("00_driving_mini_background_rule_relevance_prior")
 
 
 def get_background_causal_prior_output_root() -> Path:
