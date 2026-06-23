@@ -625,6 +625,14 @@ def prepare_video_3d_positions(
                     **dict(candidate_object),
                     "position_3d": [],
                     "has_3d_position": False,
+                    "position_3d_provenance": {
+                        "estimation_source": "depth_map_bbox_center",
+                        "frame_path": str(frame_path),
+                        "depth_map_path": str(depth_map_path),
+                        "bbox": list(dict(candidate_object).get("bbox", [])),
+                        "has_3d_position": False,
+                        "missing_assets": list(missing_assets),
+                    },
                 }
                 for candidate_object in list(frame_entry.get("candidate_objects", []))
             ]
@@ -659,6 +667,13 @@ def prepare_video_3d_positions(
                     **candidate_object,
                     "position_3d": list(position_3d),
                     "has_3d_position": True,
+                    "position_3d_provenance": {
+                        "estimation_source": "depth_map_bbox_center",
+                        "frame_path": str(frame_path),
+                        "depth_map_path": str(depth_map_path),
+                        "bbox": list(candidate_object.get("bbox", [])),
+                        "has_3d_position": True,
+                    },
                 }
             )
         updated_frame["positions_3d"] = positions_3d

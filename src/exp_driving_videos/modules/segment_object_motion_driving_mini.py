@@ -33,7 +33,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SEGMENT_OBJECT_MOTION_VERSION = 5
+_SEGMENT_OBJECT_MOTION_VERSION = 6
 
 
 def get_output_root() -> Path:
@@ -189,6 +189,15 @@ def _classify_distance_state(mean_z: float, near_threshold: float, medium_thresh
     return "far"
 
 
+def _visibility_state(visibility_ratio: float, persistent_threshold: float = 0.8, present_threshold: float = 0.3) -> str:
+    ratio = float(visibility_ratio)
+    if ratio >= persistent_threshold:
+        return "persistent"
+    if ratio >= present_threshold:
+        return "intermittent"
+    return "brief"
+
+
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
         "rel_vz_threshold",
@@ -303,6 +312,32 @@ def _summarize_segment_object_group(
                     if s.get("candidate_object_id")
                 }
             ])
+            visibility_ratio = float(len(samples) / max(1, num_frames_in_segment))
+            distance_series_meters = [
+                float(position[2]) if len(position) > 2 else 0.0
+                for position in positions
+            ]
+            distance_state_series = [
+                str(sample.get("distance_state", _classify_distance_state(
+                    mean_z=float(position[2]) if len(position) > 2 else 0.0,
+                    near_threshold=distance_near_threshold,
+                    medium_threshold=distance_medium_threshold,
+                )))
+                for sample, position in zip(samples, positions)
+            ]
+            vx_state_series = [
+                str(sample.get("vx_state", "vx_unknown"))
+                for sample in samples
+            ]
+            vz_state_series = [
+                str(sample.get("vz_state", "vz_unknown"))
+                for sample in samples
+            ]
+            speed_state_series = [
+                str(sample.get("speed_state", "speed_unknown"))
+                for sample in samples
+            ]
+            visibility_state = _visibility_state(visibility_ratio)
             summary.update(
                 {
                     "accepted": False,
@@ -316,6 +351,27 @@ def _summarize_segment_object_group(
                     "score_breakdown": dict(first.get("score_breakdown", {})),
                     "selection_score": float(first.get("selection_score", 0.0)),
                     "track_quality": dict(first.get("track_quality", {})),
+                    "position_3d_provenance": dict(first.get("position_3d_provenance", {})),
+                    "relative_position_3d_series": positions,
+                    "distance_series_meters": distance_series_meters,
+                    "distance_state_series": distance_state_series,
+                    "vx_state_series": vx_state_series,
+                    "vz_state_series": vz_state_series,
+                    "speed_state_series": speed_state_series,
+                    "visibility_state": visibility_state,
+                    "segment_ready_motion_features": {
+                        "visibility_ratio": visibility_ratio,
+                        "visibility_state": visibility_state,
+                        "mean_position_3d": mean_position,
+                        "mean_rel_vx": mean_rel_vx,
+                        "mean_rel_vz": mean_rel_vz,
+                        "mean_rel_speed": mean_rel_speed,
+                        "distance_state": summary["distance_state"],
+                        "vx_state": summary["vx_state"],
+                        "vz_state": summary["vz_state"],
+                        "speed_state": summary["speed_state"],
+                        "num_motion_frames": len(rel_motion_samples),
+                    },
                 }
             )
 

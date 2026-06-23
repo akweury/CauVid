@@ -35,7 +35,15 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RELATIVE_OBJECT_MOTION_VERSION = 2
+_RELATIVE_OBJECT_MOTION_VERSION = 3
+_REL_VZ_THRESHOLD = 0.2
+_REL_VX_THRESHOLD = 0.2
+_REL_SPEED_THRESHOLD = 0.3
+_DISTANCE_NEAR_THRESHOLD = 15.0
+_DISTANCE_MEDIUM_THRESHOLD = 30.0
+_X_POSITION_THRESHOLD = 2.0
+_VISIBILITY_PERSISTENT_THRESHOLD = 0.8
+_VISIBILITY_PRESENT_THRESHOLD = 0.3
 
 
 def get_output_root() -> Path:
@@ -56,6 +64,59 @@ def _ego_vx_vz(frame_ego: Dict[str, Any]) -> Tuple[float, float]:
     vx = float(frame_ego.get("ego_vx_smoothed", frame_ego.get("ego_vx", 0.0)))
     vz = float(frame_ego.get("ego_vz_smoothed", frame_ego.get("ego_vz", 0.0)))
     return vx, vz
+
+
+def _distance_state(distance_meters: float) -> str:
+    z = float(distance_meters)
+    if z <= _DISTANCE_NEAR_THRESHOLD:
+        return "near"
+    if z <= _DISTANCE_MEDIUM_THRESHOLD:
+        return "medium"
+    return "far"
+
+
+def _position_x_state(x_meters: float) -> str:
+    x = float(x_meters)
+    if x < -_X_POSITION_THRESHOLD:
+        return "left_of_ego"
+    if x > _X_POSITION_THRESHOLD:
+        return "right_of_ego"
+    return "centered"
+
+
+def _instantaneous_vz_state(rel_vz: float, has_rel_motion: bool) -> str:
+    if not has_rel_motion:
+        return "vz_unknown"
+    if rel_vz < -_REL_VZ_THRESHOLD:
+        return "vz_approaching"
+    if rel_vz > _REL_VZ_THRESHOLD:
+        return "vz_awaying"
+    return "vz_stable"
+
+
+def _instantaneous_vx_state(rel_vx: float, has_rel_motion: bool) -> str:
+    if not has_rel_motion:
+        return "vx_unknown"
+    if rel_vx < -_REL_VX_THRESHOLD:
+        return "vx_turning_left"
+    if rel_vx > _REL_VX_THRESHOLD:
+        return "vx_turning_right"
+    return "vx_stable"
+
+
+def _speed_state(rel_speed: float, has_rel_motion: bool) -> str:
+    if not has_rel_motion:
+        return "speed_unknown"
+    return "rel_moving" if float(rel_speed) > _REL_SPEED_THRESHOLD else "rel_static"
+
+
+def _visibility_state(track_quality: Dict[str, Any]) -> str:
+    ratio = float(dict(track_quality).get("temporal_consistency", 0.0))
+    if ratio >= _VISIBILITY_PERSISTENT_THRESHOLD:
+        return "persistent"
+    if ratio >= _VISIBILITY_PRESENT_THRESHOLD:
+        return "intermittent"
+    return "brief"
 
 
 def _relative_motion_entry(
@@ -172,40 +233,78 @@ def process_video(
             position_3d = list(candidate_object.get("position_3d", []))
             if len(position_3d) < 3:
                 continue
-            candidate_objects.append(
-                _relative_motion_entry(
-                    track_key=candidate_track_id,
-                    label=str(candidate_object.get("label", "unknown")),
-                    box=list(candidate_object.get("bbox", [])),
-                    position_3d=position_3d,
-                    ego_vx=ego_vx,
-                    ego_vz=ego_vz,
-                    prev_state=prev_candidate_track_state,
-                    frame_index=frame_index,
-                    extra_fields={
-                        "accepted": False,
-                        "source_type": str(candidate_object.get("source_type", "selected_candidate_track")),
-                        "candidate_object_id": str(
-                            candidate_object.get(
-                                "candidate_object_id",
-                                f"candidate_track_{candidate_track_id}_frame_{frame_index:05d}",
-                            )
-                        ),
-                        "candidate_track_id": candidate_track_id,
-                        "source_detection_ids": list(candidate_object.get("source_detection_ids", [])),
-                        "candidate_source": str(candidate_object.get("candidate_source", "")),
-                        "prior_metadata": dict(candidate_object.get("prior_metadata", {})),
-                        "score_breakdown": dict(candidate_object.get("score_breakdown", {})),
-                        "selection_score": float(
-                            dict(candidate_object.get("score_breakdown", {})).get(
-                                "selection_score",
-                                candidate_object.get("track_quality", {}).get("selection_score", 0.0),
-                            )
-                        ),
-                        "track_quality": dict(candidate_object.get("track_quality", {})),
-                    },
-                )
+            track_quality = dict(candidate_object.get("track_quality", {}))
+            motion_entry = _relative_motion_entry(
+                track_key=candidate_track_id,
+                label=str(candidate_object.get("label", "unknown")),
+                box=list(candidate_object.get("bbox", [])),
+                position_3d=position_3d,
+                ego_vx=ego_vx,
+                ego_vz=ego_vz,
+                prev_state=prev_candidate_track_state,
+                frame_index=frame_index,
+                extra_fields={
+                    "accepted": False,
+                    "source_type": str(candidate_object.get("source_type", "selected_candidate_track")),
+                    "candidate_object_id": str(
+                        candidate_object.get(
+                            "candidate_object_id",
+                            f"candidate_track_{candidate_track_id}_frame_{frame_index:05d}",
+                        )
+                    ),
+                    "candidate_track_id": candidate_track_id,
+                    "source_detection_ids": list(candidate_object.get("source_detection_ids", [])),
+                    "candidate_source": str(candidate_object.get("candidate_source", "")),
+                    "prior_metadata": dict(candidate_object.get("prior_metadata", {})),
+                    "score_breakdown": dict(candidate_object.get("score_breakdown", {})),
+                    "selection_score": float(
+                        dict(candidate_object.get("score_breakdown", {})).get(
+                            "selection_score",
+                            track_quality.get("selection_score", 0.0),
+                        )
+                    ),
+                    "track_quality": track_quality,
+                    "has_3d_position": bool(candidate_object.get("has_3d_position", True)),
+                    "position_3d_provenance": dict(candidate_object.get("position_3d_provenance", {})),
+                },
             )
+            x_pos = float(motion_entry["position_3d"][0]) if len(motion_entry["position_3d"]) > 0 else 0.0
+            z_pos = float(motion_entry["position_3d"][2]) if len(motion_entry["position_3d"]) > 2 else 0.0
+            has_rel_motion = bool(motion_entry.get("has_rel_motion", False))
+            rel_vx = float(motion_entry.get("rel_vx", 0.0))
+            rel_vz = float(motion_entry.get("rel_vz", 0.0))
+            rel_speed = float(motion_entry.get("rel_speed", 0.0))
+            distance_state = _distance_state(z_pos)
+            vx_state = _instantaneous_vx_state(rel_vx, has_rel_motion)
+            vz_state = _instantaneous_vz_state(rel_vz, has_rel_motion)
+            speed_state = _speed_state(rel_speed, has_rel_motion)
+            visibility_state = _visibility_state(track_quality)
+            motion_entry.update(
+                {
+                    "relative_position_3d": list(motion_entry.get("position_3d", [])),
+                    "distance_meters": z_pos,
+                    "distance_state": distance_state,
+                    "x_position_state": _position_x_state(x_pos),
+                    "vx_state": vx_state,
+                    "vz_state": vz_state,
+                    "speed_state": speed_state,
+                    "visibility_state": visibility_state,
+                    "motion_state": "observed_with_rel_motion" if has_rel_motion else "observed_without_rel_motion",
+                    "segment_ready_motion_features": {
+                        "relative_position_3d": list(motion_entry.get("position_3d", [])),
+                        "distance_meters": z_pos,
+                        "distance_state": distance_state,
+                        "x_position_state": _position_x_state(x_pos),
+                        "vx_state": vx_state,
+                        "vz_state": vz_state,
+                        "speed_state": speed_state,
+                        "visibility_state": visibility_state,
+                        "has_rel_motion": has_rel_motion,
+                        "has_3d_position": bool(motion_entry.get("has_3d_position", False)),
+                    },
+                }
+            )
+            candidate_objects.append(motion_entry)
 
         frames_out.append(
             {
