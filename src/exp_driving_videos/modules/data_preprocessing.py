@@ -619,7 +619,17 @@ def prepare_video_3d_positions(
             if not depth_map_path.exists():
                 missing_assets.append("depth")
             updated_frame["positions_3d"] = []
+            updated_frame["candidate_positions_3d"] = []
+            updated_frame["candidate_objects"] = [
+                {
+                    **dict(candidate_object),
+                    "position_3d": [],
+                    "has_3d_position": False,
+                }
+                for candidate_object in list(frame_entry.get("candidate_objects", []))
+            ]
             updated_frame["has_3d_positions"] = False
+            updated_frame["has_candidate_3d_positions"] = False
             updated_frame["missing_assets"] = missing_assets
             skipped_frames += 1
             frames_with_3d.append(updated_frame)
@@ -636,8 +646,26 @@ def prepare_video_3d_positions(
             depth_map_path=depth_map_path,
             frame_path=frame_path,
         )
+        candidate_objects_in = [dict(candidate_object) for candidate_object in list(frame_entry.get("candidate_objects", []))]
+        candidate_positions_3d = estimate_3d_positions_for_frame(
+            bboxes=[list(candidate_object.get("bbox", [])) for candidate_object in candidate_objects_in],
+            depth_map_path=depth_map_path,
+            frame_path=frame_path,
+        ) if candidate_objects_in else []
+        candidate_objects_out = []
+        for candidate_object, position_3d in zip(candidate_objects_in, candidate_positions_3d):
+            candidate_objects_out.append(
+                {
+                    **candidate_object,
+                    "position_3d": list(position_3d),
+                    "has_3d_position": True,
+                }
+            )
         updated_frame["positions_3d"] = positions_3d
+        updated_frame["candidate_positions_3d"] = candidate_positions_3d
+        updated_frame["candidate_objects"] = candidate_objects_out
         updated_frame["has_3d_positions"] = True
+        updated_frame["has_candidate_3d_positions"] = bool(candidate_positions_3d)
         frames_with_3d.append(updated_frame)
 
     result = dict(video_result)

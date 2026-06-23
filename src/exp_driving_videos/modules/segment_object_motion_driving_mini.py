@@ -33,7 +33,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SEGMENT_OBJECT_MOTION_VERSION = 4
+_SEGMENT_OBJECT_MOTION_VERSION = 5
 
 
 def get_output_root() -> Path:
@@ -202,6 +202,126 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "visualization_fps",
     ]
     return {k: cfg.get(k) for k in keys}
+
+
+def _summarize_segment_object_group(
+    *,
+    grouped: Dict[int, List[Dict[str, Any]]],
+    num_frames_in_segment: int,
+    rel_vz_threshold: float,
+    rel_vx_threshold: float,
+    dominance_ratio_threshold: float,
+    rel_speed_threshold: float,
+    distance_near_threshold: float,
+    distance_medium_threshold: float,
+    include_candidate_provenance: bool = False,
+) -> List[Dict[str, Any]]:
+    objects_out: List[Dict[str, Any]] = []
+    for track_id, samples in sorted(grouped.items()):
+        labels = [str(s.get("label", "unknown")) for s in samples]
+        positions = [s.get("position_3d", [0.0, 0.0, 0.0]) for s in samples]
+        frame_indices = [int(s.get("frame_index", -1)) for s in samples]
+        has_rel_motion_mask = [bool(s.get("has_rel_motion", False)) for s in samples]
+        rel_vx_series = [float(s.get("rel_vx", 0.0)) for s in samples]
+        rel_vz_series = [float(s.get("rel_vz", 0.0)) for s in samples]
+        rel_speed_series = [float(s.get("rel_speed", 0.0)) for s in samples]
+        obj_vx_series = [float(s.get("obj_vx", 0.0)) for s in samples]
+        obj_vz_series = [float(s.get("obj_vz", 0.0)) for s in samples]
+        ego_vx_series = [float(s.get("ego_vx", 0.0)) for s in samples]
+        ego_vz_series = [float(s.get("ego_vz", 0.0)) for s in samples]
+        mean_position = [
+            float(np.mean([float(p[0]) for p in positions])) if positions else 0.0,
+            float(np.mean([float(p[1]) for p in positions])) if positions else 0.0,
+            float(np.mean([float(p[2]) for p in positions])) if positions else 0.0,
+        ]
+
+        rel_motion_samples = [s for s in samples if bool(s.get("has_rel_motion", False))]
+        rel_vx_vals = [float(s.get("rel_vx", 0.0)) for s in rel_motion_samples]
+        rel_vz_vals = [float(s.get("rel_vz", 0.0)) for s in rel_motion_samples]
+        rel_speed_vals = [float(s.get("rel_speed", 0.0)) for s in rel_motion_samples]
+        obj_vx_vals = [float(s.get("obj_vx", 0.0)) for s in rel_motion_samples]
+        obj_vz_vals = [float(s.get("obj_vz", 0.0)) for s in rel_motion_samples]
+
+        vz_symbolic = _classify_rel_vz(
+            values=rel_vz_vals,
+            threshold=rel_vz_threshold,
+            dominance_ratio=dominance_ratio_threshold,
+        )
+        vx_symbolic = _classify_rel_vx(
+            values=rel_vx_vals,
+            threshold=rel_vx_threshold,
+            dominance_ratio=dominance_ratio_threshold,
+        )
+
+        mean_rel_vx = float(np.mean(rel_vx_vals)) if rel_vx_vals else 0.0
+        mean_rel_vz = float(np.mean(rel_vz_vals)) if rel_vz_vals else 0.0
+        mean_rel_speed = float(np.mean(rel_speed_vals)) if rel_speed_vals else 0.0
+
+        summary: Dict[str, Any] = {
+            "track_id": int(track_id),
+            "object_class": _majority_label(labels),
+            "num_visible_frames": len(samples),
+            "num_motion_frames": len(rel_motion_samples),
+            "visibility_ratio": float(len(samples) / max(1, num_frames_in_segment)),
+            "frame_indices": frame_indices,
+            "has_rel_motion_mask": has_rel_motion_mask,
+            "position_3d_series": positions,
+            "rel_vx_series": rel_vx_series,
+            "rel_vz_series": rel_vz_series,
+            "rel_speed_series": rel_speed_series,
+            "obj_vx_series": obj_vx_series,
+            "obj_vz_series": obj_vz_series,
+            "ego_vx_series": ego_vx_series,
+            "ego_vz_series": ego_vz_series,
+            "mean_position_3d": mean_position,
+            "mean_rel_vx": mean_rel_vx,
+            "mean_rel_vz": mean_rel_vz,
+            "mean_rel_speed": mean_rel_speed,
+            "mean_obj_vx": float(np.mean(obj_vx_vals)) if obj_vx_vals else 0.0,
+            "mean_obj_vz": float(np.mean(obj_vz_vals)) if obj_vz_vals else 0.0,
+            "vz_state": vz_symbolic["vz_state"],
+            "vx_state": vx_symbolic["vx_state"],
+            "speed_state": _classify_speed_state(mean_rel_speed, rel_speed_threshold),
+            "distance_state": _classify_distance_state(
+                mean_z=mean_position[2],
+                near_threshold=distance_near_threshold,
+                medium_threshold=distance_medium_threshold,
+            ),
+            "symbolic": {
+                **vz_symbolic,
+                **vx_symbolic,
+            },
+        }
+
+        if include_candidate_provenance:
+            first = samples[0] if samples else {}
+            candidate_object_ids = sorted([
+                str(candidate_object_id)
+                for candidate_object_id in {
+                    str(s.get("candidate_object_id", ""))
+                    for s in samples
+                    if s.get("candidate_object_id")
+                }
+            ])
+            summary.update(
+                {
+                    "accepted": False,
+                    "source_type": str(first.get("source_type", "selected_candidate_track")),
+                    "candidate_track_id": int(first.get("candidate_track_id", track_id)),
+                    "candidate_object_id": candidate_object_ids[0] if candidate_object_ids else "",
+                    "candidate_object_ids": candidate_object_ids,
+                    "source_detection_ids": list(first.get("source_detection_ids", [])),
+                    "candidate_source": str(first.get("candidate_source", "")),
+                    "prior_metadata": dict(first.get("prior_metadata", {})),
+                    "score_breakdown": dict(first.get("score_breakdown", {})),
+                    "selection_score": float(first.get("selection_score", 0.0)),
+                    "track_quality": dict(first.get("track_quality", {})),
+                }
+            )
+
+        objects_out.append(summary)
+
+    return objects_out
 
 
 def _find_segment_object_summary(
@@ -761,6 +881,7 @@ def process_video(
 
     segment_summaries: List[Dict[str, Any]] = []
     objects_total = 0
+    candidate_objects_total = 0
 
     for segment_index, segment in enumerate(segments):
         start_frame = int(segment.get("start_frame", 0))
@@ -774,93 +895,45 @@ def process_video(
             if start_frame <= int(frame.get("frame_index", -1)) <= end_frame
         ]
         grouped: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        grouped_candidates: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         for frame in frames_in_segment:
             frame_index = int(frame.get("frame_index", -1))
             for obj in frame.get("objects", []):
                 enriched = dict(obj)
                 enriched["frame_index"] = frame_index
                 grouped[int(obj.get("track_id", -1))].append(enriched)
+            for candidate_obj in frame.get("candidate_objects", []):
+                enriched_candidate = dict(candidate_obj)
+                enriched_candidate["frame_index"] = frame_index
+                grouped_candidates[int(candidate_obj.get("candidate_track_id", candidate_obj.get("track_id", -1)))].append(
+                    enriched_candidate
+                )
 
-        objects_out: List[Dict[str, Any]] = []
-        for track_id, samples in sorted(grouped.items()):
-            labels = [str(s.get("label", "unknown")) for s in samples]
-            positions = [s.get("position_3d", [0.0, 0.0, 0.0]) for s in samples]
-            frame_indices = [int(s.get("frame_index", -1)) for s in samples]
-            has_rel_motion_mask = [bool(s.get("has_rel_motion", False)) for s in samples]
-            rel_vx_series = [float(s.get("rel_vx", 0.0)) for s in samples]
-            rel_vz_series = [float(s.get("rel_vz", 0.0)) for s in samples]
-            rel_speed_series = [float(s.get("rel_speed", 0.0)) for s in samples]
-            obj_vx_series = [float(s.get("obj_vx", 0.0)) for s in samples]
-            obj_vz_series = [float(s.get("obj_vz", 0.0)) for s in samples]
-            ego_vx_series = [float(s.get("ego_vx", 0.0)) for s in samples]
-            ego_vz_series = [float(s.get("ego_vz", 0.0)) for s in samples]
-            mean_position = [
-                float(np.mean([float(p[0]) for p in positions])) if positions else 0.0,
-                float(np.mean([float(p[1]) for p in positions])) if positions else 0.0,
-                float(np.mean([float(p[2]) for p in positions])) if positions else 0.0,
-            ]
-
-            rel_motion_samples = [s for s in samples if bool(s.get("has_rel_motion", False))]
-            rel_vx_vals = [float(s.get("rel_vx", 0.0)) for s in rel_motion_samples]
-            rel_vz_vals = [float(s.get("rel_vz", 0.0)) for s in rel_motion_samples]
-            rel_speed_vals = [float(s.get("rel_speed", 0.0)) for s in rel_motion_samples]
-            obj_vx_vals = [float(s.get("obj_vx", 0.0)) for s in rel_motion_samples]
-            obj_vz_vals = [float(s.get("obj_vz", 0.0)) for s in rel_motion_samples]
-
-            vz_symbolic = _classify_rel_vz(
-                values=rel_vz_vals,
-                threshold=rel_vz_threshold,
-                dominance_ratio=dominance_ratio_threshold,
-            )
-            vx_symbolic = _classify_rel_vx(
-                values=rel_vx_vals,
-                threshold=rel_vx_threshold,
-                dominance_ratio=dominance_ratio_threshold,
-            )
-
-            mean_rel_vx = float(np.mean(rel_vx_vals)) if rel_vx_vals else 0.0
-            mean_rel_vz = float(np.mean(rel_vz_vals)) if rel_vz_vals else 0.0
-            mean_rel_speed = float(np.mean(rel_speed_vals)) if rel_speed_vals else 0.0
-
-            objects_out.append(
-                {
-                    "track_id": int(track_id),
-                    "object_class": _majority_label(labels),
-                    "num_visible_frames": len(samples),
-                    "num_motion_frames": len(rel_motion_samples),
-                    "visibility_ratio": float(len(samples) / max(1, len(frames_in_segment))),
-                    "frame_indices": frame_indices,
-                    "has_rel_motion_mask": has_rel_motion_mask,
-                    "position_3d_series": positions,
-                    "rel_vx_series": rel_vx_series,
-                    "rel_vz_series": rel_vz_series,
-                    "rel_speed_series": rel_speed_series,
-                    "obj_vx_series": obj_vx_series,
-                    "obj_vz_series": obj_vz_series,
-                    "ego_vx_series": ego_vx_series,
-                    "ego_vz_series": ego_vz_series,
-                    "mean_position_3d": mean_position,
-                    "mean_rel_vx": mean_rel_vx,
-                    "mean_rel_vz": mean_rel_vz,
-                    "mean_rel_speed": mean_rel_speed,
-                    "mean_obj_vx": float(np.mean(obj_vx_vals)) if obj_vx_vals else 0.0,
-                    "mean_obj_vz": float(np.mean(obj_vz_vals)) if obj_vz_vals else 0.0,
-                    "vz_state": vz_symbolic["vz_state"],
-                    "vx_state": vx_symbolic["vx_state"],
-                    "speed_state": _classify_speed_state(mean_rel_speed, rel_speed_threshold),
-                    "distance_state": _classify_distance_state(
-                        mean_z=mean_position[2],
-                        near_threshold=distance_near_threshold,
-                        medium_threshold=distance_medium_threshold,
-                    ),
-                    "symbolic": {
-                        **vz_symbolic,
-                        **vx_symbolic,
-                    },
-                }
-            )
+        objects_out = _summarize_segment_object_group(
+            grouped=grouped,
+            num_frames_in_segment=len(frames_in_segment),
+            rel_vz_threshold=rel_vz_threshold,
+            rel_vx_threshold=rel_vx_threshold,
+            dominance_ratio_threshold=dominance_ratio_threshold,
+            rel_speed_threshold=rel_speed_threshold,
+            distance_near_threshold=distance_near_threshold,
+            distance_medium_threshold=distance_medium_threshold,
+            include_candidate_provenance=False,
+        )
+        candidate_objects_out = _summarize_segment_object_group(
+            grouped=grouped_candidates,
+            num_frames_in_segment=len(frames_in_segment),
+            rel_vz_threshold=rel_vz_threshold,
+            rel_vx_threshold=rel_vx_threshold,
+            dominance_ratio_threshold=dominance_ratio_threshold,
+            rel_speed_threshold=rel_speed_threshold,
+            distance_near_threshold=distance_near_threshold,
+            distance_medium_threshold=distance_medium_threshold,
+            include_candidate_provenance=True,
+        )
 
         objects_total += len(objects_out)
+        candidate_objects_total += len(candidate_objects_out)
         segment_summaries.append(
             {
                 "segment_index": int(segment_index),
@@ -872,7 +945,9 @@ def process_video(
                 "length": int(segment.get("length", max(1, end_frame - start_frame + 1))),
                 "num_frames_covered": len(frames_in_segment),
                 "num_objects": len(objects_out),
+                "num_candidate_objects": len(candidate_objects_out),
                 "objects": objects_out,
+                "candidate_objects": candidate_objects_out,
             }
         )
 
@@ -894,6 +969,7 @@ def process_video(
         "video_id": video_id,
         "num_segments": len(segment_summaries),
         "num_objects_total": objects_total,
+        "num_candidate_objects_total": candidate_objects_total,
         "config": {
             "rel_vz_threshold": rel_vz_threshold,
             "rel_vx_threshold": rel_vx_threshold,
@@ -915,7 +991,8 @@ def process_video(
 
     print(
         f"  {video_id}: {result['num_segments']} segments, "
-        f"{result['num_objects_total']} segment-object summaries"
+        f"{result['num_objects_total']} segment-object summaries, "
+        f"{result['num_candidate_objects_total']} candidate segment-object summaries"
     )
     return result
 
@@ -949,12 +1026,14 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _SEGMENT_OBJECT_MOTION_VERSION,
         "num_videos": len(results),
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_segments": r.get("num_segments", 0),
                 "num_objects_total": r.get("num_objects_total", 0),
+                "num_candidate_objects_total": r.get("num_candidate_objects_total", 0),
             }
             for r in results
         ],

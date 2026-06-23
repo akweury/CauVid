@@ -24,6 +24,9 @@ from config import PROJECT_ROOT
 from src.exp_driving_videos.modules import data_preprocessing
 
 
+_POSITIONS_3D_VERSION = 2
+
+
 def get_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "05_driving_mini_3d_positions"
     out.mkdir(parents=True, exist_ok=True)
@@ -47,7 +50,9 @@ def process_video(
     if not force_recompute and out_file.exists():
         print(f"  [cache] {video_id} - loading {out_file.name}")
         with out_file.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+            cached = json.load(fh)
+        if int(cached.get("version", 0)) == _POSITIONS_3D_VERSION:
+            return cached
 
     enriched = data_preprocessing.prepare_video_3d_positions(
         video_result=video_result,
@@ -58,10 +63,13 @@ def process_video(
     )
 
     num_objects = sum(len(frame.get("positions_3d", [])) for frame in enriched.get("frames", []))
+    num_candidate_objects = sum(len(frame.get("candidate_positions_3d", [])) for frame in enriched.get("frames", []))
     result: Dict[str, Any] = {
+        "version": _POSITIONS_3D_VERSION,
         **enriched,
         "num_frames": len(enriched.get("frames", [])),
         "num_objects_with_3d": num_objects,
+        "num_candidate_objects_with_3d": num_candidate_objects,
     }
 
     with out_file.open("w", encoding="utf-8") as fh:
@@ -69,7 +77,8 @@ def process_video(
 
     print(
         f"  {video_id}: {result['num_frames']} frames, "
-        f"{result['num_objects_with_3d']} objects with 3D positions"
+        f"{result['num_objects_with_3d']} objects with 3D positions, "
+        f"{result['num_candidate_objects_with_3d']} candidate objects with 3D positions"
     )
     return result
 
@@ -101,15 +110,18 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _POSITIONS_3D_VERSION,
         "model_name": model_name,
         "num_videos": len(results),
         "num_frames_total": sum(r.get("num_frames", 0) for r in results),
         "num_objects_with_3d_total": sum(r.get("num_objects_with_3d", 0) for r in results),
+        "num_candidate_objects_with_3d_total": sum(r.get("num_candidate_objects_with_3d", 0) for r in results),
         "videos": [
             {
                 "video_id": r["video_id"],
                 "num_frames": r.get("num_frames", 0),
                 "num_objects_with_3d": r.get("num_objects_with_3d", 0),
+                "num_candidate_objects_with_3d": r.get("num_candidate_objects_with_3d", 0),
                 "depth_dir": r.get("depth_dir", ""),
             }
             for r in results

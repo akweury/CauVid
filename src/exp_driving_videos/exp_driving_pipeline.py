@@ -860,6 +860,10 @@ def run_step_5_prepare_3d_positions(ctx: PipelineContext, runner: StepRunner) ->
             merged_results=ctx.merged_results or [],
         )
     runner.log("5", f"completed videos={len(ctx.positions_3d_results)}")
+    runner.log(
+        "5",
+        f"candidate_objects_with_3d={sum(int(row.get('num_candidate_objects_with_3d', 0)) for row in (ctx.positions_3d_results or []))}",
+    )
     runner.complete_step("5", subtitle=f"videos={len(ctx.positions_3d_results)}")
 
 
@@ -892,6 +896,10 @@ def run_step_7_relative_object_motion(ctx: PipelineContext, runner: StepRunner) 
             force_recompute=False,
         )
     runner.log("7", f"completed videos={len(ctx.relative_motion_results)}")
+    runner.log(
+        "7",
+        f"candidate_objects_with_motion={sum(int(row.get('num_candidate_objects_with_rel_motion', 0)) for row in (ctx.relative_motion_results or []))}",
+    )
     runner.complete_step("7", subtitle=f"videos={len(ctx.relative_motion_results)}")
 
 
@@ -922,6 +930,10 @@ def run_step_9_segment_object_motion(ctx: PipelineContext, runner: StepRunner) -
             force_recompute=False,
         )
     runner.log("9", f"completed videos={len(ctx.segment_object_results)}")
+    runner.log(
+        "9",
+        f"candidate_segment_objects={sum(int(row.get('num_candidate_objects_total', 0)) for row in (ctx.segment_object_results or []))}",
+    )
     runner.complete_step("9", subtitle=f"videos={len(ctx.segment_object_results)}")
 
 

@@ -35,6 +35,9 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
+_RELATIVE_OBJECT_MOTION_VERSION = 2
+
+
 def get_output_root() -> Path:
     out = config.get_output_path("pipeline_output") / "07_driving_mini_relative_object_motion"
     out.mkdir(parents=True, exist_ok=True)
@@ -55,6 +58,52 @@ def _ego_vx_vz(frame_ego: Dict[str, Any]) -> Tuple[float, float]:
     return vx, vz
 
 
+def _relative_motion_entry(
+    *,
+    track_key: int,
+    label: str,
+    box: List[float],
+    position_3d: List[float],
+    ego_vx: float,
+    ego_vz: float,
+    prev_state: Dict[int, Tuple[int, Tuple[float, float, float]]],
+    frame_index: int,
+    extra_fields: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    x, y, z = [float(v) for v in position_3d]
+    obj_vx = 0.0
+    obj_vz = 0.0
+    rel_vx = 0.0
+    rel_vz = 0.0
+    rel_speed = 0.0
+    has_rel_motion = False
+    if track_key in prev_state:
+        prev_frame_index, (px, py, pz) = prev_state[track_key]
+        d_frame = max(1, frame_index - prev_frame_index)
+        obj_vx = (x - px) / float(d_frame)
+        obj_vz = (z - pz) / float(d_frame)
+        rel_vx = obj_vx - ego_vx
+        rel_vz = obj_vz - ego_vz
+        rel_speed = float(np.hypot(rel_vx, rel_vz))
+        has_rel_motion = True
+    prev_state[track_key] = (frame_index, (x, y, z))
+    return {
+        "track_id": int(track_key),
+        "label": str(label),
+        "box": list(box),
+        "position_3d": [x, y, z],
+        "obj_vx": float(obj_vx),
+        "obj_vz": float(obj_vz),
+        "ego_vx": float(ego_vx),
+        "ego_vz": float(ego_vz),
+        "rel_vx": float(rel_vx),
+        "rel_vz": float(rel_vz),
+        "rel_speed": float(rel_speed),
+        "has_rel_motion": has_rel_motion,
+        **(extra_fields or {}),
+    }
+
+
 def process_video(
     positions_3d_video_result: Dict[str, Any],
     ego_video_result: Dict[str, Any],
@@ -69,13 +118,16 @@ def process_video(
     if not force_recompute and out_file.exists():
         print(f"  [cache] {video_id} - loading {out_file.name}")
         with out_file.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
+            cached = json.load(fh)
+        if int(cached.get("version", 0)) == _RELATIVE_OBJECT_MOTION_VERSION:
+            return cached
 
     ego_by_frame = _build_ego_frame_map(ego_video_result)
 
     frames_out: List[Dict[str, Any]] = []
     # track_id -> (frame_index, (x, y, z))
     prev_track_state: Dict[int, Tuple[int, Tuple[float, float, float]]] = {}
+    prev_candidate_track_state: Dict[int, Tuple[int, Tuple[float, float, float]]] = {}
 
     for idx, frame in enumerate(positions_3d_video_result.get("frames", [])):
         frame_index = int(frame.get("frame_index", idx))
@@ -85,6 +137,7 @@ def process_video(
         labels = frame.get("labels", [])
         track_ids = frame.get("track_ids", [])
         positions_3d = frame.get("positions_3d", [])
+        candidate_objects_in = [dict(obj) for obj in list(frame.get("candidate_objects", []))]
 
         n = min(len(positions_3d), len(track_ids), len(labels), len(boxes))
 
@@ -96,55 +149,77 @@ def process_video(
             track_id = int(track_ids[obj_i])
             label = str(labels[obj_i])
             box = boxes[obj_i]
-            x, y, z = [float(v) for v in positions_3d[obj_i]]
-
-            obj_vx = 0.0
-            obj_vz = 0.0
-            rel_vx = 0.0
-            rel_vz = 0.0
-            rel_speed = 0.0
-            has_rel_motion = False
-
-            if track_id in prev_track_state:
-                prev_frame_index, (px, py, pz) = prev_track_state[track_id]
-                d_frame = max(1, frame_index - prev_frame_index)
-                obj_vx = (x - px) / float(d_frame)
-                obj_vz = (z - pz) / float(d_frame)
-
-                rel_vx = obj_vx - ego_vx
-                rel_vz = obj_vz - ego_vz
-                rel_speed = float(np.hypot(rel_vx, rel_vz))
-                has_rel_motion = True
-
             objects.append(
-                {
-                    "track_id": track_id,
-                    "label": label,
-                    "box": box,
-                    "position_3d": [x, y, z],
-                    "obj_vx": float(obj_vx),
-                    "obj_vz": float(obj_vz),
-                    "ego_vx": float(ego_vx),
-                    "ego_vz": float(ego_vz),
-                    "rel_vx": float(rel_vx),
-                    "rel_vz": float(rel_vz),
-                    "rel_speed": float(rel_speed),
-                    "has_rel_motion": has_rel_motion,
-                }
+                _relative_motion_entry(
+                    track_key=track_id,
+                    label=label,
+                    box=list(box),
+                    position_3d=list(positions_3d[obj_i]),
+                    ego_vx=ego_vx,
+                    ego_vz=ego_vz,
+                    prev_state=prev_track_state,
+                    frame_index=frame_index,
+                    extra_fields={
+                        "accepted": True,
+                        "source_type": "accepted_object",
+                    },
+                )
             )
 
-            prev_track_state[track_id] = (frame_index, (x, y, z))
+        candidate_objects: List[Dict[str, Any]] = []
+        for candidate_object in candidate_objects_in:
+            candidate_track_id = int(candidate_object.get("candidate_track_id", candidate_object.get("track_id", -1)))
+            position_3d = list(candidate_object.get("position_3d", []))
+            if len(position_3d) < 3:
+                continue
+            candidate_objects.append(
+                _relative_motion_entry(
+                    track_key=candidate_track_id,
+                    label=str(candidate_object.get("label", "unknown")),
+                    box=list(candidate_object.get("bbox", [])),
+                    position_3d=position_3d,
+                    ego_vx=ego_vx,
+                    ego_vz=ego_vz,
+                    prev_state=prev_candidate_track_state,
+                    frame_index=frame_index,
+                    extra_fields={
+                        "accepted": False,
+                        "source_type": str(candidate_object.get("source_type", "selected_candidate_track")),
+                        "candidate_object_id": str(
+                            candidate_object.get(
+                                "candidate_object_id",
+                                f"candidate_track_{candidate_track_id}_frame_{frame_index:05d}",
+                            )
+                        ),
+                        "candidate_track_id": candidate_track_id,
+                        "source_detection_ids": list(candidate_object.get("source_detection_ids", [])),
+                        "candidate_source": str(candidate_object.get("candidate_source", "")),
+                        "prior_metadata": dict(candidate_object.get("prior_metadata", {})),
+                        "score_breakdown": dict(candidate_object.get("score_breakdown", {})),
+                        "selection_score": float(
+                            dict(candidate_object.get("score_breakdown", {})).get(
+                                "selection_score",
+                                candidate_object.get("track_quality", {}).get("selection_score", 0.0),
+                            )
+                        ),
+                        "track_quality": dict(candidate_object.get("track_quality", {})),
+                    },
+                )
+            )
 
         frames_out.append(
             {
                 "frame_index": frame_index,
                 "image_path": image_path,
                 "num_objects": len(objects),
+                "num_candidate_objects": len(candidate_objects),
                 "objects": objects,
+                "candidate_objects": candidate_objects,
             }
         )
 
     result: Dict[str, Any] = {
+        "version": _RELATIVE_OBJECT_MOTION_VERSION,
         "video_id": video_id,
         "num_frames": len(frames_out),
         "num_frames_with_objects": sum(1 for f in frames_out if f["num_objects"] > 0),
@@ -155,6 +230,14 @@ def process_video(
             for obj in f.get("objects", [])
             if obj.get("has_rel_motion", False)
         ),
+        "num_frames_with_candidate_objects": sum(1 for f in frames_out if f["num_candidate_objects"] > 0),
+        "num_candidate_objects_total": sum(f["num_candidate_objects"] for f in frames_out),
+        "num_candidate_objects_with_rel_motion": sum(
+            1
+            for f in frames_out
+            for obj in f.get("candidate_objects", [])
+            if obj.get("has_rel_motion", False)
+        ),
         "frames": frames_out,
     }
 
@@ -163,7 +246,8 @@ def process_video(
 
     print(
         f"  {video_id}: {result['num_frames']} frames, "
-        f"{result['num_objects_with_rel_motion']} object motions relative to ego"
+        f"{result['num_objects_with_rel_motion']} object motions relative to ego, "
+        f"{result['num_candidate_objects_with_rel_motion']} candidate object motions"
     )
     return result
 
@@ -198,6 +282,7 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _RELATIVE_OBJECT_MOTION_VERSION,
         "num_videos": len(results),
         "videos": [
             {
@@ -205,6 +290,8 @@ def run(
                 "num_frames": r.get("num_frames", 0),
                 "num_objects_total": r.get("num_objects_total", 0),
                 "num_objects_with_rel_motion": r.get("num_objects_with_rel_motion", 0),
+                "num_candidate_objects_total": r.get("num_candidate_objects_total", 0),
+                "num_candidate_objects_with_rel_motion": r.get("num_candidate_objects_with_rel_motion", 0),
             }
             for r in results
         ],
