@@ -793,7 +793,22 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
             render_video=render_video,
         )
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
-    runner.log("2", f"candidate_tracks={sum(int(row.get('num_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}")
+    runner.log(
+        "2",
+        f"raw_candidate_tracks={sum(int(row.get('num_raw_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}",
+    )
+    runner.log(
+        "2",
+        f"deduplicated_candidate_tracks={sum(int(row.get('num_deduplicated_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}",
+    )
+    runner.log(
+        "2",
+        f"selected_candidate_tracks={sum(int(row.get('num_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}",
+    )
+    runner.log(
+        "2",
+        f"rejected_candidate_tracks={sum(int(row.get('num_rejected_candidate_tracks', 0)) for row in (ctx.tracking_results or []))}",
+    )
     runner.log(
         "2",
         f"rejected_candidate_detections={sum(int(row.get('num_rejected_candidate_detections', 0)) for row in (ctx.tracking_results or []))}",

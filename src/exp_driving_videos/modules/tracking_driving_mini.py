@@ -4,6 +4,9 @@ Prior-guided candidate-aware multi-object tracking over driving_mini detections.
 Accepted detections keep the existing ByteTrack-based tracking behavior.
 Candidate detections are tracked in a separate lightweight branch using detector
 score, Step 0 prior metadata, and simple spatial/temporal plausibility gates.
+Candidate outputs are split into raw, deduplicated, selected, and rejected
+track groups so downstream reasoning can diagnose candidate-track explosion and
+where pruning occurred.
 
 Output layout:
     pipeline_output/02_driving_mini_tracking/<video_id>/
@@ -61,7 +64,7 @@ _DEFAULT_TRACKER_ARGS = SimpleNamespace(
 # ByteTracker needs orig_shape to build Boxes; we use the first available
 # detection to derive it when possible, otherwise fall back to this.
 _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
-_TRACKING_SCHEMA_VERSION = 3
+_TRACKING_SCHEMA_VERSION = 4
 _CANDIDATE_TRACK_ID_OFFSET = 1_000_000
 _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
     "visual_score_weight": 1.0,
@@ -101,6 +104,35 @@ _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
     "exploration_quota": {
         "non_prior_high_score_candidates_per_frame": 1,
         "non_prior_high_score_min_score": 0.35,
+    },
+    "candidate_track_deduplication": {
+        "accepted_duplicate_mean_iou": 0.6,
+        "accepted_duplicate_shared_frame_ratio": 0.5,
+        "candidate_duplicate_mean_iou": 0.55,
+        "candidate_duplicate_shared_frame_ratio": 0.5,
+        "duplicate_penalty_cap": 1.0,
+    },
+    "candidate_track_selection": {
+        "visual_score_weight": 0.35,
+        "prior_relevance_weight": 0.2,
+        "temporal_consistency_weight": 0.2,
+        "spatial_plausibility_weight": 0.2,
+        "duplicate_penalty_weight": 0.25,
+        "min_selection_score": 0.15,
+    },
+    "selection_budgets": {
+        "max_tracks_per_video": 24,
+        "max_tracks_per_class_default": 4,
+        "max_tracks_per_class": {
+            "car": 6,
+            "truck": 4,
+            "bus": 3,
+            "motorcycle": 4,
+            "bicycle": 4,
+            "person": 6,
+            "traffic light": 4,
+            "stop sign": 3,
+        },
     },
 }
 
@@ -410,7 +442,7 @@ def _candidate_summary_from_track(track: Dict[str, Any]) -> Dict[str, Any]:
             matched_prior_ids.add(prior_id_text)
             prior_id_frequency.update([prior_id_text])
     label_counts = Counter(str(obs.get("label", "unknown")) for obs in observations)
-    return {
+    summary = {
         "track_id": int(track.get("track_id", -1)),
         "label": label_counts.most_common(1)[0][0] if label_counts else "unknown",
         "source_detection_ids": detection_ids,
@@ -428,6 +460,14 @@ def _candidate_summary_from_track(track: Dict[str, Any]) -> Dict[str, Any]:
         "first_frame_index": int(observations[0].get("frame_index", -1)) if observations else -1,
         "last_frame_index": int(observations[-1].get("frame_index", -1)) if observations else -1,
     }
+    if isinstance(track.get("duplicate_with_accepted"), dict):
+        summary["duplicate_with_accepted"] = dict(track.get("duplicate_with_accepted", {}))
+    if isinstance(track.get("duplicate_with_candidate"), dict):
+        summary["duplicate_with_candidate"] = dict(track.get("duplicate_with_candidate", {}))
+    if isinstance(track.get("score_breakdown"), dict):
+        summary["score_breakdown"] = dict(track.get("score_breakdown", {}))
+        summary["selection_score"] = _safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0))
+    return summary
 
 
 def _accepted_track_summaries(tracked_frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -464,6 +504,180 @@ def _accepted_track_summaries(tracked_frames: List[Dict[str, Any]]) -> List[Dict
             }
         )
     return summaries
+
+
+def _accepted_track_records(tracked_frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    track_rows: Dict[int, Dict[str, Any]] = {}
+    for rec in tracked_frames:
+        frame_index = int(rec.get("frame_index", -1))
+        image_path = str(rec.get("image_path", ""))
+        for box, score, label, track_id, detection_id in zip(
+            rec.get("boxes", []),
+            rec.get("scores", []),
+            rec.get("labels", []),
+            rec.get("track_ids", []),
+            rec.get("detection_ids", []),
+        ):
+            bucket = track_rows.setdefault(
+                int(track_id),
+                {
+                    "track_id": int(track_id),
+                    "label": str(label),
+                    "observations": [],
+                },
+            )
+            bucket["observations"].append(
+                {
+                    "frame_index": frame_index,
+                    "image_path": image_path,
+                    "bbox": list(box),
+                    "score": _safe_float(score),
+                    "label": str(label),
+                    "detection_id": str(detection_id),
+                }
+            )
+    return [track_rows[track_id] for track_id in sorted(track_rows)]
+
+
+def _tracks_to_frame_records(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    frame_map: Dict[int, Dict[str, Any]] = {}
+    for track in tracks:
+        track_id = int(track.get("track_id", -1))
+        for obs in list(track.get("observations", [])):
+            frame_index = int(obs.get("frame_index", -1))
+            frame_rec = frame_map.setdefault(
+                frame_index,
+                {
+                    "frame": obs.get("frame", ""),
+                    "frame_index": frame_index,
+                    "image_path": obs.get("image_path", ""),
+                    "boxes": [],
+                    "scores": [],
+                    "labels": [],
+                    "track_ids": [],
+                    "detection_ids": [],
+                    "candidate_sources": [],
+                    "prior_relevance_scores": [],
+                    "matched_prior_ids": [],
+                },
+            )
+            frame_rec["boxes"].append(list(obs.get("bbox", [])))
+            frame_rec["scores"].append(_safe_float(obs.get("score", 0.0)))
+            frame_rec["labels"].append(str(obs.get("label", "unknown")))
+            frame_rec["track_ids"].append(track_id)
+            frame_rec["detection_ids"].append(str(obs.get("detection_id", "")))
+            frame_rec["candidate_sources"].append(str(obs.get("candidate_source", "")))
+            frame_rec["prior_relevance_scores"].append(_safe_float(obs.get("prior_relevance_score", 0.0)))
+            frame_rec["matched_prior_ids"].append(list(obs.get("matched_prior_ids", [])))
+    return [frame_map[frame_index] for frame_index in sorted(frame_map)]
+
+
+def _track_overlap_metrics(track_a: Dict[str, Any], track_b: Dict[str, Any]) -> Dict[str, Any]:
+    observations_a = list(track_a.get("observations", []))
+    observations_b = list(track_b.get("observations", []))
+    index_b = {int(obs.get("frame_index", -1)): obs for obs in observations_b}
+    shared_ious: List[float] = []
+    shared_frames: List[int] = []
+    for obs_a in observations_a:
+        frame_index = int(obs_a.get("frame_index", -1))
+        obs_b = index_b.get(frame_index)
+        if obs_b is None:
+            continue
+        shared_frames.append(frame_index)
+        shared_ious.append(_match_iou(list(obs_a.get("bbox", [])), list(obs_b.get("bbox", []))))
+    shared_count = len(shared_ious)
+    denom = max(1, min(len(observations_a), len(observations_b)))
+    mean_iou = float(sum(shared_ious) / shared_count) if shared_count else 0.0
+    max_iou = float(max(shared_ious) if shared_ious else 0.0)
+    return {
+        "shared_frame_count": shared_count,
+        "shared_frame_ratio": float(shared_count / denom),
+        "mean_iou": mean_iou,
+        "max_iou": max_iou,
+        "overlap_score": float(mean_iou * (shared_count / denom)),
+        "shared_frame_indices": shared_frames,
+        "other_track_id": int(track_b.get("track_id", -1)),
+    }
+
+
+def _track_spatial_plausibility(track: Dict[str, Any], orig_shape: Tuple[int, int], policy: Dict[str, Any]) -> float:
+    observations = list(track.get("observations", []))
+    if not observations:
+        return 0.0
+    plausible_count = sum(
+        1
+        for obs in observations
+        if _candidate_spatially_plausible({"bbox": list(obs.get("bbox", []))}, orig_shape, policy)
+    )
+    return float(plausible_count / max(1, len(observations)))
+
+
+def _candidate_track_score_breakdown(track: Dict[str, Any], orig_shape: Tuple[int, int], policy: Dict[str, Any]) -> Dict[str, Any]:
+    selection_cfg = dict(policy.get("candidate_track_selection", {}))
+    dedupe_cfg = dict(policy.get("candidate_track_deduplication", {}))
+    summary = _candidate_summary_from_track(track)
+    spatial_plausibility = _track_spatial_plausibility(track, orig_shape, policy)
+    accepted_overlap_score = _safe_float(dict(track.get("duplicate_with_accepted", {})).get("overlap_score", 0.0))
+    candidate_overlap_score = _safe_float(dict(track.get("duplicate_with_candidate", {})).get("overlap_score", 0.0))
+    duplicate_penalty_raw = max(accepted_overlap_score, candidate_overlap_score)
+    duplicate_penalty = min(
+        duplicate_penalty_raw,
+        _safe_float(dedupe_cfg.get("duplicate_penalty_cap", 1.0), 1.0),
+    )
+    visual_component = _safe_float(selection_cfg.get("visual_score_weight", 0.35), 0.35) * _safe_float(
+        summary.get("mean_score", 0.0)
+    )
+    prior_component = _safe_float(selection_cfg.get("prior_relevance_weight", 0.2), 0.2) * _safe_float(
+        summary.get("prior_relevance_mean", 0.0)
+    )
+    temporal_component = _safe_float(selection_cfg.get("temporal_consistency_weight", 0.2), 0.2) * _safe_float(
+        summary.get("temporal_consistency", 0.0)
+    )
+    spatial_component = _safe_float(selection_cfg.get("spatial_plausibility_weight", 0.2), 0.2) * spatial_plausibility
+    duplicate_penalty_component = _safe_float(
+        selection_cfg.get("duplicate_penalty_weight", 0.25),
+        0.25,
+    ) * duplicate_penalty
+    selection_score = (
+        visual_component
+        + prior_component
+        + temporal_component
+        + spatial_component
+        - duplicate_penalty_component
+    )
+    return {
+        "selection_score": float(selection_score),
+        "visual_component": float(visual_component),
+        "prior_component": float(prior_component),
+        "temporal_component": float(temporal_component),
+        "spatial_component": float(spatial_component),
+        "duplicate_penalty_component": float(duplicate_penalty_component),
+        "spatial_plausibility": float(spatial_plausibility),
+        "duplicate_penalty_raw": float(duplicate_penalty_raw),
+        "duplicate_penalty": float(duplicate_penalty),
+        "mean_score": _safe_float(summary.get("mean_score", 0.0)),
+        "prior_relevance_mean": _safe_float(summary.get("prior_relevance_mean", 0.0)),
+        "temporal_consistency": _safe_float(summary.get("temporal_consistency", 0.0)),
+    }
+
+
+def _candidate_track_rejection_entry(track: Dict[str, Any], reason: str, **extra: Any) -> Dict[str, Any]:
+    summary = _candidate_summary_from_track(track)
+    return {
+        "track_id": int(track.get("track_id", -1)),
+        "label": str(summary.get("label", "unknown")),
+        "rejection_reason": str(reason),
+        "selection_score": _safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
+        "score_breakdown": dict(track.get("score_breakdown", {})),
+        "duplicate_with_accepted": dict(track.get("duplicate_with_accepted", {})),
+        "duplicate_with_candidate": dict(track.get("duplicate_with_candidate", {})),
+        "summary": summary,
+        "provenance": {
+            "observations": list(track.get("observations", [])),
+            "match_ious": list(track.get("match_ious", [])),
+        },
+        **extra,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -536,12 +750,12 @@ def _run_accepted_tracking(
 
 def _run_candidate_tracking(
     frame_records: List[Dict[str, Any]],
+    accepted_frames: List[Dict[str, Any]],
     orig_shape: Tuple[int, int],
     policy: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+) -> Dict[str, Any]:
     active_tracks: Dict[int, Dict[str, Any]] = {}
     completed_tracks: List[Dict[str, Any]] = []
-    candidate_frames: List[Dict[str, Any]] = []
     rejected_frames: List[Dict[str, Any]] = []
     rejection_reason_counts: Counter[str] = Counter()
     next_track_id = _CANDIDATE_TRACK_ID_OFFSET
@@ -616,14 +830,6 @@ def _run_candidate_tracking(
 
         selected_non_prior_exploration = 0
         used_track_ids: set[int] = set()
-        frame_candidate_boxes: List[List[float]] = []
-        frame_candidate_scores: List[float] = []
-        frame_candidate_labels: List[str] = []
-        frame_candidate_track_ids: List[int] = []
-        frame_candidate_detection_ids: List[str] = []
-        frame_candidate_sources: List[str] = []
-        frame_candidate_prior_scores: List[float] = []
-        frame_candidate_prior_ids: List[List[str]] = []
 
         for detection in candidate_inputs:
             label = str(detection.get("class", "unknown"))
@@ -757,31 +963,6 @@ def _run_candidate_tracking(
             best_track["match_ious"].append(best_iou)
             best_track["last_bbox"] = bbox
             best_track["last_frame_index"] = frame_index
-
-            frame_candidate_boxes.append(bbox)
-            frame_candidate_scores.append(_safe_float(detection.get("score", 0.0)))
-            frame_candidate_labels.append(label)
-            frame_candidate_track_ids.append(int(best_track_id))
-            frame_candidate_detection_ids.append(str(detection.get("detection_id", "")))
-            frame_candidate_sources.append(str(detection.get("candidate_source", "")))
-            frame_candidate_prior_scores.append(_safe_float(detection.get("prior_relevance_score", 0.0)))
-            frame_candidate_prior_ids.append(list(detection.get("matched_prior_ids", [])))
-
-        candidate_frames.append(
-            {
-                "frame": rec.get("frame", ""),
-                "frame_index": frame_index,
-                "image_path": rec.get("image_path", ""),
-                "boxes": frame_candidate_boxes,
-                "scores": frame_candidate_scores,
-                "labels": frame_candidate_labels,
-                "track_ids": frame_candidate_track_ids,
-                "detection_ids": frame_candidate_detection_ids,
-                "candidate_sources": frame_candidate_sources,
-                "prior_relevance_scores": frame_candidate_prior_scores,
-                "matched_prior_ids": frame_candidate_prior_ids,
-            }
-        )
         rejected_frames.append(
             {
                 "frame": rec.get("frame", ""),
@@ -792,17 +973,201 @@ def _run_candidate_tracking(
         )
 
     completed_tracks.extend(active_tracks.values())
-    candidate_track_summaries = sorted(
-        (_candidate_summary_from_track(track) for track in completed_tracks if track.get("observations")),
-        key=lambda row: (int(row.get("track_id", -1))),
+    raw_tracks = [track for track in completed_tracks if track.get("observations")]
+    accepted_track_records = _accepted_track_records(accepted_frames)
+    dedupe_cfg = dict(policy.get("candidate_track_deduplication", {}))
+    selection_cfg = dict(policy.get("candidate_track_selection", {}))
+    budget_cfg = dict(policy.get("selection_budgets", {}))
+
+    candidate_duplicate_threshold = _safe_float(
+        dedupe_cfg.get("candidate_duplicate_mean_iou", 0.55),
+        0.55,
     )
-    rejected_bundle = {
+    candidate_duplicate_shared_ratio = _safe_float(
+        dedupe_cfg.get("candidate_duplicate_shared_frame_ratio", 0.5),
+        0.5,
+    )
+    accepted_duplicate_threshold = _safe_float(
+        dedupe_cfg.get("accepted_duplicate_mean_iou", 0.6),
+        0.6,
+    )
+    accepted_duplicate_shared_ratio = _safe_float(
+        dedupe_cfg.get("accepted_duplicate_shared_frame_ratio", 0.5),
+        0.5,
+    )
+
+    prefiltered_tracks: List[Dict[str, Any]] = []
+    rejected_track_entries: List[Dict[str, Any]] = []
+    rejected_track_reason_counts: Counter[str] = Counter()
+
+    for track in raw_tracks:
+        best_accepted_overlap: Dict[str, Any] = {}
+        for accepted_track in accepted_track_records:
+            if str(accepted_track.get("label", "")) != str(track.get("label", "")):
+                continue
+            overlap = _track_overlap_metrics(track, accepted_track)
+            if _safe_float(overlap.get("overlap_score", 0.0)) > _safe_float(
+                best_accepted_overlap.get("overlap_score", 0.0)
+            ):
+                best_accepted_overlap = {
+                    **overlap,
+                    "accepted_track_id": int(accepted_track.get("track_id", -1)),
+                }
+        track["duplicate_with_accepted"] = best_accepted_overlap
+        track["duplicate_with_candidate"] = {}
+        track["score_breakdown"] = _candidate_track_score_breakdown(track, orig_shape, policy)
+        if (
+            best_accepted_overlap
+            and _safe_float(best_accepted_overlap.get("mean_iou", 0.0)) >= accepted_duplicate_threshold
+            and _safe_float(best_accepted_overlap.get("shared_frame_ratio", 0.0)) >= accepted_duplicate_shared_ratio
+        ):
+            rejected_track_entries.append(
+                _candidate_track_rejection_entry(
+                    track,
+                    "duplicate_of_accepted_track",
+                    duplicate_track_id=int(best_accepted_overlap.get("accepted_track_id", -1)),
+                )
+            )
+            rejected_track_reason_counts.update(["duplicate_of_accepted_track"])
+            continue
+        prefiltered_tracks.append(track)
+
+    prefiltered_tracks.sort(
+        key=lambda track: (
+            -_safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
+            -len(list(track.get("observations", []))),
+            int(track.get("track_id", -1)),
+        )
+    )
+
+    deduplicated_tracks: List[Dict[str, Any]] = []
+    for track in prefiltered_tracks:
+        best_candidate_overlap: Dict[str, Any] = {}
+        for kept_track in deduplicated_tracks:
+            if str(kept_track.get("label", "")) != str(track.get("label", "")):
+                continue
+            overlap = _track_overlap_metrics(track, kept_track)
+            if _safe_float(overlap.get("overlap_score", 0.0)) > _safe_float(
+                best_candidate_overlap.get("overlap_score", 0.0)
+            ):
+                best_candidate_overlap = {
+                    **overlap,
+                    "candidate_track_id": int(kept_track.get("track_id", -1)),
+                }
+        track["duplicate_with_candidate"] = best_candidate_overlap
+        track["score_breakdown"] = _candidate_track_score_breakdown(track, orig_shape, policy)
+        if (
+            best_candidate_overlap
+            and _safe_float(best_candidate_overlap.get("mean_iou", 0.0)) >= candidate_duplicate_threshold
+            and _safe_float(best_candidate_overlap.get("shared_frame_ratio", 0.0)) >= candidate_duplicate_shared_ratio
+        ):
+            rejected_track_entries.append(
+                _candidate_track_rejection_entry(
+                    track,
+                    "duplicate_of_candidate_track",
+                    duplicate_track_id=int(best_candidate_overlap.get("candidate_track_id", -1)),
+                )
+            )
+            rejected_track_reason_counts.update(["duplicate_of_candidate_track"])
+            continue
+        deduplicated_tracks.append(track)
+
+    for track in deduplicated_tracks:
+        track["score_breakdown"] = _candidate_track_score_breakdown(track, orig_shape, policy)
+
+    deduplicated_tracks.sort(
+        key=lambda track: (
+            -_safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0)),
+            -_safe_float(dict(track.get("score_breakdown", {})).get("temporal_consistency", 0.0)),
+            -_safe_float(dict(track.get("score_breakdown", {})).get("prior_relevance_mean", 0.0)),
+            int(track.get("track_id", -1)),
+        )
+    )
+
+    max_tracks_per_video = max(0, _safe_int(budget_cfg.get("max_tracks_per_video", 24), 24))
+    max_tracks_per_class_default = max(0, _safe_int(budget_cfg.get("max_tracks_per_class_default", 4), 4))
+    per_class_budget_cfg = {
+        str(key): max(0, _safe_int(value, max_tracks_per_class_default))
+        for key, value in dict(budget_cfg.get("max_tracks_per_class", {})).items()
+    }
+    min_selection_score = _safe_float(selection_cfg.get("min_selection_score", 0.15), 0.15)
+    selected_tracks: List[Dict[str, Any]] = []
+    selected_counts_by_class: Counter[str] = Counter()
+    for track in deduplicated_tracks:
+        label = str(track.get("label", "unknown"))
+        selection_score = _safe_float(dict(track.get("score_breakdown", {})).get("selection_score", 0.0))
+        if selection_score < min_selection_score:
+            rejected_track_entries.append(_candidate_track_rejection_entry(track, "below_track_selection_score"))
+            rejected_track_reason_counts.update(["below_track_selection_score"])
+            continue
+        if max_tracks_per_video and len(selected_tracks) >= max_tracks_per_video:
+            rejected_track_entries.append(_candidate_track_rejection_entry(track, "video_budget_exceeded"))
+            rejected_track_reason_counts.update(["video_budget_exceeded"])
+            continue
+        class_budget = per_class_budget_cfg.get(label, max_tracks_per_class_default)
+        if class_budget and selected_counts_by_class[label] >= class_budget:
+            rejected_track_entries.append(
+                _candidate_track_rejection_entry(
+                    track,
+                    "class_budget_exceeded",
+                    class_budget=class_budget,
+                )
+            )
+            rejected_track_reason_counts.update(["class_budget_exceeded"])
+            continue
+        selected_tracks.append(track)
+        selected_counts_by_class.update([label])
+
+    rejected_detections_bundle = {
         "num_rejected": sum(len(frame.get("rejected_candidates", [])) for frame in rejected_frames),
         "frames": rejected_frames,
         "rejection_reason_counts": dict(sorted(rejection_reason_counts.items())),
         "selection_policy": policy,
     }
-    return candidate_frames, candidate_track_summaries, rejected_bundle
+    rejected_track_entries.sort(
+        key=lambda row: (
+            row.get("rejection_reason", ""),
+            -_safe_float(row.get("selection_score", 0.0)),
+            int(row.get("track_id", -1)),
+        )
+    )
+    return {
+        "raw_candidate_tracks": {
+            "num_tracks": len(raw_tracks),
+            "frames": _tracks_to_frame_records(raw_tracks),
+            "track_summaries": sorted(
+                (_candidate_summary_from_track(track) for track in raw_tracks),
+                key=lambda row: int(row.get("track_id", -1)),
+            ),
+        },
+        "deduplicated_candidate_tracks": {
+            "num_tracks": len(deduplicated_tracks),
+            "frames": _tracks_to_frame_records(deduplicated_tracks),
+            "track_summaries": [
+                _candidate_summary_from_track(track) for track in deduplicated_tracks
+            ],
+        },
+        "selected_candidate_tracks": {
+            "num_tracks": len(selected_tracks),
+            "frames": _tracks_to_frame_records(selected_tracks),
+            "track_summaries": [
+                _candidate_summary_from_track(track) for track in selected_tracks
+            ],
+        },
+        "rejected_candidate_tracks": {
+            "num_tracks": len(rejected_track_entries),
+            "tracks": rejected_track_entries,
+            "rejection_reason_counts": dict(sorted(rejected_track_reason_counts.items())),
+        },
+        "rejected_candidate_detections": rejected_detections_bundle,
+        "selection_policy": policy,
+        "selection_budgets": {
+            "max_tracks_per_video": max_tracks_per_video,
+            "max_tracks_per_class_default": max_tracks_per_class_default,
+            "max_tracks_per_class": dict(sorted(per_class_budget_cfg.items())),
+            "selected_counts_by_class": dict(sorted(selected_counts_by_class.items())),
+        },
+    }
 
 def track_video(
     video_result: Dict[str, Any],
@@ -863,18 +1228,27 @@ def track_video(
         frame_rate=frame_rate,
         tracker_args=tracker_args,
     )
-    candidate_frames, candidate_track_summaries, rejected_candidate_detections = _run_candidate_tracking(
+    candidate_track_bundle = _run_candidate_tracking(
         frame_records=frame_records,
+        accepted_frames=accepted_frames,
         orig_shape=orig_shape,
         policy=candidate_scoring_policy,
     )
+    selected_candidate_tracks = dict(candidate_track_bundle.get("selected_candidate_tracks", {}))
+    rejected_candidate_detections = dict(candidate_track_bundle.get("rejected_candidate_detections", {}))
+    raw_candidate_tracks = dict(candidate_track_bundle.get("raw_candidate_tracks", {}))
+    deduplicated_candidate_tracks = dict(candidate_track_bundle.get("deduplicated_candidate_tracks", {}))
+    rejected_candidate_tracks = dict(candidate_track_bundle.get("rejected_candidate_tracks", {}))
 
     result: Dict[str, Any] = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
         "num_frames": len(accepted_frames),
         "num_tracks": len(accepted_track_ids),
-        "num_candidate_tracks": len(candidate_track_summaries),
+        "num_candidate_tracks": int(selected_candidate_tracks.get("num_tracks", 0)),
+        "num_raw_candidate_tracks": int(raw_candidate_tracks.get("num_tracks", 0)),
+        "num_deduplicated_candidate_tracks": int(deduplicated_candidate_tracks.get("num_tracks", 0)),
+        "num_rejected_candidate_tracks": int(rejected_candidate_tracks.get("num_tracks", 0)),
         "num_rejected_candidate_detections": int(rejected_candidate_detections.get("num_rejected", 0)),
         "frames": accepted_frames,
         "accepted_tracks": {
@@ -883,11 +1257,16 @@ def track_video(
             "track_summaries": _accepted_track_summaries(accepted_frames),
         },
         "candidate_tracks": {
-            "num_tracks": len(candidate_track_summaries),
-            "frames": candidate_frames,
-            "track_summaries": candidate_track_summaries,
+            "num_tracks": int(selected_candidate_tracks.get("num_tracks", 0)),
+            "frames": list(selected_candidate_tracks.get("frames", [])),
+            "track_summaries": list(selected_candidate_tracks.get("track_summaries", [])),
+            "raw_candidate_tracks": raw_candidate_tracks,
+            "deduplicated_candidate_tracks": deduplicated_candidate_tracks,
+            "selected_candidate_tracks": selected_candidate_tracks,
+            "rejected_candidate_tracks": rejected_candidate_tracks,
             "rejected_candidate_detections": rejected_candidate_detections,
             "selection_policy": candidate_scoring_policy,
+            "selection_budgets": dict(candidate_track_bundle.get("selection_budgets", {})),
         },
         "output_paths": {
             "tracks_json": str(tracks_file),
@@ -964,6 +1343,9 @@ def run(
                 "num_frames": r["num_frames"],
                 "num_tracks": r["num_tracks"],
                 "num_candidate_tracks": int(r.get("num_candidate_tracks", 0)),
+                "num_raw_candidate_tracks": int(r.get("num_raw_candidate_tracks", 0)),
+                "num_deduplicated_candidate_tracks": int(r.get("num_deduplicated_candidate_tracks", 0)),
+                "num_rejected_candidate_tracks": int(r.get("num_rejected_candidate_tracks", 0)),
                 "num_rejected_candidate_detections": int(r.get("num_rejected_candidate_detections", 0)),
             }
             for r in tracking_results
@@ -974,13 +1356,23 @@ def run(
         json.dump(manifest, fh, indent=2)
 
     total_tracks = sum(r["num_tracks"] for r in tracking_results)
+    total_raw_candidate_tracks = sum(int(r.get("num_raw_candidate_tracks", 0)) for r in tracking_results)
+    total_deduplicated_candidate_tracks = sum(
+        int(r.get("num_deduplicated_candidate_tracks", 0)) for r in tracking_results
+    )
     total_candidate_tracks = sum(int(r.get("num_candidate_tracks", 0)) for r in tracking_results)
+    total_rejected_candidate_tracks = sum(
+        int(r.get("num_rejected_candidate_tracks", 0)) for r in tracking_results
+    )
     total_rejected_candidate_detections = sum(
         int(r.get("num_rejected_candidate_detections", 0))
         for r in tracking_results
     )
     print(f"\nSaved tracking manifest to {manifest_path}")
     print(f"Total unique tracks across all videos: {total_tracks}")
-    print(f"Total candidate tracks across all videos: {total_candidate_tracks}")
+    print(f"Total raw candidate tracks across all videos: {total_raw_candidate_tracks}")
+    print(f"Total deduplicated candidate tracks across all videos: {total_deduplicated_candidate_tracks}")
+    print(f"Total selected candidate tracks across all videos: {total_candidate_tracks}")
+    print(f"Total rejected candidate tracks across all videos: {total_rejected_candidate_tracks}")
     print(f"Total rejected candidate detections across all videos: {total_rejected_candidate_detections}")
     return tracking_results
