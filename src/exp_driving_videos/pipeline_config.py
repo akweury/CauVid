@@ -8,8 +8,9 @@ from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pat
 
 
 DRIVING_MINI_OD_MODEL = "yolov8l-worldv2.pt"
-DEFAULT_TRAIN_VIDEO_COUNT = 8
+DEFAULT_TRAIN_VIDEO_COUNT = 100
 DEFAULT_EVAL_VIDEO_COUNT = 2
+DEFAULT_PIPELINE_VIDEO_LIMIT = DEFAULT_TRAIN_VIDEO_COUNT + DEFAULT_EVAL_VIDEO_COUNT
 DRIVING_MINI_OD_CLASSES = [
     "car",
     "truck",
@@ -170,6 +171,16 @@ def get_important_objects_cfg() -> Dict[str, Any]:
         },
         path=("important_objects",),
         warn_label="important objects",
+    )
+
+
+def get_video_selection_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "default_video_limit": DEFAULT_PIPELINE_VIDEO_LIMIT,
+        },
+        path=("video_selection",),
+        warn_label="video selection",
     )
 
 

@@ -323,16 +323,21 @@ def build_train_eval_split(
 
 
 def get_default_driving_mini_video_ids() -> List[str]:
+    selection_cfg = pipeline_config.get_video_selection_cfg()
+    raw_limit = selection_cfg.get("default_video_limit")
+    default_limit = int(raw_limit) if raw_limit is not None else None
+
     dataset_root = config.get_dataset_path("driving_mini")
     frames_root = dataset_root / "frames"
     if frames_root.exists():
         video_ids = sorted(path.name for path in frames_root.iterdir() if path.is_dir())
         if video_ids:
-            return video_ids
+            return video_ids[:default_limit] if default_limit and default_limit > 0 else video_ids
 
     videos_root = dataset_root / "videos"
     if videos_root.exists():
-        return sorted(path.stem for path in videos_root.glob("*.mov"))
+        video_ids = sorted(path.stem for path in videos_root.glob("*.mov"))
+        return video_ids[:default_limit] if default_limit and default_limit > 0 else video_ids
     return []
 
 

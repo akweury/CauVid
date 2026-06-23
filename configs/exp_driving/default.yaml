@@ -1,3 +1,6 @@
+video_selection:
+  default_video_limit: 102
+
 detection:
   render_video: false
 
@@ -93,8 +96,9 @@ target_head_atoms:
   include_negative_examples: true
 
 data_split:
-  strategy: eval_fraction
-  eval_fraction: 0.2
+  strategy: fixed_counts
+  train_video_count: 100
+  eval_video_count: 2
 
 pipeline_recompute:
   traffic_control_attributes: true
