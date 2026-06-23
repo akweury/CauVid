@@ -274,6 +274,8 @@ class YOLOWorldDetector(ObjectDetector):
             predict_kwargs["batch"] = int(self._resolved_predict_batch_size)
         if self._resolved_half_precision is not None:
             predict_kwargs["half"] = bool(self._resolved_half_precision)
+        if self._runtime_device is not None:
+            predict_kwargs["device"] = str(self._runtime_device)
         return self._model.predict(
             **predict_kwargs,
         )
@@ -511,10 +513,7 @@ class YOLOWorldDetector(ObjectDetector):
         self._resolve_runtime_profile()
         self._resolved_model_source = self._resolve_model_source()
         print(f"[YOLOWorldDetector] Loading model: {self._resolved_model_source}")
-        kwargs: Dict[str, Any] = {}
-        if self._runtime_device is not None:
-            kwargs["device"] = self._runtime_device
-        self._model = YOLOWorld(self._resolved_model_source, **kwargs)
+        self._model = YOLOWorld(self._resolved_model_source)
         self._persist_loaded_checkpoint()
 
         if self.classes:
