@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 3
+_LOGIC_ATOMS_VERSION = 4
 
 
 def get_output_root() -> Path:
@@ -368,6 +368,10 @@ def process_video(
                 "object_class": object_class,
                 "accepted": not is_candidate,
                 "source_type": str(obj.get("source_type", "accepted")) if is_candidate else "accepted",
+                "bbox": list(obj.get("bbox", [])),
+                "frame_detection_id": str(obj.get("frame_detection_id", "")) if is_candidate else "",
+                "source_detection_ids": list(obj.get("source_detection_ids", [])) if is_candidate else [],
+                "candidate_source": str(obj.get("candidate_source", "")) if is_candidate else "accepted_high_confidence",
                 "selection_score": float(obj.get("selection_score", 0.0)) if is_candidate else 0.0,
                 "prior_metadata": dict(obj.get("prior_metadata", {})) if is_candidate else {},
                 "track_quality": dict(obj.get("track_quality", {})) if is_candidate else {},

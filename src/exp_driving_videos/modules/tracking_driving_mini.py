@@ -23,7 +23,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import cv2
+try:
+    import cv2
+except Exception as exc:  # pragma: no cover - optional runtime dependency guard
+    cv2 = None
+    _CV2_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    _CV2_IMPORT_ERROR = None
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -39,11 +45,12 @@ import config
 try:
     from ultralytics.trackers.byte_tracker import BYTETracker
     from ultralytics.engine.results import Boxes
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "ultralytics is required for ByteTrack tracking. "
-        "Install with: pip install ultralytics"
-    ) from exc
+except Exception as exc:  # pragma: no cover - optional runtime dependency guard
+    BYTETracker = None
+    Boxes = Any
+    _BYTE_TRACKER_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    _BYTE_TRACKER_IMPORT_ERROR = None
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +71,7 @@ _DEFAULT_TRACKER_ARGS = SimpleNamespace(
 # ByteTracker needs orig_shape to build Boxes; we use the first available
 # detection to derive it when possible, otherwise fall back to this.
 _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
-_TRACKING_SCHEMA_VERSION = 5
+_TRACKING_SCHEMA_VERSION = 6
 _CANDIDATE_TRACK_ID_OFFSET = 1_000_000
 _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
     "visual_score_weight": 1.0,
@@ -169,6 +176,22 @@ _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
 }
 
 
+def _format_dependency_error(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return ""
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+def ensure_tracking_runtime_available() -> bool:
+    if BYTETracker is None:
+        raise RuntimeError(
+            "Tracking dependencies are unavailable. "
+            "ByteTrack requires `ultralytics` and its runtime dependencies. "
+            f"Import error: {_format_dependency_error(_BYTE_TRACKER_IMPORT_ERROR)}"
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -215,6 +238,8 @@ def render_tracking_video(
     fps: float = 10.0,
 ) -> Optional[str]:
     """Render an annotated MP4 with bounding boxes colored by track ID."""
+    if cv2 is None:
+        return None
     if not tracked_frames:
         return None
 
@@ -375,6 +400,9 @@ def _candidate_detection_records(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _load_candidate_scoring_policy(video_result: Dict[str, Any]) -> Dict[str, Any]:
     policy = json.loads(json.dumps(_DEFAULT_CANDIDATE_SCORING_POLICY))
+    policy["od_calibration_policy_id"] = str(
+        dict(video_result.get("od_calibration", {})).get("policy_id", "")
+    )
     prior_json_path = str(video_result.get("output_paths", {}).get("background_rule_relevance_prior_json", ""))
     if not prior_json_path:
         return policy
@@ -401,6 +429,20 @@ def _retention_bias(detection: Dict[str, Any]) -> float:
         for prior_id in matched_prior_ids
     ]
     return max(biases) if biases else 0.0
+
+
+def _raw_detection_score(detection: Dict[str, Any]) -> float:
+    return _safe_float(detection.get("raw_score", detection.get("score", 0.0)), 0.0)
+
+
+def _candidate_ranking_score(detection: Dict[str, Any]) -> float:
+    return _safe_float(
+        detection.get(
+            "score_used_for_candidate_ranking",
+            detection.get("calibrated_score", detection.get("raw_score", detection.get("score", 0.0))),
+        ),
+        0.0,
+    )
 
 
 def _candidate_spatially_plausible(
@@ -435,7 +477,7 @@ def _candidate_combined_score(detection: Dict[str, Any], policy: Dict[str, Any])
     source_bonus = dict(policy.get("source_bonus", {}))
     priority_bonus = dict(policy.get("tracking_priority_bonus", {}))
     return (
-        _safe_float(policy.get("visual_score_weight", 1.0), 1.0) * _safe_float(detection.get("score", 0.0))
+        _safe_float(policy.get("visual_score_weight", 1.0), 1.0) * _candidate_ranking_score(detection)
         + _safe_float(policy.get("prior_relevance_weight", 0.35), 0.35) * _safe_float(prior_metadata.get("prior_relevance_score", 0.0))
         + _safe_float(source_bonus.get(str(detection.get("candidate_source", "")), 0.0))
         + _safe_float(priority_bonus.get(str(top_priority), 0.0))
@@ -487,6 +529,10 @@ def _candidate_rejection_payload(
         "bbox": list(detection.get("bbox", [])),
         "class": str(detection.get("class", "unknown")),
         "score": _safe_float(detection.get("score", 0.0)),
+        "raw_score": _raw_detection_score(detection),
+        "calibrated_score": _safe_float(detection.get("calibrated_score", detection.get("score", 0.0)), 0.0),
+        "feedback_bonus": _safe_float(detection.get("feedback_bonus", 0.0), 0.0),
+        "score_used_for_candidate_ranking": _candidate_ranking_score(detection),
         "candidate_source": str(detection.get("candidate_source", "")),
         "combined_tracking_score": _safe_float(detection.get("combined_tracking_score", 0.0)),
         "pre_tracking_score": _safe_float(detection.get("pre_tracking_score", 0.0)),
@@ -530,7 +576,7 @@ def _candidate_pretracking_score(
     spatial_plausibility = 1.0 if _candidate_spatially_plausible(detection, orig_shape, policy) else 0.0
     accepted_suppression = _safe_float(detection.get("accepted_track_suppression_iou", 0.0))
     return (
-        _safe_float(gate_cfg.get("visual_score_weight", 0.45), 0.45) * _safe_float(detection.get("score", 0.0))
+        _safe_float(gate_cfg.get("visual_score_weight", 0.45), 0.45) * _candidate_ranking_score(detection)
         + _safe_float(gate_cfg.get("prior_relevance_weight", 0.25), 0.25) * _safe_float(detection.get("prior_relevance_score", 0.0))
         + _safe_float(gate_cfg.get("tracking_priority_weight", 0.15), 0.15) * _tracking_priority_value(
             str(detection.get("tracking_priority", "")),
@@ -546,7 +592,7 @@ def _candidate_selection_decision(
     orig_shape: Tuple[int, int],
     policy: Dict[str, Any],
 ) -> Tuple[bool, str]:
-    score = _safe_float(detection.get("score", 0.0))
+    score = _candidate_ranking_score(detection)
     threshold_cfg = dict(policy.get("candidate_selection_thresholds", {}))
     if score < _safe_float(threshold_cfg.get("min_visual_score", 0.01), 0.01):
         return False, "below_min_visual_score"
@@ -567,6 +613,20 @@ def _candidate_summary_from_track(track: Dict[str, Any]) -> Dict[str, Any]:
     detection_ids = [str(obs.get("detection_id", "")) for obs in observations if str(obs.get("detection_id", ""))]
     candidate_sources = [str(obs.get("candidate_source", "")) for obs in observations if str(obs.get("candidate_source", ""))]
     scores = [_safe_float(obs.get("score", 0.0)) for obs in observations]
+    raw_scores = [_safe_float(obs.get("raw_score", obs.get("score", 0.0))) for obs in observations]
+    calibrated_scores = [
+        _safe_float(obs.get("calibrated_score", obs.get("raw_score", obs.get("score", 0.0))))
+        for obs in observations
+    ]
+    ranking_scores = [
+        _safe_float(
+            obs.get(
+                "score_used_for_candidate_ranking",
+                obs.get("calibrated_score", obs.get("raw_score", obs.get("score", 0.0))),
+            )
+        )
+        for obs in observations
+    ]
     prior_scores = [_safe_float(obs.get("prior_relevance_score", 0.0)) for obs in observations]
     ious = [_safe_float(value, 0.0) for value in list(track.get("match_ious", []))]
     matched_prior_ids: set[str] = set()
@@ -587,6 +647,10 @@ def _candidate_summary_from_track(track: Dict[str, Any]) -> Dict[str, Any]:
         "candidate_source_counts": dict(sorted(Counter(candidate_sources).items())),
         "mean_score": float(sum(scores) / max(1, len(scores))),
         "max_score": float(max(scores) if scores else 0.0),
+        "mean_raw_score": float(sum(raw_scores) / max(1, len(raw_scores))),
+        "mean_calibrated_score": float(sum(calibrated_scores) / max(1, len(calibrated_scores))),
+        "mean_ranking_score": float(sum(ranking_scores) / max(1, len(ranking_scores))),
+        "max_calibrated_score": float(max(calibrated_scores) if calibrated_scores else 0.0),
         "track_length": len(observations),
         "temporal_consistency": float(sum(ious) / max(1, len(ious))) if ious else 1.0,
         "matched_prior_ids": sorted(matched_prior_ids),
@@ -762,7 +826,7 @@ def _candidate_track_score_breakdown(track: Dict[str, Any], orig_shape: Tuple[in
         _safe_float(dedupe_cfg.get("duplicate_penalty_cap", 1.0), 1.0),
     )
     visual_component = _safe_float(selection_cfg.get("visual_score_weight", 0.35), 0.35) * _safe_float(
-        summary.get("mean_score", 0.0)
+        summary.get("mean_ranking_score", summary.get("mean_score", 0.0))
     )
     prior_component = _safe_float(selection_cfg.get("prior_relevance_weight", 0.2), 0.2) * _safe_float(
         summary.get("prior_relevance_mean", 0.0)
@@ -793,6 +857,9 @@ def _candidate_track_score_breakdown(track: Dict[str, Any], orig_shape: Tuple[in
         "duplicate_penalty_raw": float(duplicate_penalty_raw),
         "duplicate_penalty": float(duplicate_penalty),
         "mean_score": _safe_float(summary.get("mean_score", 0.0)),
+        "mean_raw_score": _safe_float(summary.get("mean_raw_score", 0.0)),
+        "mean_calibrated_score": _safe_float(summary.get("mean_calibrated_score", 0.0)),
+        "mean_ranking_score": _safe_float(summary.get("mean_ranking_score", 0.0)),
         "prior_relevance_mean": _safe_float(summary.get("prior_relevance_mean", 0.0)),
         "temporal_consistency": _safe_float(summary.get("temporal_consistency", 0.0)),
     }
@@ -1086,10 +1153,19 @@ def _run_candidate_tracking(
             detection = dict(det)
             detection["bbox"] = _coerce_bbox(detection.get("bbox", []))
             detection["score"] = _safe_float(detection.get("score", 0.0))
+            detection["raw_score"] = _raw_detection_score(detection)
+            detection["calibrated_score"] = _safe_float(
+                detection.get("calibrated_score", detection.get("raw_score", detection.get("score", 0.0))),
+                0.0,
+            )
+            detection["feedback_bonus"] = _safe_float(detection.get("feedback_bonus", 0.0), 0.0)
+            detection["score_used_for_candidate_ranking"] = _candidate_ranking_score(detection)
             detection["class"] = str(detection.get("class", "unknown"))
             detection["candidate_source"] = str(detection.get("candidate_source", "candidate"))
             detection["prior_metadata"] = dict(detection.get("prior_metadata", {}))
-            detection["detection_id"] = _detection_id(frame_index, "candidate", det_index)
+            detection["detection_id"] = str(
+                detection.get("detection_id", _detection_id(frame_index, "candidate", det_index))
+            )
             detection["combined_tracking_score"] = _candidate_combined_score(detection, policy)
             detection["matched_prior_ids"] = [
                 str(value)
@@ -1108,7 +1184,7 @@ def _run_candidate_tracking(
             is_selected, rejection_reason = _candidate_selection_decision(detection, orig_shape, policy)
             detection["exploration_eligible"] = (
                 not detection["matched_prior_ids"]
-                and detection["score"] >= exploration_min_score
+                and _candidate_ranking_score(detection) >= exploration_min_score
             )
             if not is_selected:
                 rejected_candidates.append(_candidate_rejection_payload(detection, rejection_reason))
@@ -1138,7 +1214,7 @@ def _run_candidate_tracking(
             key=lambda row: (
                 -_safe_float(row.get("pre_tracking_score", 0.0)),
                 -_safe_float(row.get("combined_tracking_score", 0.0)),
-                -_safe_float(row.get("score", 0.0)),
+                -_candidate_ranking_score(row),
             )
         )
         candidate_inputs: List[Dict[str, Any]] = []
@@ -1235,6 +1311,10 @@ def _run_candidate_tracking(
                 "image_path": rec.get("image_path", ""),
                 "bbox": bbox,
                 "score": _safe_float(detection.get("score", 0.0)),
+                "raw_score": _raw_detection_score(detection),
+                "calibrated_score": _safe_float(detection.get("calibrated_score", detection.get("score", 0.0)), 0.0),
+                "feedback_bonus": _safe_float(detection.get("feedback_bonus", 0.0), 0.0),
+                "score_used_for_candidate_ranking": _candidate_ranking_score(detection),
                 "label": label,
                 "detection_id": str(detection.get("detection_id", "")),
                 "candidate_source": str(detection.get("candidate_source", "")),
@@ -1575,6 +1655,10 @@ def track_video(
             and isinstance(cached.get("accepted_tracks"), dict)
             and isinstance(cached.get("candidate_tracks"), dict)
         )
+        current_policy_id = str(dict(video_result.get("od_calibration", {})).get("policy_id", ""))
+        cached_policy_id = str(cached.get("od_calibration_policy_id", ""))
+        if cache_is_current and cached_policy_id != current_policy_id:
+            cache_is_current = False
         if not cache_is_current:
             cached = {}
         else:
@@ -1616,6 +1700,7 @@ def track_video(
     result: Dict[str, Any] = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
+        "od_calibration_policy_id": str(dict(video_result.get("od_calibration", {})).get("policy_id", "")),
         "num_frames": len(accepted_frames),
         "num_tracks": len(accepted_track_ids),
         "num_tracking_input_candidate_detections": int(candidate_track_bundle.get("num_tracking_input_candidates", 0)),
@@ -1690,6 +1775,14 @@ def run(
     Returns:
         List of per-video tracking result dicts.
     """
+    effective_render_video = bool(render_video)
+    if effective_render_video and cv2 is None:
+        print(
+            "[warn] OpenCV (`cv2`) is not available; tracking rendering will be skipped for this run. "
+            f"Import error: {_format_dependency_error(_CV2_IMPORT_ERROR)}"
+        )
+        effective_render_video = False
+    ensure_tracking_runtime_available()
     effective_output_root = output_root or get_output_root()
 
     print(f"Videos to track: {[r['video_id'] for r in detection_results]}")
@@ -1702,7 +1795,7 @@ def run(
             frame_rate=frame_rate,
             tracker_args=tracker_args,
             force_recompute=force_recompute,
-            render_video=render_video,
+            render_video=effective_render_video,
         )
         tracking_results.append(result)
 

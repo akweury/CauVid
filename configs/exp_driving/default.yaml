@@ -114,7 +114,11 @@ pipeline_recompute:
   rule_pool_upper_bound_diagnostic: false
   oracle_rule_selection_gap_diagnostic: false
   rule_evaluation: false
+  candidate_contribution_summary: false
+  reasoning_to_od_pseudo_labels: false
+  od_confidence_calibration: false
   rule_aggregation_baseline: false
+  baseline_safe_calibration_gate: false
   object_to_atom_coverage_diagnostic: false
   traffic_control_rule_utility_diagnostic: false
   traffic_control_temporal_alignment_diagnostic: true
@@ -230,6 +234,29 @@ rule_evaluation:
   prediction_mode: any_rule_positive
   rule_set_mode: all
   primary_rule_set: original
+
+candidate_contribution_summary:
+  top_useful_candidate_rules: 10
+  top_noisy_candidate_rules: 10
+  top_broad_candidate_rules: 10
+  top_matched_priors: 10
+
+reasoning_to_od_pseudo_labels:
+  selector_mode: primary_plus_best
+  max_match_states_per_example_rule: 12
+  include_neutral_selected_candidate_detections: true
+
+od_confidence_calibration:
+  min_labeled_detections: 8
+  min_positive_detections: 2
+  min_negative_detections: 2
+  logistic_c: 1.0
+  max_iter: 500
+  class_weight: balanced
+
+baseline_safe_calibration_gate:
+  baseline_tolerance: 1.0e-09
+  final_f1_tolerance: 1.0e-09
 
 rule_aggregation_baseline:
   validation_fraction: 0.25

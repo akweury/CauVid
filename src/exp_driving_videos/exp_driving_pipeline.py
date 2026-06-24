@@ -66,6 +66,13 @@ Steps:
                     candidate-derived atoms improve held-out brake_next
                     prediction or mainly add noise using Step 17/18 outputs
                     only, without recomputing rule evaluation.
+    18H. reasoning_to_od_pseudo_labels_driving_mini — trace useful/noisy
+                    candidate-derived rules back to candidate objects,
+                    tracks, and detection boxes, and emit task-utility
+                    pseudo labels for OD confidence calibration only.
+    18I. od_confidence_calibration_driving_mini — fit or export a
+                    lightweight candidate-branch OD confidence update
+                    policy from reasoning-derived pseudo labels.
     18B. neural_symbolic_baseline_driving_mini — train single-segment and
                     short-history symbolic neural baselines on the same
                     train/eval split and compare held-out classification
@@ -91,6 +98,10 @@ Steps:
                     export sampled full-frame visual audits for detected
                     traffic-light objects with drawn bounding boxes and
                     predicted state/context overlays for manual review.
+    18J. baseline_safe_calibration_gate_driving_mini — audit accepted-only
+                    baseline preservation plus final held-out F1 and accept
+                    or reject the proposed OD calibration policy for the
+                    next iteration.
     19. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
@@ -142,6 +153,9 @@ from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import candidate_contribution_summary_driving_mini
+from src.exp_driving_videos.modules import reasoning_to_od_pseudo_labels_driving_mini
+from src.exp_driving_videos.modules import od_confidence_calibration_driving_mini
+from src.exp_driving_videos.modules import baseline_safe_calibration_gate_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
 from src.exp_driving_videos.modules import diverse_final_rules_driving_mini
 from src.exp_driving_videos.modules import evaluate_rules_driving_mini
@@ -175,6 +189,7 @@ from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
 from src.exp_driving_videos.modules import background_causal_prior_driving_mini
 from src.exp_driving_videos.modules import background_rule_relevance_prior_driving_mini
 from src.exp_driving_videos.modules import reasoning_feedback_signal_driving_mini
+from src.exp_driving_videos.modules import od_calibration_policy_utils
 
 DRIVING_MINI_OD_MODEL = driving_pipeline_config.DRIVING_MINI_OD_MODEL
 DEFAULT_TRAIN_VIDEO_COUNT = driving_pipeline_config.DEFAULT_TRAIN_VIDEO_COUNT
@@ -205,6 +220,9 @@ _get_oracle_rule_selection_gap_diagnostic_cfg = driving_pipeline_config.get_orac
 _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
 _get_candidate_contribution_summary_cfg = driving_pipeline_config.get_candidate_contribution_summary_cfg
+_get_reasoning_to_od_pseudo_labels_cfg = driving_pipeline_config.get_reasoning_to_od_pseudo_labels_cfg
+_get_od_confidence_calibration_cfg = driving_pipeline_config.get_od_confidence_calibration_cfg
+_get_baseline_safe_calibration_gate_cfg = driving_pipeline_config.get_baseline_safe_calibration_gate_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_object_to_atom_coverage_diagnostic_cfg = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_cfg
 _get_traffic_control_rule_utility_diagnostic_cfg = (
@@ -229,6 +247,9 @@ _get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diag
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
 _get_candidate_contribution_summary_output_root = (
     driving_pipeline_config.get_candidate_contribution_summary_output_root
+)
+_get_od_confidence_calibration_loop_output_root = (
+    driving_pipeline_config.get_od_confidence_calibration_loop_output_root
 )
 _get_rule_aggregation_baseline_output_root = driving_pipeline_config.get_rule_aggregation_baseline_output_root
 _get_object_to_atom_coverage_diagnostic_output_root = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_output_root
@@ -287,12 +308,15 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17E", "stop_after": None, "label": "oracle_rule_selection_gap_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
     {"tag": "18A", "stop_after": None, "label": "candidate_contribution_summary_driving_mini"},
+    {"tag": "18H", "stop_after": None, "label": "reasoning_to_od_pseudo_labels_driving_mini"},
+    {"tag": "18I", "stop_after": None, "label": "od_confidence_calibration_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "neural_symbolic_baseline_driving_mini"},
     {"tag": "18C", "stop_after": None, "label": "rule_aggregation_baseline_driving_mini"},
     {"tag": "18D", "stop_after": None, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "18E", "stop_after": None, "label": "traffic_control_rule_utility_diagnostic_driving_mini"},
     {"tag": "18F", "stop_after": None, "label": "traffic_control_temporal_alignment_diagnostic_driving_mini"},
-    {"tag": "18G", "stop_after": 18, "label": "traffic_light_detection_quality_audit_driving_mini"},
+    {"tag": "18G", "stop_after": None, "label": "traffic_light_detection_quality_audit_driving_mini"},
+    {"tag": "18J", "stop_after": 18, "label": "baseline_safe_calibration_gate_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "error_and_explainability_analysis_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "vehicle_rule_diagnostic_driving_mini"},
     {"tag": "20B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
@@ -442,8 +466,12 @@ class PipelineContext:
     evaluation_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     evaluation_results: Dict[str, Any] = field(default_factory=dict)
     candidate_contribution_summary_results: Dict[str, Any] = field(default_factory=dict)
+    od_calibration_iteration_id: str = ""
+    reasoning_to_od_pseudo_label_results: Dict[str, Any] = field(default_factory=dict)
+    od_confidence_calibration_results: Dict[str, Any] = field(default_factory=dict)
     neural_symbolic_baseline_results: Dict[str, Any] = field(default_factory=dict)
     rule_aggregation_baseline_results: Dict[str, Any] = field(default_factory=dict)
+    baseline_safe_calibration_gate_results: Dict[str, Any] = field(default_factory=dict)
     object_to_atom_coverage_results: Dict[str, Any] = field(default_factory=dict)
     traffic_control_rule_utility_results: Dict[str, Any] = field(default_factory=dict)
     traffic_control_temporal_alignment_results: Dict[str, Any] = field(default_factory=dict)
@@ -555,6 +583,7 @@ def _run_object_detection_step(
     force_recompute: bool = False,
     video_ids: Optional[List[str]] = None,
     render_video: bool = True,
+    od_calibration_policy: Optional[Dict[str, Any]] = None,
     background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     return detect_driving_mini.run(
@@ -563,6 +592,7 @@ def _run_object_detection_step(
         classes=DRIVING_MINI_OD_CLASSES,
         force_recompute=force_recompute,
         render_video=render_video,
+        od_calibration_policy=od_calibration_policy,
         background_rule_relevance_prior_results=background_rule_relevance_prior_results,
     )
 
@@ -804,11 +834,15 @@ def run_step_0_background_rule_relevance_prior(ctx: PipelineContext, runner: Ste
 
 def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_detection_render_video_enabled(default=True)
+    active_od_policy = od_calibration_policy_utils.load_active_od_calibration_policy()
     runner.announce_step("1", "detect_driving_mini", leading_newline=False)
     runner.log("1", f"model={DRIVING_MINI_OD_MODEL}")
     runner.log("1", f"classes={len(DRIVING_MINI_OD_CLASSES)} configured")
     runner.log("1", f"render_video={render_video}")
     runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
+    runner.log("1", f"od_calibration_policy={od_calibration_policy_utils.policy_id(active_od_policy) or 'none'}")
+    for warning in detect_driving_mini.detector_dependency_warnings(render_video=render_video):
+        runner.log("1", f"[warn] {warning}")
     if ctx.effective_video_ids:
         runner.log("1", f"video_filter={ctx.effective_video_ids}")
     with runner.module_output("1"):
@@ -816,6 +850,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             force_recompute=False,
             video_ids=ctx.effective_video_ids,
             render_video=render_video,
+            od_calibration_policy=active_od_policy,
             background_rule_relevance_prior_results=ctx.background_rule_relevance_prior_results,
         )
     runner.log("1", f"completed videos={len(ctx.detection_results)}")
@@ -826,6 +861,12 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_tracking_render_video_enabled(default=True)
     runner.announce_step("2", "tracking_driving_mini")
     runner.log("2", f"render_video={render_video}")
+    if ctx.detection_results:
+        runner.log(
+            "2",
+            "od_calibration_policy="
+            f"{dict(ctx.detection_results[0].get('od_calibration', {})).get('policy_id', '') or 'none'}",
+        )
     with runner.module_output("2"):
         ctx.tracking_results = tracking_driving_mini.run(
             ctx.detection_results or [],
@@ -1309,6 +1350,73 @@ def run_step_18a_candidate_contribution_summary(ctx: PipelineContext, runner: St
     runner.complete_step("18A", subtitle=f"best={best_selector or 'n/a'}")
 
 
+def _ensure_od_calibration_iteration_id(ctx: PipelineContext) -> str:
+    if not ctx.od_calibration_iteration_id:
+        ctx.od_calibration_iteration_id = od_calibration_policy_utils.next_iteration_id()
+    return ctx.od_calibration_iteration_id
+
+
+def run_step_18h_reasoning_to_od_pseudo_labels(ctx: PipelineContext, runner: StepRunner) -> None:
+    reasoning_to_od_pseudo_labels_cfg = _get_reasoning_to_od_pseudo_labels_cfg()
+    iteration_id = _ensure_od_calibration_iteration_id(ctx)
+    runner.announce_step("18H", "reasoning_to_od_pseudo_labels_driving_mini")
+    runner.log("18H", f"cfg={reasoning_to_od_pseudo_labels_cfg}")
+    runner.log("18H", f"iteration_id={iteration_id}")
+    runner.log("18H", f"recompute={bool(ctx.recompute_cfg.get('reasoning_to_od_pseudo_labels', True))}")
+    with runner.module_output("18H"):
+        ctx.reasoning_to_od_pseudo_label_results = reasoning_to_od_pseudo_labels_driving_mini.run(
+            detection_results=ctx.detection_results or [],
+            tracking_results=ctx.tracking_results or [],
+            logic_atom_results=ctx.logic_atom_results or [],
+            eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            evaluation_results_by_name=ctx.evaluation_results_by_name,
+            candidate_contribution_summary_results=ctx.candidate_contribution_summary_results,
+            primary_rule_set=ctx.primary_rule_set,
+            iteration_id=iteration_id,
+            cfg=reasoning_to_od_pseudo_labels_cfg,
+            output_root=_get_od_confidence_calibration_loop_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("reasoning_to_od_pseudo_labels", True)),
+        )
+    runner.log(
+        "18H",
+        f"detections={len(ctx.reasoning_to_od_pseudo_label_results.get('detection_pseudo_labels', []))} "
+        f"positive={int(dict(ctx.reasoning_to_od_pseudo_label_results.get('low_confidence_od_contribution_report', {})).get('num_positive_detection_pseudo_labels', 0))} "
+        f"negative={int(dict(ctx.reasoning_to_od_pseudo_label_results.get('low_confidence_od_contribution_report', {})).get('num_negative_detection_pseudo_labels', 0))}",
+    )
+    runner.complete_step(
+        "18H",
+        subtitle=f"detections={len(ctx.reasoning_to_od_pseudo_label_results.get('detection_pseudo_labels', []))}",
+    )
+
+
+def run_step_18i_od_confidence_calibration(ctx: PipelineContext, runner: StepRunner) -> None:
+    od_confidence_calibration_cfg = _get_od_confidence_calibration_cfg()
+    iteration_id = _ensure_od_calibration_iteration_id(ctx)
+    runner.announce_step("18I", "od_confidence_calibration_driving_mini")
+    runner.log("18I", f"cfg={od_confidence_calibration_cfg}")
+    runner.log("18I", f"iteration_id={iteration_id}")
+    runner.log("18I", f"recompute={bool(ctx.recompute_cfg.get('od_confidence_calibration', True))}")
+    with runner.module_output("18I"):
+        ctx.od_confidence_calibration_results = od_confidence_calibration_driving_mini.run(
+            pseudo_label_results=ctx.reasoning_to_od_pseudo_label_results,
+            detection_results=ctx.detection_results or [],
+            tracking_results=ctx.tracking_results or [],
+            iteration_id=iteration_id,
+            cfg=od_confidence_calibration_cfg,
+            output_root=_get_od_confidence_calibration_loop_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("od_confidence_calibration", True)),
+        )
+    runner.log(
+        "18I",
+        f"policy_type={str(dict(ctx.od_confidence_calibration_results.get('policy', {})).get('policy_type', '')) or 'n/a'} "
+        f"labeled_rows={int(ctx.od_confidence_calibration_results.get('num_labeled_rows', 0))}",
+    )
+    runner.complete_step(
+        "18I",
+        subtitle=f"policy={str(dict(ctx.od_confidence_calibration_results.get('policy', {})).get('policy_type', 'n/a'))}",
+    )
+
+
 def run_step_18b_neural_symbolic_baseline(ctx: PipelineContext, runner: StepRunner) -> None:
     neural_symbolic_baseline_cfg = _get_neural_symbolic_baseline_cfg()
     runner.announce_step("18B", "neural_symbolic_baseline_driving_mini")
@@ -1482,6 +1590,35 @@ def run_step_18g_traffic_light_detection_quality_audit(ctx: PipelineContext, run
     runner.complete_step(
         "18G",
         subtitle=f"saved={int(ctx.traffic_light_detection_quality_audit_results.get('num_saved_audit_images', 0))}",
+    )
+
+
+def run_step_18j_baseline_safe_calibration_gate(ctx: PipelineContext, runner: StepRunner) -> None:
+    baseline_safe_calibration_gate_cfg = _get_baseline_safe_calibration_gate_cfg()
+    iteration_id = _ensure_od_calibration_iteration_id(ctx)
+    runner.announce_step("18J", "baseline_safe_calibration_gate_driving_mini")
+    runner.log("18J", f"cfg={baseline_safe_calibration_gate_cfg}")
+    runner.log("18J", f"iteration_id={iteration_id}")
+    runner.log("18J", f"recompute={bool(ctx.recompute_cfg.get('baseline_safe_calibration_gate', True))}")
+    with runner.module_output("18J"):
+        ctx.baseline_safe_calibration_gate_results = baseline_safe_calibration_gate_driving_mini.run(
+            evaluation_results_by_name=ctx.evaluation_results_by_name,
+            primary_rule_set=ctx.primary_rule_set,
+            rule_aggregation_baseline_results=ctx.rule_aggregation_baseline_results,
+            calibration_results=ctx.od_confidence_calibration_results,
+            iteration_id=iteration_id,
+            cfg=baseline_safe_calibration_gate_cfg,
+            output_root=_get_od_confidence_calibration_loop_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("baseline_safe_calibration_gate", True)),
+        )
+    runner.log(
+        "18J",
+        f"decision={ctx.baseline_safe_calibration_gate_results.get('decision', 'n/a')} "
+        f"active_policy_after={ctx.baseline_safe_calibration_gate_results.get('active_policy_after_id', '') or 'none'}",
+    )
+    runner.complete_step(
+        "18J",
+        subtitle=f"decision={ctx.baseline_safe_calibration_gate_results.get('decision', 'n/a')}",
     )
 
 
@@ -1727,12 +1864,15 @@ def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> Non
         # Evaluation and baselines
         run_step_18_rule_evaluation(ctx, runner)
         run_step_18a_candidate_contribution_summary(ctx, runner)
+        run_step_18h_reasoning_to_od_pseudo_labels(ctx, runner)
+        run_step_18i_od_confidence_calibration(ctx, runner)
         run_step_18b_neural_symbolic_baseline(ctx, runner)
         run_step_18c_rule_aggregation_baseline(ctx, runner)
         run_step_18d_object_to_atom_coverage(ctx, runner)
         run_step_18e_traffic_control_rule_utility(ctx, runner)
         run_step_18f_traffic_control_temporal_alignment(ctx, runner)
         run_step_18g_traffic_light_detection_quality_audit(ctx, runner)
+        run_step_18j_baseline_safe_calibration_gate(ctx, runner)
 
         # Diagnostics
         run_step_19_error_analysis(ctx, runner)

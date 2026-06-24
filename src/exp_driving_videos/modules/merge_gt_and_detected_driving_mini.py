@@ -20,7 +20,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import cv2
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    cv2 = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -288,6 +291,8 @@ def render_merged_video(
     GT boxes are drawn as solid rectangles, and carried detections are drawn
     with dashed-like corner markers so source is visually distinguishable.
     """
+    if cv2 is None:
+        return None
     if not merged_frames:
         return None
 

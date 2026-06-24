@@ -445,6 +445,44 @@ def get_candidate_contribution_summary_cfg() -> Dict[str, Any]:
     )
 
 
+def get_reasoning_to_od_pseudo_labels_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "selector_mode": "primary_plus_best",
+            "max_match_states_per_example_rule": 12,
+            "include_neutral_selected_candidate_detections": True,
+        },
+        path=("reasoning_to_od_pseudo_labels",),
+        warn_label="reasoning-to-OD pseudo labels",
+    )
+
+
+def get_od_confidence_calibration_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "min_labeled_detections": 8,
+            "min_positive_detections": 2,
+            "min_negative_detections": 2,
+            "logistic_c": 1.0,
+            "max_iter": 500,
+            "class_weight": "balanced",
+        },
+        path=("od_confidence_calibration",),
+        warn_label="OD confidence calibration",
+    )
+
+
+def get_baseline_safe_calibration_gate_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "baseline_tolerance": 1e-9,
+            "final_f1_tolerance": 1e-9,
+        },
+        path=("baseline_safe_calibration_gate",),
+        warn_label="baseline-safe calibration gate",
+    )
+
+
 def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -684,7 +722,10 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,
             "candidate_contribution_summary": True,
+            "reasoning_to_od_pseudo_labels": True,
+            "od_confidence_calibration": True,
             "rule_aggregation_baseline": True,
+            "baseline_safe_calibration_gate": True,
             "object_to_atom_coverage_diagnostic": True,
             "traffic_control_rule_utility_diagnostic": True,
             "traffic_control_temporal_alignment_diagnostic": True,
@@ -743,6 +784,10 @@ def get_rule_evaluation_output_root() -> Path:
 
 def get_candidate_contribution_summary_output_root() -> Path:
     return _load_output_root("18a_driving_mini_candidate_contribution_summary")
+
+
+def get_od_confidence_calibration_loop_output_root() -> Path:
+    return _load_output_root("18hij_driving_mini_od_calibration_loop")
 
 
 def get_rule_aggregation_baseline_output_root() -> Path:

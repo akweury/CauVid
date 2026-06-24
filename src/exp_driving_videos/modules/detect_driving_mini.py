@@ -40,26 +40,43 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import cv2
-
-
+try:
+    import cv2
+except Exception as exc:  # pragma: no cover - optional runtime dependency guard
+    cv2 = None
+    _CV2_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    _CV2_IMPORT_ERROR = None
 
 import config
+from src.exp_driving_videos.modules import od_calibration_policy_utils
 
 # Reuse the shared detector classes from the nuScenes detection pipeline
-from src.exp_nuScenes.detection_pipeline import (
-    YOLO_WORLD_DEFAULT_CLASSES,
-    DetectionResult,
-    ObjectDetector,
-    YOLOWorldDetector,
-)
+try:
+    from src.exp_nuScenes.detection_pipeline import (
+        YOLO_WORLD_DEFAULT_CLASSES,
+        DetectionResult,
+        ObjectDetector,
+        YOLOWorldDetector,
+    )
+except Exception as exc:  # pragma: no cover - optional runtime dependency guard
+    YOLO_WORLD_DEFAULT_CLASSES = []
+    DetectionResult = Any
+    ObjectDetector = Any
+    YOLOWorldDetector = None
+    _DETECTOR_IMPORT_ERROR: Optional[BaseException] = exc
+else:
+    _DETECTOR_IMPORT_ERROR = None
 
 
-_DETECTION_SCHEMA_VERSION = 5
+_DETECTION_SCHEMA_VERSION = 6
 
 _PREDICTION_CSV_FIELDS: List[str] = [
-    "video_id", "frame", "frame_index", "image_path", "class_name", "score", "accepted",
+    "video_id", "frame", "frame_index", "image_path", "detection_id", "class_name", "score",
+    "raw_score", "calibrated_score", "feedback_bonus", "score_used_for_candidate_ranking",
+    "accepted",
     "candidate_source", "quality_bucket",
+    "od_calibration_policy_id", "od_calibration_policy_applied", "od_calibration_branch",
     "matched_prior_ids_json", "top_prior_id", "prior_relevance_score",
     "matched_prior_scores_json", "matched_prior_tracking_priorities_json",
     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
@@ -85,6 +102,54 @@ _VIDEO_SUMMARY_CSV_FIELDS: List[str] = [
     "num_high_quality", "num_borderline_quality", "num_low_quality",
     "num_nms_relaxed_quality", "num_discarded_quality", "detected_classes_json",
 ]
+
+
+def _format_dependency_error(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return ""
+    return f"{exc.__class__.__name__}: {exc}"
+
+
+def get_detector_dependency_status(*, render_video: bool = True) -> Dict[str, Any]:
+    return {
+        "cv2_available": cv2 is not None,
+        "cv2_error": _format_dependency_error(_CV2_IMPORT_ERROR),
+        "detector_backend_available": YOLOWorldDetector is not None,
+        "detector_backend_error": _format_dependency_error(_DETECTOR_IMPORT_ERROR),
+        "render_video_requested": bool(render_video),
+        "render_video_available": bool(render_video and cv2 is not None),
+    }
+
+
+def detector_dependency_warnings(*, render_video: bool = True) -> List[str]:
+    status = get_detector_dependency_status(render_video=render_video)
+    warnings: List[str] = []
+    if not bool(status.get("cv2_available", False)):
+        if render_video:
+            warnings.append(
+                "OpenCV (`cv2`) is not available; detection rendering will be disabled. "
+                f"Import error: {status.get('cv2_error', 'unknown')}"
+            )
+        else:
+            warnings.append(
+                "OpenCV (`cv2`) is not available. Detection can still use cached or non-rendered outputs, "
+                "but boxed-video rendering is unavailable."
+            )
+    if not bool(status.get("detector_backend_available", False)):
+        warnings.append(
+            "Detector backend dependencies are missing; Step 1 detection cannot run until they are installed. "
+            f"Import error: {status.get('detector_backend_error', 'unknown')}"
+        )
+    return warnings
+
+
+def ensure_detector_runtime_available(*, render_video: bool = True) -> bool:
+    if YOLOWorldDetector is None:
+        raise RuntimeError(
+            "Step 1 detection dependencies are unavailable. "
+            + " ".join(detector_dependency_warnings(render_video=render_video))
+        )
+    return True
 
 # ---------------------------------------------------------------------------
 # Dataset paths
@@ -147,6 +212,38 @@ def _quality_bucket(detection: Dict[str, Any]) -> str:
     return str(detection.get("candidate_source", "candidate"))
 
 
+def _detection_id(frame_index: int, collection_name: str, det_index: int) -> str:
+    return f"{int(frame_index):06d}:{collection_name}:{int(det_index):04d}"
+
+
+def _ensure_detection_identity_and_calibration(
+    frame_records: List[Dict[str, Any]],
+    policy: Optional[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    updated_records: List[Dict[str, Any]] = []
+    policy_marker = od_calibration_policy_utils.current_policy_marker(policy)
+    for frame_record in frame_records:
+        frame_index = int(frame_record.get("frame_index", -1))
+        updated_frame = od_calibration_policy_utils.apply_policy_to_frame_record(frame_record, policy)
+        for collection_name, field_name in (
+            ("accepted", "accepted_detections"),
+            ("candidate", "candidate_detections"),
+        ):
+            detections = list(updated_frame.get(field_name, []))
+            for det_index, detection in enumerate(detections):
+                detection.setdefault("detection_id", _detection_id(frame_index, collection_name, det_index))
+                detection.setdefault("raw_score", float(detection.get("score", 0.0)))
+                detection.setdefault("calibrated_score", float(detection.get("raw_score", detection.get("score", 0.0))))
+                detection.setdefault("feedback_bonus", float(detection.get("calibrated_score", 0.0)) - float(detection.get("raw_score", 0.0)))
+                detection.setdefault(
+                    "score_used_for_candidate_ranking",
+                    float(detection.get("calibrated_score", detection.get("raw_score", detection.get("score", 0.0)))),
+                )
+        updated_frame["od_calibration"] = dict(policy_marker)
+        updated_records.append(updated_frame)
+    return updated_records
+
+
 def _detection_quality_rank(quality_bucket: str) -> int:
     order = {
         "accepted_high_confidence": 0,
@@ -165,11 +262,13 @@ def _build_prediction_rows(frame_records: List[Dict[str, Any]], video_id: str = 
         frame_name = str(frame_record.get("frame", ""))
         frame_index = int(frame_record.get("frame_index", -1))
         image_path = str(frame_record.get("image_path", ""))
+        calibration_marker = dict(frame_record.get("od_calibration", {}))
         for collection_name in ("accepted_detections", "candidate_detections"):
             for detection in list(frame_record.get(collection_name, [])):
                 bbox = list(detection.get("bbox", []))
                 threshold_info = dict(detection.get("threshold_info", {}))
                 prior_metadata = dict(detection.get("prior_metadata", {}))
+                od_calibration = dict(detection.get("od_calibration", {}))
                 matched_prior_ids = [str(value) for value in list(prior_metadata.get("matched_prior_ids", [])) if str(value)]
                 quality_bucket = _quality_bucket(detection)
                 rows.append(
@@ -178,11 +277,30 @@ def _build_prediction_rows(frame_records: List[Dict[str, Any]], video_id: str = 
                         "frame": frame_name,
                         "frame_index": frame_index,
                         "image_path": image_path,
+                        "detection_id": str(detection.get("detection_id", "")),
                         "class_name": str(detection.get("class", "")),
                         "score": float(detection.get("score", 0.0)),
+                        "raw_score": float(detection.get("raw_score", detection.get("score", 0.0))),
+                        "calibrated_score": float(detection.get("calibrated_score", detection.get("score", 0.0))),
+                        "feedback_bonus": float(detection.get("feedback_bonus", 0.0)),
+                        "score_used_for_candidate_ranking": float(
+                            detection.get(
+                                "score_used_for_candidate_ranking",
+                                detection.get("calibrated_score", detection.get("score", 0.0)),
+                            )
+                        ),
                         "accepted": bool(detection.get("accepted", False)),
                         "candidate_source": str(detection.get("candidate_source", "")),
                         "quality_bucket": quality_bucket,
+                        "od_calibration_policy_id": str(
+                            od_calibration.get("policy_id", calibration_marker.get("policy_id", ""))
+                        ),
+                        "od_calibration_policy_applied": bool(
+                            od_calibration.get("policy_applied", calibration_marker.get("policy_available", False))
+                        ),
+                        "od_calibration_branch": str(
+                            od_calibration.get("calibration_branch", "candidate_exploration")
+                        ),
                         "matched_prior_ids_json": json.dumps(matched_prior_ids),
                         "top_prior_id": matched_prior_ids[0] if matched_prior_ids else "",
                         "prior_relevance_score": float(prior_metadata.get("prior_relevance_score", 0.0) or 0.0),
@@ -333,6 +451,8 @@ def render_detection_video(
     fps: float = 10.0,
 ) -> Optional[str]:
     """Render one annotated mp4 for a video using detection frame records."""
+    if cv2 is None:
+        return None
     if not frame_records:
         return None
 
@@ -400,6 +520,7 @@ def render_detection_video(
 def process_video(
     video_id: str,
     detector: ObjectDetector,
+    od_calibration_policy: Optional[Dict[str, Any]] = None,
     background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
@@ -422,6 +543,9 @@ def process_video(
             for frame in cached_frames
         )
         if cache_is_current:
+            cached_frames = _ensure_detection_identity_and_calibration(cached_frames, od_calibration_policy)
+            cached["frames"] = cached_frames
+            cached["od_calibration"] = od_calibration_policy_utils.current_policy_marker(od_calibration_policy)
             prediction_rows = _build_prediction_rows(cached_frames, video_id=video_id)
             class_summary_rows = _build_class_summary_rows(prediction_rows)
             _write_csv(
@@ -477,6 +601,7 @@ def process_video(
                 if isinstance(background_rule_relevance_prior_results, dict)
                 else "",
             },
+            "od_calibration": od_calibration_policy_utils.current_policy_marker(od_calibration_policy),
             "from_cache": False,
         }
         _write_csv(
@@ -509,9 +634,13 @@ def process_video(
             "frame_index": int(frame_path.stem.split("_")[-1]),
             **det.to_dict(),
         }
-        total_candidate_detections += int(frame_record.get("num_candidate_detections", 0))
-        total_saved_detections += int(frame_record.get("num_total_saved_detections", frame_record.get("num_detections", 0)))
         frame_records.append(frame_record)
+    frame_records = _ensure_detection_identity_and_calibration(frame_records, od_calibration_policy)
+    for frame_record in frame_records:
+        total_candidate_detections += int(frame_record.get("num_candidate_detections", 0))
+        total_saved_detections += int(
+            frame_record.get("num_total_saved_detections", frame_record.get("num_detections", 0))
+        )
 
     label_counts = dict(Counter(all_labels).most_common())
     prediction_rows = _build_prediction_rows(frame_records, video_id=video_id)
@@ -536,6 +665,7 @@ def process_video(
             if isinstance(background_rule_relevance_prior_results, dict)
             else "",
         },
+        "od_calibration": od_calibration_policy_utils.current_policy_marker(od_calibration_policy),
         "from_cache": False,
     }
 
@@ -582,6 +712,7 @@ def run(
     predict_batch_size: Optional[int] = None,
     inference_imgsz: int = 640,
     use_half_precision: Optional[bool] = None,
+    od_calibration_policy: Optional[Dict[str, Any]] = None,
     background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
     frames_root: Optional[Path] = None,
     output_root: Optional[Path] = None,
@@ -590,6 +721,14 @@ def run(
 ) -> List[Dict[str, Any]]:
     effective_frames_root = frames_root or get_frames_root()
     effective_output_root = output_root or get_output_root()
+    effective_render_video = bool(render_video)
+    if effective_render_video and cv2 is None:
+        print(
+            "[warn] OpenCV (`cv2`) is not available; detection rendering will be skipped for this run. "
+            f"Import error: {_format_dependency_error(_CV2_IMPORT_ERROR)}"
+        )
+        effective_render_video = False
+    ensure_detector_runtime_available(render_video=effective_render_video)
 
     all_videos = list_video_ids(effective_frames_root)
     target_videos = list(video_ids) if video_ids else all_videos
@@ -599,6 +738,11 @@ def run(
         raise ValueError(f"Unknown video IDs: {sorted(unknown)}. Available: {all_videos}")
 
     effective_classes = list(classes) if classes else list(YOLO_WORLD_DEFAULT_CLASSES)
+    resolved_calibration_policy = (
+        dict(od_calibration_policy)
+        if isinstance(od_calibration_policy, dict)
+        else od_calibration_policy_utils.load_active_od_calibration_policy()
+    )
 
     detector = YOLOWorldDetector(
         model_name=model_name,
@@ -619,12 +763,17 @@ def run(
 
     print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
     print(f"Model: {model_name} | classes: {len(effective_classes)}")
+    print(f"Render video: {effective_render_video}")
     print(
         "Detection cfg: "
         f"accept_conf={confidence_threshold:.3f}, "
         f"candidate_conf={candidate_confidence_threshold:.3f}, "
         f"accept_iou={nms_iou_threshold:.3f}, "
         f"candidate_iou={candidate_nms_iou_threshold:.3f}"
+    )
+    print(
+        "OD calibration policy: "
+        f"{od_calibration_policy_utils.policy_id(resolved_calibration_policy) or 'none'}"
     )
 
     detector.warmup()
@@ -644,11 +793,12 @@ def run(
             result = process_video(
                 video_id=video_id,
                 detector=detector,
+                od_calibration_policy=resolved_calibration_policy,
                 background_rule_relevance_prior_results=background_rule_relevance_prior_results,
                 frames_root=effective_frames_root,
                 output_root=effective_output_root,
                 force_recompute=force_recompute,
-                render_video=render_video,
+                render_video=effective_render_video,
             )
             video_results.append(result)
             cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
@@ -690,6 +840,7 @@ def run(
             if isinstance(background_rule_relevance_prior_results, dict)
             else "",
         },
+        "od_calibration": od_calibration_policy_utils.current_policy_marker(resolved_calibration_policy),
         "videos": [
             {
                 "video_id": r["video_id"],
