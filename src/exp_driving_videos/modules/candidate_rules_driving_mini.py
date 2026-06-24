@@ -34,7 +34,13 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 6
+_INITIAL_RULES_VERSION = 7
+_SINGLETON_PROVENANCE_ONLY_PREDICATES = {
+    "object_is_candidate",
+    "object_source_type",
+    "object_candidate_score_state",
+    "object_matched_prior",
+}
 
 
 def get_output_root() -> Path:
@@ -136,6 +142,8 @@ def _make_evidence_entry(
     example: Dict[str, Any],
     body_atom_template: str,
     concrete_atom: str,
+    body_atom_source: str,
+    matched_prior_ids: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     bindings = _extract_bindings(body_atom_template, concrete_atom)
     if bindings is None:
@@ -150,6 +158,8 @@ def _make_evidence_entry(
         "label": bool(example.get("label", False)),
         "body_atom_template": body_atom_template,
         "matched_atom": str(concrete_atom),
+        "body_atom_source": str(body_atom_source),
+        "matched_prior_ids": sorted({str(value) for value in list(matched_prior_ids or []) if str(value)}),
         "bindings": bindings,
     }
 
@@ -204,6 +214,53 @@ def _summarize_evidence(
         "confidence": confidence,
         "positive_example_ids": positive_example_ids,
         "negative_example_ids": negative_example_ids,
+    }
+
+
+def _summarize_rule_candidate_provenance(
+    *,
+    evidence_entries: List[Dict[str, Any]],
+    body_length: int,
+) -> Dict[str, Any]:
+    candidate_entries = [
+        entry for entry in evidence_entries
+        if str(entry.get("body_atom_source", "")) == "candidate"
+    ]
+    accepted_entries = [
+        entry for entry in evidence_entries
+        if str(entry.get("body_atom_source", "")) == "accepted"
+    ]
+    uses_candidate_atoms = bool(candidate_entries)
+    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_entries
+    mixes_accepted_and_candidate_atoms = bool(candidate_entries) and bool(accepted_entries)
+    num_candidate_body_atoms = 1 if uses_candidate_atoms else 0
+    matched_prior_ids_involved = sorted(
+        {
+            str(prior_id)
+            for entry in candidate_entries
+            for prior_id in list(entry.get("matched_prior_ids", []))
+            if str(prior_id)
+        }
+    )
+    if mixes_accepted_and_candidate_atoms:
+        body_source_mix = "mixed_accepted_and_candidate"
+    elif uses_only_candidate_atoms:
+        body_source_mix = "candidate_only"
+    elif accepted_entries:
+        body_source_mix = "accepted_only"
+    else:
+        body_source_mix = "non_object_or_segment_only"
+
+    return {
+        "uses_candidate_atoms": uses_candidate_atoms,
+        "num_candidate_body_atoms": num_candidate_body_atoms,
+        "candidate_body_atom_ratio": float(num_candidate_body_atoms / max(1, int(body_length))),
+        "matched_prior_ids_involved": matched_prior_ids_involved,
+        "mixes_accepted_and_candidate_atoms": mixes_accepted_and_candidate_atoms,
+        "uses_only_candidate_atoms": uses_only_candidate_atoms,
+        "body_source_mix": body_source_mix,
+        "candidate_evidence_firings": len(candidate_entries),
+        "accepted_evidence_firings": len(accepted_entries),
     }
 
 
@@ -275,6 +332,20 @@ def process_video(
         is_positive = bool(example.get("label", False))
         example_id = str(example.get("example_id", ""))
         body_atoms = list(example.get("body_atoms", []))
+        accepted_body_atoms = {str(atom) for atom in list(example.get("accepted_body_atoms", []))}
+        candidate_body_atoms = {str(atom) for atom in list(example.get("candidate_body_atoms", []))}
+        matched_prior_ids_by_candidate_object: Dict[str, List[str]] = defaultdict(list)
+        for candidate_atom in candidate_body_atoms:
+            parsed_candidate_atom = _parse_atom(candidate_atom)
+            if parsed_candidate_atom is None:
+                continue
+            candidate_predicate, candidate_args = parsed_candidate_atom
+            if candidate_predicate != "object_matched_prior" or len(candidate_args) < 2:
+                continue
+            object_id = str(candidate_args[0])
+            prior_id = str(candidate_args[1])
+            if prior_id and prior_id not in matched_prior_ids_by_candidate_object[object_id]:
+                matched_prior_ids_by_candidate_object[object_id].append(prior_id)
         seen_templates: set[str] = set()
         for body_atom in body_atoms:
             parsed_body_atom = _parse_atom(str(body_atom))
@@ -283,15 +354,28 @@ def process_video(
             body_predicate, _ = parsed_body_atom
             if body_predicate in ignored_body_predicates:
                 continue
+            if body_predicate in _SINGLETON_PROVENANCE_ONLY_PREDICATES:
+                continue
             body_template = _abstract_atom(str(body_atom))
             if not body_template or body_template in seen_templates:
                 continue
             seen_templates.add(body_template)
+            body_atom_source = (
+                "candidate"
+                if str(body_atom) in candidate_body_atoms
+                else ("accepted" if str(body_atom) in accepted_body_atoms else "segment_or_other")
+            )
+            matched_prior_ids: List[str] = []
+            bindings = _extract_bindings(body_template, str(body_atom))
+            if body_atom_source == "candidate" and isinstance(bindings, dict):
+                matched_prior_ids = list(matched_prior_ids_by_candidate_object.get(str(bindings.get("O", "")), []))
             evidence_entry = _make_evidence_entry(
                 video_id=video_id,
                 example=example,
                 body_atom_template=body_template,
                 concrete_atom=str(body_atom),
+                body_atom_source=body_atom_source,
+                matched_prior_ids=matched_prior_ids,
             )
             if evidence_entry is not None:
                 stats[body_template]["evidence_set"].append(evidence_entry)
@@ -300,12 +384,19 @@ def process_video(
             candidate_body_templates.update(seen_templates)
 
     initial_rules: List[Dict[str, Any]] = []
+    num_rules_using_candidate_atoms = 0
+    num_candidate_only_rules = 0
+    num_mixed_source_rules = 0
     for idx, body_template in enumerate(sorted(stats.keys())):
         if body_template not in candidate_body_templates:
             continue
 
         evidence_set = _dedupe_evidence_entries(list(stats[body_template].get("evidence_set", [])))
         evidence_summary = _summarize_evidence(evidence_set)
+        provenance_summary = _summarize_rule_candidate_provenance(
+            evidence_entries=evidence_set,
+            body_length=1,
+        )
         positive_support = int(evidence_summary["positive_support"])
         negative_support = int(evidence_summary["negative_support"])
         total_support = int(evidence_summary["total_support"])
@@ -314,6 +405,12 @@ def process_video(
 
         confidence = float(evidence_summary["confidence"])
         clause = _build_clause(target_predicate, body_template)
+        if bool(provenance_summary["uses_candidate_atoms"]):
+            num_rules_using_candidate_atoms += 1
+        if bool(provenance_summary["uses_only_candidate_atoms"]):
+            num_candidate_only_rules += 1
+        if bool(provenance_summary["mixes_accepted_and_candidate_atoms"]):
+            num_mixed_source_rules += 1
         initial_rules.append(
             {
                 "rule_index": len(initial_rules),
@@ -321,6 +418,7 @@ def process_video(
                 "head_predicate": target_predicate,
                 "head_atom_template": f"{target_predicate}(S).",
                 "body_atom_template": body_template,
+                "body_length": 1,
                 "clause": clause,
                 "positive_support": positive_support,
                 "negative_support": negative_support,
@@ -335,6 +433,7 @@ def process_video(
                 "negative_example_ids": (
                     evidence_summary["negative_example_ids"] if include_example_ids else []
                 ),
+                **provenance_summary,
                 "evidence_set": evidence_set,
             }
         )
@@ -347,6 +446,9 @@ def process_video(
         "num_examples": len(examples),
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
+        "num_rules_using_candidate_atoms": num_rules_using_candidate_atoms,
+        "num_candidate_only_rules": num_candidate_only_rules,
+        "num_mixed_source_rules": num_mixed_source_rules,
         "config": {
             "target_predicate": target_predicate,
             "negative_target_predicate": negative_target_predicate,
@@ -370,6 +472,7 @@ def process_video(
                 "head_predicate",
                 "head_atom_template",
                 "body_atom_template",
+                "body_length",
                 "clause",
                 "positive_support",
                 "negative_support",
@@ -378,6 +481,13 @@ def process_video(
                 "negative_firings",
                 "total_firings",
                 "confidence",
+                "uses_candidate_atoms",
+                "num_candidate_body_atoms",
+                "candidate_body_atom_ratio",
+                "matched_prior_ids_involved",
+                "mixes_accepted_and_candidate_atoms",
+                "uses_only_candidate_atoms",
+                "body_source_mix",
                 "positive_example_ids",
                 "negative_example_ids",
             ],
@@ -391,6 +501,7 @@ def process_video(
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_length": rule.get("body_length", 1),
                     "clause": rule.get("clause", ""),
                     "positive_support": rule.get("positive_support", 0),
                     "negative_support": rule.get("negative_support", 0),
@@ -399,6 +510,13 @@ def process_video(
                     "negative_firings": rule.get("negative_firings", 0),
                     "total_firings": rule.get("total_firings", 0),
                     "confidence": rule.get("confidence", 0.0),
+                    "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
+                    "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
+                    "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
+                    "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+                    "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
+                    "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
+                    "body_source_mix": rule.get("body_source_mix", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                 }
@@ -427,6 +545,7 @@ def run(
         results.append(result)
 
     manifest = {
+        "version": _INITIAL_RULES_VERSION,
         "num_videos": len(results),
         "videos": [
             {
@@ -436,6 +555,9 @@ def run(
                 "num_examples": r.get("num_examples", 0),
                 "num_positive_examples": r.get("num_positive_examples", 0),
                 "num_negative_examples": r.get("num_negative_examples", 0),
+                "num_rules_using_candidate_atoms": r.get("num_rules_using_candidate_atoms", 0),
+                "num_candidate_only_rules": r.get("num_candidate_only_rules", 0),
+                "num_mixed_source_rules": r.get("num_mixed_source_rules", 0),
             }
             for r in results
         ],

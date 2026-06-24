@@ -9,6 +9,8 @@ from typing import Any, Dict, List
 import config
 from src.exp_driving_videos import pipeline_config
 
+_MERGED_INITIAL_RULES_VERSION = 2
+
 
 def dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
@@ -60,6 +62,52 @@ def summarize_rule_evidence(evidence_entries: List[Dict[str, Any]]) -> Dict[str,
     }
 
 
+def summarize_rule_candidate_provenance(
+    evidence_entries: List[Dict[str, Any]],
+    body_length: int,
+) -> Dict[str, Any]:
+    candidate_entries = [
+        entry for entry in evidence_entries
+        if str(entry.get("body_atom_source", "")) == "candidate"
+    ]
+    accepted_entries = [
+        entry for entry in evidence_entries
+        if str(entry.get("body_atom_source", "")) == "accepted"
+    ]
+    uses_candidate_atoms = bool(candidate_entries)
+    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_entries
+    mixes_accepted_and_candidate_atoms = bool(candidate_entries) and bool(accepted_entries)
+    num_candidate_body_atoms = 1 if uses_candidate_atoms else 0
+    matched_prior_ids_involved = sorted(
+        {
+            str(prior_id)
+            for entry in candidate_entries
+            for prior_id in list(entry.get("matched_prior_ids", []))
+            if str(prior_id)
+        }
+    )
+    if mixes_accepted_and_candidate_atoms:
+        body_source_mix = "mixed_accepted_and_candidate"
+    elif uses_only_candidate_atoms:
+        body_source_mix = "candidate_only"
+    elif accepted_entries:
+        body_source_mix = "accepted_only"
+    else:
+        body_source_mix = "non_object_or_segment_only"
+
+    return {
+        "uses_candidate_atoms": uses_candidate_atoms,
+        "num_candidate_body_atoms": num_candidate_body_atoms,
+        "candidate_body_atom_ratio": float(num_candidate_body_atoms / max(1, int(body_length))),
+        "matched_prior_ids_involved": matched_prior_ids_involved,
+        "mixes_accepted_and_candidate_atoms": mixes_accepted_and_candidate_atoms,
+        "uses_only_candidate_atoms": uses_only_candidate_atoms,
+        "body_source_mix": body_source_mix,
+        "candidate_evidence_firings": len(candidate_entries),
+        "accepted_evidence_firings": len(accepted_entries),
+    }
+
+
 def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     out_root = pipeline_config.get_merged_candidate_rules_output_root()
     json_path = out_root / "merged_initial_rules.json"
@@ -72,6 +120,9 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
     total_examples = 0
     total_positive_examples = 0
     total_negative_examples = 0
+    total_rules_using_candidate_atoms = 0
+    total_candidate_only_rules = 0
+    total_mixed_source_rules = 0
 
     for video_result in sorted(candidate_rule_results, key=lambda item: str(item.get("video_id", ""))):
         video_id = str(video_result.get("video_id", "unknown"))
@@ -91,8 +142,14 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "num_examples": int(video_result.get("num_examples", 0)),
                 "num_positive_examples": int(video_result.get("num_positive_examples", 0)),
                 "num_negative_examples": int(video_result.get("num_negative_examples", 0)),
+                "num_rules_using_candidate_atoms": int(video_result.get("num_rules_using_candidate_atoms", 0)),
+                "num_candidate_only_rules": int(video_result.get("num_candidate_only_rules", 0)),
+                "num_mixed_source_rules": int(video_result.get("num_mixed_source_rules", 0)),
             }
         )
+        total_rules_using_candidate_atoms += int(video_result.get("num_rules_using_candidate_atoms", 0))
+        total_candidate_only_rules += int(video_result.get("num_candidate_only_rules", 0))
+        total_mixed_source_rules += int(video_result.get("num_mixed_source_rules", 0))
 
         for rule in candidate_rules:
             clause = str(rule.get("clause", "")).strip()
@@ -107,6 +164,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_length": int(rule.get("body_length", 1)),
                     "clause": clause,
                     "positive_support": 0,
                     "negative_support": 0,
@@ -136,6 +194,10 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         merged_rule["merged_rule_index"] = idx
         merged_rule["evidence_set"] = dedupe_rule_evidence_entries(list(merged_rule.get("evidence_set", [])))
         evidence_summary = summarize_rule_evidence(list(merged_rule.get("evidence_set", [])))
+        provenance_summary = summarize_rule_candidate_provenance(
+            list(merged_rule.get("evidence_set", [])),
+            int(merged_rule.get("body_length", 1)),
+        )
         merged_rule["positive_support"] = int(evidence_summary["positive_support"])
         merged_rule["negative_support"] = int(evidence_summary["negative_support"])
         merged_rule["total_support"] = int(evidence_summary["total_support"])
@@ -145,6 +207,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         merged_rule["confidence"] = float(evidence_summary["confidence"])
         merged_rule["positive_example_ids"] = list(evidence_summary["positive_example_ids"])
         merged_rule["negative_example_ids"] = list(evidence_summary["negative_example_ids"])
+        merged_rule.update(provenance_summary)
         merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
         merged_rule["source_rule_ids"] = sorted(
             set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
@@ -154,21 +217,38 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         ]
 
     merged_result: Dict[str, Any] = {
+        "version": _MERGED_INITIAL_RULES_VERSION,
         "num_videos": len(candidate_rule_results),
         "num_examples": total_examples,
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
+        "num_rules_using_candidate_atoms": sum(
+            1 for rule in merged_rules if bool(rule.get("uses_candidate_atoms", False))
+        ),
+        "num_candidate_only_rules": sum(
+            1 for rule in merged_rules if bool(rule.get("uses_only_candidate_atoms", False))
+        ),
+        "num_mixed_source_rules": sum(
+            1 for rule in merged_rules if bool(rule.get("mixes_accepted_and_candidate_atoms", False))
+        ),
         "target_predicates": sorted(target_predicates),
         "rules": merged_rules,
     }
 
     manifest: Dict[str, Any] = {
+        "version": _MERGED_INITIAL_RULES_VERSION,
         "num_videos": len(candidate_rule_results),
         "num_examples": total_examples,
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
+        "input_num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
+        "input_num_candidate_only_rules": total_candidate_only_rules,
+        "input_num_mixed_source_rules": total_mixed_source_rules,
+        "num_rules_using_candidate_atoms": merged_result["num_rules_using_candidate_atoms"],
+        "num_candidate_only_rules": merged_result["num_candidate_only_rules"],
+        "num_mixed_source_rules": merged_result["num_mixed_source_rules"],
         "target_predicates": sorted(target_predicates),
         "videos": video_summaries,
         "json_path": str(json_path),
@@ -187,6 +267,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "head_predicate",
                 "head_atom_template",
                 "body_atom_template",
+                "body_length",
                 "clause",
                 "positive_support",
                 "negative_support",
@@ -195,6 +276,13 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "negative_firings",
                 "total_firings",
                 "confidence",
+                "uses_candidate_atoms",
+                "num_candidate_body_atoms",
+                "candidate_body_atom_ratio",
+                "matched_prior_ids_involved",
+                "mixes_accepted_and_candidate_atoms",
+                "uses_only_candidate_atoms",
+                "body_source_mix",
                 "positive_example_ids",
                 "negative_example_ids",
                 "source_video_ids",
@@ -212,6 +300,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_length": rule.get("body_length", 1),
                     "clause": rule.get("clause", ""),
                     "positive_support": rule.get("positive_support", 0),
                     "negative_support": rule.get("negative_support", 0),
@@ -220,6 +309,13 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "negative_firings": rule.get("negative_firings", 0),
                     "total_firings": rule.get("total_firings", 0),
                     "confidence": rule.get("confidence", 0.0),
+                    "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
+                    "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
+                    "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
+                    "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+                    "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
+                    "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
+                    "body_source_mix": rule.get("body_source_mix", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                     "source_video_ids": json.dumps(rule.get("source_video_ids", [])),
