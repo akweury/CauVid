@@ -39,6 +39,7 @@ _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
     "object_candidate_score_state",
+    "object_prior_relevance_state",
     "object_matched_prior",
 }
 

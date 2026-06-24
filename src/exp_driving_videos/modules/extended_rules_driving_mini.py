@@ -37,7 +37,31 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 2
+_EXTENDED_RULES_VERSION = 3
+_PROVENANCE_ONLY_BODY_PREDICATES = {
+    "object_is_candidate",
+    "object_source_type",
+    "object_candidate_score_state",
+    "object_prior_relevance_state",
+    "object_matched_prior",
+}
+_SEMANTIC_OBJECT_BODY_PREDICATES = {
+    "object_class",
+    "object_distance_state",
+    "object_x_position_state",
+    "object_vz_state",
+    "object_vx_state",
+    "object_speed_state",
+    "object_visibility_state",
+    "traffic_control_type",
+    "traffic_control_relevance_state",
+    "traffic_control_front_center_region",
+    "traffic_control_relevant",
+    "traffic_light_relevant",
+    "stop_sign_relevant",
+    "traffic_light_position_state",
+    "traffic_light_state",
+}
 
 
 def get_output_root() -> Path:
@@ -74,6 +98,13 @@ def _strip_trailing_dot(atom_text: str) -> str:
 def _normalize_atom_template(atom_text: str) -> str:
     normalized = _strip_trailing_dot(atom_text)
     return f"{normalized}." if normalized else ""
+
+
+def _predicate_of_atom_template(atom_text: str) -> str:
+    text = _strip_trailing_dot(atom_text)
+    if "(" not in text:
+        return text
+    return text.split("(", 1)[0].strip()
 
 
 def _canonical_body_atoms(body_atoms: Iterable[str]) -> Tuple[str, ...]:
@@ -179,6 +210,8 @@ def _intersect_evidence_sets(
         for parent_entry in parent_entries:
             parent_bindings = dict(parent_entry.get("bindings", {}))
             parent_matched_atoms = dict(parent_entry.get("matched_atoms", {}))
+            parent_matched_atom_sources = dict(parent_entry.get("matched_atom_sources", {}))
+            parent_matched_atom_prior_ids = dict(parent_entry.get("matched_atom_prior_ids", {}))
             for added_entry in added_entries:
                 added_bindings = dict(added_entry.get("bindings", {}))
                 if not _bindings_compatible(parent_bindings, added_bindings):
@@ -187,6 +220,14 @@ def _intersect_evidence_sets(
                 matched_atoms = _merge_matched_atoms(
                     parent_matched_atoms,
                     dict(added_entry.get("matched_atoms", {})),
+                )
+                matched_atom_sources = _merge_matched_atom_sources(
+                    parent_matched_atom_sources,
+                    dict(added_entry.get("matched_atom_sources", {})),
+                )
+                matched_atom_prior_ids = _merge_matched_atom_prior_ids(
+                    parent_matched_atom_prior_ids,
+                    dict(added_entry.get("matched_atom_prior_ids", {})),
                 )
                 intersected.append(
                     {
@@ -204,10 +245,40 @@ def _intersect_evidence_sets(
                         "label": bool(parent_entry.get("label", added_entry.get("label", False))),
                         "bindings": _merge_bindings(parent_bindings, added_bindings),
                         "matched_atoms": matched_atoms,
+                        "matched_atom_sources": matched_atom_sources,
+                        "matched_atom_prior_ids": matched_atom_prior_ids,
                     }
                 )
 
     return _dedupe_evidence_entries(intersected)
+
+
+def _merge_matched_atom_sources(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> Dict[str, str]:
+    merged = {str(key): str(value) for key, value in left.items()}
+    for key, value in right.items():
+        merged[str(key)] = str(value)
+    return merged
+
+
+def _merge_matched_atom_prior_ids(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> Dict[str, List[str]]:
+    merged: Dict[str, List[str]] = {
+        str(key): [str(item) for item in list(value)]
+        for key, value in left.items()
+    }
+    for key, value in right.items():
+        merged_key = str(key)
+        existing = merged.setdefault(merged_key, [])
+        for item in list(value):
+            item_text = str(item)
+            if item_text and item_text not in existing:
+                existing.append(item_text)
+    return merged
 
 
 def _summarize_evidence(
@@ -247,11 +318,73 @@ def _summarize_evidence(
     }
 
 
+def _is_body_semantically_grounded(body_atom_templates: Sequence[str]) -> bool:
+    provenance_only_count = 0
+    semantic_count = 0
+    for body_atom_template in body_atom_templates:
+        predicate = _predicate_of_atom_template(body_atom_template)
+        if predicate in _PROVENANCE_ONLY_BODY_PREDICATES:
+            provenance_only_count += 1
+        if predicate in _SEMANTIC_OBJECT_BODY_PREDICATES:
+            semantic_count += 1
+    if provenance_only_count == 0:
+        return True
+    return semantic_count >= 1 and semantic_count >= provenance_only_count
+
+
+def _summarize_rule_candidate_provenance(
+    body_atom_templates: Sequence[str],
+    evidence_entries: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    candidate_body_templates: set[str] = set()
+    accepted_body_templates: set[str] = set()
+    matched_prior_ids_involved: set[str] = set()
+    for entry in evidence_entries:
+        matched_atom_sources = dict(entry.get("matched_atom_sources", {}))
+        matched_atom_prior_ids = dict(entry.get("matched_atom_prior_ids", {}))
+        for body_atom_template in body_atom_templates:
+            source = str(matched_atom_sources.get(body_atom_template, ""))
+            if source == "candidate":
+                candidate_body_templates.add(str(body_atom_template))
+                for prior_id in list(matched_atom_prior_ids.get(body_atom_template, [])):
+                    prior_id_text = str(prior_id)
+                    if prior_id_text:
+                        matched_prior_ids_involved.add(prior_id_text)
+            elif source == "accepted":
+                accepted_body_templates.add(str(body_atom_template))
+
+    uses_candidate_atoms = bool(candidate_body_templates)
+    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_body_templates
+    mixes_accepted_and_candidate_atoms = bool(candidate_body_templates) and bool(accepted_body_templates)
+    num_candidate_body_atoms = len(candidate_body_templates)
+    body_length = max(1, len(list(body_atom_templates)))
+    if mixes_accepted_and_candidate_atoms:
+        body_source_mix = "mixed_accepted_and_candidate"
+    elif uses_only_candidate_atoms:
+        body_source_mix = "candidate_only"
+    elif accepted_body_templates:
+        body_source_mix = "accepted_only"
+    else:
+        body_source_mix = "non_object_or_segment_only"
+
+    return {
+        "uses_candidate_atoms": uses_candidate_atoms,
+        "num_candidate_body_atoms": num_candidate_body_atoms,
+        "candidate_body_atom_ratio": float(num_candidate_body_atoms / float(body_length)),
+        "matched_prior_ids_involved": sorted(matched_prior_ids_involved),
+        "mixes_accepted_and_candidate_atoms": mixes_accepted_and_candidate_atoms,
+        "uses_only_candidate_atoms": uses_only_candidate_atoms,
+        "body_source_mix": body_source_mix,
+    }
+
+
 def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
     seeded: List[Dict[str, Any]] = []
     for entry in list(rule.get("evidence_set", [])):
         body_atom_template = str(entry.get("body_atom_template", rule.get("body_atom_template", ""))).strip()
         matched_atom = str(entry.get("matched_atom", "")).strip()
+        body_atom_source = str(entry.get("body_atom_source", "")).strip()
+        matched_prior_ids = [str(value) for value in list(entry.get("matched_prior_ids", [])) if str(value)]
         seeded.append(
             {
                 "video_id": str(entry.get("video_id", "")),
@@ -262,6 +395,16 @@ def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "label": bool(entry.get("label", False)),
                 "bindings": {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()},
                 "matched_atoms": {body_atom_template: matched_atom} if body_atom_template and matched_atom else {},
+                "matched_atom_sources": (
+                    {body_atom_template: body_atom_source}
+                    if body_atom_template and matched_atom and body_atom_source
+                    else {}
+                ),
+                "matched_atom_prior_ids": (
+                    {body_atom_template: matched_prior_ids}
+                    if body_atom_template and matched_atom and matched_prior_ids
+                    else {}
+                ),
             }
         )
     return _dedupe_evidence_entries(seeded)
@@ -278,6 +421,7 @@ def _serialize_rule(
     source_initial_rule_id: str,
     evidence_set: Sequence[Dict[str, Any]],
     evidence_summary: Dict[str, Any],
+    provenance_summary: Dict[str, Any],
     parent_confidence: float,
     parent_positive_support: int,
     prune_reason: str,
@@ -309,6 +453,15 @@ def _serialize_rule(
         "recall": float(evidence_summary.get("recall", 0.0)),
         "positive_example_ids": list(evidence_summary.get("positive_example_ids", [])),
         "negative_example_ids": list(evidence_summary.get("negative_example_ids", [])),
+        "uses_candidate_atoms": bool(provenance_summary.get("uses_candidate_atoms", False)),
+        "num_candidate_body_atoms": int(provenance_summary.get("num_candidate_body_atoms", 0)),
+        "candidate_body_atom_ratio": float(provenance_summary.get("candidate_body_atom_ratio", 0.0)),
+        "matched_prior_ids_involved": list(provenance_summary.get("matched_prior_ids_involved", [])),
+        "mixes_accepted_and_candidate_atoms": bool(
+            provenance_summary.get("mixes_accepted_and_candidate_atoms", False)
+        ),
+        "uses_only_candidate_atoms": bool(provenance_summary.get("uses_only_candidate_atoms", False)),
+        "body_source_mix": str(provenance_summary.get("body_source_mix", "")),
         "parent_confidence": float(parent_confidence),
         "parent_positive_support": int(parent_positive_support),
         "confidence_improvement": float(evidence_summary.get("confidence", 0.0)) - float(parent_confidence),
@@ -356,6 +509,13 @@ def _write_round_outputs(
                 "total_firings",
                 "confidence",
                 "recall",
+                "uses_candidate_atoms",
+                "num_candidate_body_atoms",
+                "candidate_body_atom_ratio",
+                "matched_prior_ids_involved",
+                "mixes_accepted_and_candidate_atoms",
+                "uses_only_candidate_atoms",
+                "body_source_mix",
                 "parent_confidence",
                 "confidence_improvement",
                 "evaluation_status",
@@ -388,6 +548,13 @@ def _write_round_outputs(
                     "total_firings": rule.get("total_firings", 0),
                     "confidence": rule.get("confidence", 0.0),
                     "recall": rule.get("recall", 0.0),
+                    "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
+                    "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
+                    "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
+                    "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+                    "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
+                    "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
+                    "body_source_mix": rule.get("body_source_mix", ""),
                     "parent_confidence": rule.get("parent_confidence", 0.0),
                     "confidence_improvement": rule.get("confidence_improvement", 0.0),
                     "evaluation_status": rule.get("evaluation_status", ""),
@@ -494,6 +661,9 @@ def process_rules(
 
     round_summaries: List[Dict[str, Any]] = []
     rounds: List[Dict[str, Any]] = []
+    total_rules_using_candidate_atoms = 0
+    total_candidate_only_rules = 0
+    total_mixed_source_rules = 0
 
     for round_index in range(1, num_rounds + 1):
         next_rule_map: Dict[Tuple[str, str, Tuple[str, ...]], Dict[str, Any]] = {}
@@ -504,7 +674,11 @@ def process_rules(
         num_pruned_no_positive = 0
         num_pruned_same_firings_as_parent = 0
         num_pruned_same_confidence_smaller_evidence = 0
+        num_pruned_provenance_dominance = 0
         num_parent_rules_skipped = 0
+        round_rules_using_candidate_atoms = 0
+        round_candidate_only_rules = 0
+        round_mixed_source_rules = 0
         for parent_rule in current_rules:
             head_predicate = str(parent_rule.get("head_predicate", ""))
             head_atom_template = str(parent_rule.get("head_atom_template", f"{head_predicate}(S)."))
@@ -522,6 +696,10 @@ def process_rules(
                     continue
 
                 new_body_atoms = _canonical_body_atoms(parent_body_atoms + (initial_body_atom_template,))
+                if not _is_body_semantically_grounded(new_body_atoms):
+                    num_pruned += 1
+                    num_pruned_provenance_dominance += 1
+                    continue
                 key = (head_predicate, head_atom_template, new_body_atoms)
                 if key in next_rule_map:
                     continue
@@ -530,6 +708,10 @@ def process_rules(
                 intersected_evidence = _intersect_evidence_sets(parent_evidence_set, initial_evidence_set)
 
                 evidence_summary = _summarize_evidence(intersected_evidence, total_positive_examples)
+                provenance_summary = _summarize_rule_candidate_provenance(
+                    body_atom_templates=new_body_atoms,
+                    evidence_entries=intersected_evidence,
+                )
                 evidence_summary["parent_confidence"] = parent_confidence
                 evidence_summary["parent_positive_firings"] = parent_positive_firings
                 evidence_summary["parent_negative_firings"] = parent_negative_firings
@@ -576,6 +758,7 @@ def process_rules(
                     source_initial_rule_id=source_initial_rule_id,
                     evidence_set=intersected_evidence,
                     evidence_summary=evidence_summary,
+                    provenance_summary=provenance_summary,
                     parent_confidence=parent_confidence,
                     parent_positive_support=parent_positive_support,
                     prune_reason=str(prune_decision.get("prune_reason", "")),
@@ -593,6 +776,16 @@ def process_rules(
         for rule_index, rule in enumerate(round_rules):
             rule["rule_index"] = rule_index
             rule["rule_id"] = f"extended_round_{round_index}_rule_{rule_index:06d}"
+            if bool(rule.get("uses_candidate_atoms", False)):
+                round_rules_using_candidate_atoms += 1
+            if bool(rule.get("uses_only_candidate_atoms", False)):
+                round_candidate_only_rules += 1
+            if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
+                round_mixed_source_rules += 1
+
+        total_rules_using_candidate_atoms += round_rules_using_candidate_atoms
+        total_candidate_only_rules += round_candidate_only_rules
+        total_mixed_source_rules += round_mixed_source_rules
 
         round_payload: Dict[str, Any] = {
             "version": _EXTENDED_RULES_VERSION,
@@ -620,7 +813,13 @@ def process_rules(
                 "pruned_no_positive_firings": num_pruned_no_positive,
                 "pruned_same_firings_as_parent": num_pruned_same_firings_as_parent,
                 "pruned_same_confidence_smaller_evidence": num_pruned_same_confidence_smaller_evidence,
+                "pruned_provenance_dominance": num_pruned_provenance_dominance,
                 "kept_num_rules": len(round_rules),
+            },
+            "candidate_rule_provenance": {
+                "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
+                "num_candidate_only_rules": round_candidate_only_rules,
+                "num_mixed_source_rules": round_mixed_source_rules,
             },
             "rules": round_rules,
         }
@@ -642,6 +841,10 @@ def process_rules(
                 "pruned_no_positive_firings": num_pruned_no_positive,
                 "pruned_same_firings_as_parent": num_pruned_same_firings_as_parent,
                 "pruned_same_confidence_smaller_evidence": num_pruned_same_confidence_smaller_evidence,
+                "pruned_provenance_dominance": num_pruned_provenance_dominance,
+                "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
+                "num_candidate_only_rules": round_candidate_only_rules,
+                "num_mixed_source_rules": round_mixed_source_rules,
             }
         )
         rounds.append(round_payload)
@@ -663,7 +866,8 @@ def process_rules(
             f"no_positive={num_pruned_no_positive} | "
             f"same_firings_as_parent={num_pruned_same_firings_as_parent} | "
             "same_confidence_smaller_evidence="
-            f"{num_pruned_same_confidence_smaller_evidence}"
+            f"{num_pruned_same_confidence_smaller_evidence} | "
+            f"provenance_dominance={num_pruned_provenance_dominance}"
         )
 
         if not current_rules:
@@ -683,8 +887,14 @@ def process_rules(
         "input_num_negative_examples": int(merged_initial_rules.get("num_negative_examples", 0)),
         "input_num_initial_rules": len(initial_rules),
         "input_num_unique_initial_body_atoms": len(initial_rule_atoms),
+        "input_num_rules_using_candidate_atoms": int(merged_initial_rules.get("num_rules_using_candidate_atoms", 0)),
+        "input_num_candidate_only_rules": int(merged_initial_rules.get("num_candidate_only_rules", 0)),
+        "input_num_mixed_source_rules": int(merged_initial_rules.get("num_mixed_source_rules", 0)),
         "num_rounds_completed": len(rounds),
         "num_all_kept_rules": len(initial_rules) + sum(len(r.get("rules", [])) for r in rounds),
+        "num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
+        "num_candidate_only_rules": total_candidate_only_rules,
+        "num_mixed_source_rules": total_mixed_source_rules,
         "all_kept_rules": _build_all_kept_rules(initial_rules, rounds),
         "round_summaries": round_summaries,
         "rounds": rounds,
