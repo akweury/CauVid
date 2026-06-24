@@ -62,6 +62,10 @@ Steps:
                     current selectors missed oracle rules.
     18. evaluate_rules_driving_mini — evaluate the learned final rules on the
                     held-out evaluation split.
+    18A. candidate_contribution_summary_driving_mini — summarize whether
+                    candidate-derived atoms improve held-out brake_next
+                    prediction or mainly add noise using Step 17/18 outputs
+                    only, without recomputing rule evaluation.
     18B. neural_symbolic_baseline_driving_mini — train single-segment and
                     short-history symbolic neural baselines on the same
                     train/eval split and compare held-out classification
@@ -137,6 +141,7 @@ from src.exp_driving_videos import pipeline_config as driving_pipeline_config
 from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
+from src.exp_driving_videos.modules import candidate_contribution_summary_driving_mini
 from src.exp_driving_videos.modules import dataset_annotations_driving_mini
 from src.exp_driving_videos.modules import diverse_final_rules_driving_mini
 from src.exp_driving_videos.modules import evaluate_rules_driving_mini
@@ -199,6 +204,7 @@ _get_rule_pool_upper_bound_diagnostic_cfg = driving_pipeline_config.get_rule_poo
 _get_oracle_rule_selection_gap_diagnostic_cfg = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_cfg
 _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
+_get_candidate_contribution_summary_cfg = driving_pipeline_config.get_candidate_contribution_summary_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_object_to_atom_coverage_diagnostic_cfg = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_cfg
 _get_traffic_control_rule_utility_diagnostic_cfg = (
@@ -221,6 +227,9 @@ _get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
 _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
 _get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diagnostic_cfg
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
+_get_candidate_contribution_summary_output_root = (
+    driving_pipeline_config.get_candidate_contribution_summary_output_root
+)
 _get_rule_aggregation_baseline_output_root = driving_pipeline_config.get_rule_aggregation_baseline_output_root
 _get_object_to_atom_coverage_diagnostic_output_root = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_output_root
 _get_traffic_control_rule_utility_diagnostic_output_root = (
@@ -277,6 +286,7 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17D", "stop_after": None, "label": "rule_pool_upper_bound_diagnostic_driving_mini"},
     {"tag": "17E", "stop_after": None, "label": "oracle_rule_selection_gap_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
+    {"tag": "18A", "stop_after": None, "label": "candidate_contribution_summary_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "neural_symbolic_baseline_driving_mini"},
     {"tag": "18C", "stop_after": None, "label": "rule_aggregation_baseline_driving_mini"},
     {"tag": "18D", "stop_after": None, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
@@ -431,6 +441,7 @@ class PipelineContext:
     evaluation_rule_sets: List[str] = field(default_factory=list)
     evaluation_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     evaluation_results: Dict[str, Any] = field(default_factory=dict)
+    candidate_contribution_summary_results: Dict[str, Any] = field(default_factory=dict)
     neural_symbolic_baseline_results: Dict[str, Any] = field(default_factory=dict)
     rule_aggregation_baseline_results: Dict[str, Any] = field(default_factory=dict)
     object_to_atom_coverage_results: Dict[str, Any] = field(default_factory=dict)
@@ -1274,6 +1285,30 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
     runner.complete_step("18", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
 
 
+def run_step_18a_candidate_contribution_summary(ctx: PipelineContext, runner: StepRunner) -> None:
+    candidate_contribution_summary_cfg = _get_candidate_contribution_summary_cfg()
+    runner.announce_step("18A", "candidate_contribution_summary_driving_mini")
+    runner.log("18A", f"cfg={candidate_contribution_summary_cfg}")
+    runner.log(
+        "18A",
+        f"recompute={bool(ctx.recompute_cfg.get('candidate_contribution_summary', True))} "
+        f"rule_sets={ctx.evaluation_rule_sets}",
+    )
+    with runner.module_output("18A"):
+        ctx.candidate_contribution_summary_results = candidate_contribution_summary_driving_mini.run(
+            rule_results_by_name=ctx.rule_results_by_name,
+            evaluation_results_by_name=ctx.evaluation_results_by_name,
+            primary_rule_set=ctx.primary_rule_set,
+            evaluation_rule_sets=ctx.evaluation_rule_sets,
+            cfg=candidate_contribution_summary_cfg,
+            output_root=_get_candidate_contribution_summary_output_root(),
+            force_recompute=bool(ctx.recompute_cfg.get("candidate_contribution_summary", True)),
+        )
+    best_selector = str(ctx.candidate_contribution_summary_results.get("best_selector_by_delta_f1", ""))
+    runner.log("18A", f"best_delta_f1_selector={best_selector or 'n/a'}")
+    runner.complete_step("18A", subtitle=f"best={best_selector or 'n/a'}")
+
+
 def run_step_18b_neural_symbolic_baseline(ctx: PipelineContext, runner: StepRunner) -> None:
     neural_symbolic_baseline_cfg = _get_neural_symbolic_baseline_cfg()
     runner.announce_step("18B", "neural_symbolic_baseline_driving_mini")
@@ -1691,6 +1726,7 @@ def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> Non
 
         # Evaluation and baselines
         run_step_18_rule_evaluation(ctx, runner)
+        run_step_18a_candidate_contribution_summary(ctx, runner)
         run_step_18b_neural_symbolic_baseline(ctx, runner)
         run_step_18c_rule_aggregation_baseline(ctx, runner)
         run_step_18d_object_to_atom_coverage(ctx, runner)

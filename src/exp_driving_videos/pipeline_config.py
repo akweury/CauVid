@@ -429,6 +429,18 @@ def get_rule_evaluation_cfg() -> Dict[str, Any]:
     )
 
 
+def get_candidate_contribution_summary_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "top_useful_candidate_rules": 10,
+            "top_noisy_candidate_rules": 10,
+            "top_matched_priors": 10,
+        },
+        path=("candidate_contribution_summary",),
+        warn_label="candidate contribution summary",
+    )
+
+
 def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -667,6 +679,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "rule_pool_upper_bound_diagnostic": True,
             "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,
+            "candidate_contribution_summary": True,
             "rule_aggregation_baseline": True,
             "object_to_atom_coverage_diagnostic": True,
             "traffic_control_rule_utility_diagnostic": True,
@@ -722,6 +735,10 @@ def get_split_output_root() -> Path:
 
 def get_rule_evaluation_output_root() -> Path:
     return _load_output_root("18_driving_mini_rule_evaluation")
+
+
+def get_candidate_contribution_summary_output_root() -> Path:
+    return _load_output_root("18a_driving_mini_candidate_contribution_summary")
 
 
 def get_rule_aggregation_baseline_output_root() -> Path:
