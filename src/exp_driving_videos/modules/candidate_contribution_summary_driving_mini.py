@@ -29,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SUMMARY_VERSION = 1
+_SUMMARY_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -42,6 +42,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "top_useful_candidate_rules": int(cfg.get("top_useful_candidate_rules", 10)),
         "top_noisy_candidate_rules": int(cfg.get("top_noisy_candidate_rules", 10)),
+        "top_broad_candidate_rules": int(cfg.get("top_broad_candidate_rules", 10)),
         "top_matched_priors": int(cfg.get("top_matched_priors", 10)),
     }
 
@@ -95,6 +96,17 @@ def _candidate_rule_rows(rule_evaluations: Sequence[Dict[str, Any]]) -> List[Dic
                     str(prior_id)
                     for prior_id in list(rule.get("matched_prior_ids_involved", []))
                     if str(prior_id)
+                ],
+                "has_strong_candidate_semantic_atom": bool(
+                    rule.get("has_strong_candidate_semantic_atom", False)
+                ),
+                "is_weak_candidate_rule": bool(rule.get("is_weak_candidate_rule", False)),
+                "is_broad_candidate_rule": bool(rule.get("is_broad_candidate_rule", False)),
+                "broad_candidate_rule_pattern": str(rule.get("broad_candidate_rule_pattern", "")),
+                "strong_candidate_semantic_predicates": [
+                    str(predicate)
+                    for predicate in list(rule.get("strong_candidate_semantic_predicates", []))
+                    if str(predicate)
                 ],
                 "candidate_body_atom_ratio": _safe_float(rule.get("candidate_body_atom_ratio", 0.0)),
                 "num_candidate_body_atoms": _safe_int(rule.get("num_candidate_body_atoms", 0)),
@@ -159,6 +171,95 @@ def _top_noisy_candidate_rules(
         if _safe_int(row.get("fp_contribution_count", 0)) > 0 or _safe_int(row.get("eval_negative_support", 0)) > 0
     ]
     return noisy[: max(0, limit)]
+
+
+def _broad_candidate_rule_rows(
+    candidate_rule_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [row for row in candidate_rule_rows if bool(row.get("is_broad_candidate_rule", False))]
+
+
+def _top_broad_candidate_rules(
+    broad_candidate_rule_rows: Sequence[Dict[str, Any]],
+    *,
+    limit: int,
+    noisy: bool,
+) -> List[Dict[str, Any]]:
+    if noisy:
+        ranked = sorted(
+            broad_candidate_rule_rows,
+            key=lambda row: (
+                -_safe_int(row.get("fp_contribution_count", 0)),
+                _safe_float(row.get("eval_precision", 0.0)),
+                -_safe_int(row.get("eval_negative_support", 0)),
+                str(row.get("rule_id", "")),
+            ),
+        )
+        filtered = [
+            row for row in ranked if _safe_int(row.get("fp_contribution_count", 0)) > 0
+        ]
+    else:
+        ranked = sorted(
+            broad_candidate_rule_rows,
+            key=lambda row: (
+                -_safe_int(row.get("fn_coverage_gain_count", 0)),
+                -_safe_int(row.get("net_candidate_utility", 0)),
+                _safe_int(row.get("fp_contribution_count", 0)),
+                -_safe_float(row.get("eval_f1", 0.0)),
+                str(row.get("rule_id", "")),
+            ),
+        )
+        filtered = [
+            row for row in ranked if _safe_int(row.get("fn_coverage_gain_count", 0)) > 0
+        ]
+    return filtered[: max(0, limit)]
+
+
+def _broad_candidate_pattern_stats(
+    broad_candidate_rule_rows: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    by_pattern: Dict[str, Dict[str, Any]] = {}
+    for row in broad_candidate_rule_rows:
+        pattern = str(row.get("broad_candidate_rule_pattern", "")).strip() or "unspecified_broad_candidate"
+        entry = by_pattern.setdefault(
+            pattern,
+            {
+                "broad_candidate_rule_pattern": pattern,
+                "selected_rule_count": 0,
+                "fn_coverage_gain_count": 0,
+                "fp_contribution_count": 0,
+                "net_candidate_utility": 0,
+                "rule_ids": [],
+            },
+        )
+        fn_gain = _safe_int(row.get("fn_coverage_gain_count", 0))
+        fp_contrib = _safe_int(row.get("fp_contribution_count", 0))
+        entry["selected_rule_count"] += 1
+        entry["fn_coverage_gain_count"] += fn_gain
+        entry["fp_contribution_count"] += fp_contrib
+        entry["net_candidate_utility"] += fn_gain - fp_contrib
+        entry["rule_ids"].append(str(row.get("rule_id", "")))
+    rows = []
+    for pattern, entry in by_pattern.items():
+        rows.append(
+            {
+                "broad_candidate_rule_pattern": pattern,
+                "selected_rule_count": _safe_int(entry.get("selected_rule_count", 0)),
+                "fn_coverage_gain_count": _safe_int(entry.get("fn_coverage_gain_count", 0)),
+                "fp_contribution_count": _safe_int(entry.get("fp_contribution_count", 0)),
+                "net_candidate_utility": _safe_int(entry.get("net_candidate_utility", 0)),
+                "rule_ids": sorted({rule_id for rule_id in entry.get("rule_ids", []) if str(rule_id)}),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            -_safe_int(row.get("fp_contribution_count", 0)),
+            -abs(_safe_int(row.get("net_candidate_utility", 0))),
+            -_safe_int(row.get("selected_rule_count", 0)),
+            str(row.get("broad_candidate_rule_pattern", "")),
+        )
+    )
+    return rows
 
 
 def _matched_prior_utility_stats(
@@ -251,6 +352,7 @@ def _selector_summary(
     category_counts = dict(dict(rule_result.get("candidate_rule_diagnostics", {})).get("category_counts", {}))
     rule_evaluations = list(evaluation_result.get("rule_evaluations", []))
     candidate_rows = _candidate_rule_rows(rule_evaluations)
+    broad_candidate_rows = _broad_candidate_rule_rows(candidate_rows)
     useful_rules = _top_useful_candidate_rules(
         candidate_rows,
         limit=int(cfg.get("top_useful_candidate_rules", 10)),
@@ -259,6 +361,17 @@ def _selector_summary(
         candidate_rows,
         limit=int(cfg.get("top_noisy_candidate_rules", 10)),
     )
+    useful_broad_rules = _top_broad_candidate_rules(
+        broad_candidate_rows,
+        limit=int(cfg.get("top_broad_candidate_rules", 10)),
+        noisy=False,
+    )
+    noisy_broad_rules = _top_broad_candidate_rules(
+        broad_candidate_rows,
+        limit=int(cfg.get("top_broad_candidate_rules", 10)),
+        noisy=True,
+    )
+    broad_candidate_pattern_stats = _broad_candidate_pattern_stats(broad_candidate_rows)
     matched_prior_stats = _matched_prior_utility_stats(
         candidate_rows,
         limit=int(cfg.get("top_matched_priors", 10)),
@@ -285,6 +398,10 @@ def _selector_summary(
         "selected_mixed_rule_count": _safe_int(category_counts.get("mixed_accepted_candidate_rules", 0)),
         "selected_candidate_involving_rule_count": _safe_int(category_counts.get("candidate_only_rules", 0))
         + _safe_int(category_counts.get("mixed_accepted_candidate_rules", 0)),
+        "selected_weak_candidate_rule_count": sum(
+            1 for row in candidate_rows if bool(row.get("is_weak_candidate_rule", False))
+        ),
+        "selected_broad_candidate_rule_count": len(broad_candidate_rows),
         "accepted_only_precision": _safe_float(baseline_metrics.get("precision", 0.0)),
         "accepted_only_recall": _safe_float(baseline_metrics.get("recall", 0.0)),
         "accepted_only_f1": _safe_float(baseline_metrics.get("f1", 0.0)),
@@ -298,10 +415,22 @@ def _selector_summary(
         "fn_coverage_gain_rate": _safe_float(ablation.get("fn_coverage_gain_rate", 0.0)),
         "fp_contribution_count": fp_contribution_count,
         "fp_contribution_rate": _safe_float(ablation.get("fp_contribution_rate", 0.0)),
+        "broad_candidate_fn_coverage_gain_count": sum(
+            _safe_int(row.get("fn_coverage_gain_count", 0)) for row in broad_candidate_rows
+        ),
+        "broad_candidate_fp_contribution_count": sum(
+            _safe_int(row.get("fp_contribution_count", 0)) for row in broad_candidate_rows
+        ),
+        "broad_candidate_net_utility": sum(
+            _safe_int(row.get("net_candidate_utility", 0)) for row in broad_candidate_rows
+        ),
         "recovered_fn_examples": list(ablation.get("recovered_false_negative_example_ids", [])),
         "introduced_fp_examples": list(ablation.get("added_false_positive_example_ids", [])),
         "top_useful_candidate_involving_rules": useful_rules,
         "top_noisy_candidate_involving_rules": noisy_rules,
+        "top_useful_broad_candidate_rules": useful_broad_rules,
+        "top_noisy_broad_candidate_rules": noisy_broad_rules,
+        "broad_candidate_rule_pattern_statistics": broad_candidate_pattern_stats,
         "matched_prior_utility_statistics": matched_prior_stats,
     }
 
@@ -383,6 +512,8 @@ def process(
                 "selected_candidate_only_rule_count",
                 "selected_mixed_rule_count",
                 "selected_candidate_involving_rule_count",
+                "selected_weak_candidate_rule_count",
+                "selected_broad_candidate_rule_count",
                 "accepted_only_precision",
                 "accepted_only_recall",
                 "accepted_only_f1",
@@ -396,10 +527,16 @@ def process(
                 "fn_coverage_gain_rate",
                 "fp_contribution_count",
                 "fp_contribution_rate",
+                "broad_candidate_fn_coverage_gain_count",
+                "broad_candidate_fp_contribution_count",
+                "broad_candidate_net_utility",
                 "recovered_fn_examples",
                 "introduced_fp_examples",
                 "top_useful_candidate_involving_rule_ids",
                 "top_noisy_candidate_involving_rule_ids",
+                "top_useful_broad_candidate_rule_ids",
+                "top_noisy_broad_candidate_rule_ids",
+                "broad_candidate_patterns",
                 "top_matched_prior_utility_ids",
             ],
         )
@@ -415,6 +552,8 @@ def process(
                     "selected_candidate_only_rule_count": row.get("selected_candidate_only_rule_count", 0),
                     "selected_mixed_rule_count": row.get("selected_mixed_rule_count", 0),
                     "selected_candidate_involving_rule_count": row.get("selected_candidate_involving_rule_count", 0),
+                    "selected_weak_candidate_rule_count": row.get("selected_weak_candidate_rule_count", 0),
+                    "selected_broad_candidate_rule_count": row.get("selected_broad_candidate_rule_count", 0),
                     "accepted_only_precision": row.get("accepted_only_precision", 0.0),
                     "accepted_only_recall": row.get("accepted_only_recall", 0.0),
                     "accepted_only_f1": row.get("accepted_only_f1", 0.0),
@@ -428,6 +567,9 @@ def process(
                     "fn_coverage_gain_rate": row.get("fn_coverage_gain_rate", 0.0),
                     "fp_contribution_count": row.get("fp_contribution_count", 0),
                     "fp_contribution_rate": row.get("fp_contribution_rate", 0.0),
+                    "broad_candidate_fn_coverage_gain_count": row.get("broad_candidate_fn_coverage_gain_count", 0),
+                    "broad_candidate_fp_contribution_count": row.get("broad_candidate_fp_contribution_count", 0),
+                    "broad_candidate_net_utility": row.get("broad_candidate_net_utility", 0),
                     "recovered_fn_examples": json.dumps(row.get("recovered_fn_examples", [])),
                     "introduced_fp_examples": json.dumps(row.get("introduced_fp_examples", [])),
                     "top_useful_candidate_involving_rule_ids": json.dumps(
@@ -435,6 +577,18 @@ def process(
                     ),
                     "top_noisy_candidate_involving_rule_ids": json.dumps(
                         [rule.get("rule_id", "") for rule in row.get("top_noisy_candidate_involving_rules", [])]
+                    ),
+                    "top_useful_broad_candidate_rule_ids": json.dumps(
+                        [rule.get("rule_id", "") for rule in row.get("top_useful_broad_candidate_rules", [])]
+                    ),
+                    "top_noisy_broad_candidate_rule_ids": json.dumps(
+                        [rule.get("rule_id", "") for rule in row.get("top_noisy_broad_candidate_rules", [])]
+                    ),
+                    "broad_candidate_patterns": json.dumps(
+                        [
+                            pattern.get("broad_candidate_rule_pattern", "")
+                            for pattern in row.get("broad_candidate_rule_pattern_statistics", [])
+                        ]
                     ),
                     "top_matched_prior_utility_ids": json.dumps(
                         [prior.get("prior_id", "") for prior in row.get("matched_prior_utility_statistics", [])]

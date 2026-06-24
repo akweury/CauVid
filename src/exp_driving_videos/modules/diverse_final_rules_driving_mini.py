@@ -31,7 +31,31 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_DIVERSE_FINAL_RULES_VERSION = 5
+_DIVERSE_FINAL_RULES_VERSION = 6
+_STRONG_SEMANTIC_BODY_PREDICATES = {
+    "object_class",
+    "object_distance_state",
+    "object_vz_state",
+    "object_vx_state",
+    "object_speed_state",
+    "object_visibility_state",
+    "traffic_control_type",
+    "traffic_control_relevance_state",
+    "traffic_control_relevant",
+    "traffic_light_relevant",
+    "stop_sign_relevant",
+    "traffic_light_state",
+}
+_BROAD_CANDIDATE_BODY_PREDICATES = {
+    "object_x_position_state",
+    "object_source_type",
+    "object_is_candidate",
+    "object_candidate_score_state",
+    "object_prior_relevance_state",
+    "object_matched_prior",
+    "traffic_control_front_center_region",
+    "traffic_light_position_state",
+}
 
 
 def get_output_root() -> Path:
@@ -55,6 +79,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "family_penalty": float(cfg.get("family_penalty", 0.75)),
         "family_diversity_bonus": float(cfg.get("family_diversity_bonus", 0.75)),
         "negative_support_penalty": float(cfg.get("negative_support_penalty", 0.1)),
+        "weak_candidate_rule_penalty": float(cfg.get("weak_candidate_rule_penalty", 1.0)),
         "semantic_hard_constraints": bool(cfg.get("semantic_hard_constraints", False)),
         "semantic_bonus_weight": float(cfg.get("semantic_bonus_weight", 1.0)),
         "semantic_min_positive_support": int(cfg.get("semantic_min_positive_support", 1)),
@@ -75,8 +100,10 @@ def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         all_kept_rules,
         key=lambda rule: (
+            int(bool(rule.get("is_weak_candidate_rule", False))),
             -float(rule.get("confidence", 0.0)),
             -int(rule.get("positive_support", 0)),
+            int(bool(rule.get("is_broad_candidate_rule", False))),
             int(rule.get("kept_round_index", 0)),
             str(rule.get("clause", "")),
         ),
@@ -93,15 +120,74 @@ def _rule_candidate_category(rule: Dict[str, Any]) -> str:
     return "accepted_only"
 
 
+def _candidate_rule_semantic_profile(rule: Dict[str, Any]) -> Dict[str, Any]:
+    predicates = {
+        predicate
+        for predicate in (_parse_atom(atom)[0] if _parse_atom(atom) is not None else None for atom in _get_rule_body_atom_templates(rule))
+        if predicate
+    }
+    non_segment_predicates = {
+        predicate
+        for predicate in predicates
+        if not str(predicate).startswith("segment_")
+        and str(predicate) not in {"object_in_segment", "object_track"}
+    }
+    has_strong_semantic_atom = bool(non_segment_predicates & _STRONG_SEMANTIC_BODY_PREDICATES)
+    uses_candidate_atoms = bool(rule.get("uses_candidate_atoms", False))
+    is_weak_candidate_rule = uses_candidate_atoms and not has_strong_semantic_atom
+    broad_candidate_predicates = sorted(non_segment_predicates & _BROAD_CANDIDATE_BODY_PREDICATES)
+    object_x_only = non_segment_predicates == {"object_x_position_state"}
+    if not uses_candidate_atoms:
+        broad_pattern = ""
+    elif has_strong_semantic_atom:
+        broad_pattern = "strong_semantic_candidate"
+    elif object_x_only:
+        broad_pattern = "object_x_position_state_only"
+    elif non_segment_predicates and non_segment_predicates <= _BROAD_CANDIDATE_BODY_PREDICATES:
+        if "object_x_position_state" in non_segment_predicates:
+            broad_pattern = "position_provenance_prior_score_only"
+        else:
+            broad_pattern = "prior_score_provenance_only"
+    else:
+        broad_pattern = "weak_candidate_other"
+    return {
+        "body_predicates": sorted(predicates),
+        "strong_candidate_semantic_predicates": sorted(
+            non_segment_predicates & _STRONG_SEMANTIC_BODY_PREDICATES
+        ),
+        "broad_candidate_predicates": broad_candidate_predicates,
+        "has_strong_candidate_semantic_atom": has_strong_semantic_atom,
+        "is_weak_candidate_rule": is_weak_candidate_rule,
+        "is_broad_candidate_rule": uses_candidate_atoms and is_weak_candidate_rule,
+        "broad_candidate_rule_pattern": broad_pattern,
+    }
+
+
+def _enrich_rule_candidate_semantics(rule: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = dict(rule)
+    enriched.update(_candidate_rule_semantic_profile(enriched))
+    return enriched
+
+
 def _summarize_candidate_rule_subset(rules: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     rules_list = list(rules)
     matched_prior_id_counts: Dict[str, int] = {}
+    broad_candidate_pattern_counts: Dict[str, int] = {}
     total_candidate_body_atoms = 0
     candidate_body_atom_ratios: List[float] = []
     candidate_rule_count = 0
+    weak_candidate_rule_count = 0
+    broad_candidate_rule_count = 0
     for rule in rules_list:
         if bool(rule.get("uses_candidate_atoms", False)):
             candidate_rule_count += 1
+        if bool(rule.get("is_weak_candidate_rule", False)):
+            weak_candidate_rule_count += 1
+        if bool(rule.get("is_broad_candidate_rule", False)):
+            broad_candidate_rule_count += 1
+        pattern = str(rule.get("broad_candidate_rule_pattern", "")).strip()
+        if pattern:
+            broad_candidate_pattern_counts[pattern] = broad_candidate_pattern_counts.get(pattern, 0) + 1
         total_candidate_body_atoms += max(0, int(rule.get("num_candidate_body_atoms", 0)))
         candidate_body_atom_ratios.append(max(0.0, float(rule.get("candidate_body_atom_ratio", 0.0))))
         for prior_id in list(rule.get("matched_prior_ids_involved", [])):
@@ -111,9 +197,15 @@ def _summarize_candidate_rule_subset(rules: Sequence[Dict[str, Any]]) -> Dict[st
     return {
         "num_rules": len(rules_list),
         "num_rules_using_candidate_atoms": candidate_rule_count,
+        "num_weak_candidate_rules": weak_candidate_rule_count,
+        "num_broad_candidate_rules": broad_candidate_rule_count,
         "total_candidate_body_atoms": total_candidate_body_atoms,
         "avg_candidate_body_atom_ratio": float(sum(candidate_body_atom_ratios) / max(1, len(candidate_body_atom_ratios))),
         "avg_num_candidate_body_atoms": float(total_candidate_body_atoms / max(1, len(rules_list))),
+        "broad_candidate_rule_pattern_counts": {
+            key: broad_candidate_pattern_counts[key]
+            for key in sorted(broad_candidate_pattern_counts)
+        },
         "matched_prior_id_counts": {
             key: matched_prior_id_counts[key]
             for key in sorted(matched_prior_id_counts)
@@ -245,12 +337,18 @@ def _legacy_diverse_utility(
 
     new_positive_gain = len(new_positive_ids)
     overlap_positive_count = len(overlap_positive_ids)
+    weak_candidate_penalty_value = (
+        float(cfg.get("weak_candidate_rule_penalty", 1.0))
+        if bool(rule.get("is_weak_candidate_rule", False))
+        else 0.0
+    )
     utility = (
         float(cfg.get("new_positive_weight", 1.0)) * new_positive_gain
         + float(cfg.get("confidence_weight", 0.25)) * confidence
         - float(cfg.get("overlap_penalty", 0.35)) * overlap_positive_count
         - float(cfg.get("family_penalty", 0.75)) * family_reuse_count
         - float(cfg.get("negative_support_penalty", 0.1)) * negative_support
+        - weak_candidate_penalty_value
     )
     return {
         "utility": utility,
@@ -262,6 +360,7 @@ def _legacy_diverse_utility(
         "base_quality_score": _base_quality_score(rule),
         "family_diversity_bonus": 0.0,
         "negative_support_penalty": float(cfg.get("negative_support_penalty", 0.1)) * negative_support,
+        "weak_candidate_penalty_value": weak_candidate_penalty_value,
         "overlap_penalty_value": float(cfg.get("overlap_penalty", 0.35)) * overlap_positive_count,
         "family_penalty_value": float(cfg.get("family_penalty", 0.75)) * family_reuse_count,
     }
@@ -284,6 +383,11 @@ def _coverage_family_aware_utility(
     overlap_positive_count = len(overlap_positive_ids)
     quality_score = _base_quality_score(rule)
     family_diversity_bonus = float(cfg.get("family_diversity_bonus", 0.75)) / float(1 + family_reuse_count)
+    weak_candidate_penalty_value = (
+        float(cfg.get("weak_candidate_rule_penalty", 1.0))
+        if bool(rule.get("is_weak_candidate_rule", False))
+        else 0.0
+    )
     utility = (
         float(cfg.get("coverage_weight", 1.0)) * new_positive_gain
         + float(cfg.get("quality_weight", 1.0)) * quality_score
@@ -291,6 +395,7 @@ def _coverage_family_aware_utility(
         - float(cfg.get("overlap_penalty", 0.35)) * overlap_positive_count
         - float(cfg.get("family_penalty", 0.75)) * family_reuse_count
         - float(cfg.get("negative_support_penalty", 0.1)) * negative_support
+        - weak_candidate_penalty_value
     )
     return {
         "utility": utility,
@@ -302,6 +407,7 @@ def _coverage_family_aware_utility(
         "base_quality_score": quality_score,
         "family_diversity_bonus": family_diversity_bonus,
         "negative_support_penalty": float(cfg.get("negative_support_penalty", 0.1)) * negative_support,
+        "weak_candidate_penalty_value": weak_candidate_penalty_value,
         "overlap_penalty_value": float(cfg.get("overlap_penalty", 0.35)) * overlap_positive_count,
         "family_penalty_value": float(cfg.get("family_penalty", 0.75)) * family_reuse_count,
     }
@@ -449,7 +555,9 @@ def process_rules(
             print(f"  [cache] loading {json_path.name}")
             return cached
 
-    candidate_rules = _sort_rules(list(extended_rule_results.get("all_kept_rules", [])))
+    candidate_rules = _sort_rules(
+        [_enrich_rule_candidate_semantics(rule) for rule in list(extended_rule_results.get("all_kept_rules", []))]
+    )
     selected_rules: List[Dict[str, Any]] = []
     selection_trace: List[Dict[str, Any]] = []
     selected_rule_ids: Set[str] = set()
@@ -490,6 +598,7 @@ def process_rules(
                 "overlap_penalty_value": float(utility["overlap_penalty_value"]),
                 "family_penalty_value": float(utility["family_penalty_value"]),
                 "negative_support_penalty_value": float(utility["negative_support_penalty"]),
+                "weak_candidate_penalty_value": float(utility.get("weak_candidate_penalty_value", 0.0)),
                 "semantic_match_level": str(utility.get("semantic_match_level", "no_match")),
                 "semantic_is_quota_qualified": bool(utility.get("semantic_is_quota_qualified", False)),
                 "semantic_deficit_reduction": int(utility.get("semantic_deficit_reduction", 0)),
@@ -541,6 +650,7 @@ def process_rules(
         selected_rule["selection_overlap_penalty_value"] = float(best_trace["overlap_penalty_value"])
         selected_rule["selection_family_penalty_value"] = float(best_trace["family_penalty_value"])
         selected_rule["selection_negative_support_penalty_value"] = float(best_trace["negative_support_penalty_value"])
+        selected_rule["selection_weak_candidate_penalty_value"] = float(best_trace.get("weak_candidate_penalty_value", 0.0))
         selected_rule["selection_semantic_match_level"] = str(best_trace["semantic_match_level"])
         selected_rule["selection_semantic_is_quota_qualified"] = bool(best_trace["semantic_is_quota_qualified"])
         selected_rule["selection_semantic_deficit_reduction"] = int(best_trace["semantic_deficit_reduction"])
@@ -572,6 +682,7 @@ def process_rules(
                 "overlap_penalty_value": float(best_trace["overlap_penalty_value"]),
                 "family_penalty_value": float(best_trace["family_penalty_value"]),
                 "negative_support_penalty_value": float(best_trace["negative_support_penalty_value"]),
+                "weak_candidate_penalty_value": float(best_trace.get("weak_candidate_penalty_value", 0.0)),
                 "semantic_match_level": semantic_match_level,
                 "semantic_is_quota_qualified": bool(best_trace["semantic_is_quota_qualified"]),
                 "semantic_deficit_reduction": int(best_trace["semantic_deficit_reduction"]),
@@ -632,6 +743,7 @@ def process_rules(
                 "selection_semantic_match_level",
                 "selection_semantic_is_quota_qualified",
                 "selection_semantic_deficit_reduction",
+                "selection_weak_candidate_penalty_value",
                 "candidate_rule_category",
                 "uses_candidate_atoms",
                 "num_candidate_body_atoms",
@@ -640,6 +752,11 @@ def process_rules(
                 "uses_only_candidate_atoms",
                 "body_source_mix",
                 "matched_prior_ids_involved",
+                "has_strong_candidate_semantic_atom",
+                "is_weak_candidate_rule",
+                "is_broad_candidate_rule",
+                "broad_candidate_rule_pattern",
+                "strong_candidate_semantic_predicates",
             ],
         )
         writer.writeheader()
@@ -668,6 +785,7 @@ def process_rules(
                     "selection_semantic_match_level": rule.get("selection_semantic_match_level", ""),
                     "selection_semantic_is_quota_qualified": rule.get("selection_semantic_is_quota_qualified", False),
                     "selection_semantic_deficit_reduction": rule.get("selection_semantic_deficit_reduction", 0),
+                    "selection_weak_candidate_penalty_value": rule.get("selection_weak_candidate_penalty_value", 0.0),
                     "candidate_rule_category": rule.get("candidate_rule_category", "accepted_only"),
                     "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
                     "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
@@ -676,6 +794,13 @@ def process_rules(
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
                     "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+                    "has_strong_candidate_semantic_atom": rule.get("has_strong_candidate_semantic_atom", False),
+                    "is_weak_candidate_rule": rule.get("is_weak_candidate_rule", False),
+                    "is_broad_candidate_rule": rule.get("is_broad_candidate_rule", False),
+                    "broad_candidate_rule_pattern": rule.get("broad_candidate_rule_pattern", ""),
+                    "strong_candidate_semantic_predicates": json.dumps(
+                        rule.get("strong_candidate_semantic_predicates", [])
+                    ),
                 }
             )
 

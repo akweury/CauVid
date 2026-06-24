@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,7 +29,31 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_FINAL_RULES_VERSION = 2
+_FINAL_RULES_VERSION = 3
+_STRONG_SEMANTIC_BODY_PREDICATES = {
+    "object_class",
+    "object_distance_state",
+    "object_vz_state",
+    "object_vx_state",
+    "object_speed_state",
+    "object_visibility_state",
+    "traffic_control_type",
+    "traffic_control_relevance_state",
+    "traffic_control_relevant",
+    "traffic_light_relevant",
+    "stop_sign_relevant",
+    "traffic_light_state",
+}
+_BROAD_CANDIDATE_BODY_PREDICATES = {
+    "object_x_position_state",
+    "object_source_type",
+    "object_is_candidate",
+    "object_candidate_score_state",
+    "object_prior_relevance_state",
+    "object_matched_prior",
+    "traffic_control_front_center_region",
+    "traffic_light_position_state",
+}
 
 
 def get_output_root() -> Path:
@@ -43,12 +68,79 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _parse_atom(atom: str) -> Optional[str]:
+    text = str(atom).strip()
+    match = re.match(r"^([a-z0-9_]+)\((.*)\)\.$", text)
+    if not match:
+        return None
+    return str(match.group(1))
+
+
+def _get_rule_body_atom_templates(rule: Dict[str, Any]) -> List[str]:
+    body_atom_templates = rule.get("body_atom_templates")
+    if isinstance(body_atom_templates, list):
+        return [str(atom).strip() for atom in body_atom_templates if str(atom).strip()]
+    body_atom_template = str(rule.get("body_atom_template", "")).strip()
+    return [body_atom_template] if body_atom_template else []
+
+
+def _candidate_rule_semantic_profile(rule: Dict[str, Any]) -> Dict[str, Any]:
+    predicates = {
+        predicate
+        for predicate in (_parse_atom(atom) for atom in _get_rule_body_atom_templates(rule))
+        if predicate
+    }
+    non_segment_predicates = {
+        predicate
+        for predicate in predicates
+        if not str(predicate).startswith("segment_")
+        and str(predicate) not in {"object_in_segment", "object_track"}
+    }
+    has_strong_semantic_atom = bool(non_segment_predicates & _STRONG_SEMANTIC_BODY_PREDICATES)
+    uses_candidate_atoms = bool(rule.get("uses_candidate_atoms", False))
+    is_weak_candidate_rule = uses_candidate_atoms and not has_strong_semantic_atom
+    broad_candidate_predicates = sorted(non_segment_predicates & _BROAD_CANDIDATE_BODY_PREDICATES)
+    object_x_only = non_segment_predicates == {"object_x_position_state"}
+    if not uses_candidate_atoms:
+        broad_pattern = ""
+    elif has_strong_semantic_atom:
+        broad_pattern = "strong_semantic_candidate"
+    elif object_x_only:
+        broad_pattern = "object_x_position_state_only"
+    elif non_segment_predicates and non_segment_predicates <= _BROAD_CANDIDATE_BODY_PREDICATES:
+        if "object_x_position_state" in non_segment_predicates:
+            broad_pattern = "position_provenance_prior_score_only"
+        else:
+            broad_pattern = "prior_score_provenance_only"
+    else:
+        broad_pattern = "weak_candidate_other"
+    return {
+        "body_predicates": sorted(predicates),
+        "strong_candidate_semantic_predicates": sorted(
+            non_segment_predicates & _STRONG_SEMANTIC_BODY_PREDICATES
+        ),
+        "broad_candidate_predicates": broad_candidate_predicates,
+        "has_strong_candidate_semantic_atom": has_strong_semantic_atom,
+        "is_weak_candidate_rule": is_weak_candidate_rule,
+        "is_broad_candidate_rule": uses_candidate_atoms and is_weak_candidate_rule,
+        "broad_candidate_rule_pattern": broad_pattern,
+    }
+
+
+def _enrich_rule_candidate_semantics(rule: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = dict(rule)
+    enriched.update(_candidate_rule_semantic_profile(enriched))
+    return enriched
+
+
 def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         all_kept_rules,
         key=lambda rule: (
+            int(bool(rule.get("is_weak_candidate_rule", False))),
             -float(rule.get("confidence", 0.0)),
             -int(rule.get("positive_support", 0)),
+            int(bool(rule.get("is_broad_candidate_rule", False))),
             int(rule.get("kept_round_index", 0)),
             str(rule.get("clause", "")),
         ),
@@ -67,12 +159,22 @@ def _rule_candidate_category(rule: Dict[str, Any]) -> str:
 
 def _summarize_candidate_rule_subset(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
     matched_prior_id_counts: Dict[str, int] = {}
+    broad_candidate_pattern_counts: Dict[str, int] = {}
     total_candidate_body_atoms = 0
     candidate_body_atom_ratios: List[float] = []
     candidate_rule_count = 0
+    weak_candidate_rule_count = 0
+    broad_candidate_rule_count = 0
     for rule in rules:
         if bool(rule.get("uses_candidate_atoms", False)):
             candidate_rule_count += 1
+        if bool(rule.get("is_weak_candidate_rule", False)):
+            weak_candidate_rule_count += 1
+        if bool(rule.get("is_broad_candidate_rule", False)):
+            broad_candidate_rule_count += 1
+        pattern = str(rule.get("broad_candidate_rule_pattern", "")).strip()
+        if pattern:
+            broad_candidate_pattern_counts[pattern] = broad_candidate_pattern_counts.get(pattern, 0) + 1
         total_candidate_body_atoms += max(0, int(rule.get("num_candidate_body_atoms", 0)))
         candidate_body_atom_ratios.append(max(0.0, float(rule.get("candidate_body_atom_ratio", 0.0))))
         for prior_id in list(rule.get("matched_prior_ids_involved", [])):
@@ -82,9 +184,15 @@ def _summarize_candidate_rule_subset(rules: List[Dict[str, Any]]) -> Dict[str, A
     return {
         "num_rules": len(rules),
         "num_rules_using_candidate_atoms": candidate_rule_count,
+        "num_weak_candidate_rules": weak_candidate_rule_count,
+        "num_broad_candidate_rules": broad_candidate_rule_count,
         "total_candidate_body_atoms": total_candidate_body_atoms,
         "avg_candidate_body_atom_ratio": float(sum(candidate_body_atom_ratios) / max(1, len(candidate_body_atom_ratios))),
         "avg_num_candidate_body_atoms": float(total_candidate_body_atoms / max(1, len(rules))),
+        "broad_candidate_rule_pattern_counts": {
+            key: broad_candidate_pattern_counts[key]
+            for key in sorted(broad_candidate_pattern_counts)
+        },
         "matched_prior_id_counts": {
             key: matched_prior_id_counts[key]
             for key in sorted(matched_prior_id_counts)
@@ -138,7 +246,7 @@ def process_rules(
             print(f"  [cache] loading {json_path.name}")
             return cached
 
-    all_kept_rules = list(extended_rule_results.get("all_kept_rules", []))
+    all_kept_rules = [_enrich_rule_candidate_semantics(rule) for rule in list(extended_rule_results.get("all_kept_rules", []))]
     ranked_rules = _sort_rules(all_kept_rules)
     final_rules = ranked_rules[: max(0, top_k)]
     for rule in final_rules:
@@ -183,6 +291,11 @@ def process_rules(
                 "uses_only_candidate_atoms",
                 "body_source_mix",
                 "matched_prior_ids_involved",
+                "has_strong_candidate_semantic_atom",
+                "is_weak_candidate_rule",
+                "is_broad_candidate_rule",
+                "broad_candidate_rule_pattern",
+                "strong_candidate_semantic_predicates",
             ],
         )
         writer.writeheader()
@@ -208,6 +321,13 @@ def process_rules(
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
                     "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+                    "has_strong_candidate_semantic_atom": rule.get("has_strong_candidate_semantic_atom", False),
+                    "is_weak_candidate_rule": rule.get("is_weak_candidate_rule", False),
+                    "is_broad_candidate_rule": rule.get("is_broad_candidate_rule", False),
+                    "broad_candidate_rule_pattern": rule.get("broad_candidate_rule_pattern", ""),
+                    "strong_candidate_semantic_predicates": json.dumps(
+                        rule.get("strong_candidate_semantic_predicates", [])
+                    ),
                 }
             )
 
