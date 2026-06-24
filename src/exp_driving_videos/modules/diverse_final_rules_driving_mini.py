@@ -31,7 +31,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_DIVERSE_FINAL_RULES_VERSION = 4
+_DIVERSE_FINAL_RULES_VERSION = 5
 
 
 def get_output_root() -> Path:
@@ -81,6 +81,68 @@ def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             str(rule.get("clause", "")),
         ),
     )
+
+
+def _rule_candidate_category(rule: Dict[str, Any]) -> str:
+    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
+        return "mixed_accepted_candidate"
+    if bool(rule.get("uses_only_candidate_atoms", False)):
+        return "candidate_only"
+    if bool(rule.get("uses_candidate_atoms", False)):
+        return "candidate_only"
+    return "accepted_only"
+
+
+def _summarize_candidate_rule_subset(rules: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    rules_list = list(rules)
+    matched_prior_id_counts: Dict[str, int] = {}
+    total_candidate_body_atoms = 0
+    candidate_body_atom_ratios: List[float] = []
+    candidate_rule_count = 0
+    for rule in rules_list:
+        if bool(rule.get("uses_candidate_atoms", False)):
+            candidate_rule_count += 1
+        total_candidate_body_atoms += max(0, int(rule.get("num_candidate_body_atoms", 0)))
+        candidate_body_atom_ratios.append(max(0.0, float(rule.get("candidate_body_atom_ratio", 0.0))))
+        for prior_id in list(rule.get("matched_prior_ids_involved", [])):
+            prior_text = str(prior_id).strip()
+            if prior_text:
+                matched_prior_id_counts[prior_text] = matched_prior_id_counts.get(prior_text, 0) + 1
+    return {
+        "num_rules": len(rules_list),
+        "num_rules_using_candidate_atoms": candidate_rule_count,
+        "total_candidate_body_atoms": total_candidate_body_atoms,
+        "avg_candidate_body_atom_ratio": float(sum(candidate_body_atom_ratios) / max(1, len(candidate_body_atom_ratios))),
+        "avg_num_candidate_body_atoms": float(total_candidate_body_atoms / max(1, len(rules_list))),
+        "matched_prior_id_counts": {
+            key: matched_prior_id_counts[key]
+            for key in sorted(matched_prior_id_counts)
+        },
+    }
+
+
+def _summarize_candidate_rule_selection(rules: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    rules_list = list(rules)
+    subset_rules = {
+        "all_rules": rules_list,
+        "accepted_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "accepted_only"],
+        "candidate_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_only"],
+        "mixed_accepted_candidate_rules": [
+            rule for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"
+        ],
+    }
+    return {
+        "category_counts": {
+            "accepted_only_rules": len(subset_rules["accepted_only_rules"]),
+            "candidate_only_rules": len(subset_rules["candidate_only_rules"]),
+            "mixed_accepted_candidate_rules": len(subset_rules["mixed_accepted_candidate_rules"]),
+            "all_rules": len(subset_rules["all_rules"]),
+        },
+        "subsets": {
+            subset_name: _summarize_candidate_rule_subset(subset)
+            for subset_name, subset in subset_rules.items()
+        },
+    }
 
 
 def _parse_atom(atom: str) -> Optional[Tuple[str, List[str]]]:
@@ -482,6 +544,7 @@ def process_rules(
         selected_rule["selection_semantic_match_level"] = str(best_trace["semantic_match_level"])
         selected_rule["selection_semantic_is_quota_qualified"] = bool(best_trace["semantic_is_quota_qualified"])
         selected_rule["selection_semantic_deficit_reduction"] = int(best_trace["semantic_deficit_reduction"])
+        selected_rule["candidate_rule_category"] = _rule_candidate_category(selected_rule)
         selected_rules.append(selected_rule)
 
         selected_rule_ids.add(str(best_rule.get("rule_id", "")))
@@ -516,6 +579,8 @@ def process_rules(
             }
         )
 
+    candidate_rule_diagnostics = _summarize_candidate_rule_selection(selected_rules)
+
     result: Dict[str, Any] = {
         "version": _DIVERSE_FINAL_RULES_VERSION,
         "config": _cfg_key_subset(cfg),
@@ -533,6 +598,7 @@ def process_rules(
             match_level: len(families)
             for match_level, families in sorted(selected_qualified_semantic_families.items())
         },
+        "candidate_rule_diagnostics": candidate_rule_diagnostics,
         "final_rules": selected_rules,
         "selection_trace": selection_trace,
     }
@@ -566,6 +632,14 @@ def process_rules(
                 "selection_semantic_match_level",
                 "selection_semantic_is_quota_qualified",
                 "selection_semantic_deficit_reduction",
+                "candidate_rule_category",
+                "uses_candidate_atoms",
+                "num_candidate_body_atoms",
+                "candidate_body_atom_ratio",
+                "mixes_accepted_and_candidate_atoms",
+                "uses_only_candidate_atoms",
+                "body_source_mix",
+                "matched_prior_ids_involved",
             ],
         )
         writer.writeheader()
@@ -594,6 +668,14 @@ def process_rules(
                     "selection_semantic_match_level": rule.get("selection_semantic_match_level", ""),
                     "selection_semantic_is_quota_qualified": rule.get("selection_semantic_is_quota_qualified", False),
                     "selection_semantic_deficit_reduction": rule.get("selection_semantic_deficit_reduction", 0),
+                    "candidate_rule_category": rule.get("candidate_rule_category", "accepted_only"),
+                    "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
+                    "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
+                    "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
+                    "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
+                    "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
+                    "body_source_mix": rule.get("body_source_mix", ""),
+                    "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
                 }
             )
 

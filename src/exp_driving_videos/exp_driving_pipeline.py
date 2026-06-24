@@ -592,6 +592,10 @@ def _write_rule_set_evaluation_comparison(
     for rule_set_name in evaluation_rule_sets:
         overall = dict(evaluation_results_by_name[rule_set_name].get("overall_metrics", {}))
         rule_eval_result = evaluation_results_by_name[rule_set_name]
+        ablation = dict(rule_eval_result.get("candidate_rule_ablation", {}))
+        candidate_rule_diagnostics = dict(rule_results_by_name[rule_set_name].get("candidate_rule_diagnostics", {}))
+        category_counts = dict(candidate_rule_diagnostics.get("category_counts", {}))
+        all_subset = dict(dict(candidate_rule_diagnostics.get("subsets", {})).get("all_rules", {}))
         predicted_positive_ids = set(rule_eval_result.get("predicted_positive_example_ids", []))
         covered_original_fn_ids = original_fn_ids & predicted_positive_ids
         comparison_rows.append(
@@ -599,6 +603,10 @@ def _write_rule_set_evaluation_comparison(
                 "rule_set_name": rule_set_name,
                 "selection_method": str(rule_results_by_name[rule_set_name].get("selection_method", "score_top_k")),
                 "num_final_rules": int(rule_results_by_name[rule_set_name].get("num_final_rules", 0)),
+                "num_accepted_only_rules": int(category_counts.get("accepted_only_rules", 0)),
+                "num_candidate_only_rules": int(category_counts.get("candidate_only_rules", 0)),
+                "num_mixed_accepted_candidate_rules": int(category_counts.get("mixed_accepted_candidate_rules", 0)),
+                "avg_candidate_body_atom_ratio": float(all_subset.get("avg_candidate_body_atom_ratio", 0.0)),
                 "covered_eval_positive_examples": len(rule_eval_result.get("covered_positive_example_ids", [])),
                 "num_fn_examples": len(rule_eval_result.get("false_negative_example_ids", [])),
                 "fn_coverage_vs_original": float(len(covered_original_fn_ids) / max(1, len(original_fn_ids))),
@@ -606,6 +614,14 @@ def _write_rule_set_evaluation_comparison(
                 "recall": float(overall.get("recall", 0.0)),
                 "f1": float(overall.get("f1", 0.0)),
                 "accuracy": float(overall.get("accuracy", 0.0)),
+                "accepted_only_precision": float(dict(ablation.get("baseline_metrics", {})).get("precision", 0.0)),
+                "accepted_only_recall": float(dict(ablation.get("baseline_metrics", {})).get("recall", 0.0)),
+                "accepted_only_f1": float(dict(ablation.get("baseline_metrics", {})).get("f1", 0.0)),
+                "candidate_augmented_precision_delta": float(ablation.get("delta_precision", 0.0)),
+                "candidate_augmented_recall_delta": float(ablation.get("delta_recall", 0.0)),
+                "candidate_augmented_f1_delta": float(ablation.get("delta_f1", 0.0)),
+                "candidate_fn_coverage_gain_count": int(ablation.get("fn_coverage_gain_count", 0)),
+                "candidate_fp_contribution_count": int(ablation.get("fp_contribution_count", 0)),
             }
         )
 
@@ -628,6 +644,10 @@ def _write_rule_set_evaluation_comparison(
                 "rule_set_name",
                 "selection_method",
                 "num_final_rules",
+                "num_accepted_only_rules",
+                "num_candidate_only_rules",
+                "num_mixed_accepted_candidate_rules",
+                "avg_candidate_body_atom_ratio",
                 "covered_eval_positive_examples",
                 "num_fn_examples",
                 "fn_coverage_vs_original",
@@ -635,6 +655,14 @@ def _write_rule_set_evaluation_comparison(
                 "recall",
                 "f1",
                 "accuracy",
+                "accepted_only_precision",
+                "accepted_only_recall",
+                "accepted_only_f1",
+                "candidate_augmented_precision_delta",
+                "candidate_augmented_recall_delta",
+                "candidate_augmented_f1_delta",
+                "candidate_fn_coverage_gain_count",
+                "candidate_fp_contribution_count",
             ],
         )
         writer.writeheader()
@@ -1234,12 +1262,14 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
 
     ctx.evaluation_results = ctx.evaluation_results_by_name[ctx.primary_rule_set]
     overall_metrics = dict(ctx.evaluation_results.get("overall_metrics", {}))
+    candidate_rule_ablation = dict(ctx.evaluation_results.get("candidate_rule_ablation", {}))
     runner.log(
         "18",
         f"rule_set={ctx.primary_rule_set} "
         f"precision={float(overall_metrics.get('precision', 0.0)):.3f} "
         f"recall={float(overall_metrics.get('recall', 0.0)):.3f} "
-        f"f1={float(overall_metrics.get('f1', 0.0)):.3f}",
+        f"f1={float(overall_metrics.get('f1', 0.0)):.3f} "
+        f"delta_f1_vs_accepted_only={float(candidate_rule_ablation.get('delta_f1', 0.0)):.3f}",
     )
     runner.complete_step("18", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
 
