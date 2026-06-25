@@ -418,27 +418,32 @@ def build_train_eval_split(
     return split_manifest
 
 
-def get_default_driving_mini_video_ids() -> List[str]:
+def get_default_driving_mini_video_ids(limit: int | None = None) -> List[str]:
     selection_cfg = pipeline_config.get_video_selection_cfg()
     raw_limit = selection_cfg.get("default_video_limit")
     default_limit = int(raw_limit) if raw_limit is not None else None
+    effective_limit = limit if limit is not None else default_limit
 
     dataset_root = config.get_dataset_path("driving_mini")
     frames_root = dataset_root / "frames"
     if frames_root.exists():
         video_ids = sorted(path.name for path in frames_root.iterdir() if path.is_dir())
         if video_ids:
-            return video_ids[:default_limit] if default_limit and default_limit > 0 else video_ids
+            return video_ids[:effective_limit] if effective_limit and effective_limit > 0 else video_ids
 
     videos_root = dataset_root / "videos"
     if videos_root.exists():
         video_ids = sorted(path.stem for path in videos_root.glob("*.mov"))
-        return video_ids[:default_limit] if default_limit and default_limit > 0 else video_ids
+        return video_ids[:effective_limit] if effective_limit and effective_limit > 0 else video_ids
     return []
 
 
-def resolve_video_ids(video_ids: List[str] | None = None) -> List[str] | None:
+def resolve_video_ids(
+    video_ids: List[str] | None = None,
+    video_count: int | None = None,
+) -> List[str] | None:
     if video_ids:
-        return list(video_ids)
-    default_video_ids = get_default_driving_mini_video_ids()
+        resolved_video_ids = list(video_ids)
+        return resolved_video_ids[:video_count] if video_count and video_count > 0 else resolved_video_ids
+    default_video_ids = get_default_driving_mini_video_ids(limit=video_count)
     return default_video_ids or None

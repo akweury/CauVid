@@ -135,6 +135,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import re
 import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -797,12 +798,25 @@ def _write_rule_set_error_comparison(
 def _prepare_rule_learning_inputs(ctx: PipelineContext) -> None:
     split_cfg = _get_data_split_cfg()
     temporal_rule_results = list(ctx.temporal_rule_results or [])
+    total_videos = len({str(result.get("video_id", "")) for result in temporal_rule_results if str(result.get("video_id", ""))})
+    strategy = str(split_cfg.get("strategy", "eval_fraction"))
+    train_video_count = int(split_cfg.get("train_video_count", DEFAULT_TRAIN_VIDEO_COUNT))
+    eval_video_count = int(split_cfg.get("eval_video_count", DEFAULT_EVAL_VIDEO_COUNT))
+    eval_fraction = float(split_cfg.get("eval_fraction", 0.2))
+
+    if strategy == "fixed_counts":
+        requested_total = train_video_count + eval_video_count
+        if total_videos >= 2 and total_videos != requested_total:
+            base_eval_fraction = eval_video_count / max(1, requested_total)
+            eval_video_count = max(1, min(total_videos - 1, int(math.ceil(total_videos * base_eval_fraction))))
+            train_video_count = total_videos - eval_video_count
+
     ctx.split_manifest = _build_train_eval_split(
         video_ids=[str(result.get("video_id", "")) for result in temporal_rule_results],
-        train_video_count=int(split_cfg.get("train_video_count", DEFAULT_TRAIN_VIDEO_COUNT)),
-        eval_video_count=int(split_cfg.get("eval_video_count", DEFAULT_EVAL_VIDEO_COUNT)),
-        strategy=str(split_cfg.get("strategy", "eval_fraction")),
-        eval_fraction=float(split_cfg.get("eval_fraction", 0.2)),
+        train_video_count=train_video_count,
+        eval_video_count=eval_video_count,
+        strategy=strategy,
+        eval_fraction=eval_fraction,
     )
     ctx.train_temporal_rule_results = _select_video_results(
         temporal_rule_results,
@@ -1813,11 +1827,27 @@ def parse_args() -> argparse.Namespace:
             "If omitted, the pipeline uses the default subset sized for 100 train and 2 eval videos."
         ),
     )
+    parser.add_argument(
+        "--data",
+        "--video-count",
+        dest="video_count",
+        type=int,
+        help=(
+            "Restrict the pipeline to the first N videos. "
+            "When used, downstream train/eval splits scale to consume the selected N videos."
+        ),
+    )
     return parser.parse_args()
 
 
-def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> None:
-    ctx = PipelineContext(effective_video_ids=_resolve_video_ids(video_ids))
+def main(
+    max_step: int | str = 23,
+    video_ids: Optional[List[str]] = None,
+    video_count: int | None = None,
+) -> None:
+    if video_count is not None and video_count < 1:
+        raise ValueError(f"video_count must be >= 1. Found {video_count}.")
+    ctx = PipelineContext(effective_video_ids=_resolve_video_ids(video_ids, video_count))
     runner = StepRunner.create(max_step)
     try:
         run_step_0_background_rule_relevance_prior(ctx, runner)
@@ -1890,4 +1920,4 @@ def main(max_step: int | str = 23, video_ids: Optional[List[str]] = None) -> Non
 
 if __name__ == "__main__":
     args = parse_args()
-    main(max_step=args.max_step, video_ids=args.video_ids)
+    main(max_step=args.max_step, video_ids=args.video_ids, video_count=args.video_count)
