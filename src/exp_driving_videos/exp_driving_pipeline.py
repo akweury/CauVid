@@ -66,13 +66,6 @@ Steps:
                     candidate-derived atoms improve held-out brake_next
                     prediction or mainly add noise using Step 17/18 outputs
                     only, without recomputing rule evaluation.
-    18H. reasoning_to_od_pseudo_labels_driving_mini — trace useful/noisy
-                    candidate-derived rules back to candidate objects,
-                    tracks, and detection boxes, and emit task-utility
-                    pseudo labels for OD confidence calibration only.
-    18I. od_confidence_calibration_driving_mini — fit or export a
-                    lightweight candidate-branch OD confidence update
-                    policy from reasoning-derived pseudo labels.
     18B. neural_symbolic_baseline_driving_mini — train single-segment and
                     short-history symbolic neural baselines on the same
                     train/eval split and compare held-out classification
@@ -98,6 +91,13 @@ Steps:
                     export sampled full-frame visual audits for detected
                     traffic-light objects with drawn bounding boxes and
                     predicted state/context overlays for manual review.
+    18H. reasoning_to_od_pseudo_labels_driving_mini — trace useful/noisy
+                    candidate-derived rules back to candidate objects,
+                    tracks, and detection boxes, and emit task-utility
+                    pseudo labels for OD confidence calibration only.
+    18I. od_confidence_calibration_driving_mini — fit or export a
+                    lightweight candidate-branch OD confidence update
+                    policy from reasoning-derived pseudo labels.
     18J. baseline_safe_calibration_gate_driving_mini — audit accepted-only
                     baseline preservation plus final held-out F1 and accept
                     or reject the proposed OD calibration policy for the
@@ -149,6 +149,7 @@ except Exception:  # pragma: no cover - optional progress monitor dependency
     RTPT = None
 
 import config
+from src.exp_driving_videos import od_calibration_loop as od_calibration_loop_utils
 from src.exp_driving_videos import pipeline_config as driving_pipeline_config
 from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
@@ -224,6 +225,7 @@ _get_candidate_contribution_summary_cfg = driving_pipeline_config.get_candidate_
 _get_reasoning_to_od_pseudo_labels_cfg = driving_pipeline_config.get_reasoning_to_od_pseudo_labels_cfg
 _get_od_confidence_calibration_cfg = driving_pipeline_config.get_od_confidence_calibration_cfg
 _get_baseline_safe_calibration_gate_cfg = driving_pipeline_config.get_baseline_safe_calibration_gate_cfg
+_get_od_calibration_loop_cfg = driving_pipeline_config.get_od_calibration_loop_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_object_to_atom_coverage_diagnostic_cfg = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_cfg
 _get_traffic_control_rule_utility_diagnostic_cfg = (
@@ -309,14 +311,14 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17E", "stop_after": None, "label": "oracle_rule_selection_gap_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
     {"tag": "18A", "stop_after": None, "label": "candidate_contribution_summary_driving_mini"},
-    {"tag": "18H", "stop_after": None, "label": "reasoning_to_od_pseudo_labels_driving_mini"},
-    {"tag": "18I", "stop_after": None, "label": "od_confidence_calibration_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "neural_symbolic_baseline_driving_mini"},
     {"tag": "18C", "stop_after": None, "label": "rule_aggregation_baseline_driving_mini"},
     {"tag": "18D", "stop_after": None, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "18E", "stop_after": None, "label": "traffic_control_rule_utility_diagnostic_driving_mini"},
     {"tag": "18F", "stop_after": None, "label": "traffic_control_temporal_alignment_diagnostic_driving_mini"},
     {"tag": "18G", "stop_after": None, "label": "traffic_light_detection_quality_audit_driving_mini"},
+    {"tag": "18H", "stop_after": None, "label": "reasoning_to_od_pseudo_labels_driving_mini"},
+    {"tag": "18I", "stop_after": None, "label": "od_confidence_calibration_driving_mini"},
     {"tag": "18J", "stop_after": 18, "label": "baseline_safe_calibration_gate_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "error_and_explainability_analysis_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "vehicle_rule_diagnostic_driving_mini"},
@@ -432,6 +434,11 @@ class _FilteredStepWriter(io.TextIOBase):
 @dataclass(slots=True)
 class PipelineContext:
     effective_video_ids: List[str]
+    recompute_cfg: Dict[str, Any] = field(default_factory=dict)
+    od_loop_iteration_index: int = 1
+    force_full_iteration_recompute: bool = False
+    defer_stop_after_gate: bool = False
+    od_loop_stop_reason: str = ""
     background_rule_relevance_prior_results: Dict[str, Any] = field(default_factory=dict)
     detection_results: Optional[List[Dict[str, Any]]] = None
     tracking_results: Optional[List[Dict[str, Any]]] = None
@@ -450,7 +457,6 @@ class PipelineContext:
     split_manifest: Dict[str, Any] = field(default_factory=dict)
     train_temporal_rule_results: Optional[List[Dict[str, Any]]] = None
     eval_temporal_rule_results: Optional[List[Dict[str, Any]]] = None
-    recompute_cfg: Dict[str, Any] = field(default_factory=dict)
     candidate_rule_results: Optional[List[Dict[str, Any]]] = None
     merged_candidate_rules: Dict[str, Any] = field(default_factory=dict)
     extended_rule_results: Dict[str, Any] = field(default_factory=dict)
@@ -494,12 +500,12 @@ class StepRunner:
     rtpt: Optional[Any]
 
     @classmethod
-    def create(cls, requested_step: int | str) -> "StepRunner":
+    def create(cls, requested_step: int | str, *, total_rtpt_iterations: int | None = None) -> "StepRunner":
         stop_target, stop_label = _resolve_stop_request(requested_step)
         return cls(
             stop_target=stop_target,
             stop_label=stop_label,
-            rtpt=_start_rtpt(stop_target),
+            rtpt=_start_rtpt(stop_target, total_iterations=total_rtpt_iterations),
         )
 
     def announce_step(self, tag: str, name: str, *, leading_newline: bool = True) -> None:
@@ -509,11 +515,14 @@ class StepRunner:
     def log(self, tag: str, message: str) -> None:
         print(f"[Step {tag}] {message}")
 
-    def complete_step(self, tag: str, subtitle: str = "") -> None:
+    def complete_step(self, tag: str, subtitle: str = "", *, allow_stop: bool = True) -> None:
         _rtpt_step(self.rtpt, tag, subtitle=subtitle)
-        if str(tag) == self.stop_target:
-            print(f"\nStopping after step {self.stop_label} by request.")
-            raise _PipelineStopRequested()
+        if allow_stop and str(tag) == self.stop_target:
+            self.stop_now()
+
+    def stop_now(self) -> None:
+        print(f"\nStopping after step {self.stop_label} by request.")
+        raise _PipelineStopRequested()
 
     @contextmanager
     def module_output(self, tag: str) -> Any:
@@ -554,18 +563,20 @@ def _parse_max_step_arg(value: str) -> str:
     return normalized
 
 
-def _rtpt_max_iterations(stop_target: str) -> int:
+def _rtpt_max_iterations(stop_target: str, total_iterations: int | None = None) -> int:
+    if total_iterations is not None and total_iterations > 0:
+        return int(total_iterations)
     return _PIPELINE_STAGE_TAGS.index(stop_target) + 1
 
 
-def _start_rtpt(stop_target: str) -> Optional[Any]:
+def _start_rtpt(stop_target: str, *, total_iterations: int | None = None) -> Optional[Any]:
     if RTPT is None:
         print("RTPT unavailable; continuing without remote progress monitor.")
         return None
     rtpt = RTPT(
         name_initials="JI",
         experiment_name="DrivingMiniPipeline",
-        max_iterations=_rtpt_max_iterations(stop_target),
+        max_iterations=_rtpt_max_iterations(stop_target, total_iterations=total_iterations),
     )
     rtpt.start()
     return rtpt
@@ -578,6 +589,74 @@ def _rtpt_step(rtpt: Optional[Any], stage_tag: str, subtitle: str = "") -> None:
     if subtitle:
         stage_subtitle = f"{stage_subtitle} | {subtitle}"
     rtpt.step(subtitle=stage_subtitle)
+
+
+def _stage_index(tag: str) -> int:
+    return _PIPELINE_STAGE_TAGS.index(str(tag))
+
+
+def _stop_target_reaches(tag: str, stop_target: str) -> bool:
+    return _stage_index(stop_target) >= _stage_index(tag)
+
+
+def _force_recompute(ctx: PipelineContext, key: str | None = None, default: bool = False) -> bool:
+    if ctx.force_full_iteration_recompute:
+        return True
+    if key is None:
+        return bool(default)
+    return bool(ctx.recompute_cfg.get(key, default))
+
+
+def _resolve_od_calibration_loop_cfg(
+    *,
+    max_iterations_override: int | None = None,
+) -> od_calibration_loop_utils.ODCalibrationLoopConfig:
+    gate_cfg = _get_baseline_safe_calibration_gate_cfg()
+    loop_cfg = dict(_get_od_calibration_loop_cfg())
+    if max_iterations_override is not None:
+        loop_cfg["max_iterations"] = max_iterations_override
+    return od_calibration_loop_utils.normalize_loop_cfg(
+        loop_cfg,
+        improvement_tolerance=float(gate_cfg.get("final_f1_tolerance", 1e-9)),
+    )
+
+
+def _should_run_od_calibration_loop(
+    stop_target: str,
+    loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
+) -> bool:
+    return loop_cfg.max_iterations > 1 and _stop_target_reaches("18J", stop_target)
+
+
+def _estimated_rtpt_iterations(
+    stop_target: str,
+    loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
+) -> int:
+    if not _should_run_od_calibration_loop(stop_target, loop_cfg):
+        return _rtpt_max_iterations(stop_target)
+    through_gate = _stage_index("18J") + 1
+    post_loop_steps = max(0, _stage_index(stop_target) - _stage_index("18J"))
+    return through_gate * int(loop_cfg.max_iterations) + post_loop_steps
+
+
+def _build_pipeline_context(
+    *,
+    video_ids: Optional[List[str]],
+    video_count: int | None,
+    iteration_index: int = 1,
+    force_full_recompute: bool = False,
+    defer_stop_after_gate: bool = False,
+) -> PipelineContext:
+    return PipelineContext(
+        effective_video_ids=_resolve_video_ids(video_ids, video_count),
+        recompute_cfg=od_calibration_loop_utils.apply_iteration_recompute_overrides(
+            _get_pipeline_recompute_cfg(),
+            force_full_recompute=force_full_recompute,
+        ),
+        od_loop_iteration_index=int(iteration_index),
+        force_full_iteration_recompute=bool(force_full_recompute),
+        defer_stop_after_gate=bool(defer_stop_after_gate),
+    )
 
 
 def _run_object_detection_step(
@@ -828,7 +907,6 @@ def _prepare_rule_learning_inputs(ctx: PipelineContext) -> None:
     )
     if not ctx.train_temporal_rule_results:
         raise RuntimeError("Train split is empty; cannot continue with rule learning.")
-    ctx.recompute_cfg = _get_pipeline_recompute_cfg()
 
 
 def run_step_0_background_rule_relevance_prior(ctx: PipelineContext, runner: StepRunner) -> None:
@@ -855,13 +933,14 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("1", f"render_video={render_video}")
     runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
     runner.log("1", f"od_calibration_policy={od_calibration_policy_utils.policy_id(active_od_policy) or 'none'}")
+    runner.log("1", f"force_recompute={_force_recompute(ctx)}")
     for warning in detect_driving_mini.detector_dependency_warnings(render_video=render_video):
         runner.log("1", f"[warn] {warning}")
     if ctx.effective_video_ids:
         runner.log("1", f"video_filter={ctx.effective_video_ids}")
     with runner.module_output("1"):
         ctx.detection_results = _run_object_detection_step(
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
             video_ids=ctx.effective_video_ids,
             render_video=render_video,
             od_calibration_policy=active_od_policy,
@@ -875,6 +954,7 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_tracking_render_video_enabled(default=True)
     runner.announce_step("2", "tracking_driving_mini")
     runner.log("2", f"render_video={render_video}")
+    runner.log("2", f"force_recompute={_force_recompute(ctx)}")
     if ctx.detection_results:
         runner.log(
             "2",
@@ -885,6 +965,7 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
         ctx.tracking_results = tracking_driving_mini.run(
             ctx.detection_results or [],
             render_video=render_video,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
     runner.log(
@@ -916,10 +997,12 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
 
 def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("3", "dataset_annotations_driving_mini")
+    runner.log("3", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("3"):
         ctx.dataset_annotation_results = dataset_annotations_driving_mini.run(
             video_ids=[r["video_id"] for r in (ctx.tracking_results or [])],
             tracking_results=ctx.tracking_results or [],
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("3", f"completed videos={len(ctx.dataset_annotation_results)}")
     runner.log(
@@ -933,11 +1016,13 @@ def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> No
     render_video = _get_merge_render_video_enabled(default=True)
     runner.announce_step("4", "merge_gt_and_detected_driving_mini")
     runner.log("4", f"render_video={render_video}")
+    runner.log("4", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("4"):
         ctx.merged_results = merge_gt_and_detected_driving_mini.run(
             tracking_results=ctx.tracking_results or [],
             dataset_annotation_results=ctx.dataset_annotation_results or [],
             render_video=render_video,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("4", f"completed videos={len(ctx.merged_results)}")
     runner.log(
@@ -949,9 +1034,11 @@ def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> No
 
 def run_step_5_prepare_3d_positions(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("5", "prepare_3d_positions_driving_mini")
+    runner.log("5", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("5"):
         ctx.positions_3d_results = prepare_3d_positions_driving_mini.run(
             merged_results=ctx.merged_results or [],
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("5", f"completed videos={len(ctx.positions_3d_results)}")
     runner.log(
@@ -969,10 +1056,11 @@ def run_step_6_ego_motion(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("6", f"smoothing_window={smoothing_window}")
     runner.log("6", f"static_adjustment={static_adjust_cfg}")
     runner.log("6", f"render_video={render_video}")
+    runner.log("6", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("6"):
         ctx.ego_motion_results = ego_motion_driving_mini.run(
             merged_results=ctx.merged_results or [],
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
             smoothing_window=smoothing_window,
             static_adjust_cfg=static_adjust_cfg,
             render_video=render_video,
@@ -983,11 +1071,12 @@ def run_step_6_ego_motion(ctx: PipelineContext, runner: StepRunner) -> None:
 
 def run_step_7_relative_object_motion(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("7", "relative_object_motion_driving_mini")
+    runner.log("7", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("7"):
         ctx.relative_motion_results = relative_object_motion_driving_mini.run(
             positions_3d_results=ctx.positions_3d_results or [],
             ego_motion_results=ctx.ego_motion_results or [],
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("7", f"completed videos={len(ctx.relative_motion_results)}")
     runner.log(
@@ -1001,12 +1090,13 @@ def run_step_8_temporal_segmentation(ctx: PipelineContext, runner: StepRunner) -
     temporal_seg_cfg = _get_temporal_segmentation_cfg()
     runner.announce_step("8", "temporal_segmentation_driving_mini")
     runner.log("8", f"cfg={temporal_seg_cfg}")
+    runner.log("8", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("8"):
         ctx.temporal_seg_results = temporal_segmentation_driving_mini.run(
             ego_motion_results=ctx.ego_motion_results or [],
             relative_motion_results=ctx.relative_motion_results or [],
             seg_cfg=temporal_seg_cfg,
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("8", f"completed videos={len(ctx.temporal_seg_results)}")
     runner.complete_step("8", subtitle=f"videos={len(ctx.temporal_seg_results)}")
@@ -1016,12 +1106,13 @@ def run_step_9_segment_object_motion(ctx: PipelineContext, runner: StepRunner) -
     segment_object_cfg = _get_segment_object_motion_cfg()
     runner.announce_step("9", "segment_object_motion_driving_mini")
     runner.log("9", f"cfg={segment_object_cfg}")
+    runner.log("9", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("9"):
         ctx.segment_object_results = segment_object_motion_driving_mini.run(
             relative_motion_results=ctx.relative_motion_results or [],
             temporal_segmentation_results=ctx.temporal_seg_results or [],
             cfg=segment_object_cfg,
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("9", f"completed videos={len(ctx.segment_object_results)}")
     runner.log(
@@ -1035,11 +1126,12 @@ def run_step_10_important_objects(ctx: PipelineContext, runner: StepRunner) -> N
     important_objects_cfg = _get_important_objects_cfg()
     runner.announce_step("10", "important_objects_driving_mini")
     runner.log("10", f"cfg={important_objects_cfg}")
+    runner.log("10", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("10"):
         ctx.important_object_results = important_objects_driving_mini.run(
             segment_object_motion_results=ctx.segment_object_results or [],
             cfg=important_objects_cfg,
-            force_recompute=False,
+            force_recompute=_force_recompute(ctx),
         )
     runner.log("10", f"completed videos={len(ctx.important_object_results)}")
     runner.complete_step("10", subtitle=f"videos={len(ctx.important_object_results)}")
@@ -1049,16 +1141,13 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
     traffic_control_attributes_cfg = _get_traffic_control_attributes_cfg()
     runner.announce_step("10B", "traffic_control_attributes_driving_mini")
     runner.log("10B", f"cfg={traffic_control_attributes_cfg}")
-    runner.log(
-        "10B",
-        f"recompute={bool(ctx.recompute_cfg.get('traffic_control_attributes', False))}",
-    )
+    runner.log("10B", f"recompute={_force_recompute(ctx, 'traffic_control_attributes', False)}")
     with runner.module_output("10B"):
         ctx.traffic_control_attribute_results = traffic_control_attributes_driving_mini.run(
             important_object_results=ctx.important_object_results or [],
             relative_motion_results=ctx.relative_motion_results or [],
             cfg=traffic_control_attributes_cfg,
-            force_recompute=bool(ctx.recompute_cfg.get("traffic_control_attributes", False)),
+            force_recompute=_force_recompute(ctx, "traffic_control_attributes", False),
         )
     runner.log("10B", f"completed videos={len(ctx.traffic_control_attribute_results)}")
     runner.complete_step("10B", subtitle=f"videos={len(ctx.traffic_control_attribute_results)}")
@@ -1068,12 +1157,12 @@ def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
     logic_atoms_cfg = _get_logic_atoms_cfg()
     runner.announce_step("11", "logic_atoms_driving_mini")
     runner.log("11", f"cfg={logic_atoms_cfg}")
-    runner.log("11", f"recompute={bool(ctx.recompute_cfg.get('logic_atoms', False))}")
+    runner.log("11", f"recompute={_force_recompute(ctx, 'logic_atoms', False)}")
     with runner.module_output("11"):
         ctx.logic_atom_results = logic_atoms_driving_mini.run(
             segment_object_motion_results=ctx.traffic_control_attribute_results or ctx.important_object_results or [],
             cfg=logic_atoms_cfg,
-            force_recompute=bool(ctx.recompute_cfg.get("logic_atoms", False)),
+            force_recompute=_force_recompute(ctx, "logic_atoms", False),
         )
     runner.log("11", f"completed videos={len(ctx.logic_atom_results)}")
     runner.complete_step("11", subtitle=f"videos={len(ctx.logic_atom_results)}")
@@ -1083,12 +1172,12 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
     target_head_cfg = _get_target_head_atoms_cfg()
     runner.announce_step("12", "target_head_atoms_driving_mini")
     runner.log("12", f"cfg={target_head_cfg}")
-    runner.log("12", f"recompute={bool(ctx.recompute_cfg.get('target_head_atoms', False))}")
+    runner.log("12", f"recompute={_force_recompute(ctx, 'target_head_atoms', False)}")
     with runner.module_output("12"):
         ctx.target_head_results = target_head_atoms_driving_mini.run(
             logic_atom_results=ctx.logic_atom_results or [],
             cfg=target_head_cfg,
-            force_recompute=bool(ctx.recompute_cfg.get("target_head_atoms", False)),
+            force_recompute=_force_recompute(ctx, "target_head_atoms", False),
         )
     runner.log("12", f"completed videos={len(ctx.target_head_results)}")
     runner.complete_step("12", subtitle=f"videos={len(ctx.target_head_results)}")
@@ -1098,12 +1187,12 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
     rule_examples_cfg = _get_temporal_rule_examples_cfg()
     runner.announce_step("13", "temporal_rule_examples_driving_mini")
     runner.log("13", f"cfg={rule_examples_cfg}")
-    runner.log("13", f"recompute={bool(ctx.recompute_cfg.get('temporal_rule_examples', False))}")
+    runner.log("13", f"recompute={_force_recompute(ctx, 'temporal_rule_examples', False)}")
     with runner.module_output("13"):
         ctx.temporal_rule_results = temporal_rule_examples_driving_mini.run(
             target_head_results=ctx.target_head_results or [],
             cfg=rule_examples_cfg,
-            force_recompute=bool(ctx.recompute_cfg.get("temporal_rule_examples", False)),
+            force_recompute=_force_recompute(ctx, "temporal_rule_examples", False),
         )
     runner.log("13", f"completed videos={len(ctx.temporal_rule_results)}")
     runner.complete_step("13", subtitle=f"videos={len(ctx.temporal_rule_results)}")
@@ -1633,6 +1722,7 @@ def run_step_18j_baseline_safe_calibration_gate(ctx: PipelineContext, runner: St
     runner.complete_step(
         "18J",
         subtitle=f"decision={ctx.baseline_safe_calibration_gate_results.get('decision', 'n/a')}",
+        allow_stop=not ctx.defer_stop_after_gate,
     )
 
 
@@ -1806,6 +1896,142 @@ def run_step_23b_reasoning_feedback_signal(ctx: PipelineContext, runner: StepRun
     runner.complete_step("23B", subtitle=f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
 
 
+def _run_steps_through_18j(ctx: PipelineContext, runner: StepRunner) -> None:
+    run_step_0_background_rule_relevance_prior(ctx, runner)
+
+    # Perception
+    run_step_1_detection(ctx, runner)
+    run_step_2_tracking(ctx, runner)
+    run_step_3_dataset_annotations(ctx, runner)
+    run_step_4_merge_annotations(ctx, runner)
+    run_step_5_prepare_3d_positions(ctx, runner)
+
+    # Motion and symbolic scene abstraction
+    run_step_6_ego_motion(ctx, runner)
+    run_step_7_relative_object_motion(ctx, runner)
+    run_step_8_temporal_segmentation(ctx, runner)
+    run_step_9_segment_object_motion(ctx, runner)
+    run_step_10_important_objects(ctx, runner)
+    run_step_10b_traffic_control_attributes(ctx, runner)
+
+    # Logic and rule mining
+    run_step_11_logic_atoms(ctx, runner)
+    run_step_12_target_head_atoms(ctx, runner)
+    run_step_13_temporal_rule_examples(ctx, runner)
+    _prepare_rule_learning_inputs(ctx)
+    runner.log(
+        "13",
+        "split "
+        f"train_videos={len(ctx.split_manifest.get('train_video_ids', []))} "
+        f"eval_videos={len(ctx.split_manifest.get('eval_video_ids', []))}",
+    )
+    runner.log("13", f"recompute_cfg={ctx.recompute_cfg}")
+    run_step_14_candidate_rules(ctx, runner)
+    run_step_15_merge_initial_rules(ctx, runner)
+    run_step_16_extended_rules(ctx, runner)
+
+    # Rule selection
+    run_step_17_final_rules(ctx, runner)
+    run_step_17b_diverse_final_rules(ctx, runner)
+    run_step_17b2_semantic_constrained(ctx, runner)
+    run_step_17c_coverage_family_aware(ctx, runner)
+    run_step_17d_rule_pool_upper_bound(ctx, runner)
+    run_step_17e_oracle_gap(ctx, runner)
+
+    # Evaluation and baselines
+    run_step_18_rule_evaluation(ctx, runner)
+    run_step_18a_candidate_contribution_summary(ctx, runner)
+    run_step_18b_neural_symbolic_baseline(ctx, runner)
+    run_step_18c_rule_aggregation_baseline(ctx, runner)
+    run_step_18d_object_to_atom_coverage(ctx, runner)
+    run_step_18e_traffic_control_rule_utility(ctx, runner)
+    run_step_18f_traffic_control_temporal_alignment(ctx, runner)
+    run_step_18g_traffic_light_detection_quality_audit(ctx, runner)
+    run_step_18h_reasoning_to_od_pseudo_labels(ctx, runner)
+    run_step_18i_od_confidence_calibration(ctx, runner)
+    run_step_18j_baseline_safe_calibration_gate(ctx, runner)
+
+
+def _run_post_loop_steps(ctx: PipelineContext, runner: StepRunner) -> None:
+    run_step_19_error_analysis(ctx, runner)
+    run_step_20_vehicle_rule_diagnostic(ctx, runner)
+    run_step_20b_fn_categorization(ctx, runner)
+    run_step_21_rule_selection_visualization(ctx, runner)
+    run_step_22_integrated_visualization(ctx, runner)
+    run_step_23a_background_causal_prior(ctx, runner)
+    run_step_23b_reasoning_feedback_signal(ctx, runner)
+
+
+def _run_single_pass_pipeline(
+    runner: StepRunner,
+    *,
+    video_ids: Optional[List[str]],
+    video_count: int | None,
+) -> None:
+    ctx = _build_pipeline_context(
+        video_ids=video_ids,
+        video_count=video_count,
+    )
+    _run_steps_through_18j(ctx, runner)
+    if _stop_target_reaches("19", runner.stop_target):
+        _run_post_loop_steps(ctx, runner)
+
+
+def _run_od_calibration_loop(
+    runner: StepRunner,
+    *,
+    video_ids: Optional[List[str]],
+    video_count: int | None,
+    loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
+) -> PipelineContext:
+    final_ctx: Optional[PipelineContext] = None
+    for iteration_index in range(1, int(loop_cfg.max_iterations) + 1):
+        force_full_recompute = od_calibration_loop_utils.iteration_requires_full_recompute(
+            iteration_index,
+            force_full_recompute_on_policy_change=loop_cfg.force_full_recompute_on_policy_change,
+        )
+        ctx = _build_pipeline_context(
+            video_ids=video_ids,
+            video_count=video_count,
+            iteration_index=iteration_index,
+            force_full_recompute=force_full_recompute,
+            defer_stop_after_gate=True,
+        )
+        active_policy_before = od_calibration_policy_utils.load_active_od_calibration_policy()
+        runner.log(
+            "18J",
+            "od_calibration_loop "
+            f"iteration={iteration_index}/{loop_cfg.max_iterations} "
+            f"input_policy={od_calibration_policy_utils.policy_id(active_policy_before) or 'identity'} "
+            f"force_recompute={force_full_recompute}",
+        )
+        _run_steps_through_18j(ctx, runner)
+        decision = od_calibration_loop_utils.should_continue_after_iteration(
+            ctx.baseline_safe_calibration_gate_results,
+            iteration_index=iteration_index,
+            loop_cfg=loop_cfg,
+        )
+        ctx.od_loop_stop_reason = decision.reason
+        reference_final_f1 = (
+            f"{decision.reference_final_f1:.3f}"
+            if decision.reference_final_f1 is not None
+            else "n/a"
+        )
+        runner.log(
+            "18J",
+            "od_calibration_loop_result "
+            f"reason={decision.reason} "
+            f"current_final_f1={decision.current_final_f1:.3f} "
+            f"reference_final_f1={reference_final_f1}",
+        )
+        final_ctx = ctx
+        if not decision.continue_loop:
+            return ctx
+    if final_ctx is None:
+        raise RuntimeError("OD calibration loop did not execute any iterations.")
+    return final_ctx
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the driving_mini experiment pipeline up to a selected step.",
@@ -1837,6 +2063,12 @@ def parse_args() -> argparse.Namespace:
             "When used, downstream train/eval splits scale to consume the selected N videos."
         ),
     )
+    parser.add_argument(
+        "--od-calibration-iterations",
+        dest="od_calibration_iterations",
+        type=int,
+        help="Override the configured maximum number of OD calibration loop iterations.",
+    )
     return parser.parse_args()
 
 
@@ -1844,80 +2076,51 @@ def main(
     max_step: int | str = 23,
     video_ids: Optional[List[str]] = None,
     video_count: int | None = None,
+    od_calibration_iterations: int | None = None,
 ) -> None:
     if video_count is not None and video_count < 1:
         raise ValueError(f"video_count must be >= 1. Found {video_count}.")
-    ctx = PipelineContext(effective_video_ids=_resolve_video_ids(video_ids, video_count))
-    runner = StepRunner.create(max_step)
-    try:
-        run_step_0_background_rule_relevance_prior(ctx, runner)
-
-        # Perception
-        run_step_1_detection(ctx, runner)
-        run_step_2_tracking(ctx, runner)
-        run_step_3_dataset_annotations(ctx, runner)
-        run_step_4_merge_annotations(ctx, runner)
-        run_step_5_prepare_3d_positions(ctx, runner)
-
-        # Motion and symbolic scene abstraction
-        run_step_6_ego_motion(ctx, runner)
-        run_step_7_relative_object_motion(ctx, runner)
-        run_step_8_temporal_segmentation(ctx, runner)
-        run_step_9_segment_object_motion(ctx, runner)
-        run_step_10_important_objects(ctx, runner)
-        run_step_10b_traffic_control_attributes(ctx, runner)
-
-        # Logic and rule mining
-        run_step_11_logic_atoms(ctx, runner)
-        run_step_12_target_head_atoms(ctx, runner)
-        run_step_13_temporal_rule_examples(ctx, runner)
-        _prepare_rule_learning_inputs(ctx)
-        runner.log(
-            "13",
-            "split "
-            f"train_videos={len(ctx.split_manifest.get('train_video_ids', []))} "
-            f"eval_videos={len(ctx.split_manifest.get('eval_video_ids', []))}",
+    if od_calibration_iterations is not None and od_calibration_iterations < 1:
+        raise ValueError(
+            "od_calibration_iterations must be >= 1. "
+            f"Found {od_calibration_iterations}."
         )
-        runner.log("13", f"recompute_cfg={ctx.recompute_cfg}")
-        run_step_14_candidate_rules(ctx, runner)
-        run_step_15_merge_initial_rules(ctx, runner)
-        run_step_16_extended_rules(ctx, runner)
-
-        # Rule selection
-        run_step_17_final_rules(ctx, runner)
-        run_step_17b_diverse_final_rules(ctx, runner)
-        run_step_17b2_semantic_constrained(ctx, runner)
-        run_step_17c_coverage_family_aware(ctx, runner)
-        run_step_17d_rule_pool_upper_bound(ctx, runner)
-        run_step_17e_oracle_gap(ctx, runner)
-
-        # Evaluation and baselines
-        run_step_18_rule_evaluation(ctx, runner)
-        run_step_18a_candidate_contribution_summary(ctx, runner)
-        run_step_18h_reasoning_to_od_pseudo_labels(ctx, runner)
-        run_step_18i_od_confidence_calibration(ctx, runner)
-        run_step_18b_neural_symbolic_baseline(ctx, runner)
-        run_step_18c_rule_aggregation_baseline(ctx, runner)
-        run_step_18d_object_to_atom_coverage(ctx, runner)
-        run_step_18e_traffic_control_rule_utility(ctx, runner)
-        run_step_18f_traffic_control_temporal_alignment(ctx, runner)
-        run_step_18g_traffic_light_detection_quality_audit(ctx, runner)
-        run_step_18j_baseline_safe_calibration_gate(ctx, runner)
-
-        # Diagnostics
-        run_step_19_error_analysis(ctx, runner)
-        run_step_20_vehicle_rule_diagnostic(ctx, runner)
-        run_step_20b_fn_categorization(ctx, runner)
-
-        # Visualization
-        run_step_21_rule_selection_visualization(ctx, runner)
-        run_step_22_integrated_visualization(ctx, runner)
-        run_step_23a_background_causal_prior(ctx, runner)
-        run_step_23b_reasoning_feedback_signal(ctx, runner)
+    resolved_stop_target, _ = _resolve_stop_request(max_step)
+    loop_cfg = _resolve_od_calibration_loop_cfg(
+        max_iterations_override=od_calibration_iterations,
+    )
+    runner = StepRunner.create(
+        max_step,
+        total_rtpt_iterations=_estimated_rtpt_iterations(resolved_stop_target, loop_cfg),
+    )
+    try:
+        if _should_run_od_calibration_loop(resolved_stop_target, loop_cfg):
+            ctx = _run_od_calibration_loop(
+                runner,
+                video_ids=video_ids,
+                video_count=video_count,
+                loop_cfg=loop_cfg,
+            )
+            runner.log("18J", f"od_calibration_loop_stop_reason={ctx.od_loop_stop_reason or 'completed'}")
+            if resolved_stop_target == "18J":
+                runner.stop_now()
+            if _stop_target_reaches("19", resolved_stop_target):
+                _run_post_loop_steps(ctx, runner)
+            return
+        _run_single_pass_pipeline(
+            runner,
+            video_ids=video_ids,
+            video_count=video_count,
+        )
     except _PipelineStopRequested:
         return
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(max_step=args.max_step, video_ids=args.video_ids, video_count=args.video_count)
+    main(
+        max_step=args.max_step,
+        video_ids=args.video_ids,
+        video_count=args.video_count,
+        od_calibration_iterations=args.od_calibration_iterations,
+    )

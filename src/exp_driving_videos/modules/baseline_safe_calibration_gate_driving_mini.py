@@ -171,8 +171,11 @@ def process(
         "config": _cfg_key_subset(cfg),
         "decision": decision,
         "decision_reason": decision_reason,
+        "active_policy_before_id": od_calibration_policy_utils.policy_id(active_policy_before),
         "proposed_policy_id": od_calibration_policy_utils.policy_id(proposed_policy),
         "active_policy_after_id": active_policy_after_id,
+        "reference_metrics": reference_metrics,
+        "current_metrics": current_metrics,
         "audit_path": str(audit_json_path),
         "active_state_after": active_state_after,
     }

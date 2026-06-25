@@ -483,6 +483,19 @@ def get_baseline_safe_calibration_gate_cfg() -> Dict[str, Any]:
     )
 
 
+def get_od_calibration_loop_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "max_iterations": 3,
+            "force_full_recompute_on_policy_change": True,
+            "stop_on_gate_reject": True,
+            "stop_on_final_f1_plateau": True,
+        },
+        path=("od_calibration_loop",),
+        warn_label="OD calibration loop",
+    )
+
+
 def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {

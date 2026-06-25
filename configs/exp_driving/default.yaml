@@ -258,6 +258,12 @@ baseline_safe_calibration_gate:
   baseline_tolerance: 1.0e-09
   final_f1_tolerance: 1.0e-09
 
+od_calibration_loop:
+  max_iterations: 3
+  force_full_recompute_on_policy_change: true
+  stop_on_gate_reject: true
+  stop_on_final_f1_plateau: true
+
 rule_aggregation_baseline:
   validation_fraction: 0.25
   class_weight: balanced
