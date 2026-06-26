@@ -38,7 +38,7 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 try:
     import cv2
@@ -214,6 +214,48 @@ def _quality_bucket(detection: Dict[str, Any]) -> str:
 
 def _detection_id(frame_index: int, collection_name: str, det_index: int) -> str:
     return f"{int(frame_index):06d}:{collection_name}:{int(det_index):04d}"
+
+
+def _iter_frame_detections(frame_records: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
+    for frame_record in frame_records:
+        for field_name in ("accepted_detections", "candidate_detections"):
+            for detection in list(frame_record.get(field_name, [])):
+                yield detection
+
+
+def _policy_marker_matches(
+    cached_marker: Dict[str, Any],
+    expected_marker: Dict[str, Any],
+) -> bool:
+    return (
+        str(cached_marker.get("policy_id", "")) == str(expected_marker.get("policy_id", ""))
+        and int(cached_marker.get("policy_version", 0)) == int(expected_marker.get("policy_version", 0))
+        and bool(cached_marker.get("policy_available", False)) == bool(expected_marker.get("policy_available", False))
+    )
+
+
+def _cache_has_detection_identity_and_calibration(
+    frame_records: List[Dict[str, Any]],
+    expected_policy_marker: Dict[str, Any],
+) -> bool:
+    for frame_record in frame_records:
+        if not _policy_marker_matches(
+            dict(frame_record.get("od_calibration", {})),
+            expected_policy_marker,
+        ):
+            return False
+        for detection in _iter_frame_detections([frame_record]):
+            if not str(detection.get("detection_id", "")).strip():
+                return False
+            if "raw_score" not in detection:
+                return False
+            if "calibrated_score" not in detection:
+                return False
+            if "feedback_bonus" not in detection:
+                return False
+            if "score_used_for_candidate_ranking" not in detection:
+                return False
+    return True
 
 
 def _ensure_detection_identity_and_calibration(
@@ -519,7 +561,7 @@ def render_detection_video(
 
 def process_video(
     video_id: str,
-    detector: ObjectDetector,
+    detector: Optional[ObjectDetector],
     od_calibration_policy: Optional[Dict[str, Any]] = None,
     background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
     frames_root: Optional[Path] = None,
@@ -533,6 +575,7 @@ def process_video(
     predictions_csv_file = out_dir / "detection_predictions.csv"
     class_summary_csv_file = out_dir / "detection_class_summary.csv"
     boxed_video_file = out_dir / "detections_boxed.mp4"
+    policy_marker = od_calibration_policy_utils.current_policy_marker(od_calibration_policy)
 
     if not force_recompute and detections_file.exists():
         with detections_file.open("r", encoding="utf-8") as fh:
@@ -543,9 +586,34 @@ def process_video(
             for frame in cached_frames
         )
         if cache_is_current:
+            cached_output_paths = dict(cached.get("output_paths", {}))
+            artifacts_ready = (
+                predictions_csv_file.exists()
+                and class_summary_csv_file.exists()
+                and (not render_video or boxed_video_file.exists() or not cached_frames)
+            )
+            if (
+                artifacts_ready
+                and _policy_marker_matches(dict(cached.get("od_calibration", {})), policy_marker)
+                and _cache_has_detection_identity_and_calibration(cached_frames, policy_marker)
+            ):
+                cached["output_paths"] = {
+                    **cached_output_paths,
+                    "detections_json": str(detections_file),
+                    "detection_predictions_csv": str(predictions_csv_file),
+                    "detection_class_summary_csv": str(class_summary_csv_file),
+                    "background_rule_relevance_prior_json": str(
+                        background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", "")
+                    )
+                    if isinstance(background_rule_relevance_prior_results, dict)
+                    else "",
+                }
+                cached["od_calibration"] = dict(policy_marker)
+                cached["from_cache"] = True
+                return cached
             cached_frames = _ensure_detection_identity_and_calibration(cached_frames, od_calibration_policy)
             cached["frames"] = cached_frames
-            cached["od_calibration"] = od_calibration_policy_utils.current_policy_marker(od_calibration_policy)
+            cached["od_calibration"] = dict(policy_marker)
             prediction_rows = _build_prediction_rows(cached_frames, video_id=video_id)
             class_summary_rows = _build_class_summary_rows(prediction_rows)
             _write_csv(
@@ -559,6 +627,7 @@ def process_video(
                 class_summary_rows,
             )
             cached.setdefault("output_paths", {})
+            cached["output_paths"]["detections_json"] = str(detections_file)
             cached["output_paths"]["detection_predictions_csv"] = str(predictions_csv_file)
             cached["output_paths"]["detection_class_summary_csv"] = str(class_summary_csv_file)
             cached["output_paths"]["background_rule_relevance_prior_json"] = str(
@@ -619,6 +688,12 @@ def process_video(
         return result
 
     # Batch all frames in one model.predict() call for speed
+    if detector is None:
+        return {
+            "video_id": video_id,
+            "from_cache": False,
+            "_requires_detection": True,
+        }
     image_paths = [str(f) for f in frames]
     results: List[DetectionResult] = detector.detect_batch(image_paths)
 
@@ -728,8 +803,6 @@ def run(
             f"Import error: {_format_dependency_error(_CV2_IMPORT_ERROR)}"
         )
         effective_render_video = False
-    ensure_detector_runtime_available(render_video=effective_render_video)
-
     all_videos = list_video_ids(effective_frames_root)
     target_videos = list(video_ids) if video_ids else all_videos
 
@@ -742,23 +815,6 @@ def run(
         dict(od_calibration_policy)
         if isinstance(od_calibration_policy, dict)
         else od_calibration_policy_utils.load_active_od_calibration_policy()
-    )
-
-    detector = YOLOWorldDetector(
-        model_name=model_name,
-        classes=effective_classes,
-        confidence_threshold=confidence_threshold,
-        nms_iou_threshold=nms_iou_threshold,
-        candidate_confidence_threshold=candidate_confidence_threshold,
-        candidate_nms_iou_threshold=candidate_nms_iou_threshold,
-        borderline_confidence_margin=borderline_confidence_margin,
-        device=device,
-        predict_batch_size=predict_batch_size,
-        inference_imgsz=inference_imgsz,
-        use_half_precision=use_half_precision,
-        background_rule_relevance_prior_entries=list(background_rule_relevance_prior_results.get("entries", []))
-        if isinstance(background_rule_relevance_prior_results, dict)
-        else [],
     )
 
     print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
@@ -776,16 +832,42 @@ def run(
         f"{od_calibration_policy_utils.policy_id(resolved_calibration_policy) or 'none'}"
     )
 
-    detector.warmup()
-    runtime_profile = detector.get_runtime_profile() if isinstance(detector, YOLOWorldDetector) else {}
-    print(
-        "Inference profile: "
-        f"device={runtime_profile.get('device', device)}, "
-        f"gpu={runtime_profile.get('gpu_name', 'n/a')}, "
-        f"batch={runtime_profile.get('predict_batch_size', predict_batch_size)}, "
-        f"imgsz={runtime_profile.get('inference_imgsz', inference_imgsz)}, "
-        f"half={runtime_profile.get('half_precision', use_half_precision)}"
-    )
+    detector: Optional[ObjectDetector] = None
+    runtime_profile: Dict[str, Any] = {}
+
+    def _ensure_detector() -> ObjectDetector:
+        nonlocal detector, runtime_profile
+        if detector is not None:
+            return detector
+        ensure_detector_runtime_available(render_video=effective_render_video)
+        detector = YOLOWorldDetector(
+            model_name=model_name,
+            classes=effective_classes,
+            confidence_threshold=confidence_threshold,
+            nms_iou_threshold=nms_iou_threshold,
+            candidate_confidence_threshold=candidate_confidence_threshold,
+            candidate_nms_iou_threshold=candidate_nms_iou_threshold,
+            borderline_confidence_margin=borderline_confidence_margin,
+            device=device,
+            predict_batch_size=predict_batch_size,
+            inference_imgsz=inference_imgsz,
+            use_half_precision=use_half_precision,
+            background_rule_relevance_prior_entries=list(background_rule_relevance_prior_results.get("entries", []))
+            if isinstance(background_rule_relevance_prior_results, dict)
+            else [],
+        )
+        detector.warmup()
+        runtime_profile = detector.get_runtime_profile() if isinstance(detector, YOLOWorldDetector) else {}
+        print(
+            "Inference profile: "
+            f"device={runtime_profile.get('device', device)}, "
+            f"gpu={runtime_profile.get('gpu_name', 'n/a')}, "
+            f"batch={runtime_profile.get('predict_batch_size', predict_batch_size)}, "
+            f"imgsz={runtime_profile.get('inference_imgsz', inference_imgsz)}, "
+            f"half={runtime_profile.get('half_precision', use_half_precision)}"
+        )
+        return detector
+
     video_results: List[Dict[str, Any]] = []
     try:
         total_videos = len(target_videos)
@@ -800,11 +882,25 @@ def run(
                 force_recompute=force_recompute,
                 render_video=effective_render_video,
             )
+            if (
+                bool(result.get("_requires_detection", False))
+            ):
+                result = process_video(
+                    video_id=video_id,
+                    detector=_ensure_detector(),
+                    od_calibration_policy=resolved_calibration_policy,
+                    background_rule_relevance_prior_results=background_rule_relevance_prior_results,
+                    frames_root=effective_frames_root,
+                    output_root=effective_output_root,
+                    force_recompute=force_recompute,
+                    render_video=effective_render_video,
+                )
             video_results.append(result)
             cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
             print(f"Progress: {_format_step_progress(index, total_videos)} | {video_id} | {cache_tag}")
     finally:
-        detector.teardown()
+        if detector is not None:
+            detector.teardown()
 
     # Aggregate class counts across all videos
     total_labels: Counter[str] = Counter()
