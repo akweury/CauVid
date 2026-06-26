@@ -32,7 +32,8 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RULE_EVALUATION_VERSION = 4
+_RULE_EVALUATION_VERSION = 5
+_VARIABLE_ARGS = {"S", "O", "C", "T", "F"}
 
 
 def get_output_root() -> Path:
@@ -76,7 +77,7 @@ def _extract_bindings(
 
     bindings: Dict[str, str] = {}
     for template_arg, concrete_arg in zip(template_args, concrete_args):
-        if template_arg in {"S", "O", "T", "F"}:
+        if template_arg in _VARIABLE_ARGS:
             existing = bindings.get(template_arg)
             if existing is not None and existing != concrete_arg:
                 return None
@@ -244,6 +245,32 @@ def _build_rule_subset_views(
             rule for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"
         ],
     }
+
+
+def _empty_category_counts() -> Dict[str, int]:
+    return {
+        "accepted_only_rules": 0,
+        "candidate_only_rules": 0,
+        "mixed_accepted_candidate_rules": 0,
+        "candidate_involving_rules": 0,
+        "all_rules": 0,
+    }
+
+
+def _count_rule_categories(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts = _empty_category_counts()
+    for rule in rules:
+        category = str(rule.get("candidate_rule_category", "")) or _rule_candidate_category(rule)
+        counts["all_rules"] += 1
+        if category == "mixed_accepted_candidate":
+            counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_only":
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        else:
+            counts["accepted_only_rules"] += 1
+    return counts
 
 
 def _predicted_positive_ids_for_rules(
@@ -667,6 +694,25 @@ def process_rules(
     covered_positive_example_ids = set(rule_subset_metrics["all_rules"].get("covered_positive_example_ids", []))
     false_negative_example_ids = list(rule_subset_metrics["all_rules"].get("false_negative_example_ids", []))
     false_positive_example_ids = list(rule_subset_metrics["all_rules"].get("false_positive_example_ids", []))
+    evaluated_rule_counts = _count_rule_categories(rule_evaluations)
+    fired_rule_counts = _count_rule_categories(
+        [rule for rule in rule_evaluations if int(rule.get("eval_total_firings", 0)) > 0]
+    )
+    candidate_rule_flow_summary = dict(final_rule_results.get("candidate_rule_flow_summary", {}))
+    if not candidate_rule_flow_summary:
+        candidate_rule_flow_summary = {
+            "atom_availability": {},
+            "initial_rule_generation": _empty_category_counts(),
+            "merged_after_step15": _empty_category_counts(),
+            "pruning": _empty_category_counts(),
+            "extension": {},
+            "final_selection": _count_rule_categories(final_rules),
+            "evaluation": _empty_category_counts(),
+        }
+    candidate_rule_flow_summary["evaluation"] = {
+        "evaluated_rule_counts": evaluated_rule_counts,
+        "fired_rule_counts": fired_rule_counts,
+    }
 
     example_prediction_rows: List[Dict[str, Any]] = []
     for example in eval_examples:
@@ -709,6 +755,12 @@ def process_rules(
         "num_eval_negative_examples": len(eval_examples) - total_positive_examples,
         "num_final_rules": len(final_rules),
         "num_rules_fired": sum(1 for rule in rule_evaluations if int(rule.get("eval_total_firings", 0)) > 0),
+        "candidate_rule_stage_stats": {
+            "stage": "step18_rule_evaluation",
+            "evaluated_rule_counts": evaluated_rule_counts,
+            "fired_rule_counts": fired_rule_counts,
+        },
+        "candidate_rule_flow_summary": candidate_rule_flow_summary,
         "predicted_positive_example_ids": sorted(predicted_positive_example_ids),
         "covered_positive_example_ids": sorted(covered_positive_example_ids),
         "false_negative_example_ids": sorted(false_negative_example_ids),
@@ -720,6 +772,7 @@ def process_rules(
         "rule_evaluations": rule_evaluations,
         "example_predictions_csv_path": str(example_csv_path),
         "rule_subset_metrics_csv_path": str(subset_csv_path),
+        "candidate_rule_flow_summary_json_path": str(out_root / "candidate_rule_flow_summary.json"),
         "pdf_path": str(pdf_path),
     }
 
@@ -727,6 +780,10 @@ def process_rules(
 
     with json_path.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
+
+    candidate_flow_path = out_root / "candidate_rule_flow_summary.json"
+    with candidate_flow_path.open("w", encoding="utf-8") as fh:
+        json.dump(candidate_rule_flow_summary, fh, indent=2)
 
     with csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(

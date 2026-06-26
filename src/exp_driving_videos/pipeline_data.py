@@ -9,18 +9,20 @@ from typing import Any, Dict, List
 import config
 from src.exp_driving_videos import pipeline_config
 
-_MERGED_INITIAL_RULES_VERSION = 2
+_MERGED_INITIAL_RULES_VERSION = 3
 
 
 def dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
-    seen: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+    seen: set[tuple[str, str, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]] = set()
     for entry in evidence_entries:
         bindings = dict(entry.get("bindings", {}))
+        matched_atoms = dict(entry.get("matched_atoms", {}))
         key = (
             str(entry.get("example_id", "")),
             str(entry.get("matched_atom", "")),
             tuple(sorted((str(k), str(v)) for k, v in bindings.items())),
+            tuple(sorted((str(k), str(v)) for k, v in matched_atoms.items())),
         )
         if key in seen:
             continue
@@ -66,31 +68,43 @@ def summarize_rule_candidate_provenance(
     evidence_entries: List[Dict[str, Any]],
     body_length: int,
 ) -> Dict[str, Any]:
-    candidate_entries = [
-        entry for entry in evidence_entries
-        if str(entry.get("body_atom_source", "")) == "candidate"
-    ]
-    accepted_entries = [
-        entry for entry in evidence_entries
-        if str(entry.get("body_atom_source", "")) == "accepted"
-    ]
-    uses_candidate_atoms = bool(candidate_entries)
-    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_entries
-    mixes_accepted_and_candidate_atoms = bool(candidate_entries) and bool(accepted_entries)
-    num_candidate_body_atoms = 1 if uses_candidate_atoms else 0
+    candidate_body_templates: set[str] = set()
+    accepted_body_templates: set[str] = set()
+    candidate_evidence_firings = 0
+    accepted_evidence_firings = 0
     matched_prior_ids_involved = sorted(
         {
             str(prior_id)
-            for entry in candidate_entries
-            for prior_id in list(entry.get("matched_prior_ids", []))
+            for entry in evidence_entries
+            for prior_ids in dict(entry.get("matched_atom_prior_ids", {})).values()
+            for prior_id in list(prior_ids)
             if str(prior_id)
         }
     )
+    for entry in evidence_entries:
+        matched_atom_sources = dict(entry.get("matched_atom_sources", {}))
+        if not matched_atom_sources:
+            body_atom_template = str(entry.get("body_atom_template", "")).strip()
+            source = str(entry.get("body_atom_source", "")).strip()
+            if body_atom_template and source:
+                matched_atom_sources = {body_atom_template: source}
+        for body_atom_template, source in matched_atom_sources.items():
+            if str(source) == "candidate":
+                candidate_body_templates.add(str(body_atom_template))
+                candidate_evidence_firings += 1
+            elif str(source) == "accepted":
+                accepted_body_templates.add(str(body_atom_template))
+                accepted_evidence_firings += 1
+
+    uses_candidate_atoms = bool(candidate_body_templates)
+    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_body_templates
+    mixes_accepted_and_candidate_atoms = bool(candidate_body_templates) and bool(accepted_body_templates)
+    num_candidate_body_atoms = len(candidate_body_templates)
     if mixes_accepted_and_candidate_atoms:
         body_source_mix = "mixed_accepted_and_candidate"
     elif uses_only_candidate_atoms:
         body_source_mix = "candidate_only"
-    elif accepted_entries:
+    elif accepted_body_templates:
         body_source_mix = "accepted_only"
     else:
         body_source_mix = "non_object_or_segment_only"
@@ -103,13 +117,50 @@ def summarize_rule_candidate_provenance(
         "mixes_accepted_and_candidate_atoms": mixes_accepted_and_candidate_atoms,
         "uses_only_candidate_atoms": uses_only_candidate_atoms,
         "body_source_mix": body_source_mix,
-        "candidate_evidence_firings": len(candidate_entries),
-        "accepted_evidence_firings": len(accepted_entries),
+        "candidate_evidence_firings": candidate_evidence_firings,
+        "accepted_evidence_firings": accepted_evidence_firings,
     }
+
+
+def rule_candidate_category(rule: Dict[str, Any]) -> str:
+    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
+        return "mixed_accepted_candidate"
+    if bool(rule.get("uses_only_candidate_atoms", False)):
+        return "candidate_only"
+    if bool(rule.get("uses_candidate_atoms", False)):
+        return "candidate_only"
+    return "accepted_only"
+
+
+def empty_rule_category_counts() -> Dict[str, int]:
+    return {
+        "accepted_only_rules": 0,
+        "candidate_only_rules": 0,
+        "mixed_accepted_candidate_rules": 0,
+        "candidate_involving_rules": 0,
+        "all_rules": 0,
+    }
+
+
+def count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = empty_rule_category_counts()
+    for rule in rules:
+        category = str(rule.get("candidate_rule_category", "")) or rule_candidate_category(rule)
+        counts["all_rules"] += 1
+        if category == "mixed_accepted_candidate":
+            counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_only":
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        else:
+            counts["accepted_only_rules"] += 1
+    return counts
 
 
 def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     out_root = pipeline_config.get_merged_candidate_rules_output_root()
+    out_root.mkdir(parents=True, exist_ok=True)
     json_path = out_root / "merged_initial_rules.json"
     csv_path = out_root / "merged_initial_rules.csv"
     manifest_path = out_root / "merged_initial_rules_manifest.json"
@@ -123,6 +174,16 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
     total_rules_using_candidate_atoms = 0
     total_candidate_only_rules = 0
     total_mixed_source_rules = 0
+    input_generated_counts = empty_rule_category_counts()
+    atom_availability_counts = {
+        "num_body_atom_templates": 0,
+        "num_accepted_body_atom_templates": 0,
+        "num_candidate_body_atom_templates": 0,
+        "num_candidate_semantic_body_atom_templates": 0,
+        "num_candidate_provenance_only_body_atom_templates": 0,
+    }
+    candidate_semantic_body_atom_templates: set[str] = set()
+    candidate_provenance_only_body_atom_templates: set[str] = set()
 
     for video_result in sorted(candidate_rule_results, key=lambda item: str(item.get("video_id", ""))):
         video_id = str(video_result.get("video_id", "unknown"))
@@ -150,6 +211,37 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         total_rules_using_candidate_atoms += int(video_result.get("num_rules_using_candidate_atoms", 0))
         total_candidate_only_rules += int(video_result.get("num_candidate_only_rules", 0))
         total_mixed_source_rules += int(video_result.get("num_mixed_source_rules", 0))
+        atom_availability = dict(
+            dict(video_result.get("candidate_rule_stage_stats", {})).get("atom_availability", {})
+        )
+        for key in atom_availability_counts:
+            atom_availability_counts[key] += int(atom_availability.get(key, 0))
+        candidate_semantic_body_atom_templates.update(
+            str(value)
+            for value in list(atom_availability.get("candidate_semantic_body_atom_templates", []))
+            if str(value)
+        )
+        candidate_provenance_only_body_atom_templates.update(
+            str(value)
+            for value in list(atom_availability.get("candidate_provenance_only_body_atom_templates", []))
+            if str(value)
+        )
+        generated_counts = dict(
+            dict(video_result.get("candidate_rule_stage_stats", {})).get("generated_rule_counts", {})
+        )
+        if not generated_counts:
+            generated_counts = {
+                "accepted_only_rules": max(
+                    0,
+                    len(candidate_rules) - int(video_result.get("num_rules_using_candidate_atoms", 0)),
+                ),
+                "candidate_only_rules": int(video_result.get("num_candidate_only_rules", 0)),
+                "mixed_accepted_candidate_rules": int(video_result.get("num_mixed_source_rules", 0)),
+                "candidate_involving_rules": int(video_result.get("num_rules_using_candidate_atoms", 0)),
+                "all_rules": len(candidate_rules),
+            }
+        for key in input_generated_counts:
+            input_generated_counts[key] += int(generated_counts.get(key, 0))
 
         for rule in candidate_rules:
             clause = str(rule.get("clause", "")).strip()
@@ -164,6 +256,9 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_atom_templates": list(rule.get("body_atom_templates", []))
+                    if isinstance(rule.get("body_atom_templates"), list)
+                    else ([rule.get("body_atom_template", "")] if rule.get("body_atom_template", "") else []),
                     "body_length": int(rule.get("body_length", 1)),
                     "clause": clause,
                     "positive_support": 0,
@@ -208,6 +303,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         merged_rule["positive_example_ids"] = list(evidence_summary["positive_example_ids"])
         merged_rule["negative_example_ids"] = list(evidence_summary["negative_example_ids"])
         merged_rule.update(provenance_summary)
+        merged_rule["candidate_rule_category"] = rule_candidate_category(merged_rule)
         merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
         merged_rule["source_rule_ids"] = sorted(
             set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
@@ -216,6 +312,12 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
             source_index for source_index in merged_rule["source_rule_indices"] if source_index is not None
         ]
 
+    merged_category_counts = count_rule_categories(merged_rules)
+    aggregate_atom_availability = {
+        **atom_availability_counts,
+        "candidate_semantic_body_atom_templates": sorted(candidate_semantic_body_atom_templates),
+        "candidate_provenance_only_body_atom_templates": sorted(candidate_provenance_only_body_atom_templates),
+    }
     merged_result: Dict[str, Any] = {
         "version": _MERGED_INITIAL_RULES_VERSION,
         "num_videos": len(candidate_rule_results),
@@ -223,15 +325,24 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
-        "num_rules_using_candidate_atoms": sum(
-            1 for rule in merged_rules if bool(rule.get("uses_candidate_atoms", False))
-        ),
-        "num_candidate_only_rules": sum(
-            1 for rule in merged_rules if bool(rule.get("uses_only_candidate_atoms", False))
-        ),
-        "num_mixed_source_rules": sum(
-            1 for rule in merged_rules if bool(rule.get("mixes_accepted_and_candidate_atoms", False))
-        ),
+        "num_rules_using_candidate_atoms": merged_category_counts["candidate_involving_rules"],
+        "num_candidate_only_rules": merged_category_counts["candidate_only_rules"],
+        "num_mixed_source_rules": merged_category_counts["mixed_accepted_candidate_rules"],
+        "candidate_rule_stage_stats": {
+            "stage": "step15_merge_initial_rules",
+            "atom_availability": aggregate_atom_availability,
+            "input_generated_rule_counts": input_generated_counts,
+            "merged_rule_counts": merged_category_counts,
+        },
+        "candidate_rule_flow_summary": {
+            "atom_availability": aggregate_atom_availability,
+            "initial_rule_generation": input_generated_counts,
+            "merged_after_step15": merged_category_counts,
+            "pruning": empty_rule_category_counts(),
+            "extension": empty_rule_category_counts(),
+            "final_selection": empty_rule_category_counts(),
+            "evaluation": empty_rule_category_counts(),
+        },
         "target_predicates": sorted(target_predicates),
         "rules": merged_rules,
     }
@@ -249,6 +360,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         "num_rules_using_candidate_atoms": merged_result["num_rules_using_candidate_atoms"],
         "num_candidate_only_rules": merged_result["num_candidate_only_rules"],
         "num_mixed_source_rules": merged_result["num_mixed_source_rules"],
+        "candidate_rule_stage_stats": merged_result["candidate_rule_stage_stats"],
         "target_predicates": sorted(target_predicates),
         "videos": video_summaries,
         "json_path": str(json_path),
@@ -267,6 +379,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "head_predicate",
                 "head_atom_template",
                 "body_atom_template",
+                "body_atom_templates",
                 "body_length",
                 "clause",
                 "positive_support",
@@ -283,6 +396,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "mixes_accepted_and_candidate_atoms",
                 "uses_only_candidate_atoms",
                 "body_source_mix",
+                "candidate_rule_category",
                 "positive_example_ids",
                 "negative_example_ids",
                 "source_video_ids",
@@ -300,6 +414,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_atom_templates": json.dumps(rule.get("body_atom_templates", [])),
                     "body_length": rule.get("body_length", 1),
                     "clause": rule.get("clause", ""),
                     "positive_support": rule.get("positive_support", 0),
@@ -316,6 +431,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
+                    "candidate_rule_category": rule.get("candidate_rule_category", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                     "source_video_ids": json.dumps(rule.get("source_video_ids", [])),

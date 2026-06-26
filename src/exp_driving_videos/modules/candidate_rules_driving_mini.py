@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 7
+_INITIAL_RULES_VERSION = 8
 _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -42,6 +42,7 @@ _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_prior_relevance_state",
     "object_matched_prior",
 }
+_VARIABLE_ARGS = {"S", "O", "C", "T", "F"}
 
 
 def get_output_root() -> Path:
@@ -58,6 +59,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "min_positive_support",
         "include_example_ids",
         "ignored_body_predicates",
+        "generate_mixed_accepted_candidate_rules",
     ]
     return {k: cfg.get(k) for k in keys}
 
@@ -87,6 +89,8 @@ def _abstract_arg(arg: str) -> str:
     text = str(arg)
     if text.startswith("seg_"):
         return "S"
+    if text.startswith("obj_candidate_"):
+        return "C"
     if text.startswith("obj_"):
         return "O"
     if text.startswith("track_"):
@@ -127,7 +131,7 @@ def _extract_bindings(
 
     bindings: Dict[str, str] = {}
     for template_arg, concrete_arg in zip(template_args, concrete_args):
-        if template_arg in {"S", "O", "T", "F"}:
+        if template_arg in _VARIABLE_ARGS:
             existing = bindings.get(template_arg)
             if existing is not None and existing != concrete_arg:
                 return None
@@ -162,6 +166,11 @@ def _make_evidence_entry(
         "body_atom_source": str(body_atom_source),
         "matched_prior_ids": sorted({str(value) for value in list(matched_prior_ids or []) if str(value)}),
         "bindings": bindings,
+        "matched_atoms": {body_atom_template: str(concrete_atom)},
+        "matched_atom_sources": {body_atom_template: str(body_atom_source)},
+        "matched_atom_prior_ids": {
+            body_atom_template: sorted({str(value) for value in list(matched_prior_ids or []) if str(value)})
+        },
     }
 
 
@@ -223,31 +232,43 @@ def _summarize_rule_candidate_provenance(
     evidence_entries: List[Dict[str, Any]],
     body_length: int,
 ) -> Dict[str, Any]:
-    candidate_entries = [
-        entry for entry in evidence_entries
-        if str(entry.get("body_atom_source", "")) == "candidate"
-    ]
-    accepted_entries = [
-        entry for entry in evidence_entries
-        if str(entry.get("body_atom_source", "")) == "accepted"
-    ]
-    uses_candidate_atoms = bool(candidate_entries)
-    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_entries
-    mixes_accepted_and_candidate_atoms = bool(candidate_entries) and bool(accepted_entries)
-    num_candidate_body_atoms = 1 if uses_candidate_atoms else 0
+    candidate_body_templates: set[str] = set()
+    accepted_body_templates: set[str] = set()
+    candidate_evidence_firings = 0
+    accepted_evidence_firings = 0
     matched_prior_ids_involved = sorted(
         {
             str(prior_id)
-            for entry in candidate_entries
-            for prior_id in list(entry.get("matched_prior_ids", []))
+            for entry in evidence_entries
+            for prior_ids in dict(entry.get("matched_atom_prior_ids", {})).values()
+            for prior_id in list(prior_ids)
             if str(prior_id)
         }
     )
+    for entry in evidence_entries:
+        matched_atom_sources = dict(entry.get("matched_atom_sources", {}))
+        if not matched_atom_sources:
+            body_atom_template = str(entry.get("body_atom_template", "")).strip()
+            source = str(entry.get("body_atom_source", "")).strip()
+            if body_atom_template and source:
+                matched_atom_sources = {body_atom_template: source}
+        for body_atom_template, source in matched_atom_sources.items():
+            if str(source) == "candidate":
+                candidate_body_templates.add(str(body_atom_template))
+                candidate_evidence_firings += 1
+            elif str(source) == "accepted":
+                accepted_body_templates.add(str(body_atom_template))
+                accepted_evidence_firings += 1
+
+    uses_candidate_atoms = bool(candidate_body_templates)
+    uses_only_candidate_atoms = uses_candidate_atoms and not accepted_body_templates
+    mixes_accepted_and_candidate_atoms = bool(candidate_body_templates) and bool(accepted_body_templates)
+    num_candidate_body_atoms = len(candidate_body_templates)
     if mixes_accepted_and_candidate_atoms:
         body_source_mix = "mixed_accepted_and_candidate"
     elif uses_only_candidate_atoms:
         body_source_mix = "candidate_only"
-    elif accepted_entries:
+    elif accepted_body_templates:
         body_source_mix = "accepted_only"
     else:
         body_source_mix = "non_object_or_segment_only"
@@ -260,9 +281,135 @@ def _summarize_rule_candidate_provenance(
         "mixes_accepted_and_candidate_atoms": mixes_accepted_and_candidate_atoms,
         "uses_only_candidate_atoms": uses_only_candidate_atoms,
         "body_source_mix": body_source_mix,
-        "candidate_evidence_firings": len(candidate_entries),
-        "accepted_evidence_firings": len(accepted_entries),
+        "candidate_evidence_firings": candidate_evidence_firings,
+        "accepted_evidence_firings": accepted_evidence_firings,
     }
+
+
+def _rule_category_from_provenance(provenance_summary: Dict[str, Any]) -> str:
+    if bool(provenance_summary.get("mixes_accepted_and_candidate_atoms", False)):
+        return "mixed_accepted_candidate"
+    if bool(provenance_summary.get("uses_only_candidate_atoms", False)):
+        return "candidate_only"
+    if bool(provenance_summary.get("uses_candidate_atoms", False)):
+        return "candidate_only"
+    return "accepted_only"
+
+
+def _empty_category_counts() -> Dict[str, int]:
+    return {
+        "accepted_only_rules": 0,
+        "candidate_only_rules": 0,
+        "mixed_accepted_candidate_rules": 0,
+        "candidate_involving_rules": 0,
+        "all_rules": 0,
+    }
+
+
+def _count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = _empty_category_counts()
+    for rule in rules:
+        category = str(rule.get("candidate_rule_category", ""))
+        if not category:
+            category = _rule_category_from_provenance(rule)
+        counts["all_rules"] += 1
+        if category == "mixed_accepted_candidate":
+            counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_only":
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        else:
+            counts["accepted_only_rules"] += 1
+    return counts
+
+
+def _predicate_of_atom_template(atom_text: str) -> str:
+    text = str(atom_text).strip().rstrip(".").strip()
+    if "(" not in text:
+        return text
+    return text.split("(", 1)[0].strip()
+
+
+def _is_provenance_only_atom_template(atom_text: str) -> bool:
+    return _predicate_of_atom_template(atom_text) in _SINGLETON_PROVENANCE_ONLY_PREDICATES
+
+
+def _bindings_compatible(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    for key, value in left.items():
+        if key in right and str(right[key]) != str(value):
+            return False
+    return True
+
+
+def _merge_bindings(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, str]:
+    merged = {str(key): str(value) for key, value in left.items()}
+    for key, value in right.items():
+        merged[str(key)] = str(value)
+    return merged
+
+
+def _combine_evidence_entries(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not entries:
+        return None
+    combined_bindings: Dict[str, str] = {}
+    matched_atoms: Dict[str, str] = {}
+    matched_atom_sources: Dict[str, str] = {}
+    matched_atom_prior_ids: Dict[str, List[str]] = {}
+    for entry in entries:
+        entry_bindings = {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()}
+        if not _bindings_compatible(combined_bindings, entry_bindings):
+            return None
+        combined_bindings = _merge_bindings(combined_bindings, entry_bindings)
+        matched_atoms.update({str(k): str(v) for k, v in dict(entry.get("matched_atoms", {})).items()})
+        matched_atom_sources.update(
+            {str(k): str(v) for k, v in dict(entry.get("matched_atom_sources", {})).items()}
+        )
+        for key, prior_ids in dict(entry.get("matched_atom_prior_ids", {})).items():
+            out_prior_ids = matched_atom_prior_ids.setdefault(str(key), [])
+            for prior_id in list(prior_ids):
+                prior_id_text = str(prior_id)
+                if prior_id_text and prior_id_text not in out_prior_ids:
+                    out_prior_ids.append(prior_id_text)
+
+    first = entries[0]
+    return {
+        "video_id": str(first.get("video_id", "")),
+        "example_id": str(first.get("example_id", "")),
+        "current_segment_id": str(first.get("current_segment_id", "")),
+        "next_segment_id": str(first.get("next_segment_id", "")),
+        "target_predicate": str(first.get("target_predicate", "")),
+        "label": bool(first.get("label", False)),
+        "body_atom_templates": sorted(matched_atoms),
+        "body_atom_template": sorted(matched_atoms)[0] if len(matched_atoms) == 1 else "",
+        "matched_atom": next(iter(matched_atoms.values()), "") if len(matched_atoms) == 1 else "",
+        "body_atom_source": next(iter(matched_atom_sources.values()), "") if len(matched_atom_sources) == 1 else "",
+        "matched_prior_ids": sorted(
+            {
+                str(prior_id)
+                for prior_ids in matched_atom_prior_ids.values()
+                for prior_id in list(prior_ids)
+                if str(prior_id)
+            }
+        ),
+        "bindings": combined_bindings,
+        "matched_atoms": matched_atoms,
+        "matched_atom_sources": matched_atom_sources,
+        "matched_atom_prior_ids": {
+            key: sorted(values)
+            for key, values in matched_atom_prior_ids.items()
+        },
+    }
+
+
+def _canonical_body_templates(body_templates: List[str]) -> Tuple[str, ...]:
+    return tuple(sorted({str(template).strip() for template in body_templates if str(template).strip()}))
+
+
+def _build_clause_from_templates(head_predicate: str, body_atom_templates: Tuple[str, ...]) -> str:
+    head_no_dot = f"{head_predicate}(S)"
+    body = ", ".join(str(atom).rstrip(".") for atom in body_atom_templates)
+    return f"{head_no_dot} :- {body}."
 
 
 def process_video(
@@ -277,6 +424,7 @@ def process_video(
     use_only_positive_examples = bool(cfg.get("use_only_positive_examples", True))
     min_positive_support = int(cfg.get("min_positive_support", 1))
     include_example_ids = bool(cfg.get("include_example_ids", True))
+    generate_mixed_accepted_candidate_rules = bool(cfg.get("generate_mixed_accepted_candidate_rules", True))
     ignored_body_predicates = {
         str(name).strip()
         for name in cfg.get(
@@ -320,8 +468,13 @@ def process_video(
             return cached
 
     examples = list(temporal_rule_examples_video_result.get("examples", []))
-    stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"evidence_set": []})
-    candidate_body_templates: set[str] = set()
+    stats: Dict[Tuple[str, ...], Dict[str, Any]] = defaultdict(lambda: {"evidence_set": []})
+    eligible_body_template_sets: set[Tuple[str, ...]] = set()
+    available_body_templates: set[str] = set()
+    available_candidate_body_templates: set[str] = set()
+    available_candidate_semantic_body_templates: set[str] = set()
+    available_candidate_provenance_only_body_templates: set[str] = set()
+    available_accepted_body_templates: set[str] = set()
     total_positive_examples = sum(1 for example in examples if bool(example.get("label", False)))
     total_negative_examples = sum(1 for example in examples if not bool(example.get("label", False)))
 
@@ -347,7 +500,9 @@ def process_video(
             prior_id = str(candidate_args[1])
             if prior_id and prior_id not in matched_prior_ids_by_candidate_object[object_id]:
                 matched_prior_ids_by_candidate_object[object_id].append(prior_id)
-        seen_templates: set[str] = set()
+        unary_entries_by_template: Dict[str, Dict[str, Any]] = {}
+        accepted_entries: List[Dict[str, Any]] = []
+        candidate_entries: List[Dict[str, Any]] = []
         for body_atom in body_atoms:
             parsed_body_atom = _parse_atom(str(body_atom))
             if parsed_body_atom is None:
@@ -355,12 +510,9 @@ def process_video(
             body_predicate, _ = parsed_body_atom
             if body_predicate in ignored_body_predicates:
                 continue
-            if body_predicate in _SINGLETON_PROVENANCE_ONLY_PREDICATES:
-                continue
             body_template = _abstract_atom(str(body_atom))
-            if not body_template or body_template in seen_templates:
+            if not body_template or body_template in unary_entries_by_template:
                 continue
-            seen_templates.add(body_template)
             body_atom_source = (
                 "candidate"
                 if str(body_atom) in candidate_body_atoms
@@ -379,24 +531,112 @@ def process_video(
                 matched_prior_ids=matched_prior_ids,
             )
             if evidence_entry is not None:
-                stats[body_template]["evidence_set"].append(evidence_entry)
+                unary_entries_by_template[body_template] = evidence_entry
+                unary_key = (body_template,)
+                stats[unary_key]["evidence_set"].append(evidence_entry)
+                available_body_templates.add(body_template)
+                if body_atom_source == "candidate":
+                    candidate_entries.append(evidence_entry)
+                    available_candidate_body_templates.add(body_template)
+                    if _is_provenance_only_atom_template(body_template):
+                        available_candidate_provenance_only_body_templates.add(body_template)
+                    else:
+                        available_candidate_semantic_body_templates.add(body_template)
+                elif body_atom_source == "accepted":
+                    accepted_entries.append(evidence_entry)
+                    available_accepted_body_templates.add(body_template)
+
+        if generate_mixed_accepted_candidate_rules:
+            for left_index, left_entry in enumerate(candidate_entries):
+                left_template = str(left_entry.get("body_atom_template", "")).strip()
+                if not left_template:
+                    continue
+                for right_entry in candidate_entries[left_index + 1 :]:
+                    right_template = str(right_entry.get("body_atom_template", "")).strip()
+                    if (
+                        not right_template
+                        or right_template == left_template
+                        or (
+                            _is_provenance_only_atom_template(left_template)
+                            and _is_provenance_only_atom_template(right_template)
+                        )
+                    ):
+                        continue
+                    body_templates = _canonical_body_templates([left_template, right_template])
+                    if len(body_templates) != 2:
+                        continue
+                    combined_entry = _combine_evidence_entries([left_entry, right_entry])
+                    if combined_entry is not None:
+                        stats[body_templates]["evidence_set"].append(combined_entry)
+
+            for accepted_entry in accepted_entries:
+                accepted_template = str(accepted_entry.get("body_atom_template", "")).strip()
+                if not accepted_template:
+                    continue
+                for candidate_entry in candidate_entries:
+                    candidate_template = str(candidate_entry.get("body_atom_template", "")).strip()
+                    if (
+                        not candidate_template
+                        or candidate_template == accepted_template
+                    ):
+                        continue
+                    body_templates = _canonical_body_templates([accepted_template, candidate_template])
+                    if len(body_templates) != 2:
+                        continue
+                    combined_entry = _combine_evidence_entries([accepted_entry, candidate_entry])
+                    if combined_entry is not None:
+                        stats[body_templates]["evidence_set"].append(combined_entry)
 
         if is_positive or not use_only_positive_examples:
-            candidate_body_templates.update(seen_templates)
+            for body_template, entry in unary_entries_by_template.items():
+                if _is_provenance_only_atom_template(body_template):
+                    continue
+                eligible_body_template_sets.add((body_template,))
+            if generate_mixed_accepted_candidate_rules:
+                for left_index, left_entry in enumerate(candidate_entries):
+                    left_template = str(left_entry.get("body_atom_template", "")).strip()
+                    if not left_template:
+                        continue
+                    for right_entry in candidate_entries[left_index + 1 :]:
+                        right_template = str(right_entry.get("body_atom_template", "")).strip()
+                        if (
+                            not right_template
+                            or right_template == left_template
+                            or (
+                                _is_provenance_only_atom_template(left_template)
+                                and _is_provenance_only_atom_template(right_template)
+                            )
+                        ):
+                            continue
+                        body_templates = _canonical_body_templates([left_template, right_template])
+                        if len(body_templates) == 2:
+                            eligible_body_template_sets.add(body_templates)
+
+                for accepted_entry in accepted_entries:
+                    accepted_template = str(accepted_entry.get("body_atom_template", "")).strip()
+                    if not accepted_template:
+                        continue
+                    for candidate_entry in candidate_entries:
+                        candidate_template = str(candidate_entry.get("body_atom_template", "")).strip()
+                        if (
+                            not candidate_template
+                            or candidate_template == accepted_template
+                        ):
+                            continue
+                        body_templates = _canonical_body_templates([accepted_template, candidate_template])
+                        if len(body_templates) == 2:
+                            eligible_body_template_sets.add(body_templates)
 
     initial_rules: List[Dict[str, Any]] = []
-    num_rules_using_candidate_atoms = 0
-    num_candidate_only_rules = 0
-    num_mixed_source_rules = 0
-    for idx, body_template in enumerate(sorted(stats.keys())):
-        if body_template not in candidate_body_templates:
+    for idx, body_templates in enumerate(sorted(stats.keys())):
+        if body_templates not in eligible_body_template_sets:
             continue
 
-        evidence_set = _dedupe_evidence_entries(list(stats[body_template].get("evidence_set", [])))
+        evidence_set = _dedupe_evidence_entries(list(stats[body_templates].get("evidence_set", [])))
         evidence_summary = _summarize_evidence(evidence_set)
         provenance_summary = _summarize_rule_candidate_provenance(
             evidence_entries=evidence_set,
-            body_length=1,
+            body_length=len(body_templates),
         )
         positive_support = int(evidence_summary["positive_support"])
         negative_support = int(evidence_summary["negative_support"])
@@ -405,21 +645,17 @@ def process_video(
             continue
 
         confidence = float(evidence_summary["confidence"])
-        clause = _build_clause(target_predicate, body_template)
-        if bool(provenance_summary["uses_candidate_atoms"]):
-            num_rules_using_candidate_atoms += 1
-        if bool(provenance_summary["uses_only_candidate_atoms"]):
-            num_candidate_only_rules += 1
-        if bool(provenance_summary["mixes_accepted_and_candidate_atoms"]):
-            num_mixed_source_rules += 1
+        clause = _build_clause_from_templates(target_predicate, body_templates)
+        candidate_rule_category = _rule_category_from_provenance(provenance_summary)
         initial_rules.append(
             {
                 "rule_index": len(initial_rules),
                 "rule_id": f"{video_id}_rule_{idx:04d}",
                 "head_predicate": target_predicate,
                 "head_atom_template": f"{target_predicate}(S).",
-                "body_atom_template": body_template,
-                "body_length": 1,
+                "body_atom_template": body_templates[0] if len(body_templates) == 1 else "",
+                "body_atom_templates": list(body_templates),
+                "body_length": len(body_templates),
                 "clause": clause,
                 "positive_support": positive_support,
                 "negative_support": negative_support,
@@ -435,10 +671,12 @@ def process_video(
                     evidence_summary["negative_example_ids"] if include_example_ids else []
                 ),
                 **provenance_summary,
+                "candidate_rule_category": candidate_rule_category,
                 "evidence_set": evidence_set,
             }
         )
 
+    generated_category_counts = _count_rule_categories(initial_rules)
     result: Dict[str, Any] = {
         "version": _INITIAL_RULES_VERSION,
         "video_id": video_id,
@@ -447,9 +685,40 @@ def process_video(
         "num_examples": len(examples),
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
-        "num_rules_using_candidate_atoms": num_rules_using_candidate_atoms,
-        "num_candidate_only_rules": num_candidate_only_rules,
-        "num_mixed_source_rules": num_mixed_source_rules,
+        "num_rules_using_candidate_atoms": generated_category_counts["candidate_involving_rules"],
+        "num_candidate_only_rules": generated_category_counts["candidate_only_rules"],
+        "num_mixed_source_rules": generated_category_counts["mixed_accepted_candidate_rules"],
+        "candidate_rule_stage_stats": {
+            "stage": "step14_initial_generation",
+            "atom_availability": {
+                "num_body_atom_templates": len(available_body_templates),
+                "num_accepted_body_atom_templates": len(available_accepted_body_templates),
+                "num_candidate_body_atom_templates": len(available_candidate_body_templates),
+                "num_candidate_semantic_body_atom_templates": len(available_candidate_semantic_body_templates),
+                "num_candidate_provenance_only_body_atom_templates": len(
+                    available_candidate_provenance_only_body_templates
+                ),
+                "candidate_semantic_body_atom_templates": sorted(available_candidate_semantic_body_templates),
+                "candidate_provenance_only_body_atom_templates": sorted(
+                    available_candidate_provenance_only_body_templates
+                ),
+            },
+            "generated_rule_counts": generated_category_counts,
+        },
+        "candidate_rule_flow_summary": {
+            "atom_availability": {
+                "num_candidate_body_atom_templates": len(available_candidate_body_templates),
+                "num_candidate_semantic_body_atom_templates": len(available_candidate_semantic_body_templates),
+                "num_candidate_provenance_only_body_atom_templates": len(
+                    available_candidate_provenance_only_body_templates
+                ),
+            },
+            "initial_rule_generation": generated_category_counts,
+            "pruning": _empty_category_counts(),
+            "extension": _empty_category_counts(),
+            "final_selection": _empty_category_counts(),
+            "evaluation": _empty_category_counts(),
+        },
         "config": {
             "target_predicate": target_predicate,
             "negative_target_predicate": negative_target_predicate,
@@ -457,6 +726,7 @@ def process_video(
             "min_positive_support": min_positive_support,
             "include_example_ids": include_example_ids,
             "ignored_body_predicates": sorted(ignored_body_predicates),
+            "generate_mixed_accepted_candidate_rules": generate_mixed_accepted_candidate_rules,
         },
         "initial_rules": initial_rules,
     }
@@ -473,6 +743,7 @@ def process_video(
                 "head_predicate",
                 "head_atom_template",
                 "body_atom_template",
+                "body_atom_templates",
                 "body_length",
                 "clause",
                 "positive_support",
@@ -489,6 +760,7 @@ def process_video(
                 "mixes_accepted_and_candidate_atoms",
                 "uses_only_candidate_atoms",
                 "body_source_mix",
+                "candidate_rule_category",
                 "positive_example_ids",
                 "negative_example_ids",
             ],
@@ -502,6 +774,7 @@ def process_video(
                     "head_predicate": rule.get("head_predicate", ""),
                     "head_atom_template": rule.get("head_atom_template", ""),
                     "body_atom_template": rule.get("body_atom_template", ""),
+                    "body_atom_templates": json.dumps(rule.get("body_atom_templates", [])),
                     "body_length": rule.get("body_length", 1),
                     "clause": rule.get("clause", ""),
                     "positive_support": rule.get("positive_support", 0),
@@ -518,6 +791,7 @@ def process_video(
                     "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
+                    "candidate_rule_category": rule.get("candidate_rule_category", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                 }
@@ -545,9 +819,49 @@ def run(
         )
         results.append(result)
 
+    aggregate_generated_counts = _empty_category_counts()
+    aggregate_atom_availability = {
+        "num_body_atom_templates": 0,
+        "num_accepted_body_atom_templates": 0,
+        "num_candidate_body_atom_templates": 0,
+        "num_candidate_semantic_body_atom_templates": 0,
+        "num_candidate_provenance_only_body_atom_templates": 0,
+    }
+    candidate_semantic_body_atom_templates: set[str] = set()
+    candidate_provenance_only_body_atom_templates: set[str] = set()
+    for result in results:
+        stage_stats = dict(result.get("candidate_rule_stage_stats", {}))
+        generated_counts = dict(stage_stats.get("generated_rule_counts", {}))
+        for key in aggregate_generated_counts:
+            aggregate_generated_counts[key] += int(generated_counts.get(key, 0))
+        atom_availability = dict(stage_stats.get("atom_availability", {}))
+        for key in aggregate_atom_availability:
+            aggregate_atom_availability[key] += int(atom_availability.get(key, 0))
+        candidate_semantic_body_atom_templates.update(
+            str(value)
+            for value in list(atom_availability.get("candidate_semantic_body_atom_templates", []))
+            if str(value)
+        )
+        candidate_provenance_only_body_atom_templates.update(
+            str(value)
+            for value in list(atom_availability.get("candidate_provenance_only_body_atom_templates", []))
+            if str(value)
+        )
+    aggregate_atom_availability["candidate_semantic_body_atom_templates"] = sorted(
+        candidate_semantic_body_atom_templates
+    )
+    aggregate_atom_availability["candidate_provenance_only_body_atom_templates"] = sorted(
+        candidate_provenance_only_body_atom_templates
+    )
+
     manifest = {
         "version": _INITIAL_RULES_VERSION,
         "num_videos": len(results),
+        "candidate_rule_stage_stats": {
+            "stage": "step14_initial_generation",
+            "atom_availability": aggregate_atom_availability,
+            "generated_rule_counts": aggregate_generated_counts,
+        },
         "videos": [
             {
                 "video_id": r["video_id"],

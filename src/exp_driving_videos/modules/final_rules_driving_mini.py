@@ -29,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_FINAL_RULES_VERSION = 3
+_FINAL_RULES_VERSION = 4
 _STRONG_SEMANTIC_BODY_PREDICATES = {
     "object_class",
     "object_distance_state",
@@ -223,6 +223,32 @@ def _summarize_candidate_rule_selection(rules: List[Dict[str, Any]]) -> Dict[str
     }
 
 
+def _empty_category_counts() -> Dict[str, int]:
+    return {
+        "accepted_only_rules": 0,
+        "candidate_only_rules": 0,
+        "mixed_accepted_candidate_rules": 0,
+        "candidate_involving_rules": 0,
+        "all_rules": 0,
+    }
+
+
+def _count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = _empty_category_counts()
+    for rule in rules:
+        category = str(rule.get("candidate_rule_category", "")) or _rule_candidate_category(rule)
+        counts["all_rules"] += 1
+        if category == "mixed_accepted_candidate":
+            counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_only":
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        else:
+            counts["accepted_only_rules"] += 1
+    return counts
+
+
 def process_rules(
     extended_rule_results: Dict[str, Any],
     cfg: Optional[Dict[str, Any]] = None,
@@ -252,6 +278,22 @@ def process_rules(
     for rule in final_rules:
         rule["candidate_rule_category"] = _rule_candidate_category(rule)
     candidate_rule_diagnostics = _summarize_candidate_rule_selection(final_rules)
+    selected_rule_counts = _count_rule_categories(final_rules)
+    input_rule_counts = _count_rule_categories(all_kept_rules)
+    candidate_rule_flow_summary = dict(extended_rule_results.get("candidate_rule_flow_summary", {}))
+    if not candidate_rule_flow_summary:
+        candidate_rule_flow_summary = {
+            "atom_availability": {},
+            "initial_rule_generation": _empty_category_counts(),
+            "merged_after_step15": _empty_category_counts(),
+            "pruning": _empty_category_counts(),
+            "extension": {
+                "all_kept_after_step16_rule_counts": input_rule_counts,
+            },
+            "final_selection": _empty_category_counts(),
+            "evaluation": _empty_category_counts(),
+        }
+    candidate_rule_flow_summary["final_selection"] = selected_rule_counts
 
     result: Dict[str, Any] = {
         "version": _FINAL_RULES_VERSION,
@@ -261,6 +303,12 @@ def process_rules(
         "selection_method": "score_top_k",
         "num_input_rules": len(all_kept_rules),
         "num_final_rules": len(final_rules),
+        "candidate_rule_stage_stats": {
+            "stage": "step17_final_selection",
+            "input_kept_after_step16_rule_counts": input_rule_counts,
+            "selected_rule_counts": selected_rule_counts,
+        },
+        "candidate_rule_flow_summary": candidate_rule_flow_summary,
         "candidate_rule_diagnostics": candidate_rule_diagnostics,
         "final_rules": final_rules,
     }

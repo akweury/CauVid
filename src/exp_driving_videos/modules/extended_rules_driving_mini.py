@@ -37,7 +37,7 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 3
+_EXTENDED_RULES_VERSION = 4
 _PROVENANCE_ONLY_BODY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -329,7 +329,50 @@ def _is_body_semantically_grounded(body_atom_templates: Sequence[str]) -> bool:
             semantic_count += 1
     if provenance_only_count == 0:
         return True
-    return semantic_count >= 1 and semantic_count >= provenance_only_count
+    return semantic_count >= 1
+
+
+def _rule_candidate_category(rule: Dict[str, Any]) -> str:
+    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
+        return "mixed_accepted_candidate"
+    if bool(rule.get("uses_only_candidate_atoms", False)):
+        return "candidate_only"
+    if bool(rule.get("uses_candidate_atoms", False)):
+        return "candidate_only"
+    body_atom_templates = list(rule.get("body_atom_templates", []))
+    has_candidate_template = any("(C" in str(atom) or ",C" in str(atom) for atom in body_atom_templates)
+    has_accepted_template = any("(O" in str(atom) or ",O" in str(atom) for atom in body_atom_templates)
+    if has_candidate_template and has_accepted_template:
+        return "mixed_accepted_candidate"
+    if has_candidate_template:
+        return "candidate_only"
+    return "accepted_only"
+
+
+def _empty_category_counts() -> Dict[str, int]:
+    return {
+        "accepted_only_rules": 0,
+        "candidate_only_rules": 0,
+        "mixed_accepted_candidate_rules": 0,
+        "candidate_involving_rules": 0,
+        "all_rules": 0,
+    }
+
+
+def _count_rule_categories(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts = _empty_category_counts()
+    for rule in rules:
+        category = str(rule.get("candidate_rule_category", "")) or _rule_candidate_category(rule)
+        counts["all_rules"] += 1
+        if category == "mixed_accepted_candidate":
+            counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_only":
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        else:
+            counts["accepted_only_rules"] += 1
+    return counts
 
 
 def _summarize_rule_candidate_provenance(
@@ -381,6 +424,34 @@ def _summarize_rule_candidate_provenance(
 def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
     seeded: List[Dict[str, Any]] = []
     for entry in list(rule.get("evidence_set", [])):
+        if isinstance(entry.get("matched_atoms"), dict):
+            seeded.append(
+                {
+                    "video_id": str(entry.get("video_id", "")),
+                    "example_id": str(entry.get("example_id", "")),
+                    "current_segment_id": str(entry.get("current_segment_id", "")),
+                    "next_segment_id": str(entry.get("next_segment_id", "")),
+                    "target_predicate": str(entry.get("target_predicate", "")),
+                    "label": bool(entry.get("label", False)),
+                    "bindings": {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()},
+                    "matched_atoms": {
+                        str(k): str(v)
+                        for k, v in dict(entry.get("matched_atoms", {})).items()
+                        if str(k) and str(v)
+                    },
+                    "matched_atom_sources": {
+                        str(k): str(v)
+                        for k, v in dict(entry.get("matched_atom_sources", {})).items()
+                        if str(k) and str(v)
+                    },
+                    "matched_atom_prior_ids": {
+                        str(k): [str(item) for item in list(v) if str(item)]
+                        for k, v in dict(entry.get("matched_atom_prior_ids", {})).items()
+                        if str(k)
+                    },
+                }
+            )
+            continue
         body_atom_template = str(entry.get("body_atom_template", rule.get("body_atom_template", ""))).strip()
         matched_atom = str(entry.get("matched_atom", "")).strip()
         body_atom_source = str(entry.get("body_atom_source", "")).strip()
@@ -405,6 +476,66 @@ def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
                     if body_atom_template and matched_atom and matched_prior_ids
                     else {}
                 ),
+            }
+        )
+    return _dedupe_evidence_entries(seeded)
+
+
+def _single_atom_evidence_from_rule(
+    rule: Dict[str, Any],
+    body_atom_template: str,
+) -> List[Dict[str, Any]]:
+    atom_template = _normalize_atom_template(body_atom_template)
+    seeded: List[Dict[str, Any]] = []
+    for entry in list(rule.get("evidence_set", [])):
+        matched_atoms = dict(entry.get("matched_atoms", {}))
+        matched_atom = str(matched_atoms.get(atom_template, "")).strip()
+        if matched_atom:
+            matched_atom_sources = dict(entry.get("matched_atom_sources", {}))
+            matched_atom_prior_ids = dict(entry.get("matched_atom_prior_ids", {}))
+            seeded.append(
+                {
+                    "video_id": str(entry.get("video_id", "")),
+                    "example_id": str(entry.get("example_id", "")),
+                    "current_segment_id": str(entry.get("current_segment_id", "")),
+                    "next_segment_id": str(entry.get("next_segment_id", "")),
+                    "target_predicate": str(entry.get("target_predicate", "")),
+                    "label": bool(entry.get("label", False)),
+                    "bindings": {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()},
+                    "matched_atoms": {atom_template: matched_atom},
+                    "matched_atom_sources": {
+                        atom_template: str(matched_atom_sources.get(atom_template, ""))
+                    },
+                    "matched_atom_prior_ids": {
+                        atom_template: [
+                            str(item)
+                            for item in list(matched_atom_prior_ids.get(atom_template, []))
+                            if str(item)
+                        ]
+                    },
+                }
+            )
+            continue
+
+        if _normalize_atom_template(str(entry.get("body_atom_template", ""))) != atom_template:
+            continue
+        matched_atom = str(entry.get("matched_atom", "")).strip()
+        if not matched_atom:
+            continue
+        body_atom_source = str(entry.get("body_atom_source", "")).strip()
+        matched_prior_ids = [str(value) for value in list(entry.get("matched_prior_ids", [])) if str(value)]
+        seeded.append(
+            {
+                "video_id": str(entry.get("video_id", "")),
+                "example_id": str(entry.get("example_id", "")),
+                "current_segment_id": str(entry.get("current_segment_id", "")),
+                "next_segment_id": str(entry.get("next_segment_id", "")),
+                "target_predicate": str(entry.get("target_predicate", "")),
+                "label": bool(entry.get("label", False)),
+                "bindings": {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()},
+                "matched_atoms": {atom_template: matched_atom},
+                "matched_atom_sources": {atom_template: body_atom_source} if body_atom_source else {},
+                "matched_atom_prior_ids": {atom_template: matched_prior_ids} if matched_prior_ids else {},
             }
         )
     return _dedupe_evidence_entries(seeded)
@@ -462,6 +593,7 @@ def _serialize_rule(
         ),
         "uses_only_candidate_atoms": bool(provenance_summary.get("uses_only_candidate_atoms", False)),
         "body_source_mix": str(provenance_summary.get("body_source_mix", "")),
+        "candidate_rule_category": _rule_candidate_category(provenance_summary),
         "parent_confidence": float(parent_confidence),
         "parent_positive_support": int(parent_positive_support),
         "confidence_improvement": float(evidence_summary.get("confidence", 0.0)) - float(parent_confidence),
@@ -516,6 +648,7 @@ def _write_round_outputs(
                 "mixes_accepted_and_candidate_atoms",
                 "uses_only_candidate_atoms",
                 "body_source_mix",
+                "candidate_rule_category",
                 "parent_confidence",
                 "confidence_improvement",
                 "evaluation_status",
@@ -555,6 +688,7 @@ def _write_round_outputs(
                     "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
+                    "candidate_rule_category": rule.get("candidate_rule_category", ""),
                     "parent_confidence": rule.get("parent_confidence", 0.0),
                     "confidence_improvement": rule.get("confidence_improvement", 0.0),
                     "evaluation_status": rule.get("evaluation_status", ""),
@@ -630,18 +764,32 @@ def process_rules(
 
     initial_rules = list(merged_initial_rules.get("rules", []))
     total_positive_examples = int(merged_initial_rules.get("num_positive_examples", 0))
-    initial_rule_atoms: List[Tuple[str, str, List[Dict[str, Any]]]] = []
-    seen_initial_atoms: set[str] = set()
+    initial_rule_atom_map: Dict[str, Dict[str, Any]] = {}
     for rule in initial_rules:
-        body_atom_template = _normalize_atom_template(str(rule.get("body_atom_template", "")))
-        if not body_atom_template or body_atom_template in seen_initial_atoms:
-            continue
-        seen_initial_atoms.add(body_atom_template)
+        for body_atom_template in _get_rule_body_atom_templates(rule):
+            normalized_body_atom_template = _normalize_atom_template(body_atom_template)
+            if not normalized_body_atom_template:
+                continue
+            entry = initial_rule_atom_map.setdefault(
+                normalized_body_atom_template,
+                {
+                    "body_atom_template": normalized_body_atom_template,
+                    "source_initial_rule_ids": [],
+                    "evidence_set": [],
+                },
+            )
+            rule_id = str(rule.get("rule_id", ""))
+            if rule_id and rule_id not in entry["source_initial_rule_ids"]:
+                entry["source_initial_rule_ids"].append(rule_id)
+            entry["evidence_set"].extend(_single_atom_evidence_from_rule(rule, normalized_body_atom_template))
+
+    initial_rule_atoms: List[Tuple[str, str, List[Dict[str, Any]]]] = []
+    for body_atom_template, atom_entry in sorted(initial_rule_atom_map.items()):
         initial_rule_atoms.append(
             (
                 body_atom_template,
-                str(rule.get("rule_id", "")),
-                _seed_rule_evidence(rule),
+                ",".join(sorted(atom_entry["source_initial_rule_ids"])),
+                _dedupe_evidence_entries(list(atom_entry.get("evidence_set", []))),
             )
         )
 
@@ -650,6 +798,7 @@ def process_rules(
         seeded_rule = dict(rule)
         seeded_rule["body_atom_templates"] = list(_get_rule_body_atom_templates(rule))
         seeded_rule["evidence_set"] = _seed_rule_evidence(rule)
+        seeded_rule["candidate_rule_category"] = _rule_candidate_category(seeded_rule)
         current_rules.append(seeded_rule)
 
     print(
@@ -664,6 +813,7 @@ def process_rules(
     total_rules_using_candidate_atoms = 0
     total_candidate_only_rules = 0
     total_mixed_source_rules = 0
+    total_pruned_candidate_rule_counts = _empty_category_counts()
 
     for round_index in range(1, num_rounds + 1):
         next_rule_map: Dict[Tuple[str, str, Tuple[str, ...]], Dict[str, Any]] = {}
@@ -699,6 +849,22 @@ def process_rules(
                 if not _is_body_semantically_grounded(new_body_atoms):
                     num_pruned += 1
                     num_pruned_provenance_dominance += 1
+                    provenance_summary = _summarize_rule_candidate_provenance(
+                        body_atom_templates=new_body_atoms,
+                        evidence_entries=[],
+                    )
+                    category = _rule_candidate_category(
+                        {**provenance_summary, "body_atom_templates": list(new_body_atoms)}
+                    )
+                    total_pruned_candidate_rule_counts["all_rules"] += 1
+                    if category == "mixed_accepted_candidate":
+                        total_pruned_candidate_rule_counts["mixed_accepted_candidate_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    elif category == "candidate_only":
+                        total_pruned_candidate_rule_counts["candidate_only_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    else:
+                        total_pruned_candidate_rule_counts["accepted_only_rules"] += 1
                     continue
                 key = (head_predicate, head_atom_template, new_body_atoms)
                 if key in next_rule_map:
@@ -734,6 +900,18 @@ def process_rules(
                 )
                 if not bool(prune_decision.get("kept", False)):
                     num_pruned += 1
+                    pruned_category = _rule_candidate_category(
+                        {**provenance_summary, "body_atom_templates": list(new_body_atoms)}
+                    )
+                    total_pruned_candidate_rule_counts["all_rules"] += 1
+                    if pruned_category == "mixed_accepted_candidate":
+                        total_pruned_candidate_rule_counts["mixed_accepted_candidate_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    elif pruned_category == "candidate_only":
+                        total_pruned_candidate_rule_counts["candidate_only_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    else:
+                        total_pruned_candidate_rule_counts["accepted_only_rules"] += 1
                     prune_reason = str(prune_decision.get("prune_reason", ""))
                     if prune_reason == "low_evidence":
                         num_pruned_low_evidence += 1
@@ -786,6 +964,7 @@ def process_rules(
         total_rules_using_candidate_atoms += round_rules_using_candidate_atoms
         total_candidate_only_rules += round_candidate_only_rules
         total_mixed_source_rules += round_mixed_source_rules
+        round_candidate_rule_counts = _count_rule_categories(round_rules)
 
         round_payload: Dict[str, Any] = {
             "version": _EXTENDED_RULES_VERSION,
@@ -820,6 +999,7 @@ def process_rules(
                 "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
                 "num_candidate_only_rules": round_candidate_only_rules,
                 "num_mixed_source_rules": round_mixed_source_rules,
+                "kept_rule_counts": round_candidate_rule_counts,
             },
             "rules": round_rules,
         }
@@ -845,6 +1025,7 @@ def process_rules(
                 "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
                 "num_candidate_only_rules": round_candidate_only_rules,
                 "num_mixed_source_rules": round_mixed_source_rules,
+                "kept_rule_counts": round_candidate_rule_counts,
             }
         )
         rounds.append(round_payload)
@@ -873,6 +1054,39 @@ def process_rules(
         if not current_rules:
             break
 
+    all_kept_rules = _build_all_kept_rules(initial_rules, rounds)
+    all_kept_counts = _count_rule_categories(all_kept_rules)
+    extension_only_counts = _count_rule_categories(
+        [rule for round_payload in rounds for rule in list(round_payload.get("rules", []))]
+    )
+    upstream_flow_summary = dict(merged_initial_rules.get("candidate_rule_flow_summary", {}))
+    candidate_rule_flow_summary = {
+        "atom_availability": dict(upstream_flow_summary.get("atom_availability", {})),
+        "initial_rule_generation": dict(
+            upstream_flow_summary.get(
+                "initial_rule_generation",
+                merged_initial_rules.get("candidate_rule_stage_stats", {}).get(
+                    "input_generated_rule_counts", _empty_category_counts()
+                ),
+            )
+        ),
+        "merged_after_step15": dict(
+            upstream_flow_summary.get(
+                "merged_after_step15",
+                merged_initial_rules.get("candidate_rule_stage_stats", {}).get(
+                    "merged_rule_counts", _count_rule_categories(initial_rules)
+                ),
+            )
+        ),
+        "pruning": total_pruned_candidate_rule_counts,
+        "extension": {
+            "extension_only_kept_rule_counts": extension_only_counts,
+            "all_kept_after_step16_rule_counts": all_kept_counts,
+        },
+        "final_selection": _empty_category_counts(),
+        "evaluation": _empty_category_counts(),
+    }
+
     manifest = {
         "version": _EXTENDED_RULES_VERSION,
         "config": {
@@ -891,11 +1105,19 @@ def process_rules(
         "input_num_candidate_only_rules": int(merged_initial_rules.get("num_candidate_only_rules", 0)),
         "input_num_mixed_source_rules": int(merged_initial_rules.get("num_mixed_source_rules", 0)),
         "num_rounds_completed": len(rounds),
-        "num_all_kept_rules": len(initial_rules) + sum(len(r.get("rules", [])) for r in rounds),
+        "num_all_kept_rules": len(all_kept_rules),
         "num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
         "num_candidate_only_rules": total_candidate_only_rules,
         "num_mixed_source_rules": total_mixed_source_rules,
-        "all_kept_rules": _build_all_kept_rules(initial_rules, rounds),
+        "candidate_rule_stage_stats": {
+            "stage": "step16_extension",
+            "input_initial_rule_counts": _count_rule_categories(initial_rules),
+            "extension_only_kept_rule_counts": extension_only_counts,
+            "all_kept_after_step16_rule_counts": all_kept_counts,
+            "pruned_rule_counts": total_pruned_candidate_rule_counts,
+        },
+        "candidate_rule_flow_summary": candidate_rule_flow_summary,
+        "all_kept_rules": all_kept_rules,
         "round_summaries": round_summaries,
         "rounds": rounds,
     }
