@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TEMPORAL_RULE_EXAMPLES_VERSION = 3
+_TEMPORAL_RULE_EXAMPLES_VERSION = 4
 
 
 def get_output_root() -> Path:
@@ -153,7 +153,17 @@ def process_video(
             sort_atoms=sort_body_atoms,
         )
         candidate_body_atoms = _normalize_body_atoms(
-            atoms=list(example.get("candidate_body_atoms", [])),
+            atoms=list(example.get("candidate_rule_search_body_atoms", example.get("candidate_body_atoms", []))),
+            deduplicate=deduplicate_body_atoms,
+            sort_atoms=sort_body_atoms,
+        )
+        candidate_quality_auxiliary_body_atoms = _normalize_body_atoms(
+            atoms=list(example.get("candidate_quality_auxiliary_body_atoms", [])),
+            deduplicate=deduplicate_body_atoms,
+            sort_atoms=sort_body_atoms,
+        )
+        candidate_provenance_metadata_body_atoms = _normalize_body_atoms(
+            atoms=list(example.get("candidate_provenance_metadata_body_atoms", [])),
             deduplicate=deduplicate_body_atoms,
             sort_atoms=sort_body_atoms,
         )
@@ -180,9 +190,14 @@ def process_video(
             "head_atom": head_atom,
             "accepted_body_atoms": accepted_body_atoms,
             "candidate_body_atoms": candidate_body_atoms,
+            "candidate_rule_search_body_atoms": candidate_body_atoms,
+            "candidate_quality_auxiliary_body_atoms": candidate_quality_auxiliary_body_atoms,
+            "candidate_provenance_metadata_body_atoms": candidate_provenance_metadata_body_atoms,
             "body_atoms": body_atoms,
             "num_accepted_body_atoms": len(accepted_body_atoms),
             "num_candidate_body_atoms": len(candidate_body_atoms),
+            "num_candidate_quality_auxiliary_body_atoms": len(candidate_quality_auxiliary_body_atoms),
+            "num_candidate_provenance_metadata_body_atoms": len(candidate_provenance_metadata_body_atoms),
             "num_body_atoms": len(body_atoms),
             "has_candidate_atoms": has_candidate_atoms,
             "rule_clause": rule_clause,
@@ -255,6 +270,8 @@ def process_video(
                 "has_candidate_atoms",
                 "body_atoms",
                 "candidate_body_atoms",
+                "candidate_quality_auxiliary_body_atoms",
+                "candidate_provenance_metadata_body_atoms",
                 "rule_clause",
             ],
         )
@@ -279,6 +296,12 @@ def process_video(
                     "has_candidate_atoms": example.get("has_candidate_atoms", False),
                     "body_atoms": json.dumps(example.get("body_atoms", [])),
                     "candidate_body_atoms": json.dumps(example.get("candidate_body_atoms", [])),
+                    "candidate_quality_auxiliary_body_atoms": json.dumps(
+                        example.get("candidate_quality_auxiliary_body_atoms", [])
+                    ),
+                    "candidate_provenance_metadata_body_atoms": json.dumps(
+                        example.get("candidate_provenance_metadata_body_atoms", [])
+                    ),
                     "rule_clause": example.get("rule_clause", ""),
                 }
             )

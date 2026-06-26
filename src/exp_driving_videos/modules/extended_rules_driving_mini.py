@@ -37,7 +37,7 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 4
+_EXTENDED_RULES_VERSION = 5
 _PROVENANCE_ONLY_BODY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -88,6 +88,12 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "same_confidence_smaller_evidence_enabled": bool(
             cfg.get("same_confidence_smaller_evidence_enabled", True)
         ),
+        "per_parent_extension_top_k": int(cfg.get("per_parent_extension_top_k", 40)),
+        "max_round_rules": int(cfg.get("max_round_rules", 50000)),
+        "max_round_accepted_only_rules": int(cfg.get("max_round_accepted_only_rules", 30000)),
+        "max_round_mixed_candidate_rules": int(cfg.get("max_round_mixed_candidate_rules", 15000)),
+        "max_round_candidate_only_rules": int(cfg.get("max_round_candidate_only_rules", 3000)),
+        "max_round_candidate_candidate_rules": int(cfg.get("max_round_candidate_candidate_rules", 500)),
     }
 
 
@@ -353,6 +359,7 @@ def _empty_category_counts() -> Dict[str, int]:
     return {
         "accepted_only_rules": 0,
         "candidate_only_rules": 0,
+        "candidate_candidate_rules": 0,
         "mixed_accepted_candidate_rules": 0,
         "candidate_involving_rules": 0,
         "all_rules": 0,
@@ -370,9 +377,111 @@ def _count_rule_categories(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
+            if str(rule.get("extension_rule_category", "")) == "candidate_candidate":
+                counts["candidate_candidate_rules"] += 1
         else:
             counts["accepted_only_rules"] += 1
     return counts
+
+
+def _extension_rule_category(rule: Dict[str, Any]) -> str:
+    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
+        return "accepted_candidate"
+    if bool(rule.get("uses_only_candidate_atoms", False)):
+        return "candidate_candidate" if int(rule.get("num_candidate_body_atoms", 0)) >= 2 else "candidate_only"
+    if bool(rule.get("uses_candidate_atoms", False)):
+        return "candidate_only"
+    return "accepted_only"
+
+
+def _candidate_category_count_key(category: str) -> str:
+    if category == "accepted_candidate":
+        return "mixed_accepted_candidate_rules"
+    if category == "candidate_only":
+        return "candidate_only_rules"
+    if category == "candidate_candidate":
+        return "candidate_candidate_rules"
+    return "accepted_only_rules"
+
+
+def _increment_category_count(counts: Dict[str, int], category: str) -> None:
+    counts["all_rules"] = counts.get("all_rules", 0) + 1
+    if category == "accepted_candidate":
+        counts["mixed_accepted_candidate_rules"] = counts.get("mixed_accepted_candidate_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_only":
+        counts["candidate_only_rules"] = counts.get("candidate_only_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_candidate":
+        counts["candidate_candidate_rules"] = counts.get("candidate_candidate_rules", 0) + 1
+        counts["candidate_only_rules"] = counts.get("candidate_only_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    else:
+        counts["accepted_only_rules"] = counts.get("accepted_only_rules", 0) + 1
+
+
+def _firing_signature(evidence_entries: Sequence[Dict[str, Any]]) -> Tuple[Tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                str(entry.get("example_id", "")),
+                "pos" if bool(entry.get("label", False)) else "neg",
+            )
+            for entry in evidence_entries
+        )
+    )
+
+
+def _semantic_predicate_strength(body_atom_templates: Sequence[str]) -> int:
+    return sum(
+        1
+        for body_atom_template in body_atom_templates
+        if _predicate_of_atom_template(body_atom_template) in _SEMANTIC_OBJECT_BODY_PREDICATES
+    )
+
+
+def _extension_rank_key(rule: Dict[str, Any]) -> Tuple[float, int, int, int, int, float, str]:
+    confidence = float(rule.get("confidence", 0.0))
+    positive_support = int(rule.get("positive_support", 0))
+    negative_support = int(rule.get("negative_support", 0))
+    support_improvement = int(rule.get("support_improvement", 0))
+    body_atoms = list(rule.get("body_atom_templates", []))
+    semantic_strength = _semantic_predicate_strength(body_atoms)
+    candidate_ratio = float(rule.get("candidate_body_atom_ratio", 0.0))
+    provenance_penalty = 1.0 if _extension_rule_category(rule) == "candidate_candidate" else 0.0
+    score = (
+        confidence * 100.0
+        + positive_support * 10.0
+        + max(0, support_improvement) * 6.0
+        - negative_support * 4.0
+        - len(body_atoms) * 0.5
+        + semantic_strength * 2.0
+        - candidate_ratio * 3.0
+        - provenance_penalty * 4.0
+    )
+    return (
+        -score,
+        -positive_support,
+        negative_support,
+        len(body_atoms),
+        -semantic_strength,
+        candidate_ratio,
+        str(rule.get("clause", "")),
+    )
+
+
+def _budget_allows_rule(
+    category: str,
+    kept_counts: Dict[str, int],
+    max_round_rules: int,
+    category_budgets: Dict[str, int],
+) -> bool:
+    if max_round_rules and kept_counts.get("all_rules", 0) >= max_round_rules:
+        return False
+    budget = int(category_budgets.get(category, -1))
+    if budget >= 0:
+        return kept_counts.get(_candidate_category_count_key(category), 0) < budget
+    return True
 
 
 def _summarize_rule_candidate_provenance(
@@ -740,6 +849,14 @@ def process_rules(
     same_confidence_smaller_evidence_enabled = bool(
         cfg.get("same_confidence_smaller_evidence_enabled", True)
     )
+    per_parent_extension_top_k = int(cfg.get("per_parent_extension_top_k", 40))
+    max_round_rules = int(cfg.get("max_round_rules", 50000))
+    category_budgets = {
+        "accepted_only": int(cfg.get("max_round_accepted_only_rules", 30000)),
+        "accepted_candidate": int(cfg.get("max_round_mixed_candidate_rules", 15000)),
+        "candidate_only": int(cfg.get("max_round_candidate_only_rules", 3000)),
+        "candidate_candidate": int(cfg.get("max_round_candidate_candidate_rules", 500)),
+    }
 
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -757,6 +874,12 @@ def process_rules(
                 "prune_strategies": prune_strategies,
                 "min_positive_support_to_extend": min_positive_support_to_extend,
                 "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
+                "per_parent_extension_top_k": per_parent_extension_top_k,
+                "max_round_rules": max_round_rules,
+                "max_round_accepted_only_rules": category_budgets["accepted_only"],
+                "max_round_mixed_candidate_rules": category_budgets["accepted_candidate"],
+                "max_round_candidate_only_rules": category_budgets["candidate_only"],
+                "max_round_candidate_candidate_rules": category_budgets["candidate_candidate"],
             }
         ):
             print(f"  [cache] loading {manifest_path.name}")
@@ -825,11 +948,19 @@ def process_rules(
         num_pruned_same_firings_as_parent = 0
         num_pruned_same_confidence_smaller_evidence = 0
         num_pruned_provenance_dominance = 0
+        num_pruned_parent_top_k = 0
+        num_pruned_round_budget = 0
+        num_deduplicated_body = 0
+        num_deduplicated_firing_signature = 0
         num_parent_rules_skipped = 0
         round_rules_using_candidate_atoms = 0
         round_candidate_only_rules = 0
         round_mixed_source_rules = 0
+        round_candidate_pool: List[Dict[str, Any]] = []
+        round_generated_category_counts = _empty_category_counts()
+        round_pruned_budget_category_counts = _empty_category_counts()
         for parent_rule in current_rules:
+            parent_candidate_rules: List[Dict[str, Any]] = []
             head_predicate = str(parent_rule.get("head_predicate", ""))
             head_atom_template = str(parent_rule.get("head_atom_template", f"{head_predicate}(S)."))
             parent_rule_id = str(parent_rule.get("rule_id", ""))
@@ -925,7 +1056,7 @@ def process_rules(
                         num_pruned_same_confidence_smaller_evidence += 1
                     continue
 
-                next_rule_map[key] = _serialize_rule(
+                serialized_rule = _serialize_rule(
                     rule_index=-1,
                     round_index=round_index,
                     head_predicate=head_predicate,
@@ -943,6 +1074,66 @@ def process_rules(
                     prune_status=str(prune_decision.get("prune_status", "kept")),
                     kept_after_prune=bool(prune_decision.get("kept", True)),
                 )
+                serialized_rule["extension_rule_category"] = _extension_rule_category(serialized_rule)
+                serialized_rule["firing_signature"] = _firing_signature(intersected_evidence)
+                parent_candidate_rules.append(serialized_rule)
+
+            parent_candidate_rules.sort(key=_extension_rank_key)
+            if per_parent_extension_top_k >= 0 and len(parent_candidate_rules) > per_parent_extension_top_k:
+                num_pruned_parent_top_k += len(parent_candidate_rules) - per_parent_extension_top_k
+                parent_candidate_rules = parent_candidate_rules[:per_parent_extension_top_k]
+            round_candidate_pool.extend(parent_candidate_rules)
+
+        body_dedup_map: Dict[Tuple[str, str, Tuple[str, ...]], Dict[str, Any]] = {}
+        for candidate_rule in round_candidate_pool:
+            candidate_category = _extension_rule_category(candidate_rule)
+            _increment_category_count(round_generated_category_counts, candidate_category)
+            key = (
+                str(candidate_rule.get("head_predicate", "")),
+                str(candidate_rule.get("head_atom_template", "")),
+                tuple(candidate_rule.get("body_atom_templates", [])),
+            )
+            existing = body_dedup_map.get(key)
+            if existing is None or _extension_rank_key(candidate_rule) < _extension_rank_key(existing):
+                if existing is not None:
+                    num_deduplicated_body += 1
+                body_dedup_map[key] = candidate_rule
+            else:
+                num_deduplicated_body += 1
+
+        signature_dedup_map: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, Any]] = {}
+        for candidate_rule in body_dedup_map.values():
+            key = (
+                str(candidate_rule.get("head_predicate", "")),
+                tuple(candidate_rule.get("firing_signature", ())),
+            )
+            existing = signature_dedup_map.get(key)
+            if existing is None or _extension_rank_key(candidate_rule) < _extension_rank_key(existing):
+                if existing is not None:
+                    num_deduplicated_firing_signature += 1
+                signature_dedup_map[key] = candidate_rule
+            else:
+                num_deduplicated_firing_signature += 1
+
+        kept_budget_counts = _empty_category_counts()
+        for candidate_rule in sorted(signature_dedup_map.values(), key=_extension_rank_key):
+            category = _extension_rule_category(candidate_rule)
+            if not _budget_allows_rule(
+                category=category,
+                kept_counts=kept_budget_counts,
+                max_round_rules=max_round_rules,
+                category_budgets=category_budgets,
+            ):
+                num_pruned_round_budget += 1
+                _increment_category_count(round_pruned_budget_category_counts, category)
+                continue
+            _increment_category_count(kept_budget_counts, category)
+            key = (
+                str(candidate_rule.get("head_predicate", "")),
+                str(candidate_rule.get("head_atom_template", "")),
+                tuple(candidate_rule.get("body_atom_templates", [])),
+            )
+            next_rule_map[key] = candidate_rule
 
         round_rules = sorted(
             next_rule_map.values(),
@@ -975,8 +1166,15 @@ def process_rules(
                 "prune_strategies": prune_strategies,
                 "min_positive_support_to_extend": min_positive_support_to_extend,
                 "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
+                "per_parent_extension_top_k": per_parent_extension_top_k,
+                "max_round_rules": max_round_rules,
+                "category_budgets": category_budgets,
             },
             "num_candidates_generated": num_candidates_generated,
+            "num_parent_top_k_pruned": num_pruned_parent_top_k,
+            "num_body_deduplicated": num_deduplicated_body,
+            "num_firing_signature_deduplicated": num_deduplicated_firing_signature,
+            "num_round_budget_pruned": num_pruned_round_budget,
             "num_rules": len(round_rules),
             "evaluation": {
                 "status": "implemented",
@@ -993,12 +1191,18 @@ def process_rules(
                 "pruned_same_firings_as_parent": num_pruned_same_firings_as_parent,
                 "pruned_same_confidence_smaller_evidence": num_pruned_same_confidence_smaller_evidence,
                 "pruned_provenance_dominance": num_pruned_provenance_dominance,
+                "pruned_parent_top_k": num_pruned_parent_top_k,
+                "pruned_round_budget": num_pruned_round_budget,
+                "deduplicated_body": num_deduplicated_body,
+                "deduplicated_firing_signature": num_deduplicated_firing_signature,
                 "kept_num_rules": len(round_rules),
             },
             "candidate_rule_provenance": {
                 "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
                 "num_candidate_only_rules": round_candidate_only_rules,
                 "num_mixed_source_rules": round_mixed_source_rules,
+                "generated_rule_counts": round_generated_category_counts,
+                "budget_pruned_rule_counts": round_pruned_budget_category_counts,
                 "kept_rule_counts": round_candidate_rule_counts,
             },
             "rules": round_rules,
@@ -1022,9 +1226,15 @@ def process_rules(
                 "pruned_same_firings_as_parent": num_pruned_same_firings_as_parent,
                 "pruned_same_confidence_smaller_evidence": num_pruned_same_confidence_smaller_evidence,
                 "pruned_provenance_dominance": num_pruned_provenance_dominance,
+                "pruned_parent_top_k": num_pruned_parent_top_k,
+                "pruned_round_budget": num_pruned_round_budget,
+                "deduplicated_body": num_deduplicated_body,
+                "deduplicated_firing_signature": num_deduplicated_firing_signature,
                 "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
                 "num_candidate_only_rules": round_candidate_only_rules,
                 "num_mixed_source_rules": round_mixed_source_rules,
+                "generated_rule_counts": round_generated_category_counts,
+                "budget_pruned_rule_counts": round_pruned_budget_category_counts,
                 "kept_rule_counts": round_candidate_rule_counts,
             }
         )
@@ -1033,6 +1243,9 @@ def process_rules(
 
         print(
             f"  round={round_index}: candidates={num_candidates_generated} | "
+            f"parent_topk_pruned={num_pruned_parent_top_k} | "
+            f"deduped={num_deduplicated_body + num_deduplicated_firing_signature} | "
+            f"budget_pruned={num_pruned_round_budget} | "
             f"kept={len(round_rules)}"
         )
         print(
@@ -1095,6 +1308,12 @@ def process_rules(
             "prune_strategies": prune_strategies,
             "min_positive_support_to_extend": min_positive_support_to_extend,
             "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
+            "per_parent_extension_top_k": per_parent_extension_top_k,
+            "max_round_rules": max_round_rules,
+            "max_round_accepted_only_rules": category_budgets["accepted_only"],
+            "max_round_mixed_candidate_rules": category_budgets["accepted_candidate"],
+            "max_round_candidate_only_rules": category_budgets["candidate_only"],
+            "max_round_candidate_candidate_rules": category_budgets["candidate_candidate"],
         },
         "input_num_examples": int(merged_initial_rules.get("num_examples", 0)),
         "input_num_positive_examples": total_positive_examples,

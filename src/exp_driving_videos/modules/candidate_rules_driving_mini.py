@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 8
+_INITIAL_RULES_VERSION = 9
 _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -60,6 +60,11 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "include_example_ids",
         "ignored_body_predicates",
         "generate_mixed_accepted_candidate_rules",
+        "generate_candidate_candidate_rules",
+        "max_candidate_only_initial_rules",
+        "max_mixed_candidate_initial_rules",
+        "max_candidate_candidate_initial_rules",
+        "max_total_initial_rules",
     ]
     return {k: cfg.get(k) for k in keys}
 
@@ -300,6 +305,7 @@ def _empty_category_counts() -> Dict[str, int]:
     return {
         "accepted_only_rules": 0,
         "candidate_only_rules": 0,
+        "candidate_candidate_rules": 0,
         "mixed_accepted_candidate_rules": 0,
         "candidate_involving_rules": 0,
         "all_rules": 0,
@@ -319,9 +325,54 @@ def _count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
+            if str(rule.get("initial_rule_pair_category", "")) == "candidate_candidate":
+                counts["candidate_candidate_rules"] += 1
         else:
             counts["accepted_only_rules"] += 1
     return counts
+
+
+def _initial_rule_pair_category(provenance_summary: Dict[str, Any], body_length: int) -> str:
+    if bool(provenance_summary.get("mixes_accepted_and_candidate_atoms", False)):
+        return "accepted_candidate"
+    if bool(provenance_summary.get("uses_only_candidate_atoms", False)):
+        return "candidate_candidate" if int(body_length) >= 2 else "candidate_only"
+    return "accepted_only"
+
+
+def _rule_budget_allowed(
+    category: str,
+    kept_counts: Dict[str, int],
+    max_candidate_only_initial_rules: int,
+    max_mixed_candidate_initial_rules: int,
+    max_candidate_candidate_initial_rules: int,
+    max_total_initial_rules: int,
+) -> bool:
+    if max_total_initial_rules and kept_counts.get("all_rules", 0) >= max_total_initial_rules:
+        return False
+    if category == "candidate_only" and max_candidate_only_initial_rules >= 0:
+        return kept_counts.get("candidate_only_rules", 0) < max_candidate_only_initial_rules
+    if category == "candidate_candidate" and max_candidate_candidate_initial_rules >= 0:
+        return kept_counts.get("candidate_candidate_rules", 0) < max_candidate_candidate_initial_rules
+    if category == "accepted_candidate" and max_mixed_candidate_initial_rules >= 0:
+        return kept_counts.get("mixed_accepted_candidate_rules", 0) < max_mixed_candidate_initial_rules
+    return True
+
+
+def _increment_budget_count(category: str, kept_counts: Dict[str, int]) -> None:
+    kept_counts["all_rules"] = kept_counts.get("all_rules", 0) + 1
+    if category == "accepted_candidate":
+        kept_counts["mixed_accepted_candidate_rules"] = kept_counts.get("mixed_accepted_candidate_rules", 0) + 1
+        kept_counts["candidate_involving_rules"] = kept_counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_only":
+        kept_counts["candidate_only_rules"] = kept_counts.get("candidate_only_rules", 0) + 1
+        kept_counts["candidate_involving_rules"] = kept_counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_candidate":
+        kept_counts["candidate_only_rules"] = kept_counts.get("candidate_only_rules", 0) + 1
+        kept_counts["candidate_candidate_rules"] = kept_counts.get("candidate_candidate_rules", 0) + 1
+        kept_counts["candidate_involving_rules"] = kept_counts.get("candidate_involving_rules", 0) + 1
+    else:
+        kept_counts["accepted_only_rules"] = kept_counts.get("accepted_only_rules", 0) + 1
 
 
 def _predicate_of_atom_template(atom_text: str) -> str:
@@ -425,6 +476,11 @@ def process_video(
     min_positive_support = int(cfg.get("min_positive_support", 1))
     include_example_ids = bool(cfg.get("include_example_ids", True))
     generate_mixed_accepted_candidate_rules = bool(cfg.get("generate_mixed_accepted_candidate_rules", True))
+    generate_candidate_candidate_rules = bool(cfg.get("generate_candidate_candidate_rules", False))
+    max_candidate_only_initial_rules = int(cfg.get("max_candidate_only_initial_rules", 500))
+    max_mixed_candidate_initial_rules = int(cfg.get("max_mixed_candidate_initial_rules", 3000))
+    max_candidate_candidate_initial_rules = int(cfg.get("max_candidate_candidate_initial_rules", 0))
+    max_total_initial_rules = int(cfg.get("max_total_initial_rules", 10000))
     ignored_body_predicates = {
         str(name).strip()
         for name in cfg.get(
@@ -460,6 +516,12 @@ def process_video(
                     "min_positive_support": min_positive_support,
                     "include_example_ids": include_example_ids,
                     "ignored_body_predicates": sorted(ignored_body_predicates),
+                    "generate_mixed_accepted_candidate_rules": generate_mixed_accepted_candidate_rules,
+                    "generate_candidate_candidate_rules": generate_candidate_candidate_rules,
+                    "max_candidate_only_initial_rules": max_candidate_only_initial_rules,
+                    "max_mixed_candidate_initial_rules": max_mixed_candidate_initial_rules,
+                    "max_candidate_candidate_initial_rules": max_candidate_candidate_initial_rules,
+                    "max_total_initial_rules": max_total_initial_rules,
                 }
             )
         ):
@@ -548,6 +610,8 @@ def process_video(
 
         if generate_mixed_accepted_candidate_rules:
             for left_index, left_entry in enumerate(candidate_entries):
+                if not generate_candidate_candidate_rules and max_candidate_candidate_initial_rules <= 0:
+                    break
                 left_template = str(left_entry.get("body_atom_template", "")).strip()
                 if not left_template:
                     continue
@@ -594,6 +658,8 @@ def process_video(
                 eligible_body_template_sets.add((body_template,))
             if generate_mixed_accepted_candidate_rules:
                 for left_index, left_entry in enumerate(candidate_entries):
+                    if not generate_candidate_candidate_rules and max_candidate_candidate_initial_rules <= 0:
+                        break
                     left_template = str(left_entry.get("body_atom_template", "")).strip()
                     if not left_template:
                         continue
@@ -628,6 +694,9 @@ def process_video(
                             eligible_body_template_sets.add(body_templates)
 
     initial_rules: List[Dict[str, Any]] = []
+    pre_budget_category_counts = _empty_category_counts()
+    budget_kept_counts = _empty_category_counts()
+    budget_pruned_counts = _empty_category_counts()
     for idx, body_templates in enumerate(sorted(stats.keys())):
         if body_templates not in eligible_body_template_sets:
             continue
@@ -647,6 +716,22 @@ def process_video(
         confidence = float(evidence_summary["confidence"])
         clause = _build_clause_from_templates(target_predicate, body_templates)
         candidate_rule_category = _rule_category_from_provenance(provenance_summary)
+        initial_rule_pair_category = _initial_rule_pair_category(
+            provenance_summary,
+            body_length=len(body_templates),
+        )
+        _increment_budget_count(initial_rule_pair_category, pre_budget_category_counts)
+        if not _rule_budget_allowed(
+            initial_rule_pair_category,
+            budget_kept_counts,
+            max_candidate_only_initial_rules=max_candidate_only_initial_rules,
+            max_mixed_candidate_initial_rules=max_mixed_candidate_initial_rules,
+            max_candidate_candidate_initial_rules=max_candidate_candidate_initial_rules,
+            max_total_initial_rules=max_total_initial_rules,
+        ):
+            _increment_budget_count(initial_rule_pair_category, budget_pruned_counts)
+            continue
+        _increment_budget_count(initial_rule_pair_category, budget_kept_counts)
         initial_rules.append(
             {
                 "rule_index": len(initial_rules),
@@ -672,6 +757,7 @@ def process_video(
                 ),
                 **provenance_summary,
                 "candidate_rule_category": candidate_rule_category,
+                "initial_rule_pair_category": initial_rule_pair_category,
                 "evidence_set": evidence_set,
             }
         )
@@ -704,6 +790,9 @@ def process_video(
                 ),
             },
             "generated_rule_counts": generated_category_counts,
+            "pre_budget_generated_rule_counts": pre_budget_category_counts,
+            "budget_pruned_rule_counts": budget_pruned_counts,
+            "kept_rule_counts": generated_category_counts,
         },
         "candidate_rule_flow_summary": {
             "atom_availability": {
@@ -727,6 +816,11 @@ def process_video(
             "include_example_ids": include_example_ids,
             "ignored_body_predicates": sorted(ignored_body_predicates),
             "generate_mixed_accepted_candidate_rules": generate_mixed_accepted_candidate_rules,
+            "generate_candidate_candidate_rules": generate_candidate_candidate_rules,
+            "max_candidate_only_initial_rules": max_candidate_only_initial_rules,
+            "max_mixed_candidate_initial_rules": max_mixed_candidate_initial_rules,
+            "max_candidate_candidate_initial_rules": max_candidate_candidate_initial_rules,
+            "max_total_initial_rules": max_total_initial_rules,
         },
         "initial_rules": initial_rules,
     }
@@ -761,6 +855,7 @@ def process_video(
                 "uses_only_candidate_atoms",
                 "body_source_mix",
                 "candidate_rule_category",
+                "initial_rule_pair_category",
                 "positive_example_ids",
                 "negative_example_ids",
             ],
@@ -792,6 +887,7 @@ def process_video(
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
                     "candidate_rule_category": rule.get("candidate_rule_category", ""),
+                    "initial_rule_pair_category": rule.get("initial_rule_pair_category", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                 }
@@ -820,6 +916,8 @@ def run(
         results.append(result)
 
     aggregate_generated_counts = _empty_category_counts()
+    aggregate_pre_budget_counts = _empty_category_counts()
+    aggregate_budget_pruned_counts = _empty_category_counts()
     aggregate_atom_availability = {
         "num_body_atom_templates": 0,
         "num_accepted_body_atom_templates": 0,
@@ -834,6 +932,12 @@ def run(
         generated_counts = dict(stage_stats.get("generated_rule_counts", {}))
         for key in aggregate_generated_counts:
             aggregate_generated_counts[key] += int(generated_counts.get(key, 0))
+        pre_budget_counts = dict(stage_stats.get("pre_budget_generated_rule_counts", {}))
+        for key in aggregate_pre_budget_counts:
+            aggregate_pre_budget_counts[key] += int(pre_budget_counts.get(key, 0))
+        budget_pruned_counts = dict(stage_stats.get("budget_pruned_rule_counts", {}))
+        for key in aggregate_budget_pruned_counts:
+            aggregate_budget_pruned_counts[key] += int(budget_pruned_counts.get(key, 0))
         atom_availability = dict(stage_stats.get("atom_availability", {}))
         for key in aggregate_atom_availability:
             aggregate_atom_availability[key] += int(atom_availability.get(key, 0))
@@ -860,6 +964,9 @@ def run(
         "candidate_rule_stage_stats": {
             "stage": "step14_initial_generation",
             "atom_availability": aggregate_atom_availability,
+            "pre_budget_generated_rule_counts": aggregate_pre_budget_counts,
+            "budget_pruned_rule_counts": aggregate_budget_pruned_counts,
+            "kept_rule_counts": aggregate_generated_counts,
             "generated_rule_counts": aggregate_generated_counts,
         },
         "videos": [

@@ -30,7 +30,34 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 4
+_LOGIC_ATOMS_VERSION = 5
+
+_CANDIDATE_SEMANTIC_RULE_SEARCH_PREDICATES = {
+    "object_class",
+    "object_vz_state",
+    "object_vx_state",
+    "object_speed_state",
+    "object_distance_state",
+    "object_visibility_state",
+    "object_x_position_state",
+    "traffic_control_type",
+    "traffic_control_relevance_state",
+    "traffic_control_front_center_region",
+    "traffic_control_relevant",
+    "traffic_light_relevant",
+    "stop_sign_relevant",
+    "traffic_light_position_state",
+    "traffic_light_state",
+}
+_CANDIDATE_QUALITY_AUXILIARY_PREDICATES = {
+    "object_prior_relevance_state",
+}
+_CANDIDATE_PROVENANCE_METADATA_PREDICATES = {
+    "object_is_candidate",
+    "object_source_type",
+    "object_candidate_score_state",
+    "object_matched_prior",
+}
 
 
 def get_output_root() -> Path:
@@ -108,6 +135,17 @@ def _make_record(predicate: str, args: List[Any], kind: str) -> Dict[str, Any]:
         "kind": kind,
         "atom": _make_atom(predicate, *args),
     }
+
+
+def _candidate_atom_category(predicate: str) -> str:
+    predicate_text = _sym(predicate)
+    if predicate_text in _CANDIDATE_SEMANTIC_RULE_SEARCH_PREDICATES:
+        return "semantic_rule_search"
+    if predicate_text in _CANDIDATE_QUALITY_AUXILIARY_PREDICATES:
+        return "quality_auxiliary"
+    if predicate_text in _CANDIDATE_PROVENANCE_METADATA_PREDICATES:
+        return "provenance_metadata"
+    return "quality_auxiliary"
 
 
 def _visibility_state(visibility_ratio: float, persistent_threshold: float, present_threshold: float) -> str:
@@ -263,11 +301,26 @@ def process_video(
 
             object_atom_records: List[Dict[str, Any]] = []
             object_atoms: List[str] = []
+            candidate_semantic_rule_search_atoms: List[str] = []
+            candidate_quality_auxiliary_atoms: List[str] = []
+            candidate_provenance_metadata_atoms: List[str] = []
 
             def _append_object_atom(predicate: str, *args: Any) -> None:
                 rec = _make_record(predicate, list(args), kind="object")
+                if is_candidate:
+                    atom_category = _candidate_atom_category(predicate)
+                    rec["candidate_atom_category"] = atom_category
+                else:
+                    atom_category = ""
                 object_atom_records.append(rec)
                 object_atoms.append(rec["atom"])
+                if is_candidate:
+                    if atom_category == "semantic_rule_search":
+                        candidate_semantic_rule_search_atoms.append(rec["atom"])
+                    elif atom_category == "quality_auxiliary":
+                        candidate_quality_auxiliary_atoms.append(rec["atom"])
+                    elif atom_category == "provenance_metadata":
+                        candidate_provenance_metadata_atoms.append(rec["atom"])
                 all_atom_records.append(rec)
                 all_atoms.append(rec["atom"])
 
@@ -379,6 +432,9 @@ def process_video(
                 if isinstance(traffic_control_attributes, dict)
                 else {},
                 "atoms": object_atoms,
+                "semantic_rule_search_atoms": candidate_semantic_rule_search_atoms if is_candidate else object_atoms,
+                "quality_auxiliary_atoms": candidate_quality_auxiliary_atoms if is_candidate else [],
+                "provenance_metadata_atoms": candidate_provenance_metadata_atoms if is_candidate else [],
                 "atom_records": object_atom_records,
             }
 

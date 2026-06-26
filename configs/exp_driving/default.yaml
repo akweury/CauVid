@@ -63,6 +63,19 @@ segment_object_motion:
 important_objects:
   selection_strategy: not_implemented
   passthrough_selected_objects: true
+  candidate_selection:
+    enabled: true
+    max_per_segment: 8
+    max_per_class: 3
+    max_per_prior: 2
+    min_score: 0.0
+    score_weights:
+      calibrated_score: 0.30
+      raw_score: 0.15
+      track_quality: 0.20
+      temporal_consistency: 0.15
+      prior_relevance: 0.10
+      semantic_relevance: 0.10
 
 traffic_control_attributes:
   enabled: true
@@ -143,6 +156,12 @@ candidate_rules:
   use_only_positive_examples: true
   min_positive_support: 1
   include_example_ids: true
+  generate_mixed_accepted_candidate_rules: true
+  generate_candidate_candidate_rules: false
+  max_candidate_only_initial_rules: 500
+  max_mixed_candidate_initial_rules: 3000
+  max_candidate_candidate_initial_rules: 0
+  max_total_initial_rules: 10000
   ignored_body_predicates:
     - segment
     - segment_start_frame
@@ -156,6 +175,12 @@ extended_rules:
   prune_strategies: [low_evidence, empty_evidence, same_firings_as_parent, same_confidence_smaller_evidence]
   min_positive_support_to_extend: 2
   same_confidence_smaller_evidence_enabled: true
+  per_parent_extension_top_k: 40
+  max_round_rules: 50000
+  max_round_accepted_only_rules: 30000
+  max_round_mixed_candidate_rules: 15000
+  max_round_candidate_only_rules: 3000
+  max_round_candidate_candidate_rules: 500
 
 final_rules:
   top_k: 50

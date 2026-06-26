@@ -136,6 +136,7 @@ def empty_rule_category_counts() -> Dict[str, int]:
     return {
         "accepted_only_rules": 0,
         "candidate_only_rules": 0,
+        "candidate_candidate_rules": 0,
         "mixed_accepted_candidate_rules": 0,
         "candidate_involving_rules": 0,
         "all_rules": 0,
@@ -153,6 +154,8 @@ def count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
+            if str(rule.get("initial_rule_pair_category", rule.get("extension_rule_category", ""))) == "candidate_candidate":
+                counts["candidate_candidate_rules"] += 1
         else:
             counts["accepted_only_rules"] += 1
     return counts
