@@ -156,7 +156,7 @@ candidate_rules:
   use_only_positive_examples: true
   min_positive_support: 1
   include_example_ids: true
-  generate_mixed_accepted_candidate_rules: true
+  generate_mixed_accepted_candidate_rules: false
   generate_candidate_candidate_rules: false
   max_candidate_only_initial_rules: 500
   max_mixed_candidate_initial_rules: 3000
@@ -168,6 +168,15 @@ candidate_rules:
     - segment_end_frame
     - object_in_segment
     - object_track
+
+initial_rule_pruning:
+  enabled: true
+  max_total_initial_rules: 8000
+  max_accepted_only_initial_rules: 4000
+  max_mixed_candidate_initial_rules: 2000
+  max_candidate_only_initial_rules: 1500
+  max_candidate_candidate_initial_rules: 500
+  diversity_key: positive_coverage
 
 extended_rules:
   num_rounds: 3

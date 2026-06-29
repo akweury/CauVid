@@ -4,12 +4,13 @@ import csv
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
 from src.exp_driving_videos import pipeline_config
 
 _MERGED_INITIAL_RULES_VERSION = 3
+_PRUNED_INITIAL_RULES_VERSION = 1
 
 
 def dedupe_rule_evidence_entries(evidence_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -154,11 +155,530 @@ def count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
-            if str(rule.get("initial_rule_pair_category", rule.get("extension_rule_category", ""))) == "candidate_candidate":
+            if (
+                str(rule.get("initial_rule_pair_category", rule.get("extension_rule_category", "")))
+                == "candidate_candidate"
+                or (
+                    bool(rule.get("uses_only_candidate_atoms", False))
+                    and int(rule.get("num_candidate_body_atoms", 0)) >= 2
+                )
+            ):
                 counts["candidate_candidate_rules"] += 1
         else:
             counts["accepted_only_rules"] += 1
     return counts
+
+
+def _rule_body_length(rule: Dict[str, Any]) -> int:
+    body_atom_templates = rule.get("body_atom_templates")
+    if isinstance(body_atom_templates, list):
+        return len([str(atom) for atom in body_atom_templates if str(atom)])
+    if str(rule.get("body_atom_template", "")):
+        return 1
+    return int(rule.get("body_length", 0))
+
+
+def _as_sorted_str_tuple(values: Any) -> Tuple[str, ...]:
+    if isinstance(values, list):
+        return tuple(sorted(str(value) for value in values if str(value)))
+    if isinstance(values, tuple):
+        return tuple(sorted(str(value) for value in values if str(value)))
+    if isinstance(values, set):
+        return tuple(sorted(str(value) for value in values if str(value)))
+    return ()
+
+
+def _jsonable_signature_value(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return str(value)
+
+
+def _rule_firing_sets(rule: Dict[str, Any]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    positive_firings: set[str] = set()
+    negative_firings: set[str] = set()
+    for entry in list(rule.get("evidence_set", [])):
+        firing_key = "|".join(
+            [
+                str(entry.get("example_id", "")),
+                str(entry.get("current_segment_id", "")),
+                str(entry.get("next_segment_id", "")),
+                _jsonable_signature_value(dict(entry.get("bindings", {}))),
+                _jsonable_signature_value(dict(entry.get("matched_atoms", {}))),
+            ]
+        )
+        if bool(entry.get("label", False)):
+            positive_firings.add(firing_key)
+        else:
+            negative_firings.add(firing_key)
+
+    if not positive_firings and not negative_firings:
+        positive_firings.update(_as_sorted_str_tuple(rule.get("positive_example_ids", [])))
+        negative_firings.update(_as_sorted_str_tuple(rule.get("negative_example_ids", [])))
+
+    return tuple(sorted(positive_firings)), tuple(sorted(negative_firings))
+
+
+def _positive_coverage_key(rule: Dict[str, Any]) -> Tuple[str, Tuple[str, ...]]:
+    return (
+        str(rule.get("head_predicate", "")),
+        _as_sorted_str_tuple(rule.get("positive_example_ids", [])),
+    )
+
+
+def _initial_pruning_category(rule: Dict[str, Any]) -> str:
+    pair_category = str(rule.get("initial_rule_pair_category", rule.get("extension_rule_category", "")))
+    if pair_category == "candidate_candidate":
+        return "candidate_candidate"
+    category = str(rule.get("candidate_rule_category", "")) or rule_candidate_category(rule)
+    if category == "mixed_accepted_candidate":
+        return "accepted_candidate"
+    if category == "candidate_only":
+        if bool(rule.get("uses_only_candidate_atoms", False)) and int(rule.get("num_candidate_body_atoms", 0)) >= 2:
+            return "candidate_candidate"
+        return "candidate_only"
+    return "accepted_only"
+
+
+def _computed_rule_ratios(
+    rule: Dict[str, Any],
+    candidate_semantic_templates: set[str],
+    candidate_provenance_templates: set[str],
+) -> Dict[str, float]:
+    body_templates = [
+        str(atom)
+        for atom in list(rule.get("body_atom_templates", []))
+        if str(atom)
+    ]
+    if not body_templates and str(rule.get("body_atom_template", "")):
+        body_templates = [str(rule.get("body_atom_template", ""))]
+    body_length = max(1, int(rule.get("body_length", len(body_templates) or 1)))
+
+    provenance_atom_count = sum(1 for atom in body_templates if atom in candidate_provenance_templates)
+    semantic_atom_count = sum(1 for atom in body_templates if atom in candidate_semantic_templates)
+    candidate_ratio = float(rule.get("candidate_body_atom_ratio", 0.0))
+    provenance_ratio = float(provenance_atom_count / body_length)
+    semantic_ratio = float(semantic_atom_count / body_length)
+    return {
+        "candidate_body_atom_ratio": candidate_ratio,
+        "candidate_provenance_atom_ratio": provenance_ratio,
+        "candidate_semantic_atom_ratio": semantic_ratio,
+        "semantic_to_provenance_atom_ratio": float(semantic_atom_count / max(1, provenance_atom_count)),
+    }
+
+
+def _initial_rule_rank_key(rule: Dict[str, Any]) -> Tuple[Any, ...]:
+    positive_support = int(rule.get("positive_support", 0))
+    positive_firings = int(rule.get("positive_firings", 0))
+    negative_firings = int(rule.get("negative_firings", 0))
+    body_length = int(rule.get("body_length", len(list(rule.get("body_atom_templates", []))) or 1))
+    candidate_ratio = float(rule.get("candidate_body_atom_ratio", 0.0))
+    provenance_ratio = float(rule.get("candidate_provenance_atom_ratio", 0.0))
+    confidence = float(rule.get("confidence", 0.0))
+    source_video_count = len(_as_sorted_str_tuple(rule.get("source_video_ids", [])))
+    source_rule_count = int(rule.get("num_source_rules", len(list(rule.get("source_rule_ids", [])))))
+    category = _initial_pruning_category(rule)
+    category_penalty = {
+        "accepted_only": 0,
+        "accepted_candidate": 1,
+        "candidate_only": 2,
+        "candidate_candidate": 3,
+    }.get(category, 4)
+    return (
+        negative_firings,
+        body_length,
+        candidate_ratio,
+        provenance_ratio,
+        -confidence,
+        -positive_support,
+        -positive_firings,
+        -source_video_count,
+        -source_rule_count,
+        category_penalty,
+        str(rule.get("clause", "")),
+    )
+
+
+def _increment_initial_pruning_count(counts: Dict[str, int], category: str) -> None:
+    counts["all_rules"] = counts.get("all_rules", 0) + 1
+    if category == "accepted_candidate":
+        counts["mixed_accepted_candidate_rules"] = counts.get("mixed_accepted_candidate_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_only":
+        counts["candidate_only_rules"] = counts.get("candidate_only_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    elif category == "candidate_candidate":
+        counts["candidate_candidate_rules"] = counts.get("candidate_candidate_rules", 0) + 1
+        counts["candidate_only_rules"] = counts.get("candidate_only_rules", 0) + 1
+        counts["candidate_involving_rules"] = counts.get("candidate_involving_rules", 0) + 1
+    else:
+        counts["accepted_only_rules"] = counts.get("accepted_only_rules", 0) + 1
+
+
+def _initial_pruning_counts(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts = empty_rule_category_counts()
+    for rule in rules:
+        _increment_initial_pruning_count(counts, _initial_pruning_category(rule))
+    return counts
+
+
+def _initial_budget_limit(cfg: Dict[str, Any], key: str, default: int) -> int:
+    value = int(cfg.get(key, default))
+    return value if value >= 0 else 10**12
+
+
+def _cluster_diverse_select(
+    rules: Sequence[Dict[str, Any]],
+    max_rules: int,
+    cluster_key_name: str,
+) -> List[Dict[str, Any]]:
+    if max_rules <= 0 or not rules:
+        return []
+
+    clusters: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for rule in rules:
+        if cluster_key_name == "firing_signature":
+            positive_firings, negative_firings = _rule_firing_sets(rule)
+            cluster_key = (
+                str(rule.get("head_predicate", "")),
+                positive_firings,
+                negative_firings,
+            )
+        else:
+            cluster_key = _positive_coverage_key(rule)
+        clusters.setdefault(cluster_key, []).append(rule)
+
+    for cluster_rules in clusters.values():
+        cluster_rules.sort(key=_initial_rule_rank_key)
+
+    ordered_clusters = sorted(
+        clusters.values(),
+        key=lambda cluster_rules: (
+            _initial_rule_rank_key(cluster_rules[0]),
+            len(cluster_rules),
+        ),
+    )
+
+    selected: List[Dict[str, Any]] = []
+    while len(selected) < max_rules:
+        made_progress = False
+        for cluster_rules in ordered_clusters:
+            if not cluster_rules:
+                continue
+            selected.append(cluster_rules.pop(0))
+            made_progress = True
+            if len(selected) >= max_rules:
+                break
+        if not made_progress:
+            break
+    return selected
+
+
+def _initial_rule_csv_row(rule: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "merged_rule_index": rule.get("merged_rule_index", ""),
+        "rule_id": rule.get("rule_id", ""),
+        "head_predicate": rule.get("head_predicate", ""),
+        "head_atom_template": rule.get("head_atom_template", ""),
+        "body_atom_template": rule.get("body_atom_template", ""),
+        "body_atom_templates": json.dumps(rule.get("body_atom_templates", [])),
+        "body_length": rule.get("body_length", 1),
+        "clause": rule.get("clause", ""),
+        "positive_support": rule.get("positive_support", 0),
+        "negative_support": rule.get("negative_support", 0),
+        "total_support": rule.get("total_support", 0),
+        "positive_firings": rule.get("positive_firings", 0),
+        "negative_firings": rule.get("negative_firings", 0),
+        "total_firings": rule.get("total_firings", 0),
+        "confidence": rule.get("confidence", 0.0),
+        "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
+        "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
+        "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
+        "candidate_provenance_atom_ratio": rule.get("candidate_provenance_atom_ratio", 0.0),
+        "candidate_semantic_atom_ratio": rule.get("candidate_semantic_atom_ratio", 0.0),
+        "semantic_to_provenance_atom_ratio": rule.get("semantic_to_provenance_atom_ratio", 0.0),
+        "matched_prior_ids_involved": json.dumps(rule.get("matched_prior_ids_involved", [])),
+        "mixes_accepted_and_candidate_atoms": rule.get("mixes_accepted_and_candidate_atoms", False),
+        "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
+        "body_source_mix": rule.get("body_source_mix", ""),
+        "candidate_rule_category": rule.get("candidate_rule_category", ""),
+        "initial_rule_pair_category": rule.get("initial_rule_pair_category", ""),
+        "initial_pruning_category": rule.get("initial_pruning_category", ""),
+        "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
+        "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
+        "source_video_ids": json.dumps(rule.get("source_video_ids", [])),
+        "source_rule_ids": json.dumps(rule.get("source_rule_ids", [])),
+        "source_rule_indices": json.dumps(rule.get("source_rule_indices", [])),
+        "num_source_rules": rule.get("num_source_rules", 0),
+    }
+
+
+def _write_pruned_initial_rules_csv(csv_path: Path, rules: Sequence[Dict[str, Any]]) -> None:
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "merged_rule_index",
+                "rule_id",
+                "head_predicate",
+                "head_atom_template",
+                "body_atom_template",
+                "body_atom_templates",
+                "body_length",
+                "clause",
+                "positive_support",
+                "negative_support",
+                "total_support",
+                "positive_firings",
+                "negative_firings",
+                "total_firings",
+                "confidence",
+                "uses_candidate_atoms",
+                "num_candidate_body_atoms",
+                "candidate_body_atom_ratio",
+                "candidate_provenance_atom_ratio",
+                "candidate_semantic_atom_ratio",
+                "semantic_to_provenance_atom_ratio",
+                "matched_prior_ids_involved",
+                "mixes_accepted_and_candidate_atoms",
+                "uses_only_candidate_atoms",
+                "body_source_mix",
+                "candidate_rule_category",
+                "initial_rule_pair_category",
+                "initial_pruning_category",
+                "positive_example_ids",
+                "negative_example_ids",
+                "source_video_ids",
+                "source_rule_ids",
+                "source_rule_indices",
+                "num_source_rules",
+            ],
+        )
+        writer.writeheader()
+        for rule in rules:
+            writer.writerow(_initial_rule_csv_row(rule))
+
+
+def prune_initial_rules(
+    merged_initial_rules: Dict[str, Any],
+    cfg: Optional[Dict[str, Any]] = None,
+    output_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    cfg = cfg or {}
+    out_root = output_root or pipeline_config.get_merged_candidate_rules_output_root()
+    out_root.mkdir(parents=True, exist_ok=True)
+    json_path = out_root / "pruned_initial_rules.json"
+    csv_path = out_root / "pruned_initial_rules.csv"
+    summary_path = out_root / "initial_rule_pruning_summary.json"
+
+    atom_availability = dict(
+        dict(merged_initial_rules.get("candidate_rule_stage_stats", {})).get("atom_availability", {})
+    )
+    candidate_semantic_templates = {
+        str(value)
+        for value in list(atom_availability.get("candidate_semantic_body_atom_templates", []))
+        if str(value)
+    }
+    candidate_provenance_templates = {
+        str(value)
+        for value in list(atom_availability.get("candidate_provenance_only_body_atom_templates", []))
+        if str(value)
+    }
+
+    input_rules = list(merged_initial_rules.get("rules", []))
+    annotated_rules: List[Dict[str, Any]] = []
+    for rule in input_rules:
+        annotated_rule = dict(rule)
+        annotated_rule.update(
+            _computed_rule_ratios(
+                annotated_rule,
+                candidate_semantic_templates=candidate_semantic_templates,
+                candidate_provenance_templates=candidate_provenance_templates,
+            )
+        )
+        annotated_rule["initial_pruning_category"] = _initial_pruning_category(annotated_rule)
+        annotated_rules.append(annotated_rule)
+
+    input_counts = _initial_pruning_counts(annotated_rules)
+
+    signature_best: Dict[Tuple[str, Tuple[str, ...], Tuple[str, ...]], Dict[str, Any]] = {}
+    signature_pruned_counts = empty_rule_category_counts()
+    for rule in annotated_rules:
+        positive_firings, negative_firings = _rule_firing_sets(rule)
+        key = (str(rule.get("head_predicate", "")), positive_firings, negative_firings)
+        existing = signature_best.get(key)
+        if existing is None:
+            signature_best[key] = rule
+            continue
+        if _initial_rule_rank_key(rule) < _initial_rule_rank_key(existing):
+            _increment_initial_pruning_count(
+                signature_pruned_counts,
+                _initial_pruning_category(existing),
+            )
+            signature_best[key] = rule
+        else:
+            _increment_initial_pruning_count(
+                signature_pruned_counts,
+                _initial_pruning_category(rule),
+            )
+
+    deduplicated_rules = list(signature_best.values())
+    deduplicated_counts = _initial_pruning_counts(deduplicated_rules)
+
+    coverage_best: Dict[Tuple[str, Tuple[str, ...]], Dict[str, Any]] = {}
+    dominance_pruned_counts = empty_rule_category_counts()
+    for rule in deduplicated_rules:
+        key = _positive_coverage_key(rule)
+        existing = coverage_best.get(key)
+        if existing is None:
+            coverage_best[key] = rule
+            continue
+        if _initial_rule_rank_key(rule) < _initial_rule_rank_key(existing):
+            _increment_initial_pruning_count(
+                dominance_pruned_counts,
+                _initial_pruning_category(existing),
+            )
+            coverage_best[key] = rule
+        else:
+            _increment_initial_pruning_count(
+                dominance_pruned_counts,
+                _initial_pruning_category(rule),
+            )
+
+    dominance_rules = list(coverage_best.values())
+    dominance_counts = _initial_pruning_counts(dominance_rules)
+
+    max_total_rules = _initial_budget_limit(cfg, "max_total_initial_rules", 8000)
+    category_budgets = {
+        "accepted_only": _initial_budget_limit(cfg, "max_accepted_only_initial_rules", 4000),
+        "accepted_candidate": _initial_budget_limit(cfg, "max_mixed_candidate_initial_rules", 2000),
+        "candidate_only": _initial_budget_limit(cfg, "max_candidate_only_initial_rules", 1500),
+        "candidate_candidate": _initial_budget_limit(cfg, "max_candidate_candidate_initial_rules", 500),
+    }
+    diversity_key = str(cfg.get("diversity_key", "positive_coverage"))
+
+    category_rules: Dict[str, List[Dict[str, Any]]] = {
+        "accepted_only": [],
+        "accepted_candidate": [],
+        "candidate_only": [],
+        "candidate_candidate": [],
+    }
+    for rule in dominance_rules:
+        category_rules.setdefault(_initial_pruning_category(rule), []).append(rule)
+
+    category_selected: Dict[str, List[Dict[str, Any]]] = {}
+    budget_pruned_counts = empty_rule_category_counts()
+    for category, rules in category_rules.items():
+        selected = _cluster_diverse_select(
+            rules=rules,
+            max_rules=min(len(rules), category_budgets.get(category, 0)),
+            cluster_key_name=diversity_key,
+        )
+        selected_ids = {id(rule) for rule in selected}
+        for rule in rules:
+            if id(rule) not in selected_ids:
+                _increment_initial_pruning_count(budget_pruned_counts, category)
+        category_selected[category] = selected
+
+    accepted_order = [
+        "accepted_only",
+        "accepted_candidate",
+        "candidate_only",
+        "candidate_candidate",
+    ]
+    budget_candidates: List[Dict[str, Any]] = []
+    for category in accepted_order:
+        budget_candidates.extend(category_selected.get(category, []))
+
+    kept_rules = _cluster_diverse_select(
+        rules=budget_candidates,
+        max_rules=min(len(budget_candidates), max_total_rules),
+        cluster_key_name=diversity_key,
+    )
+    kept_ids = {id(rule) for rule in kept_rules}
+    for rule in budget_candidates:
+        if id(rule) not in kept_ids:
+            _increment_initial_pruning_count(
+                budget_pruned_counts,
+                _initial_pruning_category(rule),
+            )
+
+    kept_rules = sorted(
+        kept_rules,
+        key=lambda rule: (
+            str(rule.get("head_predicate", "")),
+            str(rule.get("clause", "")),
+        ),
+    )
+    for idx, rule in enumerate(kept_rules):
+        rule["merged_rule_index"] = idx
+        rule["pruned_initial_rule_index"] = idx
+
+    kept_counts = _initial_pruning_counts(kept_rules)
+    pruned_result = dict(merged_initial_rules)
+    pruned_result["version"] = _PRUNED_INITIAL_RULES_VERSION
+    pruned_result["source_version"] = merged_initial_rules.get("version")
+    pruned_result["num_rules"] = len(kept_rules)
+    pruned_result["num_rules_using_candidate_atoms"] = kept_counts["candidate_involving_rules"]
+    pruned_result["num_candidate_only_rules"] = kept_counts["candidate_only_rules"]
+    pruned_result["num_mixed_source_rules"] = kept_counts["mixed_accepted_candidate_rules"]
+    pruned_result["rules"] = kept_rules
+
+    summary = {
+        "version": _PRUNED_INITIAL_RULES_VERSION,
+        "stage": "step15b_initial_rule_pruning",
+        "enabled": True,
+        "config": {
+            "max_total_initial_rules": max_total_rules,
+            "category_budgets": category_budgets,
+            "diversity_key": diversity_key,
+        },
+        "input_num_rules": len(annotated_rules),
+        "input_rule_counts": input_counts,
+        "deduplicated_num_rules": len(deduplicated_rules),
+        "deduplicated_rule_counts": deduplicated_counts,
+        "firing_signature_deduplicated_num_rules": input_counts["all_rules"] - deduplicated_counts["all_rules"],
+        "firing_signature_deduplicated_rule_counts": signature_pruned_counts,
+        "dominance_pruned_num_rules": deduplicated_counts["all_rules"] - dominance_counts["all_rules"],
+        "dominance_pruned_rule_counts": dominance_pruned_counts,
+        "dominance_pruned_remaining_num_rules": len(dominance_rules),
+        "dominance_pruned_remaining_rule_counts": dominance_counts,
+        "budget_pruned_num_rules": dominance_counts["all_rules"] - kept_counts["all_rules"],
+        "budget_pruned_rule_counts": budget_pruned_counts,
+        "kept_num_rules": len(kept_rules),
+        "kept_rule_counts": kept_counts,
+        "json_path": str(json_path),
+        "csv_path": str(csv_path),
+    }
+
+    stage_stats = dict(pruned_result.get("candidate_rule_stage_stats", {}))
+    stage_stats["initial_rule_pruning"] = summary
+    stage_stats["pruned_initial_rule_counts"] = kept_counts
+    pruned_result["candidate_rule_stage_stats"] = stage_stats
+
+    flow_summary = dict(pruned_result.get("candidate_rule_flow_summary", {}))
+    flow_summary["pruning"] = {
+        "initial_rule_pruning_pruned_rule_counts": {
+            key: int(signature_pruned_counts.get(key, 0))
+            + int(dominance_pruned_counts.get(key, 0))
+            + int(budget_pruned_counts.get(key, 0))
+            for key in empty_rule_category_counts()
+        },
+        "initial_rule_pruning_kept_rule_counts": kept_counts,
+    }
+    pruned_result["candidate_rule_flow_summary"] = flow_summary
+
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(pruned_result, fh, indent=2)
+    _write_pruned_initial_rules_csv(csv_path, kept_rules)
+    with summary_path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2)
+
+    print(f"Pruned initial rule JSON written to {json_path}")
+    print(f"Pruned initial rule CSV written to {csv_path}")
+    print(f"Initial rule pruning summary written to {summary_path}")
+    return pruned_result
 
 
 def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -177,6 +697,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
     total_rules_using_candidate_atoms = 0
     total_candidate_only_rules = 0
     total_mixed_source_rules = 0
+    total_skipped_non_unary_input_rules = 0
     input_generated_counts = empty_rule_category_counts()
     atom_availability_counts = {
         "num_body_atom_templates": 0,
@@ -198,11 +719,18 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         total_negative_examples += int(video_result.get("num_negative_examples", 0))
 
         candidate_rules = list(video_result.get("initial_rules", video_result.get("candidate_rules", [])))
+        unary_candidate_rules = [
+            rule for rule in candidate_rules
+            if _rule_body_length(rule) == 1
+        ]
+        skipped_non_unary_input_rules = len(candidate_rules) - len(unary_candidate_rules)
         video_summaries.append(
             {
                 "video_id": video_id,
                 "target_predicate": target_predicate,
-                "num_initial_rules": len(candidate_rules),
+                "num_initial_rules": len(unary_candidate_rules),
+                "num_input_initial_rules_before_unary_filter": len(candidate_rules),
+                "num_skipped_non_unary_input_rules": skipped_non_unary_input_rules,
                 "num_examples": int(video_result.get("num_examples", 0)),
                 "num_positive_examples": int(video_result.get("num_positive_examples", 0)),
                 "num_negative_examples": int(video_result.get("num_negative_examples", 0)),
@@ -211,6 +739,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "num_mixed_source_rules": int(video_result.get("num_mixed_source_rules", 0)),
             }
         )
+        total_skipped_non_unary_input_rules += skipped_non_unary_input_rules
         total_rules_using_candidate_atoms += int(video_result.get("num_rules_using_candidate_atoms", 0))
         total_candidate_only_rules += int(video_result.get("num_candidate_only_rules", 0))
         total_mixed_source_rules += int(video_result.get("num_mixed_source_rules", 0))
@@ -236,17 +765,17 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
             generated_counts = {
                 "accepted_only_rules": max(
                     0,
-                    len(candidate_rules) - int(video_result.get("num_rules_using_candidate_atoms", 0)),
+                    len(unary_candidate_rules) - int(video_result.get("num_rules_using_candidate_atoms", 0)),
                 ),
                 "candidate_only_rules": int(video_result.get("num_candidate_only_rules", 0)),
                 "mixed_accepted_candidate_rules": int(video_result.get("num_mixed_source_rules", 0)),
                 "candidate_involving_rules": int(video_result.get("num_rules_using_candidate_atoms", 0)),
-                "all_rules": len(candidate_rules),
+                "all_rules": len(unary_candidate_rules),
             }
         for key in input_generated_counts:
             input_generated_counts[key] += int(generated_counts.get(key, 0))
 
-        for rule in candidate_rules:
+        for rule in unary_candidate_rules:
             clause = str(rule.get("clause", "")).strip()
             if not clause:
                 continue
@@ -271,6 +800,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "negative_firings": 0,
                     "total_firings": 0,
                     "confidence": 0.0,
+                    "initial_rule_pair_category": rule.get("initial_rule_pair_category", ""),
                     "positive_example_ids": [],
                     "negative_example_ids": [],
                     "evidence_set": [],
@@ -282,6 +812,8 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 merged_rule_map[clause] = merged_rule
 
             merged_rule["evidence_set"].extend(list(rule.get("evidence_set", [])))
+            if not str(merged_rule.get("initial_rule_pair_category", "")):
+                merged_rule["initial_rule_pair_category"] = rule.get("initial_rule_pair_category", "")
             merged_rule["source_video_ids"].append(video_id)
             merged_rule["source_rule_ids"].append(rule.get("rule_id", ""))
             merged_rule["source_rule_indices"].append(rule.get("rule_index"))
@@ -307,6 +839,18 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         merged_rule["negative_example_ids"] = list(evidence_summary["negative_example_ids"])
         merged_rule.update(provenance_summary)
         merged_rule["candidate_rule_category"] = rule_candidate_category(merged_rule)
+        if not str(merged_rule.get("initial_rule_pair_category", "")):
+            if bool(merged_rule.get("mixes_accepted_and_candidate_atoms", False)):
+                merged_rule["initial_rule_pair_category"] = "accepted_candidate"
+            elif (
+                bool(merged_rule.get("uses_only_candidate_atoms", False))
+                and int(merged_rule.get("num_candidate_body_atoms", 0)) >= 2
+            ):
+                merged_rule["initial_rule_pair_category"] = "candidate_candidate"
+            elif bool(merged_rule.get("uses_candidate_atoms", False)):
+                merged_rule["initial_rule_pair_category"] = "candidate_only"
+            else:
+                merged_rule["initial_rule_pair_category"] = "accepted_only"
         merged_rule["source_video_ids"] = sorted(set(str(v) for v in merged_rule["source_video_ids"]))
         merged_rule["source_rule_ids"] = sorted(
             set(str(rule_id) for rule_id in merged_rule["source_rule_ids"] if str(rule_id))
@@ -328,11 +872,13 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
+        "num_skipped_non_unary_input_rules": total_skipped_non_unary_input_rules,
         "num_rules_using_candidate_atoms": merged_category_counts["candidate_involving_rules"],
         "num_candidate_only_rules": merged_category_counts["candidate_only_rules"],
         "num_mixed_source_rules": merged_category_counts["mixed_accepted_candidate_rules"],
         "candidate_rule_stage_stats": {
             "stage": "step15_merge_initial_rules",
+            "skipped_non_unary_input_rules": total_skipped_non_unary_input_rules,
             "atom_availability": aggregate_atom_availability,
             "input_generated_rule_counts": input_generated_counts,
             "merged_rule_counts": merged_category_counts,
@@ -357,6 +903,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
         "num_positive_examples": total_positive_examples,
         "num_negative_examples": total_negative_examples,
         "num_rules": len(merged_rules),
+        "num_skipped_non_unary_input_rules": total_skipped_non_unary_input_rules,
         "input_num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
         "input_num_candidate_only_rules": total_candidate_only_rules,
         "input_num_mixed_source_rules": total_mixed_source_rules,
@@ -400,6 +947,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                 "uses_only_candidate_atoms",
                 "body_source_mix",
                 "candidate_rule_category",
+                "initial_rule_pair_category",
                 "positive_example_ids",
                 "negative_example_ids",
                 "source_video_ids",
@@ -435,6 +983,7 @@ def merge_candidate_rules(candidate_rule_results: List[Dict[str, Any]]) -> Dict[
                     "uses_only_candidate_atoms": rule.get("uses_only_candidate_atoms", False),
                     "body_source_mix": rule.get("body_source_mix", ""),
                     "candidate_rule_category": rule.get("candidate_rule_category", ""),
+                    "initial_rule_pair_category": rule.get("initial_rule_pair_category", ""),
                     "positive_example_ids": json.dumps(rule.get("positive_example_ids", [])),
                     "negative_example_ids": json.dumps(rule.get("negative_example_ids", [])),
                     "source_video_ids": json.dumps(rule.get("source_video_ids", [])),

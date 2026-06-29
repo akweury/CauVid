@@ -273,7 +273,7 @@ def get_candidate_rules_cfg() -> Dict[str, Any]:
             "use_only_positive_examples": True,
             "min_positive_support": 1,
             "include_example_ids": True,
-            "generate_mixed_accepted_candidate_rules": True,
+            "generate_mixed_accepted_candidate_rules": False,
             "generate_candidate_candidate_rules": False,
             "max_candidate_only_initial_rules": 500,
             "max_mixed_candidate_initial_rules": 3000,
@@ -289,6 +289,22 @@ def get_candidate_rules_cfg() -> Dict[str, Any]:
         },
         path=("candidate_rules",),
         warn_label="candidate rules",
+    )
+
+
+def get_initial_rule_pruning_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": True,
+            "max_total_initial_rules": 8000,
+            "max_accepted_only_initial_rules": 4000,
+            "max_mixed_candidate_initial_rules": 2000,
+            "max_candidate_only_initial_rules": 1500,
+            "max_candidate_candidate_initial_rules": 500,
+            "diversity_key": "positive_coverage",
+        },
+        path=("initial_rule_pruning",),
+        warn_label="initial rule pruning",
     )
 
 

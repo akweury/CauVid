@@ -3,7 +3,7 @@ Extend merged initial temporal rules for a fixed number of rounds.
 
 Current scope:
   - Each round extends every current rule with one body atom drawn from the
-    merged initial rule set.
+    unary subset of the merged initial rule set.
   - The added atom must be new to the rule body.
   - Evaluation uses binding-aware evidence-set intersections.
   - Pruning is dispatched through a strategy interface.
@@ -18,6 +18,7 @@ Output layout:
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -81,6 +82,7 @@ def _resolve_prune_strategies(cfg: Dict[str, Any]) -> List[str]:
 
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        "input_initial_rule_pool_key": str(cfg.get("input_initial_rule_pool_key", "")),
         "num_rounds": int(cfg.get("num_rounds", 3)),
         "evaluation_strategy": str(cfg.get("evaluation_strategy", "binding_aware_intersection")),
         "prune_strategies": _resolve_prune_strategies(cfg),
@@ -95,6 +97,22 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_round_candidate_only_rules": int(cfg.get("max_round_candidate_only_rules", 3000)),
         "max_round_candidate_candidate_rules": int(cfg.get("max_round_candidate_candidate_rules", 500)),
     }
+
+
+def _initial_rule_pool_cache_key(rules: Sequence[Dict[str, Any]]) -> str:
+    payload = [
+        {
+            "rule_id": str(rule.get("rule_id", "")),
+            "clause": str(rule.get("clause", "")),
+            "positive_example_ids": list(rule.get("positive_example_ids", [])),
+            "negative_example_ids": list(rule.get("negative_example_ids", [])),
+            "positive_firings": int(rule.get("positive_firings", 0)),
+            "negative_firings": int(rule.get("negative_firings", 0)),
+        }
+        for rule in rules
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _strip_trailing_dot(atom_text: str) -> str:
@@ -141,6 +159,11 @@ def _get_rule_body_atom_templates(rule: Dict[str, Any]) -> Tuple[str, ...]:
     if body_atom_template:
         return _canonical_body_atoms([body_atom_template])
     return ()
+
+
+def _is_unary_initial_rule(rule: Dict[str, Any]) -> bool:
+    body_atoms = _get_rule_body_atom_templates(rule)
+    return len(body_atoms) == 1
 
 
 def _group_evidence_by_example(
@@ -857,6 +880,10 @@ def process_rules(
         "candidate_only": int(cfg.get("max_round_candidate_only_rules", 3000)),
         "candidate_candidate": int(cfg.get("max_round_candidate_candidate_rules", 500)),
     }
+    all_input_initial_rules = list(merged_initial_rules.get("rules", []))
+    initial_rules = [rule for rule in all_input_initial_rules if _is_unary_initial_rule(rule)]
+    num_skipped_non_unary_initial_rules = len(all_input_initial_rules) - len(initial_rules)
+    input_initial_rule_pool_key = _initial_rule_pool_cache_key(initial_rules)
 
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -869,6 +896,7 @@ def process_rules(
             cached.get("config", {})
         ) == _cfg_key_subset(
             {
+                "input_initial_rule_pool_key": input_initial_rule_pool_key,
                 "num_rounds": num_rounds,
                 "evaluation_strategy": evaluation_strategy,
                 "prune_strategies": prune_strategies,
@@ -885,7 +913,6 @@ def process_rules(
             print(f"  [cache] loading {manifest_path.name}")
             return cached
 
-    initial_rules = list(merged_initial_rules.get("rules", []))
     total_positive_examples = int(merged_initial_rules.get("num_positive_examples", 0))
     initial_rule_atom_map: Dict[str, Dict[str, Any]] = {}
     for rule in initial_rules:
@@ -923,10 +950,13 @@ def process_rules(
         seeded_rule["evidence_set"] = _seed_rule_evidence(rule)
         seeded_rule["candidate_rule_category"] = _rule_candidate_category(seeded_rule)
         current_rules.append(seeded_rule)
+    unary_initial_rule_counts = _count_rule_categories(initial_rules)
 
     print(
         "  initial_rules: "
-        f"total={len(initial_rules)} | "
+        f"input_total={len(all_input_initial_rules)} | "
+        f"unary_used={len(initial_rules)} | "
+        f"skipped_non_unary={num_skipped_non_unary_initial_rules} | "
         f"unique_body_atoms={len(initial_rule_atoms)}"
     )
     print(f"  prune_strategies: {prune_strategies}")
@@ -1161,6 +1191,7 @@ def process_rules(
             "version": _EXTENDED_RULES_VERSION,
             "round_index": round_index,
             "config": {
+                "input_initial_rule_pool_key": input_initial_rule_pool_key,
                 "num_rounds": num_rounds,
                 "evaluation_strategy": evaluation_strategy,
                 "prune_strategies": prune_strategies,
@@ -1303,6 +1334,7 @@ def process_rules(
     manifest = {
         "version": _EXTENDED_RULES_VERSION,
         "config": {
+            "input_initial_rule_pool_key": input_initial_rule_pool_key,
             "num_rounds": num_rounds,
             "evaluation_strategy": evaluation_strategy,
             "prune_strategies": prune_strategies,
@@ -1318,11 +1350,13 @@ def process_rules(
         "input_num_examples": int(merged_initial_rules.get("num_examples", 0)),
         "input_num_positive_examples": total_positive_examples,
         "input_num_negative_examples": int(merged_initial_rules.get("num_negative_examples", 0)),
-        "input_num_initial_rules": len(initial_rules),
+        "input_num_initial_rules": len(all_input_initial_rules),
+        "input_num_unary_initial_rules_used": len(initial_rules),
+        "input_num_skipped_non_unary_initial_rules": num_skipped_non_unary_initial_rules,
         "input_num_unique_initial_body_atoms": len(initial_rule_atoms),
-        "input_num_rules_using_candidate_atoms": int(merged_initial_rules.get("num_rules_using_candidate_atoms", 0)),
-        "input_num_candidate_only_rules": int(merged_initial_rules.get("num_candidate_only_rules", 0)),
-        "input_num_mixed_source_rules": int(merged_initial_rules.get("num_mixed_source_rules", 0)),
+        "input_num_rules_using_candidate_atoms": int(unary_initial_rule_counts.get("candidate_involving_rules", 0)),
+        "input_num_candidate_only_rules": int(unary_initial_rule_counts.get("candidate_only_rules", 0)),
+        "input_num_mixed_source_rules": int(unary_initial_rule_counts.get("mixed_accepted_candidate_rules", 0)),
         "num_rounds_completed": len(rounds),
         "num_all_kept_rules": len(all_kept_rules),
         "num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
@@ -1330,7 +1364,7 @@ def process_rules(
         "num_mixed_source_rules": total_mixed_source_rules,
         "candidate_rule_stage_stats": {
             "stage": "step16_extension",
-            "input_initial_rule_counts": _count_rule_categories(initial_rules),
+            "input_initial_rule_counts": unary_initial_rule_counts,
             "extension_only_kept_rule_counts": extension_only_counts,
             "all_kept_after_step16_rule_counts": all_kept_counts,
             "pruned_rule_counts": total_pruned_candidate_rule_counts,

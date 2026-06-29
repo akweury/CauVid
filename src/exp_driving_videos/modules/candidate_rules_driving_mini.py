@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 9
+_INITIAL_RULES_VERSION = 10
 _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -386,73 +386,6 @@ def _is_provenance_only_atom_template(atom_text: str) -> bool:
     return _predicate_of_atom_template(atom_text) in _SINGLETON_PROVENANCE_ONLY_PREDICATES
 
 
-def _bindings_compatible(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
-    for key, value in left.items():
-        if key in right and str(right[key]) != str(value):
-            return False
-    return True
-
-
-def _merge_bindings(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, str]:
-    merged = {str(key): str(value) for key, value in left.items()}
-    for key, value in right.items():
-        merged[str(key)] = str(value)
-    return merged
-
-
-def _combine_evidence_entries(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not entries:
-        return None
-    combined_bindings: Dict[str, str] = {}
-    matched_atoms: Dict[str, str] = {}
-    matched_atom_sources: Dict[str, str] = {}
-    matched_atom_prior_ids: Dict[str, List[str]] = {}
-    for entry in entries:
-        entry_bindings = {str(k): str(v) for k, v in dict(entry.get("bindings", {})).items()}
-        if not _bindings_compatible(combined_bindings, entry_bindings):
-            return None
-        combined_bindings = _merge_bindings(combined_bindings, entry_bindings)
-        matched_atoms.update({str(k): str(v) for k, v in dict(entry.get("matched_atoms", {})).items()})
-        matched_atom_sources.update(
-            {str(k): str(v) for k, v in dict(entry.get("matched_atom_sources", {})).items()}
-        )
-        for key, prior_ids in dict(entry.get("matched_atom_prior_ids", {})).items():
-            out_prior_ids = matched_atom_prior_ids.setdefault(str(key), [])
-            for prior_id in list(prior_ids):
-                prior_id_text = str(prior_id)
-                if prior_id_text and prior_id_text not in out_prior_ids:
-                    out_prior_ids.append(prior_id_text)
-
-    first = entries[0]
-    return {
-        "video_id": str(first.get("video_id", "")),
-        "example_id": str(first.get("example_id", "")),
-        "current_segment_id": str(first.get("current_segment_id", "")),
-        "next_segment_id": str(first.get("next_segment_id", "")),
-        "target_predicate": str(first.get("target_predicate", "")),
-        "label": bool(first.get("label", False)),
-        "body_atom_templates": sorted(matched_atoms),
-        "body_atom_template": sorted(matched_atoms)[0] if len(matched_atoms) == 1 else "",
-        "matched_atom": next(iter(matched_atoms.values()), "") if len(matched_atoms) == 1 else "",
-        "body_atom_source": next(iter(matched_atom_sources.values()), "") if len(matched_atom_sources) == 1 else "",
-        "matched_prior_ids": sorted(
-            {
-                str(prior_id)
-                for prior_ids in matched_atom_prior_ids.values()
-                for prior_id in list(prior_ids)
-                if str(prior_id)
-            }
-        ),
-        "bindings": combined_bindings,
-        "matched_atoms": matched_atoms,
-        "matched_atom_sources": matched_atom_sources,
-        "matched_atom_prior_ids": {
-            key: sorted(values)
-            for key, values in matched_atom_prior_ids.items()
-        },
-    }
-
-
 def _canonical_body_templates(body_templates: List[str]) -> Tuple[str, ...]:
     return tuple(sorted({str(template).strip() for template in body_templates if str(template).strip()}))
 
@@ -475,8 +408,9 @@ def process_video(
     use_only_positive_examples = bool(cfg.get("use_only_positive_examples", True))
     min_positive_support = int(cfg.get("min_positive_support", 1))
     include_example_ids = bool(cfg.get("include_example_ids", True))
-    generate_mixed_accepted_candidate_rules = bool(cfg.get("generate_mixed_accepted_candidate_rules", True))
-    generate_candidate_candidate_rules = bool(cfg.get("generate_candidate_candidate_rules", False))
+    # Initial rules are hard-constrained to unary bodies.
+    generate_mixed_accepted_candidate_rules = False
+    generate_candidate_candidate_rules = False
     max_candidate_only_initial_rules = int(cfg.get("max_candidate_only_initial_rules", 500))
     max_mixed_candidate_initial_rules = int(cfg.get("max_mixed_candidate_initial_rules", 3000))
     max_candidate_candidate_initial_rules = int(cfg.get("max_candidate_candidate_initial_rules", 0))
@@ -563,8 +497,6 @@ def process_video(
             if prior_id and prior_id not in matched_prior_ids_by_candidate_object[object_id]:
                 matched_prior_ids_by_candidate_object[object_id].append(prior_id)
         unary_entries_by_template: Dict[str, Dict[str, Any]] = {}
-        accepted_entries: List[Dict[str, Any]] = []
-        candidate_entries: List[Dict[str, Any]] = []
         for body_atom in body_atoms:
             parsed_body_atom = _parse_atom(str(body_atom))
             if parsed_body_atom is None:
@@ -598,100 +530,19 @@ def process_video(
                 stats[unary_key]["evidence_set"].append(evidence_entry)
                 available_body_templates.add(body_template)
                 if body_atom_source == "candidate":
-                    candidate_entries.append(evidence_entry)
                     available_candidate_body_templates.add(body_template)
                     if _is_provenance_only_atom_template(body_template):
                         available_candidate_provenance_only_body_templates.add(body_template)
                     else:
                         available_candidate_semantic_body_templates.add(body_template)
                 elif body_atom_source == "accepted":
-                    accepted_entries.append(evidence_entry)
                     available_accepted_body_templates.add(body_template)
-
-        if generate_mixed_accepted_candidate_rules:
-            for left_index, left_entry in enumerate(candidate_entries):
-                if not generate_candidate_candidate_rules and max_candidate_candidate_initial_rules <= 0:
-                    break
-                left_template = str(left_entry.get("body_atom_template", "")).strip()
-                if not left_template:
-                    continue
-                for right_entry in candidate_entries[left_index + 1 :]:
-                    right_template = str(right_entry.get("body_atom_template", "")).strip()
-                    if (
-                        not right_template
-                        or right_template == left_template
-                        or (
-                            _is_provenance_only_atom_template(left_template)
-                            and _is_provenance_only_atom_template(right_template)
-                        )
-                    ):
-                        continue
-                    body_templates = _canonical_body_templates([left_template, right_template])
-                    if len(body_templates) != 2:
-                        continue
-                    combined_entry = _combine_evidence_entries([left_entry, right_entry])
-                    if combined_entry is not None:
-                        stats[body_templates]["evidence_set"].append(combined_entry)
-
-            for accepted_entry in accepted_entries:
-                accepted_template = str(accepted_entry.get("body_atom_template", "")).strip()
-                if not accepted_template:
-                    continue
-                for candidate_entry in candidate_entries:
-                    candidate_template = str(candidate_entry.get("body_atom_template", "")).strip()
-                    if (
-                        not candidate_template
-                        or candidate_template == accepted_template
-                    ):
-                        continue
-                    body_templates = _canonical_body_templates([accepted_template, candidate_template])
-                    if len(body_templates) != 2:
-                        continue
-                    combined_entry = _combine_evidence_entries([accepted_entry, candidate_entry])
-                    if combined_entry is not None:
-                        stats[body_templates]["evidence_set"].append(combined_entry)
 
         if is_positive or not use_only_positive_examples:
             for body_template, entry in unary_entries_by_template.items():
                 if _is_provenance_only_atom_template(body_template):
                     continue
                 eligible_body_template_sets.add((body_template,))
-            if generate_mixed_accepted_candidate_rules:
-                for left_index, left_entry in enumerate(candidate_entries):
-                    if not generate_candidate_candidate_rules and max_candidate_candidate_initial_rules <= 0:
-                        break
-                    left_template = str(left_entry.get("body_atom_template", "")).strip()
-                    if not left_template:
-                        continue
-                    for right_entry in candidate_entries[left_index + 1 :]:
-                        right_template = str(right_entry.get("body_atom_template", "")).strip()
-                        if (
-                            not right_template
-                            or right_template == left_template
-                            or (
-                                _is_provenance_only_atom_template(left_template)
-                                and _is_provenance_only_atom_template(right_template)
-                            )
-                        ):
-                            continue
-                        body_templates = _canonical_body_templates([left_template, right_template])
-                        if len(body_templates) == 2:
-                            eligible_body_template_sets.add(body_templates)
-
-                for accepted_entry in accepted_entries:
-                    accepted_template = str(accepted_entry.get("body_atom_template", "")).strip()
-                    if not accepted_template:
-                        continue
-                    for candidate_entry in candidate_entries:
-                        candidate_template = str(candidate_entry.get("body_atom_template", "")).strip()
-                        if (
-                            not candidate_template
-                            or candidate_template == accepted_template
-                        ):
-                            continue
-                        body_templates = _canonical_body_templates([accepted_template, candidate_template])
-                        if len(body_templates) == 2:
-                            eligible_body_template_sets.add(body_templates)
 
     initial_rules: List[Dict[str, Any]] = []
     pre_budget_category_counts = _empty_category_counts()

@@ -39,8 +39,11 @@ Steps:
                     rules whose head is the target predicate.
     15. merge_initial_rules — flatten all per-video initial rules into a
                     single persisted list for downstream scoring/selection.
-    16. extended_rules_driving_mini — iteratively extend merged rules with
-                    initial-rule body atoms for a fixed number of rounds.
+    15B. initial_rule_pruning — prune the merged initial rule pool using
+                    dataset-agnostic coverage, category, confidence, and
+                    provenance/source metadata before extension.
+    16. extended_rules_driving_mini — iteratively extend rules with
+                    unary initial-rule body atoms for a fixed number of rounds.
     17. final_rules_driving_mini — rank all kept rules by confidence and keep
                     the top-k as the final rule set.
     17B. diverse_final_rules_driving_mini — greedily choose a diverse final
@@ -212,6 +215,7 @@ _get_logic_atoms_cfg = driving_pipeline_config.get_logic_atoms_cfg
 _get_target_head_atoms_cfg = driving_pipeline_config.get_target_head_atoms_cfg
 _get_temporal_rule_examples_cfg = driving_pipeline_config.get_temporal_rule_examples_cfg
 _get_candidate_rules_cfg = driving_pipeline_config.get_candidate_rules_cfg
+_get_initial_rule_pruning_cfg = driving_pipeline_config.get_initial_rule_pruning_cfg
 _get_extended_rules_cfg = driving_pipeline_config.get_extended_rules_cfg
 _get_final_rules_cfg = driving_pipeline_config.get_final_rules_cfg
 _get_diverse_final_rules_cfg = driving_pipeline_config.get_diverse_final_rules_cfg
@@ -280,6 +284,7 @@ _get_background_rule_relevance_prior_output_root = driving_pipeline_config.get_b
 _get_reasoning_feedback_signal_output_root = driving_pipeline_config.get_reasoning_feedback_signal_output_root
 
 _merge_candidate_rules = driving_pipeline_data.merge_candidate_rules
+_prune_initial_rules = driving_pipeline_data.prune_initial_rules
 _select_video_results = driving_pipeline_data.select_video_results
 _build_train_eval_split = driving_pipeline_data.build_train_eval_split
 _resolve_video_ids = driving_pipeline_data.resolve_video_ids
@@ -302,6 +307,7 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "13", "stop_after": 13, "label": "temporal_rule_examples_driving_mini"},
     {"tag": "14", "stop_after": 14, "label": "candidate_rules_driving_mini"},
     {"tag": "15", "stop_after": 15, "label": "merge_initial_rules"},
+    {"tag": "15B", "stop_after": None, "label": "initial_rule_pruning"},
     {"tag": "16", "stop_after": 16, "label": "extended_rules_driving_mini"},
     {"tag": "17", "stop_after": 17, "label": "final_rules_driving_mini"},
     {"tag": "17B", "stop_after": None, "label": "diverse_final_rules_driving_mini"},
@@ -459,6 +465,7 @@ class PipelineContext:
     eval_temporal_rule_results: Optional[List[Dict[str, Any]]] = None
     candidate_rule_results: Optional[List[Dict[str, Any]]] = None
     merged_candidate_rules: Dict[str, Any] = field(default_factory=dict)
+    initial_rules_for_extension: Dict[str, Any] = field(default_factory=dict)
     extended_rule_results: Dict[str, Any] = field(default_factory=dict)
     final_rule_results: Dict[str, Any] = field(default_factory=dict)
     diverse_final_rule_results: Dict[str, Any] = field(default_factory=dict)
@@ -1216,6 +1223,7 @@ def run_step_14_candidate_rules(ctx: PipelineContext, runner: StepRunner) -> Non
 def run_step_15_merge_initial_rules(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("15", "merge_initial_rules")
     ctx.merged_candidate_rules = _merge_candidate_rules(ctx.candidate_rule_results or [])
+    ctx.initial_rules_for_extension = ctx.merged_candidate_rules
     runner.log(
         "15",
         "merged "
@@ -1225,14 +1233,47 @@ def run_step_15_merge_initial_rules(ctx: PipelineContext, runner: StepRunner) ->
     runner.complete_step("15", subtitle=f"rules={ctx.merged_candidate_rules['num_rules']}")
 
 
+def run_step_15b_initial_rule_pruning(ctx: PipelineContext, runner: StepRunner) -> None:
+    pruning_cfg = _get_initial_rule_pruning_cfg()
+    runner.announce_step("15B", "initial_rule_pruning")
+    runner.log("15B", f"cfg={pruning_cfg}")
+    if not bool(pruning_cfg.get("enabled", True)):
+        ctx.initial_rules_for_extension = ctx.merged_candidate_rules
+        runner.log("15B", "disabled; Step 16 will use merged initial rules")
+        runner.complete_step("15B", subtitle="disabled")
+        return
+
+    ctx.initial_rules_for_extension = _prune_initial_rules(
+        ctx.merged_candidate_rules,
+        cfg=pruning_cfg,
+    )
+    summary = dict(
+        dict(ctx.initial_rules_for_extension.get("candidate_rule_stage_stats", {})).get(
+            "initial_rule_pruning", {}
+        )
+    )
+    runner.log(
+        "15B",
+        "pruned "
+        f"input={int(summary.get('input_num_rules', 0))} "
+        f"kept={int(summary.get('kept_num_rules', ctx.initial_rules_for_extension.get('num_rules', 0)))}",
+    )
+    runner.complete_step(
+        "15B",
+        subtitle=f"kept={int(ctx.initial_rules_for_extension.get('num_rules', 0))}",
+    )
+
+
 def run_step_16_extended_rules(ctx: PipelineContext, runner: StepRunner) -> None:
     extended_rules_cfg = _get_extended_rules_cfg()
+    initial_rules_payload = ctx.initial_rules_for_extension or ctx.merged_candidate_rules
     runner.announce_step("16", "extended_rules_driving_mini")
     runner.log("16", f"cfg={extended_rules_cfg}")
+    runner.log("16", f"input_initial_rules={int(initial_rules_payload.get('num_rules', 0))}")
     runner.log("16", f"recompute={bool(ctx.recompute_cfg.get('extended_rules', True))}")
     with runner.module_output("16"):
         ctx.extended_rule_results = extended_rules_driving_mini.run(
-            merged_initial_rules=ctx.merged_candidate_rules,
+            merged_initial_rules=initial_rules_payload,
             cfg=extended_rules_cfg,
             force_recompute=bool(ctx.recompute_cfg.get("extended_rules", True)),
         )
@@ -1928,6 +1969,7 @@ def _run_steps_through_18j(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("13", f"recompute_cfg={ctx.recompute_cfg}")
     run_step_14_candidate_rules(ctx, runner)
     run_step_15_merge_initial_rules(ctx, runner)
+    run_step_15b_initial_rule_pruning(ctx, runner)
     run_step_16_extended_rules(ctx, runner)
 
     # Rule selection
