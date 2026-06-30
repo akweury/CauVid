@@ -38,7 +38,7 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 7
+_EXTENDED_RULES_VERSION = 8
 _PROVENANCE_ONLY_BODY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",

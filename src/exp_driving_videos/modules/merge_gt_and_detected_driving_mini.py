@@ -32,7 +32,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 
-_MERGED_ANNOTATIONS_VERSION = 2
+_MERGED_ANNOTATIONS_VERSION = 3
 
 
 def get_output_root() -> Path:

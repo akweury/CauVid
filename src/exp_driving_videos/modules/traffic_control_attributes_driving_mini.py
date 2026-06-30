@@ -36,7 +36,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TRAFFIC_CONTROL_ATTRIBUTES_VERSION = 3
+_TRAFFIC_CONTROL_ATTRIBUTES_VERSION = 4
 _TRAFFIC_LIGHT_ALIASES = {"traffic light", "traffic_light", "traffic signal", "traffic signals"}
 _STOP_SIGN_ALIASES = {"stop sign", "stop_sign"}
 _DEBUG_STATES: Tuple[str, ...] = ("red", "yellow", "green", "unknown")

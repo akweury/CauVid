@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import config
 
 
-_DATASET_ANNOTATIONS_VERSION = 2
+_DATASET_ANNOTATIONS_VERSION = 3
 
 
 # ---------------------------------------------------------------------------

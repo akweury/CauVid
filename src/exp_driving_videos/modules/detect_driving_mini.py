@@ -69,7 +69,7 @@ else:
     _DETECTOR_IMPORT_ERROR = None
 
 
-_DETECTION_SCHEMA_VERSION = 6
+_DETECTION_SCHEMA_VERSION = 7
 
 _PREDICTION_CSV_FIELDS: List[str] = [
     "video_id", "frame", "frame_index", "image_path", "detection_id", "class_name", "score",
@@ -196,6 +196,35 @@ def _thresholds_match(left: Dict[str, Any], right: Dict[str, Any], *, tol: float
     return True
 
 
+def _candidate_branch_enabled_matches(payload: Dict[str, Any], expected_enabled: bool) -> bool:
+    return bool(payload.get("candidate_branch_enabled", True)) == bool(expected_enabled)
+
+
+def _strip_candidate_detections_from_frames(frame_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    updated_records: List[Dict[str, Any]] = []
+    for frame_record in frame_records:
+        updated = dict(frame_record)
+        updated["candidate_detections"] = []
+        updated["num_candidate_detections"] = 0
+        updated["num_total_saved_detections"] = int(
+            updated.get("num_detections", len(list(updated.get("accepted_detections", []))))
+        )
+        updated_records.append(updated)
+    return updated_records
+
+
+def _apply_candidate_branch_mode(video_result: Dict[str, Any], enabled: bool) -> Dict[str, Any]:
+    updated = dict(video_result)
+    updated["candidate_branch_enabled"] = bool(enabled)
+    if enabled:
+        return updated
+    frames = _strip_candidate_detections_from_frames(list(updated.get("frames", [])))
+    updated["frames"] = frames
+    updated["num_candidate_detections"] = 0
+    updated["num_total_saved_detections"] = int(updated.get("num_detections", 0))
+    return updated
+
+
 def _load_manifest_fast_path(
     *,
     manifest_path: Path,
@@ -210,6 +239,7 @@ def _load_manifest_fast_path(
     policy_marker: Dict[str, Any],
     output_root: Path,
     check_cache: bool,
+    enable_candidate_branch: bool,
 ) -> Optional[List[Dict[str, Any]]]:
     if not manifest_path.exists():
         return None
@@ -219,9 +249,11 @@ def _load_manifest_fast_path(
     except Exception:
         return None
 
+    if int(manifest.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+        return None
+    if not _candidate_branch_enabled_matches(manifest, enable_candidate_branch):
+        return None
     if check_cache:
-        if int(manifest.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
-            return None
         if str(manifest.get("model", "")) != str(model_name):
             return None
         manifest_classes = list(manifest.get("classes", []))
@@ -278,10 +310,12 @@ def _load_manifest_fast_path(
                 cached = json.load(fh)
         except Exception:
             return None
-        if check_cache and int(cached.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+        if int(cached.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+            return None
+        if not _candidate_branch_enabled_matches(cached, enable_candidate_branch):
             return None
         cached["from_cache"] = True
-        loaded_results.append(cached)
+        loaded_results.append(_apply_candidate_branch_mode(cached, enable_candidate_branch))
     return loaded_results
 
 
@@ -679,6 +713,7 @@ def process_video(
     force_recompute: bool = False,
     render_video: bool = True,
     check_cache: bool = False,
+    enable_candidate_branch: bool = False,
 ) -> Dict[str, Any]:
     out_dir = (output_root or get_output_root()) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -691,7 +726,11 @@ def process_video(
     if not force_recompute and detections_file.exists():
         with detections_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
-        if not check_cache:
+        if not _candidate_branch_enabled_matches(cached, enable_candidate_branch):
+            cached = {}
+        if cached and not check_cache:
+            cached = _apply_candidate_branch_mode(cached, enable_candidate_branch)
+        if cached and not check_cache:
             cached.setdefault("output_paths", {})
             cached["output_paths"]["detections_json"] = str(detections_file)
             cached["output_paths"]["detection_predictions_csv"] = str(predictions_csv_file)
@@ -732,10 +771,13 @@ def process_video(
                 }
                 cached["od_calibration"] = dict(policy_marker)
                 cached["from_cache"] = True
-                return cached
+                return _apply_candidate_branch_mode(cached, enable_candidate_branch)
             cached_frames = _ensure_detection_identity_and_calibration(cached_frames, od_calibration_policy)
+            if not enable_candidate_branch:
+                cached_frames = _strip_candidate_detections_from_frames(cached_frames)
             cached["frames"] = cached_frames
             cached["od_calibration"] = dict(policy_marker)
+            cached["candidate_branch_enabled"] = bool(enable_candidate_branch)
             prediction_rows = _build_prediction_rows(cached_frames, video_id=video_id)
             class_summary_rows = _build_class_summary_rows(prediction_rows)
             _write_csv(
@@ -767,8 +809,14 @@ def process_video(
                     cached["boxed_video_path"] = render_path
                     with detections_file.open("w", encoding="utf-8") as fh:
                         json.dump(cached, fh, indent=2)
+            cached["num_candidate_detections"] = 0 if not enable_candidate_branch else int(cached.get("num_candidate_detections", 0))
+            cached["num_total_saved_detections"] = (
+                int(cached.get("num_detections", 0))
+                if not enable_candidate_branch
+                else int(cached.get("num_total_saved_detections", cached.get("num_detections", 0)))
+            )
             cached["from_cache"] = True
-            return cached
+            return _apply_candidate_branch_mode(cached, enable_candidate_branch)
 
     frames = list_frames(video_id, frames_root)
 
@@ -793,6 +841,7 @@ def process_video(
                 else "",
             },
             "od_calibration": od_calibration_policy_utils.current_policy_marker(od_calibration_policy),
+            "candidate_branch_enabled": bool(enable_candidate_branch),
             "from_cache": False,
         }
         _write_csv(
@@ -833,14 +882,16 @@ def process_video(
         }
         frame_records.append(frame_record)
     frame_records = _ensure_detection_identity_and_calibration(frame_records, od_calibration_policy)
+    if not enable_candidate_branch:
+        frame_records = _strip_candidate_detections_from_frames(frame_records)
     for frame_record in frame_records:
         total_candidate_detections += int(frame_record.get("num_candidate_detections", 0))
         total_saved_detections += int(
             frame_record.get("num_total_saved_detections", frame_record.get("num_detections", 0))
         )
 
-    label_counts = dict(Counter(all_labels).most_common())
     prediction_rows = _build_prediction_rows(frame_records, video_id=video_id)
+    label_counts = dict(Counter(str(row.get("class_name", "")) for row in prediction_rows if str(row.get("class_name", ""))).most_common())
     class_summary_rows = _build_class_summary_rows(prediction_rows)
 
     video_result: Dict[str, Any] = {
@@ -852,6 +903,7 @@ def process_video(
         "num_total_saved_detections": total_saved_detections,
         "detected_classes": label_counts,
         "frames": frame_records,
+        "candidate_branch_enabled": bool(enable_candidate_branch),
         "output_paths": {
             "detections_json": str(detections_file),
             "detection_predictions_csv": str(predictions_csv_file),
@@ -916,6 +968,7 @@ def run(
     force_recompute: bool = False,
     render_video: bool = True,
     check_cache: bool = False,
+    enable_candidate_branch: bool = False,
 ) -> List[Dict[str, Any]]:
     effective_frames_root = frames_root or get_frames_root()
     effective_output_root = output_root or get_output_root()
@@ -952,6 +1005,7 @@ def run(
         f"accept_iou={nms_iou_threshold:.3f}, "
         f"candidate_iou={candidate_nms_iou_threshold:.3f}"
     )
+    print(f"Candidate branch enabled: {bool(enable_candidate_branch)}")
     print(
         "OD calibration policy: "
         f"{od_calibration_policy_utils.policy_id(resolved_calibration_policy) or 'none'}"
@@ -971,6 +1025,7 @@ def run(
             policy_marker=policy_marker,
             output_root=effective_output_root,
             check_cache=check_cache,
+            enable_candidate_branch=enable_candidate_branch,
         )
         if fast_cached_results is not None:
             mode_label = "validated cache" if check_cache else "unchecked manifest cache"
@@ -1032,6 +1087,7 @@ def run(
                 force_recompute=force_recompute,
                 render_video=effective_render_video,
                 check_cache=check_cache,
+                enable_candidate_branch=enable_candidate_branch,
             )
             if (
                 bool(result.get("_requires_detection", False))
@@ -1046,6 +1102,7 @@ def run(
                     force_recompute=force_recompute,
                     render_video=effective_render_video,
                     check_cache=check_cache,
+                    enable_candidate_branch=enable_candidate_branch,
                 )
             video_results.append(result)
             cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
@@ -1069,6 +1126,7 @@ def run(
         "schema_version": _DETECTION_SCHEMA_VERSION,
         "model": model_name,
         "classes": list(effective_classes),
+        "candidate_branch_enabled": bool(enable_candidate_branch),
         "num_videos": len(video_results),
         "num_frames_total": sum(r["num_frames"] for r in video_results),
         "num_detections_total": sum(r["num_detections"] for r in video_results),
@@ -1176,6 +1234,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-recompute", action="store_true", dest="force_recompute")
     parser.add_argument("--check-cache", action=argparse.BooleanOptionalAction, default=False, dest="check_cache",
                         help="Validate cached detection files before reuse. Disabled by default.")
+    parser.add_argument("--candidate-branch", action=argparse.BooleanOptionalAction, default=False, dest="enable_candidate_branch",
+                        help="Enable the low-confidence candidate detection branch. Disabled by default.")
     return parser.parse_args()
 
 
@@ -1198,6 +1258,7 @@ def main() -> None:
         output_root=args.output_root,
         force_recompute=args.force_recompute,
         check_cache=args.check_cache,
+        enable_candidate_branch=args.enable_candidate_branch,
     )
 
 

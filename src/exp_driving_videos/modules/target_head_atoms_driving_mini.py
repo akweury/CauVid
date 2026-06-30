@@ -32,7 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TARGET_HEAD_ATOMS_VERSION = 4
+_TARGET_HEAD_ATOMS_VERSION = 5
 
 
 def get_output_root() -> Path:

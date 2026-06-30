@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TEMPORAL_RULE_EXAMPLES_VERSION = 4
+_TEMPORAL_RULE_EXAMPLES_VERSION = 5
 
 
 def get_output_root() -> Path:

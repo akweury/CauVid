@@ -4,6 +4,7 @@ video_selection:
 detection:
   render_video: false
   check_cache: false
+  candidate_branch_enabled: false
 
 tracking:
   render_video: false
@@ -65,7 +66,7 @@ important_objects:
   selection_strategy: not_implemented
   passthrough_selected_objects: true
   candidate_selection:
-    enabled: true
+    enabled: false
     max_per_segment: 8
     max_per_class: 3
     max_per_prior: 2
@@ -160,8 +161,8 @@ candidate_rules:
   include_example_ids: true
   generate_mixed_accepted_candidate_rules: false
   generate_candidate_candidate_rules: false
-  max_candidate_only_initial_rules: 500
-  max_mixed_candidate_initial_rules: 3000
+  max_candidate_only_initial_rules: 0
+  max_mixed_candidate_initial_rules: 0
   max_candidate_candidate_initial_rules: 0
   max_total_initial_rules: 10000
   ignored_body_predicates:
@@ -177,7 +178,7 @@ initial_rule_pruning:
   category_budgets:
     accepted_only: 180
     accepted_candidate: 0
-    candidate_only: 80
+    candidate_only: 0
     candidate_candidate: 0
   diversity_key: positive_coverage
 
@@ -205,28 +206,28 @@ extended_rules:
   max_round_rules_by_category:
     round_1:
       accepted_only: 300
-      mixed_accepted_candidate: 350
-      candidate_only: 100
+      mixed_accepted_candidate: 0
+      candidate_only: 0
       candidate_candidate: 0
     round_2:
       accepted_only: 80
-      mixed_accepted_candidate: 100
-      candidate_only: 20
+      mixed_accepted_candidate: 0
+      candidate_only: 0
       candidate_candidate: 0
   parents_for_next_round:
     max_total: 300
     accepted_only: 120
-    mixed_accepted_candidate: 150
-    candidate_only: 30
+    mixed_accepted_candidate: 0
+    candidate_only: 0
     candidate_candidate: 0
 
 final_rules:
   selector_mode: coverage_family_aware
   top_k: 20
   category_budgets:
-    accepted_only: 10
-    mixed_accepted_candidate: 8
-    candidate_only: 2
+    accepted_only: 20
+    mixed_accepted_candidate: 0
+    candidate_only: 0
     candidate_candidate: 0
 
 diverse_final_rules:
@@ -235,9 +236,9 @@ diverse_final_rules:
   output_prefix: diverse_final_rules
   top_k: 50
   category_budgets:
-    accepted_only: 25
-    mixed_accepted_candidate: 20
-    candidate_only: 5
+    accepted_only: 50
+    mixed_accepted_candidate: 0
+    candidate_only: 0
     candidate_candidate: 0
   new_positive_weight: 1.0
   confidence_weight: 0.25
@@ -251,9 +252,9 @@ semantic_constrained_diverse_final_rules:
   output_prefix: semantic_constrained_diverse_final_rules
   top_k: 50
   category_budgets:
-    accepted_only: 25
-    mixed_accepted_candidate: 20
-    candidate_only: 5
+    accepted_only: 50
+    mixed_accepted_candidate: 0
+    candidate_only: 0
     candidate_candidate: 0
   new_positive_weight: 1.0
   confidence_weight: 0.25
@@ -280,9 +281,9 @@ coverage_family_aware_final_rules:
   output_prefix: coverage_family_aware_final_rules
   top_k: 50
   category_budgets:
-    accepted_only: 25
-    mixed_accepted_candidate: 20
-    candidate_only: 5
+    accepted_only: 50
+    mixed_accepted_candidate: 0
+    candidate_only: 0
     candidate_candidate: 0
   coverage_weight: 1.0
   quality_weight: 1.0
@@ -332,7 +333,7 @@ reasoning_supervised_od_calibration:
 reasoning_to_od_pseudo_labels:
   selector_mode: primary_plus_best
   max_match_states_per_example_rule: 12
-  include_neutral_selected_candidate_detections: true
+  include_neutral_selected_candidate_detections: false
 
 od_confidence_calibration:
   min_labeled_detections: 8

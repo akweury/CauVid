@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 10
+_INITIAL_RULES_VERSION = 11
 _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",

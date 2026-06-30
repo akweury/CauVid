@@ -33,7 +33,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SEGMENT_OBJECT_MOTION_VERSION = 6
+_SEGMENT_OBJECT_MOTION_VERSION = 7
 
 
 def get_output_root() -> Path:

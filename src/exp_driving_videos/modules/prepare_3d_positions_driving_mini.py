@@ -24,7 +24,7 @@ from config import PROJECT_ROOT
 from src.exp_driving_videos.modules import data_preprocessing
 
 
-_POSITIONS_3D_VERSION = 3
+_POSITIONS_3D_VERSION = 4
 
 
 def get_output_root() -> Path:

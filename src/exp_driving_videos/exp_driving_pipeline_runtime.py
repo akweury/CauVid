@@ -171,6 +171,7 @@ DRIVING_MINI_OD_CLASSES = driving_pipeline_config.DRIVING_MINI_OD_CLASSES
 _get_ego_motion_smoothing_window = driving_pipeline_config.get_ego_motion_smoothing_window
 _get_detection_render_video_enabled = driving_pipeline_config.get_detection_render_video_enabled
 _get_detection_check_cache_enabled = driving_pipeline_config.get_detection_check_cache_enabled
+_get_detection_candidate_branch_enabled = driving_pipeline_config.get_detection_candidate_branch_enabled
 _get_tracking_render_video_enabled = driving_pipeline_config.get_tracking_render_video_enabled
 _get_merge_render_video_enabled = driving_pipeline_config.get_merge_render_video_enabled
 _get_ego_motion_render_video_enabled = driving_pipeline_config.get_ego_motion_render_video_enabled
@@ -655,6 +656,7 @@ def _run_object_detection_step(
     video_ids: Optional[List[str]] = None,
     render_video: bool = True,
     check_cache: bool = False,
+    candidate_branch_enabled: bool = False,
     od_calibration_policy: Optional[Dict[str, Any]] = None,
     background_rule_relevance_prior_results: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -665,6 +667,7 @@ def _run_object_detection_step(
         force_recompute=force_recompute,
         render_video=render_video,
         check_cache=check_cache,
+        enable_candidate_branch=candidate_branch_enabled,
         od_calibration_policy=od_calibration_policy,
         background_rule_relevance_prior_results=background_rule_relevance_prior_results,
     )
@@ -934,20 +937,9 @@ def _load_cached_upstream_context(
 ) -> None:
     if _stage_index(start_target) <= _stage_index("16"):
         return
-    if ctx.has_explicit_video_selection:
-        cached_video_ids = _cached_manifest_video_ids(
-            output_root=temporal_rule_examples_driving_mini.get_output_root(),
-            manifest_name="temporal_rule_examples_manifest.json",
-        )
-        requested_video_ids = [str(video_id).strip() for video_id in ctx.effective_video_ids if str(video_id).strip()]
-        if requested_video_ids != cached_video_ids:
-            raise RuntimeError(
-                "Warm-starting after step 16 only supports an explicit video selection when it exactly "
-                "matches the cached upstream video set. "
-                f"requested_videos={len(requested_video_ids)} cached_videos={len(cached_video_ids)}. "
-                "Restart from step 0-16 to rebuild for a different subset."
-            )
-
+    warm_start_blocker = _warm_start_blocker_reason(ctx)
+    if warm_start_blocker:
+        raise RuntimeError(warm_start_blocker)
     ctx.extended_rule_results = _read_cached_json(
         extended_rules_driving_mini.get_output_root() / "extended_rules_manifest.json",
         label="step 16 extended rules result",
@@ -1056,6 +1048,36 @@ def _load_cached_upstream_context(
             ctx.final_rule_results,
             ctx.evaluation_results,
         )
+
+
+def _warm_start_blocker_reason(ctx: PipelineContext) -> str:
+    expected_candidate_branch_enabled = _get_detection_candidate_branch_enabled(default=False)
+    try:
+        detection_manifest = _read_cached_json(
+            detect_driving_mini.get_output_root() / "detection_manifest.json",
+            label="step 1 detection manifest",
+        )
+    except RuntimeError as exc:
+        return f"warm_start_detection_manifest_missing {exc}"
+    if bool(detection_manifest.get("candidate_branch_enabled", True)) != bool(expected_candidate_branch_enabled):
+        return (
+            "warm_start_candidate_branch_mismatch "
+            f"expected_candidate_branch_enabled={int(bool(expected_candidate_branch_enabled))} "
+            f"cached_candidate_branch_enabled={int(bool(detection_manifest.get('candidate_branch_enabled', True)))}"
+        )
+    if ctx.has_explicit_video_selection:
+        cached_video_ids = _cached_manifest_video_ids(
+            output_root=temporal_rule_examples_driving_mini.get_output_root(),
+            manifest_name="temporal_rule_examples_manifest.json",
+        )
+        requested_video_ids = [str(video_id).strip() for video_id in ctx.effective_video_ids if str(video_id).strip()]
+        if requested_video_ids != cached_video_ids:
+            return (
+                "warm_start_selection_mismatch "
+                f"requested_videos={len(requested_video_ids)} "
+                f"cached_videos={len(cached_video_ids)}"
+            )
+    return ""
 
 def _rule_body_length(rule: Dict[str, Any]) -> int:
     templates = rule.get("body_atom_templates")
@@ -1585,12 +1607,14 @@ def run_step_0_background_rule_relevance_prior(ctx: PipelineContext, runner: Ste
 def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_detection_render_video_enabled(default=True)
     check_cache = _get_detection_check_cache_enabled(default=False)
+    candidate_branch_enabled = _get_detection_candidate_branch_enabled(default=False)
     active_od_policy = od_calibration_policy_utils.load_active_od_calibration_policy()
     runner.announce_step("1", "detect_driving_mini", leading_newline=False)
     runner.log("1", f"model={DRIVING_MINI_OD_MODEL}")
     runner.log("1", f"classes={len(DRIVING_MINI_OD_CLASSES)} configured")
     runner.log("1", f"render_video={render_video}")
     runner.log("1", f"check_cache={check_cache}")
+    runner.log("1", f"candidate_branch_enabled={candidate_branch_enabled}")
     runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
     runner.log("1", f"od_calibration_policy={od_calibration_policy_utils.policy_id(active_od_policy) or 'none'}")
     runner.log("1", f"force_recompute={_force_recompute(ctx)}")
@@ -1604,6 +1628,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             video_ids=ctx.effective_video_ids,
             render_video=render_video,
             check_cache=check_cache,
+            candidate_branch_enabled=candidate_branch_enabled,
             od_calibration_policy=active_od_policy,
             background_rule_relevance_prior_results=ctx.background_rule_relevance_prior_results,
         )
@@ -2871,15 +2896,25 @@ def _run_single_pass_pipeline(
         video_ids=video_ids,
         video_count=video_count,
     )
+    effective_start_target = start_target
+    warm_start_blocker = ""
     if _stage_index(start_target) > _stage_index("16"):
+        warm_start_blocker = _warm_start_blocker_reason(ctx)
+    if warm_start_blocker:
+        runner.log(
+            start_target,
+            f"warm_start_unavailable={warm_start_blocker}; falling back to step 0 recompute",
+        )
+        effective_start_target = "0"
+    elif _stage_index(start_target) > _stage_index("16"):
         runner.log(
             start_target,
             f"warm_start_from={start_target} using cached upstream artifacts through step 16",
         )
-    _load_cached_upstream_context(ctx, start_target=start_target, stop_target=stop_target)
-    _run_steps_through_19(ctx, runner, start_target=start_target, stop_target=stop_target)
+    _load_cached_upstream_context(ctx, start_target=effective_start_target, stop_target=stop_target)
+    _run_steps_through_19(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
     if _stop_target_reaches("18D", stop_target):
-        _run_post_loop_steps(ctx, runner, start_target=start_target, stop_target=stop_target)
+        _run_post_loop_steps(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
 
 
 def _run_od_calibration_loop(
@@ -2904,12 +2939,22 @@ def _run_od_calibration_loop(
             force_full_recompute=force_full_recompute,
             defer_stop_after_gate=True,
         )
+        effective_start_target = start_target
+        warm_start_blocker = ""
         if _stage_index(start_target) > _stage_index("16"):
+            warm_start_blocker = _warm_start_blocker_reason(ctx)
+        if warm_start_blocker:
+            runner.log(
+                "19",
+                f"warm_start_unavailable={warm_start_blocker}; falling back to step 0 recompute",
+            )
+            effective_start_target = "0"
+        elif _stage_index(start_target) > _stage_index("16"):
             runner.log(
                 "19",
                 f"warm_start_from={start_target} using cached upstream artifacts through step 16",
             )
-        _load_cached_upstream_context(ctx, start_target=start_target, stop_target=stop_target)
+        _load_cached_upstream_context(ctx, start_target=effective_start_target, stop_target=stop_target)
         active_policy_before = od_calibration_policy_utils.load_active_od_calibration_policy()
         runner.log(
             "19",
@@ -2918,7 +2963,7 @@ def _run_od_calibration_loop(
             f"input_policy={od_calibration_policy_utils.policy_id(active_policy_before) or 'identity'} "
             f"force_recompute={force_full_recompute}",
         )
-        _run_steps_through_19(ctx, runner, start_target=start_target, stop_target=stop_target)
+        _run_steps_through_19(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
         decision = od_calibration_loop_utils.should_continue_after_iteration(
             ctx.baseline_safe_calibration_gate_results,
             iteration_index=iteration_index,

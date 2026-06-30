@@ -71,7 +71,7 @@ _DEFAULT_TRACKER_ARGS = SimpleNamespace(
 # ByteTracker needs orig_shape to build Boxes; we use the first available
 # detection to derive it when possible, otherwise fall back to this.
 _FALLBACK_SHAPE = (1080, 1920)  # (height, width)
-_TRACKING_SCHEMA_VERSION = 6
+_TRACKING_SCHEMA_VERSION = 7
 _CANDIDATE_TRACK_ID_OFFSET = 1_000_000
 _DEFAULT_CANDIDATE_SCORING_POLICY: Dict[str, Any] = {
     "visual_score_weight": 1.0,
@@ -396,6 +396,48 @@ def _accepted_detection_records(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _candidate_detection_records(rec: Dict[str, Any]) -> List[Dict[str, Any]]:
     return list(rec.get("candidate_detections", []))
+
+
+def _candidate_branch_enabled(video_result: Dict[str, Any]) -> bool:
+    return bool(video_result.get("candidate_branch_enabled", True))
+
+
+def _empty_candidate_track_bundle(policy: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "num_tracking_input_candidates": 0,
+        "tracking_input_candidates": {
+            "num_candidates": 0,
+            "frames": [],
+        },
+        "raw_candidate_tracks": {
+            "num_tracks": 0,
+            "frames": [],
+            "track_summaries": [],
+        },
+        "deduplicated_candidate_tracks": {
+            "num_tracks": 0,
+            "frames": [],
+            "track_summaries": [],
+        },
+        "selected_candidate_tracks": {
+            "num_tracks": 0,
+            "frames": [],
+            "track_summaries": [],
+        },
+        "rejected_candidate_tracks": {
+            "num_tracks": 0,
+            "tracks": [],
+            "rejection_reason_counts": {},
+        },
+        "rejected_candidate_detections": {
+            "num_rejected": 0,
+            "frames": [],
+            "rejection_reason_counts": {},
+            "selection_policy": policy,
+        },
+        "selection_policy": policy,
+        "selection_budgets": {},
+    }
 
 
 def _load_candidate_scoring_policy(video_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1659,6 +1701,8 @@ def track_video(
         cached_policy_id = str(cached.get("od_calibration_policy_id", ""))
         if cache_is_current and cached_policy_id != current_policy_id:
             cache_is_current = False
+        if cache_is_current and bool(cached.get("candidate_branch_enabled", True)) != _candidate_branch_enabled(video_result):
+            cache_is_current = False
         if not cache_is_current:
             cached = {}
         else:
@@ -1684,12 +1728,15 @@ def track_video(
         frame_rate=frame_rate,
         tracker_args=tracker_args,
     )
-    candidate_track_bundle = _run_candidate_tracking(
-        frame_records=frame_records,
-        accepted_frames=accepted_frames,
-        orig_shape=orig_shape,
-        policy=candidate_scoring_policy,
-    )
+    if _candidate_branch_enabled(video_result):
+        candidate_track_bundle = _run_candidate_tracking(
+            frame_records=frame_records,
+            accepted_frames=accepted_frames,
+            orig_shape=orig_shape,
+            policy=candidate_scoring_policy,
+        )
+    else:
+        candidate_track_bundle = _empty_candidate_track_bundle(candidate_scoring_policy)
     selected_candidate_tracks = dict(candidate_track_bundle.get("selected_candidate_tracks", {}))
     rejected_candidate_detections = dict(candidate_track_bundle.get("rejected_candidate_detections", {}))
     raw_candidate_tracks = dict(candidate_track_bundle.get("raw_candidate_tracks", {}))
@@ -1700,6 +1747,7 @@ def track_video(
     result: Dict[str, Any] = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
+        "candidate_branch_enabled": _candidate_branch_enabled(video_result),
         "od_calibration_policy_id": str(dict(video_result.get("od_calibration", {})).get("policy_id", "")),
         "num_frames": len(accepted_frames),
         "num_tracks": len(accepted_track_ids),
@@ -1802,6 +1850,7 @@ def run(
     # Write summary manifest
     manifest = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
+        "candidate_branch_enabled": all(bool(r.get("candidate_branch_enabled", True)) for r in tracking_results),
         "num_videos": len(tracking_results),
         "videos": [
             {

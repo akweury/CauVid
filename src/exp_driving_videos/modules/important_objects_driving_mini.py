@@ -35,7 +35,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_IMPORTANT_OBJECTS_VERSION = 3
+_IMPORTANT_OBJECTS_VERSION = 4
 
 
 def get_output_root() -> Path:

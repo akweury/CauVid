@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 5
+_LOGIC_ATOMS_VERSION = 6
 
 _CANDIDATE_SEMANTIC_RULE_SEARCH_PREDICATES = {
     "object_class",

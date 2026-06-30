@@ -94,6 +94,10 @@ def get_detection_check_cache_enabled(default: bool = False) -> bool:
     return _get_nested_bool(("detection", "check_cache"), default)
 
 
+def get_detection_candidate_branch_enabled(default: bool = False) -> bool:
+    return _get_nested_bool(("detection", "candidate_branch_enabled"), default)
+
+
 def get_tracking_render_video_enabled(default: bool = True) -> bool:
     return _get_nested_bool(("tracking", "render_video"), default)
 
@@ -173,7 +177,7 @@ def get_important_objects_cfg() -> Dict[str, Any]:
             "selection_strategy": "not_implemented",
             "passthrough_selected_objects": True,
             "candidate_selection": {
-                "enabled": True,
+                "enabled": False,
                 "max_per_segment": 8,
                 "max_per_class": 3,
                 "max_per_prior": 2,
@@ -279,8 +283,8 @@ def get_candidate_rules_cfg() -> Dict[str, Any]:
             "include_example_ids": True,
             "generate_mixed_accepted_candidate_rules": False,
             "generate_candidate_candidate_rules": False,
-            "max_candidate_only_initial_rules": 500,
-            "max_mixed_candidate_initial_rules": 3000,
+            "max_candidate_only_initial_rules": 0,
+            "max_mixed_candidate_initial_rules": 0,
             "max_candidate_candidate_initial_rules": 0,
             "max_total_initial_rules": 10000,
             "ignored_body_predicates": [
@@ -303,7 +307,7 @@ def get_initial_rule_pruning_cfg() -> Dict[str, Any]:
         "category_budgets": {
             "accepted_only": 180,
             "accepted_candidate": 0,
-            "candidate_only": 80,
+            "candidate_only": 0,
             "candidate_candidate": 0,
         },
         "diversity_key": "positive_coverage",
@@ -353,22 +357,22 @@ def get_extended_rules_cfg() -> Dict[str, Any]:
         "max_round_rules_by_category": {
             "round_1": {
                 "accepted_only": 300,
-                "mixed_accepted_candidate": 350,
-                "candidate_only": 100,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
             "round_2": {
                 "accepted_only": 80,
-                "mixed_accepted_candidate": 100,
-                "candidate_only": 20,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
         },
         "parents_for_next_round": {
             "max_total": 300,
             "accepted_only": 120,
-            "mixed_accepted_candidate": 150,
-            "candidate_only": 30,
+            "mixed_accepted_candidate": 0,
+            "candidate_only": 0,
             "candidate_candidate": 0,
         },
     }
@@ -398,9 +402,9 @@ def get_final_rules_cfg() -> Dict[str, Any]:
             "selector_mode": "coverage_family_aware",
             "top_k": 20,
             "category_budgets": {
-                "accepted_only": 10,
-                "mixed_accepted_candidate": 8,
-                "candidate_only": 2,
+                "accepted_only": 20,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
         },
@@ -443,9 +447,9 @@ def get_diverse_final_rules_cfg() -> Dict[str, Any]:
         {
             "top_k": 50,
             "category_budgets": {
-                "accepted_only": 25,
-                "mixed_accepted_candidate": 20,
-                "candidate_only": 5,
+                "accepted_only": 50,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
             "score_mode": "legacy_diverse_positive_coverage",
@@ -468,9 +472,9 @@ def get_semantic_constrained_diverse_cfg() -> Dict[str, Any]:
         {
             "top_k": 50,
             "category_budgets": {
-                "accepted_only": 25,
-                "mixed_accepted_candidate": 20,
-                "candidate_only": 5,
+                "accepted_only": 50,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
             "score_mode": "semantic_constrained_diverse",
@@ -507,9 +511,9 @@ def get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
         {
             "top_k": 50,
             "category_budgets": {
-                "accepted_only": 25,
-                "mixed_accepted_candidate": 20,
-                "candidate_only": 5,
+                "accepted_only": 50,
+                "mixed_accepted_candidate": 0,
+                "candidate_only": 0,
                 "candidate_candidate": 0,
             },
             "score_mode": "coverage_family_aware",
@@ -633,7 +637,7 @@ def get_reasoning_to_od_pseudo_labels_cfg() -> Dict[str, Any]:
         {
             "selector_mode": "primary_plus_best",
             "max_match_states_per_example_rule": 12,
-            "include_neutral_selected_candidate_detections": True,
+            "include_neutral_selected_candidate_detections": False,
         },
         path=("reasoning_to_od_pseudo_labels",),
         warn_label="reasoning-to-OD pseudo labels",
