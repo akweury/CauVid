@@ -40,9 +40,10 @@ from src.exp_driving_videos.modules.diverse_final_rules_driving_mini import (
     _rule_vehicle_match_level,
 )
 from src.exp_driving_videos.modules.final_rules_driving_mini import _sort_rules as _sort_original_rules
+from src.exp_driving_videos.modules.final_rules_driving_mini import _post_pruned_rule_pool
 
 
-_ORACLE_GAP_VERSION = 1
+_ORACLE_GAP_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -137,7 +138,7 @@ def _oracle_target_rows(
 def _rule_lookup(extended_rule_results: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return {
         str(rule.get("rule_id", "")): dict(rule)
-        for rule in list(extended_rule_results.get("all_kept_rules", []))
+        for rule in _post_pruned_rule_pool(extended_rule_results)
         if str(rule.get("rule_id", ""))
     }
 
@@ -476,6 +477,7 @@ def _write_markdown_report(
     *,
     oracle_target_row: Dict[str, Any],
     selector_summary_rows: Sequence[Dict[str, Any]],
+    selector_category_gap_rows: Sequence[Dict[str, Any]],
     reason_counts_by_selector: Dict[str, Dict[str, int]],
     missing_rows: Sequence[Dict[str, Any]],
 ) -> None:
@@ -505,6 +507,26 @@ def _write_markdown_report(
         if reason_counts:
             formatted = ", ".join(f"{name}: {count}" for name, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:4])
             lines.append(f"  Top miss reasons: {formatted}.")
+    if selector_category_gap_rows:
+        lines.append("")
+        lines.append("## Category Oracle Gaps")
+        lines.append("")
+        for selector_name in sorted({str(row.get("selector_name", "")) for row in selector_category_gap_rows}):
+            selector_rows = [
+                row for row in selector_category_gap_rows if str(row.get("selector_name", "")) == selector_name
+            ]
+            if not selector_rows:
+                continue
+            lines.append(f"### {selector_name}")
+            for row in selector_rows:
+                lines.append(
+                    f"- {str(row.get('subset_name', ''))}: oracle_f1={_safe_float(row.get('oracle_upper_bound_f1', 0.0)):.3f}, "
+                    f"selector_f1={_safe_float(row.get('selector_f1', 0.0)):.3f}, "
+                    f"gap={_safe_float(row.get('oracle_gap_f1', 0.0)):.3f}, "
+                    f"fn_recovery={_safe_int(row.get('fn_recovery_beyond_accepted_only', 0))}, "
+                    f"fp_cost={_safe_int(row.get('fp_cost', 0))}."
+                )
+            lines.append("")
     lines.append("")
     lines.append("## Representative Missed Oracle Rules")
     lines.append("")
@@ -540,6 +562,7 @@ def process_diagnostic(
     summary_path = out_root / "oracle_selection_gap_summary.json"
     oracle_target_path = out_root / "oracle_target_rule_set.csv"
     overlap_summary_path = out_root / "selector_oracle_overlap_summary.csv"
+    category_gap_path = out_root / "selector_category_oracle_gap_summary.csv"
     missing_rules_path = out_root / "selector_missing_oracle_rules.csv"
     extra_rules_path = out_root / "selector_extra_selected_rules.csv"
     reason_summary_path = out_root / "selector_missing_reason_summary.csv"
@@ -593,12 +616,15 @@ def process_diagnostic(
         )
 
     selector_summary_rows: List[Dict[str, Any]] = []
+    selector_category_gap_rows: List[Dict[str, Any]] = []
     missing_rows: List[Dict[str, Any]] = []
     extra_rows: List[Dict[str, Any]] = []
     reason_summary_rows: List[Dict[str, Any]] = []
     reason_counts_by_selector: Dict[str, Dict[str, int]] = {}
 
     selector_metrics_by_name = dict(rule_pool_upper_bound_results.get("actual_selected_rule_set_metrics_by_name", {}))
+    category_upper_bounds = dict(rule_pool_upper_bound_results.get("category_upper_bounds", {}))
+    category_oracle_gap_by_selector = dict(rule_pool_upper_bound_results.get("category_oracle_gap_by_selector", {}))
     for selector_name, selector_result in rule_results_by_name.items():
         selector_result = dict(selector_result)
         selector_result["overall_metrics"] = dict(selector_metrics_by_name.get(selector_name, {}))
@@ -610,6 +636,26 @@ def process_diagnostic(
             metric_by_rule_id,
         )
         selector_summary_rows.append(summary_row)
+        for subset_name, gap_info in dict(category_oracle_gap_by_selector.get(selector_name, {})).items():
+            subset_upper_bound = dict(category_upper_bounds.get(subset_name, {}))
+            selector_category_gap_rows.append(
+                {
+                    "selector_name": selector_name,
+                    "subset_name": subset_name,
+                    "oracle_upper_bound_f1": _safe_float(gap_info.get("oracle_upper_bound_f1", 0.0)),
+                    "selector_f1": _safe_float(gap_info.get("selector_f1", 0.0)),
+                    "oracle_gap_f1": _safe_float(gap_info.get("oracle_gap_f1", 0.0)),
+                    "precision": _safe_float(subset_upper_bound.get("precision", 0.0)),
+                    "recall": _safe_float(subset_upper_bound.get("recall", 0.0)),
+                    "fn_recovery_beyond_accepted_only": _safe_int(
+                        subset_upper_bound.get("fn_recovery_beyond_accepted_only", 0)
+                    ),
+                    "fp_cost": _safe_int(subset_upper_bound.get("fp_cost", 0)),
+                    "max_positive_coverage_count": _safe_int(
+                        subset_upper_bound.get("max_positive_coverage_count", 0)
+                    ),
+                }
+            )
         missing_rows.extend(selector_missing_rows[: max(1, _safe_int(cfg.get("max_missing_rules_per_selector", 20)))])
         extra_rows.extend(selector_extra_rows[: max(1, _safe_int(cfg.get("max_extra_rules_per_selector", 20)))])
         reason_counts_by_selector[selector_name] = dict(reason_counts)
@@ -657,6 +703,22 @@ def process_diagnostic(
             "primary_miss_reason",
         ],
         selector_summary_rows,
+    )
+    _write_csv(
+        category_gap_path,
+        [
+            "selector_name",
+            "subset_name",
+            "oracle_upper_bound_f1",
+            "selector_f1",
+            "oracle_gap_f1",
+            "precision",
+            "recall",
+            "fn_recovery_beyond_accepted_only",
+            "fp_cost",
+            "max_positive_coverage_count",
+        ],
+        selector_category_gap_rows,
     )
     _write_csv(
         missing_rules_path,
@@ -728,6 +790,7 @@ def process_diagnostic(
         report_path,
         oracle_target_row=oracle_target_row,
         selector_summary_rows=selector_summary_rows,
+        selector_category_gap_rows=selector_category_gap_rows,
         reason_counts_by_selector=reason_counts_by_selector,
         missing_rows=missing_rows,
     )
@@ -743,10 +806,12 @@ def process_diagnostic(
         "best_actual_selector_name": str(rule_pool_upper_bound_results.get("best_actual_selector_name", "")),
         "best_actual_selector_f1": _safe_float(rule_pool_upper_bound_results.get("best_actual_selector_f1", 0.0)),
         "selector_overlap_summary": selector_summary_rows,
+        "selector_category_oracle_gap_summary": selector_category_gap_rows,
         "reason_counts_by_selector": reason_counts_by_selector,
         "output_paths": {
             "oracle_target_rule_set_csv": str(oracle_target_path),
             "selector_oracle_overlap_summary_csv": str(overlap_summary_path),
+            "selector_category_oracle_gap_summary_csv": str(category_gap_path),
             "selector_missing_oracle_rules_csv": str(missing_rules_path),
             "selector_extra_selected_rules_csv": str(extra_rules_path),
             "selector_missing_reason_summary_csv": str(reason_summary_path),

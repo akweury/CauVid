@@ -30,9 +30,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import config
+from src.exp_driving_videos.modules.final_rules_driving_mini import (
+    _rule_candidate_category as _shared_rule_candidate_category,
+)
 
 
-_RULE_EVALUATION_VERSION = 5
+_RULE_EVALUATION_VERSION = 6
 _VARIABLE_ARGS = {"S", "O", "C", "T", "F"}
 
 
@@ -224,26 +227,28 @@ def _get_rule_body_atom_templates(rule: Dict[str, Any]) -> List[str]:
 
 
 def _rule_candidate_category(rule: Dict[str, Any]) -> str:
-    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
-        return "mixed_accepted_candidate"
-    if bool(rule.get("uses_only_candidate_atoms", False)):
-        return "candidate_only"
-    if bool(rule.get("uses_candidate_atoms", False)):
-        return "candidate_only"
-    return "accepted_only"
+    return _shared_rule_candidate_category(rule)
 
 
 def _build_rule_subset_views(
     rules: Sequence[Dict[str, Any]],
 ) -> Dict[str, List[Dict[str, Any]]]:
     rules_list = list(rules)
+    accepted_only_rules = [rule for rule in rules_list if _rule_candidate_category(rule) == "accepted_only"]
+    mixed_rules = [rule for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"]
+    candidate_only_rules = [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_only"]
+    candidate_candidate_rules = [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_candidate"]
     return {
         "all_rules": rules_list,
-        "accepted_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "accepted_only"],
-        "candidate_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_only"],
-        "mixed_accepted_candidate_rules": [
-            rule for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"
-        ],
+        "accepted_only_rules": accepted_only_rules,
+        "candidate_only_rules": candidate_only_rules,
+        "candidate_candidate_rules": candidate_candidate_rules,
+        "mixed_accepted_candidate_rules": mixed_rules,
+        "accepted_plus_mixed_rules": accepted_only_rules + mixed_rules,
+        "accepted_plus_all_candidate_rules": (
+            accepted_only_rules + mixed_rules + candidate_only_rules + candidate_candidate_rules
+        ),
+        "all_candidate_involving_rules": mixed_rules + candidate_only_rules + candidate_candidate_rules,
     }
 
 
@@ -251,6 +256,7 @@ def _empty_category_counts() -> Dict[str, int]:
     return {
         "accepted_only_rules": 0,
         "candidate_only_rules": 0,
+        "candidate_candidate_rules": 0,
         "mixed_accepted_candidate_rules": 0,
         "candidate_involving_rules": 0,
         "all_rules": 0,
@@ -264,6 +270,10 @@ def _count_rule_categories(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
         counts["all_rules"] += 1
         if category == "mixed_accepted_candidate":
             counts["mixed_accepted_candidate_rules"] += 1
+            counts["candidate_involving_rules"] += 1
+        elif category == "candidate_candidate":
+            counts["candidate_candidate_rules"] += 1
+            counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
@@ -307,6 +317,9 @@ def _subset_rule_composition(rules: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "num_rules": len(rules_list),
         "accepted_only_rule_count": sum(1 for rule in rules_list if _rule_candidate_category(rule) == "accepted_only"),
         "candidate_only_rule_count": sum(1 for rule in rules_list if _rule_candidate_category(rule) == "candidate_only"),
+        "candidate_candidate_rule_count": sum(
+            1 for rule in rules_list if _rule_candidate_category(rule) == "candidate_candidate"
+        ),
         "mixed_rule_count": sum(1 for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"),
         "candidate_usage_rule_count": sum(1 for rule in rules_list if bool(rule.get("uses_candidate_atoms", False))),
         "total_candidate_body_atoms": total_candidate_body_atoms,
@@ -418,22 +431,50 @@ def _build_candidate_rule_ablation(
     subset_metrics: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     baseline = dict(subset_metrics.get("accepted_only_rules", {}))
-    augmented = dict(subset_metrics.get("all_rules", {}))
+    augmented = dict(subset_metrics.get("accepted_plus_all_candidate_rules", {}))
+    mixed_augmented = dict(subset_metrics.get("accepted_plus_mixed_rules", {}))
+    mixed_only = dict(subset_metrics.get("mixed_accepted_candidate_rules", {}))
+    candidate_only = dict(subset_metrics.get("candidate_only_rules", {}))
+    candidate_candidate = dict(subset_metrics.get("candidate_candidate_rules", {}))
     baseline_overall = dict(baseline.get("overall_metrics", {}))
     augmented_overall = dict(augmented.get("overall_metrics", {}))
+    mixed_augmented_overall = dict(mixed_augmented.get("overall_metrics", {}))
     return {
         "baseline_subset_name": "accepted_only_rules",
-        "augmented_subset_name": "all_rules",
+        "augmented_subset_name": "accepted_plus_all_candidate_rules",
+        "mixed_augmented_subset_name": "accepted_plus_mixed_rules",
         "baseline_metrics": baseline_overall,
         "augmented_metrics": augmented_overall,
+        "mixed_augmented_metrics": mixed_augmented_overall,
         "delta_precision": float(augmented_overall.get("precision", 0.0) - baseline_overall.get("precision", 0.0)),
         "delta_recall": float(augmented_overall.get("recall", 0.0) - baseline_overall.get("recall", 0.0)),
         "delta_f1": float(augmented_overall.get("f1", 0.0) - baseline_overall.get("f1", 0.0)),
         "delta_accuracy": float(augmented_overall.get("accuracy", 0.0) - baseline_overall.get("accuracy", 0.0)),
+        "mixed_delta_precision": float(
+            mixed_augmented_overall.get("precision", 0.0) - baseline_overall.get("precision", 0.0)
+        ),
+        "mixed_delta_recall": float(
+            mixed_augmented_overall.get("recall", 0.0) - baseline_overall.get("recall", 0.0)
+        ),
+        "mixed_delta_f1": float(mixed_augmented_overall.get("f1", 0.0) - baseline_overall.get("f1", 0.0)),
         "fn_coverage_gain_count": int(augmented.get("fn_coverage_gain_count_vs_accepted_only", 0)),
         "fn_coverage_gain_rate": float(augmented.get("fn_coverage_gain_rate_vs_accepted_only", 0.0)),
         "fp_contribution_count": int(augmented.get("fp_contribution_count_vs_accepted_only", 0)),
         "fp_contribution_rate": float(augmented.get("fp_contribution_rate_vs_accepted_only", 0.0)),
+        "mixed_fn_coverage_gain_count": int(mixed_only.get("fn_coverage_gain_count_vs_accepted_only", 0)),
+        "mixed_fp_contribution_count": int(mixed_only.get("fp_contribution_count_vs_accepted_only", 0)),
+        "candidate_only_fn_coverage_gain_count": int(
+            candidate_only.get("fn_coverage_gain_count_vs_accepted_only", 0)
+        ),
+        "candidate_only_fp_contribution_count": int(
+            candidate_only.get("fp_contribution_count_vs_accepted_only", 0)
+        ),
+        "candidate_candidate_fn_coverage_gain_count": int(
+            candidate_candidate.get("fn_coverage_gain_count_vs_accepted_only", 0)
+        ),
+        "candidate_candidate_fp_contribution_count": int(
+            candidate_candidate.get("fp_contribution_count_vs_accepted_only", 0)
+        ),
         "recovered_false_negative_example_ids": list(
             augmented.get("fn_coverage_gain_example_ids_vs_accepted_only", [])
         ),
@@ -599,6 +640,16 @@ def process_rules(
             subset_trigger_map = triggered_rule_ids_by_example_by_subset.setdefault(example_id, {})
             subset_trigger_map.setdefault("all_rules", []).append(rule_id)
             subset_trigger_map.setdefault(f"{candidate_rule_category}_rules", []).append(rule_id)
+            if candidate_rule_category == "mixed_accepted_candidate":
+                subset_trigger_map.setdefault("accepted_plus_mixed_rules", []).append(rule_id)
+                subset_trigger_map.setdefault("accepted_plus_all_candidate_rules", []).append(rule_id)
+                subset_trigger_map.setdefault("all_candidate_involving_rules", []).append(rule_id)
+            elif candidate_rule_category in {"candidate_only", "candidate_candidate"}:
+                subset_trigger_map.setdefault("accepted_plus_all_candidate_rules", []).append(rule_id)
+                subset_trigger_map.setdefault("all_candidate_involving_rules", []).append(rule_id)
+            elif candidate_rule_category == "accepted_only":
+                subset_trigger_map.setdefault("accepted_plus_mixed_rules", []).append(rule_id)
+                subset_trigger_map.setdefault("accepted_plus_all_candidate_rules", []).append(rule_id)
             for match_state in match_states:
                 evidence_entries.append(
                     {
@@ -688,12 +739,20 @@ def process_rules(
         )
         evaluated_rule["eval_fp_contribution_example_ids_vs_accepted_only"] = fp_contribution_example_ids
 
-    overall_metrics = dict(rule_subset_metrics["all_rules"].get("overall_metrics", {}))
-    per_video_metrics = list(rule_subset_metrics["all_rules"].get("per_video_metrics", []))
-    predicted_positive_example_ids = set(rule_subset_metrics["all_rules"].get("predicted_positive_example_ids", []))
-    covered_positive_example_ids = set(rule_subset_metrics["all_rules"].get("covered_positive_example_ids", []))
-    false_negative_example_ids = list(rule_subset_metrics["all_rules"].get("false_negative_example_ids", []))
-    false_positive_example_ids = list(rule_subset_metrics["all_rules"].get("false_positive_example_ids", []))
+    overall_metrics = dict(rule_subset_metrics["accepted_plus_all_candidate_rules"].get("overall_metrics", {}))
+    per_video_metrics = list(rule_subset_metrics["accepted_plus_all_candidate_rules"].get("per_video_metrics", []))
+    predicted_positive_example_ids = set(
+        rule_subset_metrics["accepted_plus_all_candidate_rules"].get("predicted_positive_example_ids", [])
+    )
+    covered_positive_example_ids = set(
+        rule_subset_metrics["accepted_plus_all_candidate_rules"].get("covered_positive_example_ids", [])
+    )
+    false_negative_example_ids = list(
+        rule_subset_metrics["accepted_plus_all_candidate_rules"].get("false_negative_example_ids", [])
+    )
+    false_positive_example_ids = list(
+        rule_subset_metrics["accepted_plus_all_candidate_rules"].get("false_positive_example_ids", [])
+    )
     evaluated_rule_counts = _count_rule_categories(rule_evaluations)
     fired_rule_counts = _count_rule_categories(
         [rule for rule in rule_evaluations if int(rule.get("eval_total_firings", 0)) > 0]
@@ -727,12 +786,20 @@ def process_rules(
                 "predicted_positive": predicted_positive,
                 "predicted_positive_accepted_only": example_id in accepted_only_predicted_positive_ids,
                 "predicted_positive_candidate_only": bool(subset_rule_ids.get("candidate_only_rules", [])),
+                "predicted_positive_candidate_candidate": bool(subset_rule_ids.get("candidate_candidate_rules", [])),
                 "predicted_positive_mixed_accepted_candidate": bool(
                     subset_rule_ids.get("mixed_accepted_candidate_rules", [])
+                ),
+                "predicted_positive_accepted_plus_mixed": bool(subset_rule_ids.get("accepted_plus_mixed_rules", [])),
+                "predicted_positive_accepted_plus_all_candidate": bool(
+                    subset_rule_ids.get("accepted_plus_all_candidate_rules", [])
                 ),
                 "num_matching_rules": len(triggered_rules_by_example.get(example_id, [])),
                 "num_matching_rules_accepted_only": len(subset_rule_ids.get("accepted_only_rules", [])),
                 "num_matching_rules_candidate_only": len(subset_rule_ids.get("candidate_only_rules", [])),
+                "num_matching_rules_candidate_candidate": len(
+                    subset_rule_ids.get("candidate_candidate_rules", [])
+                ),
                 "num_matching_rules_mixed_accepted_candidate": len(
                     subset_rule_ids.get("mixed_accepted_candidate_rules", [])
                 ),
@@ -868,10 +935,14 @@ def process_rules(
                 "predicted_positive",
                 "predicted_positive_accepted_only",
                 "predicted_positive_candidate_only",
+                "predicted_positive_candidate_candidate",
                 "predicted_positive_mixed_accepted_candidate",
+                "predicted_positive_accepted_plus_mixed",
+                "predicted_positive_accepted_plus_all_candidate",
                 "num_matching_rules",
                 "num_matching_rules_accepted_only",
                 "num_matching_rules_candidate_only",
+                "num_matching_rules_candidate_candidate",
                 "num_matching_rules_mixed_accepted_candidate",
                 "matching_rule_ids",
             ],
@@ -886,12 +957,24 @@ def process_rules(
                     "predicted_positive": row.get("predicted_positive", False),
                     "predicted_positive_accepted_only": row.get("predicted_positive_accepted_only", False),
                     "predicted_positive_candidate_only": row.get("predicted_positive_candidate_only", False),
+                    "predicted_positive_candidate_candidate": row.get(
+                        "predicted_positive_candidate_candidate", False
+                    ),
                     "predicted_positive_mixed_accepted_candidate": row.get(
                         "predicted_positive_mixed_accepted_candidate", False
+                    ),
+                    "predicted_positive_accepted_plus_mixed": row.get(
+                        "predicted_positive_accepted_plus_mixed", False
+                    ),
+                    "predicted_positive_accepted_plus_all_candidate": row.get(
+                        "predicted_positive_accepted_plus_all_candidate", False
                     ),
                     "num_matching_rules": row.get("num_matching_rules", 0),
                     "num_matching_rules_accepted_only": row.get("num_matching_rules_accepted_only", 0),
                     "num_matching_rules_candidate_only": row.get("num_matching_rules_candidate_only", 0),
+                    "num_matching_rules_candidate_candidate": row.get(
+                        "num_matching_rules_candidate_candidate", 0
+                    ),
                     "num_matching_rules_mixed_accepted_candidate": row.get(
                         "num_matching_rules_mixed_accepted_candidate", 0
                     ),
@@ -908,6 +991,7 @@ def process_rules(
                 "num_rules_fired",
                 "accepted_only_rule_count",
                 "candidate_only_rule_count",
+                "candidate_candidate_rule_count",
                 "mixed_rule_count",
                 "candidate_usage_rule_count",
                 "total_candidate_body_atoms",
@@ -938,6 +1022,7 @@ def process_rules(
                     "num_rules_fired": subset_result.get("num_rules_fired", 0),
                     "accepted_only_rule_count": subset_result.get("accepted_only_rule_count", 0),
                     "candidate_only_rule_count": subset_result.get("candidate_only_rule_count", 0),
+                    "candidate_candidate_rule_count": subset_result.get("candidate_candidate_rule_count", 0),
                     "mixed_rule_count": subset_result.get("mixed_rule_count", 0),
                     "candidate_usage_rule_count": subset_result.get("candidate_usage_rule_count", 0),
                     "total_candidate_body_atoms": subset_result.get("total_candidate_body_atoms", 0),

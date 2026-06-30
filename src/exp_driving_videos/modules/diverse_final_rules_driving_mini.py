@@ -29,9 +29,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import config
+from src.exp_driving_videos.modules.final_rules_driving_mini import (
+    _normalized_category_budgets,
+    _post_pruned_rule_pool,
+    _rule_candidate_category as _shared_rule_candidate_category,
+)
 
 
-_DIVERSE_FINAL_RULES_VERSION = 6
+_DIVERSE_FINAL_RULES_VERSION = 7
 _STRONG_SEMANTIC_BODY_PREDICATES = {
     "object_class",
     "object_distance_state",
@@ -68,6 +73,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     semantic_min_family_counts = cfg.get("semantic_min_family_counts", {})
     return {
         "top_k": int(cfg.get("top_k", 50)),
+        "category_budgets": _normalized_category_budgets(cfg),
         "score_mode": str(cfg.get("score_mode", "legacy_diverse_positive_coverage")),
         "selection_method_name": str(cfg.get("selection_method_name", "greedy_diverse_positive_coverage")),
         "output_prefix": str(cfg.get("output_prefix", "diverse_final_rules")),
@@ -111,13 +117,7 @@ def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _rule_candidate_category(rule: Dict[str, Any]) -> str:
-    if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
-        return "mixed_accepted_candidate"
-    if bool(rule.get("uses_only_candidate_atoms", False)):
-        return "candidate_only"
-    if bool(rule.get("uses_candidate_atoms", False)):
-        return "candidate_only"
-    return "accepted_only"
+    return _shared_rule_candidate_category(rule)
 
 
 def _candidate_rule_semantic_profile(rule: Dict[str, Any]) -> Dict[str, Any]:
@@ -219,6 +219,7 @@ def _summarize_candidate_rule_selection(rules: Sequence[Dict[str, Any]]) -> Dict
         "all_rules": rules_list,
         "accepted_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "accepted_only"],
         "candidate_only_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_only"],
+        "candidate_candidate_rules": [rule for rule in rules_list if _rule_candidate_category(rule) == "candidate_candidate"],
         "mixed_accepted_candidate_rules": [
             rule for rule in rules_list if _rule_candidate_category(rule) == "mixed_accepted_candidate"
         ],
@@ -227,6 +228,7 @@ def _summarize_candidate_rule_selection(rules: Sequence[Dict[str, Any]]) -> Dict
         "category_counts": {
             "accepted_only_rules": len(subset_rules["accepted_only_rules"]),
             "candidate_only_rules": len(subset_rules["candidate_only_rules"]),
+            "candidate_candidate_rules": len(subset_rules["candidate_candidate_rules"]),
             "mixed_accepted_candidate_rules": len(subset_rules["mixed_accepted_candidate_rules"]),
             "all_rules": len(subset_rules["all_rules"]),
         },
@@ -538,6 +540,7 @@ def process_rules(
 ) -> Dict[str, Any]:
     cfg = cfg or {}
     top_k = int(cfg.get("top_k", 50))
+    category_budgets = _normalized_category_budgets(cfg)
     output_prefix = str(cfg.get("output_prefix", "diverse_final_rules")).strip() or "diverse_final_rules"
     selection_method_name = str(cfg.get("selection_method_name", "greedy_diverse_positive_coverage"))
 
@@ -556,11 +559,17 @@ def process_rules(
             return cached
 
     candidate_rules = _sort_rules(
-        [_enrich_rule_candidate_semantics(rule) for rule in list(extended_rule_results.get("all_kept_rules", []))]
+        [_enrich_rule_candidate_semantics(rule) for rule in _post_pruned_rule_pool(extended_rule_results)]
     )
     selected_rules: List[Dict[str, Any]] = []
     selection_trace: List[Dict[str, Any]] = []
     selected_rule_ids: Set[str] = set()
+    selected_category_counts: Dict[str, int] = {
+        "accepted_only": 0,
+        "mixed_accepted_candidate": 0,
+        "candidate_only": 0,
+        "candidate_candidate": 0,
+    }
     covered_positive_ids: Set[str] = set()
     family_counts: Dict[str, int] = {}
     selected_semantic_families: Dict[str, Set[str]] = {}
@@ -575,6 +584,10 @@ def process_rules(
         for rule in candidate_rules:
             rule_id = str(rule.get("rule_id", ""))
             if rule_id in selected_rule_ids:
+                continue
+            category = _rule_candidate_category(rule)
+            budget = int(category_budgets.get(category, -1))
+            if budget >= 0 and int(selected_category_counts.get(category, 0)) >= budget:
                 continue
             utility = _rule_utility(
                 rule,
@@ -655,9 +668,13 @@ def process_rules(
         selected_rule["selection_semantic_is_quota_qualified"] = bool(best_trace["semantic_is_quota_qualified"])
         selected_rule["selection_semantic_deficit_reduction"] = int(best_trace["semantic_deficit_reduction"])
         selected_rule["candidate_rule_category"] = _rule_candidate_category(selected_rule)
+        selected_rule["selection_rule_category"] = selected_rule["candidate_rule_category"]
         selected_rules.append(selected_rule)
 
         selected_rule_ids.add(str(best_rule.get("rule_id", "")))
+        selected_category_counts[selected_rule["candidate_rule_category"]] = (
+            int(selected_category_counts.get(selected_rule["candidate_rule_category"], 0)) + 1
+        )
         covered_positive_ids.update(best_trace["new_positive_ids"])
         family_signature = str(best_trace["family_signature"])
         family_counts[family_signature] = family_counts.get(family_signature, 0) + 1
@@ -696,6 +713,7 @@ def process_rules(
         "version": _DIVERSE_FINAL_RULES_VERSION,
         "config": _cfg_key_subset(cfg),
         "selection_method": selection_method_name,
+        "selection_input_stage": "step16_post_pruned_kept_pool",
         "num_input_rules": len(candidate_rules),
         "num_final_rules": len(selected_rules),
         "num_distinct_families": len(family_counts),
@@ -745,6 +763,7 @@ def process_rules(
                 "selection_semantic_deficit_reduction",
                 "selection_weak_candidate_penalty_value",
                 "candidate_rule_category",
+                "selection_rule_category",
                 "uses_candidate_atoms",
                 "num_candidate_body_atoms",
                 "candidate_body_atom_ratio",
@@ -787,6 +806,7 @@ def process_rules(
                     "selection_semantic_deficit_reduction": rule.get("selection_semantic_deficit_reduction", 0),
                     "selection_weak_candidate_penalty_value": rule.get("selection_weak_candidate_penalty_value", 0.0),
                     "candidate_rule_category": rule.get("candidate_rule_category", "accepted_only"),
+                    "selection_rule_category": rule.get("selection_rule_category", "accepted_only"),
                     "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
                     "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
                     "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),

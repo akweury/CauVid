@@ -318,43 +318,87 @@ def get_initial_rule_pruning_cfg() -> Dict[str, Any]:
 
 
 def get_extended_rules_cfg() -> Dict[str, Any]:
-    return _load_cfg_section(
-        {
-            "num_rounds": 2,
-            "evaluation_strategy": "binding_aware_intersection",
-            "prune_strategies": [
-                "low_evidence",
-                "empty_evidence",
-                "same_firings_as_parent",
-                "same_confidence_smaller_evidence",
-            ],
-            "min_positive_support_to_extend": 2,
-            "same_confidence_smaller_evidence_enabled": True,
-            "skip_perfect_precision_parents_without_new_positive_recovery": False,
-            "allow_segment_context_extension_atoms": True,
-            "allow_provenance_extension_atoms": False,
-            "allow_candidate_candidate_extension": False,
-            "max_segment_context_atoms_per_rule": 1,
-            "per_parent_extension_top_k": 25,
-            "max_parent_rules_next_round": 200,
-            "max_parent_next_round_accepted_only_rules": 120,
-            "max_parent_next_round_mixed_candidate_rules": 60,
-            "max_parent_next_round_candidate_only_rules": 20,
-            "max_parent_next_round_candidate_candidate_rules": 0,
-            "max_round_rules": 50000,
-            "max_round_accepted_only_rules": 1500,
-            "max_round_mixed_candidate_rules": 600,
-            "max_round_candidate_only_rules": 150,
-            "max_round_candidate_candidate_rules": 0,
+    defaults = {
+        "num_rounds": 2,
+        "evaluation_strategy": "binding_aware_intersection",
+        "prune_strategies": [
+            "low_evidence",
+            "empty_evidence",
+            "same_firings_as_parent",
+            "same_confidence_smaller_evidence",
+        ],
+        "min_positive_support_to_extend": 2,
+        "same_confidence_smaller_evidence_enabled": True,
+        "skip_perfect_precision_parents_without_new_positive_recovery": False,
+        "allow_segment_context_extension_atoms": True,
+        "allow_provenance_extension_atoms": False,
+        "allow_candidate_candidate_extension": False,
+        "max_segment_context_atoms_per_rule": 1,
+        "per_parent_extension_top_k": 25,
+        "post_extension_pruning": {
+            "enabled": True,
+            "deduplicate_by_firing_signature": True,
+            "dominance_prune_same_positive_coverage": True,
+            "max_rules_per_firing_signature": 1,
+            "max_rules_per_positive_coverage_set": 2,
         },
+        "max_round_rules": {
+            "round_1": 800,
+            "round_2": 200,
+        },
+        "max_round_rules_by_category": {
+            "round_1": {
+                "accepted_only": 300,
+                "mixed_accepted_candidate": 350,
+                "candidate_only": 100,
+                "candidate_candidate": 0,
+            },
+            "round_2": {
+                "accepted_only": 80,
+                "mixed_accepted_candidate": 100,
+                "candidate_only": 20,
+                "candidate_candidate": 0,
+            },
+        },
+        "parents_for_next_round": {
+            "max_total": 300,
+            "accepted_only": 120,
+            "mixed_accepted_candidate": 150,
+            "candidate_only": 30,
+            "candidate_candidate": 0,
+        },
+    }
+    resolved = _load_cfg_section(
+        defaults,
         path=("extended_rules",),
         warn_label="extended rules",
     )
+    for key in ("post_extension_pruning", "max_round_rules", "max_round_rules_by_category", "parents_for_next_round"):
+        merged = dict(defaults[key])
+        override = resolved.get(key)
+        if isinstance(override, dict):
+            for subkey, value in override.items():
+                if isinstance(merged.get(subkey), dict) and isinstance(value, dict):
+                    nested = dict(merged[subkey])
+                    nested.update(value)
+                    merged[subkey] = nested
+                else:
+                    merged[subkey] = value
+        resolved[key] = merged
+    return resolved
 
 
 def get_final_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
-        {"top_k": 50},
+        {
+            "top_k": 50,
+            "category_budgets": {
+                "accepted_only": 25,
+                "mixed_accepted_candidate": 20,
+                "candidate_only": 5,
+                "candidate_candidate": 0,
+            },
+        },
         path=("final_rules",),
         warn_label="final rules",
     )
@@ -364,6 +408,12 @@ def get_diverse_final_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
             "top_k": 50,
+            "category_budgets": {
+                "accepted_only": 25,
+                "mixed_accepted_candidate": 20,
+                "candidate_only": 5,
+                "candidate_candidate": 0,
+            },
             "score_mode": "legacy_diverse_positive_coverage",
             "selection_method_name": "greedy_diverse_positive_coverage",
             "output_prefix": "diverse_final_rules",
@@ -383,6 +433,12 @@ def get_semantic_constrained_diverse_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
             "top_k": 50,
+            "category_budgets": {
+                "accepted_only": 25,
+                "mixed_accepted_candidate": 20,
+                "candidate_only": 5,
+                "candidate_candidate": 0,
+            },
             "score_mode": "semantic_constrained_diverse",
             "selection_method_name": "semantic_constrained_diverse",
             "output_prefix": "semantic_constrained_diverse_final_rules",
@@ -416,6 +472,12 @@ def get_coverage_family_aware_final_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
             "top_k": 50,
+            "category_budgets": {
+                "accepted_only": 25,
+                "mixed_accepted_candidate": 20,
+                "candidate_only": 5,
+                "candidate_candidate": 0,
+            },
             "score_mode": "coverage_family_aware",
             "selection_method_name": "greedy_coverage_family_aware",
             "output_prefix": "coverage_family_aware_final_rules",

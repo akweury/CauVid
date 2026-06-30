@@ -17,7 +17,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,7 +29,13 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_FINAL_RULES_VERSION = 4
+_FINAL_RULES_VERSION = 5
+_RULE_CATEGORY_ORDER = (
+    "accepted_only",
+    "mixed_accepted_candidate",
+    "candidate_only",
+    "candidate_candidate",
+)
 _STRONG_SEMANTIC_BODY_PREDICATES = {
     "object_class",
     "object_distance_state",
@@ -65,7 +71,23 @@ def get_output_root() -> Path:
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "top_k": int(cfg.get("top_k", 50)),
+        "category_budgets": _normalized_category_budgets(cfg),
     }
+
+
+def _normalized_category_budgets(cfg: Dict[str, Any]) -> Dict[str, int]:
+    defaults = {
+        "accepted_only": 25,
+        "mixed_accepted_candidate": 20,
+        "candidate_only": 5,
+        "candidate_candidate": 0,
+    }
+    resolved = dict(defaults)
+    override = cfg.get("category_budgets")
+    if isinstance(override, dict):
+        for key, value in override.items():
+            resolved[str(key)] = int(value)
+    return resolved
 
 
 def _parse_atom(atom: str) -> Optional[str]:
@@ -148,13 +170,40 @@ def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _rule_candidate_category(rule: Dict[str, Any]) -> str:
+    explicit = str(rule.get("candidate_rule_category", "")).strip()
+    if explicit == "candidate_candidate":
+        return "candidate_candidate"
+    if explicit == "mixed_accepted_candidate":
+        return "mixed_accepted_candidate"
+    extension_category = str(rule.get("extension_rule_category", "")).strip()
+    if extension_category == "candidate_candidate":
+        return "candidate_candidate"
+    if extension_category == "accepted_candidate":
+        return "mixed_accepted_candidate"
     if bool(rule.get("mixes_accepted_and_candidate_atoms", False)):
         return "mixed_accepted_candidate"
+    if bool(rule.get("uses_only_candidate_atoms", False)) and int(rule.get("num_candidate_body_atoms", 0)) >= 2:
+        return "candidate_candidate"
     if bool(rule.get("uses_only_candidate_atoms", False)):
         return "candidate_only"
     if bool(rule.get("uses_candidate_atoms", False)):
         return "candidate_only"
     return "accepted_only"
+
+
+def _post_pruned_rule_pool(extended_rule_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    all_kept_rules = list(extended_rule_results.get("all_kept_rules", []))
+    if all_kept_rules:
+        return [dict(rule) for rule in all_kept_rules]
+
+    rules: List[Dict[str, Any]] = []
+    for round_payload in list(extended_rule_results.get("rounds", [])):
+        for rule in list(round_payload.get("rules", [])):
+            kept_rule = dict(rule)
+            kept_rule.setdefault("kept_stage", "extended")
+            kept_rule.setdefault("kept_round_index", int(round_payload.get("round_index", 0)))
+            rules.append(kept_rule)
+    return rules
 
 
 def _summarize_candidate_rule_subset(rules: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -205,6 +254,7 @@ def _summarize_candidate_rule_selection(rules: List[Dict[str, Any]]) -> Dict[str
         "all_rules": list(rules),
         "accepted_only_rules": [rule for rule in rules if _rule_candidate_category(rule) == "accepted_only"],
         "candidate_only_rules": [rule for rule in rules if _rule_candidate_category(rule) == "candidate_only"],
+        "candidate_candidate_rules": [rule for rule in rules if _rule_candidate_category(rule) == "candidate_candidate"],
         "mixed_accepted_candidate_rules": [
             rule for rule in rules if _rule_candidate_category(rule) == "mixed_accepted_candidate"
         ],
@@ -213,6 +263,7 @@ def _summarize_candidate_rule_selection(rules: List[Dict[str, Any]]) -> Dict[str
         "category_counts": {
             "accepted_only_rules": len(subset_rules["accepted_only_rules"]),
             "candidate_only_rules": len(subset_rules["candidate_only_rules"]),
+            "candidate_candidate_rules": len(subset_rules["candidate_candidate_rules"]),
             "mixed_accepted_candidate_rules": len(subset_rules["mixed_accepted_candidate_rules"]),
             "all_rules": len(subset_rules["all_rules"]),
         },
@@ -227,6 +278,7 @@ def _empty_category_counts() -> Dict[str, int]:
     return {
         "accepted_only_rules": 0,
         "candidate_only_rules": 0,
+        "candidate_candidate_rules": 0,
         "mixed_accepted_candidate_rules": 0,
         "candidate_involving_rules": 0,
         "all_rules": 0,
@@ -241,12 +293,55 @@ def _count_rule_categories(rules: List[Dict[str, Any]]) -> Dict[str, int]:
         if category == "mixed_accepted_candidate":
             counts["mixed_accepted_candidate_rules"] += 1
             counts["candidate_involving_rules"] += 1
+        elif category == "candidate_candidate":
+            counts["candidate_candidate_rules"] += 1
+            counts["candidate_only_rules"] += 1
+            counts["candidate_involving_rules"] += 1
         elif category == "candidate_only":
             counts["candidate_only_rules"] += 1
             counts["candidate_involving_rules"] += 1
         else:
             counts["accepted_only_rules"] += 1
     return counts
+
+
+def _category_count_key(category: str) -> str:
+    if category == "accepted_only":
+        return "accepted_only_rules"
+    if category == "mixed_accepted_candidate":
+        return "mixed_accepted_candidate_rules"
+    if category == "candidate_candidate":
+        return "candidate_candidate_rules"
+    return "candidate_only_rules"
+
+
+def _budgeted_final_rule_selection(
+    ranked_rules: Sequence[Dict[str, Any]],
+    *,
+    top_k: int,
+    category_budgets: Dict[str, int],
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    selected: List[Dict[str, Any]] = []
+    selected_counts = _empty_category_counts()
+    budget_pruned_counts = _empty_category_counts()
+    for rule in ranked_rules:
+        if len(selected) >= max(0, top_k):
+            break
+        category = _rule_candidate_category(rule)
+        budget = int(category_budgets.get(category, -1))
+        if budget >= 0 and selected_counts.get(_category_count_key(category), 0) >= budget:
+            budget_pruned_counts[_category_count_key(category)] += 1
+            budget_pruned_counts["all_rules"] += 1
+            if category != "accepted_only":
+                budget_pruned_counts["candidate_involving_rules"] += 1
+            continue
+        selected.append(dict(rule))
+        rule_count_key = _category_count_key(category)
+        selected_counts["all_rules"] += 1
+        selected_counts[rule_count_key] += 1
+        if category in {"mixed_accepted_candidate", "candidate_only", "candidate_candidate"}:
+            selected_counts["candidate_involving_rules"] += 1
+    return selected, budget_pruned_counts
 
 
 def process_rules(
@@ -257,6 +352,7 @@ def process_rules(
 ) -> Dict[str, Any]:
     cfg = cfg or {}
     top_k = int(cfg.get("top_k", 50))
+    category_budgets = _normalized_category_budgets(cfg)
 
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -268,15 +364,21 @@ def process_rules(
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _FINAL_RULES_VERSION and _cfg_key_subset(
             cached.get("config", {})
-        ) == _cfg_key_subset({"top_k": top_k}):
+        ) == _cfg_key_subset({"top_k": top_k, "category_budgets": category_budgets}):
             print(f"  [cache] loading {json_path.name}")
             return cached
 
-    all_kept_rules = [_enrich_rule_candidate_semantics(rule) for rule in list(extended_rule_results.get("all_kept_rules", []))]
+    post_pruned_rule_pool = _post_pruned_rule_pool(extended_rule_results)
+    all_kept_rules = [_enrich_rule_candidate_semantics(rule) for rule in post_pruned_rule_pool]
     ranked_rules = _sort_rules(all_kept_rules)
-    final_rules = ranked_rules[: max(0, top_k)]
+    final_rules, budget_pruned_counts = _budgeted_final_rule_selection(
+        ranked_rules,
+        top_k=top_k,
+        category_budgets=category_budgets,
+    )
     for rule in final_rules:
         rule["candidate_rule_category"] = _rule_candidate_category(rule)
+        rule["selection_rule_category"] = rule["candidate_rule_category"]
     candidate_rule_diagnostics = _summarize_candidate_rule_selection(final_rules)
     selected_rule_counts = _count_rule_categories(final_rules)
     input_rule_counts = _count_rule_categories(all_kept_rules)
@@ -299,13 +401,16 @@ def process_rules(
         "version": _FINAL_RULES_VERSION,
         "config": {
             "top_k": top_k,
+            "category_budgets": category_budgets,
         },
-        "selection_method": "score_top_k",
+        "selection_method": "score_top_k_category_budgeted",
+        "selection_input_stage": "step16_post_pruned_kept_pool",
         "num_input_rules": len(all_kept_rules),
         "num_final_rules": len(final_rules),
         "candidate_rule_stage_stats": {
             "stage": "step17_final_selection",
             "input_kept_after_step16_rule_counts": input_rule_counts,
+            "budget_pruned_rule_counts": budget_pruned_counts,
             "selected_rule_counts": selected_rule_counts,
         },
         "candidate_rule_flow_summary": candidate_rule_flow_summary,
@@ -332,6 +437,7 @@ def process_rules(
                 "negative_firings",
                 "total_firings",
                 "candidate_rule_category",
+                "selection_rule_category",
                 "uses_candidate_atoms",
                 "num_candidate_body_atoms",
                 "candidate_body_atom_ratio",
@@ -362,6 +468,7 @@ def process_rules(
                     "negative_firings": rule.get("negative_firings", 0),
                     "total_firings": rule.get("total_firings", 0),
                     "candidate_rule_category": rule.get("candidate_rule_category", "accepted_only"),
+                    "selection_rule_category": rule.get("selection_rule_category", "accepted_only"),
                     "uses_candidate_atoms": rule.get("uses_candidate_atoms", False),
                     "num_candidate_body_atoms": rule.get("num_candidate_body_atoms", 0),
                     "candidate_body_atom_ratio": rule.get("candidate_body_atom_ratio", 0.0),
@@ -383,7 +490,8 @@ def process_rules(
         "  final_rules: "
         f"input={len(all_kept_rules)} | "
         f"top_k={top_k} | "
-        f"kept={len(final_rules)}"
+        f"kept={len(final_rules)} | "
+        f"category_budgets={category_budgets}"
     )
     print(f"Final rules JSON written to {json_path}")
     print(f"Final rules CSV written to {csv_path}")

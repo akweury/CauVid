@@ -22,7 +22,7 @@ from src.exp_driving_videos.modules.evaluate_rules_driving_mini import (
 from src.exp_driving_videos.modules import od_calibration_policy_utils
 
 
-_PSEUDO_LABEL_VERSION = 1
+_PSEUDO_LABEL_VERSION = 2
 _POSITION_OR_PROVENANCE_ONLY_PATTERNS = {
     "object_x_position_state_only",
     "position_provenance_prior_score_only",
@@ -215,6 +215,25 @@ def _rule_feedback_profile(rule: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _rule_cluster_key(rule: Dict[str, Any]) -> str:
+    firing_signature = rule.get("firing_signature")
+    if isinstance(firing_signature, list) and firing_signature:
+        return "firing:" + "|".join(
+            f"{_safe_text(item[0])}:{_safe_text(item[1])}"
+            for item in firing_signature
+            if isinstance(item, (list, tuple)) and len(item) >= 2
+        )
+    positive_ids = sorted(
+        _safe_text(value)
+        for value in list(rule.get("positive_example_ids", []))
+        if _safe_text(value)
+    )
+    if positive_ids:
+        return "positive:" + "|".join(positive_ids)
+    body_atoms = sorted(_safe_text(atom) for atom in _get_rule_body_atom_templates(rule) if _safe_text(atom))
+    return "body:" + "|".join(body_atoms)
+
+
 def _evidence_label(
     *,
     example_id: str,
@@ -240,7 +259,12 @@ def _update_aggregate(
     example: Dict[str, Any],
     label: str,
     reason: str,
+    vote_key: str,
 ) -> None:
+    counted_vote_keys = aggregate.setdefault("counted_vote_keys", set())
+    if vote_key in counted_vote_keys:
+        return
+    counted_vote_keys.add(vote_key)
     aggregate.setdefault("selectors", set()).add(selector_name)
     aggregate.setdefault("rule_ids", set()).add(_safe_text(rule.get("rule_id", "")))
     aggregate.setdefault("reasons", Counter()).update([reason])
@@ -383,6 +407,7 @@ def process(
                     example_label=bool(example.get("label", False)),
                     rule_profile=rule_profile,
                 )
+                rule_cluster_key = _rule_cluster_key(rule)
                 for match_state in match_states[:max_match_states]:
                     candidate_object_ids = _candidate_object_ids_from_matched_atoms(
                         dict(match_state.get("matched_atoms", {}))
@@ -407,6 +432,16 @@ def process(
                                 "neutral_count": 0,
                             },
                         )
+                        object_vote_key = "::".join(
+                            [
+                                selector_name,
+                                example_id,
+                                label,
+                                reason,
+                                rule_cluster_key,
+                                object_key[2],
+                            ]
+                        )
                         _update_aggregate(
                             object_aggregate,
                             selector_name=selector_name,
@@ -414,6 +449,7 @@ def process(
                             example=example,
                             label=label,
                             reason=reason,
+                            vote_key=object_vote_key,
                         )
                         detection_ids = [
                             _safe_text(value)
@@ -440,7 +476,17 @@ def process(
                             if _safe_int(object_meta.get("candidate_track_id", -1), -1) >= 0:
                                 detection_aggregate.setdefault("candidate_track_ids", set()).add(
                                     _safe_text(object_meta.get("candidate_track_id", ""))
-                                )
+                            )
+                            detection_vote_key = "::".join(
+                                [
+                                    selector_name,
+                                    example_id,
+                                    label,
+                                    reason,
+                                    rule_cluster_key,
+                                    detection_id,
+                                ]
+                            )
                             _update_aggregate(
                                 detection_aggregate,
                                 selector_name=selector_name,
@@ -448,6 +494,7 @@ def process(
                                 example=example,
                                 label=label,
                                 reason=reason,
+                                vote_key=detection_vote_key,
                             )
                             track_id_text = _safe_text(object_meta.get("candidate_track_id", ""))
                             if track_id_text:
@@ -464,6 +511,16 @@ def process(
                                         "neutral_count": 0,
                                     },
                                 )
+                                track_vote_key = "::".join(
+                                    [
+                                        selector_name,
+                                        example_id,
+                                        label,
+                                        reason,
+                                        rule_cluster_key,
+                                        track_id_text,
+                                    ]
+                                )
                                 _update_aggregate(
                                     track_aggregate,
                                     selector_name=selector_name,
@@ -471,6 +528,7 @@ def process(
                                     example=example,
                                     label=label,
                                     reason=reason,
+                                    vote_key=track_vote_key,
                                 )
 
     if bool(cfg.get("include_neutral_selected_candidate_detections", True)):

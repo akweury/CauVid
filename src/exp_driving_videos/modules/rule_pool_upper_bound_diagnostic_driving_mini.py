@@ -30,10 +30,22 @@ if str(SRC_ROOT) not in sys.path:
 
 import config
 from src.exp_driving_videos.modules.evaluate_rules_driving_mini import _get_rule_body_atom_templates
+from src.exp_driving_videos.modules.final_rules_driving_mini import (
+    _post_pruned_rule_pool,
+    _rule_candidate_category,
+)
 
 
-_POOL_UPPER_BOUND_VERSION = 2
-_VARIABLE_NAMES = {"S", "O", "T", "F"}
+_POOL_UPPER_BOUND_VERSION = 3
+_VARIABLE_NAMES = {"S", "O", "C", "T", "F"}
+_CATEGORY_UPPER_BOUND_ORDER = (
+    "accepted_only",
+    "candidate_only",
+    "mixed_accepted_candidate",
+    "accepted_plus_mixed",
+    "all_candidate_involving",
+    "all_rules",
+)
 
 
 def get_output_root() -> Path:
@@ -309,6 +321,102 @@ def _diagnose_bottleneck(
     )
 
 
+def _oracle_curve_for_rule_subset(
+    oracle_candidate_rows: Sequence[Dict[str, Any]],
+    rule_matches_by_id: Dict[str, Dict[str, Any]],
+    *,
+    total_positive_examples: int,
+    total_negative_examples: int,
+    max_k: int,
+) -> List[Dict[str, Any]]:
+    curve_rows: List[Dict[str, Any]] = []
+    selected_rule_ids: Set[str] = set()
+    predicted_positive_mask = 0
+    current_tp = 0
+    current_fp = 0
+
+    for rank in range(1, min(max_k, len(oracle_candidate_rows)) + 1):
+        best_candidate: Optional[Dict[str, Any]] = None
+        best_candidate_metrics: Optional[Dict[str, Any]] = None
+        for row in oracle_candidate_rows:
+            rule_id = str(row.get("rule_id", ""))
+            if rule_id in selected_rule_ids:
+                continue
+            match_info = rule_matches_by_id.get(rule_id, {})
+            candidate_positive_mask = int(match_info.get("positive_mask", 0))
+            candidate_negative_mask = int(match_info.get("negative_mask", 0))
+            additional_tp = int((candidate_positive_mask & ~predicted_positive_mask).bit_count())
+            additional_fp = int((candidate_negative_mask & ~predicted_positive_mask).bit_count())
+            tp = current_tp + additional_tp
+            fp = current_fp + additional_fp
+            fn = total_positive_examples - tp
+            tn = total_negative_examples - fp
+            metrics = _compute_binary_metrics(tp, fp, fn, tn)
+            candidate = {
+                "rule_id": rule_id,
+                "clause": str(row.get("clause", "")),
+                "semantic_family": str(row.get("semantic_family", "")),
+                "added_positive_examples": additional_tp,
+                "added_negative_examples": additional_fp,
+                "precision": float(metrics["precision"]),
+                "recall": float(metrics["recall"]),
+                "f1": float(metrics["f1"]),
+                "true_positive": int(metrics["true_positive"]),
+                "false_positive": int(metrics["false_positive"]),
+                "false_negative": int(metrics["false_negative"]),
+                "true_negative": int(metrics["true_negative"]),
+                "confidence": float(row.get("confidence", 0.0)),
+            }
+            key = (
+                float(candidate["f1"]),
+                float(candidate["recall"]),
+                float(candidate["precision"]),
+                int(candidate["added_positive_examples"]) - int(candidate["added_negative_examples"]),
+                float(candidate["confidence"]),
+                str(candidate["rule_id"]),
+            )
+            best_key = None
+            if best_candidate is not None:
+                best_key = (
+                    float(best_candidate["f1"]),
+                    float(best_candidate["recall"]),
+                    float(best_candidate["precision"]),
+                    int(best_candidate["added_positive_examples"]) - int(best_candidate["added_negative_examples"]),
+                    float(best_candidate["confidence"]),
+                    str(best_candidate["rule_id"]),
+                )
+            if best_candidate is None or key > best_key:
+                best_candidate = candidate
+                best_candidate_metrics = match_info
+
+        if best_candidate is None or best_candidate_metrics is None:
+            break
+
+        best_rule_id = str(best_candidate["rule_id"])
+        selected_rule_ids.add(best_rule_id)
+        predicted_positive_mask |= int(best_candidate_metrics.get("matched_mask", 0))
+        current_tp = int(best_candidate["true_positive"])
+        current_fp = int(best_candidate["false_positive"])
+        curve_rows.append(
+            {
+                "selection_rank": rank,
+                "rule_id": best_rule_id,
+                "clause": str(best_candidate["clause"]),
+                "semantic_family": str(best_candidate["semantic_family"]),
+                "added_positive_examples": int(best_candidate["added_positive_examples"]),
+                "added_negative_examples": int(best_candidate["added_negative_examples"]),
+                "cumulative_true_positive": int(best_candidate["true_positive"]),
+                "cumulative_false_positive": int(best_candidate["false_positive"]),
+                "cumulative_false_negative": int(best_candidate["false_negative"]),
+                "cumulative_true_negative": int(best_candidate["true_negative"]),
+                "precision": float(best_candidate["precision"]),
+                "recall": float(best_candidate["recall"]),
+                "f1": float(best_candidate["f1"]),
+            }
+        )
+    return curve_rows
+
+
 def process_diagnostic(
     extended_rule_results: Dict[str, Any],
     temporal_rule_results: List[Dict[str, Any]],
@@ -327,6 +435,7 @@ def process_diagnostic(
     precision_recall_path = out_root / "best_rules_by_precision_at_min_recall.csv"
     scatter_path = out_root / "rule_pool_precision_recall_scatter.csv"
     oracle_curve_path = out_root / "oracle_greedy_rule_set_curve.csv"
+    category_upper_bound_path = out_root / "category_upper_bounds.csv"
     summary_path = out_root / "pool_upper_bound_summary.json"
 
     if not force_recompute and summary_path.exists():
@@ -376,7 +485,7 @@ def process_diagnostic(
 
     total_positive_examples = int(positive_mask.bit_count())
     total_negative_examples = int(negative_mask.bit_count())
-    all_kept_rules = list(extended_rule_results.get("all_kept_rules", []))
+    all_kept_rules = _post_pruned_rule_pool(extended_rule_results)
     oracle_k_values = sorted({max(1, int(v)) for v in cfg.get("oracle_k_values", [1, 5, 10, 20, 50, 100])})
     max_oracle_k = max(oracle_k_values, default=1)
 
@@ -431,6 +540,7 @@ def process_diagnostic(
             {
                 "rule_id": rule_id,
                 "clause": str(rule.get("clause", "")),
+                "candidate_rule_category": _rule_candidate_category(rule),
                 "confidence": float(rule.get("confidence", 0.0)),
                 "train_positive_support": int(rule.get("positive_support", 0)),
                 "train_negative_support": int(rule.get("negative_support", 0)),
@@ -505,93 +615,16 @@ def process_diagnostic(
         )
 
     oracle_curve_rows: List[Dict[str, Any]] = []
-    selected_rule_ids: Set[str] = set()
-    predicted_positive_mask = 0
-    current_tp = 0
-    current_fp = 0
     oracle_candidate_rows = [row for row in rule_rows if int(row.get("eval_total_support", 0)) > 0]
-
-    for rank in range(1, min(max_oracle_k, len(oracle_candidate_rows)) + 1):
-        best_candidate: Optional[Dict[str, Any]] = None
-        best_candidate_metrics: Optional[Dict[str, Any]] = None
-        for row in oracle_candidate_rows:
-            rule_id = str(row.get("rule_id", ""))
-            if rule_id in selected_rule_ids:
-                continue
-            match_info = rule_matches_by_id.get(rule_id, {})
-            candidate_positive_mask = int(match_info.get("positive_mask", 0))
-            candidate_negative_mask = int(match_info.get("negative_mask", 0))
-            additional_tp = int((candidate_positive_mask & ~predicted_positive_mask).bit_count())
-            additional_fp = int((candidate_negative_mask & ~predicted_positive_mask).bit_count())
-            tp = current_tp + additional_tp
-            fp = current_fp + additional_fp
-            fn = total_positive_examples - tp
-            tn = total_negative_examples - fp
-            metrics = _compute_binary_metrics(tp, fp, fn, tn)
-            candidate = {
-                "rule_id": rule_id,
-                "clause": str(row.get("clause", "")),
-                "semantic_family": str(row.get("semantic_family", "")),
-                "added_positive_examples": additional_tp,
-                "added_negative_examples": additional_fp,
-                "precision": float(metrics["precision"]),
-                "recall": float(metrics["recall"]),
-                "f1": float(metrics["f1"]),
-                "true_positive": int(metrics["true_positive"]),
-                "false_positive": int(metrics["false_positive"]),
-                "false_negative": int(metrics["false_negative"]),
-                "true_negative": int(metrics["true_negative"]),
-                "confidence": float(row.get("confidence", 0.0)),
-            }
-            key = (
-                float(candidate["f1"]),
-                float(candidate["recall"]),
-                float(candidate["precision"]),
-                int(candidate["added_positive_examples"]) - int(candidate["added_negative_examples"]),
-                float(candidate["confidence"]),
-                str(candidate["rule_id"]),
-            )
-            best_key = None
-            if best_candidate is not None:
-                best_key = (
-                    float(best_candidate["f1"]),
-                    float(best_candidate["recall"]),
-                    float(best_candidate["precision"]),
-                    int(best_candidate["added_positive_examples"]) - int(best_candidate["added_negative_examples"]),
-                    float(best_candidate["confidence"]),
-                    str(best_candidate["rule_id"]),
-                )
-            if best_candidate is None or key > best_key:
-                best_candidate = candidate
-                best_candidate_metrics = match_info
-
-        if best_candidate is None or best_candidate_metrics is None:
-            break
-
-        best_rule_id = str(best_candidate["rule_id"])
-        selected_rule_ids.add(best_rule_id)
-        predicted_positive_mask |= int(best_candidate_metrics.get("matched_mask", 0))
-        current_tp = int(best_candidate["true_positive"])
-        current_fp = int(best_candidate["false_positive"])
-
-        oracle_curve_rows.append(
-            {
-                "selection_rank": rank,
-                "rule_id": best_rule_id,
-                "clause": str(best_candidate["clause"]),
-                "semantic_family": str(best_candidate["semantic_family"]),
-                "added_positive_examples": int(best_candidate["added_positive_examples"]),
-                "added_negative_examples": int(best_candidate["added_negative_examples"]),
-                "cumulative_true_positive": int(best_candidate["true_positive"]),
-                "cumulative_false_positive": int(best_candidate["false_positive"]),
-                "cumulative_false_negative": int(best_candidate["false_negative"]),
-                "cumulative_true_negative": int(best_candidate["true_negative"]),
-                "precision": float(best_candidate["precision"]),
-                "recall": float(best_candidate["recall"]),
-                "f1": float(best_candidate["f1"]),
-                "is_reported_k": rank in oracle_k_values,
-            }
-        )
+    oracle_curve_rows = _oracle_curve_for_rule_subset(
+        oracle_candidate_rows,
+        rule_matches_by_id,
+        total_positive_examples=total_positive_examples,
+        total_negative_examples=total_negative_examples,
+        max_k=max_oracle_k,
+    )
+    for row in oracle_curve_rows:
+        row["is_reported_k"] = int(row.get("selection_rank", 0)) in oracle_k_values
 
     oracle_curve_by_k = {int(row["selection_rank"]): row for row in oracle_curve_rows}
     oracle_f1_by_k: Dict[str, float] = {}
@@ -611,6 +644,82 @@ def process_diagnostic(
                 total_positive_examples=total_positive_examples,
                 total_negative_examples=total_negative_examples,
             )
+
+    subset_rule_rows = {
+        "accepted_only": [
+            row for row in rule_rows if str(row.get("candidate_rule_category", "")) == "accepted_only"
+        ],
+        "candidate_only": [
+            row for row in rule_rows if str(row.get("candidate_rule_category", "")) == "candidate_only"
+        ],
+        "mixed_accepted_candidate": [
+            row for row in rule_rows if str(row.get("candidate_rule_category", "")) == "mixed_accepted_candidate"
+        ],
+        "accepted_plus_mixed": [
+            row
+            for row in rule_rows
+            if str(row.get("candidate_rule_category", "")) in {"accepted_only", "mixed_accepted_candidate"}
+        ],
+        "all_candidate_involving": [
+            row
+            for row in rule_rows
+            if str(row.get("candidate_rule_category", "")) in {
+                "candidate_only",
+                "candidate_candidate",
+                "mixed_accepted_candidate",
+            }
+        ],
+        "all_rules": list(rule_rows),
+    }
+    category_upper_bounds: Dict[str, Dict[str, Any]] = {}
+    accepted_only_best_tp = 0
+    for subset_name in _CATEGORY_UPPER_BOUND_ORDER:
+        subset_rows = list(subset_rule_rows.get(subset_name, []))
+        subset_oracle_curve = _oracle_curve_for_rule_subset(
+            [row for row in subset_rows if int(row.get("eval_total_support", 0)) > 0],
+            rule_matches_by_id,
+            total_positive_examples=total_positive_examples,
+            total_negative_examples=total_negative_examples,
+            max_k=len(subset_rows),
+        )
+        best_row = max(
+            subset_oracle_curve,
+            key=lambda row: (
+                float(row.get("f1", 0.0)),
+                float(row.get("recall", 0.0)),
+                float(row.get("precision", 0.0)),
+                -int(row.get("selection_rank", 0)),
+            ),
+            default={},
+        )
+        union_metrics = _evaluate_selected_rule_set(
+            [str(row.get("rule_id", "")) for row in subset_rows],
+            rule_matches_by_id=rule_matches_by_id,
+            positive_mask=positive_mask,
+            negative_mask=negative_mask,
+            total_positive_examples=total_positive_examples,
+            total_negative_examples=total_negative_examples,
+        )
+        category_upper_bounds[subset_name] = {
+            "subset_name": subset_name,
+            "num_pool_rules": len(subset_rows),
+            "max_positive_coverage_count": int(union_metrics.get("true_positive", 0)),
+            "max_positive_coverage_rate": float(union_metrics.get("recall", 0.0)),
+            "best_oracle_k": int(best_row.get("selection_rank", 0)),
+            "best_oracle_true_positive": int(best_row.get("cumulative_true_positive", 0)),
+            "best_oracle_false_positive": int(best_row.get("cumulative_false_positive", 0)),
+            "precision": float(best_row.get("precision", 0.0)),
+            "recall": float(best_row.get("recall", 0.0)),
+            "f1": float(best_row.get("f1", 0.0)),
+            "fp_cost": int(best_row.get("cumulative_false_positive", 0)),
+        }
+        if subset_name == "accepted_only":
+            accepted_only_best_tp = int(best_row.get("cumulative_true_positive", 0))
+    for subset_name, summary_row in category_upper_bounds.items():
+        summary_row["fn_recovery_beyond_accepted_only"] = max(
+            0,
+            int(summary_row.get("best_oracle_true_positive", 0)) - accepted_only_best_tp,
+        )
 
     selection_reference_k = max((int(metrics.get("num_rules", 0)) for metrics in selector_metrics_by_name.values()), default=max(oracle_k_values, default=0))
     best_actual_selector_name = ""
@@ -635,6 +744,16 @@ def process_diagnostic(
             oracle_reference_row = oracle_curve_by_k.get(fallback_rank)
     oracle_f1_at_reference_k = float(oracle_reference_row.get("f1", 0.0)) if oracle_reference_row is not None else 0.0
     best_single_rule_f1 = float(sorted_by_f1[0].get("f1", 0.0)) if sorted_by_f1 else 0.0
+    category_oracle_gap_by_selector: Dict[str, Dict[str, Any]] = {}
+    for selector_name, metrics in selector_metrics_by_name.items():
+        category_oracle_gap_by_selector[selector_name] = {
+            subset_name: {
+                "oracle_upper_bound_f1": float(subset_summary.get("f1", 0.0)),
+                "selector_f1": float(metrics.get("f1", 0.0)),
+                "oracle_gap_f1": float(subset_summary.get("f1", 0.0)) - float(metrics.get("f1", 0.0)),
+            }
+            for subset_name, subset_summary in category_upper_bounds.items()
+        }
     bottleneck_label, bottleneck_rationale = _diagnose_bottleneck(
         best_single_rule_f1=best_single_rule_f1,
         oracle_f1_at_reference_k=oracle_f1_at_reference_k,
@@ -700,6 +819,24 @@ def process_diagnostic(
         sorted_by_f1,
     )
     _write_csv(
+        category_upper_bound_path,
+        [
+            "subset_name",
+            "num_pool_rules",
+            "max_positive_coverage_count",
+            "max_positive_coverage_rate",
+            "fn_recovery_beyond_accepted_only",
+            "fp_cost",
+            "precision",
+            "recall",
+            "f1",
+            "best_oracle_k",
+            "best_oracle_true_positive",
+            "best_oracle_false_positive",
+        ],
+        [category_upper_bounds[name] for name in _CATEGORY_UPPER_BOUND_ORDER],
+    )
+    _write_csv(
         oracle_curve_path,
         [
             "selection_rank",
@@ -746,7 +883,9 @@ def process_diagnostic(
         "best_single_rule": dict(top_single_rules[0]) if top_single_rules else {},
         "best_single_rule_f1": best_single_rule_f1,
         "best_oracle_greedy_rule_set_f1_by_k": oracle_f1_by_k,
+        "category_upper_bounds": category_upper_bounds,
         "actual_selected_rule_set_metrics_by_name": selector_metrics_by_name,
+        "category_oracle_gap_by_selector": category_oracle_gap_by_selector,
         "best_actual_selector_name": best_actual_selector_name,
         "best_actual_selector_f1": best_actual_selector_f1,
         "selection_reference_k": selection_reference_k,
@@ -758,6 +897,7 @@ def process_diagnostic(
             "best_rules_by_precision_at_min_recall_csv": str(precision_recall_path),
             "rule_pool_precision_recall_scatter_csv": str(scatter_path),
             "oracle_greedy_rule_set_curve_csv": str(oracle_curve_path),
+            "category_upper_bounds_csv": str(category_upper_bound_path),
         },
     }
 

@@ -191,25 +191,51 @@ extended_rules:
   allow_candidate_candidate_extension: false
   max_segment_context_atoms_per_rule: 1
   per_parent_extension_top_k: 25
-  max_parent_rules_next_round: 200
-  max_parent_next_round_accepted_only_rules: 120
-  max_parent_next_round_mixed_candidate_rules: 60
-  max_parent_next_round_candidate_only_rules: 20
-  max_parent_next_round_candidate_candidate_rules: 0
-  max_round_rules: 50000
-  max_round_accepted_only_rules: 1500
-  max_round_mixed_candidate_rules: 600
-  max_round_candidate_only_rules: 150
-  max_round_candidate_candidate_rules: 0
+  post_extension_pruning:
+    enabled: true
+    deduplicate_by_firing_signature: true
+    dominance_prune_same_positive_coverage: true
+    max_rules_per_firing_signature: 1
+    max_rules_per_positive_coverage_set: 2
+  max_round_rules:
+    round_1: 800
+    round_2: 200
+  max_round_rules_by_category:
+    round_1:
+      accepted_only: 300
+      mixed_accepted_candidate: 350
+      candidate_only: 100
+      candidate_candidate: 0
+    round_2:
+      accepted_only: 80
+      mixed_accepted_candidate: 100
+      candidate_only: 20
+      candidate_candidate: 0
+  parents_for_next_round:
+    max_total: 300
+    accepted_only: 120
+    mixed_accepted_candidate: 150
+    candidate_only: 30
+    candidate_candidate: 0
 
 final_rules:
   top_k: 50
+  category_budgets:
+    accepted_only: 25
+    mixed_accepted_candidate: 20
+    candidate_only: 5
+    candidate_candidate: 0
 
 diverse_final_rules:
   score_mode: legacy_diverse_positive_coverage
   selection_method_name: greedy_diverse_positive_coverage
   output_prefix: diverse_final_rules
   top_k: 50
+  category_budgets:
+    accepted_only: 25
+    mixed_accepted_candidate: 20
+    candidate_only: 5
+    candidate_candidate: 0
   new_positive_weight: 1.0
   confidence_weight: 0.25
   overlap_penalty: 0.35
@@ -221,6 +247,11 @@ semantic_constrained_diverse_final_rules:
   selection_method_name: semantic_constrained_diverse
   output_prefix: semantic_constrained_diverse_final_rules
   top_k: 50
+  category_budgets:
+    accepted_only: 25
+    mixed_accepted_candidate: 20
+    candidate_only: 5
+    candidate_candidate: 0
   new_positive_weight: 1.0
   confidence_weight: 0.25
   overlap_penalty: 0.35
@@ -245,6 +276,11 @@ coverage_family_aware_final_rules:
   selection_method_name: greedy_coverage_family_aware
   output_prefix: coverage_family_aware_final_rules
   top_k: 50
+  category_budgets:
+    accepted_only: 25
+    mixed_accepted_candidate: 20
+    candidate_only: 5
+    candidate_candidate: 0
   coverage_weight: 1.0
   quality_weight: 1.0
   overlap_penalty: 0.5

@@ -29,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SUMMARY_VERSION = 2
+_SUMMARY_VERSION = 3
 
 
 def get_output_root() -> Path:
@@ -395,6 +395,7 @@ def _selector_summary(
         "num_final_rules": _safe_int(rule_result.get("num_final_rules", 0)),
         "selected_accepted_only_rule_count": _safe_int(category_counts.get("accepted_only_rules", 0)),
         "selected_candidate_only_rule_count": _safe_int(category_counts.get("candidate_only_rules", 0)),
+        "selected_candidate_candidate_rule_count": _safe_int(category_counts.get("candidate_candidate_rules", 0)),
         "selected_mixed_rule_count": _safe_int(category_counts.get("mixed_accepted_candidate_rules", 0)),
         "selected_candidate_involving_rule_count": _safe_int(category_counts.get("candidate_only_rules", 0))
         + _safe_int(category_counts.get("mixed_accepted_candidate_rules", 0)),
@@ -408,13 +409,37 @@ def _selector_summary(
         "accepted_plus_candidate_precision": _safe_float(augmented_metrics.get("precision", 0.0)),
         "accepted_plus_candidate_recall": _safe_float(augmented_metrics.get("recall", 0.0)),
         "accepted_plus_candidate_f1": _safe_float(augmented_metrics.get("f1", 0.0)),
+        "accepted_plus_mixed_precision": _safe_float(
+            dict(ablation.get("mixed_augmented_metrics", {})).get("precision", 0.0)
+        ),
+        "accepted_plus_mixed_recall": _safe_float(
+            dict(ablation.get("mixed_augmented_metrics", {})).get("recall", 0.0)
+        ),
+        "accepted_plus_mixed_f1": _safe_float(dict(ablation.get("mixed_augmented_metrics", {})).get("f1", 0.0)),
         "delta_precision": delta_precision,
         "delta_recall": delta_recall,
         "delta_f1": delta_f1,
+        "mixed_delta_precision": _safe_float(ablation.get("mixed_delta_precision", 0.0)),
+        "mixed_delta_recall": _safe_float(ablation.get("mixed_delta_recall", 0.0)),
+        "mixed_delta_f1": _safe_float(ablation.get("mixed_delta_f1", 0.0)),
         "fn_coverage_gain_count": fn_gain_count,
         "fn_coverage_gain_rate": _safe_float(ablation.get("fn_coverage_gain_rate", 0.0)),
         "fp_contribution_count": fp_contribution_count,
         "fp_contribution_rate": _safe_float(ablation.get("fp_contribution_rate", 0.0)),
+        "mixed_fn_coverage_gain_count": _safe_int(ablation.get("mixed_fn_coverage_gain_count", 0)),
+        "mixed_fp_contribution_count": _safe_int(ablation.get("mixed_fp_contribution_count", 0)),
+        "candidate_only_fn_coverage_gain_count": _safe_int(
+            ablation.get("candidate_only_fn_coverage_gain_count", 0)
+        ),
+        "candidate_only_fp_contribution_count": _safe_int(
+            ablation.get("candidate_only_fp_contribution_count", 0)
+        ),
+        "candidate_candidate_fn_coverage_gain_count": _safe_int(
+            ablation.get("candidate_candidate_fn_coverage_gain_count", 0)
+        ),
+        "candidate_candidate_fp_contribution_count": _safe_int(
+            ablation.get("candidate_candidate_fp_contribution_count", 0)
+        ),
         "broad_candidate_fn_coverage_gain_count": sum(
             _safe_int(row.get("fn_coverage_gain_count", 0)) for row in broad_candidate_rows
         ),
@@ -510,6 +535,7 @@ def process(
                 "num_final_rules",
                 "selected_accepted_only_rule_count",
                 "selected_candidate_only_rule_count",
+                "selected_candidate_candidate_rule_count",
                 "selected_mixed_rule_count",
                 "selected_candidate_involving_rule_count",
                 "selected_weak_candidate_rule_count",
@@ -520,13 +546,25 @@ def process(
                 "accepted_plus_candidate_precision",
                 "accepted_plus_candidate_recall",
                 "accepted_plus_candidate_f1",
+                "accepted_plus_mixed_precision",
+                "accepted_plus_mixed_recall",
+                "accepted_plus_mixed_f1",
                 "delta_precision",
                 "delta_recall",
                 "delta_f1",
+                "mixed_delta_precision",
+                "mixed_delta_recall",
+                "mixed_delta_f1",
                 "fn_coverage_gain_count",
                 "fn_coverage_gain_rate",
                 "fp_contribution_count",
                 "fp_contribution_rate",
+                "mixed_fn_coverage_gain_count",
+                "mixed_fp_contribution_count",
+                "candidate_only_fn_coverage_gain_count",
+                "candidate_only_fp_contribution_count",
+                "candidate_candidate_fn_coverage_gain_count",
+                "candidate_candidate_fp_contribution_count",
                 "broad_candidate_fn_coverage_gain_count",
                 "broad_candidate_fp_contribution_count",
                 "broad_candidate_net_utility",
@@ -550,6 +588,9 @@ def process(
                     "num_final_rules": row.get("num_final_rules", 0),
                     "selected_accepted_only_rule_count": row.get("selected_accepted_only_rule_count", 0),
                     "selected_candidate_only_rule_count": row.get("selected_candidate_only_rule_count", 0),
+                    "selected_candidate_candidate_rule_count": row.get(
+                        "selected_candidate_candidate_rule_count", 0
+                    ),
                     "selected_mixed_rule_count": row.get("selected_mixed_rule_count", 0),
                     "selected_candidate_involving_rule_count": row.get("selected_candidate_involving_rule_count", 0),
                     "selected_weak_candidate_rule_count": row.get("selected_weak_candidate_rule_count", 0),
@@ -560,13 +601,33 @@ def process(
                     "accepted_plus_candidate_precision": row.get("accepted_plus_candidate_precision", 0.0),
                     "accepted_plus_candidate_recall": row.get("accepted_plus_candidate_recall", 0.0),
                     "accepted_plus_candidate_f1": row.get("accepted_plus_candidate_f1", 0.0),
+                    "accepted_plus_mixed_precision": row.get("accepted_plus_mixed_precision", 0.0),
+                    "accepted_plus_mixed_recall": row.get("accepted_plus_mixed_recall", 0.0),
+                    "accepted_plus_mixed_f1": row.get("accepted_plus_mixed_f1", 0.0),
                     "delta_precision": row.get("delta_precision", 0.0),
                     "delta_recall": row.get("delta_recall", 0.0),
                     "delta_f1": row.get("delta_f1", 0.0),
+                    "mixed_delta_precision": row.get("mixed_delta_precision", 0.0),
+                    "mixed_delta_recall": row.get("mixed_delta_recall", 0.0),
+                    "mixed_delta_f1": row.get("mixed_delta_f1", 0.0),
                     "fn_coverage_gain_count": row.get("fn_coverage_gain_count", 0),
                     "fn_coverage_gain_rate": row.get("fn_coverage_gain_rate", 0.0),
                     "fp_contribution_count": row.get("fp_contribution_count", 0),
                     "fp_contribution_rate": row.get("fp_contribution_rate", 0.0),
+                    "mixed_fn_coverage_gain_count": row.get("mixed_fn_coverage_gain_count", 0),
+                    "mixed_fp_contribution_count": row.get("mixed_fp_contribution_count", 0),
+                    "candidate_only_fn_coverage_gain_count": row.get(
+                        "candidate_only_fn_coverage_gain_count", 0
+                    ),
+                    "candidate_only_fp_contribution_count": row.get(
+                        "candidate_only_fp_contribution_count", 0
+                    ),
+                    "candidate_candidate_fn_coverage_gain_count": row.get(
+                        "candidate_candidate_fn_coverage_gain_count", 0
+                    ),
+                    "candidate_candidate_fp_contribution_count": row.get(
+                        "candidate_candidate_fp_contribution_count", 0
+                    ),
                     "broad_candidate_fn_coverage_gain_count": row.get("broad_candidate_fn_coverage_gain_count", 0),
                     "broad_candidate_fp_contribution_count": row.get("broad_candidate_fp_contribution_count", 0),
                     "broad_candidate_net_utility": row.get("broad_candidate_net_utility", 0),

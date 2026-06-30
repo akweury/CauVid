@@ -38,7 +38,7 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 6
+_EXTENDED_RULES_VERSION = 7
 _PROVENANCE_ONLY_BODY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -91,6 +91,7 @@ def _resolve_prune_strategies(cfg: Dict[str, Any]) -> List[str]:
 
 
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    post_extension_pruning = _post_extension_pruning_cfg(cfg)
     return {
         "input_initial_rule_pool_key": str(cfg.get("input_initial_rule_pool_key", "")),
         "num_rounds": int(cfg.get("num_rounds", 2)),
@@ -113,26 +114,144 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
             cfg.get("allow_candidate_candidate_extension", False)
         ),
         "max_segment_context_atoms_per_rule": int(cfg.get("max_segment_context_atoms_per_rule", 1)),
-        "per_parent_extension_top_k": int(cfg.get("per_parent_extension_top_k", 40)),
-        "max_parent_rules_next_round": int(cfg.get("max_parent_rules_next_round", 200)),
-        "max_parent_next_round_accepted_only_rules": int(
-            cfg.get("max_parent_next_round_accepted_only_rules", 120)
-        ),
-        "max_parent_next_round_mixed_candidate_rules": int(
-            cfg.get("max_parent_next_round_mixed_candidate_rules", 60)
-        ),
-        "max_parent_next_round_candidate_only_rules": int(
-            cfg.get("max_parent_next_round_candidate_only_rules", 20)
-        ),
-        "max_parent_next_round_candidate_candidate_rules": int(
-            cfg.get("max_parent_next_round_candidate_candidate_rules", 0)
-        ),
-        "max_round_rules": int(cfg.get("max_round_rules", 50000)),
-        "max_round_accepted_only_rules": int(cfg.get("max_round_accepted_only_rules", 30000)),
-        "max_round_mixed_candidate_rules": int(cfg.get("max_round_mixed_candidate_rules", 15000)),
-        "max_round_candidate_only_rules": int(cfg.get("max_round_candidate_only_rules", 3000)),
-        "max_round_candidate_candidate_rules": int(cfg.get("max_round_candidate_candidate_rules", 500)),
+        "per_parent_extension_top_k": int(cfg.get("per_parent_extension_top_k", 25)),
+        "post_extension_pruning": post_extension_pruning,
+        "max_round_rules": _normalized_round_rule_budgets(cfg),
+        "max_round_rules_by_category": _normalized_round_category_budgets(cfg),
+        "parents_for_next_round": _normalized_next_round_parent_cfg(cfg),
     }
+
+
+def _round_key(round_index: int) -> str:
+    return f"round_{round_index}"
+
+
+def _post_extension_pruning_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    defaults = {
+        "enabled": True,
+        "deduplicate_by_firing_signature": True,
+        "dominance_prune_same_positive_coverage": True,
+        "max_rules_per_firing_signature": 1,
+        "max_rules_per_positive_coverage_set": 2,
+    }
+    resolved = dict(defaults)
+    override = cfg.get("post_extension_pruning")
+    if isinstance(override, dict):
+        resolved.update(override)
+    return {
+        "enabled": bool(resolved.get("enabled", True)),
+        "deduplicate_by_firing_signature": bool(
+            resolved.get("deduplicate_by_firing_signature", True)
+        ),
+        "dominance_prune_same_positive_coverage": bool(
+            resolved.get("dominance_prune_same_positive_coverage", True)
+        ),
+        "max_rules_per_firing_signature": int(resolved.get("max_rules_per_firing_signature", 1)),
+        "max_rules_per_positive_coverage_set": int(
+            resolved.get("max_rules_per_positive_coverage_set", 2)
+        ),
+    }
+
+
+def _normalized_round_rule_budgets(cfg: Dict[str, Any]) -> Dict[str, int]:
+    defaults = {"round_1": 800, "round_2": 200}
+    raw = cfg.get("max_round_rules")
+    if isinstance(raw, dict):
+        resolved = dict(defaults)
+        for key, value in raw.items():
+            resolved[str(key)] = int(value)
+        return resolved
+    return {
+        "round_1": int(raw if raw is not None else cfg.get("max_round_rules", 50000)),
+        "round_2": int(raw if raw is not None else cfg.get("max_round_rules", 50000)),
+    }
+
+
+def _normalized_round_category_budgets(cfg: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+    defaults = {
+        "round_1": {
+            "accepted_only": 300,
+            "mixed_accepted_candidate": 350,
+            "candidate_only": 100,
+            "candidate_candidate": 0,
+        },
+        "round_2": {
+            "accepted_only": 80,
+            "mixed_accepted_candidate": 100,
+            "candidate_only": 20,
+            "candidate_candidate": 0,
+        },
+    }
+    raw = cfg.get("max_round_rules_by_category")
+    if isinstance(raw, dict):
+        resolved: Dict[str, Dict[str, int]] = {
+            key: dict(value) for key, value in defaults.items()
+        }
+        for round_key, round_cfg in raw.items():
+            if not isinstance(round_cfg, dict):
+                continue
+            merged_round = dict(resolved.get(str(round_key), {}))
+            for category_key, value in round_cfg.items():
+                merged_round[str(category_key)] = int(value)
+            resolved[str(round_key)] = merged_round
+        return resolved
+    flat_default = {
+        "accepted_only": int(cfg.get("max_round_accepted_only_rules", 1500)),
+        "mixed_accepted_candidate": int(cfg.get("max_round_mixed_candidate_rules", 600)),
+        "candidate_only": int(cfg.get("max_round_candidate_only_rules", 150)),
+        "candidate_candidate": int(cfg.get("max_round_candidate_candidate_rules", 0)),
+    }
+    return {"round_1": dict(flat_default), "round_2": dict(flat_default)}
+
+
+def _normalized_next_round_parent_cfg(cfg: Dict[str, Any]) -> Dict[str, int]:
+    defaults = {
+        "max_total": 300,
+        "accepted_only": 120,
+        "mixed_accepted_candidate": 150,
+        "candidate_only": 30,
+        "candidate_candidate": 0,
+    }
+    raw = cfg.get("parents_for_next_round")
+    if isinstance(raw, dict):
+        resolved = dict(defaults)
+        for key, value in raw.items():
+            resolved[str(key)] = int(value)
+        return resolved
+    return {
+        "max_total": int(cfg.get("max_parent_rules_next_round", 200)),
+        "accepted_only": int(cfg.get("max_parent_next_round_accepted_only_rules", 120)),
+        "mixed_accepted_candidate": int(cfg.get("max_parent_next_round_mixed_candidate_rules", 60)),
+        "candidate_only": int(cfg.get("max_parent_next_round_candidate_only_rules", 20)),
+        "candidate_candidate": int(cfg.get("max_parent_next_round_candidate_candidate_rules", 0)),
+    }
+
+
+def _runtime_category_budgets(raw_budgets: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        "accepted_only": int(raw_budgets.get("accepted_only", -1)),
+        "accepted_candidate": int(raw_budgets.get("mixed_accepted_candidate", raw_budgets.get("accepted_candidate", -1))),
+        "candidate_only": int(raw_budgets.get("candidate_only", -1)),
+        "candidate_candidate": int(raw_budgets.get("candidate_candidate", -1)),
+    }
+
+
+def _round_rule_budget(cfg: Dict[str, Any], round_index: int) -> int:
+    budgets = _normalized_round_rule_budgets(cfg)
+    round_key = _round_key(round_index)
+    if round_key in budgets:
+        return int(budgets[round_key])
+    fallback_key = max(budgets) if budgets else round_key
+    return int(budgets.get(fallback_key, 0))
+
+
+def _round_category_budgets(cfg: Dict[str, Any], round_index: int) -> Dict[str, int]:
+    budgets = _normalized_round_category_budgets(cfg)
+    round_key = _round_key(round_index)
+    raw = budgets.get(round_key)
+    if not isinstance(raw, dict):
+        raw = budgets.get(max(budgets) if budgets else round_key, {})
+    return _runtime_category_budgets(raw if isinstance(raw, dict) else {})
 
 
 def _initial_rule_pool_cache_key(rules: Sequence[Dict[str, Any]]) -> str:
@@ -777,6 +896,62 @@ def _budget_allows_rule(
     return True
 
 
+def _apply_cluster_limit(
+    rules: Sequence[Dict[str, Any]],
+    *,
+    key_fn,
+    max_per_key: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    if max_per_key < 0:
+        return list(rules), 0
+    kept: List[Dict[str, Any]] = []
+    counts: Dict[Any, int] = {}
+    pruned = 0
+    for rule in sorted(rules, key=_extension_rank_key):
+        key = key_fn(rule)
+        used = counts.get(key, 0)
+        if used >= max_per_key:
+            pruned += 1
+            continue
+        counts[key] = used + 1
+        kept.append(rule)
+    return kept, pruned
+
+
+def _apply_post_extension_pruning(
+    rules: Sequence[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    pruning_cfg = _post_extension_pruning_cfg(cfg)
+    stats = {
+        "firing_signature_deduplicated": 0,
+        "positive_coverage_pruned": 0,
+    }
+    if not pruning_cfg["enabled"]:
+        return list(rules), stats
+
+    kept_rules = list(rules)
+    if pruning_cfg["deduplicate_by_firing_signature"]:
+        kept_rules, stats["firing_signature_deduplicated"] = _apply_cluster_limit(
+            kept_rules,
+            key_fn=lambda rule: (
+                str(rule.get("head_predicate", "")),
+                tuple(rule.get("firing_signature", ())),
+            ),
+            max_per_key=max(0, pruning_cfg["max_rules_per_firing_signature"]),
+        )
+    if pruning_cfg["dominance_prune_same_positive_coverage"]:
+        kept_rules, stats["positive_coverage_pruned"] = _apply_cluster_limit(
+            kept_rules,
+            key_fn=lambda rule: (
+                str(rule.get("head_predicate", "")),
+                tuple(str(value) for value in list(rule.get("positive_example_ids", []))),
+            ),
+            max_per_key=max(0, pruning_cfg["max_rules_per_positive_coverage_set"]),
+        )
+    return kept_rules, stats
+
+
 def _summarize_rule_candidate_provenance(
     body_atom_templates: Sequence[str],
     evidence_entries: Sequence[Dict[str, Any]],
@@ -1154,24 +1329,36 @@ def process_rules(
     allow_candidate_candidate_extension = bool(cfg.get("allow_candidate_candidate_extension", False))
     max_segment_context_atoms_per_rule = int(cfg.get("max_segment_context_atoms_per_rule", 1))
     per_parent_extension_top_k = int(cfg.get("per_parent_extension_top_k", 25))
-    max_parent_rules_next_round = int(cfg.get("max_parent_rules_next_round", 200))
-    next_round_parent_category_budgets = {
-        "accepted_only": int(cfg.get("max_parent_next_round_accepted_only_rules", 120)),
-        "accepted_candidate": int(cfg.get("max_parent_next_round_mixed_candidate_rules", 60)),
-        "candidate_only": int(cfg.get("max_parent_next_round_candidate_only_rules", 20)),
-        "candidate_candidate": int(cfg.get("max_parent_next_round_candidate_candidate_rules", 0)),
-    }
-    max_round_rules = int(cfg.get("max_round_rules", 50000))
-    category_budgets = {
-        "accepted_only": int(cfg.get("max_round_accepted_only_rules", 1500)),
-        "accepted_candidate": int(cfg.get("max_round_mixed_candidate_rules", 600)),
-        "candidate_only": int(cfg.get("max_round_candidate_only_rules", 150)),
-        "candidate_candidate": int(cfg.get("max_round_candidate_candidate_rules", 0)),
-    }
+    post_extension_pruning_cfg = _post_extension_pruning_cfg(cfg)
+    normalized_max_round_rules = _normalized_round_rule_budgets(cfg)
+    normalized_max_round_rules_by_category = _normalized_round_category_budgets(cfg)
+    normalized_parents_for_next_round = _normalized_next_round_parent_cfg(cfg)
+    max_parent_rules_next_round = int(normalized_parents_for_next_round["max_total"])
+    next_round_parent_category_budgets = _runtime_category_budgets(normalized_parents_for_next_round)
     all_input_initial_rules = list(merged_initial_rules.get("rules", []))
     initial_rules = [rule for rule in all_input_initial_rules if _is_unary_initial_rule(rule)]
     num_skipped_non_unary_initial_rules = len(all_input_initial_rules) - len(initial_rules)
     input_initial_rule_pool_key = _initial_rule_pool_cache_key(initial_rules)
+    normalized_cfg_for_cache = {
+        "input_initial_rule_pool_key": input_initial_rule_pool_key,
+        "num_rounds": num_rounds,
+        "evaluation_strategy": evaluation_strategy,
+        "prune_strategies": prune_strategies,
+        "min_positive_support_to_extend": min_positive_support_to_extend,
+        "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
+        "skip_perfect_precision_parents_without_new_positive_recovery": (
+            skip_perfect_precision_parents_without_new_positive_recovery
+        ),
+        "allow_segment_context_extension_atoms": allow_segment_context_extension_atoms,
+        "allow_provenance_extension_atoms": allow_provenance_extension_atoms,
+        "allow_candidate_candidate_extension": allow_candidate_candidate_extension,
+        "max_segment_context_atoms_per_rule": max_segment_context_atoms_per_rule,
+        "per_parent_extension_top_k": per_parent_extension_top_k,
+        "post_extension_pruning": post_extension_pruning_cfg,
+        "max_round_rules": normalized_max_round_rules,
+        "max_round_rules_by_category": normalized_max_round_rules_by_category,
+        "parents_for_next_round": normalized_parents_for_next_round,
+    }
 
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
@@ -1182,34 +1369,7 @@ def process_rules(
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _EXTENDED_RULES_VERSION and _cfg_key_subset(
             cached.get("config", {})
-        ) == _cfg_key_subset(
-            {
-                "input_initial_rule_pool_key": input_initial_rule_pool_key,
-                "num_rounds": num_rounds,
-                "evaluation_strategy": evaluation_strategy,
-                "prune_strategies": prune_strategies,
-                "min_positive_support_to_extend": min_positive_support_to_extend,
-                "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
-                "skip_perfect_precision_parents_without_new_positive_recovery": (
-                    skip_perfect_precision_parents_without_new_positive_recovery
-                ),
-                "allow_segment_context_extension_atoms": allow_segment_context_extension_atoms,
-                "allow_provenance_extension_atoms": allow_provenance_extension_atoms,
-                "allow_candidate_candidate_extension": allow_candidate_candidate_extension,
-                "max_segment_context_atoms_per_rule": max_segment_context_atoms_per_rule,
-                "per_parent_extension_top_k": per_parent_extension_top_k,
-                "max_parent_rules_next_round": max_parent_rules_next_round,
-                "max_parent_next_round_accepted_only_rules": next_round_parent_category_budgets["accepted_only"],
-                "max_parent_next_round_mixed_candidate_rules": next_round_parent_category_budgets["accepted_candidate"],
-                "max_parent_next_round_candidate_only_rules": next_round_parent_category_budgets["candidate_only"],
-                "max_parent_next_round_candidate_candidate_rules": next_round_parent_category_budgets["candidate_candidate"],
-                "max_round_rules": max_round_rules,
-                "max_round_accepted_only_rules": category_budgets["accepted_only"],
-                "max_round_mixed_candidate_rules": category_budgets["accepted_candidate"],
-                "max_round_candidate_only_rules": category_budgets["candidate_only"],
-                "max_round_candidate_candidate_rules": category_budgets["candidate_candidate"],
-            }
-        ):
+        ) == _cfg_key_subset(normalized_cfg_for_cache):
             print(f"  [cache] loading {manifest_path.name}")
             return cached
 
@@ -1306,6 +1466,8 @@ def process_rules(
     total_pruned_candidate_rule_counts = _empty_category_counts()
 
     for round_index in range(1, num_rounds + 1):
+        max_round_rules = _round_rule_budget(cfg, round_index)
+        category_budgets = _round_category_budgets(cfg, round_index)
         next_rule_map: Dict[Tuple[str, str, Tuple[str, ...]], Dict[str, Any]] = {}
         input_parent_count = len(current_rules)
         skipped_parent_counts = {
@@ -1328,6 +1490,7 @@ def process_rules(
         num_pruned_next_round_parent_budget = 0
         num_deduplicated_body = 0
         num_deduplicated_firing_signature = 0
+        num_positive_coverage_pruned = 0
         num_parent_rules_skipped = 0
         round_rules_using_candidate_atoms = 0
         round_candidate_only_rules = 0
@@ -1528,22 +1691,17 @@ def process_rules(
             else:
                 num_deduplicated_body += 1
 
-        signature_dedup_map: Dict[Tuple[str, Tuple[Tuple[str, str], ...]], Dict[str, Any]] = {}
-        for candidate_rule in body_dedup_map.values():
-            key = (
-                str(candidate_rule.get("head_predicate", "")),
-                tuple(candidate_rule.get("firing_signature", ())),
-            )
-            existing = signature_dedup_map.get(key)
-            if existing is None or _extension_rank_key(candidate_rule) < _extension_rank_key(existing):
-                if existing is not None:
-                    num_deduplicated_firing_signature += 1
-                signature_dedup_map[key] = candidate_rule
-            else:
-                num_deduplicated_firing_signature += 1
+        post_pruned_rules, post_pruning_stats = _apply_post_extension_pruning(
+            list(body_dedup_map.values()),
+            cfg,
+        )
+        num_deduplicated_firing_signature = int(
+            post_pruning_stats.get("firing_signature_deduplicated", 0)
+        )
+        num_positive_coverage_pruned = int(post_pruning_stats.get("positive_coverage_pruned", 0))
 
         kept_budget_counts = _empty_category_counts()
-        for candidate_rule in sorted(signature_dedup_map.values(), key=_extension_rank_key):
+        for candidate_rule in sorted(post_pruned_rules, key=_extension_rank_key):
             category = _extension_rule_category(candidate_rule)
             if not _budget_allows_rule(
                 category=category,
@@ -1595,24 +1753,15 @@ def process_rules(
             "version": _EXTENDED_RULES_VERSION,
             "round_index": round_index,
             "config": {
-                "input_initial_rule_pool_key": input_initial_rule_pool_key,
-                "num_rounds": num_rounds,
-                "evaluation_strategy": evaluation_strategy,
-                "prune_strategies": prune_strategies,
-                "min_positive_support_to_extend": min_positive_support_to_extend,
-                "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
-                "skip_perfect_precision_parents_without_new_positive_recovery": (
-                    skip_perfect_precision_parents_without_new_positive_recovery
-                ),
-                "allow_segment_context_extension_atoms": allow_segment_context_extension_atoms,
-                "allow_provenance_extension_atoms": allow_provenance_extension_atoms,
-                "allow_candidate_candidate_extension": allow_candidate_candidate_extension,
-                "max_segment_context_atoms_per_rule": max_segment_context_atoms_per_rule,
-                "per_parent_extension_top_k": per_parent_extension_top_k,
-                "max_parent_rules_next_round": max_parent_rules_next_round,
-                "next_round_parent_category_budgets": next_round_parent_category_budgets,
-                "max_round_rules": max_round_rules,
-                "category_budgets": category_budgets,
+                **normalized_cfg_for_cache,
+                "current_round_index": round_index,
+                "current_round_max_rules": max_round_rules,
+                "current_round_category_budgets": {
+                    "accepted_only": category_budgets["accepted_only"],
+                    "mixed_accepted_candidate": category_budgets["accepted_candidate"],
+                    "candidate_only": category_budgets["candidate_only"],
+                    "candidate_candidate": category_budgets["candidate_candidate"],
+                },
             },
             "input_parent_count": input_parent_count,
             "input_parent_rule_counts": _count_rule_categories(filtered_parents),
@@ -1625,6 +1774,7 @@ def process_rules(
             "num_parent_top_k_pruned": num_pruned_parent_top_k,
             "num_body_deduplicated": num_deduplicated_body,
             "num_firing_signature_deduplicated": num_deduplicated_firing_signature,
+            "num_positive_coverage_pruned": num_positive_coverage_pruned,
             "num_round_budget_pruned": num_pruned_round_budget,
             "num_next_round_parent_budget_pruned": num_pruned_next_round_parent_budget,
             "num_rules": len(round_rules),
@@ -1649,6 +1799,7 @@ def process_rules(
                 "pruned_round_budget": num_pruned_round_budget,
                 "deduplicated_body": num_deduplicated_body,
                 "deduplicated_firing_signature": num_deduplicated_firing_signature,
+                "pruned_same_positive_coverage_cluster": num_positive_coverage_pruned,
                 "kept_num_rules": len(round_rules),
             },
             "candidate_rule_provenance": {
@@ -1695,6 +1846,7 @@ def process_rules(
                 "pruned_round_budget": num_pruned_round_budget,
                 "deduplicated_body": num_deduplicated_body,
                 "deduplicated_firing_signature": num_deduplicated_firing_signature,
+                "pruned_same_positive_coverage_cluster": num_positive_coverage_pruned,
                 "num_rules_using_candidate_atoms": round_rules_using_candidate_atoms,
                 "num_candidate_only_rules": round_candidate_only_rules,
                 "num_mixed_source_rules": round_mixed_source_rules,
@@ -1733,6 +1885,12 @@ def process_rules(
             f"candidate_candidate_disabled={num_pruned_candidate_candidate_disabled} | "
             f"same_confidence_smaller_evidence={num_pruned_same_confidence_smaller_evidence} | "
             f"provenance_dominance={num_pruned_provenance_dominance}"
+        )
+        print(
+            "    post_extension_pruning: "
+            f"body_dedup={num_deduplicated_body} | "
+            f"firing_signature={num_deduplicated_firing_signature} | "
+            f"positive_coverage={num_positive_coverage_pruned}"
         )
         print(
             "    category_counts: "
@@ -1779,32 +1937,7 @@ def process_rules(
 
     manifest = {
         "version": _EXTENDED_RULES_VERSION,
-        "config": {
-            "input_initial_rule_pool_key": input_initial_rule_pool_key,
-            "num_rounds": num_rounds,
-            "evaluation_strategy": evaluation_strategy,
-            "prune_strategies": prune_strategies,
-            "min_positive_support_to_extend": min_positive_support_to_extend,
-            "same_confidence_smaller_evidence_enabled": same_confidence_smaller_evidence_enabled,
-            "skip_perfect_precision_parents_without_new_positive_recovery": (
-                skip_perfect_precision_parents_without_new_positive_recovery
-            ),
-            "allow_segment_context_extension_atoms": allow_segment_context_extension_atoms,
-            "allow_provenance_extension_atoms": allow_provenance_extension_atoms,
-            "allow_candidate_candidate_extension": allow_candidate_candidate_extension,
-            "max_segment_context_atoms_per_rule": max_segment_context_atoms_per_rule,
-            "per_parent_extension_top_k": per_parent_extension_top_k,
-            "max_parent_rules_next_round": max_parent_rules_next_round,
-            "max_parent_next_round_accepted_only_rules": next_round_parent_category_budgets["accepted_only"],
-            "max_parent_next_round_mixed_candidate_rules": next_round_parent_category_budgets["accepted_candidate"],
-            "max_parent_next_round_candidate_only_rules": next_round_parent_category_budgets["candidate_only"],
-            "max_parent_next_round_candidate_candidate_rules": next_round_parent_category_budgets["candidate_candidate"],
-            "max_round_rules": max_round_rules,
-            "max_round_accepted_only_rules": category_budgets["accepted_only"],
-            "max_round_mixed_candidate_rules": category_budgets["accepted_candidate"],
-            "max_round_candidate_only_rules": category_budgets["candidate_only"],
-            "max_round_candidate_candidate_rules": category_budgets["candidate_candidate"],
-        },
+        "config": normalized_cfg_for_cache,
         "input_num_examples": int(merged_initial_rules.get("num_examples", 0)),
         "input_num_positive_examples": total_positive_examples,
         "input_num_negative_examples": int(merged_initial_rules.get("num_negative_examples", 0)),
