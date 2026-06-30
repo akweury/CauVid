@@ -855,6 +855,19 @@ def _load_cached_video_results(
     return results
 
 
+def _cached_manifest_video_ids(
+    *,
+    output_root: Path,
+    manifest_name: str,
+) -> List[str]:
+    manifest = _read_cached_json(output_root / manifest_name, label=f"{manifest_name} manifest")
+    return [
+        str(entry.get("video_id", "")).strip()
+        for entry in list(manifest.get("videos", []))
+        if str(entry.get("video_id", "")).strip()
+    ]
+
+
 def _load_cached_detection_results(selected_video_ids: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
     output_root = detect_driving_mini.get_output_root()
     manifest = _read_cached_json(output_root / "detection_manifest.json", label="step 1 detection manifest")
@@ -922,11 +935,18 @@ def _load_cached_upstream_context(
     if _stage_index(start_target) <= _stage_index("16"):
         return
     if ctx.has_explicit_video_selection:
-        raise RuntimeError(
-            "Warm-starting after step 16 does not support `--video-id` or `--video-count`, "
-            "because the cached Step 16 pool is tied to the original upstream selection. "
-            "Restart from step 0-16 to rebuild for a filtered subset."
+        cached_video_ids = _cached_manifest_video_ids(
+            output_root=temporal_rule_examples_driving_mini.get_output_root(),
+            manifest_name="temporal_rule_examples_manifest.json",
         )
+        requested_video_ids = [str(video_id).strip() for video_id in ctx.effective_video_ids if str(video_id).strip()]
+        if requested_video_ids != cached_video_ids:
+            raise RuntimeError(
+                "Warm-starting after step 16 only supports an explicit video selection when it exactly "
+                "matches the cached upstream video set. "
+                f"requested_videos={len(requested_video_ids)} cached_videos={len(cached_video_ids)}. "
+                "Restart from step 0-16 to rebuild for a different subset."
+            )
 
     ctx.extended_rule_results = _read_cached_json(
         extended_rules_driving_mini.get_output_root() / "extended_rules_manifest.json",
