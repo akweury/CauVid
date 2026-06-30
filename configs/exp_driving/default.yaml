@@ -114,36 +114,37 @@ data_split:
   eval_video_count: 2
 
 pipeline_recompute:
-  traffic_control_attributes: true
-  logic_atoms: true
-  target_head_atoms: true
-  temporal_rule_examples: true
+  traffic_control_attributes: false
+  logic_atoms: false
+  target_head_atoms: false
+  temporal_rule_examples: false
   candidate_rules: false
   extended_rules: false
-  final_rules: false
-  diverse_final_rules: false
-  semantic_constrained_diverse_final_rules: false
-  coverage_family_aware_final_rules: false
-  rule_pool_upper_bound_diagnostic: false
-  oracle_rule_selection_gap_diagnostic: false
-  rule_evaluation: false
-  candidate_contribution_summary: false
-  reasoning_to_od_pseudo_labels: false
-  od_confidence_calibration: false
-  rule_aggregation_baseline: false
-  baseline_safe_calibration_gate: false
-  object_to_atom_coverage_diagnostic: false
-  traffic_control_rule_utility_diagnostic: false
+  background_rule_relevance_prior: false
+  final_rules: true
+  diverse_final_rules: true
+  semantic_constrained_diverse_final_rules: true
+  coverage_family_aware_final_rules: true
+  rule_pool_upper_bound_diagnostic: true
+  oracle_rule_selection_gap_diagnostic: true
+  rule_evaluation: true
+  candidate_contribution_summary: true
+  reasoning_to_od_pseudo_labels: true
+  od_confidence_calibration: true
+  rule_aggregation_baseline: true
+  baseline_safe_calibration_gate: true
+  object_to_atom_coverage_diagnostic: true
+  traffic_control_rule_utility_diagnostic: true
   traffic_control_temporal_alignment_diagnostic: true
   traffic_light_detection_quality_audit: true
-  neural_symbolic_baseline: false
-  error_and_explainability_analysis: false
-  vehicle_rule_diagnostic: false
-  fn_categorization_diagnostic: false
-  rule_selection_visualization: false
-  integrated_method_visualization: false
-  background_causal_prior: false
-  reasoning_feedback_signal: false
+  neural_symbolic_baseline: true
+  error_and_explainability_analysis: true
+  vehicle_rule_diagnostic: true
+  fn_categorization_diagnostic: true
+  rule_selection_visualization: true
+  integrated_method_visualization: true
+  background_causal_prior: true
+  reasoning_feedback_signal: true
 
 temporal_rule_examples:
   deduplicate_body_atoms: true
@@ -219,11 +220,12 @@ extended_rules:
     candidate_candidate: 0
 
 final_rules:
-  top_k: 50
+  selector_mode: coverage_family_aware
+  top_k: 20
   category_budgets:
-    accepted_only: 25
-    mixed_accepted_candidate: 20
-    candidate_only: 5
+    accepted_only: 10
+    mixed_accepted_candidate: 8
+    candidate_only: 2
     candidate_candidate: 0
 
 diverse_final_rules:
@@ -288,7 +290,8 @@ coverage_family_aware_final_rules:
   family_diversity_bonus: 0.75
   negative_support_penalty: 0.1
 
-rule_pool_upper_bound_diagnostic:
+rule_pool_and_selector_diagnostic:
+  enabled: false
   top_single_rules: 100
   precision_thresholds: [0.5, 0.7, 0.9]
   f1_thresholds: [0.1, 0.2, 0.3, 0.4]
@@ -305,22 +308,25 @@ rule_pool_upper_bound_diagnostic:
   vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
   near_states: [near]
   center_states: [centered]
-
-oracle_rule_selection_gap_diagnostic:
   oracle_target_mode: peak_f1
   max_missing_rules_per_selector: 20
   max_extra_rules_per_selector: 20
 
 rule_evaluation:
   prediction_mode: any_rule_positive
-  rule_set_mode: all
-  primary_rule_set: original
+  rule_set_mode: selected
+  primary_rule_set: selected
 
-candidate_contribution_summary:
-  top_useful_candidate_rules: 10
-  top_noisy_candidate_rules: 10
-  top_broad_candidate_rules: 10
-  top_matched_priors: 10
+baseline_comparison:
+  enabled: false
+  run_neural_symbolic: true
+  run_rule_aggregation: true
+
+reasoning_supervised_od_calibration:
+  enabled: false
+  min_delta_f1: 0.0
+  min_fn_gain: 1
+  allow_nonpositive_delta_with_fn_recovery: true
 
 reasoning_to_od_pseudo_labels:
   selector_mode: primary_plus_best
@@ -346,6 +352,7 @@ od_calibration_loop:
   stop_on_final_f1_plateau: true
 
 rule_aggregation_baseline:
+  enabled: false
   validation_fraction: 0.25
   class_weight: balanced
   c_values: [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
@@ -359,6 +366,7 @@ rule_aggregation_baseline:
   center_states: [centered]
 
 object_to_atom_coverage_diagnostic:
+  enabled: false
   class_aliases:
     traffic light: traffic_light
     traffic_light: traffic_light
@@ -367,6 +375,7 @@ object_to_atom_coverage_diagnostic:
   max_rule_examples_per_class: 5
 
 traffic_control_rule_utility_diagnostic:
+  enabled: false
   highlight_predicates:
     - traffic_light_state
     - traffic_light_relevant
@@ -379,6 +388,7 @@ traffic_control_rule_utility_diagnostic:
   center_states: [centered]
 
 traffic_control_temporal_alignment_diagnostic:
+  enabled: false
   highlight_predicates:
     - traffic_light_state
     - traffic_light_relevant
@@ -389,6 +399,7 @@ traffic_control_temporal_alignment_diagnostic:
   positive_forward_states: [forward_slowdown, stopping]
 
 traffic_light_detection_quality_audit:
+  enabled: false
   max_samples_total: 0
   max_samples_per_state: 50
   max_samples_per_video: 12
@@ -401,9 +412,11 @@ traffic_light_detection_quality_audit:
   frame_path_roots: []
 
 background_causal_prior:
+  enabled: false
   target_predicate: brake_next
 
 reasoning_feedback_signal:
+  enabled: false
   target_predicate: brake_next
   primary_rule_set: original
   max_feedback_requests: 200
@@ -414,6 +427,7 @@ reasoning_feedback_signal:
   max_fired_rules_per_request: 6
 
 neural_symbolic_baseline:
+  enabled: false
   min_feature_count: 1
   probability_threshold: 0.5
   validation_fraction: 0.25
@@ -442,11 +456,13 @@ neural_symbolic_baseline:
     early_stopping_patience: 12
 
 rule_selection_visualization:
+  enabled: false
   top_rule_families: 8
   dpi: 160
   figure_format: png
 
 integrated_method_visualization:
+  enabled: false
   dpi: 170
   figure_format: png
 
@@ -465,11 +481,13 @@ fn_categorization_diagnostic:
     - unexplained_noise_or_symbol_gap
 
 error_and_explainability_analysis:
+  enabled: false
   vehicle_classes: [car, truck, bus, motorcycle, bicycle]
   dense_context_min_objects: 2
   overlap_rule_threshold: 10
 
 vehicle_rule_diagnostic:
+  enabled: false
   vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
   near_states: [near]
   center_states: [centered]

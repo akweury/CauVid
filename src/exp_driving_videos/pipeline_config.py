@@ -391,16 +391,46 @@ def get_extended_rules_cfg() -> Dict[str, Any]:
 def get_final_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
-            "top_k": 50,
+            "selector_mode": "coverage_family_aware",
+            "top_k": 20,
             "category_budgets": {
-                "accepted_only": 25,
-                "mixed_accepted_candidate": 20,
-                "candidate_only": 5,
+                "accepted_only": 10,
+                "mixed_accepted_candidate": 8,
+                "candidate_only": 2,
                 "candidate_candidate": 0,
             },
         },
         path=("final_rules",),
         warn_label="final rules",
+    )
+
+
+def get_rule_pool_and_selector_diagnostic_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": False,
+            "top_single_rules": 100,
+            "precision_thresholds": [0.5, 0.7, 0.9],
+            "f1_thresholds": [0.1, 0.2, 0.3, 0.4],
+            "min_recall_thresholds": [0.02, 0.05, 0.1, 0.15, 0.2, 0.3],
+            "oracle_k_values": [1, 5, 10, 20, 50, 100],
+            "selection_gap_threshold": 0.05,
+            "selection_pool_min_f1": 0.35,
+            "low_pool_f1_threshold": 0.35,
+            "low_single_rule_f1_threshold": 0.2,
+            "high_precision_threshold": 0.8,
+            "low_recall_threshold": 0.1,
+            "high_recall_threshold": 0.2,
+            "low_precision_threshold": 0.5,
+            "oracle_target_mode": "peak_f1",
+            "max_missing_rules_per_selector": 20,
+            "max_extra_rules_per_selector": 20,
+            "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
+            "near_states": ["near"],
+            "center_states": ["centered"],
+        },
+        path=("rule_pool_and_selector_diagnostic",),
+        warn_label="rule-pool and selector diagnostic",
     )
 
 
@@ -548,11 +578,36 @@ def get_rule_evaluation_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
             "prediction_mode": "any_rule_positive",
-            "rule_set_mode": "all",
-            "primary_rule_set": "original",
+            "rule_set_mode": "selected",
+            "primary_rule_set": "selected",
         },
         path=("rule_evaluation",),
         warn_label="rule evaluation",
+    )
+
+
+def get_baseline_comparison_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": False,
+            "run_neural_symbolic": True,
+            "run_rule_aggregation": True,
+        },
+        path=("baseline_comparison",),
+        warn_label="baseline comparison",
+    )
+
+
+def get_reasoning_supervised_od_calibration_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": False,
+            "min_delta_f1": 0.0,
+            "min_fn_gain": 1,
+            "allow_nonpositive_delta_with_fn_recovery": True,
+        },
+        path=("reasoning_supervised_od_calibration",),
+        warn_label="reasoning-supervised OD calibration",
     )
 
 
@@ -623,6 +678,7 @@ def get_od_calibration_loop_cfg() -> Dict[str, Any]:
 def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "validation_fraction": 0.25,
             "class_weight": "balanced",
             "c_values": [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0],
@@ -642,6 +698,7 @@ def get_rule_aggregation_baseline_cfg() -> Dict[str, Any]:
 
 def get_neural_symbolic_baseline_cfg() -> Dict[str, Any]:
     defaults = {
+        "enabled": False,
         "min_feature_count": 1,
         "probability_threshold": 0.5,
         "validation_fraction": 0.25,
@@ -688,6 +745,7 @@ def get_neural_symbolic_baseline_cfg() -> Dict[str, Any]:
 def get_rule_selection_visualization_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "top_rule_families": 8,
             "dpi": 160,
             "figure_format": "png",
@@ -700,6 +758,7 @@ def get_rule_selection_visualization_cfg() -> Dict[str, Any]:
 def get_integrated_method_visualization_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "dpi": 170,
             "figure_format": "png",
         },
@@ -735,6 +794,7 @@ def get_fn_categorization_diagnostic_cfg() -> Dict[str, Any]:
 def get_object_to_atom_coverage_diagnostic_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "class_aliases": {
                 "traffic light": "traffic_light",
                 "traffic_light": "traffic_light",
@@ -751,6 +811,7 @@ def get_object_to_atom_coverage_diagnostic_cfg() -> Dict[str, Any]:
 def get_traffic_control_rule_utility_diagnostic_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "highlight_predicates": [
                 "traffic_light_state",
                 "traffic_light_relevant",
@@ -771,6 +832,7 @@ def get_traffic_control_rule_utility_diagnostic_cfg() -> Dict[str, Any]:
 def get_traffic_control_temporal_alignment_diagnostic_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "highlight_predicates": [
                 "traffic_light_state",
                 "traffic_light_relevant",
@@ -789,6 +851,7 @@ def get_traffic_control_temporal_alignment_diagnostic_cfg() -> Dict[str, Any]:
 def get_traffic_light_detection_quality_audit_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "max_samples_total": 0,
             "max_samples_per_state": 50,
             "max_samples_per_video": 12,
@@ -808,6 +871,7 @@ def get_traffic_light_detection_quality_audit_cfg() -> Dict[str, Any]:
 def get_background_causal_prior_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "target_predicate": "brake_next",
         },
         path=("background_causal_prior",),
@@ -818,6 +882,7 @@ def get_background_causal_prior_cfg() -> Dict[str, Any]:
 def get_background_rule_relevance_prior_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "target_predicate": "brake_next",
         },
         path=("background_rule_relevance_prior",),
@@ -828,6 +893,7 @@ def get_background_rule_relevance_prior_cfg() -> Dict[str, Any]:
 def get_reasoning_feedback_signal_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "target_predicate": "brake_next",
             "primary_rule_set": "original",
             "max_feedback_requests": 200,
@@ -845,16 +911,17 @@ def get_reasoning_feedback_signal_cfg() -> Dict[str, Any]:
 def get_pipeline_recompute_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
-            "logic_atoms": True,
-            "target_head_atoms": True,
-            "temporal_rule_examples": True,
-            "candidate_rules": True,
-            "extended_rules": True,
+            "logic_atoms": False,
+            "target_head_atoms": False,
+            "temporal_rule_examples": False,
+            "candidate_rules": False,
+            "extended_rules": False,
+            "traffic_control_attributes": False,
+            "background_rule_relevance_prior": False,
             "final_rules": True,
             "diverse_final_rules": True,
             "semantic_constrained_diverse_final_rules": True,
             "coverage_family_aware_final_rules": True,
-            "traffic_control_attributes": True,
             "rule_pool_upper_bound_diagnostic": True,
             "oracle_rule_selection_gap_diagnostic": True,
             "rule_evaluation": True,
@@ -873,7 +940,6 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "fn_categorization_diagnostic": True,
             "rule_selection_visualization": True,
             "integrated_method_visualization": True,
-            "background_rule_relevance_prior": True,
             "background_causal_prior": True,
             "reasoning_feedback_signal": True,
         },
@@ -885,6 +951,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
 def get_error_and_explainability_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle"],
             "dense_context_min_objects": 2,
             "overlap_rule_threshold": 10,
@@ -897,6 +964,7 @@ def get_error_and_explainability_cfg() -> Dict[str, Any]:
 def get_vehicle_rule_diagnostic_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
+            "enabled": False,
             "vehicle_classes": ["car", "truck", "bus", "motorcycle", "bicycle", "vehicle"],
             "near_states": ["near"],
             "center_states": ["centered"],
