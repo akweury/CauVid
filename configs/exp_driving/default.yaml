@@ -3,6 +3,7 @@ video_selection:
 
 detection:
   render_video: false
+  check_cache: false
 
 tracking:
   render_video: false

@@ -90,6 +90,10 @@ def get_detection_render_video_enabled(default: bool = True) -> bool:
     return _get_nested_bool(("detection", "render_video"), default)
 
 
+def get_detection_check_cache_enabled(default: bool = False) -> bool:
+    return _get_nested_bool(("detection", "check_cache"), default)
+
+
 def get_tracking_render_video_enabled(default: bool = True) -> bool:
     return _get_nested_bool(("tracking", "render_video"), default)
 

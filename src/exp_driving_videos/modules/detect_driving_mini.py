@@ -209,6 +209,7 @@ def _load_manifest_fast_path(
     borderline_confidence_margin: float,
     policy_marker: Dict[str, Any],
     output_root: Path,
+    check_cache: bool,
 ) -> Optional[List[Dict[str, Any]]]:
     if not manifest_path.exists():
         return None
@@ -218,25 +219,28 @@ def _load_manifest_fast_path(
     except Exception:
         return None
 
-    if int(manifest.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
-        return None
-    if str(manifest.get("model", "")) != str(model_name):
-        return None
-    manifest_classes = list(manifest.get("classes", []))
-    if manifest_classes and manifest_classes != list(effective_classes):
-        return None
-    if not _thresholds_match(
-        dict(manifest.get("thresholds", {})),
-        {
-            "accepted_confidence_threshold": confidence_threshold,
-            "candidate_confidence_threshold": candidate_confidence_threshold,
-            "accepted_nms_iou_threshold": nms_iou_threshold,
-            "candidate_nms_iou_threshold": candidate_nms_iou_threshold,
-            "borderline_confidence_margin": borderline_confidence_margin,
-        },
-    ):
-        return None
-    if not _policy_marker_matches(dict(manifest.get("od_calibration", {})), policy_marker):
+    if check_cache:
+        if int(manifest.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+            return None
+        if str(manifest.get("model", "")) != str(model_name):
+            return None
+        manifest_classes = list(manifest.get("classes", []))
+        if manifest_classes and manifest_classes != list(effective_classes):
+            return None
+        if not _thresholds_match(
+            dict(manifest.get("thresholds", {})),
+            {
+                "accepted_confidence_threshold": confidence_threshold,
+                "candidate_confidence_threshold": candidate_confidence_threshold,
+                "accepted_nms_iou_threshold": nms_iou_threshold,
+                "candidate_nms_iou_threshold": candidate_nms_iou_threshold,
+                "borderline_confidence_margin": borderline_confidence_margin,
+            },
+        ):
+            return None
+        if not _policy_marker_matches(dict(manifest.get("od_calibration", {})), policy_marker):
+            return None
+    elif not list(manifest.get("videos", [])):
         return None
 
     manifest_videos = {
@@ -247,19 +251,20 @@ def _load_manifest_fast_path(
     if any(video_id not in manifest_videos for video_id in target_videos):
         return None
 
-    aggregate_paths = dict(manifest.get("output_paths", {}))
-    required_aggregate_paths = (
-        output_root / "detection_predictions.csv",
-        output_root / "detection_class_summary.csv",
-        output_root / "detection_video_summary.csv",
-    )
-    for aggregate_path in required_aggregate_paths:
-        if not aggregate_path.exists():
+    if check_cache:
+        aggregate_paths = dict(manifest.get("output_paths", {}))
+        required_aggregate_paths = (
+            output_root / "detection_predictions.csv",
+            output_root / "detection_class_summary.csv",
+            output_root / "detection_video_summary.csv",
+        )
+        for aggregate_path in required_aggregate_paths:
+            if not aggregate_path.exists():
+                return None
+        if str(aggregate_paths.get("detection_predictions_csv", "")) and Path(
+            str(aggregate_paths.get("detection_predictions_csv", ""))
+        ) != required_aggregate_paths[0]:
             return None
-    if str(aggregate_paths.get("detection_predictions_csv", "")) and Path(
-        str(aggregate_paths.get("detection_predictions_csv", ""))
-    ) != required_aggregate_paths[0]:
-        return None
 
     loaded_results: List[Dict[str, Any]] = []
     for video_id in target_videos:
@@ -273,7 +278,7 @@ def _load_manifest_fast_path(
                 cached = json.load(fh)
         except Exception:
             return None
-        if int(cached.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+        if check_cache and int(cached.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
             return None
         cached["from_cache"] = True
         loaded_results.append(cached)
@@ -673,6 +678,7 @@ def process_video(
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
     render_video: bool = True,
+    check_cache: bool = False,
 ) -> Dict[str, Any]:
     out_dir = (output_root or get_output_root()) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -685,6 +691,17 @@ def process_video(
     if not force_recompute and detections_file.exists():
         with detections_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
+        if not check_cache:
+            cached.setdefault("output_paths", {})
+            cached["output_paths"]["detections_json"] = str(detections_file)
+            cached["output_paths"]["detection_predictions_csv"] = str(predictions_csv_file)
+            cached["output_paths"]["detection_class_summary_csv"] = str(class_summary_csv_file)
+            cached["output_paths"]["background_rule_relevance_prior_json"] = str(
+                background_rule_relevance_prior_results.get("output_paths", {}).get("prior_json", "")
+            ) if isinstance(background_rule_relevance_prior_results, dict) else ""
+            cached["od_calibration"] = dict(policy_marker)
+            cached["from_cache"] = True
+            return cached
         cached_frames = list(cached.get("frames", []))
         cache_is_current = int(cached.get("schema_version", 1)) >= _DETECTION_SCHEMA_VERSION and all(
             "accepted_detections" in frame and "candidate_detections" in frame
@@ -898,6 +915,7 @@ def run(
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
     render_video: bool = True,
+    check_cache: bool = False,
 ) -> List[Dict[str, Any]]:
     effective_frames_root = frames_root or get_frames_root()
     effective_output_root = output_root or get_output_root()
@@ -952,10 +970,12 @@ def run(
             borderline_confidence_margin=borderline_confidence_margin,
             policy_marker=policy_marker,
             output_root=effective_output_root,
+            check_cache=check_cache,
         )
         if fast_cached_results is not None:
+            mode_label = "validated cache" if check_cache else "unchecked manifest cache"
             print(
-                "Cache fast path: "
+                f"Cache fast path ({mode_label}): "
                 f"reusing manifest-backed detection cache for {len(fast_cached_results)} videos"
             )
             print(f"Step 1 complete: {_format_step_progress(len(fast_cached_results), len(target_videos))}")
@@ -1011,6 +1031,7 @@ def run(
                 output_root=effective_output_root,
                 force_recompute=force_recompute,
                 render_video=effective_render_video,
+                check_cache=check_cache,
             )
             if (
                 bool(result.get("_requires_detection", False))
@@ -1024,6 +1045,7 @@ def run(
                     output_root=effective_output_root,
                     force_recompute=force_recompute,
                     render_video=effective_render_video,
+                    check_cache=check_cache,
                 )
             video_results.append(result)
             cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
@@ -1152,6 +1174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=None, dest="output_root",
                         help="Override default output root.")
     parser.add_argument("--force-recompute", action="store_true", dest="force_recompute")
+    parser.add_argument("--check-cache", action=argparse.BooleanOptionalAction, default=False, dest="check_cache",
+                        help="Validate cached detection files before reuse. Disabled by default.")
     return parser.parse_args()
 
 
@@ -1173,6 +1197,7 @@ def main() -> None:
         frames_root=args.frames_root,
         output_root=args.output_root,
         force_recompute=args.force_recompute,
+        check_cache=args.check_cache,
     )
 
 
