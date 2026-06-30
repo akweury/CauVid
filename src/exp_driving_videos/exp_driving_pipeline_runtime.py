@@ -2970,7 +2970,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help=(
             "Restrict the pipeline to one or more video IDs. "
-            "If omitted, the pipeline uses the default subset sized for 100 train and 2 eval videos."
+            "If omitted, the pipeline uses the configured default video subset from the exp_driving config."
         ),
     )
     parser.add_argument(

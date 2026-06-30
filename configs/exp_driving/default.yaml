@@ -1,5 +1,5 @@
 video_selection:
-  default_video_limit: 102
+  default_video_limit: 961
 
 detection:
   render_video: false
@@ -111,8 +111,8 @@ target_head_atoms:
 
 data_split:
   strategy: fixed_counts
-  train_video_count: 100
-  eval_video_count: 2
+  train_video_count: 942
+  eval_video_count: 19
 
 pipeline_recompute:
   traffic_control_attributes: false
