@@ -328,6 +328,20 @@ def _initial_budget_limit(cfg: Dict[str, Any], key: str, default: int) -> int:
     return value if value >= 0 else 10**12
 
 
+def _initial_category_budget_limit(
+    cfg: Dict[str, Any],
+    category_key: str,
+    flat_key: str,
+    default: int,
+) -> int:
+    category_budgets = cfg.get("category_budgets")
+    if isinstance(category_budgets, dict) and category_key in category_budgets:
+        value = int(category_budgets.get(category_key, default))
+    else:
+        value = int(cfg.get(flat_key, default))
+    return value if value >= 0 else 10**12
+
+
 def _cluster_diverse_select(
     rules: Sequence[Dict[str, Any]],
     max_rules: int,
@@ -551,10 +565,18 @@ def prune_initial_rules(
 
     max_total_rules = _initial_budget_limit(cfg, "max_total_initial_rules", 8000)
     category_budgets = {
-        "accepted_only": _initial_budget_limit(cfg, "max_accepted_only_initial_rules", 4000),
-        "accepted_candidate": _initial_budget_limit(cfg, "max_mixed_candidate_initial_rules", 2000),
-        "candidate_only": _initial_budget_limit(cfg, "max_candidate_only_initial_rules", 1500),
-        "candidate_candidate": _initial_budget_limit(cfg, "max_candidate_candidate_initial_rules", 500),
+        "accepted_only": _initial_category_budget_limit(
+            cfg, "accepted_only", "max_accepted_only_initial_rules", 180
+        ),
+        "accepted_candidate": _initial_category_budget_limit(
+            cfg, "accepted_candidate", "max_mixed_candidate_initial_rules", 0
+        ),
+        "candidate_only": _initial_category_budget_limit(
+            cfg, "candidate_only", "max_candidate_only_initial_rules", 80
+        ),
+        "candidate_candidate": _initial_category_budget_limit(
+            cfg, "candidate_candidate", "max_candidate_candidate_initial_rules", 0
+        ),
     }
     diversity_key = str(cfg.get("diversity_key", "positive_coverage"))
 

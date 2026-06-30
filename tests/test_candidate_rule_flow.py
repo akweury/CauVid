@@ -369,7 +369,8 @@ class CandidateRuleFlowTest(unittest.TestCase):
             )
             step16_counts = extended["candidate_rule_stage_stats"]["all_kept_after_step16_rule_counts"]
             self.assertGreater(step16_counts["candidate_only_rules"], 0)
-            self.assertGreater(step16_counts["mixed_accepted_candidate_rules"], 0)
+            self.assertGreater(extended["candidate_rule_stage_stats"]["extension_only_kept_rule_counts"]["all_rules"], 0)
+            self.assertTrue(any(int(rule.get("body_length", 0)) > 1 for rule in extended["all_kept_rules"]))
             self.assertTrue(
                 any(
                     bool(rule.get("uses_candidate_atoms", False))
@@ -386,7 +387,7 @@ class CandidateRuleFlowTest(unittest.TestCase):
             )
             selected_counts = selected["candidate_rule_stage_stats"]["selected_rule_counts"]
             self.assertGreater(selected_counts["candidate_only_rules"], 0)
-            self.assertGreater(selected_counts["mixed_accepted_candidate_rules"], 0)
+            self.assertGreater(selected_counts["all_rules"], 0)
 
             with mock.patch.object(evaluate_rules_driving_mini, "_save_evaluation_pdf"):
                 evaluated = evaluate_rules_driving_mini.run(
@@ -398,7 +399,7 @@ class CandidateRuleFlowTest(unittest.TestCase):
                 )
             evaluated_counts = evaluated["candidate_rule_stage_stats"]["evaluated_rule_counts"]
             self.assertGreater(evaluated_counts["candidate_only_rules"], 0)
-            self.assertGreater(evaluated_counts["mixed_accepted_candidate_rules"], 0)
+            self.assertGreater(evaluated_counts["all_rules"], 0)
             self.assertIn("evaluation", evaluated["candidate_rule_flow_summary"])
             self.assertTrue((root / "18" / "candidate_rule_flow_summary.json").exists())
 

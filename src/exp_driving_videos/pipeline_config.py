@@ -293,25 +293,34 @@ def get_candidate_rules_cfg() -> Dict[str, Any]:
 
 
 def get_initial_rule_pruning_cfg() -> Dict[str, Any]:
-    return _load_cfg_section(
-        {
-            "enabled": True,
-            "max_total_initial_rules": 8000,
-            "max_accepted_only_initial_rules": 4000,
-            "max_mixed_candidate_initial_rules": 2000,
-            "max_candidate_only_initial_rules": 1500,
-            "max_candidate_candidate_initial_rules": 500,
-            "diversity_key": "positive_coverage",
+    defaults = {
+        "enabled": True,
+        "max_total_initial_rules": 300,
+        "category_budgets": {
+            "accepted_only": 180,
+            "accepted_candidate": 0,
+            "candidate_only": 80,
+            "candidate_candidate": 0,
         },
+        "diversity_key": "positive_coverage",
+    }
+    resolved = _load_cfg_section(
+        defaults,
         path=("initial_rule_pruning",),
         warn_label="initial rule pruning",
     )
+    override_budgets = resolved.get("category_budgets")
+    merged_budgets = dict(defaults["category_budgets"])
+    if isinstance(override_budgets, dict):
+        merged_budgets.update(override_budgets)
+    resolved["category_budgets"] = merged_budgets
+    return resolved
 
 
 def get_extended_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
-            "num_rounds": 3,
+            "num_rounds": 2,
             "evaluation_strategy": "binding_aware_intersection",
             "prune_strategies": [
                 "low_evidence",
@@ -321,12 +330,22 @@ def get_extended_rules_cfg() -> Dict[str, Any]:
             ],
             "min_positive_support_to_extend": 2,
             "same_confidence_smaller_evidence_enabled": True,
-            "per_parent_extension_top_k": 40,
+            "skip_perfect_precision_parents_without_new_positive_recovery": False,
+            "allow_segment_context_extension_atoms": True,
+            "allow_provenance_extension_atoms": False,
+            "allow_candidate_candidate_extension": False,
+            "max_segment_context_atoms_per_rule": 1,
+            "per_parent_extension_top_k": 25,
+            "max_parent_rules_next_round": 200,
+            "max_parent_next_round_accepted_only_rules": 120,
+            "max_parent_next_round_mixed_candidate_rules": 60,
+            "max_parent_next_round_candidate_only_rules": 20,
+            "max_parent_next_round_candidate_candidate_rules": 0,
             "max_round_rules": 50000,
-            "max_round_accepted_only_rules": 30000,
-            "max_round_mixed_candidate_rules": 15000,
-            "max_round_candidate_only_rules": 3000,
-            "max_round_candidate_candidate_rules": 500,
+            "max_round_accepted_only_rules": 1500,
+            "max_round_mixed_candidate_rules": 600,
+            "max_round_candidate_only_rules": 150,
+            "max_round_candidate_candidate_rules": 0,
         },
         path=("extended_rules",),
         warn_label="extended rules",
