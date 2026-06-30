@@ -175,6 +175,111 @@ def list_frames(video_id: str, frames_root: Optional[Path] = None) -> List[Path]
     return sorted((root / video_id).glob("frame_*.jpg"))
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _thresholds_match(left: Dict[str, Any], right: Dict[str, Any], *, tol: float = 1e-12) -> bool:
+    keys = (
+        "accepted_confidence_threshold",
+        "candidate_confidence_threshold",
+        "accepted_nms_iou_threshold",
+        "candidate_nms_iou_threshold",
+        "borderline_confidence_margin",
+    )
+    for key in keys:
+        if abs(_safe_float(left.get(key, 0.0)) - _safe_float(right.get(key, 0.0))) > tol:
+            return False
+    return True
+
+
+def _load_manifest_fast_path(
+    *,
+    manifest_path: Path,
+    target_videos: List[str],
+    model_name: str,
+    effective_classes: List[str],
+    confidence_threshold: float,
+    nms_iou_threshold: float,
+    candidate_confidence_threshold: float,
+    candidate_nms_iou_threshold: float,
+    borderline_confidence_margin: float,
+    policy_marker: Dict[str, Any],
+    output_root: Path,
+) -> Optional[List[Dict[str, Any]]]:
+    if not manifest_path.exists():
+        return None
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except Exception:
+        return None
+
+    if int(manifest.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+        return None
+    if str(manifest.get("model", "")) != str(model_name):
+        return None
+    manifest_classes = list(manifest.get("classes", []))
+    if manifest_classes and manifest_classes != list(effective_classes):
+        return None
+    if not _thresholds_match(
+        dict(manifest.get("thresholds", {})),
+        {
+            "accepted_confidence_threshold": confidence_threshold,
+            "candidate_confidence_threshold": candidate_confidence_threshold,
+            "accepted_nms_iou_threshold": nms_iou_threshold,
+            "candidate_nms_iou_threshold": candidate_nms_iou_threshold,
+            "borderline_confidence_margin": borderline_confidence_margin,
+        },
+    ):
+        return None
+    if not _policy_marker_matches(dict(manifest.get("od_calibration", {})), policy_marker):
+        return None
+
+    manifest_videos = {
+        str(entry.get("video_id", "")): dict(entry)
+        for entry in list(manifest.get("videos", []))
+        if str(entry.get("video_id", ""))
+    }
+    if any(video_id not in manifest_videos for video_id in target_videos):
+        return None
+
+    aggregate_paths = dict(manifest.get("output_paths", {}))
+    required_aggregate_paths = (
+        output_root / "detection_predictions.csv",
+        output_root / "detection_class_summary.csv",
+        output_root / "detection_video_summary.csv",
+    )
+    for aggregate_path in required_aggregate_paths:
+        if not aggregate_path.exists():
+            return None
+    if str(aggregate_paths.get("detection_predictions_csv", "")) and Path(
+        str(aggregate_paths.get("detection_predictions_csv", ""))
+    ) != required_aggregate_paths[0]:
+        return None
+
+    loaded_results: List[Dict[str, Any]] = []
+    for video_id in target_videos:
+        video_entry = manifest_videos[video_id]
+        detections_json = str(video_entry.get("detections_json", "")).strip()
+        detections_path = Path(detections_json) if detections_json else (output_root / video_id / "detections.json")
+        if not detections_path.exists():
+            return None
+        try:
+            with detections_path.open("r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except Exception:
+            return None
+        if int(cached.get("schema_version", 0)) < _DETECTION_SCHEMA_VERSION:
+            return None
+        cached["from_cache"] = True
+        loaded_results.append(cached)
+    return loaded_results
+
+
 def _label_color(label: str) -> tuple[int, int, int]:
     # Stable pseudo-random color per class label.
     h = abs(hash(label)) % 360
@@ -816,6 +921,8 @@ def run(
         if isinstance(od_calibration_policy, dict)
         else od_calibration_policy_utils.load_active_od_calibration_policy()
     )
+    policy_marker = od_calibration_policy_utils.current_policy_marker(resolved_calibration_policy)
+    manifest_path = effective_output_root / "detection_manifest.json"
 
     print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
     print(f"Model: {model_name} | classes: {len(effective_classes)}")
@@ -831,6 +938,29 @@ def run(
         "OD calibration policy: "
         f"{od_calibration_policy_utils.policy_id(resolved_calibration_policy) or 'none'}"
     )
+
+    if not force_recompute:
+        fast_cached_results = _load_manifest_fast_path(
+            manifest_path=manifest_path,
+            target_videos=target_videos,
+            model_name=model_name,
+            effective_classes=effective_classes,
+            confidence_threshold=confidence_threshold,
+            nms_iou_threshold=nms_iou_threshold,
+            candidate_confidence_threshold=candidate_confidence_threshold,
+            candidate_nms_iou_threshold=candidate_nms_iou_threshold,
+            borderline_confidence_margin=borderline_confidence_margin,
+            policy_marker=policy_marker,
+            output_root=effective_output_root,
+        )
+        if fast_cached_results is not None:
+            print(
+                "Cache fast path: "
+                f"reusing manifest-backed detection cache for {len(fast_cached_results)} videos"
+            )
+            print(f"Step 1 complete: {_format_step_progress(len(fast_cached_results), len(target_videos))}")
+            print(f"Outputs: {manifest_path.parent}")
+            return fast_cached_results
 
     detector: Optional[ObjectDetector] = None
     runtime_profile: Dict[str, Any] = {}
@@ -916,6 +1046,7 @@ def run(
     manifest = {
         "schema_version": _DETECTION_SCHEMA_VERSION,
         "model": model_name,
+        "classes": list(effective_classes),
         "num_videos": len(video_results),
         "num_frames_total": sum(r["num_frames"] for r in video_results),
         "num_detections_total": sum(r["num_detections"] for r in video_results),
@@ -936,7 +1067,7 @@ def run(
             if isinstance(background_rule_relevance_prior_results, dict)
             else "",
         },
-        "od_calibration": od_calibration_policy_utils.current_policy_marker(resolved_calibration_policy),
+        "od_calibration": policy_marker,
         "videos": [
             {
                 "video_id": r["video_id"],
@@ -945,6 +1076,7 @@ def run(
                 "num_candidate_detections": r.get("num_candidate_detections", 0),
                 "num_total_saved_detections": r.get("num_total_saved_detections", r["num_detections"]),
                 "num_classes": len(r["detected_classes"]),
+                "detections_json": str(r.get("output_paths", {}).get("detections_json", "")),
             }
             for r in video_results
         ],
@@ -954,7 +1086,6 @@ def run(
             "detection_video_summary_csv": str(effective_output_root / "detection_video_summary.csv"),
         },
     }
-    manifest_path = effective_output_root / "detection_manifest.json"
     aggregate_predictions_csv_path = effective_output_root / "detection_predictions.csv"
     aggregate_class_summary_csv_path = effective_output_root / "detection_class_summary.csv"
     video_summary_csv_path = effective_output_root / "detection_video_summary.csv"
