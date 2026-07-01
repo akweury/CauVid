@@ -29,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_FINAL_RULES_VERSION = 5
+_FINAL_RULES_VERSION = 6
 _RULE_CATEGORY_ORDER = (
     "accepted_only",
     "mixed_accepted_candidate",
@@ -153,6 +153,50 @@ def _enrich_rule_candidate_semantics(rule: Dict[str, Any]) -> Dict[str, Any]:
     enriched = dict(rule)
     enriched.update(_candidate_rule_semantic_profile(enriched))
     return enriched
+
+
+def _build_example_provenance_lookup(
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for video_result in list(temporal_rule_results or []):
+        for example in list(video_result.get("examples", [])):
+            example_id = str(example.get("example_id", "")).strip()
+            if not example_id:
+                continue
+            lookup[example_id] = {
+                str(atom): dict(provenance)
+                for atom, provenance in dict(example.get("body_atom_provenance_map", {})).items()
+                if str(atom) and isinstance(provenance, dict)
+            }
+    return lookup
+
+
+def _enrich_rule_evidence_with_provenance(
+    rule: Dict[str, Any],
+    example_provenance_lookup: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not example_provenance_lookup:
+        return dict(rule)
+    updated_rule = dict(rule)
+    evidence_out: List[Dict[str, Any]] = []
+    for entry in list(rule.get("evidence_set", [])):
+        updated_entry = dict(entry)
+        if dict(updated_entry.get("matched_atom_provenance", {})):
+            evidence_out.append(updated_entry)
+            continue
+        example_id = str(updated_entry.get("example_id", "")).strip()
+        atom_lookup = example_provenance_lookup.get(example_id, {})
+        matched_atom_provenance = {}
+        for atom_template, concrete_atom in dict(updated_entry.get("matched_atoms", {})).items():
+            provenance = atom_lookup.get(str(concrete_atom), {})
+            if isinstance(provenance, dict) and provenance:
+                matched_atom_provenance[str(atom_template)] = dict(provenance)
+        if matched_atom_provenance:
+            updated_entry["matched_atom_provenance"] = matched_atom_provenance
+        evidence_out.append(updated_entry)
+    updated_rule["evidence_set"] = evidence_out
+    return updated_rule
 
 
 def _sort_rules(all_kept_rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -346,6 +390,7 @@ def _budgeted_final_rule_selection(
 
 def process_rules(
     extended_rule_results: Dict[str, Any],
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -369,7 +414,13 @@ def process_rules(
             return cached
 
     post_pruned_rule_pool = _post_pruned_rule_pool(extended_rule_results)
-    all_kept_rules = [_enrich_rule_candidate_semantics(rule) for rule in post_pruned_rule_pool]
+    example_provenance_lookup = _build_example_provenance_lookup(temporal_rule_results)
+    all_kept_rules = [
+        _enrich_rule_candidate_semantics(
+            _enrich_rule_evidence_with_provenance(rule, example_provenance_lookup)
+        )
+        for rule in post_pruned_rule_pool
+    ]
     ranked_rules = _sort_rules(all_kept_rules)
     final_rules, budget_pruned_counts = _budgeted_final_rule_selection(
         ranked_rules,
@@ -500,12 +551,14 @@ def process_rules(
 
 def run(
     extended_rule_results: Dict[str, Any],
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
 ) -> Dict[str, Any]:
     return process_rules(
         extended_rule_results=extended_rule_results,
+        temporal_rule_results=temporal_rule_results,
         cfg=cfg,
         output_root=output_root,
         force_recompute=force_recompute,

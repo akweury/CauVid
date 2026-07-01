@@ -32,7 +32,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TARGET_HEAD_ATOMS_VERSION = 5
+_TARGET_HEAD_ATOMS_VERSION = 6
 
 
 def get_output_root() -> Path:
@@ -77,6 +77,18 @@ def _print_video_summary(result: Dict[str, Any]) -> None:
         f"brake_next={num_positive} | not_brake_next={num_negative} | "
         f"with_candidate_atoms={candidate_examples}"
     )
+
+
+def _atom_provenance_map_from_records(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    provenance_map: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        atom_text = str(record.get("atom", "")).strip()
+        if not atom_text or atom_text in provenance_map:
+            continue
+        provenance = dict(record.get("provenance", {}))
+        if provenance:
+            provenance_map[atom_text] = provenance
+    return provenance_map
 
 
 def process_video(
@@ -141,12 +153,16 @@ def process_video(
 
         head_atom = _make_atom(head_predicate, current_segment_id)
         body_atoms = list(current_seg.get("atoms", []))
+        segment_atom_records = list(current_seg.get("atom_records", []))
         accepted_object_atoms: List[str] = []
+        accepted_object_atom_records: List[Dict[str, Any]] = []
         for obj in current_seg.get("objects", []):
             accepted_object_atoms.extend(list(obj.get("atoms", [])))
+            accepted_object_atom_records.extend(list(obj.get("atom_records", [])))
         candidate_object_atoms: List[str] = []
         candidate_quality_auxiliary_atoms: List[str] = []
         candidate_provenance_metadata_atoms: List[str] = []
+        candidate_object_atom_records: List[Dict[str, Any]] = []
         for obj in current_seg.get("candidate_objects", []):
             semantic_atoms = list(obj.get("semantic_rule_search_atoms", []))
             if not semantic_atoms:
@@ -154,6 +170,7 @@ def process_video(
             candidate_object_atoms.extend(semantic_atoms)
             candidate_quality_auxiliary_atoms.extend(list(obj.get("quality_auxiliary_atoms", [])))
             candidate_provenance_metadata_atoms.extend(list(obj.get("provenance_metadata_atoms", [])))
+            candidate_object_atom_records.extend(list(obj.get("atom_records", [])))
         body_atoms.extend(accepted_object_atoms)
         body_atoms.extend(candidate_object_atoms)
         has_candidate_atoms = bool(candidate_object_atoms)
@@ -177,6 +194,11 @@ def process_video(
             "candidate_rule_search_body_atoms": candidate_object_atoms,
             "candidate_quality_auxiliary_body_atoms": candidate_quality_auxiliary_atoms,
             "candidate_provenance_metadata_body_atoms": candidate_provenance_metadata_atoms,
+            "body_atom_provenance_map": _atom_provenance_map_from_records(
+                segment_atom_records + accepted_object_atom_records + candidate_object_atom_records
+            ),
+            "accepted_body_atom_provenance_map": _atom_provenance_map_from_records(accepted_object_atom_records),
+            "candidate_body_atom_provenance_map": _atom_provenance_map_from_records(candidate_object_atom_records),
             "num_body_atoms": len(body_atoms),
             "num_accepted_body_atoms": len(accepted_object_atoms),
             "num_candidate_body_atoms": len(candidate_object_atoms),

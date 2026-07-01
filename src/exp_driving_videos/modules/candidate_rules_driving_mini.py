@@ -34,7 +34,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_INITIAL_RULES_VERSION = 11
+_INITIAL_RULES_VERSION = 12
 _SINGLETON_PROVENANCE_ONLY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -154,6 +154,7 @@ def _make_evidence_entry(
     concrete_atom: str,
     body_atom_source: str,
     matched_prior_ids: Optional[List[str]] = None,
+    matched_atom_provenance: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     bindings = _extract_bindings(body_atom_template, concrete_atom)
     if bindings is None:
@@ -176,6 +177,11 @@ def _make_evidence_entry(
         "matched_atom_prior_ids": {
             body_atom_template: sorted({str(value) for value in list(matched_prior_ids or []) if str(value)})
         },
+        "matched_atom_provenance": (
+            {body_atom_template: dict(matched_atom_provenance)}
+            if isinstance(matched_atom_provenance, dict) and matched_atom_provenance
+            else {}
+        ),
     }
 
 
@@ -484,6 +490,7 @@ def process_video(
         body_atoms = list(example.get("body_atoms", []))
         accepted_body_atoms = {str(atom) for atom in list(example.get("accepted_body_atoms", []))}
         candidate_body_atoms = {str(atom) for atom in list(example.get("candidate_body_atoms", []))}
+        body_atom_provenance_map = dict(example.get("body_atom_provenance_map", {}))
         matched_prior_ids_by_candidate_object: Dict[str, List[str]] = defaultdict(list)
         for candidate_atom in candidate_body_atoms:
             parsed_candidate_atom = _parse_atom(candidate_atom)
@@ -523,6 +530,7 @@ def process_video(
                 concrete_atom=str(body_atom),
                 body_atom_source=body_atom_source,
                 matched_prior_ids=matched_prior_ids,
+                matched_atom_provenance=dict(body_atom_provenance_map.get(str(body_atom), {})),
             )
             if evidence_entry is not None:
                 unary_entries_by_template[body_template] = evidence_entry

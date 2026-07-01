@@ -30,13 +30,15 @@ if str(SRC_ROOT) not in sys.path:
 
 import config
 from src.exp_driving_videos.modules.final_rules_driving_mini import (
+    _build_example_provenance_lookup,
+    _enrich_rule_evidence_with_provenance,
     _normalized_category_budgets,
     _post_pruned_rule_pool,
     _rule_candidate_category as _shared_rule_candidate_category,
 )
 
 
-_DIVERSE_FINAL_RULES_VERSION = 7
+_DIVERSE_FINAL_RULES_VERSION = 8
 _STRONG_SEMANTIC_BODY_PREDICATES = {
     "object_class",
     "object_distance_state",
@@ -534,6 +536,7 @@ def _rule_utility(
 
 def process_rules(
     extended_rule_results: Dict[str, Any],
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -558,8 +561,14 @@ def process_rules(
             print(f"  [cache] loading {json_path.name}")
             return cached
 
+    example_provenance_lookup = _build_example_provenance_lookup(temporal_rule_results)
     candidate_rules = _sort_rules(
-        [_enrich_rule_candidate_semantics(rule) for rule in _post_pruned_rule_pool(extended_rule_results)]
+        [
+            _enrich_rule_candidate_semantics(
+                _enrich_rule_evidence_with_provenance(rule, example_provenance_lookup)
+            )
+            for rule in _post_pruned_rule_pool(extended_rule_results)
+        ]
     )
     selected_rules: List[Dict[str, Any]] = []
     selection_trace: List[Dict[str, Any]] = []
@@ -839,12 +848,14 @@ def process_rules(
 
 def run(
     extended_rule_results: Dict[str, Any],
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
 ) -> Dict[str, Any]:
     return process_rules(
         extended_rule_results=extended_rule_results,
+        temporal_rule_results=temporal_rule_results,
         cfg=cfg,
         output_root=output_root,
         force_recompute=force_recompute,

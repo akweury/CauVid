@@ -33,7 +33,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_SEGMENT_OBJECT_MOTION_VERSION = 7
+_SEGMENT_OBJECT_MOTION_VERSION = 8
 
 
 def get_output_root() -> Path:
@@ -198,6 +198,31 @@ def _visibility_state(visibility_ratio: float, persistent_threshold: float = 0.8
     return "brief"
 
 
+def _score_stats(values: List[float]) -> Dict[str, float]:
+    cleaned = [float(value) for value in values]
+    if not cleaned:
+        return {"min": 0.0, "mean": 0.0, "max": 0.0}
+    return {
+        "min": float(min(cleaned)),
+        "mean": float(sum(cleaned) / max(1, len(cleaned))),
+        "max": float(max(cleaned)),
+    }
+
+
+def _temporal_consistency_proxy(frame_indices: List[int], num_frames_in_segment: int) -> float:
+    ordered = sorted(int(value) for value in frame_indices if int(value) >= 0)
+    if not ordered:
+        return 0.0
+    visibility_ratio = float(len(ordered) / max(1, num_frames_in_segment))
+    if len(ordered) == 1:
+        return visibility_ratio
+    consecutive_ratio = float(
+        sum(1 for left, right in zip(ordered, ordered[1:]) if int(right) - int(left) == 1)
+        / max(1, len(ordered) - 1)
+    )
+    return float((visibility_ratio + consecutive_ratio) / 2.0)
+
+
 def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
     keys = [
         "rel_vz_threshold",
@@ -302,8 +327,60 @@ def _summarize_segment_object_group(
             },
         }
 
+        first = samples[0] if samples else {}
+        source_detection_ids = sorted(
+            {
+                str(detection_id)
+                for sample in samples
+                for detection_id in list(sample.get("source_detection_ids", []))
+                if str(detection_id)
+            }
+            | {
+                str(sample.get("detection_id", ""))
+                for sample in samples
+                if str(sample.get("detection_id", ""))
+            }
+        )
+        bbox_ids = sorted(
+            {
+                str(bbox_id)
+                for sample in samples
+                for bbox_id in list(sample.get("bbox_ids", []))
+                if str(bbox_id)
+            }
+            | {
+                str(sample.get("bbox_id", ""))
+                for sample in samples
+                if str(sample.get("bbox_id", ""))
+            }
+        )
+        score_values = [float(sample.get("score", 0.0)) for sample in samples if sample.get("score") is not None]
+        detector_score_stats = _score_stats(score_values)
+        frame_range = [
+            int(min(frame_indices)) if frame_indices else -1,
+            int(max(frame_indices)) if frame_indices else -1,
+        ]
+        track_temporal_consistency = _temporal_consistency_proxy(frame_indices, num_frames_in_segment)
+        accepted_source_type = "accepted_bbox"
+        summary.update(
+            {
+                "accepted": True,
+                "source_type": accepted_source_type,
+                "frame_detection_id": str(first.get("detection_id", "")) if samples else "",
+                "source_detection_ids": source_detection_ids,
+                "bbox_ids": bbox_ids,
+                "bbox_id_available": bool(bbox_ids),
+                "detector_score_min": float(detector_score_stats["min"]),
+                "detector_score_mean": float(detector_score_stats["mean"]),
+                "detector_score_max": float(detector_score_stats["max"]),
+                "track_length": len(frame_indices),
+                "track_temporal_consistency": float(track_temporal_consistency),
+                "frame_range": frame_range,
+                "upstream_source_type": str(first.get("source_type", accepted_source_type)) if samples else accepted_source_type,
+            }
+        )
+
         if include_candidate_provenance:
-            first = samples[0] if samples else {}
             candidate_object_ids = sorted([
                 str(candidate_object_id)
                 for candidate_object_id in {
@@ -345,12 +422,22 @@ def _summarize_segment_object_group(
                     "candidate_track_id": int(first.get("candidate_track_id", track_id)),
                     "candidate_object_id": candidate_object_ids[0] if candidate_object_ids else "",
                     "candidate_object_ids": candidate_object_ids,
-                    "source_detection_ids": list(first.get("source_detection_ids", [])),
+                    "source_detection_ids": source_detection_ids,
+                    "bbox_ids": bbox_ids,
+                    "bbox_id_available": bool(bbox_ids),
                     "candidate_source": str(first.get("candidate_source", "")),
                     "prior_metadata": dict(first.get("prior_metadata", {})),
                     "score_breakdown": dict(first.get("score_breakdown", {})),
                     "selection_score": float(first.get("selection_score", 0.0)),
                     "track_quality": dict(first.get("track_quality", {})),
+                    "detector_score_min": float(detector_score_stats["min"]),
+                    "detector_score_mean": float(detector_score_stats["mean"]),
+                    "detector_score_max": float(detector_score_stats["max"]),
+                    "track_length": len(frame_indices),
+                    "track_temporal_consistency": float(
+                        dict(first.get("track_quality", {})).get("temporal_consistency", track_temporal_consistency)
+                    ),
+                    "frame_range": frame_range,
                     "position_3d_provenance": dict(first.get("position_3d_provenance", {})),
                     "relative_position_3d_series": positions,
                     "distance_series_meters": distance_series_meters,

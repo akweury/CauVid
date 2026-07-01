@@ -35,8 +35,10 @@ from src.exp_driving_videos.modules.final_rules_driving_mini import (
 )
 
 
-_RULE_EVALUATION_VERSION = 6
+_RULE_EVALUATION_VERSION = 7
 _VARIABLE_ARGS = {"S", "O", "C", "T", "F"}
+_LOW_FACT_CONFIDENCE_THRESHOLD = 0.40
+_LOW_TEMPORAL_CONSISTENCY_THRESHOLD = 0.55
 
 
 def get_output_root() -> Path:
@@ -224,6 +226,89 @@ def _get_rule_body_atom_templates(rule: Dict[str, Any]) -> List[str]:
         return [str(atom).strip() for atom in body_atom_templates if str(atom).strip()]
     body_atom_template = str(rule.get("body_atom_template", "")).strip()
     return [body_atom_template] if body_atom_template else []
+
+
+def _build_logic_segment_provenance_lookup(
+    logic_atom_results: Optional[Sequence[Dict[str, Any]]],
+) -> Dict[Tuple[str, str], Dict[str, Dict[str, Any]]]:
+    lookup: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+    for video_result in list(logic_atom_results or []):
+        video_id = str(video_result.get("video_id", "")).strip()
+        if not video_id:
+            continue
+        for segment in list(video_result.get("segments", [])):
+            segment_id = str(segment.get("segment_id", "")).strip()
+            if not segment_id:
+                continue
+            atom_provenance: Dict[str, Dict[str, Any]] = {}
+            for record in list(segment.get("atom_records", [])):
+                atom_text = str(record.get("atom", "")).strip()
+                provenance = dict(record.get("provenance", {}))
+                if atom_text and provenance:
+                    atom_provenance[atom_text] = provenance
+            for obj in list(segment.get("objects", [])) + list(segment.get("candidate_objects", [])):
+                for record in list(obj.get("atom_records", [])):
+                    atom_text = str(record.get("atom", "")).strip()
+                    provenance = dict(record.get("provenance", {}))
+                    if atom_text and provenance:
+                        atom_provenance[atom_text] = provenance
+            lookup[(video_id, segment_id)] = atom_provenance
+    return lookup
+
+
+def _resolve_example_body_atom_provenance_map(
+    example: Dict[str, Any],
+    logic_segment_provenance_lookup: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]],
+    *,
+    video_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    existing = {
+        str(atom): dict(provenance)
+        for atom, provenance in dict(example.get("body_atom_provenance_map", {})).items()
+        if str(atom) and isinstance(provenance, dict)
+    }
+    if existing:
+        return existing
+    current_segment_id = str(example.get("current_segment_id", "")).strip()
+    segment_lookup = logic_segment_provenance_lookup.get((video_id, current_segment_id), {})
+    return {
+        str(atom): dict(segment_lookup.get(str(atom), {}))
+        for atom in list(example.get("body_atoms", []))
+        if str(atom) and isinstance(segment_lookup.get(str(atom), {}), dict) and segment_lookup.get(str(atom), {})
+    }
+
+
+def _summarize_provenance_quality(provenance_entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    confidences = [
+        float(entry.get("detector_score_mean", entry.get("detector_score_max", 0.0)))
+        for entry in provenance_entries
+        if "detector_score_mean" in entry or "detector_score_max" in entry
+    ]
+    temporal_consistencies = [
+        float(entry.get("track_temporal_consistency", 0.0))
+        for entry in provenance_entries
+        if "track_temporal_consistency" in entry
+    ]
+    return {
+        "fact_confidence_min": float(min(confidences)) if confidences else 0.0,
+        "fact_confidence_mean": float(sum(confidences) / max(1, len(confidences))) if confidences else 0.0,
+        "track_temporal_consistency_mean": (
+            float(sum(temporal_consistencies) / max(1, len(temporal_consistencies)))
+            if temporal_consistencies
+            else 0.0
+        ),
+        "is_low_fact_quality": bool(
+            confidences
+            and (
+                float(sum(confidences) / max(1, len(confidences))) < _LOW_FACT_CONFIDENCE_THRESHOLD
+                or (
+                    temporal_consistencies
+                    and float(sum(temporal_consistencies) / max(1, len(temporal_consistencies)))
+                    < _LOW_TEMPORAL_CONSISTENCY_THRESHOLD
+                )
+            )
+        ),
+    }
 
 
 def _rule_candidate_category(rule: Dict[str, Any]) -> str:
@@ -484,6 +569,26 @@ def _build_candidate_rule_ablation(
     }
 
 
+def _best_explanation_candidate(
+    candidates: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    best: Dict[str, Any] = {}
+    best_key: Tuple[float, float, int, str] | None = None
+    for candidate in candidates:
+        quality = _summarize_provenance_quality(list(dict(candidate.get("matched_atom_provenance", {})).values()))
+        key = (
+            float(candidate.get("rule_confidence", 0.0)),
+            float(quality.get("fact_confidence_mean", 0.0)),
+            -int(candidate.get("body_length", 0)),
+            str(candidate.get("rule_id", "")),
+        )
+        if best_key is None or key > best_key:
+            best = dict(candidate)
+            best["quality_summary"] = quality
+            best_key = key
+    return best
+
+
 def _save_evaluation_pdf(
     result: Dict[str, Any],
     pdf_path: Path,
@@ -548,6 +653,7 @@ def _save_evaluation_pdf(
 def process_rules(
     final_rule_results: Dict[str, Any],
     temporal_rule_results: List[Dict[str, Any]],
+    logic_atom_results: Optional[Sequence[Dict[str, Any]]] = None,
     eval_video_ids: Optional[List[str]] = None,
     split_manifest: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
@@ -566,6 +672,8 @@ def process_rules(
     csv_path = out_root / "rule_evaluation.csv"
     example_csv_path = out_root / "example_predictions.csv"
     subset_csv_path = out_root / "rule_subset_metrics.csv"
+    explainable_csv_path = out_root / "explainable_event_summary.csv"
+    explainable_json_path = out_root / "explainable_event_details.json"
     pdf_path = out_root / "rule_evaluation_summary.pdf"
 
     if not force_recompute and json_path.exists():
@@ -588,6 +696,7 @@ def process_rules(
         for result in temporal_rule_results
         if not eval_video_id_set or str(result.get("video_id", "")) in eval_video_id_set
     ]
+    logic_segment_provenance_lookup = _build_logic_segment_provenance_lookup(logic_atom_results)
 
     eval_examples: List[Dict[str, Any]] = []
     examples_by_id: Dict[str, Dict[str, Any]] = {}
@@ -609,6 +718,11 @@ def process_rules(
                 "current_segment_id": str(example.get("current_segment_id", "")),
                 "next_segment_id": str(example.get("next_segment_id", "")),
                 "body_atoms": list(example.get("body_atoms", [])),
+                "body_atom_provenance_map": _resolve_example_body_atom_provenance_map(
+                    example,
+                    logic_segment_provenance_lookup,
+                    video_id=video_id,
+                ),
             }
             eval_examples.append(eval_example)
             examples_by_id[example_id] = eval_example
@@ -619,6 +733,7 @@ def process_rules(
     final_rules = list(final_rule_results.get("final_rules", []))
     triggered_rules_by_example: Dict[str, List[str]] = {}
     triggered_rule_ids_by_example_by_subset: Dict[str, Dict[str, List[str]]] = {}
+    accepted_only_explanation_candidates_by_example: Dict[str, List[Dict[str, Any]]] = {}
     rule_evaluations: List[Dict[str, Any]] = []
 
     for rule in final_rules:
@@ -661,8 +776,36 @@ def process_rules(
                         "label": bool(example.get("label", False)),
                         "bindings": dict(match_state.get("bindings", {})),
                         "matched_atoms": dict(match_state.get("matched_atoms", {})),
+                        "matched_atom_provenance": {
+                            str(atom_template): dict(example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {}))
+                            for atom_template, concrete_atom in dict(match_state.get("matched_atoms", {})).items()
+                            if isinstance(example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {}), dict)
+                            and example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {})
+                        },
                     }
                 )
+                if candidate_rule_category == "accepted_only":
+                    accepted_only_explanation_candidates_by_example.setdefault(example_id, []).append(
+                        {
+                            "rule_id": rule_id,
+                            "rule_clause": str(rule.get("clause", "")),
+                            "rule_confidence": float(rule.get("confidence", 0.0)),
+                            "rule_precision_eval": float(rule.get("eval_precision", 0.0)),
+                            "body_length": int(rule.get("body_length", len(body_atom_templates))),
+                            "matched_atoms": dict(match_state.get("matched_atoms", {})),
+                            "matched_atom_provenance": {
+                                str(atom_template): dict(
+                                    example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {})
+                                )
+                                for atom_template, concrete_atom in dict(match_state.get("matched_atoms", {})).items()
+                                if isinstance(
+                                    example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {}),
+                                    dict,
+                                )
+                                and example.get("body_atom_provenance_map", {}).get(str(concrete_atom), {})
+                            },
+                        }
+                    )
 
         evidence_summary = _summarize_rule_evidence(
             evidence_entries=evidence_entries,
@@ -774,9 +917,11 @@ def process_rules(
     }
 
     example_prediction_rows: List[Dict[str, Any]] = []
+    explainable_event_rows: List[Dict[str, Any]] = []
     for example in eval_examples:
         example_id = str(example.get("example_id", ""))
         predicted_positive = example_id in predicted_positive_example_ids
+        predicted_positive_accepted_only = example_id in accepted_only_predicted_positive_ids
         subset_rule_ids = triggered_rule_ids_by_example_by_subset.get(example_id, {})
         example_prediction_rows.append(
             {
@@ -784,7 +929,7 @@ def process_rules(
                 "example_id": example_id,
                 "label": bool(example.get("label", False)),
                 "predicted_positive": predicted_positive,
-                "predicted_positive_accepted_only": example_id in accepted_only_predicted_positive_ids,
+                "predicted_positive_accepted_only": predicted_positive_accepted_only,
                 "predicted_positive_candidate_only": bool(subset_rule_ids.get("candidate_only_rules", [])),
                 "predicted_positive_candidate_candidate": bool(subset_rule_ids.get("candidate_candidate_rules", [])),
                 "predicted_positive_mixed_accepted_candidate": bool(
@@ -804,6 +949,84 @@ def process_rules(
                     subset_rule_ids.get("mixed_accepted_candidate_rules", [])
                 ),
                 "matching_rule_ids": list(triggered_rules_by_example.get(example_id, [])),
+            }
+        )
+        explanation_candidates = accepted_only_explanation_candidates_by_example.get(example_id, [])
+        best_explanation = _best_explanation_candidate(explanation_candidates)
+        matched_atom_provenance = list(dict(best_explanation.get("matched_atom_provenance", {})).values())
+        quality_summary = dict(best_explanation.get("quality_summary", {})) or _summarize_provenance_quality(
+            matched_atom_provenance
+        )
+        supporting_object_ids = sorted(
+            {
+                str(item.get("object_id", ""))
+                for item in matched_atom_provenance
+                if str(item.get("object_id", ""))
+            }
+        )
+        supporting_track_ids = sorted(
+            {
+                str(item.get("track_id", ""))
+                for item in matched_atom_provenance
+                if str(item.get("track_id", "")) not in {"", "-1"}
+            }
+        )
+        is_explainable = bool(best_explanation)
+        is_low_fact_quality = bool(quality_summary.get("is_low_fact_quality", False))
+        label = bool(example.get("label", False))
+        if not predicted_positive_accepted_only and not label:
+            explanation_status = "true_negative"
+            error_type = "tn"
+        elif is_low_fact_quality and ((label and not is_explainable) or predicted_positive_accepted_only):
+            explanation_status = "ambiguous_low_fact_quality"
+            error_type = "ambiguous"
+        elif label and predicted_positive_accepted_only and is_explainable:
+            explanation_status = "explainable_true_positive"
+            error_type = "tp"
+        elif label and not is_explainable:
+            explanation_status = "unexplained_positive"
+            error_type = "fn"
+        elif predicted_positive_accepted_only and is_explainable:
+            explanation_status = "false_positive_with_provenance"
+            error_type = "fp"
+        else:
+            explanation_status = "not_explained"
+            error_type = "unknown"
+        supporting_atoms = [
+            str(atom)
+            for atom in dict(best_explanation.get("matched_atoms", {})).values()
+            if str(atom)
+        ]
+        if explanation_status == "explainable_true_positive":
+            main_explanation = "Accepted-only rule fired with matched perception atoms."
+        elif explanation_status == "unexplained_positive":
+            main_explanation = "Positive label not covered by any selected accepted-only rule."
+        elif explanation_status == "false_positive_with_provenance":
+            main_explanation = "Accepted-only rule fired on a negative example using tracked perception facts."
+        elif explanation_status == "ambiguous_low_fact_quality":
+            main_explanation = "Perception facts supporting or blocking explanation are low quality."
+        else:
+            main_explanation = "No accepted-only rule explanation needed."
+        explainable_event_rows.append(
+            {
+                "video_id": str(example.get("video_id", "")),
+                "segment_id": str(example.get("current_segment_id", "")),
+                "label": label,
+                "prediction": predicted_positive_accepted_only,
+                "is_explainable": is_explainable,
+                "explanation_status": explanation_status,
+                "best_rule_id": str(best_explanation.get("rule_id", "")),
+                "best_rule_clause": str(best_explanation.get("rule_clause", "")),
+                "supporting_atoms": json.dumps(supporting_atoms),
+                "supporting_object_ids": json.dumps(supporting_object_ids),
+                "supporting_track_ids": json.dumps(supporting_track_ids),
+                "fact_confidence_min": float(quality_summary.get("fact_confidence_min", 0.0)),
+                "fact_confidence_mean": float(quality_summary.get("fact_confidence_mean", 0.0)),
+                "track_temporal_consistency_mean": float(
+                    quality_summary.get("track_temporal_consistency_mean", 0.0)
+                ),
+                "error_type": error_type,
+                "main_explanation": main_explanation,
             }
         )
 
@@ -839,6 +1062,8 @@ def process_rules(
         "rule_evaluations": rule_evaluations,
         "example_predictions_csv_path": str(example_csv_path),
         "rule_subset_metrics_csv_path": str(subset_csv_path),
+        "explainable_event_summary_csv_path": str(explainable_csv_path),
+        "explainable_event_details_json_path": str(explainable_json_path),
         "candidate_rule_flow_summary_json_path": str(out_root / "candidate_rule_flow_summary.json"),
         "pdf_path": str(pdf_path),
     }
@@ -851,6 +1076,9 @@ def process_rules(
     candidate_flow_path = out_root / "candidate_rule_flow_summary.json"
     with candidate_flow_path.open("w", encoding="utf-8") as fh:
         json.dump(candidate_rule_flow_summary, fh, indent=2)
+
+    with explainable_json_path.open("w", encoding="utf-8") as fh:
+        json.dump({"rows": explainable_event_rows}, fh, indent=2)
 
     with csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
@@ -982,6 +1210,32 @@ def process_rules(
                 }
             )
 
+    with explainable_csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "video_id",
+                "segment_id",
+                "label",
+                "prediction",
+                "is_explainable",
+                "explanation_status",
+                "best_rule_id",
+                "best_rule_clause",
+                "supporting_atoms",
+                "supporting_object_ids",
+                "supporting_track_ids",
+                "fact_confidence_min",
+                "fact_confidence_mean",
+                "track_temporal_consistency_mean",
+                "error_type",
+                "main_explanation",
+            ],
+        )
+        writer.writeheader()
+        for row in explainable_event_rows:
+            writer.writerow(row)
+
     with subset_csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
             fh,
@@ -1072,6 +1326,7 @@ def process_rules(
 def run(
     final_rule_results: Dict[str, Any],
     temporal_rule_results: List[Dict[str, Any]],
+    logic_atom_results: Optional[Sequence[Dict[str, Any]]] = None,
     eval_video_ids: Optional[List[str]] = None,
     split_manifest: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
@@ -1081,6 +1336,7 @@ def run(
     return process_rules(
         final_rule_results=final_rule_results,
         temporal_rule_results=temporal_rule_results,
+        logic_atom_results=logic_atom_results,
         eval_video_ids=eval_video_ids,
         split_manifest=split_manifest,
         cfg=cfg,

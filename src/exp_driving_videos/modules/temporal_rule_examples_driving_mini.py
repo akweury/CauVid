@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_TEMPORAL_RULE_EXAMPLES_VERSION = 5
+_TEMPORAL_RULE_EXAMPLES_VERSION = 6
 
 
 def get_output_root() -> Path:
@@ -91,6 +91,21 @@ def _build_clause(head_atom: str, body_atoms: List[str]) -> str:
     if head.endswith("."):
         head = head[:-1]
     return f"{head} :- {', '.join(body_atoms)}."
+
+
+def _filtered_atom_provenance_map(
+    body_atoms: List[str],
+    atom_provenance_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    filtered: Dict[str, Any] = {}
+    for atom in body_atoms:
+        atom_text = str(atom).strip()
+        if not atom_text:
+            continue
+        provenance = atom_provenance_map.get(atom_text)
+        if isinstance(provenance, dict):
+            filtered[atom_text] = provenance
+    return filtered
 
 
 def process_video(
@@ -172,6 +187,9 @@ def process_video(
             deduplicate=deduplicate_body_atoms,
             sort_atoms=sort_body_atoms,
         )
+        body_atom_provenance_map = dict(example.get("body_atom_provenance_map", {}))
+        accepted_body_atom_provenance_map = dict(example.get("accepted_body_atom_provenance_map", {}))
+        candidate_body_atom_provenance_map = dict(example.get("candidate_body_atom_provenance_map", {}))
         head_atom = str(example.get("head_atom", ""))
         rule_clause = _build_clause(head_atom, body_atoms) if include_clause_text else ""
         has_candidate_atoms = bool(candidate_body_atoms)
@@ -193,6 +211,15 @@ def process_video(
             "candidate_rule_search_body_atoms": candidate_body_atoms,
             "candidate_quality_auxiliary_body_atoms": candidate_quality_auxiliary_body_atoms,
             "candidate_provenance_metadata_body_atoms": candidate_provenance_metadata_body_atoms,
+            "body_atom_provenance_map": _filtered_atom_provenance_map(body_atoms, body_atom_provenance_map),
+            "accepted_body_atom_provenance_map": _filtered_atom_provenance_map(
+                accepted_body_atoms,
+                accepted_body_atom_provenance_map or body_atom_provenance_map,
+            ),
+            "candidate_body_atom_provenance_map": _filtered_atom_provenance_map(
+                candidate_body_atoms,
+                candidate_body_atom_provenance_map or body_atom_provenance_map,
+            ),
             "body_atoms": body_atoms,
             "num_accepted_body_atoms": len(accepted_body_atoms),
             "num_candidate_body_atoms": len(candidate_body_atoms),

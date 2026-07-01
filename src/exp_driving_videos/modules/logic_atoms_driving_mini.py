@@ -30,7 +30,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_LOGIC_ATOMS_VERSION = 6
+_LOGIC_ATOMS_VERSION = 7
 
 _CANDIDATE_SEMANTIC_RULE_SEARCH_PREDICATES = {
     "object_class",
@@ -128,13 +128,21 @@ def _make_atom(predicate: str, *args: Any) -> str:
     return f"{_sym(predicate)}({rendered_args})."
 
 
-def _make_record(predicate: str, args: List[Any], kind: str) -> Dict[str, Any]:
-    return {
+def _make_record(
+    predicate: str,
+    args: List[Any],
+    kind: str,
+    provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    record = {
         "predicate": _sym(predicate),
         "args": [_sym(arg) for arg in args],
         "kind": kind,
         "atom": _make_atom(predicate, *args),
     }
+    if isinstance(provenance, dict) and provenance:
+        record["provenance"] = provenance
+    return record
 
 
 def _candidate_atom_category(predicate: str) -> str:
@@ -192,6 +200,82 @@ def _print_video_summary(result: Dict[str, Any]) -> None:
         f"candidate_objects={num_candidate_objects} | "
         f"types=[{object_types_text}] | atoms={num_atoms}"
     )
+
+
+def _clean_text_list(values: List[Any]) -> List[str]:
+    return sorted({str(value).strip() for value in values if str(value).strip()})
+
+
+def _object_atom_provenance(
+    *,
+    video_id: str,
+    segment_id: str,
+    segment_index: int,
+    segment_start_frame: int,
+    segment_end_frame: int,
+    obj: Dict[str, Any],
+    object_id: str,
+    track_id: int,
+    source_type: str,
+    is_candidate: bool,
+) -> Dict[str, Any]:
+    detector_score_min = float(obj.get("detector_score_min", obj.get("selection_score", 0.0)))
+    detector_score_mean = float(obj.get("detector_score_mean", obj.get("selection_score", 0.0)))
+    detector_score_max = float(obj.get("detector_score_max", obj.get("selection_score", 0.0)))
+    source_detection_ids = _clean_text_list(list(obj.get("source_detection_ids", [])))
+    bbox_ids = _clean_text_list(list(obj.get("bbox_ids", [])))
+    frame_indices = [int(value) for value in list(obj.get("frame_indices", [])) if int(value) >= 0]
+    frame_range = [
+        int(obj.get("frame_range", [segment_start_frame, segment_end_frame])[0])
+        if isinstance(obj.get("frame_range"), list) and obj.get("frame_range")
+        else (min(frame_indices) if frame_indices else segment_start_frame),
+        int(obj.get("frame_range", [segment_start_frame, segment_end_frame])[-1])
+        if isinstance(obj.get("frame_range"), list) and obj.get("frame_range")
+        else (max(frame_indices) if frame_indices else segment_end_frame),
+    ]
+    return {
+        "video_id": video_id,
+        "segment_id": segment_id,
+        "segment_index": int(segment_index),
+        "object_id": str(object_id),
+        "track_id": int(track_id),
+        "frame_range": frame_range,
+        "segment_frame_range": [int(segment_start_frame), int(segment_end_frame)],
+        "source_detection_ids": source_detection_ids,
+        "bbox_ids": bbox_ids,
+        "bbox_id_available": bool(bbox_ids),
+        "detector_score_min": float(detector_score_min),
+        "detector_score_mean": float(detector_score_mean),
+        "detector_score_max": float(detector_score_max),
+        "track_length": int(obj.get("track_length", obj.get("num_visible_frames", len(frame_indices)))),
+        "track_temporal_consistency": float(
+            obj.get(
+                "track_temporal_consistency",
+                dict(obj.get("track_quality", {})).get("temporal_consistency", obj.get("visibility_ratio", 0.0)),
+            )
+        ),
+        "source_type": str(source_type),
+        "upstream_source_type": str(obj.get("source_type", source_type)),
+        "accepted": not bool(is_candidate),
+        "object_class": str(obj.get("object_class", "unknown")),
+    }
+
+
+def _segment_atom_provenance(
+    *,
+    video_id: str,
+    segment_id: str,
+    segment_index: int,
+    start_frame: int,
+    end_frame: int,
+) -> Dict[str, Any]:
+    return {
+        "video_id": video_id,
+        "segment_id": segment_id,
+        "segment_index": int(segment_index),
+        "frame_range": [int(start_frame), int(end_frame)],
+        "source_type": "segment_context",
+    }
 
 
 def process_video(
@@ -257,8 +341,16 @@ def process_video(
         segment_atom_records: List[Dict[str, Any]] = []
         segment_atoms: List[str] = []
 
+        segment_provenance = _segment_atom_provenance(
+            video_id=video_id,
+            segment_id=segment_id,
+            segment_index=segment_index,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
+
         def _append_segment_atom(predicate: str, *args: Any) -> None:
-            rec = _make_record(predicate, list(args), kind="segment")
+            rec = _make_record(predicate, list(args), kind="segment", provenance=dict(segment_provenance))
             segment_atom_records.append(rec)
             segment_atoms.append(rec["atom"])
             all_atom_records.append(rec)
@@ -304,9 +396,21 @@ def process_video(
             candidate_semantic_rule_search_atoms: List[str] = []
             candidate_quality_auxiliary_atoms: List[str] = []
             candidate_provenance_metadata_atoms: List[str] = []
+            object_provenance = _object_atom_provenance(
+                video_id=video_id,
+                segment_id=segment_id,
+                segment_index=segment_index,
+                segment_start_frame=start_frame,
+                segment_end_frame=end_frame,
+                obj=obj,
+                object_id=object_id,
+                track_id=candidate_track_id if is_candidate else track_id,
+                source_type=str(obj.get("source_type", "selected_candidate_track")) if is_candidate else "accepted_bbox",
+                is_candidate=is_candidate,
+            )
 
             def _append_object_atom(predicate: str, *args: Any) -> None:
-                rec = _make_record(predicate, list(args), kind="object")
+                rec = _make_record(predicate, list(args), kind="object", provenance=dict(object_provenance))
                 if is_candidate:
                     atom_category = _candidate_atom_category(predicate)
                     rec["candidate_atom_category"] = atom_category
@@ -431,6 +535,7 @@ def process_video(
                 "traffic_control_attributes": traffic_control_attributes
                 if isinstance(traffic_control_attributes, dict)
                 else {},
+                "provenance": object_provenance,
                 "atoms": object_atoms,
                 "semantic_rule_search_atoms": candidate_semantic_rule_search_atoms if is_candidate else object_atoms,
                 "quality_auxiliary_atoms": candidate_quality_auxiliary_atoms if is_candidate else [],
@@ -522,6 +627,7 @@ def process_video(
         "segment_id",
         "object_id",
         "atom",
+        "provenance_json",
     ]
     with csv_file.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=csv_columns)
@@ -538,6 +644,7 @@ def process_video(
                 "segment_id": args[0] if len(args) > 0 and str(args[0]).startswith("seg_") else "",
                 "object_id": next((arg for arg in args if str(arg).startswith("obj_")), ""),
                 "atom": rec.get("atom", ""),
+                "provenance_json": json.dumps(rec.get("provenance", {}), sort_keys=True),
             }
             writer.writerow(row)
 

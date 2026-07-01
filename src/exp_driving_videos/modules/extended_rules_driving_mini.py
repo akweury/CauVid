@@ -38,7 +38,7 @@ from src.exp_driving_videos.modules.extended_rules_pruning import (
 )
 
 
-_EXTENDED_RULES_VERSION = 8
+_EXTENDED_RULES_VERSION = 9
 _PROVENANCE_ONLY_BODY_PREDICATES = {
     "object_is_candidate",
     "object_source_type",
@@ -441,6 +441,10 @@ def _intersect_evidence_sets(
                         "matched_atoms": matched_atoms,
                         "matched_atom_sources": matched_atom_sources,
                         "matched_atom_prior_ids": matched_atom_prior_ids,
+                        "matched_atom_provenance": _merge_matched_atom_provenance(
+                            dict(parent_entry.get("matched_atom_provenance", {})),
+                            dict(added_entry.get("matched_atom_provenance", {})),
+                        ),
                     }
                 )
 
@@ -472,6 +476,22 @@ def _merge_matched_atom_prior_ids(
             item_text = str(item)
             if item_text and item_text not in existing:
                 existing.append(item_text)
+    return merged
+
+
+def _merge_matched_atom_provenance(
+    left: Dict[str, Any],
+    right: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {
+        str(key): dict(value)
+        for key, value in left.items()
+        if str(key) and isinstance(value, dict)
+    }
+    for key, value in right.items():
+        if not str(key) or not isinstance(value, dict):
+            continue
+        merged[str(key)] = dict(value)
     return merged
 
 
@@ -1026,6 +1046,11 @@ def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
                         for k, v in dict(entry.get("matched_atom_prior_ids", {})).items()
                         if str(k)
                     },
+                    "matched_atom_provenance": {
+                        str(k): dict(v)
+                        for k, v in dict(entry.get("matched_atom_provenance", {})).items()
+                        if str(k) and isinstance(v, dict)
+                    },
                 }
             )
             continue
@@ -1051,6 +1076,12 @@ def _seed_rule_evidence(rule: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "matched_atom_prior_ids": (
                     {body_atom_template: matched_prior_ids}
                     if body_atom_template and matched_atom and matched_prior_ids
+                    else {}
+                ),
+                "matched_atom_provenance": (
+                    {body_atom_template: dict(value)}
+                    if isinstance((value := dict(entry.get("matched_atom_provenance", {})).get(body_atom_template, {})), dict)
+                    and value
                     else {}
                 ),
             }
@@ -1090,6 +1121,12 @@ def _single_atom_evidence_from_rule(
                             if str(item)
                         ]
                     },
+                    "matched_atom_provenance": (
+                        {atom_template: dict(value)}
+                        if isinstance((value := dict(entry.get("matched_atom_provenance", {})).get(atom_template, {})), dict)
+                        and value
+                        else {}
+                    ),
                 }
             )
             continue
@@ -1113,6 +1150,12 @@ def _single_atom_evidence_from_rule(
                 "matched_atoms": {atom_template: matched_atom},
                 "matched_atom_sources": {atom_template: body_atom_source} if body_atom_source else {},
                 "matched_atom_prior_ids": {atom_template: matched_prior_ids} if matched_prior_ids else {},
+                "matched_atom_provenance": (
+                    {atom_template: dict(value)}
+                    if isinstance((value := dict(entry.get("matched_atom_provenance", {})).get(atom_template, {})), dict)
+                    and value
+                    else {}
+                ),
             }
         )
     return _dedupe_evidence_entries(seeded)

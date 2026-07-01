@@ -607,6 +607,33 @@ def _resolve_od_calibration_loop_cfg(
     )
 
 
+def _resolve_recompute_preset(
+    *,
+    start_target: str,
+    preset: str | None,
+) -> Tuple[str, bool, str]:
+    normalized = str(preset or "none").strip().lower() or "none"
+    effective_start_target = str(start_target)
+    force_full_recompute = False
+    description = "config_defaults"
+
+    if normalized == "none":
+        return effective_start_target, force_full_recompute, description
+    if normalized == "step17_plus":
+        return effective_start_target, True, "force_recompute_from_requested_start"
+    if normalized == "provenance_chain":
+        force_full_recompute = True
+        if _stage_index(effective_start_target) > _stage_index("7"):
+            effective_start_target = "7"
+        return effective_start_target, force_full_recompute, "force_recompute_provenance_chain_from_step7"
+    if normalized == "full_pipeline":
+        return "0", True, "force_recompute_full_pipeline_from_step0"
+    raise ValueError(
+        "Unsupported recompute_preset. "
+        f"Expected one of none, step17_plus, provenance_chain, full_pipeline; found {preset!r}."
+    )
+
+
 def _should_run_od_calibration_loop(
     stop_target: str,
     loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
@@ -947,7 +974,7 @@ def _load_cached_upstream_context(
 
     needs_temporal_examples = any(
         _stop_target_reaches(tag, stop_target)
-        for tag in ("17D", "18", "18B", "19", "18E", "18F", "18G", "20", "21", "21B", "24B")
+        for tag in ("17", "17D", "18", "18B", "19", "18E", "18F", "18G", "20", "21", "21B", "24B")
     )
     if needs_temporal_examples:
         ctx.temporal_rule_results = _load_cached_video_results(
@@ -960,7 +987,8 @@ def _load_cached_upstream_context(
         _prepare_rule_learning_inputs(ctx)
 
     needs_logic_atoms = (
-        (
+        _stop_target_reaches("18", stop_target)
+        or (
             bool(_get_reasoning_supervised_od_calibration_cfg().get("enabled", False))
             and _stop_target_reaches("19", stop_target)
         )
@@ -1974,12 +2002,14 @@ def run_step_17_final_rules(ctx: PipelineContext, runner: StepRunner) -> None:
         if output_root is None:
             ctx.final_rule_results = selector_module.run(
                 extended_rule_results=ctx.extended_rule_results,
+                temporal_rule_results=ctx.train_temporal_rule_results or [],
                 cfg=selector_cfg,
                 force_recompute=bool(ctx.recompute_cfg.get("final_rules", True)),
             )
         else:
             ctx.final_rule_results = selector_module.run(
                 extended_rule_results=ctx.extended_rule_results,
+                temporal_rule_results=ctx.train_temporal_rule_results or [],
                 cfg=selector_cfg,
                 output_root=output_root,
                 force_recompute=bool(ctx.recompute_cfg.get("final_rules", True)),
@@ -2104,6 +2134,7 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
         evaluation_result = evaluate_rules_driving_mini.run(
             final_rule_results=ctx.final_rule_results,
             temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            logic_atom_results=ctx.logic_atom_results or [],
             eval_video_ids=list(ctx.split_manifest.get("eval_video_ids", [])),
             split_manifest=ctx.split_manifest,
             cfg=evaluation_cfg_for_run,
@@ -2126,6 +2157,8 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
         str(evaluation_output_root / "rule_evaluation.json"),
         str(evaluation_output_root / "rule_evaluation.csv"),
         str(evaluation_output_root / "example_predictions.csv"),
+        str(evaluation_output_root / "explainable_event_summary.csv"),
+        str(evaluation_output_root / "explainable_event_details.json"),
         str(evaluation_output_root / "rule_subset_metrics.csv"),
         str(evaluation_output_root / "candidate_rule_flow_summary.json"),
         str(evaluation_output_root / "rule_evaluation_summary.pdf"),
@@ -2133,6 +2166,7 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
     manifest = {
         "step": "18",
         "primary_summary_csv": str(summary_path),
+        "primary_explanation_csv": str(evaluation_output_root / "explainable_event_summary.csv"),
         "main_conclusion": str(summary_rows[0].get("main_conclusion", "")) if summary_rows else "",
         "secondary_debug_artifacts": secondary_debug_artifacts,
     }
@@ -2167,6 +2201,7 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
     )
     if summary_rows:
         runner.log("18", f"summary_csv={summary_path}")
+        runner.log("18", f"explanation_csv={evaluation_output_root / 'explainable_event_summary.csv'}")
         runner.log("18", str(summary_rows[0].get("main_conclusion", "")))
     runner.complete_step("18", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
 
@@ -2891,10 +2926,12 @@ def _run_single_pass_pipeline(
     stop_target: str,
     video_ids: Optional[List[str]],
     video_count: int | None,
+    force_full_recompute: bool = False,
 ) -> None:
     ctx = _build_pipeline_context(
         video_ids=video_ids,
         video_count=video_count,
+        force_full_recompute=force_full_recompute,
     )
     effective_start_target = start_target
     warm_start_blocker = ""
@@ -2925,10 +2962,11 @@ def _run_od_calibration_loop(
     video_ids: Optional[List[str]],
     video_count: int | None,
     loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
+    force_full_recompute: bool = False,
 ) -> PipelineContext:
     final_ctx: Optional[PipelineContext] = None
     for iteration_index in range(1, int(loop_cfg.max_iterations) + 1):
-        force_full_recompute = od_calibration_loop_utils.iteration_requires_full_recompute(
+        iteration_force_full_recompute = force_full_recompute or od_calibration_loop_utils.iteration_requires_full_recompute(
             iteration_index,
             force_full_recompute_on_policy_change=loop_cfg.force_full_recompute_on_policy_change,
         )
@@ -2936,7 +2974,7 @@ def _run_od_calibration_loop(
             video_ids=video_ids,
             video_count=video_count,
             iteration_index=iteration_index,
-            force_full_recompute=force_full_recompute,
+            force_full_recompute=iteration_force_full_recompute,
             defer_stop_after_gate=True,
         )
         effective_start_target = start_target
@@ -2961,7 +2999,7 @@ def _run_od_calibration_loop(
             "od_calibration_loop "
             f"iteration={iteration_index}/{loop_cfg.max_iterations} "
             f"input_policy={od_calibration_policy_utils.policy_id(active_policy_before) or 'identity'} "
-            f"force_recompute={force_full_recompute}",
+            f"force_recompute={iteration_force_full_recompute}",
         )
         _run_steps_through_19(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
         decision = od_calibration_loop_utils.should_continue_after_iteration(
@@ -3034,6 +3072,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Override the configured maximum number of OD calibration loop iterations.",
     )
+    parser.add_argument(
+        "--recompute-preset",
+        dest="recompute_preset",
+        choices=("none", "step17_plus", "provenance_chain", "full_pipeline"),
+        default="none",
+        help=(
+            "Override recompute behavior without editing YAML. "
+            "`step17_plus` forces recompute from the requested start step onward. "
+            "`provenance_chain` forces recompute from step 7 so accepted-bbox provenance reaches Step 18 explanations. "
+            "`full_pipeline` forces recompute from step 0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -3043,6 +3093,7 @@ def main(
     video_ids: Optional[List[str]] = None,
     video_count: int | None = None,
     od_calibration_iterations: int | None = None,
+    recompute_preset: str | None = None,
 ) -> None:
     if video_count is not None and video_count < 1:
         raise ValueError(f"video_count must be >= 1. Found {video_count}.")
@@ -3053,9 +3104,14 @@ def main(
         )
     resolved_start_target, _ = _resolve_stop_request(start_step)
     resolved_stop_target, _ = _resolve_stop_request(max_step)
+    resolved_start_target, force_full_recompute, recompute_description = _resolve_recompute_preset(
+        start_target=resolved_start_target,
+        preset=recompute_preset,
+    )
     if _stage_index(resolved_start_target) > _stage_index(resolved_stop_target):
         raise ValueError(
-            f"start_step={start_step} must be at or before max_step={max_step}."
+            f"effective start_step={resolved_start_target} must be at or before max_step={max_step}. "
+            f"recompute_preset={recompute_preset or 'none'}"
         )
     loop_cfg = _resolve_od_calibration_loop_cfg(
         max_iterations_override=od_calibration_iterations,
@@ -3065,6 +3121,10 @@ def main(
         total_rtpt_iterations=_estimated_rtpt_iterations(resolved_stop_target, loop_cfg),
     )
     try:
+        runner.log(
+            resolved_start_target,
+            f"recompute_preset={recompute_preset or 'none'} mode={recompute_description}",
+        )
         if _should_run_od_calibration_loop(resolved_stop_target, loop_cfg):
             ctx = _run_od_calibration_loop(
                 runner,
@@ -3073,6 +3133,7 @@ def main(
                 video_ids=video_ids,
                 video_count=video_count,
                 loop_cfg=loop_cfg,
+                force_full_recompute=force_full_recompute,
             )
             runner.log("19", f"od_calibration_loop_stop_reason={ctx.od_loop_stop_reason or 'completed'}")
             if resolved_stop_target == "19":
@@ -3091,6 +3152,7 @@ def main(
             stop_target=resolved_stop_target,
             video_ids=video_ids,
             video_count=video_count,
+            force_full_recompute=force_full_recompute,
         )
     except _PipelineStopRequested:
         return
@@ -3104,4 +3166,5 @@ if __name__ == "__main__":
         video_ids=args.video_ids,
         video_count=args.video_count,
         od_calibration_iterations=args.od_calibration_iterations,
+        recompute_preset=args.recompute_preset,
     )

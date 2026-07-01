@@ -35,7 +35,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RELATIVE_OBJECT_MOTION_VERSION = 4
+_RELATIVE_OBJECT_MOTION_VERSION = 5
 _REL_VZ_THRESHOLD = 0.2
 _REL_VX_THRESHOLD = 0.2
 _REL_SPEED_THRESHOLD = 0.3
@@ -165,6 +165,14 @@ def _relative_motion_entry(
     }
 
 
+def _accepted_track_temporal_consistency(frame_indices: List[int]) -> float:
+    ordered = sorted(int(value) for value in frame_indices if int(value) >= 0)
+    if len(ordered) <= 1:
+        return 1.0 if ordered else 0.0
+    consecutive = sum(1 for left, right in zip(ordered, ordered[1:]) if int(right) - int(left) == 1)
+    return float(consecutive / max(1, len(ordered) - 1))
+
+
 def process_video(
     positions_3d_video_result: Dict[str, Any],
     ego_video_result: Dict[str, Any],
@@ -197,6 +205,8 @@ def process_video(
         boxes = frame.get("boxes", [])
         labels = frame.get("labels", [])
         track_ids = frame.get("track_ids", [])
+        detection_ids = frame.get("detection_ids", [])
+        scores = frame.get("scores", [])
         positions_3d = frame.get("positions_3d", [])
         candidate_objects_in = [dict(obj) for obj in list(frame.get("candidate_objects", []))]
 
@@ -222,7 +232,16 @@ def process_video(
                     frame_index=frame_index,
                     extra_fields={
                         "accepted": True,
-                        "source_type": "accepted_object",
+                        "source_type": "accepted_bbox",
+                        "detection_id": str(detection_ids[obj_i]) if obj_i < len(detection_ids) else "",
+                        "bbox_id": str(detection_ids[obj_i]) if obj_i < len(detection_ids) else "",
+                        "source_detection_ids": (
+                            [str(detection_ids[obj_i])] if obj_i < len(detection_ids) and str(detection_ids[obj_i]) else []
+                        ),
+                        "bbox_ids": (
+                            [str(detection_ids[obj_i])] if obj_i < len(detection_ids) and str(detection_ids[obj_i]) else []
+                        ),
+                        "score": float(scores[obj_i]) if obj_i < len(scores) else 0.0,
                     },
                 )
             )
