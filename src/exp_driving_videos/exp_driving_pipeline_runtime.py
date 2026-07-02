@@ -2633,12 +2633,22 @@ def run_step_22_rule_selection_visualization(ctx: PipelineContext, runner: StepR
         return
     runner.log("22", f"cfg={rule_selection_visualization_cfg}")
     runner.log("22", f"recompute={bool(ctx.recompute_cfg.get('rule_selection_visualization', True))}")
-    with runner.module_output("22"):
-        ctx.rule_selection_visualization_results = rule_selection_visualization_driving_mini.run(
-            cfg=rule_selection_visualization_cfg,
-            output_root=_get_rule_selection_visualization_output_root(),
-            force_recompute=bool(ctx.recompute_cfg.get("rule_selection_visualization", True)),
-        )
+    try:
+        with runner.module_output("22"):
+            ctx.rule_selection_visualization_results = rule_selection_visualization_driving_mini.run(
+                cfg=rule_selection_visualization_cfg,
+                output_root=_get_rule_selection_visualization_output_root(),
+                force_recompute=bool(ctx.recompute_cfg.get("rule_selection_visualization", True)),
+            )
+    except FileNotFoundError as exc:
+        ctx.rule_selection_visualization_results = {
+            "skipped": True,
+            "skip_reason": str(exc),
+            "figure_paths": {},
+        }
+        runner.log("22", f"skipped_missing_artifact={exc}")
+        runner.complete_step("22", subtitle="skipped_missing_artifact")
+        return
     runner.log("22", f"figures={len(ctx.rule_selection_visualization_results.get('figure_paths', {}))}")
     runner.complete_step("22", subtitle="figures=ready")
 
@@ -2652,12 +2662,22 @@ def run_step_23_integrated_visualization(ctx: PipelineContext, runner: StepRunne
         return
     runner.log("23", f"cfg={integrated_method_visualization_cfg}")
     runner.log("23", f"recompute={bool(ctx.recompute_cfg.get('integrated_method_visualization', True))}")
-    with runner.module_output("23"):
-        ctx.integrated_method_visualization_results = integrated_method_visualization_driving_mini.run(
-            cfg=integrated_method_visualization_cfg,
-            output_root=_get_integrated_method_visualization_output_root(),
-            force_recompute=bool(ctx.recompute_cfg.get("integrated_method_visualization", True)),
-        )
+    try:
+        with runner.module_output("23"):
+            ctx.integrated_method_visualization_results = integrated_method_visualization_driving_mini.run(
+                cfg=integrated_method_visualization_cfg,
+                output_root=_get_integrated_method_visualization_output_root(),
+                force_recompute=bool(ctx.recompute_cfg.get("integrated_method_visualization", True)),
+            )
+    except FileNotFoundError as exc:
+        ctx.integrated_method_visualization_results = {
+            "skipped": True,
+            "skip_reason": str(exc),
+            "figure_paths": {},
+        }
+        runner.log("23", f"skipped_missing_artifact={exc}")
+        runner.complete_step("23", subtitle="skipped_missing_artifact")
+        return
     runner.log("23", f"figures={len(ctx.integrated_method_visualization_results.get('figure_paths', {}))}")
     runner.complete_step("23", subtitle="figures=ready")
 
