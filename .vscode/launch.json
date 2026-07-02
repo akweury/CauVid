@@ -9,10 +9,6 @@
             "type": "debugpy",
             "request": "launch",
             "program": "${file}",
-            "args": [
-                "--config",
-                "configs/exp_nuScenes/default.yaml"
-            ],
             "console": "integratedTerminal",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
@@ -84,10 +80,17 @@
         }
         ,
         {
-            "name": "Python Debugger: exp_driving_pipeline",
+            "name": "Python Debugger: exp_driving_pipeline (step 19, data 200)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/exp_driving_videos/exp_driving_pipeline.py",
+            "args": [
+                "--start-step",
+                "17",
+                "19",
+                "--video-count",
+                "200"
+            ],
             "console": "integratedTerminal",
             "cwd": "${workspaceFolder}",
             "env": {

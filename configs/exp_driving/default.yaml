@@ -4,7 +4,7 @@ video_selection:
 detection:
   render_video: false
   check_cache: false
-  candidate_branch_enabled: false
+  candidate_branch_enabled: true
 
 tracking:
   render_video: false
