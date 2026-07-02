@@ -21,7 +21,7 @@ from src.exp_driving_videos.exp_driving_pipeline_runtime import (
 )
 
 DEFAULT_START_STEP: int = 17
-DEFAULT_MAX_STEP: int = 24
+DEFAULT_MAX_STEP: int = 25
 
 PIPELINE_STEP_OVERVIEW = [
     ("0-16", "upstream perception, symbolic abstraction, initial-rule pruning, rule extension"),
@@ -29,8 +29,7 @@ PIPELINE_STEP_OVERVIEW = [
     ("17D", "optional rule-pool and selector diagnostics"),
     ("18", "selected-rule evaluation"),
     ("18B", "optional baseline comparison"),
-    ("19", "optional OD calibration loop"),
-    ("18D-24B", "optional downstream diagnostics and visualization"),
+    ("19-25", "downstream diagnostics, visualization, causal prior, and feedback signal"),
 ]
 
 

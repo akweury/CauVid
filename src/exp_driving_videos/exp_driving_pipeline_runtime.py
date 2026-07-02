@@ -57,43 +57,26 @@ Steps:
                     the held-out evaluation split.
     18B. baseline_comparison_driving_mini — optional comparison against
                     neural-symbolic and learned rule-aggregation baselines.
-    19. reasoning_supervised_od_calibration_driving_mini — optional
-                    candidate-derived pseudo labeling, OD confidence
-                    calibration, and baseline-safe gating; runs only when
-                    enabled and Step 18 indicates useful candidate signal.
-    18D. object_to_atom_coverage_diagnostic_driving_mini — optional
+    19. object_to_atom_coverage_diagnostic_driving_mini — optional
                     object-to-atom coverage tracing across perception,
                     symbolic conversion, extended rules, and selected rules.
-    18E. traffic_control_rule_utility_diagnostic_driving_mini — optional
-                    traffic-control predicate audit across the Step 16 pool,
-                    selected rules, and learned baseline outputs.
-    18F. traffic_control_temporal_alignment_diagnostic_driving_mini —
-                    optional temporal alignment audit for traffic-control
-                    predicates against near-future braking labels.
-    18G. traffic_light_detection_quality_audit_driving_mini — optional
-                    sampled full-frame visual audits for detected
-                    traffic-light objects and predicted state/context.
     20. error_and_explainability_analysis_driving_mini — summarize false
                     negatives / false positives and generate explainability-
                     oriented diagnostics for held-out evaluation examples.
-    21. vehicle_rule_diagnostic_driving_mini — audit whether vehicle-centered
-                    rules were generated, pruned/scored out, or missed due to
-                    predicate representation.
-    21B. fn_categorization_diagnostic_driving_mini — categorize false
+    21. fn_categorization_diagnostic_driving_mini — categorize false
                     negatives for each selector using the step 16 rule pool,
-                    step 18 predictions, step 20 FN examples, and step 21
-                    vehicle-context diagnostics.
+                    step 18 predictions, and step 20 FN examples.
     22. rule_selection_visualization_driving_mini — generate comparison plots
-                    from the step 18/20/21 selector summaries and save a
+                    from the step 18/20 selector summaries and save a
                     visualization manifest.
     23. integrated_method_visualization_driving_mini — generate integrated
                     publication-style figures comparing NeSy selectors,
                     neural symbolic baselines, learned rule aggregation, and
                     the oracle rule-pool upper bound.
-    24A. background_causal_prior_driving_mini — define a fixed background
+    24. background_causal_prior_driving_mini — define a fixed background
                     causal prior for brake_next that is used only to steer
                     perception re-checks and never as direct rules or facts.
-    24B. reasoning_feedback_signal_driving_mini — combine the background
+    25. reasoning_feedback_signal_driving_mini — combine the background
                     causal prior with existing diagnostics to surface
                     perception re-check signals for likely missed causes of
                     braking.
@@ -142,7 +125,6 @@ from src.exp_driving_videos.modules import prepare_3d_positions_driving_mini
 from src.exp_driving_videos.modules import tracking_driving_mini
 from src.exp_driving_videos.modules import ego_motion_driving_mini
 from src.exp_driving_videos.modules import important_objects_driving_mini
-from src.exp_driving_videos.modules import traffic_control_rule_utility_diagnostic_driving_mini
 from src.exp_driving_videos.modules import traffic_control_attributes_driving_mini
 from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
@@ -156,8 +138,6 @@ from src.exp_driving_videos.modules import target_head_atoms_driving_mini
 from src.exp_driving_videos.modules import temporal_rule_examples_driving_mini
 from src.exp_driving_videos.modules import temporal_segmentation_driving_mini
 from src.exp_driving_videos.modules import traffic_light_detection_quality_audit_driving_mini
-from src.exp_driving_videos.modules import traffic_control_temporal_alignment_diagnostic_driving_mini
-from src.exp_driving_videos.modules import vehicle_rule_diagnostic_driving_mini
 from src.exp_driving_videos.modules import background_causal_prior_driving_mini
 from src.exp_driving_videos.modules import background_rule_relevance_prior_driving_mini
 from src.exp_driving_videos.modules import reasoning_feedback_signal_driving_mini
@@ -208,12 +188,6 @@ _get_baseline_safe_calibration_gate_cfg = driving_pipeline_config.get_baseline_s
 _get_od_calibration_loop_cfg = driving_pipeline_config.get_od_calibration_loop_cfg
 _get_rule_aggregation_baseline_cfg = driving_pipeline_config.get_rule_aggregation_baseline_cfg
 _get_object_to_atom_coverage_diagnostic_cfg = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_cfg
-_get_traffic_control_rule_utility_diagnostic_cfg = (
-    driving_pipeline_config.get_traffic_control_rule_utility_diagnostic_cfg
-)
-_get_traffic_control_temporal_alignment_diagnostic_cfg = (
-    driving_pipeline_config.get_traffic_control_temporal_alignment_diagnostic_cfg
-)
 _get_traffic_light_detection_quality_audit_cfg = (
     driving_pipeline_config.get_traffic_light_detection_quality_audit_cfg
 )
@@ -226,7 +200,6 @@ _get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrate
 _get_fn_categorization_diagnostic_cfg = driving_pipeline_config.get_fn_categorization_diagnostic_cfg
 _get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
 _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
-_get_vehicle_rule_diagnostic_cfg = driving_pipeline_config.get_vehicle_rule_diagnostic_cfg
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
 _get_merged_candidate_rules_output_root = driving_pipeline_config.get_merged_candidate_rules_output_root
 _get_candidate_contribution_summary_output_root = (
@@ -237,12 +210,6 @@ _get_od_confidence_calibration_loop_output_root = (
 )
 _get_rule_aggregation_baseline_output_root = driving_pipeline_config.get_rule_aggregation_baseline_output_root
 _get_object_to_atom_coverage_diagnostic_output_root = driving_pipeline_config.get_object_to_atom_coverage_diagnostic_output_root
-_get_traffic_control_rule_utility_diagnostic_output_root = (
-    driving_pipeline_config.get_traffic_control_rule_utility_diagnostic_output_root
-)
-_get_traffic_control_temporal_alignment_diagnostic_output_root = (
-    driving_pipeline_config.get_traffic_control_temporal_alignment_diagnostic_output_root
-)
 _get_traffic_light_detection_quality_audit_output_root = (
     driving_pipeline_config.get_traffic_light_detection_quality_audit_output_root
 )
@@ -252,7 +219,6 @@ _get_coverage_family_aware_final_rules_output_root = driving_pipeline_config.get
 _get_semantic_constrained_diverse_output_root = driving_pipeline_config.get_semantic_constrained_diverse_output_root
 _get_rule_pool_upper_bound_diagnostic_output_root = driving_pipeline_config.get_rule_pool_upper_bound_diagnostic_output_root
 _get_oracle_rule_selection_gap_diagnostic_output_root = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_output_root
-_get_vehicle_rule_diagnostic_output_root = driving_pipeline_config.get_vehicle_rule_diagnostic_output_root
 _get_rule_selection_visualization_output_root = driving_pipeline_config.get_rule_selection_visualization_output_root
 _get_integrated_method_visualization_output_root = driving_pipeline_config.get_integrated_method_visualization_output_root
 _get_fn_categorization_diagnostic_output_root = driving_pipeline_config.get_fn_categorization_diagnostic_output_root
@@ -290,18 +256,13 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17D", "stop_after": None, "label": "rule_pool_and_selector_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "baseline_comparison_driving_mini"},
-    {"tag": "19", "stop_after": 19, "label": "reasoning_supervised_od_calibration_driving_mini"},
-    {"tag": "18D", "stop_after": None, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
-    {"tag": "18E", "stop_after": None, "label": "traffic_control_rule_utility_diagnostic_driving_mini"},
-    {"tag": "18F", "stop_after": None, "label": "traffic_control_temporal_alignment_diagnostic_driving_mini"},
-    {"tag": "18G", "stop_after": None, "label": "traffic_light_detection_quality_audit_driving_mini"},
+    {"tag": "19", "stop_after": 19, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "error_and_explainability_analysis_driving_mini"},
-    {"tag": "21", "stop_after": 21, "label": "vehicle_rule_diagnostic_driving_mini"},
-    {"tag": "21B", "stop_after": None, "label": "fn_categorization_diagnostic_driving_mini"},
+    {"tag": "21", "stop_after": 21, "label": "fn_categorization_diagnostic_driving_mini"},
     {"tag": "22", "stop_after": 22, "label": "rule_selection_visualization_driving_mini"},
     {"tag": "23", "stop_after": 23, "label": "integrated_method_visualization_driving_mini"},
-    {"tag": "24A", "stop_after": None, "label": "background_causal_prior_driving_mini"},
-    {"tag": "24B", "stop_after": 24, "label": "reasoning_feedback_signal_driving_mini"},
+    {"tag": "24", "stop_after": 24, "label": "background_causal_prior_driving_mini"},
+    {"tag": "25", "stop_after": 25, "label": "reasoning_feedback_signal_driving_mini"},
 ]
 _PIPELINE_STAGE_TAGS: List[str] = [str(stage["tag"]) for stage in _PIPELINE_STAGE_SEQUENCE]
 _PIPELINE_STAGE_BY_TAG: Dict[str, Dict[str, Any]] = {
@@ -517,7 +478,7 @@ def _resolve_stop_request(requested_step: int | str) -> Tuple[str, str]:
     normalized = _normalize_requested_step(requested_step)
     if normalized.isdigit():
         step_number = int(normalized)
-        if step_number < 0 or step_number > 24:
+        if step_number < 0 or step_number > 25:
             raise ValueError(f"Unsupported max_step: {requested_step}")
         default_targets = [
             str(stage["tag"])
@@ -525,6 +486,8 @@ def _resolve_stop_request(requested_step: int | str) -> Tuple[str, str]:
             if stage["stop_after"] == step_number
         ]
         resolved_target = default_targets[-1] if default_targets else str(step_number)
+        if resolved_target not in _PIPELINE_STAGE_BY_TAG:
+            raise ValueError(f"Unsupported max_step: {requested_step}")
         return resolved_target, str(step_number)
     if normalized not in _PIPELINE_STAGE_BY_TAG:
         raise ValueError(f"Unsupported step id: {requested_step}")
@@ -638,12 +601,7 @@ def _should_run_od_calibration_loop(
     stop_target: str,
     loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
 ) -> bool:
-    calibration_cfg = _get_reasoning_supervised_od_calibration_cfg()
-    return (
-        loop_cfg.max_iterations > 1
-        and bool(calibration_cfg.get("enabled", False))
-        and _stop_target_reaches("19", stop_target)
-    )
+    return False
 
 
 def _estimated_rtpt_iterations(
@@ -652,9 +610,7 @@ def _estimated_rtpt_iterations(
 ) -> int:
     if not _should_run_od_calibration_loop(stop_target, loop_cfg):
         return _rtpt_max_iterations(stop_target)
-    through_gate = _stage_index("19") + 1
-    post_loop_steps = max(0, _stage_index(stop_target) - _stage_index("19"))
-    return through_gate * int(loop_cfg.max_iterations) + post_loop_steps
+    return _rtpt_max_iterations(stop_target)
 
 
 def _build_pipeline_context(
@@ -974,7 +930,7 @@ def _load_cached_upstream_context(
 
     needs_temporal_examples = any(
         _stop_target_reaches(tag, stop_target)
-        for tag in ("17", "17D", "18", "18B", "19", "18E", "18F", "18G", "20", "21", "21B", "24B")
+        for tag in ("17", "17D", "18", "18B", "20", "21", "25")
     )
     if needs_temporal_examples:
         ctx.temporal_rule_results = _load_cached_video_results(
@@ -989,20 +945,8 @@ def _load_cached_upstream_context(
     needs_logic_atoms = (
         _stop_target_reaches("18", stop_target)
         or (
-            bool(_get_reasoning_supervised_od_calibration_cfg().get("enabled", False))
-            and _stop_target_reaches("19", stop_target)
-        )
-        or (
-            bool(_get_traffic_control_temporal_alignment_diagnostic_cfg().get("enabled", False))
-            and _stop_target_reaches("18F", stop_target)
-        )
-        or (
-            bool(_get_traffic_light_detection_quality_audit_cfg().get("enabled", False))
-            and _stop_target_reaches("18G", stop_target)
-        )
-        or (
             bool(_get_reasoning_feedback_signal_cfg().get("enabled", False))
-            and _stop_target_reaches("24B", stop_target)
+            and _stop_target_reaches("25", stop_target)
         )
     )
     if needs_logic_atoms:
@@ -1015,20 +959,8 @@ def _load_cached_upstream_context(
         )
 
     if (
-        bool(_get_traffic_light_detection_quality_audit_cfg().get("enabled", False))
-        and _stop_target_reaches("18G", stop_target)
-    ):
-        ctx.traffic_control_attribute_results = _load_cached_video_results(
-            output_root=traffic_control_attributes_driving_mini.get_output_root(),
-            manifest_name="traffic_control_attributes_manifest.json",
-            per_video_filename="traffic_control_attributes.json",
-            selected_video_ids=ctx.effective_video_ids,
-            label="step 10B traffic control attributes",
-        )
-
-    if (
         bool(_get_object_to_atom_coverage_diagnostic_cfg().get("enabled", False))
-        and _stop_target_reaches("18D", stop_target)
+        and _stop_target_reaches("19", stop_target)
     ):
         ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids)
         ctx.dataset_annotation_results = _load_cached_video_results(
@@ -1051,15 +983,6 @@ def _load_cached_upstream_context(
             per_video_filename="important_objects.json",
             selected_video_ids=ctx.effective_video_ids,
             label="step 10 important objects",
-        )
-
-    if (
-        bool(_get_vehicle_rule_diagnostic_cfg().get("enabled", False))
-        and _stop_target_reaches("21", stop_target)
-    ):
-        ctx.merged_candidate_rules = _read_cached_json(
-            _get_merged_candidate_rules_output_root() / "merged_initial_rules.json",
-            label="step 15 merged initial rules result",
         )
 
     if _stage_index(start_target) > _stage_index("17"):
@@ -1660,7 +1583,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_detection_render_video_enabled(default=True)
     check_cache = _get_detection_check_cache_enabled(default=False)
     candidate_branch_enabled = _get_detection_candidate_branch_enabled(default=False)
-    active_od_policy = od_calibration_policy_utils.load_active_od_calibration_policy()
+    active_od_policy = None
     runner.announce_step("1", "detect_driving_mini", leading_newline=False)
     runner.log("1", f"model={DRIVING_MINI_OD_MODEL}")
     runner.log("1", f"classes={len(DRIVING_MINI_OD_CLASSES)} configured")
@@ -1668,7 +1591,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("1", f"check_cache={check_cache}")
     runner.log("1", f"candidate_branch_enabled={candidate_branch_enabled}")
     runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
-    runner.log("1", f"od_calibration_policy={od_calibration_policy_utils.policy_id(active_od_policy) or 'none'}")
+    runner.log("1", "od_calibration_policy=disabled")
     runner.log("1", f"force_recompute={_force_recompute(ctx)}")
     for warning in detect_driving_mini.detector_dependency_warnings(render_video=render_video):
         runner.log("1", f"[warn] {warning}")
@@ -1693,12 +1616,6 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("2", "tracking_driving_mini")
     runner.log("2", f"render_video={render_video}")
     runner.log("2", f"force_recompute={_force_recompute(ctx)}")
-    if ctx.detection_results:
-        runner.log(
-            "2",
-            "od_calibration_policy="
-            f"{dict(ctx.detection_results[0].get('od_calibration', {})).get('policy_id', '') or 'none'}",
-        )
     with runner.module_output("2"):
         ctx.tracking_results = tracking_driving_mini.run(
             ctx.detection_results or [],
@@ -2490,14 +2407,14 @@ def run_step_18c_rule_aggregation_baseline(ctx: PipelineContext, runner: StepRun
 
 def run_step_18d_object_to_atom_coverage(ctx: PipelineContext, runner: StepRunner) -> None:
     object_to_atom_coverage_cfg = _get_object_to_atom_coverage_diagnostic_cfg()
-    runner.announce_step("18D", "object_to_atom_coverage_diagnostic_driving_mini")
+    runner.announce_step("19", "object_to_atom_coverage_diagnostic_driving_mini")
     if not bool(object_to_atom_coverage_cfg.get("enabled", False)):
-        runner.log("18D", "disabled by config")
-        runner.complete_step("18D", subtitle="skipped")
+        runner.log("19", "disabled by config")
+        runner.complete_step("19", subtitle="skipped")
         return
-    runner.log("18D", f"cfg={object_to_atom_coverage_cfg}")
-    runner.log("18D", f"recompute={bool(ctx.recompute_cfg.get('object_to_atom_coverage_diagnostic', True))}")
-    with runner.module_output("18D"):
+    runner.log("19", f"cfg={object_to_atom_coverage_cfg}")
+    runner.log("19", f"recompute={bool(ctx.recompute_cfg.get('object_to_atom_coverage_diagnostic', True))}")
+    with runner.module_output("19"):
         ctx.object_to_atom_coverage_results = object_to_atom_coverage_diagnostic_driving_mini.run(
             detection_results=ctx.detection_results or [],
             dataset_annotation_results=ctx.dataset_annotation_results or [],
@@ -2514,71 +2431,8 @@ def run_step_18d_object_to_atom_coverage(ctx: PipelineContext, runner: StepRunne
             output_root=_get_object_to_atom_coverage_diagnostic_output_root(),
             force_recompute=bool(ctx.recompute_cfg.get("object_to_atom_coverage_diagnostic", True)),
         )
-    runner.log("18D", f"classes={int(ctx.object_to_atom_coverage_results.get('num_classes', 0))}")
-    runner.complete_step("18D", subtitle=f"classes={int(ctx.object_to_atom_coverage_results.get('num_classes', 0))}")
-
-
-def run_step_18e_traffic_control_rule_utility(ctx: PipelineContext, runner: StepRunner) -> None:
-    traffic_control_rule_utility_cfg = _get_traffic_control_rule_utility_diagnostic_cfg()
-    runner.announce_step("18E", "traffic_control_rule_utility_diagnostic_driving_mini")
-    if not bool(traffic_control_rule_utility_cfg.get("enabled", False)):
-        runner.log("18E", "disabled by config")
-        runner.complete_step("18E", subtitle="skipped")
-        return
-    runner.log("18E", f"cfg={traffic_control_rule_utility_cfg}")
-    runner.log("18E", f"recompute={bool(ctx.recompute_cfg.get('traffic_control_rule_utility_diagnostic', True))}")
-    with runner.module_output("18E"):
-        ctx.traffic_control_rule_utility_results = traffic_control_rule_utility_diagnostic_driving_mini.run(
-            extended_rule_results=ctx.extended_rule_results,
-            eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
-            rule_results_by_name=ctx.rule_results_by_name,
-            rule_aggregation_baseline_results=ctx.rule_aggregation_baseline_results,
-            cfg=traffic_control_rule_utility_cfg,
-            output_root=_get_traffic_control_rule_utility_diagnostic_output_root(),
-            force_recompute=bool(ctx.recompute_cfg.get("traffic_control_rule_utility_diagnostic", True)),
-        )
-    runner.log("18E", f"keys={len(list(ctx.traffic_control_rule_utility_results.get('rows', [])))}")
-    runner.complete_step(
-        "18E",
-        subtitle=f"keys={len(list(ctx.traffic_control_rule_utility_results.get('rows', [])))}",
-    )
-
-
-def run_step_18f_traffic_control_temporal_alignment(ctx: PipelineContext, runner: StepRunner) -> None:
-    temporal_alignment_cfg = _get_traffic_control_temporal_alignment_diagnostic_cfg()
-    runner.announce_step("18F", "traffic_control_temporal_alignment_diagnostic_driving_mini")
-    if not bool(temporal_alignment_cfg.get("enabled", False)):
-        runner.log("18F", "disabled by config")
-        runner.complete_step("18F", subtitle="skipped")
-        return
-    runner.log("18F", f"cfg={temporal_alignment_cfg}")
-    runner.log(
-        "18F",
-        f"recompute={bool(ctx.recompute_cfg.get('traffic_control_temporal_alignment_diagnostic', True))}",
-    )
-    with runner.module_output("18F"):
-        ctx.traffic_control_temporal_alignment_results = (
-            traffic_control_temporal_alignment_diagnostic_driving_mini.run(
-                logic_atom_results=ctx.logic_atom_results or [],
-                eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
-                cfg=temporal_alignment_cfg,
-                output_root=_get_traffic_control_temporal_alignment_diagnostic_output_root(),
-                force_recompute=bool(
-                    ctx.recompute_cfg.get("traffic_control_temporal_alignment_diagnostic", True)
-                ),
-            )
-        )
-    runner.log(
-        "18F",
-        f"segments={int(ctx.traffic_control_temporal_alignment_results.get('num_segments_with_any_traffic_control', 0))}",
-    )
-    runner.complete_step(
-        "18F",
-        subtitle=(
-            "segments="
-            f"{int(ctx.traffic_control_temporal_alignment_results.get('num_segments_with_any_traffic_control', 0))}"
-        ),
-    )
+    runner.log("19", f"classes={int(ctx.object_to_atom_coverage_results.get('num_classes', 0))}")
+    runner.complete_step("19", subtitle=f"classes={int(ctx.object_to_atom_coverage_results.get('num_classes', 0))}")
 
 
 def run_step_18g_traffic_light_detection_quality_audit(ctx: PipelineContext, runner: StepRunner) -> None:
@@ -2699,44 +2553,13 @@ def run_step_20_error_analysis(ctx: PipelineContext, runner: StepRunner) -> None
     )
 
 
-def run_step_21_vehicle_rule_diagnostic(ctx: PipelineContext, runner: StepRunner) -> None:
-    vehicle_rule_diagnostic_cfg = _get_vehicle_rule_diagnostic_cfg()
-    vehicle_rule_diagnostic_cfg["primary_rule_set"] = ctx.primary_rule_set
-    runner.announce_step("21", "vehicle_rule_diagnostic_driving_mini")
-    if not bool(vehicle_rule_diagnostic_cfg.get("enabled", False)):
-        runner.log("21", "disabled by config")
-        runner.complete_step("21", subtitle="skipped")
-        return
-    runner.log("21", f"cfg={vehicle_rule_diagnostic_cfg}")
-    runner.log("21", f"recompute={bool(ctx.recompute_cfg.get('vehicle_rule_diagnostic', True))}")
-    with runner.module_output("21"):
-        ctx.vehicle_rule_diagnostic_results = vehicle_rule_diagnostic_driving_mini.run(
-            merged_initial_rules=ctx.merged_candidate_rules,
-            extended_rule_results=ctx.extended_rule_results,
-            original_final_rule_results=ctx.final_rule_results,
-            diverse_final_rule_results=ctx.diverse_final_rule_results,
-            semantic_constrained_diverse_final_rule_results=ctx.semantic_constrained_diverse_rule_results,
-            coverage_family_aware_final_rule_results=ctx.coverage_family_aware_rule_results,
-            eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
-            evaluation_results_by_name=ctx.evaluation_results_by_name,
-            cfg=vehicle_rule_diagnostic_cfg,
-            output_root=_get_vehicle_rule_diagnostic_output_root(),
-            force_recompute=bool(ctx.recompute_cfg.get("vehicle_rule_diagnostic", True)),
-        )
-    runner.log("21", f"diagnosis={ctx.vehicle_rule_diagnostic_results.get('primary_diagnosis', 'unknown')}")
-    runner.complete_step(
-        "21",
-        subtitle=f"diagnosis={ctx.vehicle_rule_diagnostic_results.get('primary_diagnosis', 'unknown')}",
-    )
-
-
 def run_step_21b_fn_categorization(ctx: PipelineContext, runner: StepRunner) -> None:
     fn_categorization_cfg = _get_fn_categorization_diagnostic_cfg()
-    runner.announce_step("21B", "fn_categorization_diagnostic_driving_mini")
+    runner.announce_step("21", "fn_categorization_diagnostic_driving_mini")
     if bool(fn_categorization_cfg.get("enabled", False)):
-        runner.log("21B", f"cfg={fn_categorization_cfg}")
-        runner.log("21B", f"recompute={bool(ctx.recompute_cfg.get('fn_categorization_diagnostic', True))}")
-        with runner.module_output("21B"):
+        runner.log("21", f"cfg={fn_categorization_cfg}")
+        runner.log("21", f"recompute={bool(ctx.recompute_cfg.get('fn_categorization_diagnostic', True))}")
+        with runner.module_output("21"):
             ctx.fn_categorization_results = fn_categorization_diagnostic_driving_mini.run(
                 extended_rule_results=ctx.extended_rule_results,
                 rule_results_by_name=ctx.rule_results_by_name,
@@ -2748,11 +2571,11 @@ def run_step_21b_fn_categorization(ctx: PipelineContext, runner: StepRunner) -> 
                 output_root=_get_fn_categorization_diagnostic_output_root(),
                 force_recompute=bool(ctx.recompute_cfg.get("fn_categorization_diagnostic", True)),
             )
-        runner.log("21B", f"summary={ctx.fn_categorization_results.get('summary_path', '')}")
-        runner.complete_step("21B", subtitle="enabled")
+        runner.log("21", f"summary={ctx.fn_categorization_results.get('summary_path', '')}")
+        runner.complete_step("21", subtitle="enabled")
         return
-    runner.log("21B", "disabled by config")
-    runner.complete_step("21B", subtitle="skipped")
+    runner.log("21", "disabled by config")
+    runner.complete_step("21", subtitle="skipped")
 
 
 def run_step_22_rule_selection_visualization(ctx: PipelineContext, runner: StepRunner) -> None:
@@ -2795,33 +2618,33 @@ def run_step_23_integrated_visualization(ctx: PipelineContext, runner: StepRunne
 
 def run_step_24a_background_causal_prior(ctx: PipelineContext, runner: StepRunner) -> None:
     background_causal_prior_cfg = _get_background_causal_prior_cfg()
-    runner.announce_step("24A", "background_causal_prior_driving_mini")
+    runner.announce_step("24", "background_causal_prior_driving_mini")
     if not bool(background_causal_prior_cfg.get("enabled", False)):
-        runner.log("24A", "disabled by config")
-        runner.complete_step("24A", subtitle="skipped")
+        runner.log("24", "disabled by config")
+        runner.complete_step("24", subtitle="skipped")
         return
-    runner.log("24A", f"cfg={background_causal_prior_cfg}")
-    runner.log("24A", f"recompute={bool(ctx.recompute_cfg.get('background_causal_prior', True))}")
-    with runner.module_output("24A"):
+    runner.log("24", f"cfg={background_causal_prior_cfg}")
+    runner.log("24", f"recompute={bool(ctx.recompute_cfg.get('background_causal_prior', True))}")
+    with runner.module_output("24"):
         ctx.background_causal_prior_results = background_causal_prior_driving_mini.run(
             cfg=background_causal_prior_cfg,
             output_root=_get_background_causal_prior_output_root(),
             force_recompute=bool(ctx.recompute_cfg.get("background_causal_prior", True)),
         )
-    runner.log("24A", f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
-    runner.complete_step("24A", subtitle=f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
+    runner.log("24", f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
+    runner.complete_step("24", subtitle=f"entries={int(ctx.background_causal_prior_results.get('num_prior_entries', 0))}")
 
 
 def run_step_24b_reasoning_feedback_signal(ctx: PipelineContext, runner: StepRunner) -> None:
     reasoning_feedback_signal_cfg = _get_reasoning_feedback_signal_cfg()
-    runner.announce_step("24B", "reasoning_feedback_signal_driving_mini")
+    runner.announce_step("25", "reasoning_feedback_signal_driving_mini")
     if not bool(reasoning_feedback_signal_cfg.get("enabled", False)):
-        runner.log("24B", "disabled by config")
-        runner.complete_step("24B", subtitle="skipped")
+        runner.log("25", "disabled by config")
+        runner.complete_step("25", subtitle="skipped")
         return
-    runner.log("24B", f"cfg={reasoning_feedback_signal_cfg}")
-    runner.log("24B", f"recompute={bool(ctx.recompute_cfg.get('reasoning_feedback_signal', True))}")
-    with runner.module_output("24B"):
+    runner.log("25", f"cfg={reasoning_feedback_signal_cfg}")
+    runner.log("25", f"recompute={bool(ctx.recompute_cfg.get('reasoning_feedback_signal', True))}")
+    with runner.module_output("25"):
         ctx.reasoning_feedback_signal_results = reasoning_feedback_signal_driving_mini.run(
             background_causal_prior_results=ctx.background_causal_prior_results,
             primary_rule_results=ctx.rule_results_by_name.get(ctx.primary_rule_set, {}),
@@ -2834,11 +2657,11 @@ def run_step_24b_reasoning_feedback_signal(ctx: PipelineContext, runner: StepRun
             output_root=_get_reasoning_feedback_signal_output_root(),
             force_recompute=bool(ctx.recompute_cfg.get("reasoning_feedback_signal", True)),
         )
-    runner.log("24B", f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
-    runner.complete_step("24B", subtitle=f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
+    runner.log("25", f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
+    runner.complete_step("25", subtitle=f"requests={int(ctx.reasoning_feedback_signal_results.get('num_feedback_requests', 0))}")
 
 
-def _run_steps_through_19(
+def _run_pre_diagnostic_steps(
     ctx: PipelineContext,
     runner: StepRunner,
     *,
@@ -2908,38 +2731,28 @@ def _run_steps_through_19(
         run_step_18_rule_evaluation(ctx, runner)
     if _step_is_requested("18B", start_target=start_target, stop_target=stop_target):
         run_step_18b_baseline_comparison(ctx, runner)
-    if _step_is_requested("19", start_target=start_target, stop_target=stop_target):
-        run_step_19_reasoning_supervised_od_calibration(ctx, runner)
 
 
-def _run_post_loop_steps(
+def _run_downstream_steps(
     ctx: PipelineContext,
     runner: StepRunner,
     *,
     start_target: str,
     stop_target: str,
 ) -> None:
-    if _step_is_requested("18D", start_target=start_target, stop_target=stop_target):
+    if _step_is_requested("19", start_target=start_target, stop_target=stop_target):
         run_step_18d_object_to_atom_coverage(ctx, runner)
-    if _step_is_requested("18E", start_target=start_target, stop_target=stop_target):
-        run_step_18e_traffic_control_rule_utility(ctx, runner)
-    if _step_is_requested("18F", start_target=start_target, stop_target=stop_target):
-        run_step_18f_traffic_control_temporal_alignment(ctx, runner)
-    if _step_is_requested("18G", start_target=start_target, stop_target=stop_target):
-        run_step_18g_traffic_light_detection_quality_audit(ctx, runner)
     if _step_is_requested("20", start_target=start_target, stop_target=stop_target):
         run_step_20_error_analysis(ctx, runner)
     if _step_is_requested("21", start_target=start_target, stop_target=stop_target):
-        run_step_21_vehicle_rule_diagnostic(ctx, runner)
-    if _step_is_requested("21B", start_target=start_target, stop_target=stop_target):
         run_step_21b_fn_categorization(ctx, runner)
     if _step_is_requested("22", start_target=start_target, stop_target=stop_target):
         run_step_22_rule_selection_visualization(ctx, runner)
     if _step_is_requested("23", start_target=start_target, stop_target=stop_target):
         run_step_23_integrated_visualization(ctx, runner)
-    if _step_is_requested("24A", start_target=start_target, stop_target=stop_target):
+    if _step_is_requested("24", start_target=start_target, stop_target=stop_target):
         run_step_24a_background_causal_prior(ctx, runner)
-    if _step_is_requested("24B", start_target=start_target, stop_target=stop_target):
+    if _step_is_requested("25", start_target=start_target, stop_target=stop_target):
         run_step_24b_reasoning_feedback_signal(ctx, runner)
 
 
@@ -2978,9 +2791,9 @@ def _run_single_pass_pipeline(
             f"warm_start_from={start_target} using cached upstream artifacts through step 16",
         )
     _load_cached_upstream_context(ctx, start_target=effective_start_target, stop_target=stop_target)
-    _run_steps_through_19(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
-    if _stop_target_reaches("18D", stop_target):
-        _run_post_loop_steps(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
+    _run_pre_diagnostic_steps(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
+    if _stop_target_reaches("19", stop_target):
+        _run_downstream_steps(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
 
 
 def _run_od_calibration_loop(
@@ -3035,7 +2848,7 @@ def _run_od_calibration_loop(
             f"input_policy={od_calibration_policy_utils.policy_id(active_policy_before) or 'identity'} "
             f"force_recompute={iteration_force_full_recompute}",
         )
-        _run_steps_through_19(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
+        _run_pre_diagnostic_steps(ctx, runner, start_target=effective_start_target, stop_target=stop_target)
         decision = od_calibration_loop_utils.should_continue_after_iteration(
             ctx.baseline_safe_calibration_gate_results,
             iteration_index=iteration_index,
@@ -3071,8 +2884,8 @@ def parse_args() -> argparse.Namespace:
         "max_step",
         nargs="?",
         type=_parse_max_step_arg,
-        default="24",
-        help="Run through this step number or exact step id such as 17D or 18D.",
+        default="25",
+        help="Run through this step number or exact step id such as 17D or 18B.",
     )
     parser.add_argument(
         "--start-step",
@@ -3104,7 +2917,7 @@ def parse_args() -> argparse.Namespace:
         "--od-calibration-iterations",
         dest="od_calibration_iterations",
         type=int,
-        help="Override the configured maximum number of OD calibration loop iterations.",
+        help="Deprecated compatibility option; OD calibration steps are no longer part of the pipeline.",
     )
     parser.add_argument(
         "--recompute-preset",
@@ -3172,8 +2985,8 @@ def main(
             runner.log("19", f"od_calibration_loop_stop_reason={ctx.od_loop_stop_reason or 'completed'}")
             if resolved_stop_target == "19":
                 runner.stop_now()
-            if _stop_target_reaches("18D", resolved_stop_target):
-                _run_post_loop_steps(
+            if _stop_target_reaches("19", resolved_stop_target):
+                _run_downstream_steps(
                     ctx,
                     runner,
                     start_target=resolved_start_target,

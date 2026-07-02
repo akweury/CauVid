@@ -16,7 +16,7 @@ ego_motion:
   render_video: false
   smoothing_window: 5
   static_adjustment:
-    enabled: false
+    enabled: true
     static_object_keywords: [building, traffic light]
     blend_weight: 0.7
     min_static_pixels: 300
@@ -66,7 +66,7 @@ important_objects:
   selection_strategy: not_implemented
   passthrough_selected_objects: true
   candidate_selection:
-    enabled: false
+    enabled: true
     max_per_segment: 8
     max_per_class: 3
     max_per_prior: 2
@@ -131,17 +131,17 @@ pipeline_recompute:
   oracle_rule_selection_gap_diagnostic: true
   rule_evaluation: true
   candidate_contribution_summary: true
-  reasoning_to_od_pseudo_labels: true
-  od_confidence_calibration: true
+  reasoning_to_od_pseudo_labels: false
+  od_confidence_calibration: false
   rule_aggregation_baseline: true
-  baseline_safe_calibration_gate: true
+  baseline_safe_calibration_gate: false
   object_to_atom_coverage_diagnostic: true
-  traffic_control_rule_utility_diagnostic: true
-  traffic_control_temporal_alignment_diagnostic: true
-  traffic_light_detection_quality_audit: true
+  traffic_control_rule_utility_diagnostic: false
+  traffic_control_temporal_alignment_diagnostic: false
+  traffic_light_detection_quality_audit: false
   neural_symbolic_baseline: true
   error_and_explainability_analysis: true
-  vehicle_rule_diagnostic: true
+  vehicle_rule_diagnostic: false
   fn_categorization_diagnostic: true
   rule_selection_visualization: true
   integrated_method_visualization: true
@@ -293,7 +293,7 @@ coverage_family_aware_final_rules:
   negative_support_penalty: 0.1
 
 rule_pool_and_selector_diagnostic:
-  enabled: false
+  enabled: true
   top_single_rules: 100
   precision_thresholds: [0.5, 0.7, 0.9]
   f1_thresholds: [0.1, 0.2, 0.3, 0.4]
@@ -320,7 +320,7 @@ rule_evaluation:
   primary_rule_set: selected
 
 baseline_comparison:
-  enabled: false
+  enabled: true
   run_neural_symbolic: true
   run_rule_aggregation: true
 
@@ -348,13 +348,13 @@ baseline_safe_calibration_gate:
   final_f1_tolerance: 1.0e-09
 
 od_calibration_loop:
-  max_iterations: 3
+  max_iterations: 1
   force_full_recompute_on_policy_change: true
   stop_on_gate_reject: true
   stop_on_final_f1_plateau: true
 
 rule_aggregation_baseline:
-  enabled: false
+  enabled: true
   validation_fraction: 0.25
   class_weight: balanced
   c_values: [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
@@ -368,7 +368,7 @@ rule_aggregation_baseline:
   center_states: [centered]
 
 object_to_atom_coverage_diagnostic:
-  enabled: false
+  enabled: true
   class_aliases:
     traffic light: traffic_light
     traffic_light: traffic_light
@@ -414,11 +414,11 @@ traffic_light_detection_quality_audit:
   frame_path_roots: []
 
 background_causal_prior:
-  enabled: false
+  enabled: true
   target_predicate: brake_next
 
 reasoning_feedback_signal:
-  enabled: false
+  enabled: true
   target_predicate: brake_next
   primary_rule_set: original
   max_feedback_requests: 200
@@ -429,7 +429,7 @@ reasoning_feedback_signal:
   max_fired_rules_per_request: 6
 
 neural_symbolic_baseline:
-  enabled: false
+  enabled: true
   min_feature_count: 1
   probability_threshold: 0.5
   validation_fraction: 0.25
@@ -458,18 +458,18 @@ neural_symbolic_baseline:
     early_stopping_patience: 12
 
 rule_selection_visualization:
-  enabled: false
+  enabled: true
   top_rule_families: 8
   dpi: 160
   figure_format: png
 
 integrated_method_visualization:
-  enabled: false
+  enabled: true
   dpi: 170
   figure_format: png
 
 fn_categorization_diagnostic:
-  enabled: false
+  enabled: true
   vehicle_context_match_levels:
     - exact_vehicle_near_centered
     - vehicle_near_partial
@@ -483,7 +483,7 @@ fn_categorization_diagnostic:
     - unexplained_noise_or_symbol_gap
 
 error_and_explainability_analysis:
-  enabled: false
+  enabled: true
   vehicle_classes: [car, truck, bus, motorcycle, bicycle]
   dense_context_min_objects: 2
   overlap_rule_threshold: 10

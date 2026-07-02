@@ -18,7 +18,15 @@ video reasoning by nesy and causal models
    ```bash
    ./docker.sh prepare --gpu 2 --limit 961 --target-fps 5 --generate-depth --skip-existing
    ```
-6. Run the pipeline:
+6. First-time run with no precomputed cache:
    ```bash
-   ./docker.sh run --gpu 1 --data 200 --od-calibration-iterations 3 18J
+   ./docker.sh run --gpu 2 --recompute-preset full_pipeline 18
+   ```
+7. First-time 200-video run:
+   ```bash
+   ./docker.sh run --gpu 2 --data 200 --recompute-preset full_pipeline 18
+   ```
+8. Run downstream diagnostics after Step 18 artifacts exist:
+   ```bash
+   ./docker.sh run --gpu 2 --start-step 19 25
    ```
