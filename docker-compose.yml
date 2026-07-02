@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile
     container_name: cauvid-pipeline
     volumes:
+      - ./configs:/app/configs:ro
       # Mount raw server dataset and prepared dataset separately.
       - ${CAUVID_RAW_DRIVING_DATASET:-/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking}:/raw_driving_data:ro
       - ${CAUVID_DRIVING_MINI_HOST:-/storage-01/ml-jsha/CauVid_Data/driving_mini}:/dataset/driving_mini
@@ -29,10 +30,11 @@ services:
       - CAUVID_NUSCENES_PATH=/dataset/nuScenes
       - CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output
       - CAUVID_OUTPUT_PATH=/output/output
+      - CAUVID_PIPELINE_ARGS=${CAUVID_PIPELINE_ARGS:-}
     networks:
       - cauvid-network
     restart: "no"
-    command: ["python", "-m", "src.exp_driving_videos.exp_driving_pipeline"]
+    command: ["sh", "-c", "python -m src.exp_driving_videos.exp_driving_pipeline $${CAUVID_PIPELINE_ARGS}"]
 
   # Development service with interactive shell
   cauvid-dev:
@@ -56,12 +58,12 @@ services:
       - PYTHONPATH=/app
       - LOG_LEVEL=DEBUG
       - MPLBACKEND=Agg
-      - TORCH_HOME=/app/.cache/torch
-      - CAUVID_RAW_DRIVING_DATASET=/app/raw_driving_data
-      - CAUVID_DRIVING_MINI_PATH=/app/dataset/driving_mini
-      - CAUVID_NUSCENES_PATH=/app/dataset/nuScenes
-      - CAUVID_PIPELINE_OUTPUT_PATH=/app/pipeline_output
-      - CAUVID_OUTPUT_PATH=/app/output
+      - TORCH_HOME=/.cache/torch
+      - CAUVID_RAW_DRIVING_DATASET=/raw_driving_data
+      - CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini
+      - CAUVID_NUSCENES_PATH=/dataset/nuScenes
+      - CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output
+      - CAUVID_OUTPUT_PATH=/output/output
     networks:
       - cauvid-network
     stdin_open: true

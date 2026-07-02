@@ -53,6 +53,7 @@ print_help() {
     echo "  $0 build                    # Build the Docker image"
     echo "  $0 run --gpu 0              # Run pipeline on GPU 0"
     echo "  $0 run --gpu 0 4            # Run the pipeline through step 4"
+    echo "  $0 run --gpu 0 --start-step 18D 24B # Run downstream diagnostics with remote cached outputs"
     echo "  $0 run --gpu 1 --data 200 18J # Run step 18J over the first 200 videos"
     echo "  $0 run --gpu 1 --data 200 --od-calibration-iterations 3 18J # Run the OD calibration loop up to 3 iterations"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
@@ -199,11 +200,15 @@ get_torch_cache_dir() {
     echo "${CAUVID_TORCH_CACHE_HOST:-$storage_root/.cache/torch}"
 }
 
+get_configs_dir() {
+    echo "${CAUVID_CONFIG_HOST:-$(pwd)/configs}"
+}
+
 run_pipeline() {
     log "Running driving perception-to-matrix preprocessing..."
     
     # Create writable host directories for outputs, logs, and model cache.
-    local raw_dataset prepared_dataset nuscenes_dataset_root pipeline_output_dir output_dir logs_dir torch_cache_dir
+    local raw_dataset prepared_dataset nuscenes_dataset_root pipeline_output_dir output_dir logs_dir torch_cache_dir configs_dir
     raw_dataset="$(get_raw_dataset)"
     prepared_dataset="$(get_prepared_dataset)"
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
@@ -211,10 +216,12 @@ run_pipeline() {
     output_dir="$(get_output_dir)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
+    configs_dir="$(get_configs_dir)"
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
         "${DOCKER_GPU_ARGS[@]}" \
+        -v "$configs_dir:/app/configs:ro" \
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
@@ -289,7 +296,7 @@ run_demo() {
             ;;
     esac
     
-    local raw_dataset prepared_dataset nuscenes_dataset_root pipeline_output_dir output_dir logs_dir torch_cache_dir
+    local raw_dataset prepared_dataset nuscenes_dataset_root pipeline_output_dir output_dir logs_dir torch_cache_dir configs_dir
     raw_dataset="$(get_raw_dataset)"
     prepared_dataset="$(get_prepared_dataset)"
     nuscenes_dataset_root="$(get_nuscenes_dataset_root)"
@@ -297,10 +304,12 @@ run_demo() {
     output_dir="$(get_output_dir)"
     logs_dir="$(get_logs_dir)"
     torch_cache_dir="$(get_torch_cache_dir)"
+    configs_dir="$(get_configs_dir)"
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
     
     docker run --rm \
         "${DOCKER_GPU_ARGS[@]}" \
+        -v "$configs_dir:/app/configs:ro" \
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
