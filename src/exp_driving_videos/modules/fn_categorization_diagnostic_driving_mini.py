@@ -69,6 +69,8 @@ def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) ->
 
 
 def _read_csv(path: Path) -> List[Dict[str, Any]]:
+    if not path.is_file():
+        return []
     with path.open("r", encoding="utf-8", newline="") as fh:
         return [dict(row) for row in csv.DictReader(fh)]
 
@@ -245,8 +247,9 @@ def process_diagnostic(
     selector_summary_rows: List[Dict[str, Any]] = []
     selector_output_paths: Dict[str, str] = {}
 
-    step20_eval_context_path = Path(str(vehicle_rule_diagnostic_results.get("eval_context_summary_path", "")))
-    step20_eval_context_rows = _read_csv(step20_eval_context_path) if step20_eval_context_path.exists() else []
+    eval_context_path_text = str(vehicle_rule_diagnostic_results.get("eval_context_summary_path", "")).strip()
+    step20_eval_context_path = Path(eval_context_path_text) if eval_context_path_text else None
+    step20_eval_context_rows = _read_csv(step20_eval_context_path) if step20_eval_context_path is not None else []
 
     for selector_name in [name for name in _SELECTOR_ORDER if name in rule_results_by_name]:
         selected_rule_ids = {str(rule.get("rule_id", "")) for rule in list(rule_results_by_name[selector_name].get("final_rules", []))}
@@ -255,8 +258,9 @@ def process_diagnostic(
         ]
 
         error_manifest = dict(error_analysis_results_by_name.get(selector_name, {}))
-        fn_examples_path = Path(str(error_manifest.get("fn_examples_path", "")))
-        fn_rows = _read_csv(fn_examples_path) if fn_examples_path.exists() else []
+        fn_examples_path_text = str(error_manifest.get("fn_examples_path", "")).strip()
+        fn_examples_path = Path(fn_examples_path_text) if fn_examples_path_text else None
+        fn_rows = _read_csv(fn_examples_path) if fn_examples_path is not None else []
         recovered_by_other: Dict[str, List[str]] = {}
         for other_selector_name in [name for name in _SELECTOR_ORDER if name in evaluation_results_by_name and name != selector_name]:
             predicted_ids = set(evaluation_results_by_name.get(other_selector_name, {}).get("predicted_positive_example_ids", []))
@@ -359,7 +363,7 @@ def process_diagnostic(
         "num_all_kept_rules": len(all_kept_rules),
         "selector_output_paths": selector_output_paths,
         "summary_path": str(summary_path),
-        "step20_eval_context_summary_path": str(step20_eval_context_path),
+        "step20_eval_context_summary_path": eval_context_path_text,
         "step20_eval_context_num_rows": len(step20_eval_context_rows),
     }
 
