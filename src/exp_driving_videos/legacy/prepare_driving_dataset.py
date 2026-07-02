@@ -27,7 +27,7 @@ from pathlib import Path
 import config
 
 
-DEFAULT_RAW_ROOT = Path("/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking")
+DEFAULT_RAW_ROOT = Path("/storage-02/ml-jsha/driving-video-with-object-tracking")
 
 
 def _resolve_raw_root(raw_root: str | None) -> Path:

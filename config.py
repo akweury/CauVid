@@ -10,8 +10,21 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.absolute()
 driving_demo_video_id = "0153f03b-8fbdc1ad"
 # driving_demo_video_id = "01118704-e91b1b1c"
-DEFAULT_STORAGE_ROOT = Path("/storage-01/ml-jsha/CauVid_Data")
-DEFAULT_RAW_DRIVING_DATASET = Path("/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking")
+DEFAULT_STORAGE_ROOT_CANDIDATES = [
+    Path(os.environ["CAUVID_STORAGE_ROOT"]) if os.environ.get("CAUVID_STORAGE_ROOT") else None,
+    Path("/storage-02/ml-jsha"),
+    Path("/storage-01/ml-jsha/CauVid_Data"),
+]
+DEFAULT_STORAGE_ROOT = next(
+    (path for path in DEFAULT_STORAGE_ROOT_CANDIDATES if path is not None and path.exists()),
+    Path("/storage-02/ml-jsha"),
+)
+DEFAULT_RAW_DRIVING_DATASET = Path(
+    os.environ.get(
+        "CAUVID_RAW_DRIVING_DATASET",
+        DEFAULT_STORAGE_ROOT / "driving-video-with-object-tracking",
+    )
+)
 DEFAULT_OUTPUT_ROOT = Path(os.environ.get("CAUVID_OUTPUT_PATH", PROJECT_ROOT / "output"))
 DEFAULT_PIPELINE_OUTPUT_ROOT = Path(os.environ.get("CAUVID_PIPELINE_OUTPUT_PATH", PROJECT_ROOT / "pipeline_output"))
 DEFAULT_TEMP_ROOT = Path(os.environ.get("CAUVID_TEMP_PATH", PROJECT_ROOT / "temp"))
@@ -140,5 +153,4 @@ if __name__ == "__main__":
     print(f"Project root: {PROJECT_ROOT}")
     for name, path in DATASET_PATHS.items():
         print(f"  {name}: {path}")
-
 

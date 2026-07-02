@@ -1107,6 +1107,30 @@ def _warm_start_blocker_reason(ctx: PipelineContext) -> str:
             )
     return ""
 
+
+def _prepared_frames_root_available() -> bool:
+    try:
+        return detect_driving_mini.get_frames_root().is_dir()
+    except Exception:
+        return False
+
+
+def _raise_warm_start_without_frames(
+    *,
+    start_target: str,
+    warm_start_blocker: str,
+) -> None:
+    frames_root = detect_driving_mini.get_frames_root()
+    detection_manifest = detect_driving_mini.get_output_root() / "detection_manifest.json"
+    raise RuntimeError(
+        "Cannot warm-start the requested downstream pipeline run, and full recompute is not possible "
+        f"because prepared frames are missing at {frames_root}. "
+        f"requested_start_step={start_target}; warm_start_blocker={warm_start_blocker}. "
+        f"For remote Docker runs, either mount a prepared driving_mini directory containing frames/ "
+        "via CAUVID_DRIVING_MINI_HOST, or make the mounted pipeline_output cache/configs match so "
+        f"warm-start can use cached artifacts through step 16. Detection manifest checked: {detection_manifest}."
+    )
+
 def _rule_body_length(rule: Dict[str, Any]) -> int:
     templates = rule.get("body_atom_templates")
     if isinstance(templates, list):
@@ -2938,6 +2962,11 @@ def _run_single_pass_pipeline(
     if _stage_index(start_target) > _stage_index("16"):
         warm_start_blocker = _warm_start_blocker_reason(ctx)
     if warm_start_blocker:
+        if not _prepared_frames_root_available():
+            _raise_warm_start_without_frames(
+                start_target=start_target,
+                warm_start_blocker=warm_start_blocker,
+            )
         runner.log(
             start_target,
             f"warm_start_unavailable={warm_start_blocker}; falling back to step 0 recompute",
@@ -2982,6 +3011,11 @@ def _run_od_calibration_loop(
         if _stage_index(start_target) > _stage_index("16"):
             warm_start_blocker = _warm_start_blocker_reason(ctx)
         if warm_start_blocker:
+            if not _prepared_frames_root_available():
+                _raise_warm_start_without_frames(
+                    start_target=start_target,
+                    warm_start_blocker=warm_start_blocker,
+                )
             runner.log(
                 "19",
                 f"warm_start_unavailable={warm_start_blocker}; falling back to step 0 recompute",

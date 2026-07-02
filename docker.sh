@@ -16,8 +16,14 @@ NC='\033[0m' # No Color
 IMAGE_NAME="cauvid-pipeline"
 CONTAINER_NAME="cauvid-app"
 VERSION="latest"
-REMOTE_STORAGE_ROOT="/storage-01/ml-jsha/CauVid_Data"
-REMOTE_OUTPUT_ROOT="/storage-01/ml-jsha/CauVid_output"
+REMOTE_STORAGE_ROOTS=(
+    "/storage-02/ml-jsha"
+    "/storage-01/ml-jsha/CauVid_Data"
+)
+REMOTE_OUTPUT_ROOTS=(
+    "/storage-02/ml-jsha"
+    "/storage-01/ml-jsha/CauVid_output"
+)
 
 # Functions
 print_help() {
@@ -45,8 +51,8 @@ print_help() {
     echo "  -f, --force      Force rebuild/restart"
     echo "  -g, --gpu ID     Use a specific GPU device, e.g. 0 or all"
     echo "  run/preprocess args such as --data N, --od-calibration-iterations N, and step ids are forwarded to the pipeline"
-    echo "  CAUVID_STORAGE_ROOT defaults data to /storage-01/ml-jsha/CauVid_Data when present"
-    echo "  CAUVID_OUTPUT_ROOT defaults outputs to /storage-01/ml-jsha/CauVid_output when present"
+    echo "  CAUVID_STORAGE_ROOT defaults data to /storage-02/ml-jsha when present, then legacy /storage-01/ml-jsha/CauVid_Data"
+    echo "  CAUVID_OUTPUT_ROOT defaults outputs to /storage-02/ml-jsha when present, then legacy /storage-01/ml-jsha/CauVid_output"
     echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" enables GPU access for docker run"
     echo ""
     echo "Examples:"
@@ -56,7 +62,7 @@ print_help() {
     echo "  $0 run --gpu 0 --start-step 18D 24B # Run downstream diagnostics with remote cached outputs"
     echo "  $0 run --gpu 1 --data 200 18J # Run step 18J over the first 200 videos"
     echo "  $0 run --gpu 1 --data 200 --od-calibration-iterations 3 18J # Run the OD calibration loop up to 3 iterations"
-    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-01/ml-jsha/CauVid_Data/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
+    echo "  CAUVID_DOCKER_GPU_ARGS=\"--gpus all\" CAUVID_RAW_DRIVING_DATASET=/storage-02/ml-jsha/driving-video-with-object-tracking $0 prepare --limit 1000 --target-fps 5 --generate-depth"
     echo "  $0 run                      # Run driving preprocessing over dataset/driving_mini/videos"
     echo "  $0 preprocess               # Same as run"
     echo "  $0 demo                     # Run advanced features demo"
@@ -141,9 +147,14 @@ build_image() {
 get_storage_root() {
     if [ -n "${CAUVID_STORAGE_ROOT:-}" ]; then
         echo "$CAUVID_STORAGE_ROOT"
-    elif [ -d "$REMOTE_STORAGE_ROOT" ]; then
-        echo "$REMOTE_STORAGE_ROOT"
     else
+        local candidate
+        for candidate in "${REMOTE_STORAGE_ROOTS[@]}"; do
+            if [ -d "$candidate" ]; then
+                echo "$candidate"
+                return
+            fi
+        done
         echo "$(pwd)"
     fi
 }
@@ -151,9 +162,14 @@ get_storage_root() {
 get_output_root() {
     if [ -n "${CAUVID_OUTPUT_ROOT:-}" ]; then
         echo "$CAUVID_OUTPUT_ROOT"
-    elif [ -d "$REMOTE_OUTPUT_ROOT" ]; then
-        echo "$REMOTE_OUTPUT_ROOT"
     else
+        local candidate
+        for candidate in "${REMOTE_OUTPUT_ROOTS[@]}"; do
+            if [ -d "$candidate" ]; then
+                echo "$candidate"
+                return
+            fi
+        done
         echo "$(get_storage_root)"
     fi
 }
@@ -488,6 +504,32 @@ FORCE=false
 GPU_ID=""
 PASSTHROUGH_ARGS=()
 
+collect_passthrough_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -g|--gpu)
+                if [ $# -lt 2 ]; then
+                    error "Missing value for $1"
+                fi
+                GPU_ID="$2"
+                shift 2
+                ;;
+            *)
+                PASSTHROUGH_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         build)
@@ -497,7 +539,7 @@ while [[ $# -gt 0 ]]; do
         prepare)
             COMMAND="prepare"
             shift
-            PASSTHROUGH_ARGS=("$@")
+            collect_passthrough_args "$@"
             break
             ;;
         run)
@@ -511,15 +553,7 @@ while [[ $# -gt 0 ]]; do
         download-nuscenes)
             COMMAND="download-nuscenes"
             shift
-            # Strip shell-level flags (-f/--force/-v/--verbose) so they are not
-            # forwarded to the Python script, which does not understand them.
-            for _arg in "$@"; do
-                case "$_arg" in
-                    -f|--force)   FORCE=true ;;
-                    -v|--verbose) VERBOSE=true ;;
-                    *)            PASSTHROUGH_ARGS+=("$_arg") ;;
-                esac
-            done
+            collect_passthrough_args "$@"
             break
             ;;
         demo)
