@@ -854,7 +854,11 @@ def _cached_manifest_video_ids(
     ]
 
 
-def _load_cached_detection_results(selected_video_ids: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+def _load_cached_detection_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+    *,
+    skip_invalid: bool = False,
+) -> List[Dict[str, Any]]:
     output_root = detect_driving_mini.get_output_root()
     manifest = _read_cached_json(output_root / "detection_manifest.json", label="step 1 detection manifest")
     video_entries = {
@@ -874,11 +878,20 @@ def _load_cached_detection_results(selected_video_ids: Optional[Sequence[str]] =
             "Restart from step 1 to rebuild the cache for this selection."
         )
     results: List[Dict[str, Any]] = []
+    skipped_invalid: List[str] = []
     for video_id in requested_video_ids:
         entry = video_entries[video_id]
         detections_path_text = str(entry.get("detections_json", "")).strip()
         detections_path = Path(detections_path_text) if detections_path_text else output_root / video_id / "detections.json"
-        results.append(_read_cached_json(detections_path, label=f"step 1 detection result for {video_id}"))
+        try:
+            results.append(_read_cached_json(detections_path, label=f"step 1 detection result for {video_id}"))
+        except (json.JSONDecodeError, RuntimeError) as exc:
+            if not skip_invalid:
+                raise
+            skipped_invalid.append(video_id)
+            print(f"  [warn] skipping invalid cached detection result for {video_id}: {exc}")
+    if skipped_invalid:
+        print(f"  [warn] skipped {len(skipped_invalid)} invalid cached detection result(s)")
     return results
 
 
@@ -960,9 +973,9 @@ def _load_cached_upstream_context(
 
     if (
         bool(_get_object_to_atom_coverage_diagnostic_cfg().get("enabled", False))
-        and _stop_target_reaches("19", stop_target)
+        and _step_is_requested("19", start_target=start_target, stop_target=stop_target)
     ):
-        ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids)
+        ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids, skip_invalid=True)
         ctx.dataset_annotation_results = _load_cached_video_results(
             output_root=dataset_annotations_driving_mini.get_output_root(),
             manifest_name="dataset_annotations_manifest.json",
