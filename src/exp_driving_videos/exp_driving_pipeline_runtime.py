@@ -1529,6 +1529,10 @@ def _write_rule_set_error_comparison(
     }
 
 
+def _count_temporal_rule_examples(video_results: Sequence[Dict[str, Any]] | None) -> int:
+    return sum(len(list(dict(video_result).get("examples", []))) for video_result in list(video_results or []))
+
+
 def _prepare_rule_learning_inputs(ctx: PipelineContext) -> None:
     split_cfg = _get_data_split_cfg()
     temporal_rule_results = list(ctx.temporal_rule_results or [])
@@ -2317,40 +2321,69 @@ def run_step_18b_baseline_comparison(ctx: PipelineContext, runner: StepRunner) -
         return
 
     ran_any = False
+    train_example_count = _count_temporal_rule_examples(ctx.train_temporal_rule_results)
+    eval_example_count = _count_temporal_rule_examples(ctx.eval_temporal_rule_results)
+    runner.log(
+        "18B",
+        f"baseline_input train_examples={train_example_count} eval_examples={eval_example_count}",
+    )
+    if train_example_count <= 0 or eval_example_count <= 0:
+        runner.log(
+            "18B",
+            "skipping baselines: empty train/eval temporal rule examples "
+            f"(train={train_example_count}, eval={eval_example_count})",
+        )
+        runner.complete_step("18B", subtitle="skipped_empty_split")
+        return
+
     if bool(baseline_cfg.get("run_neural_symbolic", True)):
         neural_symbolic_baseline_cfg = _get_neural_symbolic_baseline_cfg()
         runner.log("18B", f"neural_symbolic_cfg={neural_symbolic_baseline_cfg}")
-        with runner.module_output("18B"):
-            ctx.neural_symbolic_baseline_results = neural_symbolic_baseline_driving_mini.run(
-                train_temporal_rule_results=ctx.train_temporal_rule_results or [],
-                eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
-                split_manifest=ctx.split_manifest,
-                cfg=neural_symbolic_baseline_cfg,
-                output_root=_get_neural_symbolic_baseline_output_root(),
-                force_recompute=bool(ctx.recompute_cfg.get("neural_symbolic_baseline", True)),
-            )
-        ran_any = True
+        try:
+            with runner.module_output("18B"):
+                ctx.neural_symbolic_baseline_results = neural_symbolic_baseline_driving_mini.run(
+                    train_temporal_rule_results=ctx.train_temporal_rule_results or [],
+                    eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+                    split_manifest=ctx.split_manifest,
+                    cfg=neural_symbolic_baseline_cfg,
+                    output_root=_get_neural_symbolic_baseline_output_root(),
+                    force_recompute=bool(ctx.recompute_cfg.get("neural_symbolic_baseline", True)),
+                )
+            ran_any = True
+        except RuntimeError as exc:
+            ctx.neural_symbolic_baseline_results = {
+                "skipped": True,
+                "skip_reason": str(exc),
+            }
+            runner.log("18B", f"neural_symbolic_skipped={exc}")
 
     if bool(baseline_cfg.get("run_rule_aggregation", True)):
         rule_aggregation_baseline_cfg = _get_rule_aggregation_baseline_cfg()
         runner.log("18B", f"rule_aggregation_cfg={rule_aggregation_baseline_cfg}")
-        with runner.module_output("18B"):
-            ctx.rule_aggregation_baseline_results = rule_aggregation_baseline_driving_mini.run(
-                extended_rule_results=ctx.extended_rule_results,
-                train_temporal_rule_results=ctx.train_temporal_rule_results or [],
-                eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
-                split_manifest=ctx.split_manifest,
-                cfg=rule_aggregation_baseline_cfg,
-                output_root=_get_rule_aggregation_baseline_output_root(),
-                force_recompute=bool(ctx.recompute_cfg.get("rule_aggregation_baseline", True)),
-            )
-        ran_any = True
+        try:
+            with runner.module_output("18B"):
+                ctx.rule_aggregation_baseline_results = rule_aggregation_baseline_driving_mini.run(
+                    extended_rule_results=ctx.extended_rule_results,
+                    train_temporal_rule_results=ctx.train_temporal_rule_results or [],
+                    eval_temporal_rule_results=ctx.eval_temporal_rule_results or [],
+                    split_manifest=ctx.split_manifest,
+                    cfg=rule_aggregation_baseline_cfg,
+                    output_root=_get_rule_aggregation_baseline_output_root(),
+                    force_recompute=bool(ctx.recompute_cfg.get("rule_aggregation_baseline", True)),
+                )
+            ran_any = True
+        except RuntimeError as exc:
+            ctx.rule_aggregation_baseline_results = {
+                "skipped": True,
+                "skip_reason": str(exc),
+            }
+            runner.log("18B", f"rule_aggregation_skipped={exc}")
 
-    if ctx.neural_symbolic_baseline_results:
+    if ctx.neural_symbolic_baseline_results and not bool(ctx.neural_symbolic_baseline_results.get("skipped", False)):
         comparison_rows = list(ctx.neural_symbolic_baseline_results.get("comparison", []))
         if comparison_rows:
             runner.log("18B", f"neural_models={len(comparison_rows)}")
-    if ctx.rule_aggregation_baseline_results:
+    if ctx.rule_aggregation_baseline_results and not bool(ctx.rule_aggregation_baseline_results.get("skipped", False)):
         eval_best = dict(
             ctx.rule_aggregation_baseline_results.get("metrics_by_split", {})
             .get("eval", {})
