@@ -58,8 +58,9 @@ COPY LICENSE ./
 RUN mkdir -p temp external && \
     git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git external/Depth-Anything-3
 
-# Set Python path to include the project root for src.* imports
-ENV PYTHONPATH="${PYTHONPATH}:/app"
+# Set Python path to include the project root for src.* imports and the
+# vendored Depth Anything 3 source tree.
+ENV PYTHONPATH="${PYTHONPATH}:/app:/app/external/Depth-Anything-3/src"
 
 # Expose port if needed (for future web interface)
 EXPOSE 8080

@@ -245,7 +245,7 @@ run_pipeline() {
         -v "$output_dir:/output/output" \
         -v "$logs_dir:/logs" \
         -v "$torch_cache_dir:/.cache/torch" \
-        -e PYTHONPATH=/app \
+        -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/.cache/torch \
         -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
@@ -277,11 +277,10 @@ prepare_driving_dataset() {
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
-        -v "$(pwd)/external:/app/external:ro" \
         -v "$output_dir:/output/output" \
         -v "$logs_dir:/logs" \
         -v "$torch_cache_dir:/.cache/torch" \
-        -e PYTHONPATH=/app \
+        -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/.cache/torch \
         -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
@@ -333,7 +332,7 @@ run_demo() {
         -v "$output_dir:/output/output" \
         -v "$logs_dir:/logs" \
         -v "$torch_cache_dir:/.cache/torch" \
-        -e PYTHONPATH=/app \
+        -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/.cache/torch \
         -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
@@ -371,12 +370,11 @@ start_dev() {
         -v "$raw_dataset:/raw_driving_data:ro" \
         -v "$prepared_dataset:/dataset/driving_mini" \
         -v "$nuscenes_dataset_root:/dataset/nuScenes" \
-        -v "$(pwd)/external:/app/external:ro" \
         -v "$pipeline_output_dir:/output/pipeline_output" \
         -v "$output_dir:/output/output" \
         -v "$logs_dir:/logs" \
         -v "$torch_cache_dir:/.cache/torch" \
-        -e PYTHONPATH=/app \
+        -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/.cache/torch \
         -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
@@ -435,7 +433,7 @@ download_nuscenes() {
         -v "$logs_dir:/logs" \
         -v "$torch_cache_dir:/.cache/torch" \
         -v "$user_cache_dir:/.cache/user" \
-        -e PYTHONPATH=/app \
+        -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
         -e MPLBACKEND=Agg \
         -e TORCH_HOME=/.cache/torch \
         -e HOME=/.cache/user \

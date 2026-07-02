@@ -12,7 +12,6 @@ services:
       - ${CAUVID_RAW_DRIVING_DATASET:-/storage-02/ml-jsha/driving-video-with-object-tracking}:/raw_driving_data:ro
       - ${CAUVID_DRIVING_MINI_HOST:-/storage-02/ml-jsha/driving_mini}:/dataset/driving_mini
       - ${CAUVID_NUSCENES_HOST:-/storage-02/ml-jsha/nuScenes}:/dataset/nuScenes
-      - ./external:/app/external:ro
       # Mount output directories for results and visualizations
       - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-02/ml-jsha/pipeline_output}:/output/pipeline_output
       - ${CAUVID_OUTPUT_HOST:-/storage-02/ml-jsha/output}:/output/output
@@ -21,7 +20,7 @@ services:
       # Persist downloaded torchvision model weights across runs
       - ${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}:/.cache/torch
     environment:
-      - PYTHONPATH=/app
+      - PYTHONPATH=/app:/app/external/Depth-Anything-3/src
       - LOG_LEVEL=INFO
       - MPLBACKEND=Agg
       - TORCH_HOME=/.cache/torch
@@ -49,13 +48,12 @@ services:
       - ${CAUVID_RAW_DRIVING_DATASET:-/storage-02/ml-jsha/driving-video-with-object-tracking}:/raw_driving_data:ro
       - ${CAUVID_DRIVING_MINI_HOST:-/storage-02/ml-jsha/driving_mini}:/dataset/driving_mini
       - ${CAUVID_NUSCENES_HOST:-/storage-02/ml-jsha/nuScenes}:/dataset/nuScenes
-      - ./external:/app/external:ro
       - ${CAUVID_PIPELINE_OUTPUT_HOST:-/storage-02/ml-jsha/pipeline_output}:/output/pipeline_output
       - ${CAUVID_OUTPUT_HOST:-/storage-02/ml-jsha/output}:/output/output
       - ${CAUVID_LOGS_HOST:-/storage-02/ml-jsha/logs}:/logs
       - ${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}:/.cache/torch
     environment:
-      - PYTHONPATH=/app
+      - PYTHONPATH=/app:/app/external/Depth-Anything-3/src
       - LOG_LEVEL=DEBUG
       - MPLBACKEND=Agg
       - TORCH_HOME=/.cache/torch
