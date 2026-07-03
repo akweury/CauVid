@@ -40,7 +40,7 @@ from src.exp_driving_videos.modules.evaluate_rules_driving_mini import (
 )
 
 
-_ANALYSIS_VERSION = 1
+_ANALYSIS_VERSION = 2
 
 
 def get_output_root() -> Path:
@@ -55,6 +55,8 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "dense_context_min_objects": int(cfg.get("dense_context_min_objects", 2)),
         "overlap_rule_threshold": int(cfg.get("overlap_rule_threshold", 10)),
         "rule_set_name": str(cfg.get("rule_set_name", "")),
+        "causal_masking_result_json": str(cfg.get("causal_masking_result_json", "")),
+        "causal_masking_version": int(cfg.get("causal_masking_version", 0)),
     }
 
 
@@ -266,10 +268,111 @@ def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) ->
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def _json_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if str(item)]
+    return []
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _load_causal_example_summaries(
+    causal_masking_results: Optional[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    if not causal_masking_results:
+        return {}
+    output_paths = dict(causal_masking_results.get("output_paths", {}))
+    summary_path = Path(str(output_paths.get("example_causal_summary_csv", "")))
+    if not summary_path.exists():
+        return {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    with summary_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            example_id = str(row.get("example_id", ""))
+            if not example_id:
+                continue
+            rows[example_id] = {
+                "causal_masking_available": True,
+                "num_causal_prediction_flip_rules": int(row.get("num_prediction_flip_rules") or 0),
+                "num_causal_helpful_rules": int(row.get("num_helpful_rules") or 0),
+                "num_causal_harmful_rules": int(row.get("num_harmful_rules") or 0),
+                "num_causal_non_decisive_contribution_rules": int(
+                    row.get("num_non_decisive_contribution_rules") or 0
+                ),
+                "num_causal_redundant_rules": int(row.get("num_redundant_rules") or 0),
+                "causal_redundant_fraction": float(row.get("redundant_fraction") or 0.0),
+                "has_key_causal_rule": _as_bool(row.get("has_key_causal_rule", False)),
+                "has_many_redundant_rules": _as_bool(row.get("has_many_redundant_rules", False)),
+                "key_causal_rule_id": str(row.get("key_causal_rule_id", "")),
+                "key_causal_influence_type": str(row.get("key_causal_influence_type", "")),
+                "max_causal_score_delta": float(row.get("max_score_delta") or 0.0),
+                "causal_error_rule_ids": _json_list(row.get("causal_error_rule_ids", "")),
+                "necessary_support_rule_ids": _json_list(row.get("necessary_support_rule_ids", "")),
+            }
+    return rows
+
+
+def _causal_cache_cfg(causal_masking_results: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not causal_masking_results:
+        return {
+            "causal_masking_result_json": "",
+            "causal_masking_version": 0,
+        }
+    output_paths = dict(causal_masking_results.get("output_paths", {}))
+    return {
+        "causal_masking_result_json": str(output_paths.get("result_json", "")),
+        "causal_masking_version": int(causal_masking_results.get("version", 0)),
+    }
+
+
+def _empty_causal_fields() -> Dict[str, Any]:
+    return {
+        "causal_masking_available": False,
+        "num_causal_prediction_flip_rules": 0,
+        "num_causal_helpful_rules": 0,
+        "num_causal_harmful_rules": 0,
+        "num_causal_non_decisive_contribution_rules": 0,
+        "num_causal_redundant_rules": 0,
+        "causal_redundant_fraction": 0.0,
+        "has_key_causal_rule": False,
+        "has_many_redundant_rules": False,
+        "key_causal_rule_id": "",
+        "key_causal_influence_type": "",
+        "max_causal_score_delta": 0.0,
+        "causal_error_rule_ids": [],
+        "necessary_support_rule_ids": [],
+    }
+
+
+def _causal_fields_for_example(
+    example_id: str,
+    causal_summaries: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    fields = {**_empty_causal_fields(), **dict(causal_summaries.get(str(example_id), {}))}
+    fields["causal_error_rule_ids"] = json.dumps(list(fields.get("causal_error_rule_ids", [])))
+    fields["necessary_support_rule_ids"] = json.dumps(list(fields.get("necessary_support_rule_ids", [])))
+    return fields
+
+
 def process_analysis(
     final_rule_results: Dict[str, Any],
     temporal_rule_results: List[Dict[str, Any]],
     evaluation_results: Dict[str, Any],
+    causal_masking_results: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -277,6 +380,7 @@ def process_analysis(
     cfg = cfg or {}
     out_root = output_root or get_output_root()
     out_root.mkdir(parents=True, exist_ok=True)
+    cache_cfg = {**cfg, **_causal_cache_cfg(causal_masking_results)}
 
     manifest_path = out_root / "error_and_explainability_manifest.json"
     fn_path = out_root / "fn_examples.csv"
@@ -290,11 +394,12 @@ def process_analysis(
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _ANALYSIS_VERSION and _cfg_key_subset(
             cached.get("config", {})
-        ) == _cfg_key_subset(cfg):
+        ) == _cfg_key_subset(cache_cfg):
             print(f"  [cache] loading {manifest_path.name}")
             return cached
 
     final_rules = list(final_rule_results.get("final_rules", []))
+    causal_summaries = _load_causal_example_summaries(causal_masking_results)
     per_video_metrics = {
         str(item.get("video_id", "")): dict(item)
         for item in list(evaluation_results.get("per_video_metrics", []))
@@ -308,6 +413,7 @@ def process_analysis(
     for example in _iter_eval_examples(temporal_rule_results):
         matching_rule_ids = _matching_rule_ids_for_example(example, final_rules)
         row = _build_example_feature_row(example=example, matching_rule_ids=matching_rule_ids, cfg=cfg)
+        row.update(_causal_fields_for_example(str(row.get("example_id", "")), causal_summaries))
         example_rows.append(row)
         is_error = bool(row["label"]) != bool(row["predicted_positive"])
         if is_error:
@@ -337,6 +443,20 @@ def process_analysis(
         "nearest_object_distance_state",
         "nearest_object_x_position_state",
         "explainability_level",
+        "causal_masking_available",
+        "num_causal_prediction_flip_rules",
+        "num_causal_helpful_rules",
+        "num_causal_harmful_rules",
+        "num_causal_non_decisive_contribution_rules",
+        "num_causal_redundant_rules",
+        "causal_redundant_fraction",
+        "has_key_causal_rule",
+        "has_many_redundant_rules",
+        "key_causal_rule_id",
+        "key_causal_influence_type",
+        "max_causal_score_delta",
+        "causal_error_rule_ids",
+        "necessary_support_rule_ids",
     ]
     _write_csv(fn_path, example_fieldnames, fn_rows)
     _write_csv(fp_path, example_fieldnames, fp_rows)
@@ -551,11 +671,24 @@ def process_analysis(
 
     manifest = {
         "version": _ANALYSIS_VERSION,
-        "config": _cfg_key_subset(cfg),
+        "config": _cfg_key_subset(cache_cfg),
         "rule_set_name": str(cfg.get("rule_set_name", "")),
         "num_rules": int(final_rule_results.get("num_final_rules", len(final_rules))),
         "num_fn_examples": len(fn_rows),
         "num_fp_examples": len(fp_rows),
+        "causal_masking_available": bool(causal_summaries),
+        "num_causal_fp_examples": sum(
+            1
+            for row in fp_rows
+            if str(row.get("causal_error_rule_ids", "[]")) not in {"", "[]"}
+        ),
+        "num_necessary_tp_examples": sum(
+            1
+            for row in example_rows
+            if bool(row.get("label", False))
+            and bool(row.get("predicted_positive", False))
+            and str(row.get("necessary_support_rule_ids", "[]")) not in {"", "[]"}
+        ),
         "num_videos": len(per_video_rows),
         "num_rule_families": len(rule_family_rows),
         "max_rules_in_family": int(max_rules_in_family),
@@ -594,6 +727,7 @@ def run(
     final_rule_results: Dict[str, Any],
     temporal_rule_results: List[Dict[str, Any]],
     evaluation_results: Dict[str, Any],
+    causal_masking_results: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -602,6 +736,7 @@ def run(
         final_rule_results=final_rule_results,
         temporal_rule_results=temporal_rule_results,
         evaluation_results=evaluation_results,
+        causal_masking_results=causal_masking_results,
         cfg=cfg,
         output_root=output_root,
         force_recompute=force_recompute,

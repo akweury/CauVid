@@ -598,6 +598,20 @@ def get_rule_evaluation_cfg() -> Dict[str, Any]:
     )
 
 
+def get_rule_level_causal_masking_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": True,
+            "prediction_mode": "any_rule_positive",
+            "rule_set_name": "selected",
+            "score_epsilon": 1e-9,
+            "many_redundant_rule_fraction": 0.5,
+        },
+        path=("rule_level_causal_masking",),
+        warn_label="rule-level causal masking",
+    )
+
+
 def get_baseline_comparison_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -937,6 +951,7 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "rule_pool_upper_bound_diagnostic": False,
             "oracle_rule_selection_gap_diagnostic": False,
             "rule_evaluation": False,
+            "rule_level_causal_masking": False,
             "candidate_contribution_summary": False,
             "reasoning_to_od_pseudo_labels": False,
             "od_confidence_calibration": False,
@@ -997,6 +1012,10 @@ def get_split_output_root() -> Path:
 
 def get_rule_evaluation_output_root() -> Path:
     return _load_output_root("18_driving_mini_rule_evaluation")
+
+
+def get_rule_level_causal_masking_output_root() -> Path:
+    return _load_output_root("18m_driving_mini_rule_level_causal_masking")
 
 
 def get_candidate_contribution_summary_output_root() -> Path:

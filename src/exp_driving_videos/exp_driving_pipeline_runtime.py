@@ -55,6 +55,9 @@ Steps:
                     and its accepted-only, accepted-plus-mixed,
                     candidate-augmented, and balanced-core subset views on
                     the held-out evaluation split.
+    18M. rule_level_causal_masking_driving_mini — post-hoc counterfactual
+                    masking of triggered final rules using Step 18 aggregation
+                    outputs.
     18B. baseline_comparison_driving_mini — optional comparison against
                     neural-symbolic and learned rule-aggregation baselines.
     19. object_to_atom_coverage_diagnostic_driving_mini — optional
@@ -130,6 +133,7 @@ from src.exp_driving_videos.modules import logic_atoms_driving_mini
 from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
+from src.exp_driving_videos.modules import rule_level_causal_masking_driving_mini
 from src.exp_driving_videos.modules import rule_aggregation_baseline_driving_mini
 from src.exp_driving_videos.modules import integrated_method_visualization_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
@@ -201,7 +205,9 @@ _get_integrated_method_visualization_cfg = driving_pipeline_config.get_integrate
 _get_fn_categorization_diagnostic_cfg = driving_pipeline_config.get_fn_categorization_diagnostic_cfg
 _get_pipeline_recompute_cfg = driving_pipeline_config.get_pipeline_recompute_cfg
 _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explainability_cfg
+_get_rule_level_causal_masking_cfg = driving_pipeline_config.get_rule_level_causal_masking_cfg
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
+_get_rule_level_causal_masking_output_root = driving_pipeline_config.get_rule_level_causal_masking_output_root
 _get_merged_candidate_rules_output_root = driving_pipeline_config.get_merged_candidate_rules_output_root
 _get_candidate_contribution_summary_output_root = (
     driving_pipeline_config.get_candidate_contribution_summary_output_root
@@ -256,6 +262,7 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17", "stop_after": 17, "label": "final_rules_driving_mini"},
     {"tag": "17D", "stop_after": None, "label": "rule_pool_and_selector_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
+    {"tag": "18M", "stop_after": 18, "label": "rule_level_causal_masking_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "baseline_comparison_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "error_and_explainability_analysis_driving_mini"},
@@ -411,6 +418,7 @@ class PipelineContext:
     evaluation_rule_sets: List[str] = field(default_factory=list)
     evaluation_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     evaluation_results: Dict[str, Any] = field(default_factory=dict)
+    rule_level_causal_masking_results: Dict[str, Any] = field(default_factory=dict)
     candidate_contribution_summary_results: Dict[str, Any] = field(default_factory=dict)
     od_calibration_iteration_id: str = ""
     reasoning_to_od_pseudo_label_results: Dict[str, Any] = field(default_factory=dict)
@@ -555,6 +563,124 @@ def _force_recompute(ctx: PipelineContext, key: str | None = None, default: bool
     if key is None:
         return bool(default)
     return bool(ctx.recompute_cfg.get(key, default))
+
+
+_LOW_CONFIDENCE_CANDIDATE_LIST_KEYS = {
+    "candidate_detections",
+    "candidate_objects",
+    "selected_candidate_objects",
+    "filtered_candidate_objects",
+    "rejected_candidate_objects",
+    "candidate_positions_3d",
+    "candidate_object_ids",
+}
+_LOW_CONFIDENCE_CANDIDATE_BUNDLE_KEYS = {
+    "candidate_tracks",
+    "tracking_input_candidates",
+    "raw_candidate_tracks",
+    "deduplicated_candidate_tracks",
+    "selected_candidate_tracks",
+    "rejected_candidate_tracks",
+    "rejected_candidate_detections",
+}
+_LOW_CONFIDENCE_CANDIDATE_NUMERIC_MARKERS = (
+    "candidate_detection",
+    "candidate_detections",
+    "candidate_track",
+    "candidate_tracks",
+    "candidate_object",
+    "candidate_objects",
+    "candidate_atom",
+    "candidate_atoms",
+    "tracking_input_candidate",
+    "raw_candidate",
+    "deduplicated_candidate",
+    "rejected_candidate",
+    "selected_candidate",
+)
+_LOW_CONFIDENCE_CANDIDATE_ATOM_MARKERS = (
+    "obj_candidate_",
+    "object_is_candidate(",
+    "object_candidate_score_state(",
+    "object_matched_prior(",
+)
+
+
+def _low_confidence_candidate_payloads_enabled() -> bool:
+    return _get_detection_candidate_branch_enabled(default=False)
+
+
+def _is_low_confidence_candidate_atom(value: Any) -> bool:
+    text = str(value)
+    return any(marker in text for marker in _LOW_CONFIDENCE_CANDIDATE_ATOM_MARKERS)
+
+
+def _is_low_confidence_candidate_count_key(key: str) -> bool:
+    key_text = str(key)
+    if not key_text.startswith("num_"):
+        return False
+    return any(marker in key_text for marker in _LOW_CONFIDENCE_CANDIDATE_NUMERIC_MARKERS)
+
+
+def _strip_low_confidence_candidate_atom_records(records: Sequence[Any]) -> List[Any]:
+    stripped_records: List[Any] = []
+    for record in records:
+        if isinstance(record, dict) and _is_low_confidence_candidate_atom(record.get("atom", "")):
+            continue
+        stripped_records.append(_strip_low_confidence_candidate_payloads(record))
+    return stripped_records
+
+
+def _strip_low_confidence_candidate_payloads(value: Any) -> Any:
+    if _low_confidence_candidate_payloads_enabled():
+        return value
+    if isinstance(value, list):
+        if all(isinstance(item, str) for item in value):
+            return [item for item in value if not _is_low_confidence_candidate_atom(item)]
+        return [_strip_low_confidence_candidate_payloads(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    stripped: Dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if key_text == "candidate_branch_enabled":
+            stripped[key] = False
+        elif key_text in _LOW_CONFIDENCE_CANDIDATE_LIST_KEYS:
+            stripped[key] = []
+        elif key_text in _LOW_CONFIDENCE_CANDIDATE_BUNDLE_KEYS:
+            stripped[key] = {
+                "num_tracks": 0,
+                "num_candidates": 0,
+                "num_rejected": 0,
+                "frames": [],
+                "tracks": [],
+                "track_summaries": [],
+                "rejection_reason_counts": {},
+            }
+        elif _is_low_confidence_candidate_count_key(key_text):
+            stripped[key] = 0
+        elif key_text in {"atoms", "all_atoms", "body_atoms"} and isinstance(item, list):
+            stripped[key] = [
+                str(atom)
+                for atom in item
+                if not _is_low_confidence_candidate_atom(atom)
+            ]
+        elif key_text in {"atom_records", "all_atom_records"} and isinstance(item, list):
+            stripped[key] = _strip_low_confidence_candidate_atom_records(item)
+        elif key_text == "body_atom_provenance_map" and isinstance(item, dict):
+            stripped[key] = {
+                str(atom): _strip_low_confidence_candidate_payloads(provenance)
+                for atom, provenance in item.items()
+                if not _is_low_confidence_candidate_atom(atom)
+            }
+        else:
+            stripped[key] = _strip_low_confidence_candidate_payloads(item)
+    return stripped
+
+
+def _strip_low_confidence_candidate_results(results: Any) -> Any:
+    return _strip_low_confidence_candidate_payloads(results)
 
 
 def _resolve_od_calibration_loop_cfg(
@@ -944,6 +1070,13 @@ def _load_cached_step18_result() -> Dict[str, Any]:
     )
 
 
+def _load_cached_rule_level_causal_masking_result() -> Dict[str, Any]:
+    return _read_cached_json(
+        _get_rule_level_causal_masking_output_root() / "rule_level_causal_masking.json",
+        label="step 18M rule-level causal masking result",
+    )
+
+
 def _load_cached_candidate_rule_results(
     selected_video_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -989,7 +1122,7 @@ def _load_cached_upstream_context(
 
     needs_temporal_examples = any(
         _stop_target_reaches(tag, stop_target)
-        for tag in ("17", "17D", "18", "18B", "20", "21", "25")
+        for tag in ("17", "17D", "18", "18M", "18B", "20", "21", "25")
     )
     if needs_temporal_examples:
         ctx.temporal_rule_results = _load_cached_video_results(
@@ -999,6 +1132,7 @@ def _load_cached_upstream_context(
             selected_video_ids=ctx.effective_video_ids,
             label="step 13 temporal rule examples",
         )
+        ctx.temporal_rule_results = _strip_low_confidence_candidate_results(ctx.temporal_rule_results)
         _prepare_rule_learning_inputs(ctx)
 
     needs_logic_atoms = (
@@ -1016,12 +1150,14 @@ def _load_cached_upstream_context(
             selected_video_ids=ctx.effective_video_ids,
             label="step 11 logic atoms",
         )
+        ctx.logic_atom_results = _strip_low_confidence_candidate_results(ctx.logic_atom_results)
 
     if (
         bool(_get_object_to_atom_coverage_diagnostic_cfg().get("enabled", False))
         and _step_is_requested("19", start_target=start_target, stop_target=stop_target)
     ):
         ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids, skip_invalid=True)
+        ctx.detection_results = _strip_low_confidence_candidate_results(ctx.detection_results)
         ctx.dataset_annotation_results = _load_cached_video_results(
             output_root=dataset_annotations_driving_mini.get_output_root(),
             manifest_name="dataset_annotations_manifest.json",
@@ -1029,6 +1165,7 @@ def _load_cached_upstream_context(
             selected_video_ids=ctx.effective_video_ids,
             label="step 3 dataset annotations",
         )
+        ctx.dataset_annotation_results = _strip_low_confidence_candidate_results(ctx.dataset_annotation_results)
         ctx.merged_results = _load_cached_video_results(
             output_root=merge_gt_and_detected_driving_mini.get_output_root(),
             manifest_name="merged_annotations_manifest.json",
@@ -1036,6 +1173,7 @@ def _load_cached_upstream_context(
             selected_video_ids=ctx.effective_video_ids,
             label="step 4 merged annotations",
         )
+        ctx.merged_results = _strip_low_confidence_candidate_results(ctx.merged_results)
         ctx.important_object_results = _load_cached_video_results(
             output_root=important_objects_driving_mini.get_output_root(),
             manifest_name="important_objects_manifest.json",
@@ -1043,6 +1181,7 @@ def _load_cached_upstream_context(
             selected_video_ids=ctx.effective_video_ids,
             label="step 10 important objects",
         )
+        ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
 
     if _stage_index(start_target) > _stage_index("17"):
         ctx.final_rule_results = _load_cached_step17_result()
@@ -1058,6 +1197,13 @@ def _load_cached_upstream_context(
             ctx.final_rule_results,
             ctx.evaluation_results,
         )
+
+    if (
+        _stage_index(start_target) > _stage_index("18M")
+        and _stop_target_reaches("20", stop_target)
+        and (_get_rule_level_causal_masking_output_root() / "rule_level_causal_masking.json").exists()
+    ):
+        ctx.rule_level_causal_masking_results = _load_cached_rule_level_causal_masking_result()
 
 
 def _warm_start_blocker_reason(ctx: PipelineContext) -> str:
@@ -1594,7 +1740,8 @@ def _count_temporal_rule_examples(video_results: Sequence[Dict[str, Any]] | None
 
 def _prepare_rule_learning_inputs(ctx: PipelineContext) -> None:
     split_cfg = _get_data_split_cfg()
-    temporal_rule_results = list(ctx.temporal_rule_results or [])
+    temporal_rule_results = list(_strip_low_confidence_candidate_results(ctx.temporal_rule_results or []))
+    ctx.temporal_rule_results = temporal_rule_results
     total_videos = len({str(result.get("video_id", "")) for result in temporal_rule_results if str(result.get("video_id", ""))})
     strategy = str(split_cfg.get("strategy", "eval_fraction"))
     train_video_count = int(split_cfg.get("train_video_count", DEFAULT_TRAIN_VIDEO_COUNT))
@@ -1664,6 +1811,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             selected_video_ids,
             skip_invalid=True,
         )
+        ctx.detection_results = _strip_low_confidence_candidate_results(ctx.detection_results)
         if not ctx.detection_results:
             raise RuntimeError(
                 "Step 1 is configured to skip detection, but no valid cached detection results were loaded. "
@@ -1698,6 +1846,7 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             od_calibration_policy=active_od_policy,
             background_rule_relevance_prior_results=ctx.background_rule_relevance_prior_results,
         )
+    ctx.detection_results = _strip_low_confidence_candidate_results(ctx.detection_results)
     runner.log("1", f"completed videos={len(ctx.detection_results)}")
     runner.complete_step("1", subtitle=f"videos={len(ctx.detection_results)}")
 
@@ -1713,6 +1862,7 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
             render_video=render_video,
             force_recompute=_force_recompute(ctx),
         )
+    ctx.tracking_results = _strip_low_confidence_candidate_results(ctx.tracking_results)
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
     runner.log(
         "2",
@@ -1750,6 +1900,7 @@ def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> 
             tracking_results=ctx.tracking_results or [],
             force_recompute=_force_recompute(ctx),
         )
+    ctx.dataset_annotation_results = _strip_low_confidence_candidate_results(ctx.dataset_annotation_results)
     runner.log("3", f"completed videos={len(ctx.dataset_annotation_results)}")
     runner.log(
         "3",
@@ -1770,6 +1921,7 @@ def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> No
             render_video=render_video,
             force_recompute=_force_recompute(ctx),
         )
+    ctx.merged_results = _strip_low_confidence_candidate_results(ctx.merged_results)
     runner.log("4", f"completed videos={len(ctx.merged_results)}")
     runner.log(
         "4",
@@ -1786,6 +1938,7 @@ def run_step_5_prepare_3d_positions(ctx: PipelineContext, runner: StepRunner) ->
             merged_results=ctx.merged_results or [],
             force_recompute=_force_recompute(ctx),
         )
+    ctx.positions_3d_results = _strip_low_confidence_candidate_results(ctx.positions_3d_results)
     runner.log("5", f"completed videos={len(ctx.positions_3d_results)}")
     runner.log(
         "5",
@@ -1824,6 +1977,7 @@ def run_step_7_relative_object_motion(ctx: PipelineContext, runner: StepRunner) 
             ego_motion_results=ctx.ego_motion_results or [],
             force_recompute=_force_recompute(ctx),
         )
+    ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
     runner.log("7", f"completed videos={len(ctx.relative_motion_results)}")
     runner.log(
         "7",
@@ -1860,6 +2014,7 @@ def run_step_9_segment_object_motion(ctx: PipelineContext, runner: StepRunner) -
             cfg=segment_object_cfg,
             force_recompute=_force_recompute(ctx),
         )
+    ctx.segment_object_results = _strip_low_confidence_candidate_results(ctx.segment_object_results)
     runner.log("9", f"completed videos={len(ctx.segment_object_results)}")
     runner.log(
         "9",
@@ -1879,6 +2034,7 @@ def run_step_10_important_objects(ctx: PipelineContext, runner: StepRunner) -> N
             cfg=important_objects_cfg,
             force_recompute=_force_recompute(ctx),
         )
+    ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
     runner.log("10", f"completed videos={len(ctx.important_object_results)}")
     runner.complete_step("10", subtitle=f"videos={len(ctx.important_object_results)}")
 
@@ -1895,6 +2051,7 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
             cfg=traffic_control_attributes_cfg,
             force_recompute=_force_recompute(ctx, "traffic_control_attributes", False),
         )
+    ctx.traffic_control_attribute_results = _strip_low_confidence_candidate_results(ctx.traffic_control_attribute_results)
     runner.log("10B", f"completed videos={len(ctx.traffic_control_attribute_results)}")
     runner.complete_step("10B", subtitle=f"videos={len(ctx.traffic_control_attribute_results)}")
 
@@ -1910,6 +2067,7 @@ def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
             cfg=logic_atoms_cfg,
             force_recompute=_force_recompute(ctx, "logic_atoms", False),
         )
+    ctx.logic_atom_results = _strip_low_confidence_candidate_results(ctx.logic_atom_results)
     runner.log("11", f"completed videos={len(ctx.logic_atom_results)}")
     runner.complete_step("11", subtitle=f"videos={len(ctx.logic_atom_results)}")
 
@@ -1925,6 +2083,7 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
             cfg=target_head_cfg,
             force_recompute=_force_recompute(ctx, "target_head_atoms", False),
         )
+    ctx.target_head_results = _strip_low_confidence_candidate_results(ctx.target_head_results)
     runner.log("12", f"completed videos={len(ctx.target_head_results)}")
     runner.complete_step("12", subtitle=f"videos={len(ctx.target_head_results)}")
 
@@ -1940,6 +2099,7 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
             cfg=rule_examples_cfg,
             force_recompute=_force_recompute(ctx, "temporal_rule_examples", False),
         )
+    ctx.temporal_rule_results = _strip_low_confidence_candidate_results(ctx.temporal_rule_results)
     runner.log("13", f"completed videos={len(ctx.temporal_rule_results)}")
     runner.complete_step("13", subtitle=f"videos={len(ctx.temporal_rule_results)}")
 
@@ -2260,6 +2420,66 @@ def run_step_18_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> Non
         runner.log("18", f"explanation_csv={evaluation_output_root / 'explainable_event_summary.csv'}")
         runner.log("18", str(summary_rows[0].get("main_conclusion", "")))
     runner.complete_step("18", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
+
+
+def run_step_18m_rule_level_causal_masking(ctx: PipelineContext, runner: StepRunner) -> None:
+    masking_cfg = _get_rule_level_causal_masking_cfg()
+    masking_output_root = _get_rule_level_causal_masking_output_root()
+    runner.announce_step("18M", "rule_level_causal_masking_driving_mini")
+    if not bool(masking_cfg.get("enabled", True)):
+        runner.log("18M", "disabled by config")
+        runner.complete_step("18M", subtitle="skipped")
+        return
+    runner.log("18M", f"cfg={masking_cfg}")
+    runner.log("18M", f"recompute={bool(ctx.recompute_cfg.get('rule_level_causal_masking', True))}")
+    with runner.module_output("18M"):
+        ctx.rule_level_causal_masking_results = rule_level_causal_masking_driving_mini.run(
+            final_rule_results=ctx.final_rule_results,
+            evaluation_results=ctx.evaluation_results,
+            cfg=masking_cfg,
+            output_root=masking_output_root,
+            force_recompute=bool(ctx.recompute_cfg.get("rule_level_causal_masking", True)),
+        )
+    manifest_path = masking_output_root / "18m_rule_level_causal_masking_manifest.json"
+    output_paths = dict(ctx.rule_level_causal_masking_results.get("output_paths", {}))
+    secondary_debug_artifacts = [
+        str(path)
+        for path in [
+            output_paths.get("result_json", ""),
+            output_paths.get("example_rule_masking_csv", ""),
+            output_paths.get("rule_causal_summary_csv", ""),
+            output_paths.get("example_causal_summary_csv", ""),
+        ]
+        if str(path)
+    ]
+    manifest = {
+        "step": "18M",
+        "primary_summary_csv": str(output_paths.get("rule_causal_summary_csv", "")),
+        "primary_explanation_csv": str(output_paths.get("example_causal_summary_csv", "")),
+        "main_conclusion": (
+            f"Rule-level masking tested {int(ctx.rule_level_causal_masking_results.get('num_triggered_example_rules', 0))} "
+            f"triggered example-rule pairs and found "
+            f"{int(ctx.rule_level_causal_masking_results.get('num_prediction_flips', 0))} prediction flips."
+        ),
+        "secondary_debug_artifacts": secondary_debug_artifacts,
+    }
+    _write_manifest_json(manifest_path, manifest)
+    ctx.rule_level_causal_masking_results["manifest_json"] = str(manifest_path)
+    ctx.rule_level_causal_masking_results["primary_summary_csv"] = str(
+        output_paths.get("rule_causal_summary_csv", "")
+    )
+    ctx.rule_level_causal_masking_results["secondary_debug_artifacts"] = secondary_debug_artifacts
+    runner.log(
+        "18M",
+        f"masks={int(ctx.rule_level_causal_masking_results.get('num_triggered_example_rules', 0))} "
+        f"flips={int(ctx.rule_level_causal_masking_results.get('num_prediction_flips', 0))} "
+        f"harmful={int(ctx.rule_level_causal_masking_results.get('num_harmful_masks', 0))} "
+        f"helpful={int(ctx.rule_level_causal_masking_results.get('num_helpful_masks', 0))}",
+    )
+    runner.complete_step(
+        "18M",
+        subtitle=f"flips={int(ctx.rule_level_causal_masking_results.get('num_prediction_flips', 0))}",
+    )
 
 
 def _ensure_od_calibration_iteration_id(ctx: PipelineContext) -> str:
@@ -2666,6 +2886,7 @@ def run_step_20_error_analysis(ctx: PipelineContext, runner: StepRunner) -> None
                 final_rule_results=ctx.rule_results_by_name[rule_set_name],
                 temporal_rule_results=ctx.eval_temporal_rule_results or [],
                 evaluation_results=ctx.evaluation_results_by_name[rule_set_name],
+                causal_masking_results=ctx.rule_level_causal_masking_results,
                 cfg=error_cfg_for_run,
                 output_root=output_root,
                 force_recompute=bool(ctx.recompute_cfg.get("error_and_explainability_analysis", True)),
@@ -2893,6 +3114,8 @@ def _run_pre_diagnostic_steps(
         run_step_17d_rule_pool_and_selector_diagnostic(ctx, runner)
     if _step_is_requested("18", start_target=start_target, stop_target=stop_target):
         run_step_18_rule_evaluation(ctx, runner)
+    if _step_is_requested("18M", start_target=start_target, stop_target=stop_target):
+        run_step_18m_rule_level_causal_masking(ctx, runner)
     if _step_is_requested("18B", start_target=start_target, stop_target=stop_target):
         run_step_18b_baseline_comparison(ctx, runner)
 

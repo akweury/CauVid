@@ -27,7 +27,7 @@ PIPELINE_STEP_OVERVIEW = [
     ("0-16", "upstream perception, symbolic abstraction, initial-rule pruning, rule extension"),
     ("17", "final rule selection"),
     ("17D", "optional rule-pool and selector diagnostics"),
-    ("18", "selected-rule evaluation"),
+    ("18", "selected-rule evaluation and rule-level causal masking"),
     ("18B", "optional baseline comparison"),
     ("19-25", "downstream diagnostics, visualization, causal prior, and feedback signal"),
 ]

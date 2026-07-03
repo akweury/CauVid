@@ -381,6 +381,38 @@ def _predicted_positive_ids_for_rules(
     return predicted_ids
 
 
+def aggregate_rule_prediction(
+    triggered_rule_ids: Sequence[str],
+    rule_lookup: Dict[str, Dict[str, Any]],
+    *,
+    prediction_mode: str = "any_rule_positive",
+) -> Dict[str, Any]:
+    """Aggregate triggered rule ids into the final prediction used by Step 18."""
+    if prediction_mode != "any_rule_positive":
+        raise ValueError(f"Unsupported prediction_mode: {prediction_mode}")
+
+    unique_triggered_rule_ids: List[str] = []
+    seen: Set[str] = set()
+    for rule_id in triggered_rule_ids:
+        rule_id_text = str(rule_id).strip()
+        if not rule_id_text or rule_id_text in seen:
+            continue
+        seen.add(rule_id_text)
+        unique_triggered_rule_ids.append(rule_id_text)
+
+    rule_scores = [
+        float(rule_lookup.get(rule_id, {}).get("confidence", 1.0))
+        for rule_id in unique_triggered_rule_ids
+    ]
+    return {
+        "prediction_mode": prediction_mode,
+        "predicted_positive": bool(unique_triggered_rule_ids),
+        "prediction_score": float(max(rule_scores)) if rule_scores else 0.0,
+        "num_triggered_rules": len(unique_triggered_rule_ids),
+        "triggered_rule_ids": unique_triggered_rule_ids,
+    }
+
+
 def _matched_prior_id_counts(rules: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for rule in rules:
@@ -916,11 +948,22 @@ def process_rules(
         "fired_rule_counts": fired_rule_counts,
     }
 
+    rule_lookup = {
+        str(rule.get("rule_id", "")): dict(rule)
+        for rule in rule_evaluations
+        if str(rule.get("rule_id", ""))
+    }
     example_prediction_rows: List[Dict[str, Any]] = []
     explainable_event_rows: List[Dict[str, Any]] = []
     for example in eval_examples:
         example_id = str(example.get("example_id", ""))
-        predicted_positive = example_id in predicted_positive_example_ids
+        matching_rule_ids = list(triggered_rules_by_example.get(example_id, []))
+        aggregate_prediction = aggregate_rule_prediction(
+            matching_rule_ids,
+            rule_lookup,
+            prediction_mode=prediction_mode,
+        )
+        predicted_positive = bool(aggregate_prediction.get("predicted_positive", False))
         predicted_positive_accepted_only = example_id in accepted_only_predicted_positive_ids
         subset_rule_ids = triggered_rule_ids_by_example_by_subset.get(example_id, {})
         example_prediction_rows.append(
@@ -929,6 +972,7 @@ def process_rules(
                 "example_id": example_id,
                 "label": bool(example.get("label", False)),
                 "predicted_positive": predicted_positive,
+                "prediction_score": float(aggregate_prediction.get("prediction_score", 0.0)),
                 "predicted_positive_accepted_only": predicted_positive_accepted_only,
                 "predicted_positive_candidate_only": bool(subset_rule_ids.get("candidate_only_rules", [])),
                 "predicted_positive_candidate_candidate": bool(subset_rule_ids.get("candidate_candidate_rules", [])),
@@ -948,7 +992,7 @@ def process_rules(
                 "num_matching_rules_mixed_accepted_candidate": len(
                     subset_rule_ids.get("mixed_accepted_candidate_rules", [])
                 ),
-                "matching_rule_ids": list(triggered_rules_by_example.get(example_id, [])),
+                "matching_rule_ids": matching_rule_ids,
             }
         )
         explanation_candidates = accepted_only_explanation_candidates_by_example.get(example_id, [])
@@ -1161,6 +1205,7 @@ def process_rules(
                 "example_id",
                 "label",
                 "predicted_positive",
+                "prediction_score",
                 "predicted_positive_accepted_only",
                 "predicted_positive_candidate_only",
                 "predicted_positive_candidate_candidate",
@@ -1183,6 +1228,7 @@ def process_rules(
                     "example_id": row.get("example_id", ""),
                     "label": row.get("label", False),
                     "predicted_positive": row.get("predicted_positive", False),
+                    "prediction_score": row.get("prediction_score", 0.0),
                     "predicted_positive_accepted_only": row.get("predicted_positive_accepted_only", False),
                     "predicted_positive_candidate_only": row.get("predicted_positive_candidate_only", False),
                     "predicted_positive_candidate_candidate": row.get(
