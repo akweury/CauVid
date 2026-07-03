@@ -234,6 +234,9 @@ run_pipeline() {
     torch_cache_dir="$(get_torch_cache_dir)"
     configs_dir="$(get_configs_dir)"
     mkdir -p "$prepared_dataset" "$nuscenes_dataset_root" "$pipeline_output_dir" "$output_dir" "$logs_dir" "$torch_cache_dir"
+
+    # Remove any leftover container with the same name so docker run --rm works cleanly.
+    docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
     
     docker run --rm \
         "${DOCKER_GPU_ARGS[@]}" \

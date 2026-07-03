@@ -51,7 +51,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 COPY src/ ./src/
 COPY configs/ ./configs/
 COPY *.py ./
-COPY *.md ./
+COPY README.md ./
 COPY LICENSE ./
 
 # Create necessary directories (data/output are mounted externally, not under /app)
@@ -60,7 +60,7 @@ RUN mkdir -p temp external && \
 
 # Set Python path to include the project root for src.* imports and the
 # vendored Depth Anything 3 source tree.
-ENV PYTHONPATH="${PYTHONPATH}:/app:/app/external/Depth-Anything-3/src"
+ENV PYTHONPATH="/app:/app/external/Depth-Anything-3/src"
 
 # Expose port if needed (for future web interface)
 EXPOSE 8080
