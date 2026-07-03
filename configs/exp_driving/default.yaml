@@ -2,7 +2,7 @@ video_selection:
   default_video_limit: 961
 
 detection:
-  skip_step: true
+  skip_step: false
   render_video: false
   check_cache: false
   candidate_branch_enabled: true

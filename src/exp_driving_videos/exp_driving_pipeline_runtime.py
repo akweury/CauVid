@@ -809,6 +809,15 @@ def _read_cached_json(path: Path, *, label: str) -> Dict[str, Any]:
     return _read_json_file(path)
 
 
+def _summarize_video_id_list(video_ids: Sequence[str], *, max_examples: int = 5) -> str:
+    ids = [str(video_id).strip() for video_id in video_ids if str(video_id).strip()]
+    if not ids:
+        return "count=0"
+    examples = ", ".join(ids[:max_examples])
+    suffix = "" if len(ids) <= max_examples else ", ..."
+    return f"count={len(ids)}, examples=[{examples}{suffix}]"
+
+
 def _load_cached_video_results(
     *,
     output_root: Path,
@@ -832,7 +841,8 @@ def _load_cached_video_results(
     missing_video_ids = sorted(set(requested_video_ids) - set(manifest_video_ids))
     if missing_video_ids:
         raise RuntimeError(
-            f"Cached {label} does not contain requested videos: {missing_video_ids}. "
+            f"Cached {label} does not contain requested videos "
+            f"({_summarize_video_id_list(missing_video_ids)}). "
             "Restart from an earlier step to rebuild the cached artifacts for this selection."
         )
     results: List[Dict[str, Any]] = []
@@ -875,11 +885,12 @@ def _load_cached_detection_results(
     missing_video_ids = sorted(set(requested_video_ids) - set(video_entries.keys()))
     if missing_video_ids:
         raise RuntimeError(
-            f"Cached step 1 detection results do not contain requested videos: {missing_video_ids}. "
+            "Cached step 1 detection results do not contain requested videos "
+            f"({_summarize_video_id_list(missing_video_ids)}). "
             "Restart from step 1 to rebuild the cache for this selection."
         )
     results: List[Dict[str, Any]] = []
-    skipped_invalid: List[str] = []
+    skipped_invalid: List[Tuple[str, str]] = []
     for video_id in requested_video_ids:
         entry = video_entries[video_id]
         detections_path_text = str(entry.get("detections_json", "")).strip()
@@ -889,10 +900,17 @@ def _load_cached_detection_results(
         except (json.JSONDecodeError, RuntimeError) as exc:
             if not skip_invalid:
                 raise
-            skipped_invalid.append(video_id)
-            print(f"  [warn] skipping invalid cached detection result for {video_id}: {exc}")
+            skipped_invalid.append((video_id, f"{exc.__class__.__name__}: {exc}"))
     if skipped_invalid:
-        print(f"  [warn] skipped {len(skipped_invalid)} invalid cached detection result(s)")
+        examples = "; ".join(
+            f"{video_id} ({reason})"
+            for video_id, reason in skipped_invalid[:3]
+        )
+        suffix = "" if len(skipped_invalid) <= 3 else "; ..."
+        print(
+            "  [warn] skipped invalid cached detection result(s): "
+            f"count={len(skipped_invalid)}, examples=[{examples}{suffix}]"
+        )
     return results
 
 
@@ -1641,8 +1659,29 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("1", "od_calibration_policy=disabled")
     runner.log("1", f"force_recompute={_force_recompute(ctx)}")
     if skip_step:
-        ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids)
-        runner.log("1", f"skipped detection; loaded cached videos={len(ctx.detection_results)}")
+        selected_video_ids = ctx.effective_video_ids if ctx.has_explicit_video_selection else None
+        ctx.detection_results = _load_cached_detection_results(
+            selected_video_ids,
+            skip_invalid=True,
+        )
+        if not ctx.detection_results:
+            raise RuntimeError(
+                "Step 1 is configured to skip detection, but no valid cached detection results were loaded. "
+                "Regenerate Step 1 cache or disable detection.skip_step."
+            )
+        if not ctx.has_explicit_video_selection:
+            ctx.effective_video_ids = [
+                str(result.get("video_id", "")).strip()
+                for result in ctx.detection_results
+                if str(result.get("video_id", "")).strip()
+            ]
+            runner.log(
+                "1",
+                "skipped detection; using cached manifest video selection "
+                f"videos={len(ctx.effective_video_ids)}",
+            )
+        else:
+            runner.log("1", f"skipped detection; loaded cached videos={len(ctx.detection_results)}")
         runner.complete_step("1", subtitle=f"skipped cached={len(ctx.detection_results)}")
         return
     for warning in detect_driving_mini.detector_dependency_warnings(render_video=render_video):
