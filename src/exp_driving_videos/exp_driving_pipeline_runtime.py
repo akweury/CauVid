@@ -150,6 +150,7 @@ DRIVING_MINI_OD_CLASSES = driving_pipeline_config.DRIVING_MINI_OD_CLASSES
 
 _get_ego_motion_smoothing_window = driving_pipeline_config.get_ego_motion_smoothing_window
 _get_detection_render_video_enabled = driving_pipeline_config.get_detection_render_video_enabled
+_get_detection_skip_step_enabled = driving_pipeline_config.get_detection_skip_step_enabled
 _get_detection_check_cache_enabled = driving_pipeline_config.get_detection_check_cache_enabled
 _get_detection_candidate_branch_enabled = driving_pipeline_config.get_detection_candidate_branch_enabled
 _get_tracking_render_video_enabled = driving_pipeline_config.get_tracking_render_video_enabled
@@ -1624,11 +1625,13 @@ def run_step_0_background_rule_relevance_prior(ctx: PipelineContext, runner: Ste
 
 
 def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
+    skip_step = _get_detection_skip_step_enabled(default=False)
     render_video = _get_detection_render_video_enabled(default=True)
     check_cache = _get_detection_check_cache_enabled(default=False)
     candidate_branch_enabled = _get_detection_candidate_branch_enabled(default=False)
     active_od_policy = None
     runner.announce_step("1", "detect_driving_mini", leading_newline=False)
+    runner.log("1", f"skip_step={skip_step}")
     runner.log("1", f"model={DRIVING_MINI_OD_MODEL}")
     runner.log("1", f"classes={len(DRIVING_MINI_OD_CLASSES)} configured")
     runner.log("1", f"render_video={render_video}")
@@ -1637,6 +1640,11 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.log("1", f"step0_prior_entries={int(ctx.background_rule_relevance_prior_results.get('num_prior_entries', 0))}")
     runner.log("1", "od_calibration_policy=disabled")
     runner.log("1", f"force_recompute={_force_recompute(ctx)}")
+    if skip_step:
+        ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids)
+        runner.log("1", f"skipped detection; loaded cached videos={len(ctx.detection_results)}")
+        runner.complete_step("1", subtitle=f"skipped cached={len(ctx.detection_results)}")
+        return
     for warning in detect_driving_mini.detector_dependency_warnings(render_video=render_video):
         runner.log("1", f"[warn] {warning}")
     if ctx.effective_video_ids:
