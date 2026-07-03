@@ -1993,6 +1993,7 @@ def process_rules(
         "input_num_mixed_source_rules": int(unary_initial_rule_counts.get("mixed_accepted_candidate_rules", 0)),
         "num_rounds_completed": len(rounds),
         "num_all_kept_rules": len(all_kept_rules),
+        "num_kept_rules": len(all_kept_rules),
         "num_rules_using_candidate_atoms": total_rules_using_candidate_atoms,
         "num_candidate_only_rules": total_candidate_only_rules,
         "num_mixed_source_rules": total_mixed_source_rules,

@@ -123,30 +123,30 @@ pipeline_recompute:
   candidate_rules: false
   extended_rules: false
   background_rule_relevance_prior: false
-  final_rules: true
-  diverse_final_rules: true
-  semantic_constrained_diverse_final_rules: true
-  coverage_family_aware_final_rules: true
-  rule_pool_upper_bound_diagnostic: true
-  oracle_rule_selection_gap_diagnostic: true
-  rule_evaluation: true
-  candidate_contribution_summary: true
+  final_rules: false
+  diverse_final_rules: false
+  semantic_constrained_diverse_final_rules: false
+  coverage_family_aware_final_rules: false
+  rule_pool_upper_bound_diagnostic: false
+  oracle_rule_selection_gap_diagnostic: false
+  rule_evaluation: false
+  candidate_contribution_summary: false
   reasoning_to_od_pseudo_labels: false
   od_confidence_calibration: false
-  rule_aggregation_baseline: true
+  rule_aggregation_baseline: false
   baseline_safe_calibration_gate: false
-  object_to_atom_coverage_diagnostic: true
+  object_to_atom_coverage_diagnostic: false
   traffic_control_rule_utility_diagnostic: false
   traffic_control_temporal_alignment_diagnostic: false
   traffic_light_detection_quality_audit: false
-  neural_symbolic_baseline: true
-  error_and_explainability_analysis: true
+  neural_symbolic_baseline: false
+  error_and_explainability_analysis: false
   vehicle_rule_diagnostic: false
-  fn_categorization_diagnostic: true
-  rule_selection_visualization: true
-  integrated_method_visualization: true
-  background_causal_prior: true
-  reasoning_feedback_signal: true
+  fn_categorization_diagnostic: false
+  rule_selection_visualization: false
+  integrated_method_visualization: false
+  background_causal_prior: false
+  reasoning_feedback_signal: false
 
 temporal_rule_examples:
   deduplicate_body_atoms: true

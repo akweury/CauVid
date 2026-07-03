@@ -20,7 +20,7 @@ from src.exp_driving_videos.exp_driving_pipeline_runtime import (
     parse_args as _runtime_parse_args,
 )
 
-DEFAULT_START_STEP: int = 17
+DEFAULT_START_STEP: int = 0
 DEFAULT_MAX_STEP: int = 25
 
 PIPELINE_STEP_OVERVIEW = [

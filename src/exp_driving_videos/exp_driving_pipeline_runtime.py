@@ -925,6 +925,33 @@ def _load_cached_step18_result() -> Dict[str, Any]:
     )
 
 
+def _load_cached_candidate_rule_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=candidate_rules_driving_mini.get_output_root(),
+        manifest_name="initial_rules_manifest.json",
+        per_video_filename="initial_rules.json",
+        selected_video_ids=selected_video_ids,
+        label="step 14 candidate rules",
+    )
+
+
+def _load_cached_merged_initial_rules() -> Dict[str, Any]:
+    return _read_cached_json(
+        _get_merged_candidate_rules_output_root() / "merged_initial_rules.json",
+        label="step 15 merged initial rules",
+    )
+
+
+def _load_cached_initial_rules_for_extension() -> Dict[str, Any]:
+    out_root = _get_merged_candidate_rules_output_root()
+    pruned_path = out_root / "pruned_initial_rules.json"
+    if pruned_path.exists():
+        return _read_cached_json(pruned_path, label="step 15B pruned initial rules")
+    return _load_cached_merged_initial_rules()
+
+
 def _load_cached_upstream_context(
     ctx: PipelineContext,
     *,
@@ -1887,6 +1914,14 @@ def run_step_14_candidate_rules(ctx: PipelineContext, runner: StepRunner) -> Non
 
 def run_step_15_merge_initial_rules(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("15", "merge_initial_rules")
+    if not ctx.candidate_rule_results:
+        selected_video_ids = ctx.effective_video_ids if ctx.has_explicit_video_selection else None
+        ctx.candidate_rule_results = _load_cached_candidate_rule_results(selected_video_ids)
+        runner.log(
+            "15",
+            "loaded cached candidate rules "
+            f"videos={len(ctx.candidate_rule_results)}",
+        )
     ctx.merged_candidate_rules = _merge_candidate_rules(ctx.candidate_rule_results or [])
     ctx.initial_rules_for_extension = ctx.merged_candidate_rules
     runner.log(
@@ -1902,6 +1937,13 @@ def run_step_15b_initial_rule_pruning(ctx: PipelineContext, runner: StepRunner) 
     pruning_cfg = _get_initial_rule_pruning_cfg()
     runner.announce_step("15B", "initial_rule_pruning")
     runner.log("15B", f"cfg={pruning_cfg}")
+    if not ctx.merged_candidate_rules:
+        ctx.merged_candidate_rules = _load_cached_merged_initial_rules()
+        runner.log(
+            "15B",
+            "loaded cached merged initial rules "
+            f"rules={int(ctx.merged_candidate_rules.get('num_rules', 0))}",
+        )
     if not bool(pruning_cfg.get("enabled", True)):
         ctx.initial_rules_for_extension = ctx.merged_candidate_rules
         runner.log("15B", "disabled; Step 16 will use merged initial rules")
@@ -1932,6 +1974,9 @@ def run_step_15b_initial_rule_pruning(ctx: PipelineContext, runner: StepRunner) 
 def run_step_16_extended_rules(ctx: PipelineContext, runner: StepRunner) -> None:
     extended_rules_cfg = _get_extended_rules_cfg()
     initial_rules_payload = ctx.initial_rules_for_extension or ctx.merged_candidate_rules
+    if not initial_rules_payload:
+        initial_rules_payload = _load_cached_initial_rules_for_extension()
+        ctx.initial_rules_for_extension = initial_rules_payload
     runner.announce_step("16", "extended_rules_driving_mini")
     runner.log("16", f"cfg={extended_rules_cfg}")
     runner.log("16", f"input_initial_rules={int(initial_rules_payload.get('num_rules', 0))}")
@@ -1943,9 +1988,15 @@ def run_step_16_extended_rules(ctx: PipelineContext, runner: StepRunner) -> None
             force_recompute=bool(ctx.recompute_cfg.get("extended_rules", True)),
         )
     runner.log("16", f"rounds={ctx.extended_rule_results.get('num_rounds_completed', 0)}")
+    num_kept_rules = int(
+        ctx.extended_rule_results.get(
+            "num_all_kept_rules",
+            ctx.extended_rule_results.get("num_kept_rules", 0) or 0,
+        )
+    )
     runner.complete_step(
         "16",
-        subtitle=f"kept={int(ctx.extended_rule_results.get('num_kept_rules', 0))}",
+        subtitle=f"kept={num_kept_rules}",
     )
 
 
@@ -2957,8 +3008,8 @@ def parse_args() -> argparse.Namespace:
         "--start-step",
         dest="start_step",
         type=_parse_max_step_arg,
-        default="17",
-        help="Start from this step number or exact step id. Defaults to warm-starting at step 17.",
+        default="0",
+        help="Start from this step number or exact step id. Defaults to running the full main pipeline.",
     )
     parser.add_argument(
         "--video-id",
@@ -3001,8 +3052,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main(
-    start_step: int | str = 17,
-    max_step: int | str = 24,
+    start_step: int | str = 0,
+    max_step: int | str = 25,
     video_ids: Optional[List[str]] = None,
     video_count: int | None = None,
     od_calibration_iterations: int | None = None,
