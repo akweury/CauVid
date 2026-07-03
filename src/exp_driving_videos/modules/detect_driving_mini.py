@@ -724,8 +724,15 @@ def process_video(
     policy_marker = od_calibration_policy_utils.current_policy_marker(od_calibration_policy)
 
     if not force_recompute and detections_file.exists():
-        with detections_file.open("r", encoding="utf-8") as fh:
-            cached = json.load(fh)
+        try:
+            with detections_file.open("r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(
+                f"  [warn] ignoring invalid detection cache for {video_id}: "
+                f"{detections_file} ({exc.__class__.__name__})"
+            )
+            cached = {}
         if not _candidate_branch_enabled_matches(cached, enable_candidate_branch):
             cached = {}
         if cached and not check_cache:
