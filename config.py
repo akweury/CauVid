@@ -26,7 +26,12 @@ DEFAULT_RAW_DRIVING_DATASET = Path(
     )
 )
 DEFAULT_OUTPUT_ROOT = Path(os.environ.get("CAUVID_OUTPUT_PATH", PROJECT_ROOT / "output"))
-DEFAULT_PIPELINE_OUTPUT_ROOT = Path(os.environ.get("CAUVID_PIPELINE_OUTPUT_PATH", PROJECT_ROOT / "pipeline_output"))
+DEFAULT_PIPELINE_OUTPUT_ROOT = Path(
+    os.environ.get(
+        "CAUVID_PIPELINE_OUTPUT_PATH",
+        "/storage-01/ml-jsha/CauVid_output/pipeline_output",
+    )
+)
 DEFAULT_TEMP_ROOT = Path(os.environ.get("CAUVID_TEMP_PATH", PROJECT_ROOT / "temp"))
 
 # Dataset paths
@@ -153,4 +158,3 @@ if __name__ == "__main__":
     print(f"Project root: {PROJECT_ROOT}")
     for name, path in DATASET_PATHS.items():
         print(f"  {name}: {path}")
-
