@@ -1106,7 +1106,16 @@ def run(
                 )
             video_results.append(result)
             cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
-            print(f"Progress: {_format_step_progress(index, total_videos)} | {video_id} | {cache_tag}")
+            cache_path = str(
+                dict(result.get("output_paths", {})).get(
+                    "detections_json",
+                    effective_output_root / video_id / "detections.json",
+                )
+            )
+            print(
+                f"Progress: {_format_step_progress(index, total_videos)} | "
+                f"{video_id} | {cache_tag} | cache={cache_path}"
+            )
     finally:
         if detector is not None:
             detector.teardown()
