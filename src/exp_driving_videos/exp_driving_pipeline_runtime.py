@@ -709,6 +709,24 @@ def _strip_low_confidence_candidate_results(results: Any) -> Any:
     return _strip_low_confidence_candidate_payloads(results)
 
 
+def _postprocess_candidate_payloads(
+    runner: StepRunner,
+    tag: str,
+    label: str,
+    results: Any,
+) -> Any:
+    if _low_confidence_candidate_payloads_enabled():
+        runner.log(tag, f"postprocess={label} passthrough candidate_branch_enabled")
+        return results
+    if _candidate_summary_counts_are_zero(results):
+        runner.log(tag, f"postprocess={label} skipped summary_candidate_counts=0")
+        return results
+    runner.log(tag, f"postprocess={label} candidate_cleanup_start")
+    cleaned = _strip_low_confidence_candidate_payloads(results)
+    runner.log(tag, f"postprocess={label} candidate_cleanup_done")
+    return cleaned
+
+
 def _resolve_od_calibration_loop_cfg(
     *,
     max_iterations_override: int | None = None,
@@ -1929,7 +1947,12 @@ def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> 
             tracking_results=ctx.tracking_results or [],
             force_recompute=_force_recompute(ctx),
         )
-    ctx.dataset_annotation_results = _strip_low_confidence_candidate_results(ctx.dataset_annotation_results)
+    ctx.dataset_annotation_results = _postprocess_candidate_payloads(
+        runner,
+        "3",
+        "dataset_annotations",
+        ctx.dataset_annotation_results,
+    )
     runner.log("3", f"completed videos={len(ctx.dataset_annotation_results)}")
     runner.log(
         "3",
@@ -1950,7 +1973,12 @@ def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> No
             render_video=render_video,
             force_recompute=_force_recompute(ctx),
         )
-    ctx.merged_results = _strip_low_confidence_candidate_results(ctx.merged_results)
+    ctx.merged_results = _postprocess_candidate_payloads(
+        runner,
+        "4",
+        "merged_annotations",
+        ctx.merged_results,
+    )
     runner.log("4", f"completed videos={len(ctx.merged_results)}")
     runner.log(
         "4",
@@ -1967,7 +1995,12 @@ def run_step_5_prepare_3d_positions(ctx: PipelineContext, runner: StepRunner) ->
             merged_results=ctx.merged_results or [],
             force_recompute=_force_recompute(ctx),
         )
-    ctx.positions_3d_results = _strip_low_confidence_candidate_results(ctx.positions_3d_results)
+    ctx.positions_3d_results = _postprocess_candidate_payloads(
+        runner,
+        "5",
+        "positions_3d",
+        ctx.positions_3d_results,
+    )
     runner.log("5", f"completed videos={len(ctx.positions_3d_results)}")
     runner.log(
         "5",
@@ -2006,7 +2039,12 @@ def run_step_7_relative_object_motion(ctx: PipelineContext, runner: StepRunner) 
             ego_motion_results=ctx.ego_motion_results or [],
             force_recompute=_force_recompute(ctx),
         )
-    ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
+    ctx.relative_motion_results = _postprocess_candidate_payloads(
+        runner,
+        "7",
+        "relative_motion",
+        ctx.relative_motion_results,
+    )
     runner.log("7", f"completed videos={len(ctx.relative_motion_results)}")
     runner.log(
         "7",
@@ -2043,7 +2081,12 @@ def run_step_9_segment_object_motion(ctx: PipelineContext, runner: StepRunner) -
             cfg=segment_object_cfg,
             force_recompute=_force_recompute(ctx),
         )
-    ctx.segment_object_results = _strip_low_confidence_candidate_results(ctx.segment_object_results)
+    ctx.segment_object_results = _postprocess_candidate_payloads(
+        runner,
+        "9",
+        "segment_object_motion",
+        ctx.segment_object_results,
+    )
     runner.log("9", f"completed videos={len(ctx.segment_object_results)}")
     runner.log(
         "9",
@@ -2063,7 +2106,12 @@ def run_step_10_important_objects(ctx: PipelineContext, runner: StepRunner) -> N
             cfg=important_objects_cfg,
             force_recompute=_force_recompute(ctx),
         )
-    ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
+    ctx.important_object_results = _postprocess_candidate_payloads(
+        runner,
+        "10",
+        "important_objects",
+        ctx.important_object_results,
+    )
     runner.log("10", f"completed videos={len(ctx.important_object_results)}")
     runner.complete_step("10", subtitle=f"videos={len(ctx.important_object_results)}")
 
@@ -2080,7 +2128,12 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
             cfg=traffic_control_attributes_cfg,
             force_recompute=_force_recompute(ctx, "traffic_control_attributes", False),
         )
-    ctx.traffic_control_attribute_results = _strip_low_confidence_candidate_results(ctx.traffic_control_attribute_results)
+    ctx.traffic_control_attribute_results = _postprocess_candidate_payloads(
+        runner,
+        "10B",
+        "traffic_control_attributes",
+        ctx.traffic_control_attribute_results,
+    )
     runner.log("10B", f"completed videos={len(ctx.traffic_control_attribute_results)}")
     runner.complete_step("10B", subtitle=f"videos={len(ctx.traffic_control_attribute_results)}")
 
@@ -2096,7 +2149,12 @@ def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
             cfg=logic_atoms_cfg,
             force_recompute=_force_recompute(ctx, "logic_atoms", False),
         )
-    ctx.logic_atom_results = _strip_low_confidence_candidate_results(ctx.logic_atom_results)
+    ctx.logic_atom_results = _postprocess_candidate_payloads(
+        runner,
+        "11",
+        "logic_atoms",
+        ctx.logic_atom_results,
+    )
     runner.log("11", f"completed videos={len(ctx.logic_atom_results)}")
     runner.complete_step("11", subtitle=f"videos={len(ctx.logic_atom_results)}")
 
@@ -2112,7 +2170,12 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
             cfg=target_head_cfg,
             force_recompute=_force_recompute(ctx, "target_head_atoms", False),
         )
-    ctx.target_head_results = _strip_low_confidence_candidate_results(ctx.target_head_results)
+    ctx.target_head_results = _postprocess_candidate_payloads(
+        runner,
+        "12",
+        "target_head_atoms",
+        ctx.target_head_results,
+    )
     runner.log("12", f"completed videos={len(ctx.target_head_results)}")
     runner.complete_step("12", subtitle=f"videos={len(ctx.target_head_results)}")
 
@@ -2128,7 +2191,12 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
             cfg=rule_examples_cfg,
             force_recompute=_force_recompute(ctx, "temporal_rule_examples", False),
         )
-    ctx.temporal_rule_results = _strip_low_confidence_candidate_results(ctx.temporal_rule_results)
+    ctx.temporal_rule_results = _postprocess_candidate_payloads(
+        runner,
+        "13",
+        "temporal_rule_examples",
+        ctx.temporal_rule_results,
+    )
     runner.log("13", f"completed videos={len(ctx.temporal_rule_results)}")
     runner.complete_step("13", subtitle=f"videos={len(ctx.temporal_rule_results)}")
 

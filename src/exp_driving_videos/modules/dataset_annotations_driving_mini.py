@@ -188,6 +188,7 @@ def process_video(
         with out_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _DATASET_ANNOTATIONS_VERSION:
+            cached["from_cache"] = True
             return cached
 
     frame_dir = get_frames_root() / video_id
@@ -282,6 +283,7 @@ def process_video(
     result: Dict[str, Any] = {
         "version": _DATASET_ANNOTATIONS_VERSION,
         "video_id": video_id,
+        "from_cache": False,
         "source": "dataset/driving_mini/labels.csv",
         "num_frames": len(frames),
         "num_tracks": len(all_track_ids),
@@ -345,7 +347,9 @@ def run(
     print(f"Dataset annotation videos to process: {target_videos}")
 
     results: List[Dict[str, Any]] = []
-    for video_id in target_videos:
+    total_videos = len(target_videos)
+    for index, video_id in enumerate(target_videos, start=1):
+        print(f"Dataset annotation progress: {index}/{total_videos} | {video_id} | starting")
         result = process_video(
             video_id=video_id,
             rows=rows_by_video.get(video_id, []),
@@ -354,6 +358,8 @@ def run(
             force_recompute=force_recompute,
         )
         results.append(result)
+        cache_tag = "cached" if bool(result.get("from_cache", False)) else "recomputed"
+        print(f"Dataset annotation progress: {index}/{total_videos} | {video_id} | {cache_tag}")
 
     manifest = {
         "version": _DATASET_ANNOTATIONS_VERSION,
