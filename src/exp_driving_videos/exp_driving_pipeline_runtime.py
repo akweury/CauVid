@@ -722,7 +722,16 @@ def _postprocess_candidate_payloads(
         runner.log(tag, f"postprocess={label} skipped summary_candidate_counts=0")
         return results
     runner.log(tag, f"postprocess={label} candidate_cleanup_start")
-    cleaned = _strip_low_confidence_candidate_payloads(results)
+    if isinstance(results, list) and all(isinstance(item, dict) for item in results):
+        total_items = len(results)
+        cleaned_items: List[Any] = []
+        for index, item in enumerate(results, start=1):
+            cleaned_items.append(_strip_low_confidence_candidate_payloads(item))
+            if index == total_items or index == 1 or index % 50 == 0:
+                runner.log(tag, f"postprocess={label} candidate_cleanup_progress {index}/{total_items}")
+        cleaned = cleaned_items
+    else:
+        cleaned = _strip_low_confidence_candidate_payloads(results)
     runner.log(tag, f"postprocess={label} candidate_cleanup_done")
     return cleaned
 

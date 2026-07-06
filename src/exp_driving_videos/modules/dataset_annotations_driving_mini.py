@@ -167,6 +167,37 @@ def _selected_candidate_objects_by_frame(
     return frame_map
 
 
+def _tracking_has_selected_candidate_objects(
+    tracking_video_result: Optional[Dict[str, Any]],
+) -> bool:
+    if not isinstance(tracking_video_result, dict):
+        return False
+    if _to_int(tracking_video_result.get("num_candidate_tracks", 0), default=0) > 0:
+        return True
+    candidate_frames = (
+        tracking_video_result.get("candidate_tracks", {})
+        .get("selected_candidate_tracks", {})
+        .get("frames", [])
+    )
+    return bool(candidate_frames)
+
+
+def _strip_cached_candidate_objects(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = dict(payload)
+    frames = []
+    for frame in list(cleaned.get("frames", [])):
+        if not isinstance(frame, dict):
+            frames.append(frame)
+            continue
+        updated_frame = dict(frame)
+        updated_frame["candidate_objects"] = []
+        frames.append(updated_frame)
+    cleaned["frames"] = frames
+    cleaned["num_candidate_tracks"] = 0
+    cleaned["num_candidate_objects"] = 0
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Per-video processing
 # ---------------------------------------------------------------------------
@@ -188,6 +219,17 @@ def process_video(
         with out_file.open("r", encoding="utf-8") as fh:
             cached = json.load(fh)
         if int(cached.get("version", 0)) == _DATASET_ANNOTATIONS_VERSION:
+            if (
+                not _tracking_has_selected_candidate_objects(tracking_video_result)
+                and (
+                    _to_int(cached.get("num_candidate_tracks", 0), default=0) > 0
+                    or _to_int(cached.get("num_candidate_objects", 0), default=0) > 0
+                )
+            ):
+                print(f"  [cache] {video_id} - removing stale candidate objects from {out_file.name}")
+                cached = _strip_cached_candidate_objects(cached)
+                with out_file.open("w", encoding="utf-8") as fh:
+                    json.dump(cached, fh, indent=2)
             cached["from_cache"] = True
             return cached
 
