@@ -1846,7 +1846,9 @@ def run_step_1_detection(ctx: PipelineContext, runner: StepRunner) -> None:
             od_calibration_policy=active_od_policy,
             background_rule_relevance_prior_results=ctx.background_rule_relevance_prior_results,
         )
-    ctx.detection_results = _strip_low_confidence_candidate_results(ctx.detection_results)
+    # detect_driving_mini.run already applies the active candidate-branch mode
+    # before returning. Re-walking 961 full detection payloads here is expensive
+    # and can look like a hang immediately after the Step 1 cache fast path.
     runner.log("1", f"completed videos={len(ctx.detection_results)}")
     runner.complete_step("1", subtitle=f"videos={len(ctx.detection_results)}")
 
@@ -1862,7 +1864,8 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
             render_video=render_video,
             force_recompute=_force_recompute(ctx),
         )
-    ctx.tracking_results = _strip_low_confidence_candidate_results(ctx.tracking_results)
+    # tracking_driving_mini rejects stale candidate-branch caches and emits the
+    # active branch shape, so avoid another full recursive copy of all tracks.
     runner.log("2", f"completed videos={len(ctx.tracking_results)}")
     runner.log(
         "2",
