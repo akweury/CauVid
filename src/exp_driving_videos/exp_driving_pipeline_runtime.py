@@ -679,7 +679,33 @@ def _strip_low_confidence_candidate_payloads(value: Any) -> Any:
     return stripped
 
 
+def _candidate_summary_counts_are_zero(value: Any) -> bool:
+    if isinstance(value, list):
+        if not value or not all(isinstance(item, dict) for item in value):
+            return False
+        return all(_candidate_summary_counts_are_zero(item) for item in value)
+    if not isinstance(value, dict):
+        return False
+
+    saw_candidate_counter = False
+    if bool(value.get("candidate_branch_enabled", False)):
+        return False
+    for key, item in value.items():
+        key_text = str(key)
+        if not _is_low_confidence_candidate_count_key(key_text):
+            continue
+        saw_candidate_counter = True
+        try:
+            if float(item) != 0.0:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return saw_candidate_counter
+
+
 def _strip_low_confidence_candidate_results(results: Any) -> Any:
+    if not _low_confidence_candidate_payloads_enabled() and _candidate_summary_counts_are_zero(results):
+        return results
     return _strip_low_confidence_candidate_payloads(results)
 
 

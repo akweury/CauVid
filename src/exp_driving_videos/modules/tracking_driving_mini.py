@@ -1684,8 +1684,10 @@ def track_video(
     out_dir = (output_root or get_output_root()) / video_id
     out_dir.mkdir(parents=True, exist_ok=True)
     tracks_file = out_dir / "tracks.json"
+    cache_status = "force_recompute" if force_recompute else "missing"
 
     if not force_recompute and tracks_file.exists():
+        cache_status = "invalid"
         try:
             with tracks_file.open("r", encoding="utf-8") as fh:
                 cached = json.load(fh)
@@ -1697,15 +1699,20 @@ def track_video(
             and isinstance(cached.get("accepted_tracks"), dict)
             and isinstance(cached.get("candidate_tracks"), dict)
         )
+        if not cache_is_current:
+            cache_status = "stale_schema_or_shape"
         current_policy_id = str(dict(video_result.get("od_calibration", {})).get("policy_id", ""))
         cached_policy_id = str(cached.get("od_calibration_policy_id", ""))
         if cache_is_current and cached_policy_id != current_policy_id:
             cache_is_current = False
+            cache_status = "stale_od_policy"
         if cache_is_current and bool(cached.get("candidate_branch_enabled", True)) != _candidate_branch_enabled(video_result):
             cache_is_current = False
+            cache_status = "stale_candidate_branch"
         if not cache_is_current:
             cached = {}
         else:
+            cache_status = "hit"
             tracked_video_file = out_dir / "tracks_boxed.mp4"
             if render_video and not tracked_video_file.exists() and cached.get("frames"):
                 render_path = render_tracking_video(
@@ -1717,6 +1724,8 @@ def track_video(
                 if render_path:
                     cached["tracked_video_path"] = render_path
                     _write_json_atomic(tracks_file, cached)
+            cached["from_cache"] = True
+            cached["tracking_cache_status"] = cache_status
             return cached
 
     frame_records: List[Dict[str, Any]] = video_result.get("frames", [])
@@ -1747,6 +1756,8 @@ def track_video(
     result: Dict[str, Any] = {
         "schema_version": _TRACKING_SCHEMA_VERSION,
         "video_id": video_id,
+        "from_cache": False,
+        "tracking_cache_status": cache_status,
         "candidate_branch_enabled": _candidate_branch_enabled(video_result),
         "od_calibration_policy_id": str(dict(video_result.get("od_calibration", {})).get("policy_id", "")),
         "num_frames": len(accepted_frames),
@@ -1836,7 +1847,10 @@ def run(
     print(f"Videos to track: {[r['video_id'] for r in detection_results]}")
 
     tracking_results: List[Dict[str, Any]] = []
-    for video_result in detection_results:
+    total_videos = len(detection_results)
+    for index, video_result in enumerate(detection_results, start=1):
+        video_id = str(video_result.get("video_id", ""))
+        print(f"Tracking progress: {index}/{total_videos} | {video_id} | starting")
         result = track_video(
             video_result=video_result,
             output_root=effective_output_root,
@@ -1846,6 +1860,12 @@ def run(
             render_video=effective_render_video,
         )
         tracking_results.append(result)
+        cache_tag = "cached" if bool(result.get("from_cache", False)) else "recomputed"
+        print(
+            "Tracking progress: "
+            f"{index}/{total_videos} | {video_id} | {cache_tag} "
+            f"status={result.get('tracking_cache_status', '')}"
+        )
 
     # Write summary manifest
     manifest = {
