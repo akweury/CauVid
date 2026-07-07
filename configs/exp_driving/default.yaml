@@ -334,7 +334,7 @@ baseline_comparison:
   run_rule_aggregation: true
 
 reasoning_supervised_od_calibration:
-  enabled: false
+  enabled: true
   min_delta_f1: 0.0
   min_fn_gain: 1
   allow_nonpositive_delta_with_fn_recovery: true
@@ -386,7 +386,7 @@ object_to_atom_coverage_diagnostic:
   max_rule_examples_per_class: 5
 
 traffic_control_rule_utility_diagnostic:
-  enabled: false
+  enabled: true
   highlight_predicates:
     - traffic_light_state
     - traffic_light_relevant
@@ -399,7 +399,7 @@ traffic_control_rule_utility_diagnostic:
   center_states: [centered]
 
 traffic_control_temporal_alignment_diagnostic:
-  enabled: false
+  enabled: true
   highlight_predicates:
     - traffic_light_state
     - traffic_light_relevant
@@ -410,7 +410,7 @@ traffic_control_temporal_alignment_diagnostic:
   positive_forward_states: [forward_slowdown, stopping]
 
 traffic_light_detection_quality_audit:
-  enabled: false
+  enabled: true
   max_samples_total: 0
   max_samples_per_state: 50
   max_samples_per_video: 12
@@ -421,6 +421,10 @@ traffic_light_detection_quality_audit:
   confidence_split_threshold: 0.75
   max_samples_per_state_per_confidence_band: 0
   frame_path_roots: []
+
+background_rule_relevance_prior:
+  enabled: true
+  target_predicate: brake_next
 
 background_causal_prior:
   enabled: true
@@ -498,7 +502,7 @@ error_and_explainability_analysis:
   overlap_rule_threshold: 10
 
 vehicle_rule_diagnostic:
-  enabled: false
+  enabled: true
   vehicle_classes: [car, truck, bus, motorcycle, bicycle, vehicle]
   near_states: [near]
   center_states: [centered]
