@@ -85,7 +85,7 @@ important_objects:
       semantic_relevance: 0.10
 
 traffic_control_attributes:
-  enabled: true
+  enabled: false
   min_crop_size: 8
   traffic_light_state_threshold: 0.06
   traffic_light_min_confidence_margin: 0.025

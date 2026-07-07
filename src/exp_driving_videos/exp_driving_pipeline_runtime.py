@@ -1380,7 +1380,8 @@ def _load_cached_upstream_context(
         traffic_control_output_root = traffic_control_attributes_driving_mini.get_output_root()
         traffic_control_video_ids = []
         traffic_control_manifest = traffic_control_output_root / "traffic_control_attributes_manifest.json"
-        if traffic_control_manifest.exists():
+        traffic_control_enabled = bool(_get_traffic_control_attributes_cfg().get("enabled", True))
+        if traffic_control_enabled and traffic_control_manifest.exists():
             traffic_control_video_ids = _cached_manifest_video_ids(
                 output_root=traffic_control_output_root,
                 manifest_name="traffic_control_attributes_manifest.json",
@@ -2406,6 +2407,11 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
     traffic_control_attributes_cfg = _get_traffic_control_attributes_cfg()
     runner.announce_step("10B", "traffic_control_attributes_driving_mini")
     runner.log("10B", f"cfg={traffic_control_attributes_cfg}")
+    if not bool(traffic_control_attributes_cfg.get("enabled", True)):
+        ctx.traffic_control_attribute_results = []
+        runner.log("10B", "disabled by traffic_control_attributes.enabled=false")
+        runner.complete_step("10B", subtitle="skipped")
+        return
     runner.log("10B", f"recompute={_force_recompute(ctx, 'traffic_control_attributes', False)}")
     runner.log("10B", f"input_videos={len(ctx.important_object_results or [])}")
     runner.log("10B", f"relative_motion_videos={len(ctx.relative_motion_results or [])}")
