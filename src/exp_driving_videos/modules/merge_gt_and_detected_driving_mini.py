@@ -411,6 +411,8 @@ def merge_video(
     frame_indices = sorted(set(tracked_frames.keys()) | set(gt_frames.keys()))
 
     merged_frames: List[Dict[str, Any]] = []
+    total_frames = len(frame_indices)
+    print(f"  progress=merge_video_start video_id={video_id} frames={total_frames}")
 
     max_gt_track_id = -1
     for fr in gt_video.get("frames", []):
@@ -427,7 +429,7 @@ def merge_video(
     candidate_track_ids: set[int] = set()
     candidate_objects_total = 0
 
-    for frame_index in frame_indices:
+    for frame_pos, frame_index in enumerate(frame_indices, start=1):
         gt_frame = gt_frames.get(frame_index, {})
         det_frame = tracked_frames.get(frame_index, {})
 
@@ -539,6 +541,12 @@ def merge_video(
                 "candidate_objects": candidate_objects,
             }
         )
+        if frame_pos == 1 or frame_pos == total_frames or frame_pos % 100 == 0:
+            print(
+                "  progress=merge_video_frames "
+                f"video_id={video_id} frames={frame_pos}/{total_frames} "
+                f"overlap_to_gt={overlap_count} carry_det={carried_det_count}"
+            )
 
     result: Dict[str, Any] = {
         "version": _MERGED_ANNOTATIONS_VERSION,
@@ -602,12 +610,19 @@ def run(
     effective_output_root = output_root or get_output_root()
 
     merged_results: List[Dict[str, Any]] = []
-    for tracked in tracking_results:
+    total_videos = len(tracking_results)
+    print(
+        "  progress=merge_start "
+        f"tracking_videos={len(tracking_results)} gt_videos={len(dataset_annotation_results)}"
+    )
+    for index, tracked in enumerate(tracking_results, start=1):
         video_id = tracked["video_id"]
+        print(f"  progress=merge_video {index}/{total_videos} video_id={video_id}")
         if video_id not in gt_by_video:
             if keep_tracked_only:
                 print(f"  [tracked-only] {video_id} (no GT annotations)")
                 merged_results.append(_tracked_video_as_merged_result(tracked))
+                print(f"  progress=merge_video_done {index}/{total_videos} video_id={video_id} mode=tracked_only")
             else:
                 print(f"  [skip] {video_id} not found in GT annotations")
             continue
@@ -622,6 +637,7 @@ def run(
             render_video=render_video,
         )
         merged_results.append(merged)
+        print(f"  progress=merge_video_done {index}/{total_videos} video_id={video_id}")
 
     manifest = {
         "version": _MERGED_ANNOTATIONS_VERSION,

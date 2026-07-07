@@ -605,7 +605,10 @@ def prepare_video_3d_positions(
 
     frames_with_3d = []
     skipped_frames = 0
-    for frame_entry in video_result.get("frames", []):
+    frame_entries = list(video_result.get("frames", []))
+    total_frames = len(frame_entries)
+    print(f"  progress=positions_3d_video_start video_id={video_id} frames={total_frames}")
+    for frame_pos, frame_entry in enumerate(frame_entries, start=1):
         frame_name = frame_entry.get("frame", "")
         frame_path = Path(frame_entry.get("image_path") or (frames_root / video_id / frame_name))
         depth_map_path = _depth_map_path_for_frame(depth_dir, frame_name)
@@ -647,6 +650,11 @@ def prepare_video_3d_positions(
                 frame_name,
                 ", ".join(missing_assets),
             )
+            if frame_pos == 1 or frame_pos == total_frames or frame_pos % 100 == 0:
+                print(
+                    "  progress=positions_3d_frames "
+                    f"video_id={video_id} frames={frame_pos}/{total_frames} skipped={skipped_frames}"
+                )
             continue
 
         positions_3d = estimate_3d_positions_for_frame(
@@ -682,6 +690,11 @@ def prepare_video_3d_positions(
         updated_frame["has_3d_positions"] = True
         updated_frame["has_candidate_3d_positions"] = bool(candidate_positions_3d)
         frames_with_3d.append(updated_frame)
+        if frame_pos == 1 or frame_pos == total_frames or frame_pos % 100 == 0:
+            print(
+                "  progress=positions_3d_frames "
+                f"video_id={video_id} frames={frame_pos}/{total_frames} skipped={skipped_frames}"
+            )
 
     result = dict(video_result)
     result["depth_dir"] = str(depth_dir)

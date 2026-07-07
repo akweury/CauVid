@@ -631,52 +631,58 @@ def _strip_low_confidence_candidate_atom_records(records: Sequence[Any]) -> List
     return stripped_records
 
 
+def _empty_candidate_bundle() -> Dict[str, Any]:
+    return {
+        "num_tracks": 0,
+        "num_candidates": 0,
+        "num_rejected": 0,
+        "frames": [],
+        "tracks": [],
+        "track_summaries": [],
+        "rejection_reason_counts": {},
+    }
+
+
 def _strip_low_confidence_candidate_payloads(value: Any) -> Any:
     if _low_confidence_candidate_payloads_enabled():
         return value
     if isinstance(value, list):
         if all(isinstance(item, str) for item in value):
             return [item for item in value if not _is_low_confidence_candidate_atom(item)]
-        return [_strip_low_confidence_candidate_payloads(item) for item in value]
+        for index, item in enumerate(value):
+            if isinstance(item, (dict, list)):
+                value[index] = _strip_low_confidence_candidate_payloads(item)
+        return value
     if not isinstance(value, dict):
         return value
 
-    stripped: Dict[str, Any] = {}
-    for key, item in value.items():
+    for key, item in list(value.items()):
         key_text = str(key)
         if key_text == "candidate_branch_enabled":
-            stripped[key] = False
+            value[key] = False
         elif key_text in _LOW_CONFIDENCE_CANDIDATE_LIST_KEYS:
-            stripped[key] = []
+            value[key] = []
         elif key_text in _LOW_CONFIDENCE_CANDIDATE_BUNDLE_KEYS:
-            stripped[key] = {
-                "num_tracks": 0,
-                "num_candidates": 0,
-                "num_rejected": 0,
-                "frames": [],
-                "tracks": [],
-                "track_summaries": [],
-                "rejection_reason_counts": {},
-            }
+            value[key] = _empty_candidate_bundle()
         elif _is_low_confidence_candidate_count_key(key_text):
-            stripped[key] = 0
+            value[key] = 0
         elif key_text in {"atoms", "all_atoms", "body_atoms"} and isinstance(item, list):
-            stripped[key] = [
+            value[key] = [
                 str(atom)
                 for atom in item
                 if not _is_low_confidence_candidate_atom(atom)
             ]
         elif key_text in {"atom_records", "all_atom_records"} and isinstance(item, list):
-            stripped[key] = _strip_low_confidence_candidate_atom_records(item)
+            value[key] = _strip_low_confidence_candidate_atom_records(item)
         elif key_text == "body_atom_provenance_map" and isinstance(item, dict):
-            stripped[key] = {
+            value[key] = {
                 str(atom): _strip_low_confidence_candidate_payloads(provenance)
                 for atom, provenance in item.items()
                 if not _is_low_confidence_candidate_atom(atom)
             }
-        else:
-            stripped[key] = _strip_low_confidence_candidate_payloads(item)
-    return stripped
+        elif isinstance(item, (dict, list)):
+            value[key] = _strip_low_confidence_candidate_payloads(item)
+    return value
 
 
 def _candidate_summary_counts_are_zero(value: Any) -> bool:
@@ -726,9 +732,23 @@ def _postprocess_candidate_payloads(
         total_items = len(results)
         cleaned_items: List[Any] = []
         for index, item in enumerate(results, start=1):
+            video_id = str(item.get("video_id", "unknown"))
+            num_frames = len(list(item.get("frames", []))) if isinstance(item.get("frames", []), list) else 0
+            if index == total_items or index == 1 or index % 10 == 0:
+                runner.log(
+                    tag,
+                    "postprocess="
+                    f"{label} candidate_cleanup_item_start {index}/{total_items} "
+                    f"video_id={video_id} frames={num_frames}",
+                )
             cleaned_items.append(_strip_low_confidence_candidate_payloads(item))
-            if index == total_items or index == 1 or index % 50 == 0:
-                runner.log(tag, f"postprocess={label} candidate_cleanup_progress {index}/{total_items}")
+            if index == total_items or index == 1 or index % 10 == 0:
+                runner.log(
+                    tag,
+                    "postprocess="
+                    f"{label} candidate_cleanup_progress {index}/{total_items} "
+                    f"video_id={video_id}",
+                )
         cleaned = cleaned_items
     else:
         cleaned = _strip_low_confidence_candidate_payloads(results)

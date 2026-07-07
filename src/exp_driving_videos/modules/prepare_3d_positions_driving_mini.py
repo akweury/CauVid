@@ -97,7 +97,14 @@ def run(
     print(f"Videos to prepare 3D positions for: {[r['video_id'] for r in merged_results]}")
 
     results: List[Dict[str, Any]] = []
-    for video_result in merged_results:
+    total_videos = len(merged_results)
+    print(f"progress=positions_3d_start videos={total_videos}")
+    for index, video_result in enumerate(merged_results, start=1):
+        video_id = str(video_result.get("video_id", "unknown"))
+        print(
+            "progress=positions_3d_video "
+            f"{index}/{total_videos} video_id={video_id} frames={len(list(video_result.get('frames', [])))}"
+        )
         result = process_video(
             video_result=video_result,
             output_root=effective_output_root,
@@ -108,6 +115,7 @@ def run(
             force_recompute_depth=force_recompute_depth,
         )
         results.append(result)
+        print(f"progress=positions_3d_video_done {index}/{total_videos} video_id={video_id}")
 
     manifest = {
         "version": _POSITIONS_3D_VERSION,
