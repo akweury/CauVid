@@ -1154,6 +1154,30 @@ def _load_cached_important_object_results(
     )
 
 
+def _load_cached_segment_object_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=segment_object_motion_driving_mini.get_output_root(),
+        manifest_name="segment_object_motion_manifest.json",
+        per_video_filename="segment_object_motion.json",
+        selected_video_ids=selected_video_ids,
+        label="step 9 segment object motion",
+    )
+
+
+def _load_cached_relative_motion_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=relative_object_motion_driving_mini.get_output_root(),
+        manifest_name="relative_object_motion_manifest.json",
+        per_video_filename="relative_object_motion.json",
+        selected_video_ids=selected_video_ids,
+        label="step 7 relative object motion",
+    )
+
+
 def _load_cached_traffic_control_attribute_results(
     selected_video_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1223,11 +1247,30 @@ def _load_cached_upstream_context(
     start_target: str,
     stop_target: str,
 ) -> None:
-    if _stage_index(start_target) == _stage_index("11"):
-        traffic_control_manifest = (
-            traffic_control_attributes_driving_mini.get_output_root() / "traffic_control_attributes_manifest.json"
+    if _stage_index(start_target) == _stage_index("10"):
+        ctx.segment_object_results = _load_cached_segment_object_results(ctx.effective_video_ids)
+        ctx.segment_object_results = _strip_low_confidence_candidate_results(ctx.segment_object_results)
+
+    if _stage_index(start_target) == _stage_index("10B"):
+        ctx.important_object_results = _load_cached_important_object_results(ctx.effective_video_ids)
+        ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
+        relative_motion_manifest = (
+            relative_object_motion_driving_mini.get_output_root() / "relative_object_motion_manifest.json"
         )
+        if relative_motion_manifest.exists():
+            ctx.relative_motion_results = _load_cached_relative_motion_results(ctx.effective_video_ids)
+            ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
+
+    if _stage_index(start_target) == _stage_index("11"):
+        traffic_control_output_root = traffic_control_attributes_driving_mini.get_output_root()
+        traffic_control_video_ids = []
+        traffic_control_manifest = traffic_control_output_root / "traffic_control_attributes_manifest.json"
         if traffic_control_manifest.exists():
+            traffic_control_video_ids = _cached_manifest_video_ids(
+                output_root=traffic_control_output_root,
+                manifest_name="traffic_control_attributes_manifest.json",
+            )
+        if traffic_control_video_ids:
             ctx.traffic_control_attribute_results = _load_cached_traffic_control_attribute_results(
                 ctx.effective_video_ids,
             )
@@ -2179,6 +2222,12 @@ def run_step_10_important_objects(ctx: PipelineContext, runner: StepRunner) -> N
     runner.announce_step("10", "important_objects_driving_mini")
     runner.log("10", f"cfg={important_objects_cfg}")
     runner.log("10", f"force_recompute={_force_recompute(ctx)}")
+    runner.log("10", f"input_videos={len(ctx.segment_object_results or [])}")
+    if not ctx.segment_object_results:
+        raise RuntimeError(
+            "Step 10 has zero input videos. "
+            "Run Step 9 first or start from Step 10 only after cached Step 9 segment-object motion exists."
+        )
     with runner.module_output("10"):
         ctx.important_object_results = important_objects_driving_mini.run(
             segment_object_motion_results=ctx.segment_object_results or [],
@@ -2200,6 +2249,13 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
     runner.announce_step("10B", "traffic_control_attributes_driving_mini")
     runner.log("10B", f"cfg={traffic_control_attributes_cfg}")
     runner.log("10B", f"recompute={_force_recompute(ctx, 'traffic_control_attributes', False)}")
+    runner.log("10B", f"input_videos={len(ctx.important_object_results or [])}")
+    runner.log("10B", f"relative_motion_videos={len(ctx.relative_motion_results or [])}")
+    if not ctx.important_object_results:
+        raise RuntimeError(
+            "Step 10B has zero input videos. "
+            "Run Step 10 first or start from Step 10B only after cached Step 10 important objects exist."
+        )
     with runner.module_output("10B"):
         ctx.traffic_control_attribute_results = traffic_control_attributes_driving_mini.run(
             important_object_results=ctx.important_object_results or [],
