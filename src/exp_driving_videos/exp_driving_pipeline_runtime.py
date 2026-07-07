@@ -1178,6 +1178,30 @@ def _load_cached_relative_motion_results(
     )
 
 
+def _load_cached_positions_3d_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=prepare_3d_positions_driving_mini.get_output_root(),
+        manifest_name="positions_3d_manifest.json",
+        per_video_filename="positions_3d.json",
+        selected_video_ids=selected_video_ids,
+        label="step 5 3D positions",
+    )
+
+
+def _load_cached_ego_motion_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=ego_motion_driving_mini.get_output_root(),
+        manifest_name="ego_motion_manifest.json",
+        per_video_filename="ego_motion.json",
+        selected_video_ids=selected_video_ids,
+        label="step 6 ego motion",
+    )
+
+
 def _load_cached_temporal_segmentation_results(
     selected_video_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1259,7 +1283,45 @@ def _load_cached_upstream_context(
     start_target: str,
     stop_target: str,
 ) -> None:
+    if _stage_index(start_target) == _stage_index("7"):
+        ctx.positions_3d_results = _load_cached_positions_3d_results(ctx.effective_video_ids)
+        ctx.positions_3d_results = _strip_low_confidence_candidate_results(ctx.positions_3d_results)
+        ctx.ego_motion_results = _load_cached_ego_motion_results(ctx.effective_video_ids)
+        ctx.ego_motion_results = _strip_low_confidence_candidate_results(ctx.ego_motion_results)
+
+    if _stage_index(start_target) == _stage_index("8"):
+        ctx.ego_motion_results = _load_cached_ego_motion_results(ctx.effective_video_ids)
+        ctx.ego_motion_results = _strip_low_confidence_candidate_results(ctx.ego_motion_results)
+        ctx.relative_motion_results = _load_cached_relative_motion_results(ctx.effective_video_ids)
+        ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
+
     if _stage_index(start_target) == _stage_index("9"):
+        relative_motion_output_root = relative_object_motion_driving_mini.get_output_root()
+        relative_motion_video_ids = []
+        relative_motion_manifest = relative_motion_output_root / "relative_object_motion_manifest.json"
+        if relative_motion_manifest.exists():
+            relative_motion_video_ids = _cached_manifest_video_ids(
+                output_root=relative_motion_output_root,
+                manifest_name="relative_object_motion_manifest.json",
+            )
+        if not relative_motion_video_ids:
+            raise RuntimeError(
+                "Cached step 7 relative object motion contains zero videos. "
+                "Restart from Step 7 or earlier to rebuild it before starting from Step 9."
+            )
+        temporal_seg_output_root = temporal_segmentation_driving_mini.get_output_root()
+        temporal_seg_video_ids = []
+        temporal_seg_manifest = temporal_seg_output_root / "temporal_segmentation_manifest.json"
+        if temporal_seg_manifest.exists():
+            temporal_seg_video_ids = _cached_manifest_video_ids(
+                output_root=temporal_seg_output_root,
+                manifest_name="temporal_segmentation_manifest.json",
+            )
+        if not temporal_seg_video_ids:
+            raise RuntimeError(
+                "Cached step 8 temporal segmentation contains zero videos. "
+                "Restart from Step 8 or earlier to rebuild it before starting from Step 9."
+            )
         ctx.relative_motion_results = _load_cached_relative_motion_results(ctx.effective_video_ids)
         ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
         ctx.temporal_seg_results = _load_cached_temporal_segmentation_results(ctx.effective_video_ids)
@@ -2186,6 +2248,18 @@ def run_step_6_ego_motion(ctx: PipelineContext, runner: StepRunner) -> None:
 def run_step_7_relative_object_motion(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("7", "relative_object_motion_driving_mini")
     runner.log("7", f"force_recompute={_force_recompute(ctx)}")
+    runner.log("7", f"positions_3d_videos={len(ctx.positions_3d_results or [])}")
+    runner.log("7", f"ego_motion_videos={len(ctx.ego_motion_results or [])}")
+    if not ctx.positions_3d_results:
+        raise RuntimeError(
+            "Step 7 has zero 3D-position input videos. "
+            "Run Step 5 first or start from Step 7 only after cached Step 5 3D positions exist."
+        )
+    if not ctx.ego_motion_results:
+        raise RuntimeError(
+            "Step 7 has zero ego-motion input videos. "
+            "Run Step 6 first or start from Step 7 only after cached Step 6 ego motion exists."
+        )
     with runner.module_output("7"):
         ctx.relative_motion_results = relative_object_motion_driving_mini.run(
             positions_3d_results=ctx.positions_3d_results or [],
@@ -2211,6 +2285,18 @@ def run_step_8_temporal_segmentation(ctx: PipelineContext, runner: StepRunner) -
     runner.announce_step("8", "temporal_segmentation_driving_mini")
     runner.log("8", f"cfg={temporal_seg_cfg}")
     runner.log("8", f"force_recompute={_force_recompute(ctx)}")
+    runner.log("8", f"ego_motion_videos={len(ctx.ego_motion_results or [])}")
+    runner.log("8", f"relative_motion_videos={len(ctx.relative_motion_results or [])}")
+    if not ctx.ego_motion_results:
+        raise RuntimeError(
+            "Step 8 has zero ego-motion input videos. "
+            "Run Step 6 first or start from Step 8 only after cached Step 6 ego motion exists."
+        )
+    if not ctx.relative_motion_results:
+        raise RuntimeError(
+            "Step 8 has zero relative-motion input videos. "
+            "Run Step 7 first or start from Step 8 only after cached Step 7 relative motion exists."
+        )
     with runner.module_output("8"):
         ctx.temporal_seg_results = temporal_segmentation_driving_mini.run(
             ego_motion_results=ctx.ego_motion_results or [],
