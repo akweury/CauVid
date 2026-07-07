@@ -2152,6 +2152,7 @@ def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("11", "logic_atoms_driving_mini")
     runner.log("11", f"cfg={logic_atoms_cfg}")
     runner.log("11", f"recompute={_force_recompute(ctx, 'logic_atoms', False)}")
+    runner.log("11", f"input_videos={len(ctx.traffic_control_attribute_results or ctx.important_object_results or [])}")
     with runner.module_output("11"):
         ctx.logic_atom_results = logic_atoms_driving_mini.run(
             segment_object_motion_results=ctx.traffic_control_attribute_results or ctx.important_object_results or [],
@@ -2173,6 +2174,11 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
     runner.announce_step("12", "target_head_atoms_driving_mini")
     runner.log("12", f"cfg={target_head_cfg}")
     runner.log("12", f"recompute={_force_recompute(ctx, 'target_head_atoms', False)}")
+    runner.log("12", f"input_videos={len(ctx.logic_atom_results or [])}")
+    runner.log(
+        "12",
+        f"input_segments={sum(len(list(dict(row).get('segments', []))) for row in (ctx.logic_atom_results or []))}",
+    )
     with runner.module_output("12"):
         ctx.target_head_results = target_head_atoms_driving_mini.run(
             logic_atom_results=ctx.logic_atom_results or [],
@@ -2186,6 +2192,15 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
         ctx.target_head_results,
     )
     runner.log("12", f"completed videos={len(ctx.target_head_results)}")
+    runner.log(
+        "12",
+        f"output_examples={sum(int(row.get('num_examples', 0)) for row in (ctx.target_head_results or []))}",
+    )
+    if not ctx.target_head_results:
+        raise RuntimeError(
+            "Step 12 produced zero video results. "
+            "Inspect Step 11 completed_videos/input_segments and the Step 12 input_videos/input_segments logs."
+        )
     runner.complete_step("12", subtitle=f"videos={len(ctx.target_head_results)}")
 
 
@@ -2194,6 +2209,11 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
     runner.announce_step("13", "temporal_rule_examples_driving_mini")
     runner.log("13", f"cfg={rule_examples_cfg}")
     runner.log("13", f"recompute={_force_recompute(ctx, 'temporal_rule_examples', False)}")
+    runner.log("13", f"input_videos={len(ctx.target_head_results or [])}")
+    runner.log(
+        "13",
+        f"input_examples={sum(int(row.get('num_examples', 0)) for row in (ctx.target_head_results or []))}",
+    )
     with runner.module_output("13"):
         ctx.temporal_rule_results = temporal_rule_examples_driving_mini.run(
             target_head_results=ctx.target_head_results or [],
@@ -2207,6 +2227,15 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
         ctx.temporal_rule_results,
     )
     runner.log("13", f"completed videos={len(ctx.temporal_rule_results)}")
+    runner.log(
+        "13",
+        f"output_examples={sum(int(row.get('num_examples', 0)) for row in (ctx.temporal_rule_results or []))}",
+    )
+    if not ctx.temporal_rule_results:
+        raise RuntimeError(
+            "Step 13 produced zero temporal rule-example video results. "
+            "Step 12 input/output counts above identify whether the empty input started earlier."
+        )
     runner.complete_step("13", subtitle=f"videos={len(ctx.temporal_rule_results)}")
 
 
