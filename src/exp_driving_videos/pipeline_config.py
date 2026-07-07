@@ -620,6 +620,49 @@ def get_rule_level_causal_masking_cfg() -> Dict[str, Any]:
     )
 
 
+def get_causal_rule_reselection_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": True,
+            "prediction_mode": "any_rule_positive",
+            "top_k": 50,
+            "remove_pure_harmful": True,
+            "downrank_redundant": True,
+            "weak_grounding_penalty": 1.5,
+            "harmful_penalty": 3.0,
+            "false_positive_penalty": 2.0,
+            "necessary_positive_bonus": 3.0,
+            "helpful_bonus": 1.0,
+            "object_support_bonus": 0.5,
+            "broad_weak_predicates": [
+                "vz_approaching",
+                "vz_awaying",
+                "intermittent_visibility",
+                "visibility_intermittent",
+            ],
+            "ego_motion_only_predicates": [
+                "ego_forward_slowdown",
+                "ego_stopping",
+                "forward_slowdown",
+                "stopping",
+            ],
+        },
+        path=("causal_rule_reselection",),
+        warn_label="causal rule reselection",
+    )
+
+
+def get_refined_rule_evaluation_cfg() -> Dict[str, Any]:
+    return _load_cfg_section(
+        {
+            "enabled": True,
+            "prediction_mode": "any_rule_positive",
+        },
+        path=("refined_rule_evaluation",),
+        warn_label="refined rule evaluation",
+    )
+
+
 def get_baseline_comparison_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
@@ -960,6 +1003,8 @@ def get_pipeline_recompute_cfg() -> Dict[str, Any]:
             "oracle_rule_selection_gap_diagnostic": False,
             "rule_evaluation": False,
             "rule_level_causal_masking": False,
+            "causal_rule_reselection": False,
+            "refined_rule_evaluation": False,
             "candidate_contribution_summary": False,
             "reasoning_to_od_pseudo_labels": False,
             "od_confidence_calibration": False,
@@ -1024,6 +1069,14 @@ def get_rule_evaluation_output_root() -> Path:
 
 def get_rule_level_causal_masking_output_root() -> Path:
     return _load_output_root("18m_driving_mini_rule_level_causal_masking")
+
+
+def get_causal_rule_reselection_output_root() -> Path:
+    return _load_output_root("18n_driving_mini_causal_rule_reselection")
+
+
+def get_refined_rule_evaluation_output_root() -> Path:
+    return _load_output_root("18o_driving_mini_refined_rule_evaluation")
 
 
 def get_candidate_contribution_summary_output_root() -> Path:

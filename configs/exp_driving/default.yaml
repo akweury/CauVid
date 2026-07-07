@@ -137,6 +137,8 @@ pipeline_recompute:
   oracle_rule_selection_gap_diagnostic: false
   rule_evaluation: false
   rule_level_causal_masking: false
+  causal_rule_reselection: false
+  refined_rule_evaluation: false
   candidate_contribution_summary: false
   reasoning_to_od_pseudo_labels: false
   od_confidence_calibration: false
@@ -332,6 +334,33 @@ rule_level_causal_masking:
   rule_set_name: selected
   score_epsilon: 1.0e-09
   many_redundant_rule_fraction: 0.5
+
+causal_rule_reselection:
+  enabled: true
+  prediction_mode: any_rule_positive
+  top_k: 50
+  remove_pure_harmful: true
+  downrank_redundant: true
+  weak_grounding_penalty: 1.5
+  harmful_penalty: 3.0
+  false_positive_penalty: 2.0
+  necessary_positive_bonus: 3.0
+  helpful_bonus: 1.0
+  object_support_bonus: 0.5
+  broad_weak_predicates:
+    - vz_approaching
+    - vz_awaying
+    - intermittent_visibility
+    - visibility_intermittent
+  ego_motion_only_predicates:
+    - ego_forward_slowdown
+    - ego_stopping
+    - forward_slowdown
+    - stopping
+
+refined_rule_evaluation:
+  enabled: true
+  prediction_mode: any_rule_positive
 
 baseline_comparison:
   enabled: true

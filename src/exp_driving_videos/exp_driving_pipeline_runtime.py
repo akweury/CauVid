@@ -58,6 +58,10 @@ Steps:
     18M. rule_level_causal_masking_driving_mini — post-hoc counterfactual
                     masking of triggered final rules using Step 18 aggregation
                     outputs.
+    18N. causal_rule_reselection_driving_mini — re-rank and filter Step 17
+                    rules using Step 18M rule-level causal contribution stats.
+    18O. refined_rule_evaluation_driving_mini — evaluate the Step 18N refined
+                    rule set with the same protocol as Step 18.
     18B. baseline_comparison_driving_mini — optional comparison against
                     neural-symbolic and learned rule-aggregation baselines.
     19. object_to_atom_coverage_diagnostic_driving_mini — optional
@@ -110,6 +114,7 @@ from src.exp_driving_videos import pipeline_config as driving_pipeline_config
 from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
+from src.exp_driving_videos.modules import causal_rule_reselection_driving_mini
 from src.exp_driving_videos.modules import candidate_contribution_summary_driving_mini
 from src.exp_driving_videos.modules import reasoning_to_od_pseudo_labels_driving_mini
 from src.exp_driving_videos.modules import od_confidence_calibration_driving_mini
@@ -134,6 +139,7 @@ from src.exp_driving_videos.modules import relative_object_motion_driving_mini
 from src.exp_driving_videos.modules import oracle_rule_selection_gap_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_pool_upper_bound_diagnostic_driving_mini
 from src.exp_driving_videos.modules import rule_level_causal_masking_driving_mini
+from src.exp_driving_videos.modules import refined_rule_evaluation_driving_mini
 from src.exp_driving_videos.modules import rule_aggregation_baseline_driving_mini
 from src.exp_driving_videos.modules import integrated_method_visualization_driving_mini
 from src.exp_driving_videos.modules import rule_selection_visualization_driving_mini
@@ -184,6 +190,8 @@ _get_rule_pool_upper_bound_diagnostic_cfg = driving_pipeline_config.get_rule_poo
 _get_oracle_rule_selection_gap_diagnostic_cfg = driving_pipeline_config.get_oracle_rule_selection_gap_diagnostic_cfg
 _get_data_split_cfg = driving_pipeline_config.get_data_split_cfg
 _get_rule_evaluation_cfg = driving_pipeline_config.get_rule_evaluation_cfg
+_get_causal_rule_reselection_cfg = driving_pipeline_config.get_causal_rule_reselection_cfg
+_get_refined_rule_evaluation_cfg = driving_pipeline_config.get_refined_rule_evaluation_cfg
 _get_baseline_comparison_cfg = driving_pipeline_config.get_baseline_comparison_cfg
 _get_candidate_contribution_summary_cfg = driving_pipeline_config.get_candidate_contribution_summary_cfg
 _get_reasoning_supervised_od_calibration_cfg = (
@@ -210,6 +218,8 @@ _get_error_and_explainability_cfg = driving_pipeline_config.get_error_and_explai
 _get_rule_level_causal_masking_cfg = driving_pipeline_config.get_rule_level_causal_masking_cfg
 _get_rule_evaluation_output_root = driving_pipeline_config.get_rule_evaluation_output_root
 _get_rule_level_causal_masking_output_root = driving_pipeline_config.get_rule_level_causal_masking_output_root
+_get_causal_rule_reselection_output_root = driving_pipeline_config.get_causal_rule_reselection_output_root
+_get_refined_rule_evaluation_output_root = driving_pipeline_config.get_refined_rule_evaluation_output_root
 _get_merged_candidate_rules_output_root = driving_pipeline_config.get_merged_candidate_rules_output_root
 _get_candidate_contribution_summary_output_root = (
     driving_pipeline_config.get_candidate_contribution_summary_output_root
@@ -265,6 +275,8 @@ _PIPELINE_STAGE_SEQUENCE: List[Dict[str, Any]] = [
     {"tag": "17D", "stop_after": None, "label": "rule_pool_and_selector_diagnostic_driving_mini"},
     {"tag": "18", "stop_after": None, "label": "evaluate_rules_driving_mini"},
     {"tag": "18M", "stop_after": 18, "label": "rule_level_causal_masking_driving_mini"},
+    {"tag": "18N", "stop_after": 18, "label": "causal_rule_reselection_driving_mini"},
+    {"tag": "18O", "stop_after": 18, "label": "refined_rule_evaluation_driving_mini"},
     {"tag": "18B", "stop_after": None, "label": "baseline_comparison_driving_mini"},
     {"tag": "19", "stop_after": 19, "label": "object_to_atom_coverage_diagnostic_driving_mini"},
     {"tag": "20", "stop_after": 20, "label": "error_and_explainability_analysis_driving_mini"},
@@ -421,6 +433,8 @@ class PipelineContext:
     evaluation_results_by_name: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     evaluation_results: Dict[str, Any] = field(default_factory=dict)
     rule_level_causal_masking_results: Dict[str, Any] = field(default_factory=dict)
+    causal_rule_reselection_results: Dict[str, Any] = field(default_factory=dict)
+    refined_rule_evaluation_results: Dict[str, Any] = field(default_factory=dict)
     candidate_contribution_summary_results: Dict[str, Any] = field(default_factory=dict)
     od_calibration_iteration_id: str = ""
     reasoning_to_od_pseudo_label_results: Dict[str, Any] = field(default_factory=dict)
@@ -1152,6 +1166,27 @@ def _load_cached_rule_level_causal_masking_result() -> Dict[str, Any]:
     )
 
 
+def _load_cached_causal_rule_reselection_result() -> Dict[str, Any]:
+    return _read_cached_json(
+        _get_causal_rule_reselection_output_root() / "causal_rule_reselection.json",
+        label="step 18N causal rule reselection result",
+    )
+
+
+def _load_cached_refined_rule_evaluation_result() -> Dict[str, Any]:
+    return _read_cached_json(
+        _get_refined_rule_evaluation_output_root() / "rule_evaluation.json",
+        label="step 18O refined rule evaluation result",
+    )
+
+
+def _load_cached_reasoning_feedback_signal_result_if_available() -> Dict[str, Any]:
+    path = _get_reasoning_feedback_signal_output_root() / "feedback_signal_summary.json"
+    if not path.exists():
+        return {}
+    return _read_cached_json(path, label="step 25 reasoning feedback signal result")
+
+
 def _load_cached_candidate_rule_results(
     selected_video_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1482,10 +1517,17 @@ def _load_cached_upstream_context(
 
     if (
         _stage_index(start_target) > _stage_index("18M")
-        and _stop_target_reaches("20", stop_target)
+        and _stop_target_reaches("18N", stop_target)
         and (_get_rule_level_causal_masking_output_root() / "rule_level_causal_masking.json").exists()
     ):
         ctx.rule_level_causal_masking_results = _load_cached_rule_level_causal_masking_result()
+
+    if (
+        _stage_index(start_target) > _stage_index("18N")
+        and _stop_target_reaches("18O", stop_target)
+        and (_get_causal_rule_reselection_output_root() / "causal_rule_reselection.json").exists()
+    ):
+        ctx.causal_rule_reselection_results = _load_cached_causal_rule_reselection_result()
 
 
 def _warm_start_blocker_reason(ctx: PipelineContext) -> str:
@@ -2923,6 +2965,146 @@ def run_step_18m_rule_level_causal_masking(ctx: PipelineContext, runner: StepRun
     )
 
 
+def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunner) -> None:
+    reselection_cfg = _get_causal_rule_reselection_cfg()
+    reselection_output_root = _get_causal_rule_reselection_output_root()
+    runner.announce_step("18N", "causal_rule_reselection_driving_mini")
+    if not bool(reselection_cfg.get("enabled", True)):
+        runner.log("18N", "disabled by config")
+        runner.complete_step("18N", subtitle="skipped")
+        return
+    if not ctx.final_rule_results:
+        ctx.final_rule_results = _load_cached_step17_result()
+    if not ctx.evaluation_results:
+        ctx.evaluation_results = _load_cached_step18_result()
+    if not ctx.rule_level_causal_masking_results:
+        ctx.rule_level_causal_masking_results = _load_cached_rule_level_causal_masking_result()
+    if not ctx.reasoning_feedback_signal_results:
+        ctx.reasoning_feedback_signal_results = _load_cached_reasoning_feedback_signal_result_if_available()
+    runner.log("18N", f"cfg={reselection_cfg}")
+    runner.log("18N", f"recompute={bool(ctx.recompute_cfg.get('causal_rule_reselection', True))}")
+    with runner.module_output("18N"):
+        ctx.causal_rule_reselection_results = causal_rule_reselection_driving_mini.run(
+            final_rule_results=ctx.final_rule_results,
+            evaluation_results=ctx.evaluation_results,
+            rule_level_causal_masking_results=ctx.rule_level_causal_masking_results,
+            reasoning_feedback_results=ctx.reasoning_feedback_signal_results,
+            cfg=reselection_cfg,
+            output_root=reselection_output_root,
+            force_recompute=bool(ctx.recompute_cfg.get("causal_rule_reselection", True)),
+        )
+    output_paths = dict(ctx.causal_rule_reselection_results.get("output_paths", {}))
+    manifest_path = reselection_output_root / "causal_rule_reselection_manifest.json"
+    secondary_debug_artifacts = [
+        str(path)
+        for path in [
+            output_paths.get("refined_final_rules_json", ""),
+            output_paths.get("refined_final_rules_csv", ""),
+            output_paths.get("removed_rules_csv", ""),
+            output_paths.get("retained_rules_csv", ""),
+            output_paths.get("refinement_targets_csv", ""),
+        ]
+        if str(path)
+    ]
+    main_conclusion = (
+        "Causal masking-guided reselection kept "
+        f"{int(ctx.causal_rule_reselection_results.get('num_final_rules', 0))}/"
+        f"{int(ctx.causal_rule_reselection_results.get('num_input_rules', 0))} rules, removed "
+        f"{int(ctx.causal_rule_reselection_results.get('num_removed_harmful_rules', 0))} harmful rules, and marked "
+        f"{int(ctx.causal_rule_reselection_results.get('num_mixed_refinement_targets', 0))} mixed rules for refinement."
+    )
+    manifest = {
+        "step": "18N",
+        "primary_summary_csv": str(output_paths.get("causal_rule_reselection_summary_csv", "")),
+        "main_conclusion": main_conclusion,
+        "secondary_debug_artifacts": secondary_debug_artifacts,
+    }
+    _write_manifest_json(manifest_path, manifest)
+    ctx.causal_rule_reselection_results["manifest_json"] = str(manifest_path)
+    ctx.causal_rule_reselection_results["primary_summary_csv"] = str(
+        output_paths.get("causal_rule_reselection_summary_csv", "")
+    )
+    ctx.causal_rule_reselection_results["main_conclusion"] = main_conclusion
+    ctx.causal_rule_reselection_results["secondary_debug_artifacts"] = secondary_debug_artifacts
+    runner.log(
+        "18N",
+        f"refined_rules={int(ctx.causal_rule_reselection_results.get('num_final_rules', 0))} "
+        f"removed={int(ctx.causal_rule_reselection_results.get('num_removed_rules', 0))} "
+        f"harmful_removed={int(ctx.causal_rule_reselection_results.get('num_removed_harmful_rules', 0))} "
+        f"refine_targets={int(ctx.causal_rule_reselection_results.get('num_mixed_refinement_targets', 0))}",
+    )
+    runner.log("18N", f"summary_csv={output_paths.get('causal_rule_reselection_summary_csv', '')}")
+    runner.complete_step(
+        "18N",
+        subtitle=f"rules={int(ctx.causal_rule_reselection_results.get('num_final_rules', 0))}",
+    )
+
+
+def run_step_18o_refined_rule_evaluation(ctx: PipelineContext, runner: StepRunner) -> None:
+    refined_eval_cfg = _get_refined_rule_evaluation_cfg()
+    refined_eval_output_root = _get_refined_rule_evaluation_output_root()
+    runner.announce_step("18O", "refined_rule_evaluation_driving_mini")
+    if not bool(refined_eval_cfg.get("enabled", True)):
+        runner.log("18O", "disabled by config")
+        runner.complete_step("18O", subtitle="skipped")
+        return
+    if not ctx.causal_rule_reselection_results:
+        ctx.causal_rule_reselection_results = _load_cached_causal_rule_reselection_result()
+    if not ctx.evaluation_results:
+        ctx.evaluation_results = _load_cached_step18_result()
+    force_refined_eval_recompute = bool(ctx.recompute_cfg.get("refined_rule_evaluation", True)) or bool(
+        ctx.causal_rule_reselection_results.get("_freshly_computed", False)
+    )
+    runner.log("18O", f"cfg={refined_eval_cfg}")
+    runner.log("18O", f"recompute={force_refined_eval_recompute}")
+    with runner.module_output("18O"):
+        ctx.refined_rule_evaluation_results = refined_rule_evaluation_driving_mini.run(
+            refined_rule_results=ctx.causal_rule_reselection_results,
+            original_evaluation_results=ctx.evaluation_results,
+            temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            logic_atom_results=ctx.logic_atom_results or [],
+            eval_video_ids=list(ctx.split_manifest.get("eval_video_ids", [])),
+            split_manifest=ctx.split_manifest,
+            cfg=refined_eval_cfg,
+            output_root=refined_eval_output_root,
+            force_recompute=force_refined_eval_recompute,
+        )
+    comparison = dict(ctx.refined_rule_evaluation_results.get("refined_comparison", {}))
+    output_paths = dict(comparison.get("output_paths", {}))
+    overall_metrics = dict(ctx.refined_rule_evaluation_results.get("overall_metrics", {}))
+    manifest_path = refined_eval_output_root / "refined_rule_evaluation_manifest.json"
+    secondary_debug_artifacts = [
+        str(path)
+        for path in [
+            output_paths.get("comparison_json", ""),
+            output_paths.get("rule_evaluation_json", ""),
+            output_paths.get("rule_evaluation_csv", ""),
+            output_paths.get("example_predictions_csv", ""),
+        ]
+        if str(path)
+    ]
+    manifest = {
+        "step": "18O",
+        "primary_summary_csv": str(output_paths.get("comparison_csv", "")),
+        "main_conclusion": str(comparison.get("main_conclusion", "")),
+        "secondary_debug_artifacts": secondary_debug_artifacts,
+    }
+    _write_manifest_json(manifest_path, manifest)
+    ctx.refined_rule_evaluation_results["manifest_json"] = str(manifest_path)
+    ctx.refined_rule_evaluation_results["primary_summary_csv"] = str(output_paths.get("comparison_csv", ""))
+    ctx.refined_rule_evaluation_results["main_conclusion"] = str(comparison.get("main_conclusion", ""))
+    ctx.refined_rule_evaluation_results["secondary_debug_artifacts"] = secondary_debug_artifacts
+    runner.log(
+        "18O",
+        f"rule_set=refined precision={float(overall_metrics.get('precision', 0.0)):.3f} "
+        f"recall={float(overall_metrics.get('recall', 0.0)):.3f} "
+        f"f1={float(overall_metrics.get('f1', 0.0)):.3f}",
+    )
+    runner.log("18O", f"comparison_csv={output_paths.get('comparison_csv', '')}")
+    runner.log("18O", str(comparison.get("main_conclusion", "")))
+    runner.complete_step("18O", subtitle=f"f1={float(overall_metrics.get('f1', 0.0)):.3f}")
+
+
 def _ensure_od_calibration_iteration_id(ctx: PipelineContext) -> str:
     if not ctx.od_calibration_iteration_id:
         ctx.od_calibration_iteration_id = od_calibration_policy_utils.next_iteration_id()
@@ -3557,6 +3739,10 @@ def _run_pre_diagnostic_steps(
         run_step_18_rule_evaluation(ctx, runner)
     if _step_is_requested("18M", start_target=start_target, stop_target=stop_target):
         run_step_18m_rule_level_causal_masking(ctx, runner)
+    if _step_is_requested("18N", start_target=start_target, stop_target=stop_target):
+        run_step_18n_causal_rule_reselection(ctx, runner)
+    if _step_is_requested("18O", start_target=start_target, stop_target=stop_target):
+        run_step_18o_refined_rule_evaluation(ctx, runner)
     if _step_is_requested("18B", start_target=start_target, stop_target=stop_target):
         run_step_18b_baseline_comparison(ctx, runner)
 
