@@ -116,9 +116,10 @@ target_head_atoms:
   include_negative_examples: true
 
 data_split:
-  strategy: fixed_counts
-  train_video_count: 942
-  eval_video_count: 19
+  strategy: eval_fraction
+  eval_fraction: 0.2
+  train_video_count: 4
+  eval_video_count: 1
 
 pipeline_recompute:
   traffic_control_attributes: false
