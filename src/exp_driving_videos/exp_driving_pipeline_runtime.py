@@ -158,7 +158,9 @@ _get_detection_skip_step_enabled = driving_pipeline_config.get_detection_skip_st
 _get_detection_check_cache_enabled = driving_pipeline_config.get_detection_check_cache_enabled
 _get_detection_candidate_branch_enabled = driving_pipeline_config.get_detection_candidate_branch_enabled
 _get_tracking_render_video_enabled = driving_pipeline_config.get_tracking_render_video_enabled
+_get_dataset_annotations_enabled = driving_pipeline_config.get_dataset_annotations_enabled
 _get_merge_render_video_enabled = driving_pipeline_config.get_merge_render_video_enabled
+_get_merge_use_dataset_annotations_enabled = driving_pipeline_config.get_merge_use_dataset_annotations_enabled
 _get_ego_motion_render_video_enabled = driving_pipeline_config.get_ego_motion_render_video_enabled
 _get_ego_static_adjustment_cfg = driving_pipeline_config.get_ego_static_adjustment_cfg
 _get_temporal_segmentation_cfg = driving_pipeline_config.get_temporal_segmentation_cfg
@@ -2175,6 +2177,11 @@ def run_step_2_tracking(ctx: PipelineContext, runner: StepRunner) -> None:
 
 def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> None:
     runner.announce_step("3", "dataset_annotations_driving_mini")
+    if not _get_dataset_annotations_enabled(default=True):
+        ctx.dataset_annotation_results = []
+        runner.log("3", "disabled by dataset_annotations.enabled=false")
+        runner.complete_step("3", subtitle="skipped")
+        return
     runner.log("3", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("3"):
         ctx.dataset_annotation_results = dataset_annotations_driving_mini.run(
@@ -2198,13 +2205,15 @@ def run_step_3_dataset_annotations(ctx: PipelineContext, runner: StepRunner) -> 
 
 def run_step_4_merge_annotations(ctx: PipelineContext, runner: StepRunner) -> None:
     render_video = _get_merge_render_video_enabled(default=True)
+    use_dataset_annotations = _get_merge_use_dataset_annotations_enabled(default=True)
     runner.announce_step("4", "merge_gt_and_detected_driving_mini")
     runner.log("4", f"render_video={render_video}")
+    runner.log("4", f"use_dataset_annotations={use_dataset_annotations}")
     runner.log("4", f"force_recompute={_force_recompute(ctx)}")
     with runner.module_output("4"):
         ctx.merged_results = merge_gt_and_detected_driving_mini.run(
             tracking_results=ctx.tracking_results or [],
-            dataset_annotation_results=ctx.dataset_annotation_results or [],
+            dataset_annotation_results=(ctx.dataset_annotation_results or []) if use_dataset_annotations else [],
             render_video=render_video,
             force_recompute=_force_recompute(ctx),
         )

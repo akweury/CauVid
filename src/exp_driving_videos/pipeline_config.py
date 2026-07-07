@@ -106,8 +106,16 @@ def get_tracking_render_video_enabled(default: bool = True) -> bool:
     return _get_nested_bool(("tracking", "render_video"), default)
 
 
+def get_dataset_annotations_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("dataset_annotations", "enabled"), default)
+
+
 def get_merge_render_video_enabled(default: bool = True) -> bool:
     return _get_nested_bool(("merge_annotations", "render_video"), default)
+
+
+def get_merge_use_dataset_annotations_enabled(default: bool = True) -> bool:
+    return _get_nested_bool(("merge_annotations", "use_dataset_annotations"), default)
 
 
 def get_ego_motion_render_video_enabled(default: bool = True) -> bool:

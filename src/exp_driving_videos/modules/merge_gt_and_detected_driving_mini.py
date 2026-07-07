@@ -258,6 +258,29 @@ def _tracked_video_as_merged_result(
     }
 
 
+def _load_or_write_tracked_only_result(
+    tracked_video: Dict[str, Any],
+    output_root: Optional[Path] = None,
+    force_recompute: bool = False,
+) -> Dict[str, Any]:
+    video_id = str(tracked_video["video_id"])
+    out_dir = (output_root or get_output_root()) / video_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "merged_annotations.json"
+
+    if not force_recompute and out_file.exists():
+        print(f"  [cache] {video_id} - loading {out_file.name}")
+        with out_file.open("r", encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if int(cached.get("version", 0)) == _MERGED_ANNOTATIONS_VERSION and bool(cached.get("tracked_only", False)):
+            return cached
+
+    result = _tracked_video_as_merged_result(tracked_video)
+    with out_file.open("w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    return result
+
+
 def _track_color(track_id: int) -> tuple[int, int, int]:
     """Return a stable BGR color for a merged track ID."""
     h = (track_id * 37) % 360
@@ -621,7 +644,13 @@ def run(
         if video_id not in gt_by_video:
             if keep_tracked_only:
                 print(f"  [tracked-only] {video_id} (no GT annotations)")
-                merged_results.append(_tracked_video_as_merged_result(tracked))
+                merged_results.append(
+                    _load_or_write_tracked_only_result(
+                        tracked_video=tracked,
+                        output_root=effective_output_root,
+                        force_recompute=force_recompute,
+                    )
+                )
                 print(f"  progress=merge_video_done {index}/{total_videos} video_id={video_id} mode=tracked_only")
             else:
                 print(f"  [skip] {video_id} not found in GT annotations")

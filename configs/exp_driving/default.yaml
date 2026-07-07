@@ -10,8 +10,12 @@ detection:
 tracking:
   render_video: false
 
+dataset_annotations:
+  enabled: false
+
 merge_annotations:
   render_video: false
+  use_dataset_annotations: false
 
 ego_motion:
   render_video: false
