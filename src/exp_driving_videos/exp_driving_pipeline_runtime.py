@@ -1142,6 +1142,66 @@ def _load_cached_candidate_rule_results(
     )
 
 
+def _load_cached_important_object_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=important_objects_driving_mini.get_output_root(),
+        manifest_name="important_objects_manifest.json",
+        per_video_filename="important_objects.json",
+        selected_video_ids=selected_video_ids,
+        label="step 10 important objects",
+    )
+
+
+def _load_cached_traffic_control_attribute_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=traffic_control_attributes_driving_mini.get_output_root(),
+        manifest_name="traffic_control_attributes_manifest.json",
+        per_video_filename="traffic_control_attributes.json",
+        selected_video_ids=selected_video_ids,
+        label="step 10B traffic control attributes",
+    )
+
+
+def _load_cached_logic_atom_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=logic_atoms_driving_mini.get_output_root(),
+        manifest_name="logic_atoms_manifest.json",
+        per_video_filename="logic_atoms.json",
+        selected_video_ids=selected_video_ids,
+        label="step 11 logic atoms",
+    )
+
+
+def _load_cached_target_head_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=target_head_atoms_driving_mini.get_output_root(),
+        manifest_name="target_head_atoms_manifest.json",
+        per_video_filename="target_head_atoms.json",
+        selected_video_ids=selected_video_ids,
+        label="step 12 target head atoms",
+    )
+
+
+def _load_cached_temporal_rule_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=temporal_rule_examples_driving_mini.get_output_root(),
+        manifest_name="temporal_rule_examples_manifest.json",
+        per_video_filename="temporal_rule_examples.json",
+        selected_video_ids=selected_video_ids,
+        label="step 13 temporal rule examples",
+    )
+
+
 def _load_cached_merged_initial_rules() -> Dict[str, Any]:
     return _read_cached_json(
         _get_merged_candidate_rules_output_root() / "merged_initial_rules.json",
@@ -1163,6 +1223,34 @@ def _load_cached_upstream_context(
     start_target: str,
     stop_target: str,
 ) -> None:
+    if _stage_index(start_target) == _stage_index("11"):
+        traffic_control_manifest = (
+            traffic_control_attributes_driving_mini.get_output_root() / "traffic_control_attributes_manifest.json"
+        )
+        if traffic_control_manifest.exists():
+            ctx.traffic_control_attribute_results = _load_cached_traffic_control_attribute_results(
+                ctx.effective_video_ids,
+            )
+            ctx.traffic_control_attribute_results = _strip_low_confidence_candidate_results(
+                ctx.traffic_control_attribute_results
+            )
+        else:
+            ctx.important_object_results = _load_cached_important_object_results(ctx.effective_video_ids)
+            ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
+
+    if _stage_index(start_target) == _stage_index("12"):
+        ctx.logic_atom_results = _load_cached_logic_atom_results(ctx.effective_video_ids)
+        ctx.logic_atom_results = _strip_low_confidence_candidate_results(ctx.logic_atom_results)
+
+    if _stage_index(start_target) == _stage_index("13"):
+        ctx.target_head_results = _load_cached_target_head_results(ctx.effective_video_ids)
+        ctx.target_head_results = _strip_low_confidence_candidate_results(ctx.target_head_results)
+
+    if _stage_index(start_target) == _stage_index("14"):
+        ctx.temporal_rule_results = _load_cached_temporal_rule_results(ctx.effective_video_ids)
+        ctx.temporal_rule_results = _strip_low_confidence_candidate_results(ctx.temporal_rule_results)
+        _prepare_rule_learning_inputs(ctx)
+
     if _stage_index(start_target) <= _stage_index("16"):
         return
     warm_start_blocker = _warm_start_blocker_reason(ctx)
@@ -1178,13 +1266,7 @@ def _load_cached_upstream_context(
         for tag in ("17", "17D", "18", "18M", "18B", "20", "21", "25")
     )
     if needs_temporal_examples:
-        ctx.temporal_rule_results = _load_cached_video_results(
-            output_root=temporal_rule_examples_driving_mini.get_output_root(),
-            manifest_name="temporal_rule_examples_manifest.json",
-            per_video_filename="temporal_rule_examples.json",
-            selected_video_ids=ctx.effective_video_ids,
-            label="step 13 temporal rule examples",
-        )
+        ctx.temporal_rule_results = _load_cached_temporal_rule_results(ctx.effective_video_ids)
         ctx.temporal_rule_results = _strip_low_confidence_candidate_results(ctx.temporal_rule_results)
         _prepare_rule_learning_inputs(ctx)
 
@@ -1196,13 +1278,7 @@ def _load_cached_upstream_context(
         )
     )
     if needs_logic_atoms:
-        ctx.logic_atom_results = _load_cached_video_results(
-            output_root=logic_atoms_driving_mini.get_output_root(),
-            manifest_name="logic_atoms_manifest.json",
-            per_video_filename="logic_atoms.json",
-            selected_video_ids=ctx.effective_video_ids,
-            label="step 11 logic atoms",
-        )
+        ctx.logic_atom_results = _load_cached_logic_atom_results(ctx.effective_video_ids)
         ctx.logic_atom_results = _strip_low_confidence_candidate_results(ctx.logic_atom_results)
 
     if (
@@ -1227,13 +1303,7 @@ def _load_cached_upstream_context(
             label="step 4 merged annotations",
         )
         ctx.merged_results = _strip_low_confidence_candidate_results(ctx.merged_results)
-        ctx.important_object_results = _load_cached_video_results(
-            output_root=important_objects_driving_mini.get_output_root(),
-            manifest_name="important_objects_manifest.json",
-            per_video_filename="important_objects.json",
-            selected_video_ids=ctx.effective_video_ids,
-            label="step 10 important objects",
-        )
+        ctx.important_object_results = _load_cached_important_object_results(ctx.effective_video_ids)
         ctx.important_object_results = _strip_low_confidence_candidate_results(ctx.important_object_results)
 
     if _stage_index(start_target) > _stage_index("17"):
@@ -2149,13 +2219,19 @@ def run_step_10b_traffic_control_attributes(ctx: PipelineContext, runner: StepRu
 
 def run_step_11_logic_atoms(ctx: PipelineContext, runner: StepRunner) -> None:
     logic_atoms_cfg = _get_logic_atoms_cfg()
+    input_results = ctx.traffic_control_attribute_results or ctx.important_object_results or []
     runner.announce_step("11", "logic_atoms_driving_mini")
     runner.log("11", f"cfg={logic_atoms_cfg}")
     runner.log("11", f"recompute={_force_recompute(ctx, 'logic_atoms', False)}")
-    runner.log("11", f"input_videos={len(ctx.traffic_control_attribute_results or ctx.important_object_results or [])}")
+    runner.log("11", f"input_videos={len(input_results)}")
+    if not input_results:
+        raise RuntimeError(
+            "Step 11 has zero input videos. "
+            "Run Step 10B/10 first or start the pipeline from an earlier step so logic atoms can be built."
+        )
     with runner.module_output("11"):
         ctx.logic_atom_results = logic_atoms_driving_mini.run(
-            segment_object_motion_results=ctx.traffic_control_attribute_results or ctx.important_object_results or [],
+            segment_object_motion_results=input_results,
             cfg=logic_atoms_cfg,
             force_recompute=_force_recompute(ctx, "logic_atoms", False),
         )
@@ -2179,6 +2255,11 @@ def run_step_12_target_head_atoms(ctx: PipelineContext, runner: StepRunner) -> N
         "12",
         f"input_segments={sum(len(list(dict(row).get('segments', []))) for row in (ctx.logic_atom_results or []))}",
     )
+    if not ctx.logic_atom_results:
+        raise RuntimeError(
+            "Step 12 has zero input videos. "
+            "Run Step 11 first or start from Step 12 only after cached Step 11 logic atoms exist."
+        )
     with runner.module_output("12"):
         ctx.target_head_results = target_head_atoms_driving_mini.run(
             logic_atom_results=ctx.logic_atom_results or [],
@@ -2214,6 +2295,11 @@ def run_step_13_temporal_rule_examples(ctx: PipelineContext, runner: StepRunner)
         "13",
         f"input_examples={sum(int(row.get('num_examples', 0)) for row in (ctx.target_head_results or []))}",
     )
+    if not ctx.target_head_results:
+        raise RuntimeError(
+            "Step 13 has zero input videos. "
+            "Run Step 12 first or start from Step 13 only after cached Step 12 target/head atoms exist."
+        )
     with runner.module_output("13"):
         ctx.temporal_rule_results = temporal_rule_examples_driving_mini.run(
             target_head_results=ctx.target_head_results or [],
