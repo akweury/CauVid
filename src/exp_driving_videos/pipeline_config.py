@@ -412,9 +412,9 @@ def get_final_rules_cfg() -> Dict[str, Any]:
     return _load_cfg_section(
         {
             "selector_mode": "coverage_family_aware",
-            "top_k": 20,
+            "top_k": 50,
             "category_budgets": {
-                "accepted_only": 20,
+                "accepted_only": 50,
                 "mixed_accepted_candidate": 0,
                 "candidate_only": 0,
                 "candidate_candidate": 0,
