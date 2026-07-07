@@ -1178,6 +1178,18 @@ def _load_cached_relative_motion_results(
     )
 
 
+def _load_cached_temporal_segmentation_results(
+    selected_video_ids: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    return _load_cached_video_results(
+        output_root=temporal_segmentation_driving_mini.get_output_root(),
+        manifest_name="temporal_segmentation_manifest.json",
+        per_video_filename="temporal_segmentation.json",
+        selected_video_ids=selected_video_ids,
+        label="step 8 temporal segmentation",
+    )
+
+
 def _load_cached_traffic_control_attribute_results(
     selected_video_ids: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1247,7 +1259,26 @@ def _load_cached_upstream_context(
     start_target: str,
     stop_target: str,
 ) -> None:
+    if _stage_index(start_target) == _stage_index("9"):
+        ctx.relative_motion_results = _load_cached_relative_motion_results(ctx.effective_video_ids)
+        ctx.relative_motion_results = _strip_low_confidence_candidate_results(ctx.relative_motion_results)
+        ctx.temporal_seg_results = _load_cached_temporal_segmentation_results(ctx.effective_video_ids)
+        ctx.temporal_seg_results = _strip_low_confidence_candidate_results(ctx.temporal_seg_results)
+
     if _stage_index(start_target) == _stage_index("10"):
+        segment_object_output_root = segment_object_motion_driving_mini.get_output_root()
+        segment_object_video_ids = []
+        segment_object_manifest = segment_object_output_root / "segment_object_motion_manifest.json"
+        if segment_object_manifest.exists():
+            segment_object_video_ids = _cached_manifest_video_ids(
+                output_root=segment_object_output_root,
+                manifest_name="segment_object_motion_manifest.json",
+            )
+        if not segment_object_video_ids:
+            raise RuntimeError(
+                "Cached step 9 segment object motion contains zero videos. "
+                "Restart from Step 9 or earlier to rebuild it before starting from Step 10."
+            )
         ctx.segment_object_results = _load_cached_segment_object_results(ctx.effective_video_ids)
         ctx.segment_object_results = _strip_low_confidence_candidate_results(ctx.segment_object_results)
 
@@ -2196,6 +2227,18 @@ def run_step_9_segment_object_motion(ctx: PipelineContext, runner: StepRunner) -
     runner.announce_step("9", "segment_object_motion_driving_mini")
     runner.log("9", f"cfg={segment_object_cfg}")
     runner.log("9", f"force_recompute={_force_recompute(ctx)}")
+    runner.log("9", f"relative_motion_videos={len(ctx.relative_motion_results or [])}")
+    runner.log("9", f"temporal_segmentation_videos={len(ctx.temporal_seg_results or [])}")
+    if not ctx.relative_motion_results:
+        raise RuntimeError(
+            "Step 9 has zero relative-motion input videos. "
+            "Run Step 7 first or start from Step 9 only after cached Step 7 relative motion exists."
+        )
+    if not ctx.temporal_seg_results:
+        raise RuntimeError(
+            "Step 9 has zero temporal-segmentation input videos. "
+            "Run Step 8 first or start from Step 9 only after cached Step 8 temporal segmentation exists."
+        )
     with runner.module_output("9"):
         ctx.segment_object_results = segment_object_motion_driving_mini.run(
             relative_motion_results=ctx.relative_motion_results or [],
