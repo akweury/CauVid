@@ -344,6 +344,13 @@ causal_rule_reselection:
   backfill_mixed_rules: false
   remove_mixed_harmful_dominant: false
   skip_zero_positive_support_refill: true
+  iterative_enabled: true
+  max_rounds: 5
+  removal_mode: strict
+  max_remove_fraction_per_round: 0.2
+  selection_metric: f1
+  tie_breaker: precision
+  early_stop_no_improvement_rounds: 2
   weak_grounding_penalty: 1.5
   harmful_penalty: 3.0
   false_positive_penalty: 2.0

@@ -2994,6 +2994,10 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
             evaluation_results=ctx.evaluation_results,
             rule_level_causal_masking_results=ctx.rule_level_causal_masking_results,
             reasoning_feedback_results=ctx.reasoning_feedback_signal_results,
+            temporal_rule_results=ctx.eval_temporal_rule_results or [],
+            logic_atom_results=ctx.logic_atom_results or [],
+            eval_video_ids=list(ctx.split_manifest.get("eval_video_ids", [])),
+            split_manifest=ctx.split_manifest,
             cfg=reselection_cfg,
             output_root=reselection_output_root,
             force_recompute=bool(ctx.recompute_cfg.get("causal_rule_reselection", True)),
@@ -3009,6 +3013,12 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
             output_paths.get("retained_rules_csv", ""),
             output_paths.get("refilled_rules_csv", ""),
             output_paths.get("refinement_targets_csv", ""),
+            output_paths.get("per_round_rule_evaluation_csv", ""),
+            output_paths.get("per_round_removed_rules_csv", ""),
+            output_paths.get("per_round_refilled_rules_csv", ""),
+            output_paths.get("iterative_reselection_summary_csv", ""),
+            output_paths.get("best_round_refined_final_rules_csv", ""),
+            output_paths.get("best_round_manifest_json", ""),
         ]
         if str(path)
     ]
@@ -3044,6 +3054,10 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
         ),
         "num_step18m_rules": int(ctx.causal_rule_reselection_results.get("num_step18m_rules", 0)),
         "num_removed_harmful_rules": int(ctx.causal_rule_reselection_results.get("num_removed_harmful_rules", 0)),
+        "iterative_enabled": bool(ctx.causal_rule_reselection_results.get("iterative_enabled", False)),
+        "num_rounds_executed": int(ctx.causal_rule_reselection_results.get("num_rounds_executed", 0)),
+        "best_round_index": int(ctx.causal_rule_reselection_results.get("best_round_index", 0)),
+        "best_round_metrics": dict(ctx.causal_rule_reselection_results.get("best_round_metrics", {})),
         "warning_section": dict(ctx.causal_rule_reselection_results.get("warning_section", {})),
     }
     _write_manifest_json(manifest_path, manifest)
@@ -3107,6 +3121,12 @@ def run_step_18o_refined_rule_evaluation(ctx: PipelineContext, runner: StepRunne
             output_paths.get("rule_evaluation_json", ""),
             output_paths.get("rule_evaluation_csv", ""),
             output_paths.get("example_predictions_csv", ""),
+            output_paths.get("per_round_rule_evaluation_csv", ""),
+            output_paths.get("per_round_removed_rules_csv", ""),
+            output_paths.get("per_round_refilled_rules_csv", ""),
+            output_paths.get("iterative_reselection_summary_csv", ""),
+            output_paths.get("best_round_refined_final_rules_csv", ""),
+            output_paths.get("best_round_manifest_json", ""),
         ]
         if str(path)
     ]

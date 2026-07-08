@@ -22,6 +22,66 @@ from src.exp_driving_videos.modules import evaluate_rules_driving_mini
 
 
 _REFINED_EVALUATION_VERSION = 1
+_PER_ROUND_RULE_EVALUATION_FIELDS = [
+    "round_index",
+    "rule_set_name",
+    "num_rules",
+    "num_removed_rules",
+    "num_refilled_rules",
+    "num_blacklisted_rules",
+    "top_k_reached",
+    "true_positive",
+    "false_positive",
+    "false_negative",
+    "true_negative",
+    "precision",
+    "recall",
+    "f1",
+    "accuracy",
+    "selected_as_best",
+    "early_stop_reason",
+]
+_PER_ROUND_REMOVED_FIELDS = [
+    "round_index",
+    "rule_id",
+    "clause",
+    "original_rank",
+    "removal_reason",
+    "helpful_count",
+    "harmful_count",
+    "necessary_true_positive_count",
+    "causal_false_positive_count",
+    "prediction_flip_count",
+]
+_PER_ROUND_REFILLED_FIELDS = [
+    "round_index",
+    "rule_id",
+    "clause",
+    "original_rank",
+    "original_score",
+    "refill_reason",
+    "replaced_removed_rule_id",
+    "selection_source",
+]
+_BEST_RULE_FIELDS = [
+    "rule_id",
+    "clause",
+    "original_rank",
+    "original_score",
+    "selection_source",
+    "reselection_decision",
+    "assigned_reselection_category",
+    "helpful_count",
+    "harmful_count",
+    "necessary_true_positive_count",
+    "causal_false_positive_count",
+    "prediction_flip_count",
+    "found_in_step18m",
+    "blacklist_status",
+    "refill_reason",
+    "replaced_removed_rule_id",
+    "refined_rank",
+]
 
 
 def get_output_root() -> Path:
@@ -148,6 +208,78 @@ def _main_conclusion(comparison_rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
+def _per_round_rows(refined_rule_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = list(refined_rule_results.get("per_round_evaluation_rows", []))
+    if rows:
+        return [dict(row) for row in rows]
+    output_rows: List[Dict[str, Any]] = []
+    for record in list(refined_rule_results.get("rounds", [])):
+        metrics = dict(record.get("metrics", {}))
+        output_rows.append(
+            {
+                "round_index": int(record.get("round_index", 0)),
+                "rule_set_name": str(record.get("rule_set_name", "")),
+                "num_rules": len(list(record.get("final_rules", []))),
+                "num_removed_rules": int(record.get("num_removed_rules", 0)),
+                "num_refilled_rules": int(record.get("num_refilled_rules", 0)),
+                "num_blacklisted_rules": int(record.get("num_blacklisted_rules", 0)),
+                "top_k_reached": bool(record.get("top_k_reached", False)),
+                "true_positive": int(metrics.get("true_positive", 0)),
+                "false_positive": int(metrics.get("false_positive", 0)),
+                "false_negative": int(metrics.get("false_negative", 0)),
+                "true_negative": int(metrics.get("true_negative", 0)),
+                "precision": float(metrics.get("precision", 0.0)),
+                "recall": float(metrics.get("recall", 0.0)),
+                "f1": float(metrics.get("f1", 0.0)),
+                "accuracy": float(metrics.get("accuracy", 0.0)),
+                "selected_as_best": bool(record.get("selected_as_best", False)),
+                "early_stop_reason": str(record.get("early_stop_reason", "")),
+            }
+        )
+    return output_rows
+
+
+def _per_round_detail_rows(refined_rule_results: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for record in list(refined_rule_results.get("rounds", [])):
+        round_index = int(record.get("round_index", 0))
+        for row in list(record.get(key, [])):
+            rows.append({"round_index": round_index, **dict(row)})
+    return rows
+
+
+def _best_rule_rows(refined_rule_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    best_round_index = int(refined_rule_results.get("best_round_index", 0))
+    for record in list(refined_rule_results.get("rounds", [])):
+        if int(record.get("round_index", -1)) == best_round_index and list(record.get("selected_rows", [])):
+            return [dict(row) for row in list(record.get("selected_rows", []))]
+    rows: List[Dict[str, Any]] = []
+    for index, rule in enumerate(list(refined_rule_results.get("final_rules", [])), start=1):
+        reselection = dict(rule.get("causal_reselection", {}))
+        rows.append(
+            {
+                "rule_id": str(rule.get("rule_id", "")),
+                "clause": str(rule.get("clause", "")),
+                "original_rank": reselection.get("original_rank", rule.get("original_rank", index)),
+                "original_score": reselection.get("original_score", rule.get("original_score", rule.get("confidence", 0.0))),
+                "selection_source": reselection.get("selection_source", "best_round"),
+                "reselection_decision": reselection.get("reselection_decision", "keep"),
+                "assigned_reselection_category": reselection.get("assigned_reselection_category", ""),
+                "helpful_count": reselection.get("helpful_count", 0),
+                "harmful_count": reselection.get("harmful_count", 0),
+                "necessary_true_positive_count": reselection.get("necessary_true_positive_count", 0),
+                "causal_false_positive_count": reselection.get("causal_false_positive_count", 0),
+                "prediction_flip_count": reselection.get("prediction_flip_count", 0),
+                "found_in_step18m": reselection.get("found_in_step18m", ""),
+                "blacklist_status": reselection.get("blacklist_status", ""),
+                "refill_reason": reselection.get("refill_reason", ""),
+                "replaced_removed_rule_id": reselection.get("replaced_removed_rule_id", ""),
+                "refined_rank": int(rule.get("refined_rank", index)),
+            }
+        )
+    return rows
+
+
 def process_refined_evaluation(
     refined_rule_results: Dict[str, Any],
     original_evaluation_results: Dict[str, Any],
@@ -164,6 +296,12 @@ def process_refined_evaluation(
     out_root.mkdir(parents=True, exist_ok=True)
     comparison_csv_path = out_root / "refined_rule_evaluation_comparison.csv"
     comparison_json_path = out_root / "refined_rule_evaluation_comparison.json"
+    per_round_rule_evaluation_csv_path = out_root / "per_round_rule_evaluation.csv"
+    per_round_removed_rules_csv_path = out_root / "per_round_removed_rules.csv"
+    per_round_refilled_rules_csv_path = out_root / "per_round_refilled_rules.csv"
+    iterative_reselection_summary_csv_path = out_root / "iterative_reselection_summary.csv"
+    best_round_refined_final_rules_csv_path = out_root / "best_round_refined_final_rules.csv"
+    best_round_manifest_path = out_root / "best_round_manifest.json"
 
     eval_cfg = {
         "prediction_mode": str(cfg.get("prediction_mode", "any_rule_positive")),
@@ -189,6 +327,25 @@ def process_refined_evaluation(
         ["metric", "original_step18", "refined_step18o", "delta_refined_minus_original"],
         comparison_rows,
     )
+    per_round_rows = _per_round_rows(refined_rule_results)
+    per_round_removed_rows = _per_round_detail_rows(refined_rule_results, "removed_rules")
+    per_round_refilled_rows = _per_round_detail_rows(refined_rule_results, "refilled_rules")
+    best_rule_rows = _best_rule_rows(refined_rule_results)
+    _write_csv(per_round_rule_evaluation_csv_path, _PER_ROUND_RULE_EVALUATION_FIELDS, per_round_rows)
+    _write_csv(iterative_reselection_summary_csv_path, _PER_ROUND_RULE_EVALUATION_FIELDS, per_round_rows)
+    _write_csv(per_round_removed_rules_csv_path, _PER_ROUND_REMOVED_FIELDS, per_round_removed_rows)
+    _write_csv(per_round_refilled_rules_csv_path, _PER_ROUND_REFILLED_FIELDS, per_round_refilled_rows)
+    _write_csv(best_round_refined_final_rules_csv_path, _BEST_RULE_FIELDS, best_rule_rows)
+    best_round_manifest = {
+        "best_round_index": int(refined_rule_results.get("best_round_index", 0)),
+        "selected_on_validation_performance": bool(refined_rule_results.get("selected_on_validation_performance", False)),
+        "selection_metric": str(refined_rule_results.get("selection_metric", "f1")),
+        "tie_breaker": str(refined_rule_results.get("tie_breaker", "precision")),
+        "best_round_metrics": dict(refined_rule_results.get("best_round_metrics", {})),
+        "final_test_evaluation_uses_best_validation_round_once": True,
+    }
+    with best_round_manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(best_round_manifest, fh, indent=2)
     comparison = {
         "version": _REFINED_EVALUATION_VERSION,
         "config": _cfg_key_subset(cfg),
@@ -205,6 +362,12 @@ def process_refined_evaluation(
             "rule_evaluation_json": str(out_root / "rule_evaluation.json"),
             "rule_evaluation_csv": str(out_root / "rule_evaluation.csv"),
             "example_predictions_csv": str(out_root / "example_predictions.csv"),
+            "per_round_rule_evaluation_csv": str(per_round_rule_evaluation_csv_path),
+            "per_round_removed_rules_csv": str(per_round_removed_rules_csv_path),
+            "per_round_refilled_rules_csv": str(per_round_refilled_rules_csv_path),
+            "iterative_reselection_summary_csv": str(iterative_reselection_summary_csv_path),
+            "best_round_refined_final_rules_csv": str(best_round_refined_final_rules_csv_path),
+            "best_round_manifest_json": str(best_round_manifest_path),
         },
     }
     with comparison_json_path.open("w", encoding="utf-8") as fh:

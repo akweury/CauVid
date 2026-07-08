@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 4
+_RESELECTION_VERSION = 5
 _ROW_FIELDS = [
     "rule_id",
     "clause",
@@ -108,6 +108,25 @@ _REFILLED_RULE_FIELDS = [
     "selection_source",
 ]
 _REFINEMENT_TARGET_FIELDS = _ROW_FIELDS + ["suggested_action"]
+_PER_ROUND_EVALUATION_FIELDS = [
+    "round_index",
+    "rule_set_name",
+    "num_rules",
+    "num_removed_rules",
+    "num_refilled_rules",
+    "num_blacklisted_rules",
+    "top_k_reached",
+    "true_positive",
+    "false_positive",
+    "false_negative",
+    "true_negative",
+    "precision",
+    "recall",
+    "f1",
+    "accuracy",
+    "selected_as_best",
+    "early_stop_reason",
+]
 
 
 def get_output_root() -> Path:
@@ -132,6 +151,13 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "backfill_mixed_rules": bool(cfg.get("backfill_mixed_rules", False)),
         "remove_mixed_harmful_dominant": bool(cfg.get("remove_mixed_harmful_dominant", False)),
         "skip_zero_positive_support_refill": bool(cfg.get("skip_zero_positive_support_refill", True)),
+        "iterative_enabled": bool(cfg.get("iterative_enabled", False)),
+        "max_rounds": int(cfg.get("max_rounds", 1)),
+        "removal_mode": str(cfg.get("removal_mode", "strict")),
+        "max_remove_fraction_per_round": float(cfg.get("max_remove_fraction_per_round", 0.2)),
+        "selection_metric": str(cfg.get("selection_metric", "f1")),
+        "tie_breaker": str(cfg.get("tie_breaker", "precision")),
+        "early_stop_no_improvement_rounds": int(cfg.get("early_stop_no_improvement_rounds", 2)),
         "broad_weak_predicates": sorted(str(value) for value in list(cfg.get("broad_weak_predicates", []))),
         "ego_motion_only_predicates": sorted(str(value) for value in list(cfg.get("ego_motion_only_predicates", []))),
     }
@@ -693,11 +719,800 @@ def _make_reselection_row(
     return row
 
 
+def _metric_value(evaluation_results: Dict[str, Any], metric: str) -> float:
+    metrics = dict(evaluation_results.get("overall_metrics", {}))
+    return _safe_float(metrics.get(metric, 0.0))
+
+
+def _round_sort_key(
+    row: Dict[str, Any],
+    *,
+    selection_metric: str,
+    tie_breaker: str,
+) -> Tuple[float, float, int, int]:
+    metrics = dict(row.get("metrics", {}))
+    return (
+        _safe_float(metrics.get(selection_metric, 0.0)),
+        _safe_float(metrics.get(tie_breaker, 0.0)),
+        -_safe_int(row.get("num_cumulative_removed_rules", row.get("num_removed_rules", 0))),
+        -_safe_int(row.get("round_index", 0)),
+    )
+
+
+def _is_better_round(
+    candidate: Dict[str, Any],
+    current_best: Dict[str, Any],
+    *,
+    selection_metric: str,
+    tie_breaker: str,
+) -> bool:
+    if not current_best:
+        return True
+    return _round_sort_key(
+        candidate,
+        selection_metric=selection_metric,
+        tie_breaker=tie_breaker,
+    ) > _round_sort_key(
+        current_best,
+        selection_metric=selection_metric,
+        tie_breaker=tie_breaker,
+    )
+
+
+def _can_use_refill_candidate(
+    rule: Dict[str, Any],
+    *,
+    selected_rule_ids: set[str],
+    selected_clause_keys: set[str],
+    blacklisted_rule_ids: set[str],
+    blacklisted_clauses: set[str],
+    skip_zero_positive_support_refill: bool,
+) -> bool:
+    rule_id = str(rule.get("rule_id", "")).strip()
+    clause_key = _normalize_clause(rule.get("clause", ""))
+    if rule_id in selected_rule_ids or (clause_key and clause_key in selected_clause_keys):
+        return False
+    if rule_id in blacklisted_rule_ids or (clause_key and clause_key in blacklisted_clauses):
+        return False
+    if skip_zero_positive_support_refill and _safe_int(rule.get("positive_support", 0)) <= 0:
+        return False
+    return True
+
+
+def _available_refill_count(
+    ranked_rules: Sequence[Dict[str, Any]],
+    current_rules: Sequence[Dict[str, Any]],
+    *,
+    blacklisted_rule_ids: set[str],
+    blacklisted_clauses: set[str],
+    skip_zero_positive_support_refill: bool,
+) -> int:
+    selected_rule_ids = {str(rule.get("rule_id", "")).strip() for rule in current_rules if str(rule.get("rule_id", "")).strip()}
+    selected_clause_keys = {
+        _normalize_clause(rule.get("clause", ""))
+        for rule in current_rules
+        if _normalize_clause(rule.get("clause", ""))
+    }
+    count = 0
+    for rule in ranked_rules:
+        if _can_use_refill_candidate(
+            rule,
+            selected_rule_ids=selected_rule_ids,
+            selected_clause_keys=selected_clause_keys,
+            blacklisted_rule_ids=blacklisted_rule_ids,
+            blacklisted_clauses=blacklisted_clauses,
+            skip_zero_positive_support_refill=skip_zero_positive_support_refill,
+        ):
+            count += 1
+    return count
+
+
+def _removal_reason_for_mode(
+    row: Dict[str, Any],
+    rule: Dict[str, Any],
+    *,
+    cfg: Dict[str, Any],
+    removal_mode: str,
+) -> str:
+    helpful_count = _safe_int(row.get("helpful_count", 0))
+    harmful_count = _safe_int(row.get("harmful_count", 0))
+    necessary_true_positive_count = _safe_int(row.get("necessary_true_positive_count", 0))
+    pure_harmful = helpful_count == 0 and harmful_count > 0 and necessary_true_positive_count == 0
+    if pure_harmful:
+        return "strict:pure harmful causal false-positive source"
+    if removal_mode not in {"moderate", "aggressive"}:
+        return ""
+    if harmful_count >= 2 * max(1, helpful_count) and harmful_count > 0 and necessary_true_positive_count == 0:
+        return "moderate:harmful-dominant mixed causal source"
+    if removal_mode != "aggressive":
+        return ""
+    grounding = _rule_grounding_features(rule, cfg)
+    eval_precision = _safe_float(row.get("eval_precision", rule.get("eval_precision", 0.0)))
+    eval_fp_count = _safe_int(row.get("eval_fp_contribution_count_vs_accepted_only", rule.get("eval_fp_contribution_count_vs_accepted_only", 0)))
+    broad_rule = _is_broad_high_coverage_rule(rule, grounding)
+    weak_rule = bool(grounding.get("weak_causal_grounding", False))
+    redundant_high_fp = (
+        str(row.get("assigned_reselection_category", "")) == "redundant_rule"
+        and eval_fp_count > 0
+    )
+    low_precision_threshold = _safe_float(cfg.get("aggressive_low_precision_threshold", 0.5), 0.5)
+    if broad_rule and eval_precision < low_precision_threshold:
+        return "aggressive:broad low-precision rule with replacement available"
+    if redundant_high_fp:
+        return "aggressive:redundant high-FP rule with replacement available"
+    if weak_rule and necessary_true_positive_count == 0:
+        return "aggressive:weak causal grounding rule with replacement available"
+    return ""
+
+
+def _candidate_removal_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, float, str]:
+    reason = str(row.get("removal_reason", ""))
+    mode_priority = 3 if reason.startswith("strict:") else 2 if reason.startswith("moderate:") else 1
+    return (
+        mode_priority,
+        _safe_int(row.get("harmful_count", 0)) - _safe_int(row.get("helpful_count", 0)),
+        _safe_int(row.get("causal_false_positive_count", 0)),
+        _safe_float(row.get("eval_fp_contribution_rate_vs_accepted_only", 0.0)),
+        str(row.get("rule_id", "")),
+    )
+
+
+def _build_round_rule_results(
+    *,
+    rules: Sequence[Dict[str, Any]],
+    base_results: Dict[str, Any],
+    round_index: int,
+) -> Dict[str, Any]:
+    return {
+        **dict(base_results),
+        "final_rules": [dict(rule) for rule in rules],
+        "num_final_rules": len(rules),
+        "selection_method": "iterative_causal_aware_top_k_rule_maintenance",
+        "iterative_round_index": int(round_index),
+    }
+
+
+def _write_refined_rules_artifacts(
+    *,
+    json_path: Path,
+    csv_path: Path,
+    result: Dict[str, Any],
+    selected_rows: Sequence[Dict[str, Any]],
+) -> None:
+    with json_path.open("w", encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+    _write_csv(csv_path, _REFINED_RULE_FIELDS, selected_rows)
+
+
+def _run_maintenance_pass(
+    *,
+    current_rules: Sequence[Dict[str, Any]],
+    base_final_rule_results: Dict[str, Any],
+    ranked_rules: Sequence[Dict[str, Any]],
+    evaluation_results: Dict[str, Any],
+    masking_results: Dict[str, Any],
+    reasoning_feedback_results: Optional[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    output_root: Path,
+    top_k: int,
+    round_index: int,
+    blacklisted_rule_ids: set[str],
+    blacklisted_clauses: set[str],
+) -> Dict[str, Any]:
+    causal_rows = _load_rule_causal_rows(masking_results, output_root=output_root)
+    eval_rows = _load_step18_rule_eval_rows(evaluation_results, output_root=output_root)
+    feedback_counts = _feedback_rule_counts(reasoning_feedback_results, output_root=output_root)
+    backup_min_trigger_count = max(1, int(cfg.get("backup_explanation_min_trigger_count", 5)))
+    skip_zero_positive_support_refill = bool(cfg.get("skip_zero_positive_support_refill", True))
+    removal_mode = str(cfg.get("removal_mode", "strict")).strip().lower()
+    if removal_mode not in {"strict", "moderate", "aggressive"}:
+        removal_mode = "strict"
+    max_remove_fraction = max(0.0, min(1.0, _safe_float(cfg.get("max_remove_fraction_per_round", 0.2), 0.2)))
+    max_remove_count = int(max(1, int(top_k * max_remove_fraction))) if top_k > 0 and max_remove_fraction > 0 else 0
+
+    active_rule_by_id = {str(rule.get("rule_id", "")).strip(): dict(rule) for rule in current_rules if str(rule.get("rule_id", "")).strip()}
+    active_rule_by_clause = {
+        _normalize_clause(rule.get("clause", "")): dict(rule)
+        for rule in current_rules
+        if _normalize_clause(rule.get("clause", ""))
+    }
+    consumed_causal_ids: set[str] = set()
+    active_rows: List[Dict[str, Any]] = []
+    refinement_target_rows: List[Dict[str, Any]] = []
+
+    for active_rank, rule in enumerate(current_rules, start=1):
+        rule_id = str(rule.get("rule_id", "")).strip()
+        matched_by = "missing_from_step18m"
+        alignment_warning = ""
+        causal: Dict[str, Any] = {}
+        causal_rule_id = ""
+        if rule_id and rule_id in causal_rows:
+            causal_rule_id = rule_id
+            causal = dict(causal_rows[rule_id])
+            matched_by = "rule_id"
+        else:
+            clause_key = _normalize_clause(rule.get("clause", ""))
+            for candidate_causal_id, candidate_causal in causal_rows.items():
+                if candidate_causal_id in consumed_causal_ids:
+                    continue
+                if clause_key and _normalize_clause(candidate_causal.get("clause", "")) == clause_key:
+                    causal_rule_id = candidate_causal_id
+                    causal = dict(candidate_causal)
+                    matched_by = "normalized_clause"
+                    alignment_warning = (
+                        "Active rule_id was not found in Step 18M, but normalized clause matched "
+                        f"Step 18M rule_id={candidate_causal_id}."
+                    )
+                    break
+        if causal_rule_id:
+            consumed_causal_ids.add(causal_rule_id)
+        eval_row = dict(eval_rows.get(rule_id, {}))
+        row = _make_reselection_row(
+            rule=rule,
+            causal=causal,
+            eval_row=eval_row,
+            rank=_rule_rank(rule, active_rank),
+            found_in_step17=True,
+            found_in_step18m=bool(causal),
+            matched_by=matched_by,
+            alignment_warning=alignment_warning,
+            cfg=cfg,
+            feedback_counts=feedback_counts,
+            backup_min_trigger_count=backup_min_trigger_count,
+            backfill_mixed_rules=False,
+        )
+        row["round_index"] = int(round_index)
+        row["selection_source"] = str(rule.get("selection_source", row.get("selection_source", "original_topk_retained")))
+        row["eval_precision"] = _safe_float(eval_row.get("eval_precision", rule.get("eval_precision", 0.0)))
+        row["eval_fp_contribution_count_vs_accepted_only"] = _safe_int(
+            eval_row.get(
+                "eval_fp_contribution_count_vs_accepted_only",
+                rule.get("eval_fp_contribution_count_vs_accepted_only", 0),
+            )
+        )
+        row["eval_fp_contribution_rate_vs_accepted_only"] = _safe_float(
+            eval_row.get(
+                "eval_fp_contribution_rate_vs_accepted_only",
+                rule.get("eval_fp_contribution_rate_vs_accepted_only", 0.0),
+            )
+        )
+        helpful_count = _safe_int(row.get("helpful_count", 0))
+        harmful_count = _safe_int(row.get("harmful_count", 0))
+        mixed_rule = helpful_count > 0 and harmful_count > 0
+        grounding = _rule_grounding_features(rule, cfg)
+        broad_refinement_target = _is_broad_high_coverage_rule(rule, grounding)
+        if mixed_rule:
+            row["assigned_reselection_category"] = "mixed_rule"
+            row["reselection_decision"] = "refine"
+        elif broad_refinement_target and str(row.get("reselection_decision", "")) != "remove":
+            row["assigned_reselection_category"] = (
+                "weak_causal_grounding_rule"
+                if bool(grounding.get("weak_causal_grounding", False))
+                else str(row.get("assigned_reselection_category", "broad_high_coverage_rule"))
+            )
+            row["reselection_decision"] = "refine" if bool(grounding.get("weak_causal_grounding", False)) else "keep"
+        row["removal_reason"] = _removal_reason_for_mode(row, rule, cfg=cfg, removal_mode=removal_mode)
+        row["blacklist_status"] = ""
+        row["refill_reason"] = ""
+        row["replaced_removed_rule_id"] = ""
+        if (
+            str(row.get("assigned_reselection_category", "")) == "mixed_rule"
+            or broad_refinement_target
+            or str(row.get("assigned_reselection_category", "")) == "weak_causal_grounding_rule"
+        ):
+            row["suggested_action"] = (
+                "refine_with_more_specific_descendant"
+                if str(row.get("assigned_reselection_category", "")) in {"mixed_rule", "weak_causal_grounding_rule"}
+                else "keep_but_monitor"
+            )
+            refinement_target_rows.append(row)
+        active_rows.append(row)
+
+    available_replacements = _available_refill_count(
+        ranked_rules,
+        current_rules,
+        blacklisted_rule_ids=blacklisted_rule_ids,
+        blacklisted_clauses=blacklisted_clauses,
+        skip_zero_positive_support_refill=skip_zero_positive_support_refill,
+    )
+    removable_rows = sorted(
+        [row for row in active_rows if str(row.get("removal_reason", ""))],
+        key=_candidate_removal_sort_key,
+        reverse=True,
+    )
+    remove_limit = min(len(removable_rows), max_remove_count, available_replacements)
+    remove_ids = {str(row.get("rule_id", "")) for row in removable_rows[:remove_limit]}
+
+    removed_rows: List[Dict[str, Any]] = []
+    retained_rows: List[Dict[str, Any]] = []
+    for row in active_rows:
+        rule_id = str(row.get("rule_id", "")).strip()
+        if rule_id in remove_ids:
+            row["reselection_decision"] = "remove"
+            row["blacklist_status"] = "blacklisted_harmful"
+            removed_rows.append(row)
+            if rule_id:
+                blacklisted_rule_ids.add(rule_id)
+            clause_key = _normalize_clause(row.get("clause", ""))
+            if clause_key:
+                blacklisted_clauses.add(clause_key)
+        else:
+            if str(row.get("reselection_decision", "")) == "remove":
+                row["reselection_decision"] = "keep"
+            if str(row.get("removal_reason", "")) and rule_id not in remove_ids:
+                row["warning_message"] = (
+                    f"{row.get('warning_message', '')}; removal candidate retained because per-round removal cap "
+                    "or replacement availability was exhausted"
+                ).strip("; ")
+            retained_rows.append(row)
+
+    selected_rules: List[Dict[str, Any]] = []
+    selected_rows: List[Dict[str, Any]] = []
+    selected_rule_ids: set[str] = set()
+    selected_clause_keys: set[str] = set()
+    for row in retained_rows:
+        rule = dict(active_rule_by_id.get(str(row.get("rule_id", "")), {}))
+        if not rule:
+            rule = dict(active_rule_by_clause.get(_normalize_clause(row.get("clause", "")), {}))
+        if not rule:
+            continue
+        rule["selection_source"] = str(row.get("selection_source", "original_topk_retained"))
+        selected_rules.append(rule)
+        selected_rows.append(row)
+        selected_rule_ids.add(str(rule.get("rule_id", "")).strip())
+        selected_clause_keys.add(_normalize_clause(rule.get("clause", "")))
+
+    refilled_rows: List[Dict[str, Any]] = []
+    scanned_for_refill = 0
+    skipped_duplicate = 0
+    skipped_blacklist = 0
+    skipped_zero_positive_support = 0
+    replacement_queue = [str(row.get("rule_id", "")) for row in removed_rows]
+    for ranked_rule in ranked_rules:
+        if len(selected_rules) >= top_k:
+            break
+        scanned_for_refill += 1
+        rule_id = str(ranked_rule.get("rule_id", "")).strip()
+        clause_key = _normalize_clause(ranked_rule.get("clause", ""))
+        if rule_id in selected_rule_ids or (clause_key and clause_key in selected_clause_keys):
+            skipped_duplicate += 1
+            continue
+        if rule_id in blacklisted_rule_ids or (clause_key and clause_key in blacklisted_clauses):
+            skipped_blacklist += 1
+            continue
+        if skip_zero_positive_support_refill and _safe_int(ranked_rule.get("positive_support", 0)) <= 0:
+            skipped_zero_positive_support += 1
+            continue
+        replaced_rule_id = replacement_queue.pop(0) if replacement_queue else ""
+        refill_reason = "refill_removed_harmful_rule" if replaced_rule_id else "fill_to_top_k_budget"
+        refill_rule = dict(ranked_rule)
+        refill_rule["selection_source"] = "ranked_pool_refill"
+        refill_row = {
+            "round_index": int(round_index),
+            "rule_id": rule_id,
+            "clause": str(ranked_rule.get("clause", "")),
+            "original_clause": str(ranked_rule.get("clause", "")),
+            "original_rank": _rule_rank(ranked_rule, len(selected_rules) + 1),
+            "original_score": _rule_score(ranked_rule),
+            "found_in_step18m": False,
+            "missing_from_step18m": True,
+            "found_in_step17": True,
+            "matched_by": "ranked_pool",
+            "causal_effect_status": "not_evaluated_by_18m",
+            "alignment_warning": "",
+            "selection_source": "ranked_pool_refill",
+            "backfill_reason": "",
+            "helpful_count": 0,
+            "harmful_count": 0,
+            "necessary_true_positive_count": 0,
+            "causal_false_positive_count": 0,
+            "redundant_count": 0,
+            "prediction_flip_count": 0,
+            "net_helpful_minus_harmful": 0,
+            "dominant_influence_type": "not_evaluated_by_18m",
+            "assigned_reselection_category": "ranked_pool_refill_rule",
+            "reselection_decision": "refill",
+            "reason": refill_reason,
+            "trigger_count": 0,
+            "non_decisive_contribution_count": 0,
+            "weak_grounding_penalty_applied": False,
+            "has_object_level_support": False,
+            "uses_only_ego_motion_atoms": False,
+            "uses_broad_weak_atoms": False,
+            "reasoning_feedback_request_count": 0,
+            "backup_explanation_candidate": False,
+            "warning_message": (
+                "Step 17 ranked-pool refill rule was not evaluated by Step 18M in this iteration; "
+                "causal effect statistics are missing, not zero."
+            ),
+            "reselection_score": _rule_score(ranked_rule),
+            "blacklist_status": "",
+            "removal_reason": "",
+            "refill_reason": refill_reason,
+            "refill_rank": len(refilled_rows) + 1,
+            "replaced_removed_rule_id": replaced_rule_id,
+        }
+        refilled_rows.append(refill_row)
+        selected_rows.append(refill_row)
+        selected_rules.append(refill_rule)
+        if rule_id:
+            selected_rule_ids.add(rule_id)
+        if clause_key:
+            selected_clause_keys.add(clause_key)
+
+    for new_rank, row in enumerate(selected_rows, start=1):
+        row["refined_rank"] = new_rank
+    refined_rules: List[Dict[str, Any]] = []
+    for row, rule in zip(selected_rows, selected_rules):
+        refined_rule = dict(rule)
+        refined_rule["causal_reselection"] = {key: row.get(key, "") for key in _ROW_FIELDS}
+        refined_rule["refined_rank"] = int(row.get("refined_rank", 0))
+        refined_rules.append(refined_rule)
+
+    return {
+        "round_index": int(round_index),
+        "final_rules": refined_rules,
+        "selected_rows": selected_rows,
+        "active_rows": active_rows,
+        "removed_rows": removed_rows,
+        "retained_rows": retained_rows,
+        "refilled_rows": refilled_rows,
+        "refinement_target_rows": refinement_target_rows,
+        "causal_rows": causal_rows,
+        "num_refill_skipped_duplicate": skipped_duplicate,
+        "num_refill_skipped_blacklist": skipped_blacklist,
+        "num_refill_skipped_zero_positive_support": skipped_zero_positive_support,
+        "ranked_pool_candidates_scanned_for_refill": scanned_for_refill,
+        "refined_final_rules_reached_top_k": len(refined_rules) == top_k,
+        "available_replacements": available_replacements,
+        "num_removal_candidates": len(removable_rows),
+    }
+
+
+def _process_iterative_reselection(
+    *,
+    final_rule_results: Dict[str, Any],
+    evaluation_results: Dict[str, Any],
+    rule_level_causal_masking_results: Dict[str, Any],
+    reasoning_feedback_results: Optional[Dict[str, Any]],
+    temporal_rule_results: Sequence[Dict[str, Any]],
+    logic_atom_results: Sequence[Dict[str, Any]],
+    eval_video_ids: Sequence[str],
+    split_manifest: Dict[str, Any],
+    cfg: Dict[str, Any],
+    output_root: Path,
+) -> Dict[str, Any]:
+    from src.exp_driving_videos.modules import evaluate_rules_driving_mini
+    from src.exp_driving_videos.modules import rule_level_causal_masking_driving_mini
+
+    result_path = output_root / "causal_rule_reselection.json"
+    refined_json_path = output_root / "refined_final_rules.json"
+    refined_csv_path = output_root / "refined_final_rules.csv"
+    summary_csv_path = output_root / "causal_rule_reselection_summary.csv"
+    removed_csv_path = output_root / "removed_rules.csv"
+    retained_csv_path = output_root / "retained_rules.csv"
+    refilled_csv_path = output_root / "refilled_rules.csv"
+    refinement_targets_csv_path = output_root / "refinement_targets.csv"
+    per_round_evaluation_csv_path = output_root / "per_round_rule_evaluation.csv"
+    per_round_removed_csv_path = output_root / "per_round_removed_rules.csv"
+    per_round_refilled_csv_path = output_root / "per_round_refilled_rules.csv"
+    iterative_summary_csv_path = output_root / "iterative_reselection_summary.csv"
+    best_round_refined_csv_path = output_root / "best_round_refined_final_rules.csv"
+    best_round_manifest_path = output_root / "best_round_manifest.json"
+
+    top_k = max(0, int(cfg.get("top_k", len(final_rule_results.get("final_rules", [])) or 50)))
+    max_rounds = max(1, int(cfg.get("max_rounds", 5)))
+    selection_metric = str(cfg.get("selection_metric", "f1")).strip() or "f1"
+    tie_breaker = str(cfg.get("tie_breaker", "precision")).strip() or "precision"
+    early_stop_limit = max(0, int(cfg.get("early_stop_no_improvement_rounds", 2)))
+    ranked_rules = [
+        _normalize_ranked_rule(rule, rank)
+        for rank, rule in enumerate(_load_ranked_rules(final_rule_results, output_root=output_root), start=1)
+    ]
+    current_rules = [dict(rule) for rule in list(final_rule_results.get("final_rules", []))]
+    blacklisted_rule_ids: set[str] = set()
+    blacklisted_clauses: set[str] = set()
+    round_records: List[Dict[str, Any]] = []
+    all_summary_rows: List[Dict[str, Any]] = []
+    all_removed_rows: List[Dict[str, Any]] = []
+    all_retained_rows: List[Dict[str, Any]] = []
+    all_refilled_rows: List[Dict[str, Any]] = []
+    all_refinement_target_rows: List[Dict[str, Any]] = []
+
+    baseline_metrics = dict(evaluation_results.get("overall_metrics", {}))
+    best_record: Dict[str, Any] = {
+        "round_index": 0,
+        "rule_set_name": "round_00_initial",
+        "final_rules": [dict(rule) for rule in current_rules],
+        "selected_rows": [],
+        "metrics": baseline_metrics,
+        "evaluation_results": dict(evaluation_results),
+        "num_removed_rules": 0,
+        "num_cumulative_removed_rules": 0,
+        "num_refilled_rules": 0,
+        "num_blacklisted_rules": 0,
+        "top_k_reached": len(current_rules) == top_k,
+    }
+    round_records.append(best_record)
+    no_improvement_rounds = 0
+    current_eval = dict(evaluation_results)
+    current_masking = dict(rule_level_causal_masking_results)
+    stop_reason = ""
+
+    for round_index in range(1, max_rounds + 1):
+        round_root = output_root / f"round_{round_index:02d}"
+        round_root.mkdir(parents=True, exist_ok=True)
+        maintenance = _run_maintenance_pass(
+            current_rules=current_rules,
+            base_final_rule_results=final_rule_results,
+            ranked_rules=ranked_rules,
+            evaluation_results=current_eval,
+            masking_results=current_masking,
+            reasoning_feedback_results=reasoning_feedback_results,
+            cfg=cfg,
+            output_root=round_root,
+            top_k=top_k,
+            round_index=round_index,
+            blacklisted_rule_ids=blacklisted_rule_ids,
+            blacklisted_clauses=blacklisted_clauses,
+        )
+        next_rules = [dict(rule) for rule in list(maintenance.get("final_rules", []))]
+        round_rule_results = _build_round_rule_results(
+            rules=next_rules,
+            base_results=final_rule_results,
+            round_index=round_index,
+        )
+        round_rule_results["output_paths"] = {
+            **dict(final_rule_results.get("output_paths", {})),
+            "refined_final_rules_json": str(round_root / "refined_final_rules.json"),
+            "refined_final_rules_csv": str(round_root / "refined_final_rules.csv"),
+        }
+        round_rule_results["causal_rule_reselection_round"] = {
+            "round_index": round_index,
+            "removed_rules": list(maintenance.get("removed_rows", [])),
+            "refilled_rules": list(maintenance.get("refilled_rows", [])),
+        }
+        _write_refined_rules_artifacts(
+            json_path=round_root / "refined_final_rules.json",
+            csv_path=round_root / "refined_final_rules.csv",
+            result=round_rule_results,
+            selected_rows=list(maintenance.get("selected_rows", [])),
+        )
+        _write_csv(round_root / "causal_rule_reselection_summary.csv", _ROW_FIELDS, list(maintenance.get("active_rows", [])) + list(maintenance.get("refilled_rows", [])))
+        _write_csv(round_root / "removed_rules.csv", _REMOVED_RULE_FIELDS, list(maintenance.get("removed_rows", [])))
+        _write_csv(round_root / "refilled_rules.csv", _REFILLED_RULE_FIELDS, list(maintenance.get("refilled_rows", [])))
+        _write_csv(round_root / "refinement_targets.csv", _REFINEMENT_TARGET_FIELDS, list(maintenance.get("refinement_target_rows", [])))
+
+        round_eval_root = round_root / "evaluation"
+        round_evaluation = evaluate_rules_driving_mini.run(
+            final_rule_results=round_rule_results,
+            temporal_rule_results=list(temporal_rule_results),
+            logic_atom_results=list(logic_atom_results),
+            eval_video_ids=list(eval_video_ids),
+            split_manifest=split_manifest,
+            cfg={
+                "prediction_mode": str(cfg.get("prediction_mode", "any_rule_positive")),
+                "evaluated_rule_set_name": f"iterative_round_{round_index:02d}",
+            },
+            output_root=round_eval_root,
+            force_recompute=True,
+        )
+        round_masking_root = round_root / "masking"
+        round_masking = rule_level_causal_masking_driving_mini.run(
+            final_rule_results=round_rule_results,
+            evaluation_results=round_evaluation,
+            cfg={
+                "prediction_mode": str(cfg.get("prediction_mode", "any_rule_positive")),
+                "rule_set_name": f"iterative_round_{round_index:02d}",
+                "score_epsilon": float(cfg.get("score_epsilon", 1e-9)),
+                "many_redundant_rule_fraction": float(cfg.get("many_redundant_rule_fraction", 0.5)),
+            },
+            output_root=round_masking_root,
+            force_recompute=True,
+        )
+
+        record = {
+            "round_index": round_index,
+            "rule_set_name": f"round_{round_index:02d}",
+            "final_rules": next_rules,
+            "selected_rows": list(maintenance.get("selected_rows", [])),
+            "metrics": dict(round_evaluation.get("overall_metrics", {})),
+            "evaluation_results": round_evaluation,
+            "masking_results": round_masking,
+            "num_removed_rules": len(list(maintenance.get("removed_rows", []))),
+            "num_cumulative_removed_rules": len(all_removed_rows) + len(list(maintenance.get("removed_rows", []))),
+            "num_refilled_rules": len(list(maintenance.get("refilled_rows", []))),
+            "num_blacklisted_rules": len(blacklisted_rule_ids),
+            "top_k_reached": len(next_rules) == top_k,
+            "removed_rules": list(maintenance.get("removed_rows", [])),
+            "refilled_rules": list(maintenance.get("refilled_rows", [])),
+            "retained_rules": list(maintenance.get("retained_rows", [])),
+            "refinement_targets": list(maintenance.get("refinement_target_rows", [])),
+            "ranked_pool_candidates_scanned_for_refill": int(
+                maintenance.get("ranked_pool_candidates_scanned_for_refill", 0)
+            ),
+            "num_refill_skipped_duplicate": int(maintenance.get("num_refill_skipped_duplicate", 0)),
+            "num_refill_skipped_blacklist": int(maintenance.get("num_refill_skipped_blacklist", 0)),
+            "num_refill_skipped_zero_positive_support": int(
+                maintenance.get("num_refill_skipped_zero_positive_support", 0)
+            ),
+            "round_output_root": str(round_root),
+        }
+        round_records.append(record)
+        all_summary_rows.extend(list(maintenance.get("active_rows", [])) + list(maintenance.get("refilled_rows", [])))
+        all_removed_rows.extend(list(maintenance.get("removed_rows", [])))
+        all_retained_rows.extend(list(maintenance.get("retained_rows", [])))
+        all_refilled_rows.extend(list(maintenance.get("refilled_rows", [])))
+        all_refinement_target_rows.extend(list(maintenance.get("refinement_target_rows", [])))
+
+        if _is_better_round(record, best_record, selection_metric=selection_metric, tie_breaker=tie_breaker):
+            best_record = record
+            no_improvement_rounds = 0
+        else:
+            no_improvement_rounds += 1
+        if not record["removed_rules"] and not record["refilled_rules"]:
+            stop_reason = "no_rules_removed_or_refilled"
+            break
+        if early_stop_limit and no_improvement_rounds >= early_stop_limit:
+            stop_reason = f"no_validation_improvement_for_{early_stop_limit}_rounds"
+            break
+        current_rules = next_rules
+        current_eval = round_evaluation
+        current_masking = round_masking
+
+    for record in round_records:
+        record["selected_as_best"] = int(record.get("round_index", -1)) == int(best_record.get("round_index", -1))
+        record["early_stop_reason"] = stop_reason if record is round_records[-1] else ""
+
+    best_rules = [dict(rule) for rule in list(best_record.get("final_rules", []))]
+    best_rows = list(best_record.get("selected_rows", []))
+    if not best_rows:
+        best_rows = [
+            {
+                "rule_id": str(rule.get("rule_id", "")),
+                "clause": str(rule.get("clause", "")),
+                "original_rank": _rule_rank(rule, index),
+                "original_score": _rule_score(rule),
+                "selection_source": "original_topk_retained",
+                "reselection_decision": "keep",
+                "assigned_reselection_category": "initial_rule",
+                "helpful_count": 0,
+                "harmful_count": 0,
+                "necessary_true_positive_count": 0,
+                "causal_false_positive_count": 0,
+                "prediction_flip_count": 0,
+                "found_in_step18m": False,
+                "blacklist_status": "",
+                "refill_reason": "",
+                "replaced_removed_rule_id": "",
+                "refined_rank": index,
+            }
+            for index, rule in enumerate(best_rules, start=1)
+        ]
+
+    per_round_rows: List[Dict[str, Any]] = []
+    for record in round_records:
+        metrics = dict(record.get("metrics", {}))
+        per_round_rows.append(
+            {
+                "round_index": int(record.get("round_index", 0)),
+                "rule_set_name": str(record.get("rule_set_name", "")),
+                "num_rules": len(list(record.get("final_rules", []))),
+                "num_removed_rules": int(record.get("num_removed_rules", 0)),
+                "num_refilled_rules": int(record.get("num_refilled_rules", 0)),
+                "num_blacklisted_rules": int(record.get("num_blacklisted_rules", 0)),
+                "top_k_reached": bool(record.get("top_k_reached", False)),
+                "true_positive": _safe_int(metrics.get("true_positive", 0)),
+                "false_positive": _safe_int(metrics.get("false_positive", 0)),
+                "false_negative": _safe_int(metrics.get("false_negative", 0)),
+                "true_negative": _safe_int(metrics.get("true_negative", 0)),
+                "precision": _safe_float(metrics.get("precision", 0.0)),
+                "recall": _safe_float(metrics.get("recall", 0.0)),
+                "f1": _safe_float(metrics.get("f1", 0.0)),
+                "accuracy": _safe_float(metrics.get("accuracy", 0.0)),
+                "selected_as_best": bool(record.get("selected_as_best", False)),
+                "early_stop_reason": str(record.get("early_stop_reason", "")),
+            }
+        )
+
+    _write_csv(summary_csv_path, _ROW_FIELDS, all_summary_rows)
+    _write_csv(removed_csv_path, _REMOVED_RULE_FIELDS, all_removed_rows)
+    _write_csv(retained_csv_path, _ROW_FIELDS, all_retained_rows)
+    _write_csv(refilled_csv_path, _REFILLED_RULE_FIELDS, all_refilled_rows)
+    _write_csv(refinement_targets_csv_path, _REFINEMENT_TARGET_FIELDS, all_refinement_target_rows)
+    _write_csv(per_round_evaluation_csv_path, _PER_ROUND_EVALUATION_FIELDS, per_round_rows)
+    _write_csv(per_round_removed_csv_path, ["round_index", *_REMOVED_RULE_FIELDS], all_removed_rows)
+    _write_csv(per_round_refilled_csv_path, ["round_index", *_REFILLED_RULE_FIELDS], all_refilled_rows)
+    _write_csv(iterative_summary_csv_path, _PER_ROUND_EVALUATION_FIELDS, per_round_rows)
+    _write_csv(refined_csv_path, _REFINED_RULE_FIELDS, best_rows)
+    _write_csv(best_round_refined_csv_path, _REFINED_RULE_FIELDS, best_rows)
+
+    best_round_manifest = {
+        "best_round_index": int(best_record.get("round_index", 0)),
+        "selection_metric": selection_metric,
+        "tie_breaker": tie_breaker,
+        "selected_on_validation_performance": True,
+        "metrics": dict(best_record.get("metrics", {})),
+        "num_rules": len(best_rules),
+        "num_removed_rules": int(best_record.get("num_removed_rules", 0)),
+        "num_refilled_rules": int(best_record.get("num_refilled_rules", 0)),
+    }
+    with best_round_manifest_path.open("w", encoding="utf-8") as fh:
+        json.dump(best_round_manifest, fh, indent=2)
+
+    refined_result = {
+        "version": _RESELECTION_VERSION,
+        "config": _cfg_key_subset(cfg),
+        "selection_method": "iterative_causal_aware_top_k_rule_maintenance",
+        "selection_input_stage": "step17_ranked_pool_plus_iterative_step18_evaluation_and_step18m_causal_masking",
+        "iterative_enabled": True,
+        "top_k": top_k,
+        "max_rounds": max_rounds,
+        "num_rounds_executed": max(0, len(round_records) - 1),
+        "best_round_index": int(best_record.get("round_index", 0)),
+        "best_round_metrics": dict(best_record.get("metrics", {})),
+        "selected_on_validation_performance": True,
+        "selection_metric": selection_metric,
+        "tie_breaker": tie_breaker,
+        "early_stop_reason": stop_reason,
+        "num_input_rules": len(final_rule_results.get("final_rules", [])),
+        "num_initial_final_rules": len(final_rule_results.get("final_rules", [])),
+        "num_final_rules": len(best_rules),
+        "num_refined_final_rules": len(best_rules),
+        "num_removed_rules": len(all_removed_rows),
+        "num_removed_harmful_rules": len(all_removed_rows),
+        "num_refilled_rules": len(all_refilled_rows),
+        "num_blacklisted_rules": len(blacklisted_rule_ids),
+        "num_refinement_targets": len(all_refinement_target_rows),
+        "refined_final_rules_reached_top_k": len(best_rules) == top_k,
+        "rounds": round_records,
+        "per_round_evaluation_rows": per_round_rows,
+        "removed_rules": all_removed_rows,
+        "refilled_rules": all_refilled_rows,
+        "refinement_targets": all_refinement_target_rows,
+        "final_rules": best_rules,
+        "reselection_rows": all_summary_rows,
+        "output_paths": {
+            "result_json": str(result_path),
+            "refined_final_rules_json": str(refined_json_path),
+            "refined_final_rules_csv": str(refined_csv_path),
+            "causal_rule_reselection_summary_csv": str(summary_csv_path),
+            "removed_rules_csv": str(removed_csv_path),
+            "retained_rules_csv": str(retained_csv_path),
+            "refilled_rules_csv": str(refilled_csv_path),
+            "refinement_targets_csv": str(refinement_targets_csv_path),
+            "per_round_rule_evaluation_csv": str(per_round_evaluation_csv_path),
+            "per_round_removed_rules_csv": str(per_round_removed_csv_path),
+            "per_round_refilled_rules_csv": str(per_round_refilled_csv_path),
+            "iterative_reselection_summary_csv": str(iterative_summary_csv_path),
+            "best_round_refined_final_rules_csv": str(best_round_refined_csv_path),
+            "best_round_manifest_json": str(best_round_manifest_path),
+        },
+    }
+    with refined_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(refined_result, fh, indent=2)
+    with result_path.open("w", encoding="utf-8") as fh:
+        json.dump(refined_result, fh, indent=2)
+    print(
+        "  iterative_causal_rule_reselection: "
+        f"rounds={refined_result['num_rounds_executed']} | "
+        f"best_round={refined_result['best_round_index']} | "
+        f"best_f1={_safe_float(refined_result['best_round_metrics'].get('f1', 0.0)):.3f} | "
+        f"rules={len(best_rules)}"
+    )
+    refined_result["_freshly_computed"] = True
+    return refined_result
+
+
 def process_reselection(
     final_rule_results: Dict[str, Any],
     evaluation_results: Dict[str, Any],
     rule_level_causal_masking_results: Dict[str, Any],
     reasoning_feedback_results: Optional[Dict[str, Any]] = None,
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
+    logic_atom_results: Optional[Sequence[Dict[str, Any]]] = None,
+    eval_video_ids: Optional[Sequence[str]] = None,
+    split_manifest: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -721,6 +1536,20 @@ def process_reselection(
             print(f"  [cache] loading {result_path.name}")
             cached["_freshly_computed"] = False
             return cached
+
+    if bool(cfg.get("iterative_enabled", False)) and temporal_rule_results is not None:
+        return _process_iterative_reselection(
+            final_rule_results=final_rule_results,
+            evaluation_results=evaluation_results,
+            rule_level_causal_masking_results=rule_level_causal_masking_results,
+            reasoning_feedback_results=reasoning_feedback_results,
+            temporal_rule_results=list(temporal_rule_results or []),
+            logic_atom_results=list(logic_atom_results or []),
+            eval_video_ids=list(eval_video_ids or []),
+            split_manifest=dict(split_manifest or {}),
+            cfg=cfg,
+            output_root=out_root,
+        )
 
     final_rules = [dict(rule) for rule in list(final_rule_results.get("final_rules", []))]
     causal_rows = _load_rule_causal_rows(rule_level_causal_masking_results, output_root=out_root)
@@ -1125,6 +1954,10 @@ def run(
     evaluation_results: Dict[str, Any],
     rule_level_causal_masking_results: Dict[str, Any],
     reasoning_feedback_results: Optional[Dict[str, Any]] = None,
+    temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
+    logic_atom_results: Optional[Sequence[Dict[str, Any]]] = None,
+    eval_video_ids: Optional[Sequence[str]] = None,
+    split_manifest: Optional[Dict[str, Any]] = None,
     cfg: Optional[Dict[str, Any]] = None,
     output_root: Optional[Path] = None,
     force_recompute: bool = False,
@@ -1134,6 +1967,10 @@ def run(
         evaluation_results=evaluation_results,
         rule_level_causal_masking_results=rule_level_causal_masking_results,
         reasoning_feedback_results=reasoning_feedback_results,
+        temporal_rule_results=temporal_rule_results,
+        logic_atom_results=logic_atom_results,
+        eval_video_ids=eval_video_ids,
+        split_manifest=split_manifest,
         cfg=cfg,
         output_root=output_root,
         force_recompute=force_recompute,
