@@ -93,19 +93,31 @@ def _comparison_rows(
                 "delta_refined_minus_original": refined_rules - original_rules,
             },
             {
-                "metric": "number_of_removed_harmful_rules",
+                "metric": "removed_harmful_rules",
                 "original_step18": 0,
                 "refined_step18o": int(reselection.get("num_removed_harmful_rules", 0)),
                 "delta_refined_minus_original": int(reselection.get("num_removed_harmful_rules", 0)),
             },
             {
-                "metric": "number_of_retained_necessary_rules",
+                "metric": "refilled_replacement_rules",
+                "original_step18": 0,
+                "refined_step18o": int(reselection.get("num_refilled_rules", 0)),
+                "delta_refined_minus_original": int(reselection.get("num_refilled_rules", 0)),
+            },
+            {
+                "metric": "refinement_targets",
+                "original_step18": 0,
+                "refined_step18o": int(reselection.get("num_refinement_targets", 0)),
+                "delta_refined_minus_original": int(reselection.get("num_refinement_targets", 0)),
+            },
+            {
+                "metric": "retained_necessary_rules",
                 "original_step18": 0,
                 "refined_step18o": int(reselection.get("num_retained_necessary_rules", 0)),
                 "delta_refined_minus_original": int(reselection.get("num_retained_necessary_rules", 0)),
             },
             {
-                "metric": "number_of_mixed_refinement_targets",
+                "metric": "mixed_refinement_targets",
                 "original_step18": 0,
                 "refined_step18o": int(reselection.get("num_mixed_refinement_targets", 0)),
                 "delta_refined_minus_original": int(reselection.get("num_mixed_refinement_targets", 0)),
@@ -122,16 +134,16 @@ def _main_conclusion(comparison_rows: Sequence[Dict[str, Any]]) -> str:
     f1_delta = _metric(by_metric.get("F1", {}), "delta_refined_minus_original")
     if fp_delta < 0 and recall_delta >= -1e-9:
         return (
-            "Causal masking-guided reselection reduced false positives while preserving recall "
+            "Causal-aware top-k maintenance reduced false positives while preserving recall "
             f"(delta_fp={fp_delta:.0f}, delta_recall={recall_delta:.3f}, delta_f1={f1_delta:.3f})."
         )
     if fp_delta < 0:
         return (
-            "Causal masking-guided reselection reduced false positives but changed recall "
+            "Causal-aware top-k maintenance reduced false positives but changed recall "
             f"(delta_fp={fp_delta:.0f}, delta_recall={recall_delta:.3f}, delta_f1={f1_delta:.3f})."
         )
     return (
-        "Causal masking-guided reselection did not reduce false positives "
+        "Causal-aware top-k maintenance did not reduce false positives "
         f"(delta_fp={fp_delta:.0f}, delta_recall={recall_delta:.3f}, delta_f1={f1_delta:.3f})."
     )
 

@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 3
+_RESELECTION_VERSION = 4
 _ROW_FIELDS = [
     "rule_id",
     "clause",
@@ -61,8 +61,53 @@ _ROW_FIELDS = [
     "reasoning_feedback_request_count",
     "backup_explanation_candidate",
     "warning_message",
+    "blacklist_status",
+    "removal_reason",
+    "refill_reason",
+    "refill_rank",
+    "replaced_removed_rule_id",
     "reselection_score",
 ]
+_REFINED_RULE_FIELDS = [
+    "rule_id",
+    "clause",
+    "original_rank",
+    "original_score",
+    "selection_source",
+    "reselection_decision",
+    "assigned_reselection_category",
+    "helpful_count",
+    "harmful_count",
+    "necessary_true_positive_count",
+    "causal_false_positive_count",
+    "prediction_flip_count",
+    "found_in_step18m",
+    "blacklist_status",
+    "refill_reason",
+    "replaced_removed_rule_id",
+    "refined_rank",
+]
+_REMOVED_RULE_FIELDS = [
+    "rule_id",
+    "clause",
+    "original_rank",
+    "removal_reason",
+    "helpful_count",
+    "harmful_count",
+    "necessary_true_positive_count",
+    "causal_false_positive_count",
+    "prediction_flip_count",
+]
+_REFILLED_RULE_FIELDS = [
+    "rule_id",
+    "clause",
+    "original_rank",
+    "original_score",
+    "refill_reason",
+    "replaced_removed_rule_id",
+    "selection_source",
+]
+_REFINEMENT_TARGET_FIELDS = _ROW_FIELDS + ["suggested_action"]
 
 
 def get_output_root() -> Path:
@@ -85,6 +130,8 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "object_support_bonus": float(cfg.get("object_support_bonus", 0.5)),
         "backup_explanation_min_trigger_count": int(cfg.get("backup_explanation_min_trigger_count", 5)),
         "backfill_mixed_rules": bool(cfg.get("backfill_mixed_rules", False)),
+        "remove_mixed_harmful_dominant": bool(cfg.get("remove_mixed_harmful_dominant", False)),
+        "skip_zero_positive_support_refill": bool(cfg.get("skip_zero_positive_support_refill", True)),
         "broad_weak_predicates": sorted(str(value) for value in list(cfg.get("broad_weak_predicates", []))),
         "ego_motion_only_predicates": sorted(str(value) for value in list(cfg.get("ego_motion_only_predicates", []))),
     }
@@ -265,11 +312,67 @@ def _is_refinement_target_candidate(grounding: Dict[str, Any]) -> bool:
     return bool(grounding.get("uses_broad_weak_atoms", False) or grounding.get("uses_only_ego_motion_atoms", False))
 
 
+def _is_broad_high_coverage_rule(rule: Dict[str, Any], grounding: Dict[str, Any]) -> bool:
+    atoms = list(grounding.get("body_atoms", [])) or _body_atoms(rule)
+    if bool(grounding.get("uses_broad_weak_atoms", False) or grounding.get("uses_only_ego_motion_atoms", False)):
+        return True
+    if len(atoms) != 1:
+        return False
+    predicate, args = _parse_atom(str(atoms[0]))
+    atom_text = str(atoms[0]).lower()
+    if predicate == "object_distance_state" and any(str(arg).strip().lower() == "near" for arg in args):
+        return True
+    return "vz_approaching" in atom_text or "vz_awaying" in atom_text or "intermittent" in atom_text
+
+
 def _row_brief(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "rule_id": str(row.get("rule_id", "")),
         "clause": str(row.get("original_clause", row.get("clause", ""))),
     }
+
+
+def _load_ranked_rules(final_rule_results: Dict[str, Any], *, output_root: Path) -> List[Dict[str, Any]]:
+    ranked_rules = [dict(rule) for rule in list(final_rule_results.get("ranked_rules", []))]
+    if ranked_rules:
+        return ranked_rules
+    output_paths = dict(final_rule_results.get("output_paths", {}))
+    ranked_path_text = str(output_paths.get("ranked_rules_json", ""))
+    ranked_path = (
+        Path(ranked_path_text)
+        if ranked_path_text
+        else output_root.parent / "17_driving_mini_final_rules" / "ranked_rules.json"
+    )
+    loaded = _load_json_if_exists(ranked_path)
+    ranked_rules = [dict(rule) for rule in list(loaded.get("ranked_rules", []))]
+    if ranked_rules:
+        return ranked_rules
+    return [dict(rule) for rule in list(final_rule_results.get("final_rules", []))]
+
+
+def _rule_rank(rule: Dict[str, Any], default: int) -> int:
+    return _safe_int(rule.get("original_rank", rule.get("rank", rule.get("selection_rank", default))), default)
+
+
+def _rule_score(rule: Dict[str, Any]) -> float:
+    return _safe_float(rule.get("original_score", rule.get("selection_utility", rule.get("confidence", 0.0))))
+
+
+def _normalize_ranked_rule(rule: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    normalized = dict(rule)
+    normalized.setdefault("rank", rank)
+    normalized.setdefault("original_rank", _rule_rank(normalized, rank))
+    normalized.setdefault("original_score", _rule_score(normalized))
+    normalized.setdefault("confidence", _safe_float(normalized.get("confidence", normalized.get("original_score", 0.0))))
+    normalized.setdefault("support", _safe_int(normalized.get("total_support", normalized.get("support", 0))))
+    return normalized
+
+
+def _rule_key(rule: Dict[str, Any]) -> str:
+    rule_id = str(rule.get("rule_id", "")).strip()
+    if rule_id:
+        return f"id:{rule_id}"
+    return f"clause:{_normalize_clause(rule.get('clause', ''))}"
 
 
 def _load_rule_causal_rows(masking_results: Dict[str, Any], *, output_root: Path) -> Dict[str, Dict[str, Any]]:
@@ -608,6 +711,7 @@ def process_reselection(
     summary_csv_path = out_root / "causal_rule_reselection_summary.csv"
     removed_csv_path = out_root / "removed_rules.csv"
     retained_csv_path = out_root / "retained_rules.csv"
+    refilled_csv_path = out_root / "refilled_rules.csv"
     refinement_targets_csv_path = out_root / "refinement_targets.csv"
 
     cfg_subset = _cfg_key_subset(cfg)
@@ -624,31 +728,34 @@ def process_reselection(
     feedback_counts = _feedback_rule_counts(reasoning_feedback_results, output_root=out_root)
     top_k = max(0, int(cfg.get("top_k", len(final_rules) or 50)))
     backup_min_trigger_count = max(1, int(cfg.get("backup_explanation_min_trigger_count", 5)))
-    backfill_mixed_rules = bool(cfg.get("backfill_mixed_rules", False))
+    remove_mixed_harmful_dominant = bool(cfg.get("remove_mixed_harmful_dominant", False))
+    skip_zero_positive_support_refill = bool(cfg.get("skip_zero_positive_support_refill", True))
+    ranked_rules = [
+        _normalize_ranked_rule(rule, rank)
+        for rank, rule in enumerate(_load_ranked_rules(final_rule_results, output_root=out_root), start=1)
+    ]
 
-    candidate_rows: List[Dict[str, Any]] = []
-    rule_by_id: Dict[str, Dict[str, Any]] = {}
-    rule_by_clause: Dict[str, Dict[str, Any]] = {}
-    rank_by_rule_id: Dict[str, int] = {}
+    active_rule_by_id = {str(rule.get("rule_id", "")).strip(): dict(rule) for rule in final_rules if str(rule.get("rule_id", "")).strip()}
+    active_rule_by_clause = {
+        _normalize_clause(rule.get("clause", "")): dict(rule)
+        for rule in final_rules
+        if _normalize_clause(rule.get("clause", ""))
+    }
     consumed_causal_ids: set[str] = set()
-    for rank, rule in enumerate(final_rules, start=1):
-        rule_id = str(rule.get("rule_id", "")).strip()
-        if rule_id:
-            rule_by_id[rule_id] = rule
-            rank_by_rule_id[rule_id] = rank
-        clause_key = _normalize_clause(rule.get("clause", ""))
-        if clause_key:
-            rule_by_clause.setdefault(clause_key, rule)
+    active_rows: List[Dict[str, Any]] = []
+    removed_rows: List[Dict[str, Any]] = []
+    retained_rows: List[Dict[str, Any]] = []
+    refinement_target_rows: List[Dict[str, Any]] = []
+    blacklisted_rule_ids: set[str] = set()
+    blacklisted_clauses: set[str] = set()
 
-    for rank, rule in enumerate(final_rules, start=1):
+    for active_rank, rule in enumerate(final_rules, start=1):
         rule_id = str(rule.get("rule_id", "")).strip()
-        if not rule_id:
-            continue
         matched_by = "missing_from_step18m"
         alignment_warning = ""
         causal: Dict[str, Any] = {}
         causal_rule_id = ""
-        if rule_id in causal_rows:
+        if rule_id and rule_id in causal_rows:
             causal_rule_id = rule_id
             causal = dict(causal_rows[rule_id])
             matched_by = "rule_id"
@@ -662,220 +769,255 @@ def process_reselection(
                     causal = dict(candidate_causal)
                     matched_by = "normalized_clause"
                     alignment_warning = (
-                        "Step 17 rule_id was not found in Step 18M, but normalized clause matched "
+                        "Step 17 active rule_id was not found in Step 18M, but normalized clause matched "
                         f"Step 18M rule_id={candidate_causal_id}."
                     )
                     break
         if causal_rule_id:
             consumed_causal_ids.add(causal_rule_id)
-        candidate_rows.append(
-            _make_reselection_row(
-                rule=rule,
-                causal=causal,
-                eval_row=dict(eval_rows.get(rule_id, {})),
-                rank=rank,
-                found_in_step17=True,
-                found_in_step18m=bool(causal),
-                matched_by=matched_by,
-                alignment_warning=alignment_warning,
-                cfg=cfg,
-                feedback_counts=feedback_counts,
-                backup_min_trigger_count=backup_min_trigger_count,
-                backfill_mixed_rules=backfill_mixed_rules,
-            )
-        )
 
-    for causal_rule_id, causal in sorted(causal_rows.items()):
-        if causal_rule_id in consumed_causal_ids:
+        row = _make_reselection_row(
+            rule=rule,
+            causal=causal,
+            eval_row=dict(eval_rows.get(rule_id, {})),
+            rank=_rule_rank(rule, active_rank),
+            found_in_step17=True,
+            found_in_step18m=bool(causal),
+            matched_by=matched_by,
+            alignment_warning=alignment_warning,
+            cfg=cfg,
+            feedback_counts=feedback_counts,
+            backup_min_trigger_count=backup_min_trigger_count,
+            backfill_mixed_rules=False,
+        )
+        helpful_count = _safe_int(row.get("helpful_count", 0))
+        harmful_count = _safe_int(row.get("harmful_count", 0))
+        necessary_true_positive_count = _safe_int(row.get("necessary_true_positive_count", 0))
+        grounding = _rule_grounding_features(rule, cfg)
+        broad_refinement_target = _is_broad_high_coverage_rule(rule, grounding)
+        pure_harmful = helpful_count == 0 and harmful_count > 0 and necessary_true_positive_count == 0
+        mixed_rule = helpful_count > 0 and harmful_count > 0
+        harmful_dominant_mixed = mixed_rule and harmful_count > helpful_count
+        if pure_harmful:
+            row["assigned_reselection_category"] = "harmful_false_positive_rule"
+            row["reselection_decision"] = "remove"
+            row["removal_reason"] = "pure harmful causal false-positive source"
+            row["blacklist_status"] = "blacklisted_harmful"
+        elif harmful_dominant_mixed:
+            row["assigned_reselection_category"] = "mixed_rule"
+            row["reselection_decision"] = "remove" if remove_mixed_harmful_dominant else "refine"
+            row["removal_reason"] = "harmful-dominant mixed causal source" if remove_mixed_harmful_dominant else ""
+            row["blacklist_status"] = "blacklisted_harmful" if remove_mixed_harmful_dominant else ""
+        elif mixed_rule:
+            row["assigned_reselection_category"] = "mixed_rule"
+            row["reselection_decision"] = "refine"
+            row["removal_reason"] = ""
+            row["blacklist_status"] = ""
+        elif broad_refinement_target and str(row.get("reselection_decision", "")) != "remove":
+            row["assigned_reselection_category"] = (
+                "weak_causal_grounding_rule"
+                if bool(grounding.get("weak_causal_grounding", False))
+                else str(row.get("assigned_reselection_category", "broad_high_coverage_rule"))
+            )
+            row["reselection_decision"] = "refine" if bool(grounding.get("weak_causal_grounding", False)) else "keep"
+            row["removal_reason"] = ""
+            row["blacklist_status"] = ""
+        else:
+            row["blacklist_status"] = ""
+            row["removal_reason"] = ""
+            if str(row.get("reselection_decision", "")) in {"backfill_keep", "backfill_refine_candidate"}:
+                row["reselection_decision"] = "keep"
+        row["selection_source"] = "original_topk_retained"
+        row["refill_reason"] = ""
+        row["replaced_removed_rule_id"] = ""
+        if str(row.get("reselection_decision", "")) == "remove":
+            removed_rows.append(row)
+            if rule_id:
+                blacklisted_rule_ids.add(rule_id)
+            clause_key = _normalize_clause(rule.get("clause", ""))
+            if clause_key:
+                blacklisted_clauses.add(clause_key)
+        else:
+            retained_rows.append(row)
+        if (
+            str(row.get("assigned_reselection_category", "")) == "mixed_rule"
+            or harmful_dominant_mixed
+            or broad_refinement_target
+            or str(row.get("assigned_reselection_category", "")) == "weak_causal_grounding_rule"
+        ):
+            row["suggested_action"] = (
+                "refine_with_more_specific_descendant"
+                if str(row.get("assigned_reselection_category", "")) in {"mixed_rule", "weak_causal_grounding_rule"}
+                else "keep_but_monitor"
+            )
+            refinement_target_rows.append(row)
+        active_rows.append(row)
+
+    selected_rules: List[Dict[str, Any]] = []
+    selected_rows: List[Dict[str, Any]] = []
+    selected_rule_ids: set[str] = set()
+    selected_clause_keys: set[str] = set()
+    for row in retained_rows:
+        rule = dict(active_rule_by_id.get(str(row.get("rule_id", "")), {}))
+        if not rule:
+            rule = dict(active_rule_by_clause.get(_normalize_clause(row.get("clause", "")), {}))
+        if not rule:
             continue
-        causal_rule = _rule_from_causal_row({"rule_id": causal_rule_id, **dict(causal)})
-        clause_key = _normalize_clause(causal_rule.get("clause", ""))
-        matched_by = "step18m_only"
-        alignment_warning = ""
-        if clause_key in rule_by_clause:
-            matched_by = "normalized_clause"
-            alignment_warning = (
-                "Step 18M rule_id was not found in Step 17 by id, but its normalized clause "
-                "matches a Step 17 rule already represented in the candidate pool."
-            )
-        elif str(causal.get("alignment_warning", "")).strip():
-            alignment_warning = str(causal.get("alignment_warning", "")).strip()
-        candidate_rows.append(
-            _make_reselection_row(
-                rule=causal_rule,
-                causal={"rule_id": causal_rule_id, **dict(causal)},
-                eval_row=dict(eval_rows.get(causal_rule_id, {})),
-                rank="",
-                found_in_step17=False,
-                found_in_step18m=True,
-                matched_by=matched_by,
-                alignment_warning=alignment_warning,
-                cfg=cfg,
-                feedback_counts=feedback_counts,
-                backup_min_trigger_count=backup_min_trigger_count,
-                backfill_mixed_rules=backfill_mixed_rules,
-            )
-        )
+        selected_rules.append(rule)
+        selected_rows.append(row)
+        selected_rule_ids.add(str(rule.get("rule_id", "")).strip())
+        selected_clause_keys.add(_normalize_clause(rule.get("clause", "")))
 
-    summary_rows = candidate_rows
-    step17_rows = [row for row in candidate_rows if bool(row.get("found_in_step17", False))]
-    step18m_rows = [row for row in candidate_rows if bool(row.get("found_in_step18m", False))]
-    overlap_rows = [
-        row for row in candidate_rows if bool(row.get("found_in_step17", False)) and bool(row.get("found_in_step18m", False))
-    ]
-    missing_from_step18m_rows = [row for row in step17_rows if bool(row.get("missing_from_step18m", False))]
-    step18m_missing_from_step17_rows = [row for row in step18m_rows if not bool(row.get("found_in_step17", False))]
-    step18m_only_nonzero_rows = [
-        row for row in step18m_missing_from_step17_rows if _safe_int(row.get("prediction_flip_count", 0)) > 0
-    ]
-    step18m_only_backfilled_keep_rows = [
-        row for row in step18m_missing_from_step17_rows if str(row.get("reselection_decision", "")) == "backfill_keep"
-    ]
-    step18m_only_mixed_refinement_rows = [
-        row
-        for row in step18m_missing_from_step17_rows
-        if str(row.get("assigned_reselection_category", "")) == "mixed_rule"
-    ]
-    step18m_only_harmful_not_backfilled_rows = [
-        row
-        for row in step18m_missing_from_step17_rows
-        if str(row.get("assigned_reselection_category", "")) == "harmful_false_positive_rule"
-    ]
-    uncovered_nonzero_rows = [
-        row
-        for row in step18m_only_nonzero_rows
-        if str(row.get("reselection_decision", ""))
-        not in {"backfill_keep", "backfill_refine_candidate", "remove"}
-    ]
-    alignment_warnings: List[str] = []
-    nonzero_step18m_count = sum(1 for row in step18m_rows if _safe_int(row.get("prediction_flip_count", 0)) > 0)
-    if nonzero_step18m_count:
-        missing_nonzero_fraction = len(step18m_only_nonzero_rows) / max(1, nonzero_step18m_count)
-        if missing_nonzero_fraction > 0.10:
-            alignment_warnings.append(
-                "More than 10% of Step 18M nonzero-effect rules are missing from Step 17 "
-                f"({len(step18m_only_nonzero_rows)}/{nonzero_step18m_count})."
-            )
-    if uncovered_nonzero_rows:
-        alignment_warnings.append(
-            "Some Step 18M-only rules with prediction_flip_count > 0 were neither backfilled nor marked "
-            f"for refinement: {[str(row.get('rule_id', '')) for row in uncovered_nonzero_rows]}"
-        )
-    warning_section = {
-        "num_step17_rules": len(final_rules),
-        "num_step18m_rules": len(causal_rows),
-        "num_overlap_rules": len(overlap_rows),
-        "num_step17_missing_from_18m": len(missing_from_step18m_rows),
-        "num_step18m_missing_from_17": len(step18m_missing_from_step17_rows),
-        "num_step18m_only_nonzero_effect_rules": len(step18m_only_nonzero_rows),
-        "num_step18m_only_backfilled_keep_rules": len(step18m_only_backfilled_keep_rows),
-        "num_step18m_only_mixed_refinement_targets": len(step18m_only_mixed_refinement_rows),
-        "num_step18m_only_harmful_not_backfilled": len(step18m_only_harmful_not_backfilled_rows),
-        "backfill_mixed_rules_enabled": backfill_mixed_rules,
-        "num_step17_rules_missing_from_step18m": len(missing_from_step18m_rows),
-        "step17_rules_missing_from_step18m": [_row_brief(row) for row in missing_from_step18m_rows],
-        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(step18m_only_nonzero_rows),
-        "step18m_nonzero_causal_effect_rules_missing_from_step17": [
-            _row_brief(row) for row in step18m_only_nonzero_rows
-        ],
-        "alignment_warnings": alignment_warnings,
-    }
+    refilled_rows: List[Dict[str, Any]] = []
+    scanned_for_refill = 0
+    skipped_duplicate = 0
+    skipped_blacklist = 0
+    skipped_zero_positive_support = 0
+    replacement_queue = [str(row.get("rule_id", "")) for row in removed_rows]
 
-    selectable_rows = [
-        row
-        for row in candidate_rows
-        if str(row.get("reselection_decision", "")) != "remove"
-        and (
-            bool(row.get("found_in_step17", False))
-            or str(row.get("reselection_decision", "")) == "backfill_keep"
-            or (backfill_mixed_rules and str(row.get("reselection_decision", "")) == "backfill_refine_candidate")
-        )
-    ]
-    def _selection_priority(item: Dict[str, Any]) -> int:
-        decision = str(item.get("reselection_decision", ""))
-        category = str(item.get("assigned_reselection_category", ""))
-        if decision == "backfill_keep":
-            return 0
-        if bool(item.get("found_in_step17", False)) and category == "necessary_positive_rule":
-            return 1
-        if bool(item.get("found_in_step17", False)) and decision in {"keep", "refine"}:
-            return 2
-        if decision == "backfill_refine_candidate":
-            return 3
-        if decision in {"keep_for_review", "backup_explanation"}:
-            return 4
-        return 5
-
-    def _selection_key(item: Dict[str, Any]) -> Tuple[int, float, int, str]:
-        return (
-            _selection_priority(item),
-            -_safe_float(item.get("reselection_score", 0.0)),
-            _safe_int(item.get("original_rank", 10**9), 10**9),
-            str(item.get("rule_id", "")),
-        )
-
-    selected_rows = []
-    selected_seen: set[str] = set()
-    for row in sorted(selectable_rows, key=_selection_key):
-        if len(selected_rows) >= top_k:
+    for ranked_rule in ranked_rules:
+        if len(selected_rules) >= top_k:
             break
-        rule_id = str(row.get("rule_id", ""))
-        if rule_id not in selected_seen:
-            selected_rows.append(row)
-            selected_seen.add(rule_id)
-    selected_rule_ids = {str(row.get("rule_id", "")) for row in selected_rows}
+        scanned_for_refill += 1
+        rule_id = str(ranked_rule.get("rule_id", "")).strip()
+        clause_key = _normalize_clause(ranked_rule.get("clause", ""))
+        if rule_id in selected_rule_ids or (clause_key and clause_key in selected_clause_keys):
+            skipped_duplicate += 1
+            continue
+        if rule_id in blacklisted_rule_ids or (clause_key and clause_key in blacklisted_clauses):
+            skipped_blacklist += 1
+            continue
+        if skip_zero_positive_support_refill and _safe_int(ranked_rule.get("positive_support", 0)) <= 0:
+            skipped_zero_positive_support += 1
+            continue
+        replaced_rule_id = replacement_queue.pop(0) if replacement_queue else ""
+        refill_reason = "refill_removed_harmful_rule" if replaced_rule_id else "fill_to_top_k_budget"
+        refill_row = {
+            "rule_id": rule_id,
+            "clause": str(ranked_rule.get("clause", "")),
+            "original_clause": str(ranked_rule.get("clause", "")),
+            "original_rank": _rule_rank(ranked_rule, len(selected_rules) + 1),
+            "original_score": _rule_score(ranked_rule),
+            "found_in_step18m": False,
+            "missing_from_step18m": True,
+            "found_in_step17": True,
+            "matched_by": "ranked_pool",
+            "causal_effect_status": "not_evaluated_by_18m",
+            "alignment_warning": "",
+            "selection_source": "ranked_pool_refill",
+            "backfill_reason": "",
+            "helpful_count": 0,
+            "harmful_count": 0,
+            "necessary_true_positive_count": 0,
+            "causal_false_positive_count": 0,
+            "redundant_count": 0,
+            "prediction_flip_count": 0,
+            "net_helpful_minus_harmful": 0,
+            "dominant_influence_type": "not_evaluated_by_18m",
+            "assigned_reselection_category": "ranked_pool_refill_rule",
+            "reselection_decision": "refill",
+            "reason": refill_reason,
+            "trigger_count": 0,
+            "non_decisive_contribution_count": 0,
+            "weak_grounding_penalty_applied": False,
+            "has_object_level_support": False,
+            "uses_only_ego_motion_atoms": False,
+            "uses_broad_weak_atoms": False,
+            "reasoning_feedback_request_count": 0,
+            "backup_explanation_candidate": False,
+            "warning_message": (
+                "Step 17 ranked-pool refill rule was not evaluated by Step 18M in this iteration; "
+                "causal effect statistics are missing, not zero."
+            ),
+            "reselection_score": _rule_score(ranked_rule),
+            "blacklist_status": "",
+            "refill_reason": refill_reason,
+            "refill_rank": len(refilled_rows) + 1,
+            "replaced_removed_rule_id": replaced_rule_id,
+        }
+        refilled_rows.append(refill_row)
+        selected_rows.append(refill_row)
+        selected_rules.append(dict(ranked_rule))
+        if rule_id:
+            selected_rule_ids.add(rule_id)
+        if clause_key:
+            selected_clause_keys.add(clause_key)
+
     for new_rank, row in enumerate(selected_rows, start=1):
         row["refined_rank"] = new_rank
 
     refined_rules: List[Dict[str, Any]] = []
-    for row in selected_rows:
-        rule = dict(rule_by_id.get(str(row.get("rule_id", "")), {}))
-        if not rule:
-            rule = _rule_from_causal_row(
-                {
-                    "rule_id": row.get("rule_id", ""),
-                    "clause": row.get("clause", row.get("original_clause", "")),
-                    "confidence": row.get("original_score", 0.0),
-                }
-            )
-        rule["causal_reselection"] = {key: row.get(key, "") for key in _ROW_FIELDS}
-        rule["refined_rank"] = int(row.get("refined_rank", 0))
-        refined_rules.append(rule)
+    for row, rule in zip(selected_rows, selected_rules):
+        refined_rule = dict(rule)
+        refined_rule["causal_reselection"] = {key: row.get(key, "") for key in _ROW_FIELDS}
+        refined_rule["refined_rank"] = int(row.get("refined_rank", 0))
+        refined_rules.append(refined_rule)
 
-    retained_rows = [row for row in candidate_rows if str(row.get("rule_id", "")) in selected_rule_ids]
-    removed_rows = [
-        row
-        for row in candidate_rows
-        if str(row.get("reselection_decision", "")) == "remove"
-    ]
-    refinement_target_rows = [
-        row
-        for row in candidate_rows
-        if str(row.get("reselection_decision", "")) in {"refine", "backfill_refine_candidate"}
-        or (
-            _is_refinement_target_candidate(
+    summary_rows = active_rows + refilled_rows
+    decision_counts = Counter(str(row.get("reselection_decision", "")) for row in summary_rows)
+    category_counts = Counter(str(row.get("assigned_reselection_category", "")) for row in summary_rows)
+    reached_top_k = len(refined_rules) == top_k
+    step17_missing_from_step18m = [row for row in active_rows if not bool(row.get("found_in_step18m", False))]
+    step18m_nonzero_missing_from_step17: List[Dict[str, Any]] = []
+    active_clause_keys = {
+        _normalize_clause(rule.get("clause", ""))
+        for rule in final_rules
+        if _normalize_clause(rule.get("clause", ""))
+    }
+    active_rule_ids = {str(rule.get("rule_id", "")).strip() for rule in final_rules if str(rule.get("rule_id", "")).strip()}
+    for causal_rule_id, causal in sorted(causal_rows.items()):
+        clause_key = _normalize_clause(causal.get("clause", ""))
+        if causal_rule_id in consumed_causal_ids:
+            continue
+        if causal_rule_id in active_rule_ids or (clause_key and clause_key in active_clause_keys):
+            continue
+        if _has_nonzero_causal_effect(causal):
+            step18m_nonzero_missing_from_step17.append(
                 {
-                    "uses_broad_weak_atoms": row.get("uses_broad_weak_atoms", False),
-                    "uses_only_ego_motion_atoms": row.get("uses_only_ego_motion_atoms", False),
+                    "rule_id": causal_rule_id,
+                    "clause": str(causal.get("clause", "")),
+                    "prediction_flip_count": _safe_int(causal.get("prediction_flip_count", 0)),
+                    "helpful_count": _safe_int(causal.get("helpful_count", 0)),
+                    "harmful_count": _safe_int(causal.get("harmful_count", 0)),
+                    "necessary_true_positive_count": _safe_int(
+                        causal.get("necessary_true_positive_count", 0)
+                    ),
                 }
             )
-            and str(row.get("reselection_decision", "")) != "remove"
-        )
-    ]
-    decision_counts = Counter(str(row.get("reselection_decision", "")) for row in candidate_rows)
-    category_counts = Counter(str(row.get("assigned_reselection_category", "")) for row in candidate_rows)
+    warning_section = {
+        "alignment_warnings": [],
+        "num_step17_rules_missing_from_step18m": len(step17_missing_from_step18m),
+        "step17_rules_missing_from_step18m": [_row_brief(row) for row in step17_missing_from_step18m],
+        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(
+            step18m_nonzero_missing_from_step17
+        ),
+        "step18m_nonzero_causal_effect_rules_missing_from_step17": step18m_nonzero_missing_from_step17,
+        "top_k": top_k,
+        "num_initial_final_rules": len(final_rules),
+        "num_removed_rules": len(removed_rows),
+        "num_refilled_rules": len(refilled_rows),
+        "num_refined_final_rules": len(refined_rules),
+        "num_blacklisted_rules": len(removed_rows),
+        "num_refinement_targets": len(refinement_target_rows),
+        "refined_final_rules_reached_top_k": reached_top_k,
+        "ranked_pool_candidates_scanned_for_refill": scanned_for_refill,
+        "num_refill_skipped_duplicate": skipped_duplicate,
+        "num_refill_skipped_blacklist": skipped_blacklist,
+        "num_refill_skipped_zero_positive_support": skipped_zero_positive_support,
+    }
 
     _write_csv(summary_csv_path, _ROW_FIELDS, summary_rows)
-    _write_csv(removed_csv_path, _ROW_FIELDS, removed_rows)
+    _write_csv(removed_csv_path, _REMOVED_RULE_FIELDS, removed_rows)
     _write_csv(retained_csv_path, _ROW_FIELDS, retained_rows)
-    _write_csv(refinement_targets_csv_path, _ROW_FIELDS, refinement_target_rows)
-    _write_csv(refined_csv_path, _ROW_FIELDS + ["refined_rank"], selected_rows)
+    _write_csv(refilled_csv_path, _REFILLED_RULE_FIELDS, refilled_rows)
+    _write_csv(refinement_targets_csv_path, _REFINEMENT_TARGET_FIELDS, refinement_target_rows)
+    _write_csv(refined_csv_path, _REFINED_RULE_FIELDS, selected_rows)
 
     refined_result = {
         "version": _RESELECTION_VERSION,
         "config": cfg_subset,
-        "selection_method": "causal_masking_guided_reselection",
-        "selection_input_stage": "step17_final_rules_plus_step18m_causal_masking",
+        "selection_method": "causal_aware_top_k_rule_maintenance",
+        "selection_input_stage": "step17_topk_plus_step17_ranked_pool_plus_step18m_causal_masking",
         "usage_constraints": {
             "does_not_learn_new_rules": True,
             "does_not_add_object_facts": True,
@@ -884,28 +1026,36 @@ def process_reselection(
             "step23_feedback_is_diagnostic_only": True,
             "validation_time_rule_selection_only": True,
         },
+        "top_k": top_k,
         "num_input_rules": len(final_rules),
+        "num_initial_final_rules": len(final_rules),
         "num_step17_rules": len(final_rules),
         "num_step18m_rules": len(causal_rows),
-        "num_overlap_rules": len(overlap_rows),
-        "num_step17_missing_from_18m": len(missing_from_step18m_rows),
-        "num_step18m_missing_from_17": len(step18m_missing_from_step17_rows),
-        "num_step18m_only_nonzero_effect_rules": len(step18m_only_nonzero_rows),
-        "num_step18m_only_backfilled_keep_rules": len(step18m_only_backfilled_keep_rows),
-        "num_step18m_only_mixed_refinement_targets": len(step18m_only_mixed_refinement_rows),
-        "num_step18m_only_harmful_not_backfilled": len(step18m_only_harmful_not_backfilled_rows),
-        "backfill_mixed_rules_enabled": backfill_mixed_rules,
+        "num_overlap_rules": sum(1 for row in active_rows if bool(row.get("found_in_step18m", False))),
         "num_final_rules": len(refined_rules),
+        "num_refined_final_rules": len(refined_rules),
         "num_removed_rules": len(removed_rows),
         "num_removed_harmful_rules": sum(
             1
             for row in removed_rows
             if str(row.get("assigned_reselection_category", "")) == "harmful_false_positive_rule"
         ),
-        "num_step17_rules_missing_from_step18m": len(missing_from_step18m_rows),
-        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(step18m_only_nonzero_rows),
+        "num_refilled_rules": len(refilled_rows),
+        "num_blacklisted_rules": len(removed_rows),
+        "num_refinement_targets": len(refinement_target_rows),
+        "refined_final_rules_reached_top_k": reached_top_k,
+        "ranked_pool_candidates_scanned_for_refill": scanned_for_refill,
+        "num_refill_skipped_duplicate": skipped_duplicate,
+        "num_refill_skipped_blacklist": skipped_blacklist,
+        "num_refill_skipped_zero_positive_support": skipped_zero_positive_support,
+        "skip_zero_positive_support_refill": skip_zero_positive_support_refill,
+        "remove_mixed_harmful_dominant": remove_mixed_harmful_dominant,
+        "num_step17_rules_missing_from_step18m": len(step17_missing_from_step18m),
+        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(
+            step18m_nonzero_missing_from_step17
+        ),
         "num_backup_explanation_candidates": sum(
-            1 for row in candidate_rows if bool(row.get("backup_explanation_candidate", False))
+            1 for row in summary_rows if bool(row.get("backup_explanation_candidate", False))
         ),
         "num_retained_necessary_rules": sum(
             1
@@ -917,6 +1067,9 @@ def process_reselection(
             for row in refinement_target_rows
             if str(row.get("assigned_reselection_category", "")) == "mixed_rule"
         ),
+        "refilled_rules": refilled_rows,
+        "removed_rules": removed_rows,
+        "refinement_targets": refinement_target_rows,
         "decision_counts": dict(sorted(decision_counts.items())),
         "category_counts": dict(sorted(category_counts.items())),
         "warning_section": warning_section,
@@ -929,6 +1082,7 @@ def process_reselection(
             "causal_rule_reselection_summary_csv": str(summary_csv_path),
             "removed_rules_csv": str(removed_csv_path),
             "retained_rules_csv": str(retained_csv_path),
+            "refilled_rules_csv": str(refilled_csv_path),
             "refinement_targets_csv": str(refinement_targets_csv_path),
         },
     }

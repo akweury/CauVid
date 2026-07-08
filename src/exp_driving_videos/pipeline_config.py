@@ -629,6 +629,8 @@ def get_causal_rule_reselection_cfg() -> Dict[str, Any]:
             "remove_pure_harmful": True,
             "downrank_redundant": True,
             "backfill_mixed_rules": False,
+            "remove_mixed_harmful_dominant": False,
+            "skip_zero_positive_support_refill": True,
             "weak_grounding_penalty": 1.5,
             "harmful_penalty": 3.0,
             "false_positive_penalty": 2.0,

@@ -342,6 +342,8 @@ causal_rule_reselection:
   remove_pure_harmful: true
   downrank_redundant: true
   backfill_mixed_rules: false
+  remove_mixed_harmful_dominant: false
+  skip_zero_positive_support_refill: true
   weak_grounding_penalty: 1.5
   harmful_penalty: 3.0
   false_positive_penalty: 2.0

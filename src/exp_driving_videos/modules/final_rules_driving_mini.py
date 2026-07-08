@@ -29,7 +29,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_FINAL_RULES_VERSION = 6
+_FINAL_RULES_VERSION = 7
 _RULE_CATEGORY_ORDER = (
     "accepted_only",
     "mixed_accepted_candidate",
@@ -60,6 +60,46 @@ _BROAD_CANDIDATE_BODY_PREDICATES = {
     "traffic_control_front_center_region",
     "traffic_light_position_state",
 }
+
+_RANKED_RULE_FIELDS = [
+    "rule_id",
+    "clause",
+    "rank",
+    "original_score",
+    "confidence",
+    "support",
+    "positive_support",
+    "negative_support",
+    "rule_source",
+    "kept_stage",
+    "kept_round_index",
+    "candidate_rule_category",
+    "selection_rule_category",
+    "uses_candidate_atoms",
+    "num_candidate_body_atoms",
+    "candidate_body_atom_ratio",
+    "mixes_accepted_and_candidate_atoms",
+    "uses_only_candidate_atoms",
+    "body_source_mix",
+    "initial_pruning_category",
+    "pruned_initial_rule_index",
+    "selection_rank",
+    "selection_method",
+    "selection_utility",
+    "selection_family_signature",
+    "selection_new_positive_gain",
+    "selection_overlap_positive_count",
+    "selection_family_reuse_count",
+    "selection_base_quality_score",
+    "selection_family_diversity_bonus",
+    "selection_overlap_penalty_value",
+    "selection_family_penalty_value",
+    "selection_negative_support_penalty_value",
+    "selection_weak_candidate_penalty_value",
+    "selection_semantic_match_level",
+    "selection_semantic_is_quota_qualified",
+    "selection_semantic_deficit_reduction",
+]
 
 
 def get_output_root() -> Path:
@@ -388,6 +428,33 @@ def _budgeted_final_rule_selection(
     return selected, budget_pruned_counts
 
 
+def _rule_original_score(rule: Dict[str, Any]) -> float:
+    if "selection_utility" in rule:
+        return float(rule.get("selection_utility", 0.0))
+    return float(rule.get("confidence", 0.0))
+
+
+def _ranked_rule_payload(rule: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    payload = dict(rule)
+    category = _rule_candidate_category(payload)
+    payload["rank"] = int(rank)
+    payload["original_rank"] = int(rank)
+    payload["original_score"] = _rule_original_score(payload)
+    payload["support"] = int(payload.get("total_support", payload.get("support", 0)) or 0)
+    payload["candidate_rule_category"] = category
+    payload["selection_rule_category"] = str(payload.get("selection_rule_category", category))
+    payload["rule_source"] = str(payload.get("kept_stage", payload.get("source", "")))
+    return payload
+
+
+def _write_ranked_rules_csv(path: Path, ranked_rules: Sequence[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_RANKED_RULE_FIELDS)
+        writer.writeheader()
+        for rule in ranked_rules:
+            writer.writerow({key: rule.get(key, "") for key in _RANKED_RULE_FIELDS})
+
+
 def process_rules(
     extended_rule_results: Dict[str, Any],
     temporal_rule_results: Optional[Sequence[Dict[str, Any]]] = None,
@@ -403,6 +470,8 @@ def process_rules(
     out_root.mkdir(parents=True, exist_ok=True)
     json_path = out_root / "final_rules.json"
     csv_path = out_root / "final_rules.csv"
+    ranked_json_path = out_root / "ranked_rules.json"
+    ranked_csv_path = out_root / "ranked_rules.csv"
 
     if not force_recompute and json_path.exists():
         with json_path.open("r", encoding="utf-8") as fh:
@@ -427,6 +496,10 @@ def process_rules(
         top_k=top_k,
         category_budgets=category_budgets,
     )
+    ranked_rule_payloads = [
+        _ranked_rule_payload(rule, rank)
+        for rank, rule in enumerate(ranked_rules, start=1)
+    ]
     for rule in final_rules:
         rule["candidate_rule_category"] = _rule_candidate_category(rule)
         rule["selection_rule_category"] = rule["candidate_rule_category"]
@@ -467,10 +540,31 @@ def process_rules(
         "candidate_rule_flow_summary": candidate_rule_flow_summary,
         "candidate_rule_diagnostics": candidate_rule_diagnostics,
         "final_rules": final_rules,
+        "ranked_rules": ranked_rule_payloads,
+        "output_paths": {
+            "final_rules_json": str(json_path),
+            "final_rules_csv": str(csv_path),
+            "ranked_rules_json": str(ranked_json_path),
+            "ranked_rules_csv": str(ranked_csv_path),
+        },
     }
 
     with json_path.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
+    with ranked_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": _FINAL_RULES_VERSION,
+                "config": result["config"],
+                "selection_method": result["selection_method"],
+                "selection_input_stage": result["selection_input_stage"],
+                "num_ranked_rules": len(ranked_rule_payloads),
+                "ranked_rules": ranked_rule_payloads,
+            },
+            fh,
+            indent=2,
+        )
+    _write_ranked_rules_csv(ranked_csv_path, ranked_rule_payloads)
 
     with csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
@@ -546,6 +640,8 @@ def process_rules(
     )
     print(f"Final rules JSON written to {json_path}")
     print(f"Final rules CSV written to {csv_path}")
+    print(f"Ranked rules JSON written to {ranked_json_path}")
+    print(f"Ranked rules CSV written to {ranked_csv_path}")
     return result
 
 

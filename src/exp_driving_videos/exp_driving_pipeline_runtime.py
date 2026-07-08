@@ -2733,6 +2733,8 @@ def run_step_17_final_rules(ctx: PipelineContext, runner: StepRunner) -> None:
         "secondary_debug_artifacts": [
             str(final_rules_output_root / "final_rules.json"),
             str(final_rules_output_root / "final_rules.csv"),
+            str(final_rules_output_root / "ranked_rules.json"),
+            str(final_rules_output_root / "ranked_rules.csv"),
         ],
     }
     _write_manifest_json(manifest_path, manifest)
@@ -3005,44 +3007,43 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
             output_paths.get("refined_final_rules_csv", ""),
             output_paths.get("removed_rules_csv", ""),
             output_paths.get("retained_rules_csv", ""),
+            output_paths.get("refilled_rules_csv", ""),
             output_paths.get("refinement_targets_csv", ""),
         ]
         if str(path)
     ]
     main_conclusion = (
-        "Causal masking-guided reselection kept "
+        "Causal-aware top-k maintenance produced "
         f"{int(ctx.causal_rule_reselection_results.get('num_final_rules', 0))}/"
-        f"{int(ctx.causal_rule_reselection_results.get('num_input_rules', 0))} rules, removed "
-        f"{int(ctx.causal_rule_reselection_results.get('num_removed_harmful_rules', 0))} harmful rules, and marked "
-        f"{int(ctx.causal_rule_reselection_results.get('num_mixed_refinement_targets', 0))} mixed rules for refinement."
+        f"{int(ctx.causal_rule_reselection_results.get('top_k', 0))} active rules after removing "
+        f"{int(ctx.causal_rule_reselection_results.get('num_removed_harmful_rules', 0))} harmful rules and refilling "
+        f"{int(ctx.causal_rule_reselection_results.get('num_refilled_rules', 0))} ranked-pool replacements."
     )
     manifest = {
         "step": "18N",
         "primary_summary_csv": str(output_paths.get("causal_rule_reselection_summary_csv", "")),
         "main_conclusion": main_conclusion,
         "secondary_debug_artifacts": secondary_debug_artifacts,
-        "num_step17_rules": int(ctx.causal_rule_reselection_results.get("num_step17_rules", 0)),
+        "top_k": int(ctx.causal_rule_reselection_results.get("top_k", 0)),
+        "num_initial_final_rules": int(ctx.causal_rule_reselection_results.get("num_initial_final_rules", 0)),
+        "num_removed_rules": int(ctx.causal_rule_reselection_results.get("num_removed_rules", 0)),
+        "num_refilled_rules": int(ctx.causal_rule_reselection_results.get("num_refilled_rules", 0)),
+        "num_refined_final_rules": int(ctx.causal_rule_reselection_results.get("num_refined_final_rules", 0)),
+        "num_blacklisted_rules": int(ctx.causal_rule_reselection_results.get("num_blacklisted_rules", 0)),
+        "num_refinement_targets": int(ctx.causal_rule_reselection_results.get("num_refinement_targets", 0)),
+        "refined_final_rules_reached_top_k": bool(
+            ctx.causal_rule_reselection_results.get("refined_final_rules_reached_top_k", False)
+        ),
+        "ranked_pool_candidates_scanned_for_refill": int(
+            ctx.causal_rule_reselection_results.get("ranked_pool_candidates_scanned_for_refill", 0)
+        ),
+        "num_refill_skipped_duplicate": int(ctx.causal_rule_reselection_results.get("num_refill_skipped_duplicate", 0)),
+        "num_refill_skipped_blacklist": int(ctx.causal_rule_reselection_results.get("num_refill_skipped_blacklist", 0)),
+        "num_refill_skipped_zero_positive_support": int(
+            ctx.causal_rule_reselection_results.get("num_refill_skipped_zero_positive_support", 0)
+        ),
         "num_step18m_rules": int(ctx.causal_rule_reselection_results.get("num_step18m_rules", 0)),
-        "num_overlap_rules": int(ctx.causal_rule_reselection_results.get("num_overlap_rules", 0)),
-        "num_step17_missing_from_18m": int(ctx.causal_rule_reselection_results.get("num_step17_missing_from_18m", 0)),
-        "num_step18m_missing_from_17": int(ctx.causal_rule_reselection_results.get("num_step18m_missing_from_17", 0)),
-        "num_step18m_only_nonzero_effect_rules": int(
-            ctx.causal_rule_reselection_results.get("num_step18m_only_nonzero_effect_rules", 0)
-        ),
-        "num_step18m_only_backfilled_keep_rules": int(
-            ctx.causal_rule_reselection_results.get("num_step18m_only_backfilled_keep_rules", 0)
-        ),
-        "num_step18m_only_mixed_refinement_targets": int(
-            ctx.causal_rule_reselection_results.get("num_step18m_only_mixed_refinement_targets", 0)
-        ),
-        "num_step18m_only_harmful_not_backfilled": int(
-            ctx.causal_rule_reselection_results.get("num_step18m_only_harmful_not_backfilled", 0)
-        ),
         "num_removed_harmful_rules": int(ctx.causal_rule_reselection_results.get("num_removed_harmful_rules", 0)),
-        "num_refined_final_rules": int(ctx.causal_rule_reselection_results.get("num_final_rules", 0)),
-        "backfill_mixed_rules_enabled": bool(
-            ctx.causal_rule_reselection_results.get("backfill_mixed_rules_enabled", False)
-        ),
         "warning_section": dict(ctx.causal_rule_reselection_results.get("warning_section", {})),
     }
     _write_manifest_json(manifest_path, manifest)
@@ -3056,8 +3057,8 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
         "18N",
         f"refined_rules={int(ctx.causal_rule_reselection_results.get('num_final_rules', 0))} "
         f"removed={int(ctx.causal_rule_reselection_results.get('num_removed_rules', 0))} "
-        f"harmful_removed={int(ctx.causal_rule_reselection_results.get('num_removed_harmful_rules', 0))} "
-        f"refine_targets={int(ctx.causal_rule_reselection_results.get('num_mixed_refinement_targets', 0))}",
+        f"refilled={int(ctx.causal_rule_reselection_results.get('num_refilled_rules', 0))} "
+        f"refine_targets={int(ctx.causal_rule_reselection_results.get('num_refinement_targets', 0))}",
     )
     runner.log("18N", f"summary_csv={output_paths.get('causal_rule_reselection_summary_csv', '')}")
     runner.complete_step(

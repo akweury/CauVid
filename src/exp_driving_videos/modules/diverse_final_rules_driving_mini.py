@@ -34,11 +34,13 @@ from src.exp_driving_videos.modules.final_rules_driving_mini import (
     _enrich_rule_evidence_with_provenance,
     _normalized_category_budgets,
     _post_pruned_rule_pool,
+    _ranked_rule_payload,
     _rule_candidate_category as _shared_rule_candidate_category,
+    _write_ranked_rules_csv,
 )
 
 
-_DIVERSE_FINAL_RULES_VERSION = 8
+_DIVERSE_FINAL_RULES_VERSION = 9
 _STRONG_SEMANTIC_BODY_PREDICATES = {
     "object_class",
     "object_distance_state",
@@ -551,6 +553,8 @@ def process_rules(
     out_root.mkdir(parents=True, exist_ok=True)
     json_path = out_root / f"{output_prefix}.json"
     csv_path = out_root / f"{output_prefix}.csv"
+    ranked_json_path = out_root / "ranked_rules.json"
+    ranked_csv_path = out_root / "ranked_rules.csv"
 
     if not force_recompute and json_path.exists():
         with json_path.open("r", encoding="utf-8") as fh:
@@ -717,6 +721,19 @@ def process_rules(
         )
 
     candidate_rule_diagnostics = _summarize_candidate_rule_selection(selected_rules)
+    selected_ids = {str(rule.get("rule_id", "")) for rule in selected_rules}
+    selected_ranked_payloads = [
+        _ranked_rule_payload(rule, rank)
+        for rank, rule in enumerate(selected_rules, start=1)
+    ]
+    remaining_ranked_payloads = [
+        _ranked_rule_payload(rule, rank)
+        for rank, rule in enumerate(
+            [rule for rule in candidate_rules if str(rule.get("rule_id", "")) not in selected_ids],
+            start=len(selected_ranked_payloads) + 1,
+        )
+    ]
+    ranked_rule_payloads = selected_ranked_payloads + remaining_ranked_payloads
 
     result: Dict[str, Any] = {
         "version": _DIVERSE_FINAL_RULES_VERSION,
@@ -738,11 +755,32 @@ def process_rules(
         },
         "candidate_rule_diagnostics": candidate_rule_diagnostics,
         "final_rules": selected_rules,
+        "ranked_rules": ranked_rule_payloads,
         "selection_trace": selection_trace,
+        "output_paths": {
+            "final_rules_json": str(json_path),
+            "final_rules_csv": str(csv_path),
+            "ranked_rules_json": str(ranked_json_path),
+            "ranked_rules_csv": str(ranked_csv_path),
+        },
     }
 
     with json_path.open("w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2)
+    with ranked_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "version": _DIVERSE_FINAL_RULES_VERSION,
+                "config": result["config"],
+                "selection_method": result["selection_method"],
+                "selection_input_stage": result["selection_input_stage"],
+                "num_ranked_rules": len(ranked_rule_payloads),
+                "ranked_rules": ranked_rule_payloads,
+            },
+            fh,
+            indent=2,
+        )
+    _write_ranked_rules_csv(ranked_csv_path, ranked_rule_payloads)
 
     with csv_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(
@@ -843,6 +881,8 @@ def process_rules(
     )
     print(f"Diverse final rules JSON written to {json_path}")
     print(f"Diverse final rules CSV written to {csv_path}")
+    print(f"Ranked rules JSON written to {ranked_json_path}")
+    print(f"Ranked rules CSV written to {ranked_csv_path}")
     return result
 
 

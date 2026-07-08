@@ -80,7 +80,7 @@
         }
         ,
         {
-            "name": "Python Debugger: exp_driving_pipeline (step 19, data 200)",
+            "name": "Python Debugger: exp_driving_pipeline (from step 17 to 19, data 200)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/exp_driving_videos/exp_driving_pipeline.py",
