@@ -30,3 +30,29 @@ video reasoning by nesy and causal models
    ```bash
    ./docker.sh run --gpu 2 --start-step 19 25
    ```
+
+## exp_july Base Usage
+
+Use `d2.sh` to run the lightweight `exp_july` pipeline in Docker on the remote server.
+
+Example:
+```bash
+./d2.sh --gpu 1 --step 2 --data 20
+```
+
+Meaning:
+- `--gpu 1`: run inside Docker on GPU 1
+- `--step 2`: run the pipeline only up to Step 2
+- `--data 20`: use the first 20 videos from `driving_mini`
+
+More examples:
+```bash
+./d2.sh
+./d2.sh run --gpu 0 --step 18 --data 50 --rounds 3
+./d2.sh shell --gpu 0
+```
+
+Outputs for this pipeline go to:
+```bash
+/storage-01/ml-jsha/storage/CauVid_output/output_july
+```

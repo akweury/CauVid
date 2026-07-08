@@ -15,7 +15,14 @@ LOGS_DIR="${CAUVID_LOGS_HOST:-$OUTPUT_ROOT/logs}"
 TORCH_CACHE="${CAUVID_TORCH_CACHE_HOST:-$STORAGE_ROOT/.cache/torch}"
 
 GPU_ARGS=()
-if [[ -n "${CAUVID_DOCKER_GPU_ARGS:-}" ]]; then
+GPU_ID="${CAUVID_GPU_ID:-}"
+if [[ -n "$GPU_ID" ]]; then
+  if [[ "$GPU_ID" == "all" ]]; then
+    GPU_ARGS=(--gpus all)
+  else
+    GPU_ARGS=(--gpus "device=$GPU_ID")
+  fi
+elif [[ -n "${CAUVID_DOCKER_GPU_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
   GPU_ARGS=(${CAUVID_DOCKER_GPU_ARGS})
 else
@@ -24,8 +31,8 @@ fi
 
 usage() {
   echo "Usage:"
+  echo "  ./d2.sh run --gpu 0 --step 2 --data 10 --rounds 3"
   echo "  ./d2.sh                 # run exp_july with defaults"
-  echo "  ./d2.sh run 10 3        # run exp_july with video_count=10, rounds=3"
   echo "  ./d2.sh build           # build docker image"
   echo "  ./d2.sh shell           # open interactive shell in container"
 }
@@ -43,6 +50,7 @@ prepare_dirs() {
 run_container() {
   local video_count="${1:-}"
   local rounds="${2:-3}"
+  local max_step="${3:-18}"
   local model_mounts=()
 
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
@@ -72,9 +80,10 @@ run_container() {
     -e CAUVID_OUTPUT_PATH=/output/output \
     -e EXP_JULY_VIDEO_COUNT="$video_count" \
     -e EXP_JULY_ROUNDS="$rounds" \
+    -e EXP_JULY_MAX_STEP="$max_step" \
     --name "$CONTAINER_NAME" \
     "$IMAGE_NAME" \
-    sh -lc 'python -c "import os; from src.exp_july.pipeline import main; count=os.getenv(\"EXP_JULY_VIDEO_COUNT\", \"\"); rounds=int(os.getenv(\"EXP_JULY_ROUNDS\", \"3\")); main(video_count=int(count) if count else None, rounds=rounds)"'
+    sh -lc 'python -c "import os; from src.exp_july.pipeline import main; count=os.getenv(\"EXP_JULY_VIDEO_COUNT\", \"\"); rounds=int(os.getenv(\"EXP_JULY_ROUNDS\", \"3\")); max_step=int(os.getenv(\"EXP_JULY_MAX_STEP\", \"18\")); main(video_count=int(count) if count else None, rounds=rounds, max_step=max_step)"'
 }
 
 shell_container() {
@@ -111,17 +120,76 @@ shell_container() {
 
 main() {
   local cmd="${1:-run}"
+  local video_count=""
+  local rounds="3"
+  local max_step="18"
   prepare_dirs
+
+  if [[ "${cmd:-run}" == --* ]]; then
+    cmd="run"
+  fi
 
   case "$cmd" in
     build)
       docker build -t "$IMAGE_NAME" "$ROOT_DIR"
       ;;
     run)
+      if [[ "${1:-}" == "run" ]]; then
+        shift || true
+      fi
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --gpu)
+            GPU_ID="${2:?missing gpu id}"
+            if [[ "$GPU_ID" == "all" ]]; then
+              GPU_ARGS=(--gpus all)
+            else
+              GPU_ARGS=(--gpus "device=$GPU_ID")
+            fi
+            shift 2
+            ;;
+          --step)
+            max_step="${2:?missing step id}"
+            shift 2
+            ;;
+          --data|--video-count)
+            video_count="${2:?missing video count}"
+            shift 2
+            ;;
+          --rounds)
+            rounds="${2:?missing rounds}"
+            shift 2
+            ;;
+          *)
+            echo "Unknown run option: $1" >&2
+            usage
+            exit 1
+            ;;
+        esac
+      done
       ensure_image
-      run_container "${2:-}" "${3:-3}"
+      run_container "$video_count" "$rounds" "$max_step"
       ;;
     shell)
+      shift || true
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --gpu)
+            GPU_ID="${2:?missing gpu id}"
+            if [[ "$GPU_ID" == "all" ]]; then
+              GPU_ARGS=(--gpus all)
+            else
+              GPU_ARGS=(--gpus "device=$GPU_ID")
+            fi
+            shift 2
+            ;;
+          *)
+            echo "Unknown shell option: $1" >&2
+            usage
+            exit 1
+            ;;
+        esac
+      done
       ensure_image
       shell_container
       ;;
@@ -130,7 +198,7 @@ main() {
       ;;
     *)
       ensure_image
-      run_container "${1:-}" "${2:-3}"
+      run_container "" "3" "18"
       ;;
   esac
 }
