@@ -3019,6 +3019,10 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
             output_paths.get("iterative_reselection_summary_csv", ""),
             output_paths.get("best_round_refined_final_rules_csv", ""),
             output_paths.get("best_round_manifest_json", ""),
+            output_paths.get("descendant_replacement_candidates_csv", ""),
+            output_paths.get("descendant_replacement_trials_csv", ""),
+            output_paths.get("per_round_descendant_replacement_summary_csv", ""),
+            output_paths.get("failed_descendant_trials_csv", ""),
         ]
         if str(path)
     ]
@@ -3058,6 +3062,18 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
         "num_rounds_executed": int(ctx.causal_rule_reselection_results.get("num_rounds_executed", 0)),
         "best_round_index": int(ctx.causal_rule_reselection_results.get("best_round_index", 0)),
         "best_round_metrics": dict(ctx.causal_rule_reselection_results.get("best_round_metrics", {})),
+        "descendant_replacement_enabled": bool(
+            ctx.causal_rule_reselection_results.get("descendant_replacement_enabled", False)
+        ),
+        "num_descendant_replacement_candidates": int(
+            ctx.causal_rule_reselection_results.get("num_descendant_replacement_candidates", 0)
+        ),
+        "num_descendant_replacement_trials": int(
+            ctx.causal_rule_reselection_results.get("num_descendant_replacement_trials", 0)
+        ),
+        "num_failed_descendant_trials": int(
+            ctx.causal_rule_reselection_results.get("num_failed_descendant_trials", 0)
+        ),
         "warning_section": dict(ctx.causal_rule_reselection_results.get("warning_section", {})),
     }
     _write_manifest_json(manifest_path, manifest)

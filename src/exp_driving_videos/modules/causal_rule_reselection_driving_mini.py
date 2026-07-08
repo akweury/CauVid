@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 5
+_RESELECTION_VERSION = 6
 _ROW_FIELDS = [
     "rule_id",
     "clause",
@@ -127,6 +127,44 @@ _PER_ROUND_EVALUATION_FIELDS = [
     "selected_as_best",
     "early_stop_reason",
 ]
+_DESCENDANT_CANDIDATE_FIELDS = [
+    "round_index",
+    "parent_rule_id",
+    "parent_clause",
+    "candidate_rule_id",
+    "candidate_clause",
+    "candidate_rank",
+    "score",
+    "precision_gain",
+    "fp_reduction",
+    "positive_coverage_retention",
+    "causal_grounding_bonus",
+    "rank_bonus",
+    "rule_length_penalty",
+    "parent_reason",
+]
+_DESCENDANT_TRIAL_FIELDS = [
+    "round_index",
+    "parent_rule_id",
+    "descendant_rule_id",
+    "parent_clause",
+    "descendant_clause",
+    "trial_status",
+    "validation_f1",
+    "validation_precision",
+    "improved_over_previous_best",
+    "failure_reason",
+]
+_DESCENDANT_ROUND_SUMMARY_FIELDS = [
+    "round_index",
+    "num_candidate_parents",
+    "num_candidate_descendants",
+    "num_trial_replacements",
+    "num_failed_trials",
+    "validation_f1",
+    "validation_precision",
+    "selected_as_best",
+]
 
 
 def get_output_root() -> Path:
@@ -158,6 +196,11 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "selection_metric": str(cfg.get("selection_metric", "f1")),
         "tie_breaker": str(cfg.get("tie_breaker", "precision")),
         "early_stop_no_improvement_rounds": int(cfg.get("early_stop_no_improvement_rounds", 2)),
+        "descendant_replacement_enabled": bool(cfg.get("descendant_replacement_enabled", False)),
+        "max_replacement_parents_per_round": int(cfg.get("max_replacement_parents_per_round", 3)),
+        "descendant_queue_size_per_parent": int(cfg.get("descendant_queue_size_per_parent", 10)),
+        "max_descendant_replacements_per_round": int(cfg.get("max_descendant_replacements_per_round", 3)),
+        "max_descendant_rounds": int(cfg.get("max_descendant_rounds", 6)),
         "broad_weak_predicates": sorted(str(value) for value in list(cfg.get("broad_weak_predicates", []))),
         "ego_motion_only_predicates": sorted(str(value) for value in list(cfg.get("ego_motion_only_predicates", []))),
     }
@@ -242,6 +285,17 @@ def _body_atoms_from_clause(clause: str, *, trailing_dot: bool = False) -> List[
     if trailing_dot:
         return [atom if atom.endswith(".") else f"{atom}." for atom in atoms]
     return [atom.rstrip(".") for atom in atoms]
+
+
+def _clause_head(clause: Any) -> str:
+    text = str(clause or "").strip()
+    if ":-" in text:
+        text = text.split(":-", 1)[0].strip()
+    return _normalize_clause(text)
+
+
+def _normalized_body_atom_set(rule: Dict[str, Any]) -> set[str]:
+    return {_normalize_clause(atom) for atom in _body_atoms(rule) if _normalize_clause(atom)}
 
 
 def _normalize_clause(clause: Any) -> str:
@@ -857,6 +911,238 @@ def _candidate_removal_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, flo
     )
 
 
+def _is_descendant_rule(parent: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    if _clause_head(parent.get("clause", "")) != _clause_head(candidate.get("clause", "")):
+        return False
+    parent_atoms = _normalized_body_atom_set(parent)
+    candidate_atoms = _normalized_body_atom_set(candidate)
+    return bool(parent_atoms) and parent_atoms < candidate_atoms
+
+
+def _parent_replacement_reason(row: Dict[str, Any], rule: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    reasons: List[str] = []
+    helpful_count = _safe_int(row.get("helpful_count", 0))
+    harmful_count = _safe_int(row.get("harmful_count", 0))
+    if str(row.get("assigned_reselection_category", "")) == "mixed_rule" and harmful_count > 0:
+        reasons.append("mixed_harmful")
+    atoms = _body_atoms(rule)
+    if len(atoms) == 1:
+        predicate, args = _parse_atom(str(atoms[0]))
+        if any(arg == "O" or str(arg).startswith("object") for arg in args) or predicate.startswith("object_"):
+            reasons.append("broad_one_atom_object_rule")
+    if _safe_float(row.get("eval_precision", rule.get("eval_precision", 1.0)), 1.0) < _safe_float(
+        cfg.get("descendant_low_precision_threshold", 0.5),
+        0.5,
+    ):
+        reasons.append("low_precision")
+    if _safe_int(rule.get("negative_support", 0)) > _safe_int(rule.get("positive_support", 0)):
+        reasons.append("negative_support_gt_positive_support")
+    if str(row.get("assigned_reselection_category", "")) == "weak_causal_grounding_rule" or bool(
+        row.get("weak_grounding_penalty_applied", False)
+    ):
+        reasons.append("weak_causal_grounding")
+    if _safe_int(row.get("eval_fp_contribution_count_vs_accepted_only", 0)) > 0 or _safe_int(
+        row.get("causal_false_positive_count", 0)
+    ) > 0:
+        reasons.append("high_fp")
+    return "|".join(sorted(set(reasons)))
+
+
+def _descendant_score(
+    *,
+    parent_row: Dict[str, Any],
+    parent_rule: Dict[str, Any],
+    candidate: Dict[str, Any],
+    candidate_rank: int,
+    ranked_count: int,
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    parent_precision = _safe_float(parent_row.get("eval_precision", parent_rule.get("eval_precision", 0.0)))
+    candidate_precision = _safe_float(candidate.get("eval_precision", candidate.get("precision", candidate.get("confidence", 0.0))))
+    precision_gain = candidate_precision - parent_precision
+    parent_fp = _safe_int(
+        parent_row.get(
+            "eval_fp_contribution_count_vs_accepted_only",
+            parent_rule.get("eval_fp_contribution_count_vs_accepted_only", parent_rule.get("negative_support", 0)),
+        )
+    )
+    candidate_fp = _safe_int(candidate.get("eval_fp_contribution_count_vs_accepted_only", candidate.get("negative_support", 0)))
+    fp_reduction = parent_fp - candidate_fp
+    parent_pos = max(1, _safe_int(parent_rule.get("positive_support", parent_row.get("helpful_count", 0)), 1))
+    candidate_pos = _safe_int(candidate.get("positive_support", 0))
+    positive_coverage_retention = float(min(1.0, candidate_pos / max(1, parent_pos)))
+    grounding = _rule_grounding_features(candidate, cfg)
+    causal_grounding_bonus = 0.25 if bool(grounding.get("has_object_level_support", False)) else 0.0
+    rank_bonus = float((ranked_count - candidate_rank + 1) / max(1, ranked_count))
+    rule_length_penalty = 0.05 * max(0, len(_body_atoms(candidate)) - len(_body_atoms(parent_rule)))
+    score = (
+        2.0 * precision_gain
+        + 1.0 * fp_reduction
+        + 0.75 * positive_coverage_retention
+        + causal_grounding_bonus
+        + 0.25 * rank_bonus
+        - rule_length_penalty
+    )
+    return {
+        "score": score,
+        "precision_gain": precision_gain,
+        "fp_reduction": fp_reduction,
+        "positive_coverage_retention": positive_coverage_retention,
+        "causal_grounding_bonus": causal_grounding_bonus,
+        "rank_bonus": rank_bonus,
+        "rule_length_penalty": rule_length_penalty,
+    }
+
+
+def _build_descendant_replacement_plan(
+    *,
+    current_rules: Sequence[Dict[str, Any]],
+    selected_rows: Sequence[Dict[str, Any]],
+    ranked_rules: Sequence[Dict[str, Any]],
+    blacklisted_rule_ids: set[str],
+    blacklisted_clauses: set[str],
+    failed_descendant_pairs: set[Tuple[str, str]],
+    cfg: Dict[str, Any],
+    round_index: int,
+) -> Dict[str, Any]:
+    if not bool(cfg.get("descendant_replacement_enabled", False)):
+        return {"rules": [dict(rule) for rule in current_rules], "candidates": [], "trials": [], "summary": {}}
+    max_parents = max(0, int(cfg.get("max_replacement_parents_per_round", 3)))
+    queue_size = max(1, int(cfg.get("descendant_queue_size_per_parent", 10)))
+    max_replacements = max(0, int(cfg.get("max_descendant_replacements_per_round", 3)))
+    if max_parents <= 0 or max_replacements <= 0:
+        return {"rules": [dict(rule) for rule in current_rules], "candidates": [], "trials": [], "summary": {}}
+
+    rules_by_id = {str(rule.get("rule_id", "")).strip(): dict(rule) for rule in current_rules if str(rule.get("rule_id", "")).strip()}
+    selected_rule_ids = set(rules_by_id)
+    selected_clause_keys = {
+        _normalize_clause(rule.get("clause", ""))
+        for rule in current_rules
+        if _normalize_clause(rule.get("clause", ""))
+    }
+    parent_rows: List[Dict[str, Any]] = []
+    for row in selected_rows:
+        rule_id = str(row.get("rule_id", "")).strip()
+        rule = rules_by_id.get(rule_id)
+        if not rule:
+            continue
+        reason = _parent_replacement_reason(row, rule, cfg)
+        if reason:
+            parent_row = dict(row)
+            parent_row["parent_reason"] = reason
+            parent_rows.append(parent_row)
+    parent_rows = sorted(
+        parent_rows,
+        key=lambda row: (
+            _safe_int(row.get("harmful_count", 0)) + _safe_int(row.get("causal_false_positive_count", 0)),
+            _safe_int(row.get("eval_fp_contribution_count_vs_accepted_only", 0)),
+            -_safe_float(row.get("eval_precision", 1.0), 1.0),
+            str(row.get("rule_id", "")),
+        ),
+        reverse=True,
+    )[:max_parents]
+
+    candidate_rows: List[Dict[str, Any]] = []
+    parent_queues: Dict[str, List[Dict[str, Any]]] = {}
+    ranked_count = len(ranked_rules)
+    rank_by_id = {str(rule.get("rule_id", "")).strip(): index for index, rule in enumerate(ranked_rules, start=1)}
+    for parent_row in parent_rows:
+        parent_id = str(parent_row.get("rule_id", "")).strip()
+        parent_rule = rules_by_id.get(parent_id, {})
+        queue: List[Dict[str, Any]] = []
+        for candidate in ranked_rules:
+            candidate_id = str(candidate.get("rule_id", "")).strip()
+            clause_key = _normalize_clause(candidate.get("clause", ""))
+            if (parent_id, candidate_id) in failed_descendant_pairs:
+                continue
+            if candidate_id in selected_rule_ids or (clause_key and clause_key in selected_clause_keys):
+                continue
+            if candidate_id in blacklisted_rule_ids or (clause_key and clause_key in blacklisted_clauses):
+                continue
+            if _safe_int(candidate.get("positive_support", 0)) <= 0:
+                continue
+            if not _is_descendant_rule(parent_rule, candidate):
+                continue
+            candidate_rank = rank_by_id.get(candidate_id, _rule_rank(candidate, ranked_count))
+            score_parts = _descendant_score(
+                parent_row=parent_row,
+                parent_rule=parent_rule,
+                candidate=candidate,
+                candidate_rank=candidate_rank,
+                ranked_count=ranked_count,
+                cfg=cfg,
+            )
+            row = {
+                "round_index": int(round_index),
+                "parent_rule_id": parent_id,
+                "parent_clause": str(parent_rule.get("clause", "")),
+                "candidate_rule_id": candidate_id,
+                "candidate_clause": str(candidate.get("clause", "")),
+                "candidate_rank": candidate_rank,
+                "parent_reason": str(parent_row.get("parent_reason", "")),
+                **score_parts,
+                "_candidate_rule": dict(candidate),
+            }
+            queue.append(row)
+        queue = sorted(queue, key=lambda row: (_safe_float(row.get("score", 0.0)), -_safe_int(row.get("candidate_rank", 0))), reverse=True)[:queue_size]
+        parent_queues[parent_id] = queue
+        candidate_rows.extend(queue)
+
+    used_parent_ids: set[str] = set()
+    used_candidate_ids: set[str] = set()
+    chosen: List[Dict[str, Any]] = []
+    for candidate_row in sorted(candidate_rows, key=lambda row: (_safe_float(row.get("score", 0.0)), -_safe_int(row.get("candidate_rank", 0))), reverse=True):
+        parent_id = str(candidate_row.get("parent_rule_id", ""))
+        candidate_id = str(candidate_row.get("candidate_rule_id", ""))
+        if parent_id in used_parent_ids or candidate_id in used_candidate_ids:
+            continue
+        chosen.append(candidate_row)
+        used_parent_ids.add(parent_id)
+        used_candidate_ids.add(candidate_id)
+        if len(chosen) >= max_replacements:
+            break
+
+    replacements_by_parent = {str(row.get("parent_rule_id", "")): row for row in chosen}
+    next_rules: List[Dict[str, Any]] = []
+    trials: List[Dict[str, Any]] = []
+    for rule in current_rules:
+        parent_id = str(rule.get("rule_id", "")).strip()
+        replacement = replacements_by_parent.get(parent_id)
+        if not replacement:
+            next_rules.append(dict(rule))
+            continue
+        descendant = dict(replacement.get("_candidate_rule", {}))
+        descendant["selection_source"] = "descendant_replacement"
+        descendant["replaced_parent_rule_id"] = parent_id
+        next_rules.append(descendant)
+        trials.append(
+            {
+                "round_index": int(round_index),
+                "parent_rule_id": parent_id,
+                "descendant_rule_id": str(descendant.get("rule_id", "")),
+                "parent_clause": str(rule.get("clause", "")),
+                "descendant_clause": str(descendant.get("clause", "")),
+                "trial_status": "pending_validation",
+                "validation_f1": "",
+                "validation_precision": "",
+                "improved_over_previous_best": False,
+                "failure_reason": "",
+            }
+        )
+    return {
+        "rules": next_rules,
+        "candidates": [{key: value for key, value in row.items() if key != "_candidate_rule"} for row in candidate_rows],
+        "trials": trials,
+        "summary": {
+            "round_index": int(round_index),
+            "num_candidate_parents": len(parent_rows),
+            "num_candidate_descendants": len(candidate_rows),
+            "num_trial_replacements": len(trials),
+            "num_failed_trials": 0,
+        },
+    }
+
+
 def _build_round_rule_results(
     *,
     rules: Sequence[Dict[str, Any]],
@@ -1199,9 +1485,15 @@ def _process_iterative_reselection(
     iterative_summary_csv_path = output_root / "iterative_reselection_summary.csv"
     best_round_refined_csv_path = output_root / "best_round_refined_final_rules.csv"
     best_round_manifest_path = output_root / "best_round_manifest.json"
+    descendant_candidates_csv_path = output_root / "descendant_replacement_candidates.csv"
+    descendant_trials_csv_path = output_root / "descendant_replacement_trials.csv"
+    descendant_round_summary_csv_path = output_root / "per_round_descendant_replacement_summary.csv"
+    failed_descendant_trials_csv_path = output_root / "failed_descendant_trials.csv"
 
     top_k = max(0, int(cfg.get("top_k", len(final_rule_results.get("final_rules", [])) or 50)))
     max_rounds = max(1, int(cfg.get("max_rounds", 5)))
+    if bool(cfg.get("descendant_replacement_enabled", False)):
+        max_rounds = max(max_rounds, max(1, int(cfg.get("max_descendant_rounds", 6))))
     selection_metric = str(cfg.get("selection_metric", "f1")).strip() or "f1"
     tie_breaker = str(cfg.get("tie_breaker", "precision")).strip() or "precision"
     early_stop_limit = max(0, int(cfg.get("early_stop_no_improvement_rounds", 2)))
@@ -1218,6 +1510,11 @@ def _process_iterative_reselection(
     all_retained_rows: List[Dict[str, Any]] = []
     all_refilled_rows: List[Dict[str, Any]] = []
     all_refinement_target_rows: List[Dict[str, Any]] = []
+    all_descendant_candidate_rows: List[Dict[str, Any]] = []
+    all_descendant_trial_rows: List[Dict[str, Any]] = []
+    all_descendant_round_rows: List[Dict[str, Any]] = []
+    failed_descendant_trial_rows: List[Dict[str, Any]] = []
+    failed_descendant_pairs: set[Tuple[str, str]] = set()
 
     baseline_metrics = dict(evaluation_results.get("overall_metrics", {}))
     best_record: Dict[str, Any] = {
@@ -1256,7 +1553,53 @@ def _process_iterative_reselection(
             blacklisted_rule_ids=blacklisted_rule_ids,
             blacklisted_clauses=blacklisted_clauses,
         )
-        next_rules = [dict(rule) for rule in list(maintenance.get("final_rules", []))]
+        maintenance_rules = [dict(rule) for rule in list(maintenance.get("final_rules", []))]
+        descendant_plan = _build_descendant_replacement_plan(
+            current_rules=maintenance_rules,
+            selected_rows=list(maintenance.get("selected_rows", [])),
+            ranked_rules=ranked_rules,
+            blacklisted_rule_ids=blacklisted_rule_ids,
+            blacklisted_clauses=blacklisted_clauses,
+            failed_descendant_pairs=failed_descendant_pairs,
+            cfg=cfg,
+            round_index=round_index,
+        )
+        next_rules = [dict(rule) for rule in list(descendant_plan.get("rules", maintenance_rules))]
+        descendant_trials = [dict(row) for row in list(descendant_plan.get("trials", []))]
+        descendant_candidates = [dict(row) for row in list(descendant_plan.get("candidates", []))]
+        selected_rows_for_round = list(maintenance.get("selected_rows", []))
+        if descendant_trials:
+            trial_by_parent = {str(row.get("parent_rule_id", "")): row for row in descendant_trials}
+            replaced_rows: List[Dict[str, Any]] = []
+            for row in selected_rows_for_round:
+                parent_id = str(row.get("rule_id", "")).strip()
+                trial = trial_by_parent.get(parent_id)
+                if not trial:
+                    replaced_rows.append(row)
+                    continue
+                descendant_rule = next(
+                    (rule for rule in next_rules if str(rule.get("rule_id", "")) == str(trial.get("descendant_rule_id", ""))),
+                    {},
+                )
+                replacement_row = dict(row)
+                replacement_row.update(
+                    {
+                        "rule_id": str(descendant_rule.get("rule_id", "")),
+                        "clause": str(descendant_rule.get("clause", "")),
+                        "selection_source": "descendant_replacement",
+                        "reselection_decision": "replace_with_descendant",
+                        "assigned_reselection_category": "descendant_replacement_rule",
+                        "found_in_step18m": False,
+                        "missing_from_step18m": True,
+                        "causal_effect_status": "not_evaluated_by_18m",
+                        "warning_message": "Descendant replacement trial; causal effect measured after this round evaluation.",
+                        "refill_reason": "descendant_replacement",
+                        "replaced_removed_rule_id": parent_id,
+                        "blacklist_status": "",
+                    }
+                )
+                replaced_rows.append(replacement_row)
+            selected_rows_for_round = replaced_rows
         round_rule_results = _build_round_rule_results(
             rules=next_rules,
             base_results=final_rule_results,
@@ -1271,12 +1614,13 @@ def _process_iterative_reselection(
             "round_index": round_index,
             "removed_rules": list(maintenance.get("removed_rows", [])),
             "refilled_rules": list(maintenance.get("refilled_rows", [])),
+            "descendant_replacement_trials": descendant_trials,
         }
         _write_refined_rules_artifacts(
             json_path=round_root / "refined_final_rules.json",
             csv_path=round_root / "refined_final_rules.csv",
             result=round_rule_results,
-            selected_rows=list(maintenance.get("selected_rows", [])),
+            selected_rows=selected_rows_for_round,
         )
         _write_csv(round_root / "causal_rule_reselection_summary.csv", _ROW_FIELDS, list(maintenance.get("active_rows", [])) + list(maintenance.get("refilled_rows", [])))
         _write_csv(round_root / "removed_rules.csv", _REMOVED_RULE_FIELDS, list(maintenance.get("removed_rows", [])))
@@ -1315,7 +1659,7 @@ def _process_iterative_reselection(
             "round_index": round_index,
             "rule_set_name": f"round_{round_index:02d}",
             "final_rules": next_rules,
-            "selected_rows": list(maintenance.get("selected_rows", [])),
+            "selected_rows": selected_rows_for_round,
             "metrics": dict(round_evaluation.get("overall_metrics", {})),
             "evaluation_results": round_evaluation,
             "masking_results": round_masking,
@@ -1328,6 +1672,8 @@ def _process_iterative_reselection(
             "refilled_rules": list(maintenance.get("refilled_rows", [])),
             "retained_rules": list(maintenance.get("retained_rows", [])),
             "refinement_targets": list(maintenance.get("refinement_target_rows", [])),
+            "descendant_replacement_candidates": descendant_candidates,
+            "descendant_replacement_trials": descendant_trials,
             "ranked_pool_candidates_scanned_for_refill": int(
                 maintenance.get("ranked_pool_candidates_scanned_for_refill", 0)
             ),
@@ -1338,27 +1684,52 @@ def _process_iterative_reselection(
             ),
             "round_output_root": str(round_root),
         }
+        improved_round = _is_better_round(record, best_record, selection_metric=selection_metric, tie_breaker=tie_breaker)
+        for trial in descendant_trials:
+            trial["validation_f1"] = _safe_float(record["metrics"].get("f1", 0.0))
+            trial["validation_precision"] = _safe_float(record["metrics"].get("precision", 0.0))
+            trial["improved_over_previous_best"] = bool(improved_round)
+            if not improved_round:
+                trial["trial_status"] = "failed_trial"
+                trial["failure_reason"] = "did_not_improve_validation_selection_metric"
+                failed_descendant_pairs.add((str(trial.get("parent_rule_id", "")), str(trial.get("descendant_rule_id", ""))))
+                failed_descendant_trial_rows.append(dict(trial))
+            else:
+                trial["trial_status"] = "accepted_trial"
+        descendant_round_summary = dict(descendant_plan.get("summary", {}))
+        descendant_round_summary.update(
+            {
+                "validation_f1": _safe_float(record["metrics"].get("f1", 0.0)),
+                "validation_precision": _safe_float(record["metrics"].get("precision", 0.0)),
+                "selected_as_best": bool(improved_round),
+                "num_failed_trials": sum(1 for trial in descendant_trials if str(trial.get("trial_status", "")) == "failed_trial"),
+            }
+        )
         round_records.append(record)
         all_summary_rows.extend(list(maintenance.get("active_rows", [])) + list(maintenance.get("refilled_rows", [])))
         all_removed_rows.extend(list(maintenance.get("removed_rows", [])))
         all_retained_rows.extend(list(maintenance.get("retained_rows", [])))
         all_refilled_rows.extend(list(maintenance.get("refilled_rows", [])))
         all_refinement_target_rows.extend(list(maintenance.get("refinement_target_rows", [])))
+        all_descendant_candidate_rows.extend(descendant_candidates)
+        all_descendant_trial_rows.extend(descendant_trials)
+        all_descendant_round_rows.append(descendant_round_summary)
 
-        if _is_better_round(record, best_record, selection_metric=selection_metric, tie_breaker=tie_breaker):
+        if improved_round:
             best_record = record
             no_improvement_rounds = 0
         else:
             no_improvement_rounds += 1
-        if not record["removed_rules"] and not record["refilled_rules"]:
+        if not record["removed_rules"] and not record["refilled_rules"] and not descendant_trials:
             stop_reason = "no_rules_removed_or_refilled"
             break
         if early_stop_limit and no_improvement_rounds >= early_stop_limit:
             stop_reason = f"no_validation_improvement_for_{early_stop_limit}_rounds"
             break
-        current_rules = next_rules
-        current_eval = round_evaluation
-        current_masking = round_masking
+        if improved_round or not descendant_trials:
+            current_rules = next_rules
+            current_eval = round_evaluation
+            current_masking = round_masking
 
     for record in round_records:
         record["selected_as_best"] = int(record.get("round_index", -1)) == int(best_record.get("round_index", -1))
@@ -1426,6 +1797,10 @@ def _process_iterative_reselection(
     _write_csv(iterative_summary_csv_path, _PER_ROUND_EVALUATION_FIELDS, per_round_rows)
     _write_csv(refined_csv_path, _REFINED_RULE_FIELDS, best_rows)
     _write_csv(best_round_refined_csv_path, _REFINED_RULE_FIELDS, best_rows)
+    _write_csv(descendant_candidates_csv_path, _DESCENDANT_CANDIDATE_FIELDS, all_descendant_candidate_rows)
+    _write_csv(descendant_trials_csv_path, _DESCENDANT_TRIAL_FIELDS, all_descendant_trial_rows)
+    _write_csv(descendant_round_summary_csv_path, _DESCENDANT_ROUND_SUMMARY_FIELDS, all_descendant_round_rows)
+    _write_csv(failed_descendant_trials_csv_path, _DESCENDANT_TRIAL_FIELDS, failed_descendant_trial_rows)
 
     best_round_manifest = {
         "best_round_index": int(best_record.get("round_index", 0)),
@@ -1464,12 +1839,19 @@ def _process_iterative_reselection(
         "num_refilled_rules": len(all_refilled_rows),
         "num_blacklisted_rules": len(blacklisted_rule_ids),
         "num_refinement_targets": len(all_refinement_target_rows),
+        "descendant_replacement_enabled": bool(cfg.get("descendant_replacement_enabled", False)),
+        "num_descendant_replacement_candidates": len(all_descendant_candidate_rows),
+        "num_descendant_replacement_trials": len(all_descendant_trial_rows),
+        "num_failed_descendant_trials": len(failed_descendant_trial_rows),
         "refined_final_rules_reached_top_k": len(best_rules) == top_k,
         "rounds": round_records,
         "per_round_evaluation_rows": per_round_rows,
         "removed_rules": all_removed_rows,
         "refilled_rules": all_refilled_rows,
         "refinement_targets": all_refinement_target_rows,
+        "descendant_replacement_candidates": all_descendant_candidate_rows,
+        "descendant_replacement_trials": all_descendant_trial_rows,
+        "failed_descendant_trials": failed_descendant_trial_rows,
         "final_rules": best_rules,
         "reselection_rows": all_summary_rows,
         "output_paths": {
@@ -1487,6 +1869,10 @@ def _process_iterative_reselection(
             "iterative_reselection_summary_csv": str(iterative_summary_csv_path),
             "best_round_refined_final_rules_csv": str(best_round_refined_csv_path),
             "best_round_manifest_json": str(best_round_manifest_path),
+            "descendant_replacement_candidates_csv": str(descendant_candidates_csv_path),
+            "descendant_replacement_trials_csv": str(descendant_trials_csv_path),
+            "per_round_descendant_replacement_summary_csv": str(descendant_round_summary_csv_path),
+            "failed_descendant_trials_csv": str(failed_descendant_trials_csv_path),
         },
     }
     with refined_json_path.open("w", encoding="utf-8") as fh:
