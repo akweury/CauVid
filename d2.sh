@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE_NAME="${CAUVID_IMAGE_NAME:-cauvid:latest}"
+CONTAINER_NAME="${CAUVID_CONTAINER_NAME:-cauvid-exp-july}"
+STORAGE_ROOT="${CAUVID_STORAGE_ROOT:-/storage-02/ml-jsha}"
+OUTPUT_ROOT="${CAUVID_OUTPUT_ROOT:-/storage-01/ml-jsha/storage/CauVid_output}"
+RAW_DATASET="${CAUVID_RAW_DRIVING_DATASET:-$STORAGE_ROOT/driving-video-with-object-tracking}"
+DRIVING_MINI="${CAUVID_DRIVING_MINI_HOST:-$STORAGE_ROOT/driving_mini}"
+NUSCENES="${CAUVID_NUSCENES_HOST:-$STORAGE_ROOT/nuScenes}"
+PIPELINE_OUTPUT="${CAUVID_PIPELINE_OUTPUT_HOST:-$OUTPUT_ROOT/output_july}"
+OUTPUT_DIR="${CAUVID_OUTPUT_HOST:-$OUTPUT_ROOT/output}"
+LOGS_DIR="${CAUVID_LOGS_HOST:-$OUTPUT_ROOT/logs}"
+TORCH_CACHE="${CAUVID_TORCH_CACHE_HOST:-$STORAGE_ROOT/.cache/torch}"
+
+GPU_ARGS=()
+if [[ -n "${CAUVID_DOCKER_GPU_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  GPU_ARGS=(${CAUVID_DOCKER_GPU_ARGS})
+else
+  GPU_ARGS=(--gpus all)
+fi
+
+usage() {
+  echo "Usage:"
+  echo "  ./d2.sh                 # run exp_july with defaults"
+  echo "  ./d2.sh run 10 3        # run exp_july with video_count=10, rounds=3"
+  echo "  ./d2.sh build           # build docker image"
+  echo "  ./d2.sh shell           # open interactive shell in container"
+}
+
+ensure_image() {
+  if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+    docker build -t "$IMAGE_NAME" "$ROOT_DIR"
+  fi
+}
+
+prepare_dirs() {
+  mkdir -p "$DRIVING_MINI" "$NUSCENES" "$PIPELINE_OUTPUT" "$OUTPUT_DIR" "$LOGS_DIR" "$TORCH_CACHE"
+}
+
+run_container() {
+  local video_count="${1:-}"
+  local rounds="${2:-3}"
+  local model_mounts=()
+
+  [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
+  [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
+
+  docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+  docker run --rm \
+    "${GPU_ARGS[@]}" \
+    -v "$ROOT_DIR/src:/app/src" \
+    -v "$ROOT_DIR/configs:/app/configs" \
+    -v "$ROOT_DIR/config.py:/app/config.py:ro" \
+    -v "$RAW_DATASET:/raw_driving_data:ro" \
+    -v "$DRIVING_MINI:/dataset/driving_mini" \
+    -v "$NUSCENES:/dataset/nuScenes" \
+    -v "$PIPELINE_OUTPUT:/output/output_july" \
+    -v "$OUTPUT_DIR:/output/output" \
+    -v "$LOGS_DIR:/logs" \
+    -v "$TORCH_CACHE:/.cache/torch" \
+    "${model_mounts[@]}" \
+    -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
+    -e MPLBACKEND=Agg \
+    -e TORCH_HOME=/.cache/torch \
+    -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+    -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+    -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+    -e CAUVID_PIPELINE_OUTPUT_PATH=/output/output_july \
+    -e CAUVID_OUTPUT_PATH=/output/output \
+    -e EXP_JULY_VIDEO_COUNT="$video_count" \
+    -e EXP_JULY_ROUNDS="$rounds" \
+    --name "$CONTAINER_NAME" \
+    "$IMAGE_NAME" \
+    sh -lc 'python -c "import os; from src.exp_july.pipeline import main; count=os.getenv(\"EXP_JULY_VIDEO_COUNT\", \"\"); rounds=int(os.getenv(\"EXP_JULY_ROUNDS\", \"3\")); main(video_count=int(count) if count else None, rounds=rounds)"'
+}
+
+shell_container() {
+  local model_mounts=()
+  [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
+  [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
+
+  docker rm -f "${CONTAINER_NAME}-shell" 2>/dev/null || true
+  docker run -it --rm \
+    "${GPU_ARGS[@]}" \
+    -v "$ROOT_DIR/src:/app/src" \
+    -v "$ROOT_DIR/configs:/app/configs" \
+    -v "$ROOT_DIR/config.py:/app/config.py:ro" \
+    -v "$RAW_DATASET:/raw_driving_data:ro" \
+    -v "$DRIVING_MINI:/dataset/driving_mini" \
+    -v "$NUSCENES:/dataset/nuScenes" \
+    -v "$PIPELINE_OUTPUT:/output/output_july" \
+    -v "$OUTPUT_DIR:/output/output" \
+    -v "$LOGS_DIR:/logs" \
+    -v "$TORCH_CACHE:/.cache/torch" \
+    "${model_mounts[@]}" \
+    -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
+    -e MPLBACKEND=Agg \
+    -e TORCH_HOME=/.cache/torch \
+    -e CAUVID_RAW_DRIVING_DATASET=/raw_driving_data \
+    -e CAUVID_DRIVING_MINI_PATH=/dataset/driving_mini \
+    -e CAUVID_NUSCENES_PATH=/dataset/nuScenes \
+    -e CAUVID_PIPELINE_OUTPUT_PATH=/output/output_july \
+    -e CAUVID_OUTPUT_PATH=/output/output \
+    --name "${CONTAINER_NAME}-shell" \
+    "$IMAGE_NAME" \
+    /bin/bash
+}
+
+main() {
+  local cmd="${1:-run}"
+  prepare_dirs
+
+  case "$cmd" in
+    build)
+      docker build -t "$IMAGE_NAME" "$ROOT_DIR"
+      ;;
+    run)
+      ensure_image
+      run_container "${2:-}" "${3:-3}"
+      ;;
+    shell)
+      ensure_image
+      shell_container
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      ensure_image
+      run_container "${1:-}" "${2:-3}"
+      ;;
+  esac
+}
+
+main "$@"
