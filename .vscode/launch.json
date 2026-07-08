@@ -88,6 +88,8 @@
                 "--start-step",
                 "17",
                 "19",
+                "--recompute-preset",
+                "step17_plus",
                 "--video-count",
                 "200"
             ],

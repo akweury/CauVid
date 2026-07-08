@@ -957,6 +957,20 @@ def process_reselection(
     decision_counts = Counter(str(row.get("reselection_decision", "")) for row in summary_rows)
     category_counts = Counter(str(row.get("assigned_reselection_category", "")) for row in summary_rows)
     reached_top_k = len(refined_rules) == top_k
+    harmful_active_rows = [row for row in active_rows if _safe_int(row.get("harmful_count", 0)) > 0]
+    pure_harmful_removal_candidates = [
+        row
+        for row in active_rows
+        if _safe_int(row.get("helpful_count", 0)) == 0
+        and _safe_int(row.get("harmful_count", 0)) > 0
+        and _safe_int(row.get("necessary_true_positive_count", 0)) == 0
+    ]
+    harmful_dominant_mixed_rows = [
+        row
+        for row in active_rows
+        if _safe_int(row.get("helpful_count", 0)) > 0
+        and _safe_int(row.get("harmful_count", 0)) > _safe_int(row.get("helpful_count", 0))
+    ]
     step17_missing_from_step18m = [row for row in active_rows if not bool(row.get("found_in_step18m", False))]
     step18m_nonzero_missing_from_step17: List[Dict[str, Any]] = []
     active_clause_keys = {
@@ -995,6 +1009,9 @@ def process_reselection(
         "top_k": top_k,
         "num_initial_final_rules": len(final_rules),
         "num_removed_rules": len(removed_rows),
+        "num_active_rules_with_harmful_count": len(harmful_active_rows),
+        "num_pure_harmful_removal_candidates": len(pure_harmful_removal_candidates),
+        "num_harmful_dominant_mixed_rules": len(harmful_dominant_mixed_rows),
         "num_refilled_rules": len(refilled_rows),
         "num_refined_final_rules": len(refined_rules),
         "num_blacklisted_rules": len(removed_rows),
@@ -1035,6 +1052,9 @@ def process_reselection(
         "num_final_rules": len(refined_rules),
         "num_refined_final_rules": len(refined_rules),
         "num_removed_rules": len(removed_rows),
+        "num_active_rules_with_harmful_count": len(harmful_active_rows),
+        "num_pure_harmful_removal_candidates": len(pure_harmful_removal_candidates),
+        "num_harmful_dominant_mixed_rules": len(harmful_dominant_mixed_rows),
         "num_removed_harmful_rules": sum(
             1
             for row in removed_rows
