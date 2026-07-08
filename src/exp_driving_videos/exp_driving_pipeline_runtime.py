@@ -1481,13 +1481,16 @@ def _load_cached_upstream_context(
     ):
         ctx.detection_results = _load_cached_detection_results(ctx.effective_video_ids, skip_invalid=True)
         ctx.detection_results = _strip_low_confidence_candidate_results(ctx.detection_results)
-        ctx.dataset_annotation_results = _load_cached_video_results(
-            output_root=dataset_annotations_driving_mini.get_output_root(),
-            manifest_name="dataset_annotations_manifest.json",
-            per_video_filename="dataset_annotations.json",
-            selected_video_ids=ctx.effective_video_ids,
-            label="step 3 dataset annotations",
-        )
+        if _get_dataset_annotations_enabled(default=True):
+            ctx.dataset_annotation_results = _load_cached_video_results(
+                output_root=dataset_annotations_driving_mini.get_output_root(),
+                manifest_name="dataset_annotations_manifest.json",
+                per_video_filename="dataset_annotations.json",
+                selected_video_ids=ctx.effective_video_ids,
+                label="step 3 dataset annotations",
+            )
+        else:
+            ctx.dataset_annotation_results = []
         ctx.dataset_annotation_results = _strip_low_confidence_candidate_results(ctx.dataset_annotation_results)
         ctx.merged_results = _load_cached_video_results(
             output_root=merge_gt_and_detected_driving_mini.get_output_root(),
