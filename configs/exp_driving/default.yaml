@@ -351,6 +351,10 @@ causal_rule_reselection:
   selection_metric: f1
   tie_breaker: precision
   early_stop_no_improvement_rounds: 2
+  min_f1_improvement: 0.001
+  max_recall_drop: 0.03
+  max_tp_loss: 1
+  rollback_bad_rounds: true
   descendant_replacement_enabled: true
   max_replacement_parents_per_round: 3
   descendant_queue_size_per_parent: 10

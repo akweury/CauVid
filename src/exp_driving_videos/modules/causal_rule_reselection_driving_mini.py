@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 6
+_RESELECTION_VERSION = 7
 _ROW_FIELDS = [
     "rule_id",
     "clause",
@@ -196,6 +196,10 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "selection_metric": str(cfg.get("selection_metric", "f1")),
         "tie_breaker": str(cfg.get("tie_breaker", "precision")),
         "early_stop_no_improvement_rounds": int(cfg.get("early_stop_no_improvement_rounds", 2)),
+        "min_f1_improvement": float(cfg.get("min_f1_improvement", 0.001)),
+        "max_recall_drop": float(cfg.get("max_recall_drop", 0.03)),
+        "max_tp_loss": int(cfg.get("max_tp_loss", 1)),
+        "rollback_bad_rounds": bool(cfg.get("rollback_bad_rounds", True)),
         "descendant_replacement_enabled": bool(cfg.get("descendant_replacement_enabled", False)),
         "max_replacement_parents_per_round": int(cfg.get("max_replacement_parents_per_round", 3)),
         "descendant_queue_size_per_parent": int(cfg.get("descendant_queue_size_per_parent", 10)),
@@ -811,6 +815,37 @@ def _is_better_round(
         selection_metric=selection_metric,
         tie_breaker=tie_breaker,
     )
+
+
+def _round_acceptance(
+    candidate: Dict[str, Any],
+    current_best: Dict[str, Any],
+    *,
+    cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    metrics = dict(candidate.get("metrics", {}))
+    best_metrics = dict(current_best.get("metrics", {}))
+    f1 = _safe_float(metrics.get("f1", 0.0))
+    best_f1 = _safe_float(best_metrics.get("f1", 0.0))
+    precision = _safe_float(metrics.get("precision", 0.0))
+    best_precision = _safe_float(best_metrics.get("precision", 0.0))
+    recall = _safe_float(metrics.get("recall", 0.0))
+    best_recall = _safe_float(best_metrics.get("recall", 0.0))
+    tp = _safe_int(metrics.get("true_positive", 0))
+    best_tp = _safe_int(best_metrics.get("true_positive", 0))
+    min_f1_improvement = _safe_float(cfg.get("min_f1_improvement", 0.001), 0.001)
+    max_recall_drop = _safe_float(cfg.get("max_recall_drop", 0.03), 0.03)
+    max_tp_loss = _safe_int(cfg.get("max_tp_loss", 1), 1)
+
+    if f1 < best_f1:
+        return False, "failed_trial:f1_below_current_best"
+    if f1 >= best_f1 + min_f1_improvement:
+        return True, "accepted:f1_improved"
+    recall_drop = best_recall - recall
+    tp_loss = best_tp - tp
+    if precision > best_precision and recall_drop <= max_recall_drop and tp_loss <= max_tp_loss:
+        return True, "accepted:precision_improved_within_recall_tp_tolerance"
+    return False, "failed_trial:no_f1_or_precision_acceptance"
 
 
 def _can_use_refill_candidate(
@@ -1497,6 +1532,7 @@ def _process_iterative_reselection(
     selection_metric = str(cfg.get("selection_metric", "f1")).strip() or "f1"
     tie_breaker = str(cfg.get("tie_breaker", "precision")).strip() or "precision"
     early_stop_limit = max(0, int(cfg.get("early_stop_no_improvement_rounds", 2)))
+    rollback_bad_rounds = bool(cfg.get("rollback_bad_rounds", True))
     ranked_rules = [
         _normalize_ranked_rule(rule, rank)
         for rank, rule in enumerate(_load_ranked_rules(final_rule_results, output_root=output_root), start=1)
@@ -1539,6 +1575,8 @@ def _process_iterative_reselection(
     for round_index in range(1, max_rounds + 1):
         round_root = output_root / f"round_{round_index:02d}"
         round_root.mkdir(parents=True, exist_ok=True)
+        trial_blacklisted_rule_ids = set(blacklisted_rule_ids)
+        trial_blacklisted_clauses = set(blacklisted_clauses)
         maintenance = _run_maintenance_pass(
             current_rules=current_rules,
             base_final_rule_results=final_rule_results,
@@ -1550,16 +1588,16 @@ def _process_iterative_reselection(
             output_root=round_root,
             top_k=top_k,
             round_index=round_index,
-            blacklisted_rule_ids=blacklisted_rule_ids,
-            blacklisted_clauses=blacklisted_clauses,
+            blacklisted_rule_ids=trial_blacklisted_rule_ids,
+            blacklisted_clauses=trial_blacklisted_clauses,
         )
         maintenance_rules = [dict(rule) for rule in list(maintenance.get("final_rules", []))]
         descendant_plan = _build_descendant_replacement_plan(
             current_rules=maintenance_rules,
             selected_rows=list(maintenance.get("selected_rows", [])),
             ranked_rules=ranked_rules,
-            blacklisted_rule_ids=blacklisted_rule_ids,
-            blacklisted_clauses=blacklisted_clauses,
+            blacklisted_rule_ids=trial_blacklisted_rule_ids,
+            blacklisted_clauses=trial_blacklisted_clauses,
             failed_descendant_pairs=failed_descendant_pairs,
             cfg=cfg,
             round_index=round_index,
@@ -1666,7 +1704,7 @@ def _process_iterative_reselection(
             "num_removed_rules": len(list(maintenance.get("removed_rows", []))),
             "num_cumulative_removed_rules": len(all_removed_rows) + len(list(maintenance.get("removed_rows", []))),
             "num_refilled_rules": len(list(maintenance.get("refilled_rows", []))),
-            "num_blacklisted_rules": len(blacklisted_rule_ids),
+            "num_blacklisted_rules": len(trial_blacklisted_rule_ids),
             "top_k_reached": len(next_rules) == top_k,
             "removed_rules": list(maintenance.get("removed_rows", [])),
             "refilled_rules": list(maintenance.get("refilled_rows", [])),
@@ -1684,14 +1722,16 @@ def _process_iterative_reselection(
             ),
             "round_output_root": str(round_root),
         }
-        improved_round = _is_better_round(record, best_record, selection_metric=selection_metric, tie_breaker=tie_breaker)
+        accepted_round, acceptance_reason = _round_acceptance(record, best_record, cfg=cfg)
+        record["accepted_round"] = bool(accepted_round)
+        record["acceptance_reason"] = acceptance_reason
         for trial in descendant_trials:
             trial["validation_f1"] = _safe_float(record["metrics"].get("f1", 0.0))
             trial["validation_precision"] = _safe_float(record["metrics"].get("precision", 0.0))
-            trial["improved_over_previous_best"] = bool(improved_round)
-            if not improved_round:
+            trial["improved_over_previous_best"] = bool(accepted_round)
+            if not accepted_round:
                 trial["trial_status"] = "failed_trial"
-                trial["failure_reason"] = "did_not_improve_validation_selection_metric"
+                trial["failure_reason"] = acceptance_reason
                 failed_descendant_pairs.add((str(trial.get("parent_rule_id", "")), str(trial.get("descendant_rule_id", ""))))
                 failed_descendant_trial_rows.append(dict(trial))
             else:
@@ -1701,7 +1741,7 @@ def _process_iterative_reselection(
             {
                 "validation_f1": _safe_float(record["metrics"].get("f1", 0.0)),
                 "validation_precision": _safe_float(record["metrics"].get("precision", 0.0)),
-                "selected_as_best": bool(improved_round),
+                "selected_as_best": bool(accepted_round),
                 "num_failed_trials": sum(1 for trial in descendant_trials if str(trial.get("trial_status", "")) == "failed_trial"),
             }
         )
@@ -1715,8 +1755,10 @@ def _process_iterative_reselection(
         all_descendant_trial_rows.extend(descendant_trials)
         all_descendant_round_rows.append(descendant_round_summary)
 
-        if improved_round:
+        if accepted_round:
             best_record = record
+            blacklisted_rule_ids = trial_blacklisted_rule_ids
+            blacklisted_clauses = trial_blacklisted_clauses
             no_improvement_rounds = 0
         else:
             no_improvement_rounds += 1
@@ -1726,7 +1768,15 @@ def _process_iterative_reselection(
         if early_stop_limit and no_improvement_rounds >= early_stop_limit:
             stop_reason = f"no_validation_improvement_for_{early_stop_limit}_rounds"
             break
-        if improved_round or not descendant_trials:
+        if accepted_round:
+            current_rules = next_rules
+            current_eval = round_evaluation
+            current_masking = round_masking
+        elif rollback_bad_rounds:
+            current_rules = [dict(rule) for rule in list(best_record.get("final_rules", []))]
+            current_eval = dict(best_record.get("evaluation_results", evaluation_results))
+            current_masking = dict(best_record.get("masking_results", rule_level_causal_masking_results))
+        else:
             current_rules = next_rules
             current_eval = round_evaluation
             current_masking = round_masking
