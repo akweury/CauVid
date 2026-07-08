@@ -642,6 +642,7 @@ def get_causal_rule_reselection_cfg() -> Dict[str, Any]:
             "max_recall_drop": 0.03,
             "max_tp_loss": 1,
             "rollback_bad_rounds": True,
+            "descendant_min_positive_coverage_retention": 0.8,
             "descendant_replacement_enabled": True,
             "max_replacement_parents_per_round": 3,
             "descendant_queue_size_per_parent": 10,

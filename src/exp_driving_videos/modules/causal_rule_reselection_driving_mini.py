@@ -26,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 7
+_RESELECTION_VERSION = 8
 _ROW_FIELDS = [
     "rule_id",
     "clause",
@@ -200,6 +200,9 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_recall_drop": float(cfg.get("max_recall_drop", 0.03)),
         "max_tp_loss": int(cfg.get("max_tp_loss", 1)),
         "rollback_bad_rounds": bool(cfg.get("rollback_bad_rounds", True)),
+        "descendant_min_positive_coverage_retention": float(
+            cfg.get("descendant_min_positive_coverage_retention", 0.8)
+        ),
         "descendant_replacement_enabled": bool(cfg.get("descendant_replacement_enabled", False)),
         "max_replacement_parents_per_round": int(cfg.get("max_replacement_parents_per_round", 3)),
         "descendant_queue_size_per_parent": int(cfg.get("descendant_queue_size_per_parent", 10)),
@@ -836,14 +839,18 @@ def _round_acceptance(
     min_f1_improvement = _safe_float(cfg.get("min_f1_improvement", 0.001), 0.001)
     max_recall_drop = _safe_float(cfg.get("max_recall_drop", 0.03), 0.03)
     max_tp_loss = _safe_int(cfg.get("max_tp_loss", 1), 1)
+    recall_drop = best_recall - recall
+    tp_loss = best_tp - tp
 
     if f1 < best_f1:
         return False, "failed_trial:f1_below_current_best"
+    if recall_drop > max_recall_drop:
+        return False, "failed_trial:recall_drop_exceeds_tolerance"
+    if tp_loss > max_tp_loss:
+        return False, "failed_trial:tp_loss_exceeds_tolerance"
     if f1 >= best_f1 + min_f1_improvement:
-        return True, "accepted:f1_improved"
-    recall_drop = best_recall - recall
-    tp_loss = best_tp - tp
-    if precision > best_precision and recall_drop <= max_recall_drop and tp_loss <= max_tp_loss:
+        return True, "accepted:f1_improved_within_recall_tp_tolerance"
+    if precision > best_precision:
         return True, "accepted:precision_improved_within_recall_tp_tolerance"
     return False, "failed_trial:no_f1_or_precision_acceptance"
 
@@ -1045,6 +1052,10 @@ def _build_descendant_replacement_plan(
     max_parents = max(0, int(cfg.get("max_replacement_parents_per_round", 3)))
     queue_size = max(1, int(cfg.get("descendant_queue_size_per_parent", 10)))
     max_replacements = max(0, int(cfg.get("max_descendant_replacements_per_round", 3)))
+    min_positive_retention = max(
+        0.0,
+        min(1.0, _safe_float(cfg.get("descendant_min_positive_coverage_retention", 0.8), 0.8)),
+    )
     if max_parents <= 0 or max_replacements <= 0:
         return {"rules": [dict(rule) for rule in current_rules], "candidates": [], "trials": [], "summary": {}}
 
@@ -1107,6 +1118,8 @@ def _build_descendant_replacement_plan(
                 ranked_count=ranked_count,
                 cfg=cfg,
             )
+            if _safe_float(score_parts.get("positive_coverage_retention", 0.0)) < min_positive_retention:
+                continue
             row = {
                 "round_index": int(round_index),
                 "parent_rule_id": parent_id,

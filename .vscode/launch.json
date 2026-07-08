@@ -101,6 +101,27 @@
         }
         ,
         {
+            "name": "Python Debugger: exp_driving_pipeline (from step 18N to 18O, data 200)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/exp_driving_videos/exp_driving_pipeline.py",
+            "args": [
+                "--start-step",
+                "18N",
+                "18O",
+                "--recompute-preset",
+                "step17_plus",
+                "--video-count",
+                "200"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
             "name": "Python Debugger: nuScenes detection (YOLO-World)",
             "type": "debugpy",
             "request": "launch",
