@@ -341,6 +341,7 @@ causal_rule_reselection:
   top_k: 50
   remove_pure_harmful: true
   downrank_redundant: true
+  backfill_mixed_rules: false
   weak_grounding_penalty: 1.5
   harmful_penalty: 3.0
   false_positive_penalty: 2.0

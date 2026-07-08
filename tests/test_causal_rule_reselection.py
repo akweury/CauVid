@@ -86,6 +86,40 @@ def test_reselection_distinguishes_missing_step18m_from_redundant(tmp_path):
                 "causal_false_positive_count": 1,
                 "dominant_influence_type": "harmful_causal_source",
             },
+            {
+                "rule_id": "orphan_necessary",
+                "clause": "brake_next(S) :- object_distance_state(S,O,near), segment_motion_state(S,forward_slowdown_left).",
+                "confidence": 0.8,
+                "trigger_count": 2,
+                "prediction_flip_count": 2,
+                "helpful_count": 2,
+                "harmful_count": 0,
+                "necessary_true_positive_count": 2,
+                "dominant_influence_type": "helpful_for_correct_prediction",
+            },
+            {
+                "rule_id": "orphan_mixed",
+                "clause": "brake_next(S) :- object_vz_state(S,O,vz_approaching).",
+                "confidence": 0.6,
+                "trigger_count": 4,
+                "prediction_flip_count": 4,
+                "helpful_count": 2,
+                "harmful_count": 2,
+                "necessary_true_positive_count": 2,
+                "causal_false_positive_count": 2,
+                "dominant_influence_type": "helpful_for_correct_prediction",
+            },
+            {
+                "rule_id": "",
+                "clause": "brake_next(S) :- object_distance_state(S,O,mid).",
+                "confidence": 0.7,
+                "trigger_count": 1,
+                "prediction_flip_count": 1,
+                "helpful_count": 1,
+                "harmful_count": 0,
+                "necessary_true_positive_count": 1,
+                "dominant_influence_type": "helpful_for_correct_prediction",
+            },
         ],
     )
     final_rules = [
@@ -119,6 +153,12 @@ def test_reselection_distinguishes_missing_step18m_from_redundant(tmp_path):
             "confidence": 0.4,
             "body_atom_templates": ["object_vz_state(S,O,vz_approaching)."],
         },
+        {
+            "rule_id": "clause_matched",
+            "clause": "brake_next(S) :- object_distance_state(S,O,mid).",
+            "confidence": 0.7,
+            "body_atom_templates": ["object_distance_state(S,O,mid)."],
+        },
     ]
 
     result = reselection.process_reselection(
@@ -135,6 +175,7 @@ def test_reselection_distinguishes_missing_step18m_from_redundant(tmp_path):
             "broad_weak_predicates": ["vz_approaching", "vz_awaying", "intermittent_visibility"],
             "ego_motion_only_predicates": ["ego_forward_slowdown"],
             "backup_explanation_min_trigger_count": 5,
+            "backfill_mixed_rules": False,
         },
         output_root=output_root,
         force_recompute=True,
@@ -155,9 +196,20 @@ def test_reselection_distinguishes_missing_step18m_from_redundant(tmp_path):
     assert rows["redundant_backup"]["backup_explanation_candidate"] is True
 
     assert rows["orphan_effect"]["found_in_step17"] is False
-    assert rows["orphan_effect"]["reselection_decision"] == "warning_only"
+    assert rows["orphan_effect"]["assigned_reselection_category"] == "harmful_false_positive_rule"
+    assert rows["orphan_effect"]["reselection_decision"] == "remove"
+    assert rows["orphan_necessary"]["assigned_reselection_category"] == "necessary_positive_rule"
+    assert rows["orphan_necessary"]["reselection_decision"] == "backfill_keep"
+    assert rows["orphan_necessary"]["selection_source"] == "step18m_backfill"
+    assert rows["orphan_mixed"]["assigned_reselection_category"] == "mixed_rule"
+    assert rows["orphan_mixed"]["reselection_decision"] == "backfill_refine_candidate"
+    assert rows["clause_matched"]["matched_by"] == "normalized_clause"
+    assert rows["clause_matched"]["found_in_step18m"] is True
     assert result["warning_section"]["num_step17_rules_missing_from_step18m"] == 1
-    assert result["warning_section"]["num_step18m_nonzero_causal_effect_rules_missing_from_step17"] == 1
+    assert result["warning_section"]["num_step18m_nonzero_causal_effect_rules_missing_from_step17"] == 3
+    assert result["num_step18m_only_backfilled_keep_rules"] == 1
+    assert result["num_step18m_only_mixed_refinement_targets"] == 1
+    assert result["num_step18m_only_harmful_not_backfilled"] == 1
 
     with Path(result["output_paths"]["causal_rule_reselection_summary_csv"]).open(
         "r", encoding="utf-8", newline=""
@@ -166,11 +218,21 @@ def test_reselection_distinguishes_missing_step18m_from_redundant(tmp_path):
     assert "found_in_step18m" in csv_rows[0]
     assert "missing_from_step18m" in csv_rows[0]
     assert "found_in_step17" in csv_rows[0]
+    assert "matched_by" in csv_rows[0]
     assert "causal_effect_status" in csv_rows[0]
+    assert "selection_source" in csv_rows[0]
+    assert "backfill_reason" in csv_rows[0]
     assert "backup_explanation_candidate" in csv_rows[0]
     assert "warning_message" in csv_rows[0]
+    with Path(result["output_paths"]["refinement_targets_csv"]).open(
+        "r", encoding="utf-8", newline=""
+    ) as fh:
+        refinement_rows = {row["rule_id"]: row for row in csv.DictReader(fh)}
+    assert "orphan_mixed" in refinement_rows
 
     refined = json.loads(Path(result["output_paths"]["refined_final_rules_json"]).read_text(encoding="utf-8"))
     refined_rule_ids = {rule["rule_id"] for rule in refined["final_rules"]}
     assert "orphan_effect" not in refined_rule_ids
+    assert "orphan_mixed" not in refined_rule_ids
+    assert "orphan_necessary" in refined_rule_ids
     assert "harmful" not in refined_rule_ids

@@ -3021,6 +3021,28 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
         "primary_summary_csv": str(output_paths.get("causal_rule_reselection_summary_csv", "")),
         "main_conclusion": main_conclusion,
         "secondary_debug_artifacts": secondary_debug_artifacts,
+        "num_step17_rules": int(ctx.causal_rule_reselection_results.get("num_step17_rules", 0)),
+        "num_step18m_rules": int(ctx.causal_rule_reselection_results.get("num_step18m_rules", 0)),
+        "num_overlap_rules": int(ctx.causal_rule_reselection_results.get("num_overlap_rules", 0)),
+        "num_step17_missing_from_18m": int(ctx.causal_rule_reselection_results.get("num_step17_missing_from_18m", 0)),
+        "num_step18m_missing_from_17": int(ctx.causal_rule_reselection_results.get("num_step18m_missing_from_17", 0)),
+        "num_step18m_only_nonzero_effect_rules": int(
+            ctx.causal_rule_reselection_results.get("num_step18m_only_nonzero_effect_rules", 0)
+        ),
+        "num_step18m_only_backfilled_keep_rules": int(
+            ctx.causal_rule_reselection_results.get("num_step18m_only_backfilled_keep_rules", 0)
+        ),
+        "num_step18m_only_mixed_refinement_targets": int(
+            ctx.causal_rule_reselection_results.get("num_step18m_only_mixed_refinement_targets", 0)
+        ),
+        "num_step18m_only_harmful_not_backfilled": int(
+            ctx.causal_rule_reselection_results.get("num_step18m_only_harmful_not_backfilled", 0)
+        ),
+        "num_removed_harmful_rules": int(ctx.causal_rule_reselection_results.get("num_removed_harmful_rules", 0)),
+        "num_refined_final_rules": int(ctx.causal_rule_reselection_results.get("num_final_rules", 0)),
+        "backfill_mixed_rules_enabled": bool(
+            ctx.causal_rule_reselection_results.get("backfill_mixed_rules_enabled", False)
+        ),
         "warning_section": dict(ctx.causal_rule_reselection_results.get("warning_section", {})),
     }
     _write_manifest_json(manifest_path, manifest)
