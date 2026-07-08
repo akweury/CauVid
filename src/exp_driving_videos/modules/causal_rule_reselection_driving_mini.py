@@ -26,12 +26,16 @@ if str(SRC_ROOT) not in sys.path:
 import config
 
 
-_RESELECTION_VERSION = 1
+_RESELECTION_VERSION = 2
 _ROW_FIELDS = [
     "rule_id",
     "original_clause",
     "original_rank",
     "original_score",
+    "found_in_step18m",
+    "missing_from_step18m",
+    "found_in_step17",
+    "causal_effect_status",
     "helpful_count",
     "harmful_count",
     "necessary_true_positive_count",
@@ -50,6 +54,8 @@ _ROW_FIELDS = [
     "uses_only_ego_motion_atoms",
     "uses_broad_weak_atoms",
     "reasoning_feedback_request_count",
+    "backup_explanation_candidate",
+    "warning_message",
     "reselection_score",
 ]
 
@@ -72,6 +78,7 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "necessary_positive_bonus": float(cfg.get("necessary_positive_bonus", 3.0)),
         "helpful_bonus": float(cfg.get("helpful_bonus", 1.0)),
         "object_support_bonus": float(cfg.get("object_support_bonus", 0.5)),
+        "backup_explanation_min_trigger_count": int(cfg.get("backup_explanation_min_trigger_count", 5)),
         "broad_weak_predicates": sorted(str(value) for value in list(cfg.get("broad_weak_predicates", []))),
         "ego_motion_only_predicates": sorted(str(value) for value in list(cfg.get("ego_motion_only_predicates", []))),
     }
@@ -150,10 +157,13 @@ def _rule_grounding_features(rule: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[
         predicate, args = _parse_atom(atom)
         predicates.append(predicate)
         atom_text = atom.lower()
-        if predicate in broad_weak_predicates or any(token.lower() in atom_text for token in broad_weak_predicates):
+        atom_uses_broad_weak = predicate in broad_weak_predicates or any(
+            token.lower() in atom_text for token in broad_weak_predicates
+        )
+        if atom_uses_broad_weak:
             uses_broad_weak_atoms = True
         if any(arg == "O" or str(arg).startswith("object") for arg in args):
-            if predicate not in broad_weak_predicates and "intermittent" not in atom_text:
+            if not atom_uses_broad_weak and "intermittent" not in atom_text:
                 has_object_level_support = True
     uses_only_ego_motion_atoms = bool(atoms) and all(predicate in ego_motion_only_predicates for predicate in predicates)
     weak_causal_grounding = bool(uses_only_ego_motion_atoms or (uses_broad_weak_atoms and not has_object_level_support))
@@ -163,6 +173,43 @@ def _rule_grounding_features(rule: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[
         "uses_only_ego_motion_atoms": uses_only_ego_motion_atoms,
         "uses_broad_weak_atoms": uses_broad_weak_atoms,
         "weak_causal_grounding": weak_causal_grounding,
+    }
+
+
+def _dominant_influence_indicates_redundancy(dominant_influence_type: str) -> bool:
+    return str(dominant_influence_type).strip().lower() in {"redundant_trigger", "redundant_rule"}
+
+
+def _has_nonzero_causal_effect(row: Dict[str, Any]) -> bool:
+    causal_count_fields = (
+        "prediction_flip_count",
+        "helpful_count",
+        "harmful_count",
+        "necessary_true_positive_count",
+        "causal_false_positive_count",
+        "non_decisive_contribution_count",
+    )
+    if any(_safe_int(row.get(field, 0)) > 0 for field in causal_count_fields):
+        return True
+    return abs(_safe_float(row.get("score_delta_sum", 0.0), 0.0)) > 0.0
+
+
+def _causal_effect_status(*, found_in_step18m: bool, causal: Dict[str, Any]) -> str:
+    if not found_in_step18m:
+        return "missing_from_step18m"
+    if _has_nonzero_causal_effect(causal):
+        return "nonzero_causal_effect"
+    return "no_causal_effect"
+
+
+def _is_refinement_target_candidate(grounding: Dict[str, Any]) -> bool:
+    return bool(grounding.get("uses_broad_weak_atoms", False) or grounding.get("uses_only_ego_motion_atoms", False))
+
+
+def _row_brief(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "rule_id": str(row.get("rule_id", "")),
+        "clause": str(row.get("original_clause", row.get("clause", ""))),
     }
 
 
@@ -221,32 +268,32 @@ def _feedback_rule_counts(
 
 def _classify_rule(
     *,
+    found_in_step18m: bool,
     helpful_count: int,
     harmful_count: int,
     necessary_true_positive_count: int,
     causal_false_positive_count: int,
-    redundant_count: int,
     prediction_flip_count: int,
-    trigger_count: int,
+    dominant_influence_type: str,
     weak_causal_grounding: bool,
 ) -> str:
-    if helpful_count > 0 and necessary_true_positive_count > 0 and harmful_count == 0:
-        return "necessary_positive_rule"
+    if not found_in_step18m:
+        return "causal_effect_missing"
     if helpful_count == 0 and harmful_count > 0:
         return "harmful_false_positive_rule"
-    if necessary_true_positive_count > 0 and causal_false_positive_count > 0:
-        return "mixed_rule"
     if helpful_count > 0 and harmful_count > 0:
         return "mixed_rule"
-    if prediction_flip_count == 0 or (trigger_count > 0 and redundant_count >= max(1, trigger_count - harmful_count - helpful_count)):
-        return "redundant_rule"
-    if weak_causal_grounding and helpful_count <= harmful_count:
-        return "weak_causal_grounding_rule"
-    if helpful_count > 0 or necessary_true_positive_count > 0:
+    if necessary_true_positive_count > 0 and causal_false_positive_count > 0:
+        return "mixed_rule"
+    if necessary_true_positive_count > 0 and harmful_count == 0:
         return "necessary_positive_rule"
     if weak_causal_grounding:
         return "weak_causal_grounding_rule"
-    return "redundant_rule"
+    if prediction_flip_count == 0 or _dominant_influence_indicates_redundancy(dominant_influence_type):
+        return "redundant_rule"
+    if helpful_count > 0:
+        return "necessary_positive_rule"
+    return "mixed_rule"
 
 
 def _decision_for_category(
@@ -255,22 +302,53 @@ def _decision_for_category(
     helpful_count: int,
     harmful_count: int,
     necessary_true_positive_count: int,
+    prediction_flip_count: int,
+    trigger_count: int,
+    found_in_step18m: bool,
+    has_object_level_support: bool,
+    refinement_target_candidate: bool,
+    backup_min_trigger_count: int,
     remove_pure_harmful: bool,
     downrank_redundant: bool,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, bool]:
+    no_causal_effect = prediction_flip_count == 0 and helpful_count == 0 and harmful_count == 0
+    if category == "causal_effect_missing":
+        if trigger_count > 0 or has_object_level_support:
+            return (
+                "keep_for_review",
+                "Step 17 rule was not found in Step 18M causal masking summary; causal effect is unknown",
+                False,
+            )
+        return (
+            "downrank_missing_effect",
+            "Step 17 rule was not found in Step 18M and has no Step 18 trigger evidence",
+            False,
+        )
     if remove_pure_harmful and helpful_count == 0 and harmful_count > 0:
-        return "remove", "masking only helped by removing this rule from false positives"
+        return "remove", "masking only helped by removing this rule from false positives", False
     if category == "necessary_positive_rule":
         if harmful_count == 0:
-            return "keep", "masking shows necessary true-positive support without harmful flips"
-        return "keep", "rule preserves positive coverage despite some harmful contribution"
+            return "keep", "masking shows necessary true-positive support without harmful flips", False
+        return "keep", "rule preserves positive coverage despite some harmful contribution", False
     if category == "mixed_rule":
-        return "refine", "rule contributes to both true positives and false positives"
+        return "refine", "rule contributes to both true positives and false positives", False
+    if category == "weak_causal_grounding_rule" and refinement_target_candidate:
+        return "refine", "rule uses broad weak object-motion or ego-motion-only atoms with weak causal grounding", False
+    if found_in_step18m and trigger_count == 0 and no_causal_effect:
+        return "strong_downrank", "rule has zero Step 18M triggers and no measured causal effect", False
     if category == "redundant_rule" and downrank_redundant:
-        return "downrank", "masking produced no final prediction change or mostly redundant triggers"
+        if has_object_level_support and trigger_count >= backup_min_trigger_count:
+            return (
+                "backup_explanation",
+                "redundant by masking but frequently triggered with object-level support",
+                True,
+            )
+        if trigger_count == 0 and no_causal_effect:
+            return "strong_downrank", "rule has zero trigger count and no measured causal effect", False
+        return "downrank", "masking produced no final prediction change or dominant redundant influence", False
     if category == "weak_causal_grounding_rule" and necessary_true_positive_count <= 0:
-        return "downrank", "rule depends on broad or ego-motion-only atoms without causal object support"
-    return "keep", "no causal evidence requiring removal"
+        return "downrank", "rule depends on broad or ego-motion-only atoms without causal object support", False
+    return "keep", "no causal evidence requiring removal", False
 
 
 def _reselection_score(
@@ -292,8 +370,14 @@ def _reselection_score(
         score -= float(cfg.get("weak_grounding_penalty", 1.5))
     if str(row.get("reselection_decision", "")) == "remove":
         score -= 1000000.0
-    elif str(row.get("reselection_decision", "")) == "downrank":
+    elif str(row.get("reselection_decision", "")) == "strong_downrank":
+        score -= 100.0
+    elif str(row.get("reselection_decision", "")) in {"downrank", "downrank_missing_effect"}:
         score -= 10.0
+    elif str(row.get("reselection_decision", "")) == "keep_for_review":
+        score -= 1.0
+    elif str(row.get("reselection_decision", "")) == "backup_explanation":
+        score -= 3.0
     return score
 
 
@@ -330,14 +414,16 @@ def process_reselection(
     eval_rows = _load_step18_rule_eval_rows(evaluation_results, output_root=out_root)
     feedback_counts = _feedback_rule_counts(reasoning_feedback_results, output_root=out_root)
     top_k = max(0, int(cfg.get("top_k", len(final_rules) or 50)))
+    backup_min_trigger_count = max(1, int(cfg.get("backup_explanation_min_trigger_count", 5)))
 
-    summary_rows: List[Dict[str, Any]] = []
+    step17_summary_rows: List[Dict[str, Any]] = []
     rule_by_id: Dict[str, Dict[str, Any]] = {}
     for rank, rule in enumerate(final_rules, start=1):
         rule_id = str(rule.get("rule_id", "")).strip()
         if not rule_id:
             continue
         rule_by_id[rule_id] = rule
+        found_in_step18m = rule_id in causal_rows
         causal = dict(causal_rows.get(rule_id, {}))
         eval_row = dict(eval_rows.get(rule_id, {}))
         helpful_count = _safe_int(causal.get("helpful_count", 0))
@@ -347,33 +433,51 @@ def process_reselection(
         redundant_count = _safe_int(causal.get("redundant_count", 0))
         prediction_flip_count = _safe_int(causal.get("prediction_flip_count", 0))
         trigger_count = _safe_int(causal.get("trigger_count", eval_row.get("eval_total_firings", 0)))
+        dominant_influence_type = str(causal.get("dominant_influence_type", "none"))
         grounding = _rule_grounding_features(rule, cfg)
+        causal_effect_status = _causal_effect_status(found_in_step18m=found_in_step18m, causal=causal)
         category = _classify_rule(
+            found_in_step18m=found_in_step18m,
             helpful_count=helpful_count,
             harmful_count=harmful_count,
             necessary_true_positive_count=necessary_true_positive_count,
             causal_false_positive_count=causal_false_positive_count,
-            redundant_count=redundant_count,
             prediction_flip_count=prediction_flip_count,
-            trigger_count=trigger_count,
+            dominant_influence_type=dominant_influence_type,
             weak_causal_grounding=bool(grounding["weak_causal_grounding"]),
         )
-        decision, reason = _decision_for_category(
+        decision, reason, backup_explanation_candidate = _decision_for_category(
             category,
             helpful_count=helpful_count,
             harmful_count=harmful_count,
             necessary_true_positive_count=necessary_true_positive_count,
+            prediction_flip_count=prediction_flip_count,
+            trigger_count=trigger_count,
+            found_in_step18m=found_in_step18m,
+            has_object_level_support=bool(grounding["has_object_level_support"]),
+            refinement_target_candidate=_is_refinement_target_candidate(grounding),
+            backup_min_trigger_count=backup_min_trigger_count,
             remove_pure_harmful=bool(cfg.get("remove_pure_harmful", True)),
             downrank_redundant=bool(cfg.get("downrank_redundant", True)),
         )
         if category == "weak_causal_grounding_rule" and feedback_counts.get(rule_id, 0) > 0 and decision != "remove":
             decision = "refine"
             reason = f"{reason}; Step 23 feedback also flagged related examples"
+        warning_message = ""
+        if not found_in_step18m:
+            warning_message = (
+                "Step 17 rule_id was not found in Step 18M causal masking summary; "
+                "causal effect statistics are missing, not zero."
+            )
         row = {
             "rule_id": rule_id,
             "original_clause": str(rule.get("clause", causal.get("clause", ""))),
             "original_rank": rank,
             "original_score": _safe_float(rule.get("score", rule.get("confidence", causal.get("confidence", 0.0)))),
+            "found_in_step18m": bool(found_in_step18m),
+            "missing_from_step18m": bool(not found_in_step18m),
+            "found_in_step17": True,
+            "causal_effect_status": causal_effect_status,
             "helpful_count": helpful_count,
             "harmful_count": harmful_count,
             "necessary_true_positive_count": necessary_true_positive_count,
@@ -381,7 +485,7 @@ def process_reselection(
             "redundant_count": redundant_count,
             "prediction_flip_count": prediction_flip_count,
             "net_helpful_minus_harmful": helpful_count - harmful_count,
-            "dominant_influence_type": str(causal.get("dominant_influence_type", "none")),
+            "dominant_influence_type": dominant_influence_type,
             "assigned_reselection_category": category,
             "reselection_decision": decision,
             "reason": reason,
@@ -392,14 +496,68 @@ def process_reselection(
             "uses_only_ego_motion_atoms": bool(grounding["uses_only_ego_motion_atoms"]),
             "uses_broad_weak_atoms": bool(grounding["uses_broad_weak_atoms"]),
             "reasoning_feedback_request_count": int(feedback_counts.get(rule_id, 0)),
+            "backup_explanation_candidate": bool(backup_explanation_candidate),
+            "warning_message": warning_message,
         }
         row["reselection_score"] = _reselection_score(row, cfg)
-        summary_rows.append(row)
+        step17_summary_rows.append(row)
+
+    step17_rule_ids = set(rule_by_id)
+    step18m_nonzero_missing_from_step17_rows: List[Dict[str, Any]] = []
+    for causal_rule_id, causal in sorted(causal_rows.items()):
+        if causal_rule_id in step17_rule_ids or not _has_nonzero_causal_effect(causal):
+            continue
+        step18m_nonzero_missing_from_step17_rows.append(
+            {
+                "rule_id": causal_rule_id,
+                "original_clause": str(causal.get("clause", "")),
+                "original_rank": "",
+                "original_score": _safe_float(causal.get("confidence", 0.0)),
+                "found_in_step18m": True,
+                "missing_from_step18m": False,
+                "found_in_step17": False,
+                "causal_effect_status": "nonzero_causal_effect_without_step17_rule",
+                "helpful_count": _safe_int(causal.get("helpful_count", 0)),
+                "harmful_count": _safe_int(causal.get("harmful_count", 0)),
+                "necessary_true_positive_count": _safe_int(causal.get("necessary_true_positive_count", 0)),
+                "causal_false_positive_count": _safe_int(causal.get("causal_false_positive_count", 0)),
+                "redundant_count": _safe_int(causal.get("redundant_count", 0)),
+                "prediction_flip_count": _safe_int(causal.get("prediction_flip_count", 0)),
+                "net_helpful_minus_harmful": _safe_int(causal.get("helpful_count", 0))
+                - _safe_int(causal.get("harmful_count", 0)),
+                "dominant_influence_type": str(causal.get("dominant_influence_type", "none")),
+                "assigned_reselection_category": "causal_effect_without_step17_rule",
+                "reselection_decision": "warning_only",
+                "reason": "Step 18M reports nonzero causal effect for a rule_id absent from Step 17 final rules",
+                "trigger_count": _safe_int(causal.get("trigger_count", 0)),
+                "non_decisive_contribution_count": _safe_int(causal.get("non_decisive_contribution_count", 0)),
+                "weak_grounding_penalty_applied": False,
+                "has_object_level_support": False,
+                "uses_only_ego_motion_atoms": False,
+                "uses_broad_weak_atoms": False,
+                "reasoning_feedback_request_count": int(feedback_counts.get(causal_rule_id, 0)),
+                "backup_explanation_candidate": False,
+                "warning_message": "Step 18M rule with nonzero causal effect was not found in Step 17 final rules.",
+                "reselection_score": "",
+            }
+        )
+    summary_rows = step17_summary_rows + step18m_nonzero_missing_from_step17_rows
+    missing_from_step18m_rows = [row for row in step17_summary_rows if bool(row.get("missing_from_step18m", False))]
+    warning_section = {
+        "num_step17_rules_missing_from_step18m": len(missing_from_step18m_rows),
+        "step17_rules_missing_from_step18m": [_row_brief(row) for row in missing_from_step18m_rows],
+        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(
+            step18m_nonzero_missing_from_step17_rows
+        ),
+        "step18m_nonzero_causal_effect_rules_missing_from_step17": [
+            _row_brief(row) for row in step18m_nonzero_missing_from_step17_rows
+        ],
+    }
 
     selected_rows = [
         row
         for row in sorted(
-            summary_rows,
+            step17_summary_rows,
             key=lambda item: (
                 str(item.get("reselection_decision", "")) == "remove",
                 -_safe_float(item.get("reselection_score", 0.0)),
@@ -419,13 +577,24 @@ def process_reselection(
         rule["refined_rank"] = int(row.get("refined_rank", 0))
         refined_rules.append(rule)
 
-    retained_rows = [row for row in summary_rows if str(row.get("rule_id", "")) in selected_rule_ids]
-    removed_rows = [row for row in summary_rows if str(row.get("reselection_decision", "")) == "remove"]
+    retained_rows = [row for row in step17_summary_rows if str(row.get("rule_id", "")) in selected_rule_ids]
+    removed_rows = [row for row in step17_summary_rows if str(row.get("reselection_decision", "")) == "remove"]
     refinement_target_rows = [
-        row for row in summary_rows if str(row.get("reselection_decision", "")) == "refine"
+        row
+        for row in step17_summary_rows
+        if str(row.get("reselection_decision", "")) == "refine"
+        or (
+            _is_refinement_target_candidate(
+                {
+                    "uses_broad_weak_atoms": row.get("uses_broad_weak_atoms", False),
+                    "uses_only_ego_motion_atoms": row.get("uses_only_ego_motion_atoms", False),
+                }
+            )
+            and str(row.get("reselection_decision", "")) != "remove"
+        )
     ]
-    decision_counts = Counter(str(row.get("reselection_decision", "")) for row in summary_rows)
-    category_counts = Counter(str(row.get("assigned_reselection_category", "")) for row in summary_rows)
+    decision_counts = Counter(str(row.get("reselection_decision", "")) for row in step17_summary_rows)
+    category_counts = Counter(str(row.get("assigned_reselection_category", "")) for row in step17_summary_rows)
 
     _write_csv(summary_csv_path, _ROW_FIELDS, summary_rows)
     _write_csv(removed_csv_path, _ROW_FIELDS, removed_rows)
@@ -454,6 +623,13 @@ def process_reselection(
             for row in removed_rows
             if str(row.get("assigned_reselection_category", "")) == "harmful_false_positive_rule"
         ),
+        "num_step17_rules_missing_from_step18m": len(missing_from_step18m_rows),
+        "num_step18m_nonzero_causal_effect_rules_missing_from_step17": len(
+            step18m_nonzero_missing_from_step17_rows
+        ),
+        "num_backup_explanation_candidates": sum(
+            1 for row in step17_summary_rows if bool(row.get("backup_explanation_candidate", False))
+        ),
         "num_retained_necessary_rules": sum(
             1
             for row in retained_rows
@@ -466,6 +642,7 @@ def process_reselection(
         ),
         "decision_counts": dict(sorted(decision_counts.items())),
         "category_counts": dict(sorted(category_counts.items())),
+        "warning_section": warning_section,
         "final_rules": refined_rules,
         "reselection_rows": summary_rows,
         "output_paths": {

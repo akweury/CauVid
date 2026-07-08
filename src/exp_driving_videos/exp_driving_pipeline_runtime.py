@@ -3018,6 +3018,7 @@ def run_step_18n_causal_rule_reselection(ctx: PipelineContext, runner: StepRunne
         "primary_summary_csv": str(output_paths.get("causal_rule_reselection_summary_csv", "")),
         "main_conclusion": main_conclusion,
         "secondary_debug_artifacts": secondary_debug_artifacts,
+        "warning_section": dict(ctx.causal_rule_reselection_results.get("warning_section", {})),
     }
     _write_manifest_json(manifest_path, manifest)
     ctx.causal_rule_reselection_results["manifest_json"] = str(manifest_path)
