@@ -4,6 +4,7 @@ red_blue_colors/
 pipeline_output/
 logs/
 output/
+output_july/
 dataset_mini/
 dataset/driving-video-with-object-tracking
 external/

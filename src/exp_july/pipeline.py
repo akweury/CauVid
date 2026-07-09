@@ -8,8 +8,6 @@ if str(ROOT) not in sys.path:
 from src.exp_july.perception import step1_init
 from src.exp_july.perception import step2_detection
 from src.exp_july.perception import step3_tracking
-from src.exp_july.perception import step4_dataset_annotations
-from src.exp_july.perception import step5_merge_annotations
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step8_relative_object_motion
@@ -95,16 +93,11 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     tracking_state = step3_tracking(detection_state)
     if max_step <= 3:
         return tracking_state
-    # Step 4: load dataset annotations.
-    annotation_state = step4_dataset_annotations(env)
-    if max_step <= 4:
-        return annotation_state
-    # Step 5: merge tracking results with annotations.
-    merged_state = step5_merge_annotations(tracking_state, annotation_state)
+    # Step 4-5: removed; downstream uses OD detections and tracks only.
     if max_step <= 5:
-        return merged_state
+        return tracking_state
     # Step 6: prepare 3D positions or geometry.
-    position_state = step6_positions_3d(merged_state)
+    position_state = step6_positions_3d(tracking_state)
     if max_step <= 6:
         return position_state
     # Step 7: estimate ego motion signals.
