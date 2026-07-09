@@ -3,6 +3,7 @@ from src.exp_july.perception.pipeline import step2_detection
 from src.exp_july.perception.pipeline import step3_tracking
 from src.exp_july.perception.pipeline import step6_positions_3d
 from src.exp_july.perception.pipeline import step7_ego_motion
+from src.exp_july.perception.pipeline import step7b_tracklet_repair
 from src.exp_july.perception.pipeline import step8_relative_object_motion
 from src.exp_july.perception.pipeline import step9_temporal_segmentation
 from src.exp_july.perception.pipeline import step10_segment_object_motion

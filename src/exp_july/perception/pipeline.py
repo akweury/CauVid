@@ -444,7 +444,28 @@ def step7_ego_motion(position_state):
     }
 
 
-def step8_relative_object_motion(position_state, ego_state):
+def step7b_tracklet_repair(ego_state):
+    # 1. perform only the safest interpolations
+    # handle short-term omissions, 
+    # such as missing few frames, 
+    # where the preceding and 
+    # following bounding boxes are contiguous, 
+    # the class is consistent, and motion is smooth. 
+    # In this round, interpolated bounding boxes 
+    # can be generated directly with a high degree 
+    # of confidence.
+    
+    
+    
+    return {
+        "videos": ego_state["videos"],
+        "tracklet_repair": [],
+        "ego_motion": ego_state["ego_motion"],
+        "ego_motion_output_root": ego_state.get("ego_motion_output_root"),
+    }
+
+
+def step8_relative_object_motion(position_state, repaired_state):
     return {"videos": position_state["videos"], "relative_object_motion": []}
 
 
