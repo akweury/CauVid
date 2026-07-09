@@ -2,11 +2,11 @@
 Estimate ego motion for driving_mini videos.
 
 For each consecutive frame pair:
-  1. Compute dense optical flow (RAFT-Small).
-  2. Build a background mask by blacking out detected/GT object bounding boxes.
-  3. ego_flow = flow[bg_mask]  — use only background pixels.
+  1. Detect sparse background features after masking dynamic object boxes.
+  2. Track them with pyramidal Lucas-Kanade optical flow.
+  3. Reject outliers with forward-backward consistency and affine RANSAC.
   4. Estimate (vx, vz) lateral and forward ego speed + yaw rate using
-     depth-weighted background flow via estimate_ego_motion / estimate_ego_rotation.
+     depth-weighted sparse background motion.
 
 Consumes:
   - Step 4 merged annotations (image_path, boxes per frame)
@@ -18,8 +18,6 @@ Output layout:
         <video_id>/
             ego_motion.json          — raw + smoothed per-frame ego motion signals
             ego_motion_vis.mp4       — side-by-side: original frame + smoothed charts
-            optical_flows/
-                flow_NNNNN.npy       — cached RAFT flow arrays (H, W, 2)
 """
 
 from __future__ import annotations
@@ -40,12 +38,12 @@ if str(SRC_ROOT) not in sys.path:
 
 import config
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import (
-    compute_optical_flow,
     create_bg_mask,
-    estimate_ego_motion,
-    estimate_ego_rotation,
 )
 from src.exp_driving_videos.modules.data_preprocessing import get_depth_maps_root
+
+_EGO_MOTION_VERSION = 2
+_EGO_MOTION_METHOD = "sparse_lk_ransac_depth"
 
 
 def get_output_root() -> Path:
@@ -304,6 +302,191 @@ def _load_frame_image(image_path: str) -> Optional[np.ndarray]:
         return None
 
 
+def _combine_background_masks(
+    frame_shape: Tuple[int, int],
+    prev_boxes: List[List[float]],
+    curr_boxes: List[List[float]],
+) -> np.ndarray:
+    h, w = frame_shape
+    dummy = np.zeros((h, w, 3), dtype=np.uint8)
+    prev_mask = create_bg_mask(dummy, prev_boxes, [], [])
+    curr_mask = create_bg_mask(dummy, curr_boxes, [], [])
+    return np.minimum(prev_mask, curr_mask)
+
+
+def _track_sparse_points(
+    img_prev: np.ndarray,
+    img_curr: np.ndarray,
+    mask: np.ndarray,
+    max_corners: int = 600,
+    quality_level: float = 0.01,
+    min_distance: int = 7,
+    fb_error_threshold: float = 1.5,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    try:
+        import cv2
+    except ModuleNotFoundError:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32), {"num_features": 0, "num_valid_tracks": 0, "num_inliers": 0}
+
+    gray_prev = cv2.cvtColor(img_prev, cv2.COLOR_RGB2GRAY)
+    gray_curr = cv2.cvtColor(img_curr, cv2.COLOR_RGB2GRAY)
+    features = cv2.goodFeaturesToTrack(
+        gray_prev,
+        maxCorners=max_corners,
+        qualityLevel=quality_level,
+        minDistance=min_distance,
+        blockSize=7,
+        mask=mask,
+    )
+    if features is None or len(features) < 8:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32), {"num_features": 0, "num_valid_tracks": 0, "num_inliers": 0}
+
+    next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+        gray_prev,
+        gray_curr,
+        features,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
+        gray_curr,
+        gray_prev,
+        next_pts,
+        None,
+        winSize=(21, 21),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    prev_pts = features.reshape(-1, 2)
+    curr_pts = next_pts.reshape(-1, 2)
+    back_pts = back_pts.reshape(-1, 2)
+    valid = (status.reshape(-1) == 1) & (back_status.reshape(-1) == 1)
+    if not np.any(valid):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32), {"num_features": int(len(features)), "num_valid_tracks": 0, "num_inliers": 0}
+
+    fb_error = np.linalg.norm(prev_pts - back_pts, axis=1)
+    valid &= np.isfinite(fb_error) & (fb_error <= fb_error_threshold)
+    h, w = gray_curr.shape[:2]
+    valid &= np.isfinite(curr_pts).all(axis=1)
+    valid &= (curr_pts[:, 0] >= 0) & (curr_pts[:, 0] < w) & (curr_pts[:, 1] >= 0) & (curr_pts[:, 1] < h)
+    prev_pts = prev_pts[valid].astype(np.float32)
+    curr_pts = curr_pts[valid].astype(np.float32)
+    if len(prev_pts) < 8:
+        return prev_pts, curr_pts, {"num_features": int(len(features)), "num_valid_tracks": int(len(prev_pts)), "num_inliers": 0}
+
+    affine, inliers = cv2.estimateAffinePartial2D(
+        prev_pts,
+        curr_pts,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=2.0,
+        maxIters=2000,
+        confidence=0.99,
+    )
+    if affine is not None and inliers is not None and int(inliers.sum()) >= 6:
+        keep = inliers.reshape(-1).astype(bool)
+        prev_pts = prev_pts[keep]
+        curr_pts = curr_pts[keep]
+    return prev_pts, curr_pts, {
+        "num_features": int(len(features)),
+        "num_valid_tracks": int(valid.sum()),
+        "num_inliers": int(len(prev_pts)),
+    }
+
+
+def _estimate_sparse_ego_motion(
+    prev_pts: np.ndarray,
+    curr_pts: np.ndarray,
+    depth_map: np.ndarray,
+    frame_shape: Tuple[int, int],
+    focal_length: float = 1000.0,
+    angle_tol_deg: float = 35.0,
+    min_flow_px: float = 0.5,
+) -> Dict[str, Any]:
+    if len(prev_pts) < 5 or len(curr_pts) < 5:
+        return {"vx": 0.0, "vz": 0.0, "yaw_rate": 0.0, "success": False, "num_motion_points": 0}
+
+    depth = np.asarray(depth_map, dtype=np.float32)
+    h, w = frame_shape
+    sample_pts = np.round(curr_pts).astype(int)
+    sample_pts[:, 0] = np.clip(sample_pts[:, 0], 0, w - 1)
+    sample_pts[:, 1] = np.clip(sample_pts[:, 1], 0, h - 1)
+    Z = depth[sample_pts[:, 1], sample_pts[:, 0]]
+
+    dx = (curr_pts[:, 0] - prev_pts[:, 0]).astype(np.float32)
+    dy = (curr_pts[:, 1] - prev_pts[:, 1]).astype(np.float32)
+    valid = np.isfinite(dx) & np.isfinite(dy) & np.isfinite(Z) & (Z > 0)
+    if not np.any(valid):
+        return {"vx": 0.0, "vz": 0.0, "yaw_rate": 0.0, "success": False, "num_motion_points": 0}
+
+    xx = curr_pts[valid, 0].astype(np.float32)
+    yy = curr_pts[valid, 1].astype(np.float32)
+    dx = dx[valid]
+    dy = dy[valid]
+    Z = Z[valid].astype(np.float32)
+
+    mag = np.hypot(dx, dy)
+    moving = mag > min_flow_px
+    if moving.sum() < 5:
+        return {"vx": 0.0, "vz": 0.0, "yaw_rate": 0.0, "success": False, "num_motion_points": int(moving.sum())}
+
+    xx = xx[moving]
+    yy = yy[moving]
+    dx = dx[moving]
+    dy = dy[moving]
+    Z = Z[moving]
+    angles = np.arctan2(dy, dx)
+    theta_consensus = np.arctan2(np.median(np.sin(angles)), np.median(np.cos(angles)))
+    angle_diff = (angles - theta_consensus + np.pi) % (2.0 * np.pi) - np.pi
+    inliers = np.abs(angle_diff) < np.deg2rad(angle_tol_deg)
+    if inliers.sum() < max(5, int(0.05 * len(dx))):
+        inliers = np.ones(len(dx), dtype=bool)
+
+    dx_in = dx[inliers]
+    dy_in = dy[inliers]
+    Z_in = Z[inliers]
+    xx_in = xx[inliers]
+    yy_in = yy[inliers]
+
+    vx_initial = float(np.median(dx_in * Z_in))
+    dx_lat_residual = dx_in - (vx_initial / np.maximum(Z_in, 1e-3))
+    yaw_rate = float(-np.median(dx_lat_residual) / focal_length)
+    dx_no_yaw = dx_in + (focal_length * yaw_rate)
+    vx = float(np.median(dx_no_yaw * Z_in))
+    dx_forward_residual = dx_no_yaw - (vx / np.maximum(Z_in, 1e-3))
+    vz_mag = float(np.median(np.hypot(dx_forward_residual, dy_in) * Z_in))
+
+    cx = 0.5 * float(w - 1)
+    cy = 0.5 * float(h - 1)
+    radial_x = xx_in - cx
+    radial_y = yy_in - cy
+    radial_norm = np.hypot(radial_x, radial_y)
+    radial_valid = radial_norm > 1e-3
+    if np.any(radial_valid):
+        radial_proj = (
+            (radial_x[radial_valid] * dx_forward_residual[radial_valid])
+            + (radial_y[radial_valid] * dy_in[radial_valid])
+        ) / radial_norm[radial_valid]
+        radial_median = float(np.median(radial_proj))
+    else:
+        radial_median = float(np.median(dy_in))
+    if radial_median > 1e-4:
+        vz_sign = 1.0
+    elif radial_median < -1e-4:
+        vz_sign = -1.0
+    else:
+        vz_sign = 1.0 if float(np.median(dy_in)) >= 0.0 else -1.0
+
+    return {
+        "vx": vx,
+        "vz": float(vz_sign * vz_mag),
+        "yaw_rate": yaw_rate,
+        "success": True,
+        "num_motion_points": int(len(dx_in)),
+    }
+
+
 def process_video(
     video_result: Dict[str, Any],
     output_root: Optional[Path] = None,
@@ -343,6 +526,8 @@ def process_video(
             cached = json.load(fh)
 
         frames_ego = cached.get("frames", [])
+        cache_version_ok = int(cached.get("version", 0)) == _EGO_MOTION_VERSION
+        cache_method_ok = str(cached.get("estimation_method", "")) == _EGO_MOTION_METHOD
         has_smoothed = bool(frames_ego) and all(
             "ego_vx_smoothed" in frame
             and "ego_vz_smoothed" in frame
@@ -354,7 +539,7 @@ def process_video(
             for frame in frames_ego
         )
         vis_path = out_dir / "ego_motion_vis.mp4"
-        cache_ok = has_smoothed and (
+        cache_ok = cache_version_ok and cache_method_ok and has_smoothed and (
             (not render_video) or vis_path.exists()
         ) and (
             (not static_adjust_enabled) or has_static_adjusted
@@ -362,15 +547,15 @@ def process_video(
         if cache_ok:
             print(f"  [cache-hit] {video_id} - using {out_file}")
             return cached
-        if static_adjust_enabled and not has_static_adjusted:
+        if not cache_version_ok or not cache_method_ok:
+            print(f"  [cache] {video_id} - cache is stale; recomputing with {_EGO_MOTION_METHOD}")
+        elif static_adjust_enabled and not has_static_adjusted:
             print(f"  [cache] {video_id} - cache is stale; recomputing with static-object adjustment")
         elif render_video and not vis_path.exists():
             print(f"  [cache] {video_id} - cache visualization is missing; rerendering")
 
     frames: List[Dict[str, Any]] = video_result.get("frames", [])
     depth_root = get_depth_maps_root() / video_id
-    flow_cache_dir = out_dir / "optical_flows"
-    flow_cache_dir.mkdir(parents=True, exist_ok=True)
 
     per_frame_ego: List[Dict[str, Any]] = []
 
@@ -409,7 +594,8 @@ def process_video(
         boxes = frame_info.get("boxes", [])
         labels = frame_info.get("labels", [])
         track_ids = frame_info.get("track_ids", [])
-        bg_mask = create_bg_mask(img_curr, boxes, labels, track_ids)
+        prev_boxes = prev_frame_info.get("boxes", [])
+        bg_mask = _combine_background_masks(img_curr.shape[:2], prev_boxes, boxes)
 
         # Load depth map for current frame (used for metric-scale estimation)
         depth_file = depth_root / f"{Path(image_path).stem}_depth.npz"
@@ -419,29 +605,21 @@ def process_video(
             # Fallback: uniform depth — still gives direction but no metric scale
             depth_map = np.ones(img_curr.shape[:2], dtype=np.float32)
 
-        # --- Compute optical flow (RAFT-Small), with per-frame cache ---
-        flow_cache_file = flow_cache_dir / f"flow_{frame_index:05d}.npy"
-        if not force_recompute and flow_cache_file.exists():
-            flow = np.load(str(flow_cache_file))
-        else:
-            try:
-                flow = compute_optical_flow(img_prev, img_curr, device=flow_device)
-                np.save(str(flow_cache_file), flow)
-            except Exception as e:
-                print(f"    [warn] {video_id} frame {frame_index}: optical flow failed: {e}")
-                per_frame_ego.append(entry)
-                continue
-
-        # ego_flow = flow[bg_mask] uses background pixels only
-        # estimate_ego_motion internally applies bg_mask == 255 filtering
         try:
-            vx, vz, yaw_rate = estimate_ego_motion(
-                flow, bg_mask, depth_map, return_yaw=True
-            )
-        except TypeError:
-            # Older signature without return_yaw
-            vx, vz = estimate_ego_motion(flow, bg_mask, depth_map)
-            yaw_rate = float(estimate_ego_rotation(flow, bg_mask, depth_map))
+            prev_pts, curr_pts, point_stats = _track_sparse_points(img_prev, img_curr, bg_mask)
+        except Exception as e:
+            print(f"    [warn] {video_id} frame {frame_index}: sparse tracking failed: {e}")
+            per_frame_ego.append(entry)
+            continue
+        motion = _estimate_sparse_ego_motion(prev_pts, curr_pts, depth_map, img_curr.shape[:2])
+        vx = float(motion["vx"])
+        vz = float(motion["vz"])
+        yaw_rate = float(motion["yaw_rate"])
+        has_ego_motion = bool(motion.get("success", False))
+        entry["num_background_features"] = int(point_stats.get("num_features", 0))
+        entry["num_background_tracks"] = int(point_stats.get("num_valid_tracks", 0))
+        entry["num_background_inliers"] = int(point_stats.get("num_inliers", 0))
+        entry["num_motion_points"] = int(motion.get("num_motion_points", 0))
 
         # Optional adjustment using static-object regions (e.g., building, traffic light).
         if static_adjust_enabled:
@@ -454,32 +632,35 @@ def process_video(
             num_static_pixels = int(np.count_nonzero(static_mask == 255))
             entry["num_static_pixels"] = num_static_pixels
             if num_static_pixels >= min_static_pixels:
-                try:
-                    sx, sz, syaw = estimate_ego_motion(
-                        flow,
-                        static_mask,
-                        depth_map,
-                        return_yaw=True,
-                    )
-                except TypeError:
-                    sx, sz = estimate_ego_motion(flow, static_mask, depth_map)
-                    syaw = float(estimate_ego_rotation(flow, static_mask, depth_map))
-
-                vx = (1.0 - blend_weight) * float(vx) + blend_weight * float(sx)
-                vz = (1.0 - blend_weight) * float(vz) + blend_weight * float(sz)
-                yaw_rate = (1.0 - blend_weight) * float(yaw_rate) + blend_weight * float(syaw)
-                entry["static_adjustment_used"] = True
+                static_prev_pts, static_curr_pts, static_stats = _track_sparse_points(img_prev, img_curr, static_mask)
+                static_motion = _estimate_sparse_ego_motion(static_prev_pts, static_curr_pts, depth_map, img_curr.shape[:2])
+                entry["num_static_features"] = int(static_stats.get("num_features", 0))
+                entry["num_static_tracks"] = int(static_stats.get("num_valid_tracks", 0))
+                entry["num_static_inliers"] = int(static_stats.get("num_inliers", 0))
+                if static_motion.get("success", False):
+                    if has_ego_motion:
+                        vx = (1.0 - blend_weight) * float(vx) + blend_weight * float(static_motion["vx"])
+                        vz = (1.0 - blend_weight) * float(vz) + blend_weight * float(static_motion["vz"])
+                        yaw_rate = (1.0 - blend_weight) * float(yaw_rate) + blend_weight * float(static_motion["yaw_rate"])
+                    else:
+                        vx = float(static_motion["vx"])
+                        vz = float(static_motion["vz"])
+                        yaw_rate = float(static_motion["yaw_rate"])
+                    has_ego_motion = True
+                    entry["static_adjustment_used"] = True
 
         entry["ego_vx"] = float(vx)
         entry["ego_vz"] = float(vz)
         entry["ego_yaw_rate"] = float(yaw_rate)
-        entry["has_ego_motion"] = True
+        entry["has_ego_motion"] = has_ego_motion
         per_frame_ego.append(entry)
 
     per_frame_ego = _apply_smoothing(per_frame_ego, smoothing_window=smoothing_window)
 
     result: Dict[str, Any] = {
+        "version": _EGO_MOTION_VERSION,
         "video_id": video_id,
+        "estimation_method": _EGO_MOTION_METHOD,
         "num_frames": len(frames),
         "num_frames_with_ego_motion": sum(
             1 for e in per_frame_ego if e["has_ego_motion"]
@@ -561,6 +742,8 @@ def run(
 
     # Write manifest
     manifest = {
+        "version": _EGO_MOTION_VERSION,
+        "estimation_method": _EGO_MOTION_METHOD,
         "num_videos": len(ego_motion_results),
         "videos": [
             {

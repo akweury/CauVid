@@ -331,6 +331,7 @@ def step6_positions_3d(tracking_state):
     run_args = dict(tracking_state["positions_3d_args"])
     output_root = Path(run_args["output_root"])
     output_root.mkdir(parents=True, exist_ok=True)
+    print(f"[step 6] output_root={output_root}")
     merged_results = [
         merge_gt_and_detected_driving_mini._tracked_video_as_merged_result(video_result)
         for video_result in tracking_results
