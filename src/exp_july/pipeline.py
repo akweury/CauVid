@@ -106,7 +106,7 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     if max_step <= 7:
         return ego_state
     # Step 7B: repair broken tracklets after ego estimation.
-    repaired_state = step7b_tracklet_repair(ego_state)
+    repaired_state = step7b_tracklet_repair(position_state, ego_state)
     # Step 8: compute relative object motion.
     relative_motion_state = step8_relative_object_motion(position_state, repaired_state)
     if max_step <= 8:

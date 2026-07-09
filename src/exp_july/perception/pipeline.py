@@ -70,6 +70,14 @@ def load_json_if_exists(path):
         return json.load(f)
 
 
+def is_step6_cache_payload(payload, video_id):
+    return (
+        isinstance(payload, dict)
+        and str(payload.get("video_id", "")) == str(video_id)
+        and isinstance(payload.get("frames", []), list)
+    )
+
+
 def collect_track_lengths(tracking_results):
     lengths = []
     for video_result in tracking_results:
@@ -346,7 +354,7 @@ def step6_positions_3d(tracking_state):
         cached_result = None
         if not bool(run_args.get("force_recompute", False)):
             payload = load_json_if_exists(cache_path)
-            if payload and int(payload.get("version", 0)) == getattr(prepare_3d_positions_driving_mini, "_POSITIONS_3D_VERSION", 4):
+            if is_step6_cache_payload(payload, video_id):
                 cached_result = payload
         if cached_result is not None:
             cached_videos += 1
@@ -409,9 +417,25 @@ def step7_ego_motion(position_state):
     output_root = Path(run_args["output_root"])
     output_root.mkdir(parents=True, exist_ok=True)
     ego_motion = []
+    cached_videos = 0
     progress = tqdm(positions_3d, desc="[step 7] ego_motion", unit="video")
     for video_result in progress:
-        progress.set_postfix_str(str(video_result.get("video_id", "")), refresh=False)
+        video_id = str(video_result.get("video_id", ""))
+        progress.set_postfix_str(video_id, refresh=False)
+        cache_path = output_root / video_id / "ego_motion.json"
+        cached_result = None
+        if not bool(run_args.get("force_recompute", False)):
+            payload = load_json_if_exists(cache_path)
+            if (
+                payload
+                and int(payload.get("version", 0)) == getattr(ego_motion_driving_mini, "_EGO_MOTION_VERSION", 0)
+                and str(payload.get("estimation_method", "")) == getattr(ego_motion_driving_mini, "_EGO_MOTION_METHOD", "")
+            ):
+                cached_result = payload
+        if cached_result is not None:
+            cached_videos += 1
+            ego_motion.append(cached_result)
+            continue
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             ego_motion.append(
                 ego_motion_driving_mini.process_video(
@@ -439,6 +463,7 @@ def step7_ego_motion(position_state):
         json.dump(manifest, f, indent=2)
     print(
         f"[step 7] done videos={len(ego_motion)} "
+        f"cached={cached_videos} "
         f"frames_with_ego_motion={sum(int(row.get('num_frames_with_ego_motion', 0)) for row in ego_motion)}"
     )
     return {
@@ -448,7 +473,7 @@ def step7_ego_motion(position_state):
     }
 
 
-def step7b_tracklet_repair(ego_state):
+def step7b_tracklet_repair(position_state, ego_state):
     # 1. perform only the safest interpolations
     # handle short-term omissions, 
     # such as missing few frames, 
@@ -462,8 +487,10 @@ def step7b_tracklet_repair(ego_state):
     
     
     return {
-        "videos": ego_state["videos"],
+        "videos": position_state["videos"],
         "tracklet_repair": [],
+        "positions_3d": position_state.get("positions_3d", []),
+        "positions_3d_output_root": position_state.get("positions_3d_output_root"),
         "ego_motion": ego_state["ego_motion"],
         "ego_motion_output_root": ego_state.get("ego_motion_output_root"),
     }
