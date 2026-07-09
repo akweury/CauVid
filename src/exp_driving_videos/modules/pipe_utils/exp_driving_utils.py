@@ -25,6 +25,9 @@ except ModuleNotFoundError:
 import config
 
 
+_RAFT_SMALL_RUNTIME = {}
+
+
 def merge_cfg(base, override):
     cfg = deepcopy(base)
     if not override:
@@ -567,7 +570,37 @@ def create_bg_mask(frame, bboxes, labels, obj_ids):
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         cv2.rectangle(mask, (x1, y1), (x2, y2), (0), thickness=-1)  # fill object area with black
     return mask
-    
+
+
+def _resolve_torch_device(device=None):
+    if torch is None:
+        raise ModuleNotFoundError("torch is required for optical flow computation")
+    if device is None or str(device).strip().lower() == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+def _get_raft_small_runtime(device=None):
+    device_obj = _resolve_torch_device(device)
+    device_key = str(device_obj)
+    cached = _RAFT_SMALL_RUNTIME.get(device_key)
+    if cached is not None:
+        return cached
+
+    from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+
+    weights = Raft_Small_Weights.DEFAULT
+    model = raft_small(weights=weights).to(device_obj).eval()
+    transforms = weights.transforms()
+    runtime = {
+        "device": device_obj,
+        "model": model,
+        "transforms": transforms,
+    }
+    _RAFT_SMALL_RUNTIME[device_key] = runtime
+    return runtime
+
+
 def compute_optical_flow(frame1, frame2, device=None):
     """
     Compute dense optical flow between two RGB frames using torchvision's
@@ -589,17 +622,12 @@ def compute_optical_flow(frame1, frame2, device=None):
         flow[y, x, 0] = horizontal displacement (dx),
         flow[y, x, 1] = vertical displacement   (dy).
     """
-    from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
     import torch.nn.functional as F
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(device)
-
-    weights = Raft_Small_Weights.DEFAULT
-    model = raft_small(weights=weights).to(device).eval()
-    transforms = weights.transforms()
+    runtime = _get_raft_small_runtime(device=device)
+    device = runtime["device"]
+    model = runtime["model"]
+    transforms = runtime["transforms"]
 
     def to_tensor(img):
         # (H, W, 3) uint8 -> (1, 3, H, W) uint8
@@ -616,7 +644,7 @@ def compute_optical_flow(frame1, frame2, device=None):
         t1 = F.pad(t1, (0, pad_w, 0, pad_h))
         t2 = F.pad(t2, (0, pad_w, 0, pad_h))
 
-    with torch.no_grad():
+    with torch.inference_mode():
         # returns list of iteratively refined predictions; last is finest
         flow_predictions = model(t1, t2)
         flow_tensor = flow_predictions[-1]  # (1, 2, H_pad, W_pad)

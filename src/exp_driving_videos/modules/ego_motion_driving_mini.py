@@ -311,6 +311,7 @@ def process_video(
     smoothing_window: int = 5,
     static_adjust_cfg: Optional[Dict[str, Any]] = None,
     render_video: bool = True,
+    flow_device: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Estimate ego motion for a single video and cache the result."""
     video_id = video_result["video_id"]
@@ -424,7 +425,7 @@ def process_video(
             flow = np.load(str(flow_cache_file))
         else:
             try:
-                flow = compute_optical_flow(img_prev, img_curr)
+                flow = compute_optical_flow(img_prev, img_curr, device=flow_device)
                 np.save(str(flow_cache_file), flow)
             except Exception as e:
                 print(f"    [warn] {video_id} frame {frame_index}: optical flow failed: {e}")
@@ -521,6 +522,7 @@ def run(
     smoothing_window: int = 5,
     static_adjust_cfg: Optional[Dict[str, Any]] = None,
     render_video: bool = True,
+    flow_device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Run ego motion estimation for all videos.
@@ -553,6 +555,7 @@ def run(
             smoothing_window=smoothing_window,
             static_adjust_cfg=static_adjust_cfg,
             render_video=render_video,
+            flow_device=flow_device,
         )
         ego_motion_results.append(result)
 

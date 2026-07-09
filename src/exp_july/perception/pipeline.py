@@ -101,13 +101,14 @@ def track_length_range_counts(track_lengths):
 def save_track_length_histogram(track_lengths, output_root):
     if not track_lengths:
         return None
-    figure_path = Path(output_root) / "track_length_histogram.png"
+    track_count = len(track_lengths)
+    figure_path = Path(output_root) / f"track_length_histogram_n{track_count}.png"
     plt.figure(figsize=(8, 4.5))
     plt.hist(track_lengths, bins=20, color="#4C78A8", edgecolor="black")
     plt.xlabel("Track length")
     plt.ylabel("Number of tracks")
     plt.yscale("log")
-    plt.title("Track Length Distribution")
+    plt.title(f"Track Length Distribution (n={track_count})")
     plt.tight_layout()
     plt.savefig(figure_path, dpi=160)
     plt.close()
@@ -165,6 +166,7 @@ def step1_init(video_ids=None, video_count=None):
         "smoothing_window": driving_pipeline_config.get_ego_motion_smoothing_window(default=5),
         "static_adjust_cfg": driving_pipeline_config.get_ego_static_adjustment_cfg(),
         "render_video": driving_pipeline_config.get_ego_motion_render_video_enabled(default=True),
+        "flow_device": "auto",
     }
     return {
         "videos": videos,
@@ -418,6 +420,7 @@ def step7_ego_motion(position_state):
                     smoothing_window=int(run_args.get("smoothing_window", 5)),
                     static_adjust_cfg=run_args.get("static_adjust_cfg"),
                     render_video=bool(run_args.get("render_video", True)),
+                    flow_device=run_args.get("flow_device"),
                 )
             )
     manifest = {
