@@ -12,6 +12,7 @@ from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step7b_tracklet_repair
 from src.exp_july.perception import step8_relative_object_motion
+from src.exp_july.perception import step8_visual_relative_motion
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -109,6 +110,8 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     repaired_state = step7b_tracklet_repair(position_state, ego_state)
     # Step 8: compute relative object motion.
     relative_motion_state = step8_relative_object_motion(position_state, repaired_state)
+    # Step 8 visual: render per-track relative motion videos.
+    relative_motion_state = step8_visual_relative_motion(relative_motion_state)
     if max_step <= 8:
         return relative_motion_state
     # Step 9: segment videos into temporal chunks.
