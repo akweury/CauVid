@@ -13,6 +13,7 @@ from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step7b_tracklet_repair
 from src.exp_july.perception import step8_relative_object_motion
 from src.exp_july.perception import step8_visual_relative_motion
+from src.exp_july.perception import step8b_causal_filter_out
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -110,7 +111,9 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     repaired_state = step7b_tracklet_repair(position_state, ego_state)
     # Step 8: compute relative object motion.
     relative_motion_state = step8_relative_object_motion(position_state, repaired_state)
-    # Step 8 visual: render per-track relative motion videos.
+    # Step 8B: validate trajectory motion facts and decide symbolic-layer eligibility.
+    relative_motion_state = step8b_causal_filter_out(ego_state, relative_motion_state)
+    # Step 8 visual: render per-track relative motion videos with causal filter decisions.
     relative_motion_state = step8_visual_relative_motion(relative_motion_state)
     if max_step <= 8:
         return relative_motion_state
@@ -118,6 +121,7 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     segment_state = step9_temporal_segmentation(ego_state, relative_motion_state)
     if max_step <= 9:
         return segment_state
+
     # Step 10: summarize object motion per segment.
     segment_motion_state = step10_segment_object_motion(segment_state)
     if max_step <= 10:

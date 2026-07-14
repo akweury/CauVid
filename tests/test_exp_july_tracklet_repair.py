@@ -46,6 +46,7 @@ _PIPELINE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_PIPELINE)
 _repair_video_tracklets = _PIPELINE._repair_video_tracklets
 _relative_motion_video = _PIPELINE._relative_motion_video
+_trajectory_motion_evidence_video = _PIPELINE._trajectory_motion_evidence_video
 
 
 def _frame(frame_index, boxes=None, scores=None, labels=None, track_ids=None, positions_3d=None):
@@ -163,3 +164,129 @@ def test_relative_motion_marks_observed_and_repaired_sources_with_frame_labels()
     assert second["motion_state"] == "repaired_with_rel_motion"
     assert second["frame_label"] == "car"
     assert abs(second["rel_vx"] - 0.9) < 1e-9
+
+
+def test_trajectory_motion_evidence_aggregates_frame_level_motion():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.8], ["car"], [7], [[0, 0, 10]]),
+            _frame(1, [[5, 0, 15, 10]], [0.7], ["car"], [7], [[1, 0, 9]]),
+        ],
+    }
+    video["frames"][1]["sources"] = ["tracklet_repair"]
+    video["frames"][1]["objects"][0]["source"] = "tracklet_repair"
+    video["frames"][1]["objects"][0]["source_type"] = "interpolated_tracklet"
+    video["frames"][1]["objects"][0]["position_3d"] = [1, 0, 9]
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+    relative = _relative_motion_video(video, ego)
+
+    evidence = _trajectory_motion_evidence_video(relative, ego)
+
+    assert evidence["evidence_type"] == "trajectory_motion_evidence"
+    assert evidence["num_trajectories"] == 1
+    trajectory = evidence["trajectory_motion_evidence"][0]
+    assert trajectory["track_id"] == 7
+    assert len(trajectory["trajectory_observations"]) == 2
+    assert trajectory["trajectory_observations"][0]["bbox"] == [0.0, 0.0, 10.0, 10.0]
+    assert trajectory["trajectory_observations"][1]["provenance"]["source"] == "repaired"
+    stats = trajectory["trajectory_statistics"]
+    assert stats["num_observations"] == 2
+    assert stats["frame_span"] == 2
+    assert stats["repaired_count"] == 1
+    assert stats["observed_count"] == 1
+    assert abs(stats["position_z_depth"]["delta"] + 1.0) < 1e-9
+    assert abs(stats["rel_speed"]["mean"] - (2 ** 0.5)) < 1e-9
+    assert "uncertainty_score" in trajectory["uncertainty"]
+    validation = trajectory["causal_motion_fact_validation"]
+    assert validation["validation_status"] == "repaired"
+    assert validation["repaired"] is True
+    assert trajectory["fact_decision_status"] == "Repair"
+    assert trajectory["fact_decision"]["symbolic_layer_eligible"] is True
+
+
+def test_trajectory_motion_validation_detects_id_switch_label_change():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.9], ["car"], [7], [[0, 0, 10]]),
+            _frame(1, [[1, 0, 11, 10]], [0.9], ["truck"], [7], [[0.2, 0, 10]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+
+    evidence = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)
+
+    validation = evidence["trajectory_motion_evidence"][0]["causal_motion_fact_validation"]
+    assert validation["validation_status"] == "invalid"
+    assert validation["invalid"] is True
+    assert "id_switch" in validation["rejection_reasons"]
+    trajectory = evidence["trajectory_motion_evidence"][0]
+    assert trajectory["fact_decision_status"] == "Discard"
+    assert trajectory["fact_decision"]["symbolic_layer_eligible"] is False
+
+
+def test_motion_significance_marks_static_short_track_low():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.9], ["car"], [7], [[0, 0, 10]]),
+            _frame(1, [[0, 0, 10, 10]], [0.9], ["car"], [7], [[0.01, 0, 10.01]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+
+    trajectory = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)["trajectory_motion_evidence"][0]
+
+    assessment = trajectory["motion_significance_assessment"]
+    assert trajectory["motion_significance"] == "low_significance"
+    assert assessment["is_low_significance"] is True
+    assert {reason["kind"] for reason in assessment["reasons"]} & {"extremely_short_trajectory", "nearly_static", "below_estimated_noise"}
+    assert trajectory["fact_decision_status"] == "Keep with uncertainty"
+    assert trajectory["fact_decision"]["symbolic_layer_eligible"] is True
+
+
+def test_motion_significance_marks_stable_motion_high():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.95], ["car"], [7], [[0, 0, 10]]),
+            _frame(1, [[4, 0, 14, 10]], [0.95], ["car"], [7], [[0.4, 0, 9.7]]),
+            _frame(2, [[8, 0, 18, 10]], [0.95], ["car"], [7], [[0.8, 0, 9.4]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 2, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+
+    trajectory = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)["trajectory_motion_evidence"][0]
+
+    assert trajectory["causal_motion_fact_validation"]["validation_status"] == "valid"
+    assessment = trajectory["motion_significance_assessment"]
+    assert trajectory["motion_significance"] == "high_significance"
+    assert assessment["is_high_significance"] is True
+    assert trajectory["fact_decision_status"] == "Keep"
+    assert trajectory["fact_decision"]["symbolic_layer_eligible"] is True

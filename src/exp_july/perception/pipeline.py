@@ -3,6 +3,7 @@ import json
 import math
 import os
 import sys
+from collections import Counter
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 import io
@@ -48,6 +49,42 @@ _RELATIVE_MOTION_VIS_VERSION = 1
 _VIS_OBSERVED_COLOR = (70, 220, 70)
 _VIS_REPAIRED_COLOR = (220, 60, 255)
 _VIS_ABSENT_COLOR = (58, 58, 58)
+_VIS_DECISION_COLORS = {
+    "Keep": (80, 220, 80),
+    "Keep with uncertainty": (80, 200, 255),
+    "Repair": (220, 60, 255),
+    "Discard": (40, 40, 230),
+}
+_CAUSAL_FILTER_OUT_VERSION = 1
+_TRAJECTORY_VALIDATION_THRESHOLDS = {
+    "max_valid_frame_gap": 3,
+    "max_uncertain_frame_gap": 1,
+    "max_invalid_center_step_diag_ratio": 2.0,
+    "max_uncertain_center_step_diag_ratio": 1.0,
+    "max_invalid_bbox_size_ratio": 3.0,
+    "max_uncertain_bbox_size_ratio": 2.0,
+    "max_invalid_depth_step_per_frame": 8.0,
+    "max_uncertain_depth_step_per_frame": 4.0,
+    "max_invalid_rel_velocity_delta": 10.0,
+    "max_uncertain_rel_velocity_delta": 5.0,
+    "max_invalid_rel_speed": 25.0,
+    "max_uncertain_rel_speed": 12.0,
+    "min_motion_ratio": 0.5,
+}
+_MOTION_SIGNIFICANCE_THRESHOLDS = {
+    "min_observations": 3,
+    "min_has_motion_ratio": 0.6,
+    "max_repaired_ratio": 0.5,
+    "max_uncertainty_score": 0.55,
+    "min_rel_speed_mean": 0.05,
+    "min_rel_speed_max": 0.12,
+    "min_path_length_xz": 0.25,
+    "min_displacement_xz": 0.15,
+    "min_depth_abs_delta": 0.15,
+    "min_bbox_center_path_px": 3.0,
+    "noise_rel_speed": 0.05,
+    "noise_position_xz_step": 0.03,
+}
 
 
 def get_pipeline_output_root():
@@ -740,6 +777,7 @@ def _render_relative_motion_track_video(
     frame_indices,
     output_path,
     fps=10.0,
+    trajectory_evidence=None,
 ):
     try:
         import cv2
@@ -765,7 +803,7 @@ def _render_relative_motion_track_video(
         return None, "missing_frame_images"
 
     frame_h, frame_w = first_img.shape[:2]
-    panel_h = max(112, int(frame_h * 0.18))
+    panel_h = max(170, int(frame_h * 0.26))
     total_h = frame_h + panel_h
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -782,6 +820,13 @@ def _render_relative_motion_track_video(
     font = cv2.FONT_HERSHEY_SIMPLEX
     video_id = str(relative_motion_video_result.get("video_id", ""))
     label = str(track_data.get("label", "unknown"))
+    trajectory_evidence = dict(trajectory_evidence or {})
+    fact_decision = dict(trajectory_evidence.get("fact_decision", {}))
+    decision_status = str(fact_decision.get("decision", trajectory_evidence.get("fact_decision_status", "not_available")))
+    validation_status = str(trajectory_evidence.get("validation_status", "not_available"))
+    motion_significance = str(trajectory_evidence.get("motion_significance", "not_available"))
+    symbolic_eligible = bool(trajectory_evidence.get("symbolic_layer_eligible", False))
+    decision_color = _VIS_DECISION_COLORS.get(decision_status, (180, 180, 180))
 
     try:
         for frame_index in frame_indices:
@@ -812,10 +857,10 @@ def _render_relative_motion_track_video(
                     _put_text_with_background(
                         cv2,
                         img,
-                        f"track {track_id} | {label} | {source_label}",
+                        f"track {track_id} | {label} | {source_label} | {decision_status}",
                         (max(8, x1), text_y),
                         0.72,
-                        source_color,
+                        decision_color if decision_status == "Discard" else source_color,
                         2,
                     )
 
@@ -825,10 +870,11 @@ def _render_relative_motion_track_video(
 
             panel = cv2.resize(first_img[:1, :1], (frame_w, panel_h))
             panel[:] = (24, 24, 24)
+            cv2.rectangle(panel, (0, 0), (frame_w, 8), decision_color, -1)
             cv2.putText(
                 panel,
                 f"relative motion: {motion_state}",
-                (18, 30),
+                (18, 34),
                 font,
                 0.7,
                 (235, 235, 235),
@@ -843,13 +889,20 @@ def _render_relative_motion_track_video(
                 )
             else:
                 metrics = "source=absent"
-            cv2.putText(panel, metrics, (18, 58), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (18, 72), (42, 88), _VIS_OBSERVED_COLOR, -1)
-            cv2.putText(panel, "observed", (48, 87), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (142, 72), (166, 88), _VIS_REPAIRED_COLOR, -1)
-            cv2.putText(panel, "repaired", (172, 87), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (266, 72), (290, 88), _VIS_ABSENT_COLOR, -1)
-            cv2.putText(panel, "absent", (296, 87), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.putText(panel, metrics, (18, 62), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
+            decision_text = (
+                f"causal filter: {decision_status} | validation={validation_status} | "
+                f"significance={motion_significance} | symbolic={str(symbolic_eligible).lower()}"
+            )
+            cv2.putText(panel, decision_text, (18, 88), font, 0.56, decision_color, 2, cv2.LINE_AA)
+            cv2.rectangle(panel, (18, 104), (42, 120), _VIS_OBSERVED_COLOR, -1)
+            cv2.putText(panel, "observed", (48, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (142, 104), (166, 120), _VIS_REPAIRED_COLOR, -1)
+            cv2.putText(panel, "repaired", (172, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (266, 104), (290, 120), _VIS_ABSENT_COLOR, -1)
+            cv2.putText(panel, "absent", (296, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (382, 104), (406, 120), decision_color, -1)
+            cv2.putText(panel, decision_status, (412, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
             _draw_track_progress_bar(cv2, panel, frame_indices, frame_index, track_frames, frame_w)
             writer.write(cv2.vconcat([img, panel]))
     finally:
@@ -858,12 +911,14 @@ def _render_relative_motion_track_video(
     return str(output_path), "rendered"
 
 
-def _render_relative_motion_track_videos(relative_motion_video_result, output_root, fps=10.0):
+def _render_relative_motion_track_videos(relative_motion_video_result, output_root, fps=10.0, trajectory_evidence_by_track=None):
     frame_indices, tracks = _relative_motion_track_index(relative_motion_video_result)
     video_id = str(relative_motion_video_result.get("video_id", ""))
+    trajectory_evidence_by_track = dict(trajectory_evidence_by_track or {})
     rendered = []
     skipped = []
     for track_id, track_data in sorted(tracks.items()):
+        trajectory_evidence = dict(trajectory_evidence_by_track.get(int(track_id), {}))
         output_path = Path(output_root) / video_id / f"track_{track_id:04d}_relative_motion.mp4"
         path, status = _render_relative_motion_track_video(
             relative_motion_video_result=relative_motion_video_result,
@@ -872,6 +927,7 @@ def _render_relative_motion_track_videos(relative_motion_video_result, output_ro
             frame_indices=frame_indices,
             output_path=output_path,
             fps=fps,
+            trajectory_evidence=trajectory_evidence,
         )
         row = {
             "video_id": video_id,
@@ -879,6 +935,10 @@ def _render_relative_motion_track_videos(relative_motion_video_result, output_ro
             "label": str(track_data.get("label", "unknown")),
             "num_present_frames": len(track_data.get("frames", {})),
             "status": status,
+            "fact_decision_status": str(trajectory_evidence.get("fact_decision_status", "")),
+            "validation_status": str(trajectory_evidence.get("validation_status", "")),
+            "motion_significance": str(trajectory_evidence.get("motion_significance", "")),
+            "symbolic_layer_eligible": bool(trajectory_evidence.get("symbolic_layer_eligible", False)),
         }
         if path:
             row["visualization_path"] = path
@@ -886,6 +946,756 @@ def _render_relative_motion_track_videos(relative_motion_video_result, output_ro
         else:
             skipped.append(row)
     return rendered, skipped
+
+
+def _numeric_stats(values):
+    vals = [_safe_float(value) for value in values if value is not None and math.isfinite(_safe_float(value))]
+    if not vals:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "first": 0.0,
+            "last": 0.0,
+            "delta": 0.0,
+            "abs_delta": 0.0,
+            "mean_abs_step": 0.0,
+            "max_abs_step": 0.0,
+        }
+    mean = sum(vals) / len(vals)
+    variance = sum((value - mean) ** 2 for value in vals) / len(vals)
+    abs_steps = [abs(right - left) for left, right in zip(vals, vals[1:])]
+    return {
+        "count": len(vals),
+        "min": float(min(vals)),
+        "max": float(max(vals)),
+        "mean": float(mean),
+        "std": float(math.sqrt(variance)),
+        "first": float(vals[0]),
+        "last": float(vals[-1]),
+        "delta": float(vals[-1] - vals[0]),
+        "abs_delta": float(abs(vals[-1] - vals[0])),
+        "mean_abs_step": float(sum(abs_steps) / len(abs_steps)) if abs_steps else 0.0,
+        "max_abs_step": float(max(abs_steps)) if abs_steps else 0.0,
+    }
+
+
+def _bbox_features(box):
+    bbox = _valid_bbox(box)
+    if bbox is None:
+        return {
+            "width": 0.0,
+            "height": 0.0,
+            "area": 0.0,
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "diag": 0.0,
+        }
+    width, height = _bbox_size(bbox)
+    center_x, center_y = _bbox_center(bbox)
+    return {
+        "width": float(width),
+        "height": float(height),
+        "area": float(_bbox_area(bbox)),
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "diag": float(_bbox_diag(bbox)),
+    }
+
+
+def _source_kind_from_motion_object(obj):
+    source = str(obj.get("source", "")).strip().lower()
+    source_type = str(obj.get("source_type", "")).strip().lower()
+    if bool(obj.get("is_repaired", False)) or source == "repaired" or source_type == "interpolated_tracklet":
+        return "repaired"
+    if source == "merged" or "merged" in source_type:
+        return "merged"
+    return "observed"
+
+
+def _trajectory_observation_from_motion_object(frame_index, obj):
+    bbox = list(obj.get("bbox", obj.get("box", [])))
+    position_3d = list(obj.get("position_3d", obj.get("relative_position_3d", [])))
+    source_kind = _source_kind_from_motion_object(obj)
+    score = _safe_float(obj.get("score", 0.0), 0.0)
+    has_rel_motion = bool(obj.get("has_rel_motion", False))
+    source_uncertainty = 0.0
+    if source_kind == "repaired":
+        source_uncertainty += 0.35
+    elif source_kind == "merged":
+        source_uncertainty += 0.2
+    if not has_rel_motion:
+        source_uncertainty += 0.25
+    if score > 0.0:
+        source_uncertainty += max(0.0, 1.0 - score) * 0.2
+    return {
+        "frame_index": int(frame_index),
+        "object_index": int(obj.get("object_index", -1)),
+        "frame_label": str(obj.get("frame_label", obj.get("label", "unknown"))),
+        "bbox": bbox,
+        "position_3d": position_3d,
+        "motion": {
+            "obj_vx": _safe_float(obj.get("obj_vx", 0.0)),
+            "obj_vz": _safe_float(obj.get("obj_vz", 0.0)),
+            "ego_vx": _safe_float(obj.get("ego_vx", 0.0)),
+            "ego_vz": _safe_float(obj.get("ego_vz", 0.0)),
+            "rel_vx": _safe_float(obj.get("rel_vx", 0.0)),
+            "rel_vz": _safe_float(obj.get("rel_vz", 0.0)),
+            "rel_speed": _safe_float(obj.get("rel_speed", 0.0)),
+            "has_rel_motion": has_rel_motion,
+            "motion_state": str(obj.get("motion_state", "unknown")),
+            "vx_state": str(obj.get("vx_state", "vx_unknown")),
+            "vz_state": str(obj.get("vz_state", "vz_unknown")),
+            "speed_state": str(obj.get("speed_state", "speed_unknown")),
+            "distance_meters": _safe_float(obj.get("distance_meters", position_3d[2] if len(position_3d) > 2 else 0.0)),
+            "distance_state": str(obj.get("distance_state", "unknown")),
+            "x_position_state": str(obj.get("x_position_state", "unknown")),
+        },
+        "provenance": {
+            "source": source_kind,
+            "source_type": str(obj.get("source_type", "")),
+            "is_observed": source_kind == "observed",
+            "is_repaired": source_kind == "repaired",
+            "is_merged": source_kind == "merged",
+            "detection_id": str(obj.get("detection_id", "")),
+            "bbox_id": str(obj.get("bbox_id", "")),
+            "source_detection_ids": list(obj.get("source_detection_ids", [])),
+            "bbox_ids": list(obj.get("bbox_ids", [])),
+            "repair_provenance": dict(obj.get("repair_provenance", {})),
+        },
+        "uncertainty": {
+            "score": float(score),
+            "source_uncertainty": float(min(1.0, source_uncertainty)),
+            "has_rel_motion": has_rel_motion,
+        },
+    }
+
+
+def _trajectory_statistics(observations, video_num_frames):
+    frame_indices = [int(obs["frame_index"]) for obs in observations]
+    frame_gaps = [right - left for left, right in zip(frame_indices, frame_indices[1:])]
+    positions = [list(obs.get("position_3d", [])) for obs in observations]
+    valid_positions = [pos for pos in positions if len(pos) >= 3]
+    bboxes = [list(obs.get("bbox", [])) for obs in observations]
+    bbox_rows = [_bbox_features(box) for box in bboxes]
+    motions = [dict(obs.get("motion", {})) for obs in observations]
+
+    path_length_3d = 0.0
+    path_length_xz = 0.0
+    for left, right in zip(valid_positions, valid_positions[1:]):
+        dx = _safe_float(right[0]) - _safe_float(left[0])
+        dy = _safe_float(right[1]) - _safe_float(left[1])
+        dz = _safe_float(right[2]) - _safe_float(left[2])
+        path_length_3d += math.sqrt(dx * dx + dy * dy + dz * dz)
+        path_length_xz += math.sqrt(dx * dx + dz * dz)
+    displacement_3d = 0.0
+    displacement_xz = 0.0
+    if len(valid_positions) >= 2:
+        first = valid_positions[0]
+        last = valid_positions[-1]
+        dx = _safe_float(last[0]) - _safe_float(first[0])
+        dy = _safe_float(last[1]) - _safe_float(first[1])
+        dz = _safe_float(last[2]) - _safe_float(first[2])
+        displacement_3d = math.sqrt(dx * dx + dy * dy + dz * dz)
+        displacement_xz = math.sqrt(dx * dx + dz * dz)
+
+    center_path_px = 0.0
+    centers = [(row["center_x"], row["center_y"]) for row in bbox_rows]
+    for left, right in zip(centers, centers[1:]):
+        center_path_px += math.hypot(right[0] - left[0], right[1] - left[1])
+    center_displacement_px = 0.0
+    if len(centers) >= 2:
+        center_displacement_px = math.hypot(centers[-1][0] - centers[0][0], centers[-1][1] - centers[0][1])
+
+    source_counts = Counter(str(obs.get("provenance", {}).get("source", "observed")) for obs in observations)
+    motion_state_counts = Counter(str(motion.get("motion_state", "unknown")) for motion in motions)
+    label_counts = Counter(str(obs.get("frame_label", "unknown")) for obs in observations)
+    num_observations = len(observations)
+    frame_span = (max(frame_indices) - min(frame_indices) + 1) if frame_indices else 0
+    rel_motion_count = sum(1 for motion in motions if bool(motion.get("has_rel_motion", False)))
+
+    return {
+        "num_observations": int(num_observations),
+        "frame_start": int(min(frame_indices)) if frame_indices else -1,
+        "frame_end": int(max(frame_indices)) if frame_indices else -1,
+        "frame_span": int(frame_span),
+        "video_num_frames": int(video_num_frames),
+        "temporal_coverage_in_span": float(num_observations / max(1, frame_span)),
+        "temporal_coverage_in_video": float(num_observations / max(1, int(video_num_frames))),
+        "num_temporal_gaps": int(sum(1 for gap in frame_gaps if gap > 1)),
+        "max_frame_gap": int(max(frame_gaps) if frame_gaps else 0),
+        "mean_frame_gap": float(sum(frame_gaps) / len(frame_gaps)) if frame_gaps else 0.0,
+        "has_motion_ratio": float(rel_motion_count / max(1, num_observations)),
+        "label_counts": dict(sorted(label_counts.items())),
+        "primary_label": label_counts.most_common(1)[0][0] if label_counts else "unknown",
+        "source_counts": dict(sorted(source_counts.items())),
+        "observed_count": int(source_counts.get("observed", 0)),
+        "repaired_count": int(source_counts.get("repaired", 0)),
+        "merged_count": int(source_counts.get("merged", 0)),
+        "observed_ratio": float(source_counts.get("observed", 0) / max(1, num_observations)),
+        "repaired_ratio": float(source_counts.get("repaired", 0) / max(1, num_observations)),
+        "merged_ratio": float(source_counts.get("merged", 0) / max(1, num_observations)),
+        "position_x": _numeric_stats([pos[0] for pos in valid_positions]),
+        "position_y": _numeric_stats([pos[1] for pos in valid_positions]),
+        "position_z_depth": _numeric_stats([pos[2] for pos in valid_positions]),
+        "depth_change": _numeric_stats([motion.get("distance_meters", 0.0) for motion in motions]),
+        "path_length_3d": float(path_length_3d),
+        "path_length_xz": float(path_length_xz),
+        "displacement_3d": float(displacement_3d),
+        "displacement_xz": float(displacement_xz),
+        "bbox_width": _numeric_stats([row["width"] for row in bbox_rows]),
+        "bbox_height": _numeric_stats([row["height"] for row in bbox_rows]),
+        "bbox_area": _numeric_stats([row["area"] for row in bbox_rows]),
+        "bbox_center_x": _numeric_stats([row["center_x"] for row in bbox_rows]),
+        "bbox_center_y": _numeric_stats([row["center_y"] for row in bbox_rows]),
+        "bbox_center_path_px": float(center_path_px),
+        "bbox_center_displacement_px": float(center_displacement_px),
+        "obj_vx": _numeric_stats([motion.get("obj_vx", 0.0) for motion in motions if bool(motion.get("has_rel_motion", False))]),
+        "obj_vz": _numeric_stats([motion.get("obj_vz", 0.0) for motion in motions if bool(motion.get("has_rel_motion", False))]),
+        "rel_vx": _numeric_stats([motion.get("rel_vx", 0.0) for motion in motions if bool(motion.get("has_rel_motion", False))]),
+        "rel_vz": _numeric_stats([motion.get("rel_vz", 0.0) for motion in motions if bool(motion.get("has_rel_motion", False))]),
+        "rel_speed": _numeric_stats([motion.get("rel_speed", 0.0) for motion in motions if bool(motion.get("has_rel_motion", False))]),
+        "motion_state_counts": dict(sorted(motion_state_counts.items())),
+    }
+
+
+def _trajectory_uncertainty(observations, statistics):
+    scores = [obs.get("uncertainty", {}).get("score", 0.0) for obs in observations]
+    source_uncertainties = [obs.get("uncertainty", {}).get("source_uncertainty", 0.0) for obs in observations]
+    score_stats = _numeric_stats(scores)
+    repaired_ratio = _safe_float(statistics.get("repaired_ratio", 0.0))
+    merged_ratio = _safe_float(statistics.get("merged_ratio", 0.0))
+    missing_motion_ratio = 1.0 - _safe_float(statistics.get("has_motion_ratio", 0.0))
+    gap_penalty = min(1.0, _safe_float(statistics.get("num_temporal_gaps", 0)) / max(1.0, _safe_float(statistics.get("num_observations", 1))))
+    low_score_penalty = max(0.0, 1.0 - _safe_float(score_stats.get("mean", 0.0))) if score_stats.get("count", 0) else 0.3
+    source_uncertainty_mean = _safe_float(_numeric_stats(source_uncertainties).get("mean", 0.0))
+    uncertainty_score = min(
+        1.0,
+        0.25 * repaired_ratio
+        + 0.15 * merged_ratio
+        + 0.25 * missing_motion_ratio
+        + 0.15 * gap_penalty
+        + 0.1 * low_score_penalty
+        + 0.1 * source_uncertainty_mean,
+    )
+    return {
+        "score_stats": score_stats,
+        "repaired_ratio": float(repaired_ratio),
+        "merged_ratio": float(merged_ratio),
+        "missing_motion_ratio": float(missing_motion_ratio),
+        "temporal_gap_penalty": float(gap_penalty),
+        "source_uncertainty_mean": float(source_uncertainty_mean),
+        "uncertainty_score": float(uncertainty_score),
+        "confidence_score": float(max(0.0, 1.0 - uncertainty_score)),
+        "notes": [
+            "Scores are detector/interpolation confidence proxies when available.",
+            "Uncertainty is heuristic and intended for causal fact validation, not final filtering.",
+        ],
+    }
+
+
+def _ratio_larger_to_smaller(value_a, value_b):
+    a = max(1e-6, abs(_safe_float(value_a)))
+    b = max(1e-6, abs(_safe_float(value_b)))
+    return float(max(a, b) / min(a, b))
+
+
+def _trajectory_step_metrics(observations):
+    metrics = {
+        "frame_gaps": [],
+        "bbox_center_step_px_per_frame": [],
+        "bbox_center_step_diag_ratio": [],
+        "bbox_width_ratio": [],
+        "bbox_height_ratio": [],
+        "bbox_area_ratio": [],
+        "depth_step_per_frame": [],
+        "position_xz_step_per_frame": [],
+        "rel_velocity_delta": [],
+        "rel_speed_delta": [],
+        "direction_reversal_count": 0,
+    }
+    ordered = sorted(observations, key=lambda row: int(row.get("frame_index", -1)))
+    for left, right in zip(ordered, ordered[1:]):
+        left_frame = int(left.get("frame_index", -1))
+        right_frame = int(right.get("frame_index", -1))
+        frame_gap = max(1, right_frame - left_frame)
+        metrics["frame_gaps"].append(frame_gap)
+
+        left_bbox = _bbox_features(left.get("bbox", []))
+        right_bbox = _bbox_features(right.get("bbox", []))
+        center_step = math.hypot(
+            right_bbox["center_x"] - left_bbox["center_x"],
+            right_bbox["center_y"] - left_bbox["center_y"],
+        ) / float(frame_gap)
+        avg_diag = max(1.0, (left_bbox["diag"] + right_bbox["diag"]) / 2.0)
+        metrics["bbox_center_step_px_per_frame"].append(float(center_step))
+        metrics["bbox_center_step_diag_ratio"].append(float(center_step / avg_diag))
+        metrics["bbox_width_ratio"].append(_ratio_larger_to_smaller(left_bbox["width"], right_bbox["width"]))
+        metrics["bbox_height_ratio"].append(_ratio_larger_to_smaller(left_bbox["height"], right_bbox["height"]))
+        metrics["bbox_area_ratio"].append(_ratio_larger_to_smaller(left_bbox["area"], right_bbox["area"]))
+
+        left_pos = list(left.get("position_3d", []))
+        right_pos = list(right.get("position_3d", []))
+        if len(left_pos) >= 3 and len(right_pos) >= 3:
+            dx = _safe_float(right_pos[0]) - _safe_float(left_pos[0])
+            dz = _safe_float(right_pos[2]) - _safe_float(left_pos[2])
+            metrics["depth_step_per_frame"].append(float(abs(dz) / frame_gap))
+            metrics["position_xz_step_per_frame"].append(float(math.hypot(dx, dz) / frame_gap))
+
+        left_motion = dict(left.get("motion", {}))
+        right_motion = dict(right.get("motion", {}))
+        if bool(left_motion.get("has_rel_motion", False)) and bool(right_motion.get("has_rel_motion", False)):
+            left_v = (_safe_float(left_motion.get("rel_vx", 0.0)), _safe_float(left_motion.get("rel_vz", 0.0)))
+            right_v = (_safe_float(right_motion.get("rel_vx", 0.0)), _safe_float(right_motion.get("rel_vz", 0.0)))
+            left_speed = math.hypot(left_v[0], left_v[1])
+            right_speed = math.hypot(right_v[0], right_v[1])
+            metrics["rel_velocity_delta"].append(float(math.hypot(right_v[0] - left_v[0], right_v[1] - left_v[1])))
+            metrics["rel_speed_delta"].append(float(abs(right_speed - left_speed)))
+            if left_speed > _REL_SPEED_THRESHOLD and right_speed > _REL_SPEED_THRESHOLD:
+                dot = left_v[0] * right_v[0] + left_v[1] * right_v[1]
+                if dot < 0.0:
+                    metrics["direction_reversal_count"] += 1
+    return metrics
+
+
+def _validation_issue(kind, severity, message, value=None, threshold=None):
+    issue = {
+        "kind": str(kind),
+        "severity": str(severity),
+        "message": str(message),
+    }
+    if value is not None:
+        issue["value"] = value
+    if threshold is not None:
+        issue["threshold"] = threshold
+    return issue
+
+
+def _trajectory_reality_validation(observations, statistics, uncertainty):
+    thresholds = dict(_TRAJECTORY_VALIDATION_THRESHOLDS)
+    step_metrics = _trajectory_step_metrics(observations)
+    issues = []
+    label_counts = dict(statistics.get("label_counts", {}))
+    num_observations = int(statistics.get("num_observations", len(observations)))
+    max_frame_gap = int(statistics.get("max_frame_gap", 0))
+    has_motion_ratio = _safe_float(statistics.get("has_motion_ratio", 0.0))
+    repaired_count = int(statistics.get("repaired_count", 0))
+    merged_count = int(statistics.get("merged_count", 0))
+
+    if num_observations < 2:
+        issues.append(_validation_issue("trajectory_too_short", "uncertain", "Only one observation; continuity cannot be verified.", num_observations, 2))
+    if len(label_counts) > 1:
+        issues.append(_validation_issue("id_switch", "invalid", "Track contains multiple frame-level labels.", label_counts))
+    if max_frame_gap > int(thresholds["max_valid_frame_gap"]):
+        issues.append(_validation_issue("trajectory_discontinuity", "invalid", "Large frame gap inside trajectory.", max_frame_gap, thresholds["max_valid_frame_gap"]))
+    elif max_frame_gap > int(thresholds["max_uncertain_frame_gap"]):
+        issues.append(_validation_issue("trajectory_discontinuity", "uncertain", "Non-consecutive trajectory observations.", max_frame_gap, thresholds["max_uncertain_frame_gap"]))
+    if has_motion_ratio < float(thresholds["min_motion_ratio"]):
+        issues.append(_validation_issue("insufficient_motion_evidence", "uncertain", "Too few observations have relative motion.", has_motion_ratio, thresholds["min_motion_ratio"]))
+
+    max_center_ratio = max(step_metrics["bbox_center_step_diag_ratio"]) if step_metrics["bbox_center_step_diag_ratio"] else 0.0
+    if max_center_ratio > float(thresholds["max_invalid_center_step_diag_ratio"]):
+        issues.append(_validation_issue("track_drift", "invalid", "BBox center jump is too large relative to object size.", max_center_ratio, thresholds["max_invalid_center_step_diag_ratio"]))
+    elif max_center_ratio > float(thresholds["max_uncertain_center_step_diag_ratio"]):
+        issues.append(_validation_issue("track_drift", "uncertain", "BBox center motion is high relative to object size.", max_center_ratio, thresholds["max_uncertain_center_step_diag_ratio"]))
+
+    max_bbox_ratio = max(
+        step_metrics["bbox_width_ratio"] + step_metrics["bbox_height_ratio"] + step_metrics["bbox_area_ratio"]
+    ) if (step_metrics["bbox_width_ratio"] or step_metrics["bbox_height_ratio"] or step_metrics["bbox_area_ratio"]) else 1.0
+    if max_bbox_ratio > float(thresholds["max_invalid_bbox_size_ratio"]):
+        issues.append(_validation_issue("bbox_jump", "invalid", "BBox size or area changes abruptly.", max_bbox_ratio, thresholds["max_invalid_bbox_size_ratio"]))
+    elif max_bbox_ratio > float(thresholds["max_uncertain_bbox_size_ratio"]):
+        issues.append(_validation_issue("bbox_jump", "uncertain", "BBox size or area change is high.", max_bbox_ratio, thresholds["max_uncertain_bbox_size_ratio"]))
+
+    max_depth_step = max(step_metrics["depth_step_per_frame"]) if step_metrics["depth_step_per_frame"] else 0.0
+    if max_depth_step > float(thresholds["max_invalid_depth_step_per_frame"]):
+        issues.append(_validation_issue("depth_jump", "invalid", "Depth changes too abruptly.", max_depth_step, thresholds["max_invalid_depth_step_per_frame"]))
+    elif max_depth_step > float(thresholds["max_uncertain_depth_step_per_frame"]):
+        issues.append(_validation_issue("depth_jump", "uncertain", "Depth change is high.", max_depth_step, thresholds["max_uncertain_depth_step_per_frame"]))
+
+    max_velocity_delta = max(step_metrics["rel_velocity_delta"]) if step_metrics["rel_velocity_delta"] else 0.0
+    max_rel_speed = _safe_float(dict(statistics.get("rel_speed", {})).get("max", 0.0))
+    if max_velocity_delta > float(thresholds["max_invalid_rel_velocity_delta"]) or max_rel_speed > float(thresholds["max_invalid_rel_speed"]):
+        issues.append(
+            _validation_issue(
+                "speed_abnormal_change",
+                "invalid",
+                "Relative velocity delta or speed is too large.",
+                {"max_rel_velocity_delta": max_velocity_delta, "max_rel_speed": max_rel_speed},
+                {"max_rel_velocity_delta": thresholds["max_invalid_rel_velocity_delta"], "max_rel_speed": thresholds["max_invalid_rel_speed"]},
+            )
+        )
+    elif max_velocity_delta > float(thresholds["max_uncertain_rel_velocity_delta"]) or max_rel_speed > float(thresholds["max_uncertain_rel_speed"]):
+        issues.append(
+            _validation_issue(
+                "speed_abnormal_change",
+                "uncertain",
+                "Relative velocity delta or speed is high.",
+                {"max_rel_velocity_delta": max_velocity_delta, "max_rel_speed": max_rel_speed},
+                {"max_rel_velocity_delta": thresholds["max_uncertain_rel_velocity_delta"], "max_rel_speed": thresholds["max_uncertain_rel_speed"]},
+            )
+        )
+
+    direction_reversals = int(step_metrics["direction_reversal_count"])
+    if direction_reversals >= 2:
+        issues.append(_validation_issue("motion_direction_abrupt_change", "invalid", "Multiple relative motion direction reversals.", direction_reversals, 2))
+    elif direction_reversals == 1:
+        issues.append(_validation_issue("motion_direction_abrupt_change", "uncertain", "One relative motion direction reversal.", direction_reversals, 1))
+
+    invalid_issues = [issue for issue in issues if issue["severity"] == "invalid"]
+    uncertain_issues = [issue for issue in issues if issue["severity"] == "uncertain"]
+    if invalid_issues:
+        status = "invalid"
+    elif uncertain_issues:
+        status = "uncertain"
+    elif repaired_count > 0 or merged_count > 0:
+        status = "repaired"
+    else:
+        status = "valid"
+
+    checks = {
+        "id_switch": {"passed": len(label_counts) <= 1, "label_counts": label_counts},
+        "trajectory_discontinuity": {"passed": max_frame_gap <= int(thresholds["max_uncertain_frame_gap"]), "max_frame_gap": max_frame_gap},
+        "track_drift": {"passed": max_center_ratio <= float(thresholds["max_uncertain_center_step_diag_ratio"]), "max_bbox_center_step_diag_ratio": float(max_center_ratio)},
+        "bbox_depth_jump": {
+            "passed": (
+                max_bbox_ratio <= float(thresholds["max_uncertain_bbox_size_ratio"])
+                and max_depth_step <= float(thresholds["max_uncertain_depth_step_per_frame"])
+            ),
+            "max_bbox_size_ratio": float(max_bbox_ratio),
+            "max_depth_step_per_frame": float(max_depth_step),
+        },
+        "motion_direction_abrupt_change": {"passed": direction_reversals == 0, "direction_reversal_count": direction_reversals},
+        "speed_abnormal_change": {
+            "passed": (
+                max_velocity_delta <= float(thresholds["max_uncertain_rel_velocity_delta"])
+                and max_rel_speed <= float(thresholds["max_uncertain_rel_speed"])
+            ),
+            "max_rel_velocity_delta": float(max_velocity_delta),
+            "max_rel_speed": float(max_rel_speed),
+        },
+        "motion_evidence": {"passed": has_motion_ratio >= float(thresholds["min_motion_ratio"]), "has_motion_ratio": float(has_motion_ratio)},
+    }
+    return {
+        "status": status,
+        "validation_status": status,
+        "valid": status in {"valid", "repaired"},
+        "repaired": status == "repaired",
+        "uncertain": status == "uncertain",
+        "invalid": status == "invalid",
+        "issues": issues,
+        "rejection_reasons": [issue["kind"] for issue in invalid_issues],
+        "uncertain_reasons": [issue["kind"] for issue in uncertain_issues],
+        "checks": checks,
+        "step_metrics": {
+            "max_bbox_center_step_px_per_frame": float(max(step_metrics["bbox_center_step_px_per_frame"]) if step_metrics["bbox_center_step_px_per_frame"] else 0.0),
+            "max_bbox_center_step_diag_ratio": float(max_center_ratio),
+            "max_bbox_size_ratio": float(max_bbox_ratio),
+            "max_depth_step_per_frame": float(max_depth_step),
+            "max_rel_velocity_delta": float(max_velocity_delta),
+            "max_rel_speed": float(max_rel_speed),
+            "direction_reversal_count": direction_reversals,
+        },
+        "thresholds": thresholds,
+        "notes": "Heuristic continuity validation for causal motion fact validation.",
+    }
+
+
+def _motion_significance_assessment(statistics, provenance, uncertainty, validation):
+    thresholds = dict(_MOTION_SIGNIFICANCE_THRESHOLDS)
+    reasons = []
+    supporting_metrics = {}
+
+    validation_status = str(validation.get("validation_status", validation.get("status", "uncertain")))
+    num_observations = int(statistics.get("num_observations", 0))
+    has_motion_ratio = _safe_float(statistics.get("has_motion_ratio", 0.0))
+    repaired_ratio = _safe_float(provenance.get("repaired_ratio", statistics.get("repaired_ratio", 0.0)))
+    uncertainty_score = _safe_float(uncertainty.get("uncertainty_score", 1.0), 1.0)
+    rel_speed_mean = _safe_float(dict(statistics.get("rel_speed", {})).get("mean", 0.0))
+    rel_speed_max = _safe_float(dict(statistics.get("rel_speed", {})).get("max", 0.0))
+    path_length_xz = _safe_float(statistics.get("path_length_xz", 0.0))
+    displacement_xz = _safe_float(statistics.get("displacement_xz", 0.0))
+    depth_abs_delta = _safe_float(dict(statistics.get("position_z_depth", {})).get("abs_delta", 0.0))
+    bbox_center_path_px = _safe_float(statistics.get("bbox_center_path_px", 0.0))
+    position_xz_step_mean = _safe_float(dict(statistics.get("position_x", {})).get("mean_abs_step", 0.0)) + _safe_float(
+        dict(statistics.get("position_z_depth", {})).get("mean_abs_step", 0.0)
+    )
+
+    supporting_metrics.update(
+        {
+            "validation_status": validation_status,
+            "num_observations": num_observations,
+            "has_motion_ratio": float(has_motion_ratio),
+            "repaired_ratio": float(repaired_ratio),
+            "uncertainty_score": float(uncertainty_score),
+            "rel_speed_mean": float(rel_speed_mean),
+            "rel_speed_max": float(rel_speed_max),
+            "path_length_xz": float(path_length_xz),
+            "displacement_xz": float(displacement_xz),
+            "depth_abs_delta": float(depth_abs_delta),
+            "bbox_center_path_px": float(bbox_center_path_px),
+            "position_xz_step_mean_proxy": float(position_xz_step_mean),
+        }
+    )
+
+    if validation_status in {"invalid", "uncertain"}:
+        reasons.append(
+            {
+                "kind": "motion_not_reliably_validated",
+                "message": "Trajectory reality validation is not stable enough for high-significance motion facts.",
+                "value": validation_status,
+            }
+        )
+    if num_observations < int(thresholds["min_observations"]):
+        reasons.append(
+            {
+                "kind": "extremely_short_trajectory",
+                "message": "Trajectory has too few observations to support a stable motion fact.",
+                "value": num_observations,
+                "threshold": int(thresholds["min_observations"]),
+            }
+        )
+    if has_motion_ratio < float(thresholds["min_has_motion_ratio"]):
+        reasons.append(
+            {
+                "kind": "motion_unstable_or_missing",
+                "message": "Too few observations have usable relative motion.",
+                "value": float(has_motion_ratio),
+                "threshold": float(thresholds["min_has_motion_ratio"]),
+            }
+        )
+    if repaired_ratio > float(thresholds["max_repaired_ratio"]):
+        reasons.append(
+            {
+                "kind": "mostly_interpolated",
+                "message": "Most of the trajectory comes from repaired/interpolated observations.",
+                "value": float(repaired_ratio),
+                "threshold": float(thresholds["max_repaired_ratio"]),
+            }
+        )
+    if uncertainty_score > float(thresholds["max_uncertainty_score"]):
+        reasons.append(
+            {
+                "kind": "high_uncertainty",
+                "message": "Trajectory uncertainty is too high for a high-significance motion fact.",
+                "value": float(uncertainty_score),
+                "threshold": float(thresholds["max_uncertainty_score"]),
+            }
+        )
+
+    near_static = (
+        rel_speed_mean < float(thresholds["min_rel_speed_mean"])
+        and rel_speed_max < float(thresholds["min_rel_speed_max"])
+        and path_length_xz < float(thresholds["min_path_length_xz"])
+        and displacement_xz < float(thresholds["min_displacement_xz"])
+        and depth_abs_delta < float(thresholds["min_depth_abs_delta"])
+        and bbox_center_path_px < float(thresholds["min_bbox_center_path_px"])
+    )
+    below_noise = (
+        rel_speed_mean < float(thresholds["noise_rel_speed"])
+        and position_xz_step_mean < float(thresholds["noise_position_xz_step"])
+    )
+    if near_static:
+        reasons.append(
+            {
+                "kind": "nearly_static",
+                "message": "Trajectory motion is close to static across 3D, relative speed, and bbox evidence.",
+            }
+        )
+    if below_noise:
+        reasons.append(
+            {
+                "kind": "below_estimated_noise",
+                "message": "Motion magnitude is below the configured noise floor.",
+            }
+        )
+
+    high_motion_signal = (
+        rel_speed_mean >= float(thresholds["min_rel_speed_mean"])
+        or rel_speed_max >= float(thresholds["min_rel_speed_max"])
+        or path_length_xz >= float(thresholds["min_path_length_xz"])
+        or displacement_xz >= float(thresholds["min_displacement_xz"])
+        or depth_abs_delta >= float(thresholds["min_depth_abs_delta"])
+        or bbox_center_path_px >= float(thresholds["min_bbox_center_path_px"])
+    )
+    significance = "high_significance" if not reasons and high_motion_signal else "low_significance"
+    return {
+        "significance": significance,
+        "is_high_significance": significance == "high_significance",
+        "is_low_significance": significance == "low_significance",
+        "reasons": reasons,
+        "supporting_metrics": supporting_metrics,
+        "thresholds": thresholds,
+        "notes": "Motion significance is a label for information content; it does not remove trajectories.",
+    }
+
+
+def _fact_decision_for_trajectory(validation, significance, provenance, uncertainty):
+    validation_status = str(validation.get("validation_status", validation.get("status", "uncertain")))
+    motion_significance = str(significance.get("significance", "low_significance"))
+    confidence_score = _safe_float(uncertainty.get("confidence_score", 0.0), 0.0)
+    repaired_count = int(provenance.get("repaired_count", 0))
+    merged_count = int(provenance.get("merged_count", 0))
+    reasons = []
+
+    if validation_status == "invalid":
+        decision = "Discard"
+        symbolic_layer_eligible = False
+        reasons.append(
+            {
+                "kind": "invalid_trajectory",
+                "message": "Trajectory failed reality validation and should not enter the symbolic layer.",
+                "validation_reasons": list(validation.get("rejection_reasons", [])),
+            }
+        )
+    elif validation_status == "repaired" or repaired_count > 0 or merged_count > 0:
+        decision = "Repair"
+        symbolic_layer_eligible = True
+        reasons.append(
+            {
+                "kind": "repaired_trajectory_kept",
+                "message": "Trajectory contains repaired or merged evidence and is retained with repair provenance.",
+                "repaired_count": repaired_count,
+                "merged_count": merged_count,
+            }
+        )
+        if motion_significance == "low_significance":
+            reasons.append(
+                {
+                    "kind": "low_motion_significance",
+                    "message": "Trajectory is retained after repair but carries a low motion-significance label.",
+                    "significance_reasons": [row.get("kind", "") for row in significance.get("reasons", [])],
+                }
+            )
+    elif validation_status == "valid" and motion_significance == "high_significance":
+        decision = "Keep"
+        symbolic_layer_eligible = True
+        reasons.append(
+            {
+                "kind": "valid_high_significance",
+                "message": "Trajectory is realistic and has enough motion information.",
+            }
+        )
+    else:
+        decision = "Keep with uncertainty"
+        symbolic_layer_eligible = True
+        reasons.append(
+            {
+                "kind": "credible_but_uncertain",
+                "message": "Trajectory is not clearly invalid, but validation/significance/uncertainty is not strong enough for a plain Keep decision.",
+                "validation_status": validation_status,
+                "motion_significance": motion_significance,
+                "confidence_score": confidence_score,
+            }
+        )
+        if validation.get("uncertain_reasons"):
+            reasons.append(
+                {
+                    "kind": "validation_uncertainty",
+                    "message": "Trajectory reality validation reported uncertainty.",
+                    "uncertain_reasons": list(validation.get("uncertain_reasons", [])),
+                }
+            )
+        if significance.get("reasons"):
+            reasons.append(
+                {
+                    "kind": "significance_uncertainty",
+                    "message": "Motion significance assessment reported low-information or unstable motion evidence.",
+                    "significance_reasons": [row.get("kind", "") for row in significance.get("reasons", [])],
+                }
+            )
+
+    return {
+        "decision": decision,
+        "status": decision,
+        "symbolic_layer_eligible": bool(symbolic_layer_eligible),
+        "decision_reasons": reasons,
+        "provenance_summary": dict(provenance),
+        "supporting_status": {
+            "validation_status": validation_status,
+            "motion_significance": motion_significance,
+            "confidence_score": float(confidence_score),
+        },
+        "notes": "Final 8B fact decision for symbolic-layer admission; it preserves provenance and reasons for explanation.",
+    }
+
+
+def _trajectory_motion_evidence_video(relative_video, ego_video=None):
+    frame_indices, tracks = _relative_motion_track_index(relative_video)
+    video_num_frames = int(relative_video.get("num_frames", len(frame_indices)))
+    trajectories = []
+    for track_id, track_data in sorted(tracks.items()):
+        observations = [
+            _trajectory_observation_from_motion_object(frame_index, track_data["frames"][frame_index])
+            for frame_index in sorted(track_data.get("frames", {}))
+        ]
+        statistics = _trajectory_statistics(observations, video_num_frames)
+        uncertainty = _trajectory_uncertainty(observations, statistics)
+        validation = _trajectory_reality_validation(observations, statistics, uncertainty)
+        provenance = {
+            "source_counts": dict(statistics.get("source_counts", {})),
+            "observed_count": int(statistics.get("observed_count", 0)),
+            "repaired_count": int(statistics.get("repaired_count", 0)),
+            "merged_count": int(statistics.get("merged_count", 0)),
+            "observed_ratio": float(statistics.get("observed_ratio", 0.0)),
+            "repaired_ratio": float(statistics.get("repaired_ratio", 0.0)),
+            "merged_ratio": float(statistics.get("merged_ratio", 0.0)),
+        }
+        significance = _motion_significance_assessment(statistics, provenance, uncertainty, validation)
+        fact_decision = _fact_decision_for_trajectory(validation, significance, provenance, uncertainty)
+        trajectories.append(
+            {
+                "track_id": int(track_id),
+                "primary_label": str(statistics.get("primary_label", track_data.get("label", "unknown"))),
+                "trajectory_observations": observations,
+                "trajectory_statistics": statistics,
+                "provenance": provenance,
+                "uncertainty": uncertainty,
+                "causal_motion_fact_validation": validation,
+                "motion_significance_assessment": significance,
+                "fact_decision": fact_decision,
+                "validation_status": validation["validation_status"],
+                "motion_significance": significance["significance"],
+                "fact_decision_status": fact_decision["decision"],
+                "symbolic_layer_eligible": bool(fact_decision["symbolic_layer_eligible"]),
+            }
+        )
+    status_counts = Counter(str(row.get("validation_status", "uncertain")) for row in trajectories)
+    significance_counts = Counter(str(row.get("motion_significance", "low_significance")) for row in trajectories)
+    decision_counts = Counter(str(row.get("fact_decision_status", "Keep with uncertainty")) for row in trajectories)
+    return {
+        "version": _CAUSAL_FILTER_OUT_VERSION,
+        "evidence_type": "trajectory_motion_evidence",
+        "video_id": str(relative_video.get("video_id", "")),
+        "num_frames": video_num_frames,
+        "num_trajectories": len(trajectories),
+        "validation_status_counts": dict(sorted(status_counts.items())),
+        "motion_significance_counts": dict(sorted(significance_counts.items())),
+        "fact_decision_counts": dict(sorted(decision_counts.items())),
+        "num_valid_trajectories": int(status_counts.get("valid", 0)),
+        "num_repaired_trajectories": int(status_counts.get("repaired", 0)),
+        "num_uncertain_trajectories": int(status_counts.get("uncertain", 0)),
+        "num_invalid_trajectories": int(status_counts.get("invalid", 0)),
+        "num_high_significance_trajectories": int(significance_counts.get("high_significance", 0)),
+        "num_low_significance_trajectories": int(significance_counts.get("low_significance", 0)),
+        "num_keep_trajectories": int(decision_counts.get("Keep", 0)),
+        "num_keep_with_uncertainty_trajectories": int(decision_counts.get("Keep with uncertainty", 0)),
+        "num_repair_decision_trajectories": int(decision_counts.get("Repair", 0)),
+        "num_discard_trajectories": int(decision_counts.get("Discard", 0)),
+        "num_symbolic_layer_eligible_trajectories": sum(
+            1 for row in trajectories if bool(row.get("symbolic_layer_eligible", False))
+        ),
+        "num_observations": sum(len(row.get("trajectory_observations", [])) for row in trajectories),
+        "num_repaired_observations": sum(int(row.get("provenance", {}).get("repaired_count", 0)) for row in trajectories),
+        "num_observed_observations": sum(int(row.get("provenance", {}).get("observed_count", 0)) for row in trajectories),
+        "inputs": {
+            "has_ego_motion": bool(ego_video),
+            "has_relative_object_motion": True,
+        },
+        "trajectory_motion_evidence": trajectories,
+    }
 
 
 def load_json_if_exists(path):
@@ -1501,6 +2311,20 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
 
     output_root = get_pipeline_output_root() / "08visual_relative_motion_tracks"
     output_root.mkdir(parents=True, exist_ok=True)
+    evidence_by_video = {}
+    for evidence_video in relative_motion_state.get("trajectory_motion_evidence", []):
+        video_id = str(evidence_video.get("video_id", ""))
+        if not video_id:
+            continue
+        evidence_by_track = {}
+        for row in evidence_video.get("trajectory_motion_evidence", []):
+            try:
+                track_id = int(row.get("track_id", -1))
+            except (TypeError, ValueError):
+                continue
+            if track_id >= 0:
+                evidence_by_track[track_id] = dict(row)
+        evidence_by_video[video_id] = evidence_by_track
     all_rendered = []
     all_skipped = []
     progress = tqdm(relative_motion, desc="[step 8visual] relative_motion_tracks", unit="video")
@@ -1511,6 +2335,7 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
             relative_motion_video_result=video_result,
             output_root=output_root,
             fps=float(fps),
+            trajectory_evidence_by_track=evidence_by_video.get(video_id, {}),
         )
         all_rendered.extend(rendered)
         all_skipped.extend(skipped)
@@ -1521,6 +2346,7 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
         "fps": float(fps),
         "num_track_videos_rendered": len(all_rendered),
         "num_track_videos_skipped": len(all_skipped),
+        "uses_causal_filter_out": bool(evidence_by_video),
         "rendered": all_rendered,
         "skipped": all_skipped,
     }
@@ -1542,6 +2368,173 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
 
 def step9_temporal_segmentation(ego_state, relative_motion_state):
     return {"videos": ego_state["videos"], "temporal_segments": []}
+
+
+def step8b_causal_filter_out(ego_state, relative_motion_state):
+    videos = relative_motion_state.get("videos", ego_state.get("videos", []))
+    relative_motion = relative_motion_state.get("relative_object_motion", [])
+    output_root = get_pipeline_output_root() / "08b_driving_mini_causal_filter_out"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    ego_by_video = {
+        str(row.get("video_id", "")): row
+        for row in ego_state.get("ego_motion", [])
+        if str(row.get("video_id", ""))
+    }
+
+    trajectory_motion_evidence = []
+    for relative_video in relative_motion:
+        video_id = str(relative_video.get("video_id", ""))
+        evidence = _trajectory_motion_evidence_video(relative_video, ego_by_video.get(video_id))
+        num_objects_in = int(evidence.get("num_observations", 0))
+        num_tracks_in = int(evidence.get("num_trajectories", 0))
+        evidence.update(
+            {
+                "method": "causal_motion_fact_validation_evidence_build",
+                "status": "trajectory_reality_validated",
+                "description": (
+                    "Frame-level relative motion has been aggregated into trajectory-level "
+                    "evidence and checked for trajectory realism. Final object removal is not applied yet."
+                ),
+                "num_objects_in": int(num_objects_in),
+                "num_objects_kept": int(num_objects_in),
+                "num_objects_filtered": 0,
+                "num_tracks_in": int(num_tracks_in),
+                "num_tracks_kept": int(num_tracks_in),
+                "num_tracks_filtered": 0,
+                "kept_track_ids": [
+                    int(row.get("track_id", -1))
+                    for row in evidence.get("trajectory_motion_evidence", [])
+                    if int(row.get("track_id", -1)) >= 0
+                ],
+                "filtered_track_ids": [],
+                "filter_decisions": [],
+                "causal_reasoning": {
+                    "enabled": False,
+                    "method": "",
+                    "rules": [],
+                    "effects": [],
+                    "notes": "Trajectory realism validation is available; causal filtering rules are not implemented yet.",
+                },
+                "relative_object_motion": relative_video,
+                "filtered_relative_object_motion": relative_video,
+            }
+        )
+        evidence["trajectory_statistics_summary"] = {
+            "mean_confidence_score": _numeric_stats(
+                [
+                    row.get("uncertainty", {}).get("confidence_score", 0.0)
+                    for row in evidence.get("trajectory_motion_evidence", [])
+                ]
+            ).get("mean", 0.0),
+            "mean_repaired_ratio": _numeric_stats(
+                [
+                    row.get("provenance", {}).get("repaired_ratio", 0.0)
+                    for row in evidence.get("trajectory_motion_evidence", [])
+                ]
+            ).get("mean", 0.0),
+            "mean_temporal_coverage": _numeric_stats(
+                [
+                    row.get("trajectory_statistics", {}).get("temporal_coverage_in_span", 0.0)
+                    for row in evidence.get("trajectory_motion_evidence", [])
+                ]
+            ).get("mean", 0.0),
+        }
+        evidence["ego_temporal_signal_summary"] = {}
+        evidence["object_temporal_signal_summary"] = evidence["trajectory_statistics_summary"]
+        out_dir = output_root / video_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / "trajectory_motion_evidence.json").open("w", encoding="utf-8") as f:
+            json.dump(evidence, f, indent=2)
+        # Keep the older filename as an alias while 8B's downstream contract settles.
+        with (out_dir / "causal_filter_out.json").open("w", encoding="utf-8") as f:
+            json.dump(evidence, f, indent=2)
+        trajectory_motion_evidence.append(evidence)
+
+    manifest = {
+        "version": _CAUSAL_FILTER_OUT_VERSION,
+        "method": "causal_motion_fact_validation_evidence_build",
+        "evidence_type": "trajectory_motion_evidence",
+        "num_videos": len(trajectory_motion_evidence),
+        "num_trajectories": sum(int(row.get("num_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_valid_trajectories": sum(int(row.get("num_valid_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_repaired_trajectories": sum(int(row.get("num_repaired_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_uncertain_trajectories": sum(int(row.get("num_uncertain_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_invalid_trajectories": sum(int(row.get("num_invalid_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_high_significance_trajectories": sum(int(row.get("num_high_significance_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_low_significance_trajectories": sum(int(row.get("num_low_significance_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_keep_trajectories": sum(int(row.get("num_keep_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_keep_with_uncertainty_trajectories": sum(int(row.get("num_keep_with_uncertainty_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_repair_decision_trajectories": sum(int(row.get("num_repair_decision_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_discard_trajectories": sum(int(row.get("num_discard_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_symbolic_layer_eligible_trajectories": sum(int(row.get("num_symbolic_layer_eligible_trajectories", 0)) for row in trajectory_motion_evidence),
+        "num_observations": sum(int(row.get("num_observations", 0)) for row in trajectory_motion_evidence),
+        "num_repaired_observations": sum(int(row.get("num_repaired_observations", 0)) for row in trajectory_motion_evidence),
+        "num_observed_observations": sum(int(row.get("num_observed_observations", 0)) for row in trajectory_motion_evidence),
+        "num_objects_in": sum(int(row.get("num_objects_in", 0)) for row in trajectory_motion_evidence),
+        "num_objects_kept": sum(int(row.get("num_objects_kept", 0)) for row in trajectory_motion_evidence),
+        "num_objects_filtered": sum(int(row.get("num_objects_filtered", 0)) for row in trajectory_motion_evidence),
+        "num_tracks_in": sum(int(row.get("num_tracks_in", 0)) for row in trajectory_motion_evidence),
+        "num_tracks_kept": sum(int(row.get("num_tracks_kept", 0)) for row in trajectory_motion_evidence),
+        "num_tracks_filtered": sum(int(row.get("num_tracks_filtered", 0)) for row in trajectory_motion_evidence),
+        "videos": [
+            {
+                "video_id": row["video_id"],
+                "num_frames": row.get("num_frames", 0),
+                "num_trajectories": row.get("num_trajectories", 0),
+                "num_valid_trajectories": row.get("num_valid_trajectories", 0),
+                "num_repaired_trajectories": row.get("num_repaired_trajectories", 0),
+                "num_uncertain_trajectories": row.get("num_uncertain_trajectories", 0),
+                "num_invalid_trajectories": row.get("num_invalid_trajectories", 0),
+                "num_high_significance_trajectories": row.get("num_high_significance_trajectories", 0),
+                "num_low_significance_trajectories": row.get("num_low_significance_trajectories", 0),
+                "num_keep_trajectories": row.get("num_keep_trajectories", 0),
+                "num_keep_with_uncertainty_trajectories": row.get("num_keep_with_uncertainty_trajectories", 0),
+                "num_repair_decision_trajectories": row.get("num_repair_decision_trajectories", 0),
+                "num_discard_trajectories": row.get("num_discard_trajectories", 0),
+                "num_symbolic_layer_eligible_trajectories": row.get("num_symbolic_layer_eligible_trajectories", 0),
+                "num_observations": row.get("num_observations", 0),
+                "num_repaired_observations": row.get("num_repaired_observations", 0),
+                "num_observed_observations": row.get("num_observed_observations", 0),
+                "num_objects_filtered": row.get("num_objects_filtered", 0),
+                "num_tracks_filtered": row.get("num_tracks_filtered", 0),
+                "status": row.get("status", ""),
+            }
+            for row in trajectory_motion_evidence
+        ],
+    }
+    with (output_root / "trajectory_motion_evidence_manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    with (output_root / "causal_filter_out_manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(
+        f"[step 8b] trajectory_motion_evidence "
+        f"videos={len(trajectory_motion_evidence)} "
+        f"trajectories={manifest['num_trajectories']} "
+        f"valid={manifest['num_valid_trajectories']} "
+        f"repaired={manifest['num_repaired_trajectories']} "
+        f"uncertain={manifest['num_uncertain_trajectories']} "
+        f"invalid={manifest['num_invalid_trajectories']} "
+        f"high_sig={manifest['num_high_significance_trajectories']} "
+        f"low_sig={manifest['num_low_significance_trajectories']} "
+        f"keep={manifest['num_keep_trajectories']} "
+        f"keep_uncertain={manifest['num_keep_with_uncertainty_trajectories']} "
+        f"repair={manifest['num_repair_decision_trajectories']} "
+        f"discard={manifest['num_discard_trajectories']} "
+        f"observations={manifest['num_observations']} "
+        f"repaired_observations={manifest['num_repaired_observations']} "
+        f"filtered_objects={manifest['num_objects_filtered']}"
+    )
+    return {
+        **relative_motion_state,
+        "trajectory_motion_evidence": trajectory_motion_evidence,
+        "trajectory_motion_evidence_output_root": output_root,
+        "causal_filter_out": trajectory_motion_evidence,
+        "causal_filter_out_output_root": output_root,
+        "relative_object_motion": relative_motion,
+        "filtered_relative_object_motion": relative_motion,
+        "ego_motion": ego_state.get("ego_motion", []),
+    }
 
 
 def step10_segment_object_motion(segment_state):
