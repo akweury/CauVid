@@ -7,5 +7,6 @@ from src.exp_july.perception.pipeline import step7b_tracklet_repair
 from src.exp_july.perception.pipeline import step8_relative_object_motion
 from src.exp_july.perception.pipeline import step8_visual_relative_motion
 from src.exp_july.perception.pipeline import step8b_causal_filter_out
+from src.exp_july.perception.pipeline import step8c_prior_guided_ego_motion_refinement
 from src.exp_july.perception.pipeline import step9_temporal_segmentation
 from src.exp_july.perception.pipeline import step10_segment_object_motion

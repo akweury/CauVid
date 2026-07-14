@@ -55,6 +55,12 @@ _VIS_DECISION_COLORS = {
     "Repair": (220, 60, 255),
     "Discard": (40, 40, 230),
 }
+_VIS_EGO_METHOD_COLORS = {
+    "original": (220, 220, 220),
+    "weighted_median": (255, 190, 40),
+    "refined": (80, 220, 80),
+    "ransac": (60, 140, 255),
+}
 _CAUSAL_FILTER_OUT_VERSION = 1
 _TRAJECTORY_VALIDATION_THRESHOLDS = {
     "max_valid_frame_gap": 3,
@@ -84,6 +90,46 @@ _MOTION_SIGNIFICANCE_THRESHOLDS = {
     "min_bbox_center_path_px": 3.0,
     "noise_rel_speed": 0.05,
     "noise_position_xz_step": 0.03,
+}
+_EGO_REFINEMENT_VERSION = 1
+_STATIC_OBJECT_PRIOR = {
+    "traffic light": "static",
+    "traffic_light": "static",
+    "traffic sign": "static",
+    "traffic_sign": "static",
+    "stop sign": "static",
+    "stop_sign": "static",
+    "sign": "static",
+    "pole": "static",
+    "utility pole": "static",
+    "street light": "static",
+    "street_light": "static",
+    "building": "static",
+    "wall": "static",
+    "fence": "static",
+    "road": "static",
+    "lane": "static",
+    "crosswalk": "static",
+    "sidewalk": "static",
+    "parking meter": "static",
+    "parking_meter": "static",
+}
+_LOW_DYNAMIC_OBJECT_PRIOR = {
+    "parked car": "low_dynamic",
+    "parked_car": "low_dynamic",
+    "car": "low_dynamic",
+    "truck": "low_dynamic",
+    "bus": "low_dynamic",
+    "trailer": "low_dynamic",
+}
+_REFERENCE_OBJECT_THRESHOLDS = {
+    "min_observation_ratio": 0.25,
+    "max_uncertainty_score": 0.45,
+    "max_repaired_ratio": 0.5,
+    "max_rel_speed_mean_static": 0.12,
+    "max_rel_speed_mean_low_dynamic": 0.25,
+    "max_depth_abs_delta_static": 1.0,
+    "max_bbox_center_step_diag_ratio": 0.8,
 }
 
 
@@ -770,6 +816,384 @@ def _draw_track_progress_bar(cv2, panel, frame_indices, current_frame_index, tra
     cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (210, 210, 210), 1)
 
 
+def _ego_refinement_series(refined_ego_motion_video):
+    frame_rows = {
+        int(frame.get("frame_index", idx)): dict(frame)
+        for idx, frame in enumerate((refined_ego_motion_video or {}).get("frames", []))
+    }
+    return {
+        "method": str((refined_ego_motion_video or {}).get("method", "")),
+        "frames": frame_rows,
+        "methods": {
+            "original": {
+                "label": "original",
+                "vx_field": "original_ego_vx",
+                "vz_field": "original_ego_vz",
+                "color": _VIS_EGO_METHOD_COLORS["original"],
+            },
+            "weighted_median": {
+                "label": "median vote",
+                "vx_field": "reference_estimated_ego_vx",
+                "vz_field": "reference_estimated_ego_vz",
+                "color": _VIS_EGO_METHOD_COLORS["weighted_median"],
+            },
+            "refined": {
+                "label": "refined",
+                "vx_field": "refined_ego_vx",
+                "vz_field": "refined_ego_vz",
+                "color": _VIS_EGO_METHOD_COLORS["refined"],
+            },
+            "ransac": {
+                "label": "RANSAC",
+                "vx_field": "ransac_ego_vx",
+                "vz_field": "ransac_ego_vz",
+                "color": _VIS_EGO_METHOD_COLORS["ransac"],
+            },
+        },
+    }
+
+
+def _series_values_for_field(frame_indices, frame_rows, field):
+    values = []
+    available = False
+    for frame_index in frame_indices:
+        row = frame_rows.get(frame_index, {})
+        value = row.get(field)
+        if value is None:
+            values.append(None)
+            continue
+        available = True
+        values.append(_safe_float(value))
+    return values if available else []
+
+
+def _draw_line_chart(cv2, panel, title, frame_indices, current_frame_index, method_values, x, y, w, h):
+    cv2.rectangle(panel, (x, y), (x + w, y + h), (34, 34, 34), -1)
+    cv2.rectangle(panel, (x, y), (x + w, y + h), (90, 90, 90), 1)
+    cv2.putText(panel, title, (x + 6, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+    all_values = [
+        value
+        for series in method_values.values()
+        for value in series.get("values", [])
+        if value is not None
+    ]
+    if not all_values or not frame_indices:
+        cv2.putText(panel, "ego refinement unavailable", (x + 8, y + h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+        return
+    lo = min(all_values)
+    hi = max(all_values)
+    if abs(hi - lo) < 1e-6:
+        pad = max(0.1, abs(hi) * 0.25)
+        lo -= pad
+        hi += pad
+    else:
+        pad = (hi - lo) * 0.12
+        lo -= pad
+        hi += pad
+    plot_x = x + 8
+    plot_y = y + 22
+    plot_w = max(1, w - 16)
+    plot_h = max(1, h - 32)
+    n = max(1, len(frame_indices) - 1)
+
+    def point(idx, value):
+        px = plot_x + int(round(idx * plot_w / n))
+        py = plot_y + plot_h - int(round((value - lo) * plot_h / max(1e-6, hi - lo)))
+        return px, py
+
+    zero_y = None
+    if lo <= 0.0 <= hi:
+        zero_y = point(0, 0.0)[1]
+        cv2.line(panel, (plot_x, zero_y), (plot_x + plot_w, zero_y), (70, 70, 70), 1, cv2.LINE_AA)
+
+    for method_name, series in method_values.items():
+        values = series.get("values", [])
+        color = series.get("color", (220, 220, 220))
+        prev_pt = None
+        for idx, value in enumerate(values):
+            if value is None:
+                prev_pt = None
+                continue
+            pt = point(idx, value)
+            cv2.circle(panel, pt, 2, color, -1)
+            if prev_pt is not None:
+                cv2.line(panel, prev_pt, pt, color, 2, cv2.LINE_AA)
+            prev_pt = pt
+
+    current_pos = frame_indices.index(current_frame_index) if current_frame_index in frame_indices else 0
+    cursor_x = plot_x + int(round(current_pos * plot_w / n))
+    cv2.line(panel, (cursor_x, plot_y), (cursor_x, plot_y + plot_h), (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(panel, f"{lo:+.2f}", (x + w - 46, y + h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 170), 1, cv2.LINE_AA)
+    cv2.putText(panel, f"{hi:+.2f}", (x + w - 46, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (170, 170, 170), 1, cv2.LINE_AA)
+
+
+def _draw_ego_motion_comparison_charts(cv2, panel, frame_indices, current_frame_index, ego_series):
+    if not ego_series:
+        return
+    frame_rows = dict(ego_series.get("frames", {}))
+    methods = dict(ego_series.get("methods", {}))
+    vx_values = {}
+    vz_values = {}
+    for method_name, meta in methods.items():
+        vx_series = _series_values_for_field(frame_indices, frame_rows, meta.get("vx_field", ""))
+        vz_series = _series_values_for_field(frame_indices, frame_rows, meta.get("vz_field", ""))
+        if vx_series:
+            vx_values[method_name] = {
+                "values": vx_series,
+                "color": meta.get("color", (220, 220, 220)),
+            }
+        if vz_series:
+            vz_values[method_name] = {
+                "values": vz_series,
+                "color": meta.get("color", (220, 220, 220)),
+            }
+    panel_h, panel_w = panel.shape[:2]
+    chart_y = 128
+    chart_h = max(44, panel_h - chart_y - 70)
+    gap = 10
+    chart_w = max(80, (panel_w - 36 - gap) // 2)
+    _draw_line_chart(cv2, panel, "ego vx", frame_indices, current_frame_index, vx_values, 18, chart_y, chart_w, chart_h)
+    _draw_line_chart(cv2, panel, "ego vz", frame_indices, current_frame_index, vz_values, 18 + chart_w + gap, chart_y, chart_w, chart_h)
+    legend_y = min(panel_h - 48, chart_y + chart_h + 18)
+    legend_x = 18
+    for method_name in ("original", "weighted_median", "refined", "ransac"):
+        meta = methods.get(method_name, {})
+        color = meta.get("color", (180, 180, 180))
+        label = str(meta.get("label", method_name))
+        is_available = bool(
+            _series_values_for_field(frame_indices, frame_rows, meta.get("vx_field", ""))
+            or _series_values_for_field(frame_indices, frame_rows, meta.get("vz_field", ""))
+        )
+        if not is_available and method_name == "ransac":
+            label = "RANSAC n/a"
+        cv2.rectangle(panel, (legend_x, legend_y - 10), (legend_x + 14, legend_y + 2), color, -1)
+        cv2.putText(panel, label, (legend_x + 18, legend_y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1, cv2.LINE_AA)
+        legend_x += 104 if method_name != "weighted_median" else 132
+
+
+def _bgr_to_mpl_rgb(color):
+    b, g, r = color
+    return (r / 255.0, g / 255.0, b / 255.0)
+
+
+def _pdf_escape_text(text):
+    return str(text).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _pdf_num(value):
+    return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+
+def _bgr_to_pdf_rgb(color):
+    b, g, r = color
+    return (r / 255.0, g / 255.0, b / 255.0)
+
+
+def _pdf_text(commands, x, y, text, size=10, color=(0.0, 0.0, 0.0)):
+    r, g, b = color
+    commands.append(f"{_pdf_num(r)} {_pdf_num(g)} {_pdf_num(b)} rg")
+    commands.append(f"BT /F1 {int(size)} Tf {_pdf_num(x)} {_pdf_num(y)} Td ({_pdf_escape_text(text)}) Tj ET")
+
+
+def _pdf_line(commands, x1, y1, x2, y2, color=(0.0, 0.0, 0.0), width=1.0):
+    r, g, b = color
+    commands.append(f"{_pdf_num(r)} {_pdf_num(g)} {_pdf_num(b)} RG")
+    commands.append(f"{_pdf_num(width)} w")
+    commands.append(f"{_pdf_num(x1)} {_pdf_num(y1)} m {_pdf_num(x2)} {_pdf_num(y2)} l S")
+
+
+def _pdf_rect(commands, x, y, w, h, color=(0.0, 0.0, 0.0), width=1.0):
+    r, g, b = color
+    commands.append(f"{_pdf_num(r)} {_pdf_num(g)} {_pdf_num(b)} RG")
+    commands.append(f"{_pdf_num(width)} w")
+    commands.append(f"{_pdf_num(x)} {_pdf_num(y)} {_pdf_num(w)} {_pdf_num(h)} re S")
+
+
+def _build_ego_chart_series(axis_field, frame_indices, frame_rows, methods):
+    chart_series = []
+    all_values = []
+    for method_name in ("original", "weighted_median", "refined", "ransac"):
+        meta = dict(methods.get(method_name, {}))
+        values = _series_values_for_field(frame_indices, frame_rows, meta.get(axis_field, ""))
+        if not values:
+            continue
+        points = [(frame, value) for frame, value in zip(frame_indices, values) if value is not None]
+        if not points:
+            continue
+        all_values.extend(value for _, value in points)
+        chart_series.append(
+            {
+                "label": str(meta.get("label", method_name)),
+                "points": points,
+                "color": meta.get("color", (220, 220, 220)),
+            }
+        )
+    return chart_series, all_values
+
+
+def _draw_pdf_ego_axis(commands, x, y, w, h, title, frame_indices, chart_series, all_values):
+    _pdf_text(commands, x, y + h + 18, title, size=11, color=(0.0, 0.0, 0.0))
+    _pdf_rect(commands, x, y, w, h, color=(0.2, 0.2, 0.2), width=0.8)
+    if not chart_series or not all_values:
+        _pdf_text(commands, x + 12, y + h / 2, "ego refinement unavailable", size=10, color=(0.35, 0.35, 0.35))
+        return
+
+    lo = min(all_values)
+    hi = max(all_values)
+    if abs(hi - lo) < 1e-9:
+        pad = max(0.1, abs(hi) * 0.25)
+        lo -= pad
+        hi += pad
+    else:
+        pad = (hi - lo) * 0.12
+        lo -= pad
+        hi += pad
+
+    first_frame = min(frame_indices)
+    last_frame = max(frame_indices)
+    frame_span = max(1, last_frame - first_frame)
+
+    def point(frame, value):
+        px = x + ((float(frame) - first_frame) / frame_span) * w
+        py = y + ((float(value) - lo) / max(1e-9, hi - lo)) * h
+        return px, py
+
+    if lo <= 0.0 <= hi:
+        _, zero_y = point(first_frame, 0.0)
+        _pdf_line(commands, x, zero_y, x + w, zero_y, color=(0.72, 0.72, 0.72), width=0.6)
+
+    _pdf_text(commands, x - 42, y - 4, _pdf_num(lo), size=8, color=(0.35, 0.35, 0.35))
+    _pdf_text(commands, x - 42, y + h - 4, _pdf_num(hi), size=8, color=(0.35, 0.35, 0.35))
+    _pdf_text(commands, x, y - 18, str(first_frame), size=8, color=(0.35, 0.35, 0.35))
+    _pdf_text(commands, x + w - 24, y - 18, str(last_frame), size=8, color=(0.35, 0.35, 0.35))
+
+    legend_x = x + w - 150
+    legend_y = y + h + 18
+    for series in chart_series:
+        rgb = _bgr_to_pdf_rgb(series["color"])
+        _pdf_line(commands, legend_x, legend_y + 3, legend_x + 18, legend_y + 3, color=rgb, width=2.0)
+        _pdf_text(commands, legend_x + 24, legend_y, series["label"], size=8, color=(0.0, 0.0, 0.0))
+        legend_x += 82
+
+    for series in chart_series:
+        points = [point(frame, value) for frame, value in series["points"]]
+        if len(points) == 1:
+            px, py = points[0]
+            _pdf_line(commands, px - 1.5, py, px + 1.5, py, color=_bgr_to_pdf_rgb(series["color"]), width=2.0)
+            continue
+        r, g, b = _bgr_to_pdf_rgb(series["color"])
+        commands.append(f"{_pdf_num(r)} {_pdf_num(g)} {_pdf_num(b)} RG")
+        commands.append("1.8 w")
+        first_x, first_y = points[0]
+        path = [f"{_pdf_num(first_x)} {_pdf_num(first_y)} m"]
+        path.extend(f"{_pdf_num(px)} {_pdf_num(py)} l" for px, py in points[1:])
+        path.append("S")
+        commands.append(" ".join(path))
+
+
+def _save_ego_motion_comparison_pdf_simple(refined_ego_motion_video, output_path):
+    ego_series = _ego_refinement_series(refined_ego_motion_video)
+    frame_rows = dict(ego_series.get("frames", {}))
+    if not frame_rows:
+        return None, "no_refined_ego_motion"
+    frame_indices = sorted(frame_rows)
+    methods = dict(ego_series.get("methods", {}))
+    vx_series, vx_values = _build_ego_chart_series("vx_field", frame_indices, frame_rows, methods)
+    vz_series, vz_values = _build_ego_chart_series("vz_field", frame_indices, frame_rows, methods)
+    if not vx_series and not vz_series:
+        return None, "no_available_chart_series"
+
+    page_w = 792.0
+    page_h = 612.0
+    commands = []
+    video_id = str((refined_ego_motion_video or {}).get("video_id", ""))
+    _pdf_text(commands, 56, page_h - 42, f"ego motion comparison | {video_id}", size=15, color=(0.0, 0.0, 0.0))
+    _draw_pdf_ego_axis(commands, 78, 330, 640, 165, "ego vx", frame_indices, vx_series, vx_values)
+    _draw_pdf_ego_axis(commands, 78, 95, 640, 165, "ego vz", frame_indices, vz_series, vz_values)
+    _pdf_text(commands, 350, 48, "frame", size=10, color=(0.0, 0.0, 0.0))
+
+    content = "\n".join(commands).encode("ascii", errors="replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(content)).encode("ascii") + b" >>\nstream\n" + content + b"\nendstream",
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for idx, obj in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{idx} 0 obj\n".encode("ascii"))
+        pdf.extend(obj)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(pdf)
+    return str(output_path), "rendered"
+
+
+def _save_ego_motion_comparison_pdf(refined_ego_motion_video, output_path):
+    if plt is None:
+        return _save_ego_motion_comparison_pdf_simple(refined_ego_motion_video, output_path)
+    ego_series = _ego_refinement_series(refined_ego_motion_video)
+    frame_rows = dict(ego_series.get("frames", {}))
+    if not frame_rows:
+        return None, "no_refined_ego_motion"
+
+    frame_indices = sorted(frame_rows)
+    methods = dict(ego_series.get("methods", {}))
+    fig, axes = plt.subplots(2, 1, figsize=(11.0, 7.0), sharex=True)
+    plotted = False
+    for axis, axis_name, field_name in (
+        (axes[0], "ego vx", "vx_field"),
+        (axes[1], "ego vz", "vz_field"),
+    ):
+        for method_name in ("original", "weighted_median", "refined", "ransac"):
+            meta = dict(methods.get(method_name, {}))
+            values = _series_values_for_field(frame_indices, frame_rows, meta.get(field_name, ""))
+            if not values:
+                continue
+            xs = [frame for frame, value in zip(frame_indices, values) if value is not None]
+            ys = [value for value in values if value is not None]
+            if not xs:
+                continue
+            axis.plot(
+                xs,
+                ys,
+                label=str(meta.get("label", method_name)),
+                color=_bgr_to_mpl_rgb(meta.get("color", (220, 220, 220))),
+                linewidth=1.8,
+            )
+            plotted = True
+        axis.axhline(0.0, color="#888888", linewidth=0.8, alpha=0.55)
+        axis.set_ylabel(axis_name)
+        axis.grid(True, color="#dddddd", linewidth=0.6, alpha=0.75)
+        axis.legend(loc="best", frameon=True)
+
+    if not plotted:
+        plt.close(fig)
+        return None, "no_available_chart_series"
+
+    video_id = str((refined_ego_motion_video or {}).get("video_id", ""))
+    axes[1].set_xlabel("frame")
+    fig.suptitle(f"ego motion comparison | {video_id}".strip(), fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, format="pdf")
+    plt.close(fig)
+    return str(output_path), "rendered"
+
+
 def _render_relative_motion_track_video(
     relative_motion_video_result,
     track_id,
@@ -803,7 +1227,7 @@ def _render_relative_motion_track_video(
         return None, "missing_frame_images"
 
     frame_h, frame_w = first_img.shape[:2]
-    panel_h = max(170, int(frame_h * 0.26))
+    panel_h = max(150, int(frame_h * 0.22))
     total_h = frame_h + panel_h
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -911,7 +1335,12 @@ def _render_relative_motion_track_video(
     return str(output_path), "rendered"
 
 
-def _render_relative_motion_track_videos(relative_motion_video_result, output_root, fps=10.0, trajectory_evidence_by_track=None):
+def _render_relative_motion_track_videos(
+    relative_motion_video_result,
+    output_root,
+    fps=10.0,
+    trajectory_evidence_by_track=None,
+):
     frame_indices, tracks = _relative_motion_track_index(relative_motion_video_result)
     video_id = str(relative_motion_video_result.get("video_id", ""))
     trajectory_evidence_by_track = dict(trajectory_evidence_by_track or {})
@@ -1211,12 +1640,30 @@ def _trajectory_step_metrics(observations):
         "bbox_height_ratio": [],
         "bbox_area_ratio": [],
         "depth_step_per_frame": [],
+        "ego_compensated_depth_step_per_frame": [],
+        "ego_minus_depth_step_per_frame": [],
+        "ego_plus_depth_step_per_frame": [],
         "position_xz_step_per_frame": [],
         "rel_velocity_delta": [],
         "rel_speed_delta": [],
+        "ego_minus_velocity_delta": [],
+        "ego_plus_velocity_delta": [],
+        "ego_minus_speed": [],
+        "ego_plus_speed": [],
         "direction_reversal_count": 0,
     }
     ordered = sorted(observations, key=lambda row: int(row.get("frame_index", -1)))
+    for obs in ordered:
+        motion = dict(obs.get("motion", {}))
+        if not bool(motion.get("has_rel_motion", False)):
+            continue
+        obj_vx = _safe_float(motion.get("obj_vx", 0.0))
+        obj_vz = _safe_float(motion.get("obj_vz", 0.0))
+        ego_vx = _safe_float(motion.get("ego_vx", 0.0))
+        ego_vz = _safe_float(motion.get("ego_vz", 0.0))
+        metrics["ego_minus_speed"].append(float(math.hypot(obj_vx - ego_vx, obj_vz - ego_vz)))
+        metrics["ego_plus_speed"].append(float(math.hypot(obj_vx + ego_vx, obj_vz + ego_vz)))
+
     for left, right in zip(ordered, ordered[1:]):
         left_frame = int(left.get("frame_index", -1))
         right_frame = int(right.get("frame_index", -1))
@@ -1241,7 +1688,18 @@ def _trajectory_step_metrics(observations):
         if len(left_pos) >= 3 and len(right_pos) >= 3:
             dx = _safe_float(right_pos[0]) - _safe_float(left_pos[0])
             dz = _safe_float(right_pos[2]) - _safe_float(left_pos[2])
-            metrics["depth_step_per_frame"].append(float(abs(dz) / frame_gap))
+            dz_per_frame = dz / float(frame_gap)
+            right_motion_for_ego = dict(right.get("motion", {}))
+            ego_vz = _safe_float(right_motion_for_ego.get("ego_vz", 0.0))
+            depth_step = float(abs(dz_per_frame))
+            ego_minus_depth_step = float(abs(dz_per_frame - ego_vz))
+            ego_plus_depth_step = float(abs(dz_per_frame + ego_vz))
+            metrics["depth_step_per_frame"].append(depth_step)
+            metrics["ego_minus_depth_step_per_frame"].append(ego_minus_depth_step)
+            metrics["ego_plus_depth_step_per_frame"].append(ego_plus_depth_step)
+            metrics["ego_compensated_depth_step_per_frame"].append(
+                float(min(depth_step, ego_minus_depth_step, ego_plus_depth_step))
+            )
             metrics["position_xz_step_per_frame"].append(float(math.hypot(dx, dz) / frame_gap))
 
         left_motion = dict(left.get("motion", {}))
@@ -1253,11 +1711,68 @@ def _trajectory_step_metrics(observations):
             right_speed = math.hypot(right_v[0], right_v[1])
             metrics["rel_velocity_delta"].append(float(math.hypot(right_v[0] - left_v[0], right_v[1] - left_v[1])))
             metrics["rel_speed_delta"].append(float(abs(right_speed - left_speed)))
+            left_obj_v = (_safe_float(left_motion.get("obj_vx", 0.0)), _safe_float(left_motion.get("obj_vz", 0.0)))
+            right_obj_v = (_safe_float(right_motion.get("obj_vx", 0.0)), _safe_float(right_motion.get("obj_vz", 0.0)))
+            left_ego_v = (_safe_float(left_motion.get("ego_vx", 0.0)), _safe_float(left_motion.get("ego_vz", 0.0)))
+            right_ego_v = (_safe_float(right_motion.get("ego_vx", 0.0)), _safe_float(right_motion.get("ego_vz", 0.0)))
+            left_minus_v = (left_obj_v[0] - left_ego_v[0], left_obj_v[1] - left_ego_v[1])
+            right_minus_v = (right_obj_v[0] - right_ego_v[0], right_obj_v[1] - right_ego_v[1])
+            left_plus_v = (left_obj_v[0] + left_ego_v[0], left_obj_v[1] + left_ego_v[1])
+            right_plus_v = (right_obj_v[0] + right_ego_v[0], right_obj_v[1] + right_ego_v[1])
+            metrics["ego_minus_velocity_delta"].append(
+                float(math.hypot(right_minus_v[0] - left_minus_v[0], right_minus_v[1] - left_minus_v[1]))
+            )
+            metrics["ego_plus_velocity_delta"].append(
+                float(math.hypot(right_plus_v[0] - left_plus_v[0], right_plus_v[1] - left_plus_v[1]))
+            )
             if left_speed > _REL_SPEED_THRESHOLD and right_speed > _REL_SPEED_THRESHOLD:
                 dot = left_v[0] * right_v[0] + left_v[1] * right_v[1]
                 if dot < 0.0:
                     metrics["direction_reversal_count"] += 1
     return metrics
+
+
+def _trajectory_validation_velocity_profile(step_metrics, statistics):
+    legacy_max_speed = _safe_float(dict(statistics.get("rel_speed", {})).get("max", 0.0))
+    legacy_max_delta = max(step_metrics["rel_velocity_delta"]) if step_metrics["rel_velocity_delta"] else 0.0
+    profiles = [
+        {
+            "name": "ego_minus",
+            "description": "existing step 8 residual: obj_v - ego_v",
+            "max_speed": float(max(step_metrics["ego_minus_speed"]) if step_metrics["ego_minus_speed"] else legacy_max_speed),
+            "mean_speed": float(
+                sum(step_metrics["ego_minus_speed"]) / len(step_metrics["ego_minus_speed"])
+                if step_metrics["ego_minus_speed"]
+                else legacy_max_speed
+            ),
+            "max_velocity_delta": float(max(step_metrics["ego_minus_velocity_delta"]) if step_metrics["ego_minus_velocity_delta"] else legacy_max_delta),
+        },
+        {
+            "name": "ego_plus",
+            "description": "reverse/physical ego residual: obj_v + ego_v",
+            "max_speed": float(max(step_metrics["ego_plus_speed"]) if step_metrics["ego_plus_speed"] else legacy_max_speed),
+            "mean_speed": float(
+                sum(step_metrics["ego_plus_speed"]) / len(step_metrics["ego_plus_speed"])
+                if step_metrics["ego_plus_speed"]
+                else legacy_max_speed
+            ),
+            "max_velocity_delta": float(max(step_metrics["ego_plus_velocity_delta"]) if step_metrics["ego_plus_velocity_delta"] else legacy_max_delta),
+        },
+    ]
+    best = min(profiles, key=lambda row: (row["max_speed"], row["max_velocity_delta"]))
+    return {
+        "selected_profile": best["name"],
+        "selected_description": best["description"],
+        "max_speed": float(best["max_speed"]),
+        "max_velocity_delta": float(best["max_velocity_delta"]),
+        "profiles": profiles,
+        "legacy_rel_speed_max": float(legacy_max_speed),
+        "legacy_rel_velocity_delta_max": float(legacy_max_delta),
+        "notes": (
+            "Validation uses the lower residual across ego sign conventions so reverse ego motion "
+            "does not by itself invalidate otherwise continuous tracks."
+        ),
+    }
 
 
 def _validation_issue(kind, severity, message, value=None, threshold=None):
@@ -1309,21 +1824,49 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
     elif max_bbox_ratio > float(thresholds["max_uncertain_bbox_size_ratio"]):
         issues.append(_validation_issue("bbox_jump", "uncertain", "BBox size or area change is high.", max_bbox_ratio, thresholds["max_uncertain_bbox_size_ratio"]))
 
-    max_depth_step = max(step_metrics["depth_step_per_frame"]) if step_metrics["depth_step_per_frame"] else 0.0
+    raw_max_depth_step = max(step_metrics["depth_step_per_frame"]) if step_metrics["depth_step_per_frame"] else 0.0
+    max_depth_step = (
+        max(step_metrics["ego_compensated_depth_step_per_frame"])
+        if step_metrics["ego_compensated_depth_step_per_frame"]
+        else raw_max_depth_step
+    )
     if max_depth_step > float(thresholds["max_invalid_depth_step_per_frame"]):
-        issues.append(_validation_issue("depth_jump", "invalid", "Depth changes too abruptly.", max_depth_step, thresholds["max_invalid_depth_step_per_frame"]))
+        issues.append(
+            _validation_issue(
+                "depth_jump",
+                "invalid",
+                "Ego-compensated depth changes too abruptly.",
+                {"ego_compensated": max_depth_step, "raw": raw_max_depth_step},
+                thresholds["max_invalid_depth_step_per_frame"],
+            )
+        )
     elif max_depth_step > float(thresholds["max_uncertain_depth_step_per_frame"]):
-        issues.append(_validation_issue("depth_jump", "uncertain", "Depth change is high.", max_depth_step, thresholds["max_uncertain_depth_step_per_frame"]))
+        issues.append(
+            _validation_issue(
+                "depth_jump",
+                "uncertain",
+                "Ego-compensated depth change is high.",
+                {"ego_compensated": max_depth_step, "raw": raw_max_depth_step},
+                thresholds["max_uncertain_depth_step_per_frame"],
+            )
+        )
 
-    max_velocity_delta = max(step_metrics["rel_velocity_delta"]) if step_metrics["rel_velocity_delta"] else 0.0
-    max_rel_speed = _safe_float(dict(statistics.get("rel_speed", {})).get("max", 0.0))
+    velocity_profile = _trajectory_validation_velocity_profile(step_metrics, statistics)
+    max_velocity_delta = _safe_float(velocity_profile.get("max_velocity_delta", 0.0))
+    max_rel_speed = _safe_float(velocity_profile.get("max_speed", 0.0))
     if max_velocity_delta > float(thresholds["max_invalid_rel_velocity_delta"]) or max_rel_speed > float(thresholds["max_invalid_rel_speed"]):
         issues.append(
             _validation_issue(
                 "speed_abnormal_change",
                 "invalid",
-                "Relative velocity delta or speed is too large.",
-                {"max_rel_velocity_delta": max_velocity_delta, "max_rel_speed": max_rel_speed},
+                "Ego-compensated velocity delta or residual speed is too large.",
+                {
+                    "max_validation_velocity_delta": max_velocity_delta,
+                    "max_validation_speed": max_rel_speed,
+                    "selected_profile": velocity_profile["selected_profile"],
+                    "legacy_max_rel_velocity_delta": velocity_profile["legacy_rel_velocity_delta_max"],
+                    "legacy_max_rel_speed": velocity_profile["legacy_rel_speed_max"],
+                },
                 {"max_rel_velocity_delta": thresholds["max_invalid_rel_velocity_delta"], "max_rel_speed": thresholds["max_invalid_rel_speed"]},
             )
         )
@@ -1332,8 +1875,14 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
             _validation_issue(
                 "speed_abnormal_change",
                 "uncertain",
-                "Relative velocity delta or speed is high.",
-                {"max_rel_velocity_delta": max_velocity_delta, "max_rel_speed": max_rel_speed},
+                "Ego-compensated velocity delta or residual speed is high.",
+                {
+                    "max_validation_velocity_delta": max_velocity_delta,
+                    "max_validation_speed": max_rel_speed,
+                    "selected_profile": velocity_profile["selected_profile"],
+                    "legacy_max_rel_velocity_delta": velocity_profile["legacy_rel_velocity_delta_max"],
+                    "legacy_max_rel_speed": velocity_profile["legacy_rel_speed_max"],
+                },
                 {"max_rel_velocity_delta": thresholds["max_uncertain_rel_velocity_delta"], "max_rel_speed": thresholds["max_uncertain_rel_speed"]},
             )
         )
@@ -1366,6 +1915,7 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
             ),
             "max_bbox_size_ratio": float(max_bbox_ratio),
             "max_depth_step_per_frame": float(max_depth_step),
+            "raw_max_depth_step_per_frame": float(raw_max_depth_step),
         },
         "motion_direction_abrupt_change": {"passed": direction_reversals == 0, "direction_reversal_count": direction_reversals},
         "speed_abnormal_change": {
@@ -1373,8 +1923,11 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
                 max_velocity_delta <= float(thresholds["max_uncertain_rel_velocity_delta"])
                 and max_rel_speed <= float(thresholds["max_uncertain_rel_speed"])
             ),
-            "max_rel_velocity_delta": float(max_velocity_delta),
-            "max_rel_speed": float(max_rel_speed),
+            "max_validation_velocity_delta": float(max_velocity_delta),
+            "max_validation_speed": float(max_rel_speed),
+            "selected_velocity_profile": velocity_profile["selected_profile"],
+            "legacy_max_rel_velocity_delta": float(velocity_profile["legacy_rel_velocity_delta_max"]),
+            "legacy_max_rel_speed": float(velocity_profile["legacy_rel_speed_max"]),
         },
         "motion_evidence": {"passed": has_motion_ratio >= float(thresholds["min_motion_ratio"]), "has_motion_ratio": float(has_motion_ratio)},
     }
@@ -1394,12 +1947,22 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
             "max_bbox_center_step_diag_ratio": float(max_center_ratio),
             "max_bbox_size_ratio": float(max_bbox_ratio),
             "max_depth_step_per_frame": float(max_depth_step),
+            "raw_max_depth_step_per_frame": float(raw_max_depth_step),
             "max_rel_velocity_delta": float(max_velocity_delta),
             "max_rel_speed": float(max_rel_speed),
+            "legacy_max_rel_velocity_delta": float(velocity_profile["legacy_rel_velocity_delta_max"]),
+            "legacy_max_rel_speed": float(velocity_profile["legacy_rel_speed_max"]),
             "direction_reversal_count": direction_reversals,
         },
+        "ego_motion_consistency": {
+            "selected_velocity_profile": velocity_profile["selected_profile"],
+            "velocity_profiles": velocity_profile["profiles"],
+            "raw_max_depth_step_per_frame": float(raw_max_depth_step),
+            "max_ego_compensated_depth_step_per_frame": float(max_depth_step),
+            "notes": velocity_profile["notes"],
+        },
         "thresholds": thresholds,
-        "notes": "Heuristic continuity validation for causal motion fact validation.",
+        "notes": "Heuristic continuity validation for causal motion fact validation, with ego-aware reverse-motion handling.",
     }
 
 
@@ -1619,6 +2182,373 @@ def _fact_decision_for_trajectory(validation, significance, provenance, uncertai
             "confidence_score": float(confidence_score),
         },
         "notes": "Final 8B fact decision for symbolic-layer admission; it preserves provenance and reasons for explanation.",
+    }
+
+
+def _normalize_label_for_prior(label):
+    return str(label).strip().lower().replace("-", " ").replace("_", " ")
+
+
+def _expected_motion_from_prior(label):
+    normalized = _normalize_label_for_prior(label)
+    for prior_label, expected_motion in _STATIC_OBJECT_PRIOR.items():
+        if _normalize_label_for_prior(prior_label) == normalized or _normalize_label_for_prior(prior_label) in normalized:
+            return expected_motion
+    for prior_label, expected_motion in _LOW_DYNAMIC_OBJECT_PRIOR.items():
+        if _normalize_label_for_prior(prior_label) == normalized or _normalize_label_for_prior(prior_label) in normalized:
+            return expected_motion
+    return "dynamic"
+
+
+def _reference_object_candidate(trajectory):
+    thresholds = dict(_REFERENCE_OBJECT_THRESHOLDS)
+    label = str(trajectory.get("primary_label", "unknown"))
+    expected_motion = _expected_motion_from_prior(label)
+    statistics = dict(trajectory.get("trajectory_statistics", {}))
+    validation = dict(trajectory.get("causal_motion_fact_validation", {}))
+    uncertainty = dict(trajectory.get("uncertainty", {}))
+    provenance = dict(trajectory.get("provenance", {}))
+    significance = dict(trajectory.get("motion_significance_assessment", {}))
+    fact_decision = dict(trajectory.get("fact_decision", {}))
+
+    observation_ratio = _safe_float(statistics.get("temporal_coverage_in_video", statistics.get("temporal_coverage_in_span", 0.0)))
+    uncertainty_score = _safe_float(uncertainty.get("uncertainty_score", 1.0), 1.0)
+    repaired_ratio = _safe_float(provenance.get("repaired_ratio", 0.0))
+    rel_speed_mean = _safe_float(dict(statistics.get("rel_speed", {})).get("mean", 0.0))
+    ego_motion_consistency = dict(validation.get("ego_motion_consistency", {}))
+    selected_velocity_profile = str(ego_motion_consistency.get("selected_velocity_profile", "ego_minus"))
+    velocity_profiles = list(ego_motion_consistency.get("velocity_profiles", []))
+    selected_profile_metrics = next(
+        (dict(row) for row in velocity_profiles if str(row.get("name", "")) == selected_velocity_profile),
+        {},
+    )
+    prior_motion_speed_mean = _safe_float(selected_profile_metrics.get("mean_speed", rel_speed_mean), rel_speed_mean)
+    prior_motion_speed_max = _safe_float(selected_profile_metrics.get("max_speed", dict(statistics.get("rel_speed", {})).get("max", 0.0)))
+    depth_abs_delta = _safe_float(dict(statistics.get("position_z_depth", {})).get("abs_delta", 0.0))
+    ego_compensated_depth_step = _safe_float(
+        ego_motion_consistency.get(
+            "max_ego_compensated_depth_step_per_frame",
+            dict(validation.get("step_metrics", {})).get("max_depth_step_per_frame", 0.0),
+        )
+    )
+    center_step_ratio = _safe_float(
+        dict(validation.get("step_metrics", {})).get("max_bbox_center_step_diag_ratio", 0.0)
+    )
+    validation_status = str(validation.get("validation_status", validation.get("status", "uncertain")))
+    symbolic_eligible = bool(fact_decision.get("symbolic_layer_eligible", trajectory.get("symbolic_layer_eligible", False)))
+    max_rel_speed_mean = (
+        float(thresholds["max_rel_speed_mean_static"])
+        if expected_motion == "static"
+        else float(thresholds["max_rel_speed_mean_low_dynamic"])
+    )
+    reasons = []
+    disqualifiers = []
+
+    if expected_motion not in {"static", "low_dynamic"}:
+        disqualifiers.append("expected_motion_not_reference")
+    if validation_status not in {"valid", "repaired"}:
+        disqualifiers.append("trajectory_not_reliably_validated")
+    if not symbolic_eligible:
+        disqualifiers.append("not_symbolic_layer_eligible")
+    if observation_ratio < float(thresholds["min_observation_ratio"]):
+        disqualifiers.append("low_observation_ratio")
+    if uncertainty_score > float(thresholds["max_uncertainty_score"]):
+        disqualifiers.append("high_uncertainty")
+    if repaired_ratio > float(thresholds["max_repaired_ratio"]):
+        disqualifiers.append("mostly_repaired")
+    if expected_motion == "low_dynamic" and prior_motion_speed_mean > max_rel_speed_mean:
+        disqualifiers.append("too_dynamic_for_prior")
+    if center_step_ratio > float(thresholds["max_bbox_center_step_diag_ratio"]):
+        disqualifiers.append("bbox_motion_too_large_for_reference")
+
+    if expected_motion in {"static", "low_dynamic"}:
+        reasons.append(f"object_motion_prior={expected_motion}")
+    if validation_status in {"valid", "repaired"}:
+        reasons.append(f"trajectory_valid={validation_status}")
+    if observation_ratio >= float(thresholds["min_observation_ratio"]):
+        reasons.append("observation_ratio_high_enough")
+    if uncertainty_score <= float(thresholds["max_uncertainty_score"]):
+        reasons.append("uncertainty_low_enough")
+    if expected_motion == "static" or prior_motion_speed_mean <= max_rel_speed_mean:
+        reasons.append("relative_motion_consistent_with_prior")
+
+    reference_score = 0.0
+    reference_score += 0.25 if expected_motion == "static" else (0.15 if expected_motion == "low_dynamic" else 0.0)
+    reference_score += 0.25 if validation_status == "valid" else (0.15 if validation_status == "repaired" else 0.0)
+    reference_score += 0.2 * min(1.0, observation_ratio / max(1e-6, float(thresholds["min_observation_ratio"])))
+    reference_score += 0.15 * max(0.0, 1.0 - uncertainty_score)
+    reference_score += 0.1 * max(0.0, 1.0 - repaired_ratio)
+    reference_score += 0.05 if str(significance.get("significance", "")) == "low_significance" else 0.0
+    is_reference = not disqualifiers
+    return {
+        "track_id": int(trajectory.get("track_id", -1)),
+        "label": label,
+        "expected_motion": expected_motion,
+        "is_reliable_reference": bool(is_reference),
+        "reference_score": float(reference_score),
+        "selection_reasons": reasons,
+        "disqualifiers": disqualifiers,
+        "metrics": {
+            "observation_ratio": float(observation_ratio),
+            "uncertainty_score": float(uncertainty_score),
+            "repaired_ratio": float(repaired_ratio),
+            "rel_speed_mean": float(rel_speed_mean),
+            "prior_motion_speed_mean": float(prior_motion_speed_mean),
+            "prior_motion_speed_max": float(prior_motion_speed_max),
+            "selected_velocity_profile": selected_velocity_profile,
+            "depth_abs_delta": float(depth_abs_delta),
+            "ego_compensated_depth_step_per_frame": float(ego_compensated_depth_step),
+            "max_bbox_center_step_diag_ratio": float(center_step_ratio),
+            "validation_status": validation_status,
+            "motion_significance": str(trajectory.get("motion_significance", "")),
+            "fact_decision_status": str(trajectory.get("fact_decision_status", "")),
+        },
+        "provenance": {
+            **provenance,
+            "fact_decision": fact_decision,
+        },
+    }
+
+
+def _reliable_reference_objects_video(evidence_video):
+    candidates = [
+        _reference_object_candidate(trajectory)
+        for trajectory in evidence_video.get("trajectory_motion_evidence", [])
+    ]
+    references = [
+        candidate
+        for candidate in candidates
+        if bool(candidate.get("is_reliable_reference", False))
+    ]
+    references.sort(key=lambda row: (-_safe_float(row.get("reference_score", 0.0)), int(row.get("track_id", -1))))
+    return {
+        "version": _EGO_REFINEMENT_VERSION,
+        "video_id": str(evidence_video.get("video_id", "")),
+        "method": "prior_guided_reference_object_selection",
+        "status": "reference_objects_selected",
+        "description": (
+            "Select reliable static or low-dynamic reference objects from 8B trajectory evidence. "
+            "Ego motion refinement is not applied yet."
+        ),
+        "object_motion_prior": {
+            "static_labels": sorted(_STATIC_OBJECT_PRIOR),
+            "low_dynamic_labels": sorted(_LOW_DYNAMIC_OBJECT_PRIOR),
+            "thresholds": dict(_REFERENCE_OBJECT_THRESHOLDS),
+        },
+        "num_trajectories": len(candidates),
+        "num_reliable_reference_objects": len(references),
+        "reliable_reference_objects": references,
+        "candidate_reference_objects": candidates,
+    }
+
+
+def _median(values):
+    vals = sorted(_safe_float(value) for value in values if math.isfinite(_safe_float(value)))
+    if not vals:
+        return 0.0
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return float(vals[mid])
+    return float((vals[mid - 1] + vals[mid]) / 2.0)
+
+
+def _weighted_median(values, weights):
+    pairs = sorted(
+        (float(value), max(0.0, float(weight)))
+        for value, weight in zip(values, weights)
+        if math.isfinite(_safe_float(value)) and math.isfinite(_safe_float(weight)) and _safe_float(weight) > 0.0
+    )
+    if not pairs:
+        return 0.0
+    total_weight = sum(weight for _, weight in pairs)
+    midpoint = total_weight / 2.0
+    cumulative = 0.0
+    for value, weight in pairs:
+        cumulative += weight
+        if cumulative >= midpoint:
+            return float(value)
+    return float(pairs[-1][0])
+
+
+def _weighted_mean(values, weights):
+    pairs = [
+        (_safe_float(value), max(0.0, _safe_float(weight)))
+        for value, weight in zip(values, weights)
+        if math.isfinite(_safe_float(value)) and math.isfinite(_safe_float(weight)) and _safe_float(weight) > 0.0
+    ]
+    total_weight = sum(weight for _, weight in pairs)
+    if total_weight <= 0.0:
+        return 0.0
+    return float(sum(value * weight for value, weight in pairs) / total_weight)
+
+
+def _reference_vote_weight(reference, observation):
+    expected_motion = str(reference.get("expected_motion", "dynamic"))
+    prior_weight = 1.0 if expected_motion == "static" else 0.55
+    reference_score = _safe_float(reference.get("reference_score", 0.0))
+    obs_uncertainty = _safe_float(dict(observation.get("uncertainty", {})).get("source_uncertainty", 0.0))
+    obs_score = _safe_float(dict(observation.get("uncertainty", {})).get("score", 0.0), 0.0)
+    confidence = max(0.05, 1.0 - obs_uncertainty)
+    if obs_score > 0.0:
+        confidence *= max(0.1, obs_score)
+    return float(max(0.0, prior_weight * max(0.05, reference_score) * confidence))
+
+
+def _ego_vote_from_reference_motion(motion):
+    obj_vx = _safe_float(motion.get("obj_vx", 0.0))
+    obj_vz = _safe_float(motion.get("obj_vz", 0.0))
+    ego_vx = _safe_float(motion.get("ego_vx", 0.0))
+    ego_vz = _safe_float(motion.get("ego_vz", 0.0))
+    same_sign_vote = (obj_vx, obj_vz)
+    opposite_sign_vote = (-obj_vx, -obj_vz)
+    same_residual = math.hypot(same_sign_vote[0] - ego_vx, same_sign_vote[1] - ego_vz)
+    opposite_residual = math.hypot(opposite_sign_vote[0] - ego_vx, opposite_sign_vote[1] - ego_vz)
+    if math.hypot(ego_vx, ego_vz) > _REL_SPEED_THRESHOLD and opposite_residual < same_residual:
+        return {
+            "ego_vx_vote": float(opposite_sign_vote[0]),
+            "ego_vz_vote": float(opposite_sign_vote[1]),
+            "ego_vote_sign_convention": "negative_object_velocity",
+            "ego_vote_residual_to_original": float(opposite_residual),
+        }
+    return {
+        "ego_vx_vote": float(same_sign_vote[0]),
+        "ego_vz_vote": float(same_sign_vote[1]),
+        "ego_vote_sign_convention": "object_velocity",
+        "ego_vote_residual_to_original": float(same_residual),
+    }
+
+
+def _reference_votes_by_frame(evidence_video, reference_result):
+    references_by_track = {
+        int(row.get("track_id", -1)): dict(row)
+        for row in reference_result.get("reliable_reference_objects", [])
+        if int(row.get("track_id", -1)) >= 0
+    }
+    votes_by_frame = {}
+    for trajectory in evidence_video.get("trajectory_motion_evidence", []):
+        try:
+            track_id = int(trajectory.get("track_id", -1))
+        except (TypeError, ValueError):
+            continue
+        reference = references_by_track.get(track_id)
+        if reference is None:
+            continue
+        for obs in trajectory.get("trajectory_observations", []):
+            motion = dict(obs.get("motion", {}))
+            if not bool(motion.get("has_rel_motion", False)):
+                continue
+            frame_index = int(obs.get("frame_index", -1))
+            if frame_index < 0:
+                continue
+            weight = _reference_vote_weight(reference, obs)
+            ego_vote = _ego_vote_from_reference_motion(motion)
+            votes_by_frame.setdefault(frame_index, []).append(
+                {
+                    "track_id": track_id,
+                    "label": str(reference.get("label", trajectory.get("primary_label", "unknown"))),
+                    "expected_motion": str(reference.get("expected_motion", "unknown")),
+                    "reference_score": _safe_float(reference.get("reference_score", 0.0)),
+                    "vote_weight": weight,
+                    "ego_vx_vote": _safe_float(ego_vote.get("ego_vx_vote", 0.0)),
+                    "ego_vz_vote": _safe_float(ego_vote.get("ego_vz_vote", 0.0)),
+                    "ego_vote_sign_convention": str(ego_vote.get("ego_vote_sign_convention", "object_velocity")),
+                    "ego_vote_residual_to_original": _safe_float(ego_vote.get("ego_vote_residual_to_original", 0.0)),
+                    "source_frame_index": frame_index,
+                    "observation_uncertainty": dict(obs.get("uncertainty", {})),
+                    "selection_reasons": list(reference.get("selection_reasons", [])),
+                }
+            )
+    return votes_by_frame
+
+
+def _vote_agreement(values, estimate):
+    vals = [_safe_float(value) for value in values if math.isfinite(_safe_float(value))]
+    if not vals:
+        return 0.0
+    mad = _median([abs(value - estimate) for value in vals])
+    return float(1.0 / (1.0 + mad))
+
+
+def _refined_ego_motion_video(ego_video, evidence_video, reference_result):
+    ego_frames = list((ego_video or {}).get("frames", []))
+    if not ego_frames:
+        ego_frames = [
+            {"frame_index": idx, "ego_vx": 0.0, "ego_vz": 0.0, "ego_yaw_rate": 0.0, "has_ego_motion": False}
+            for idx in range(int(evidence_video.get("num_frames", 0)))
+        ]
+    votes_by_frame = _reference_votes_by_frame(evidence_video, reference_result)
+    frames_out = []
+    for idx, ego_frame in enumerate(ego_frames):
+        frame_index = int(ego_frame.get("frame_index", idx))
+        original_vx, original_vz = _ego_vx_vz(ego_frame)
+        votes = list(votes_by_frame.get(frame_index, []))
+        if votes:
+            vx_values = [vote["ego_vx_vote"] for vote in votes]
+            vz_values = [vote["ego_vz_vote"] for vote in votes]
+            weights = [vote["vote_weight"] for vote in votes]
+            estimated_vx = _weighted_median(vx_values, weights)
+            estimated_vz = _weighted_median(vz_values, weights)
+            mean_weight = _weighted_mean(weights, [1.0 for _ in weights])
+            support_factor = min(1.0, len(votes) / 3.0)
+            weight_factor = min(1.0, sum(weights) / 1.5)
+            agreement = (_vote_agreement(vx_values, estimated_vx) + _vote_agreement(vz_values, estimated_vz)) / 2.0
+            correction_confidence = float(max(0.0, min(1.0, support_factor * weight_factor * agreement)))
+            refined_vx = (1.0 - correction_confidence) * original_vx + correction_confidence * estimated_vx
+            refined_vz = (1.0 - correction_confidence) * original_vz + correction_confidence * estimated_vz
+        else:
+            estimated_vx = original_vx
+            estimated_vz = original_vz
+            refined_vx = original_vx
+            refined_vz = original_vz
+            correction_confidence = 0.0
+            agreement = 0.0
+            mean_weight = 0.0
+        frames_out.append(
+            {
+                **dict(ego_frame),
+                "frame_index": frame_index,
+                "original_ego_vx": float(original_vx),
+                "original_ego_vz": float(original_vz),
+                "reference_estimated_ego_vx": float(estimated_vx),
+                "reference_estimated_ego_vz": float(estimated_vz),
+                "refined_ego_vx": float(refined_vx),
+                "refined_ego_vz": float(refined_vz),
+                "ego_vx_correction": float(refined_vx - original_vx),
+                "ego_vz_correction": float(refined_vz - original_vz),
+                "correction_confidence": float(correction_confidence),
+                "reference_vote_agreement": float(agreement),
+                "reference_vote_mean_weight": float(mean_weight),
+                "num_supporting_reference_objects": len(votes),
+                "supporting_reference_objects": votes,
+            }
+        )
+    confidence_values = [frame["correction_confidence"] for frame in frames_out]
+    correction_magnitudes = [
+        math.hypot(frame["ego_vx_correction"], frame["ego_vz_correction"])
+        for frame in frames_out
+    ]
+    return {
+        "version": _EGO_REFINEMENT_VERSION,
+        "video_id": str((ego_video or {}).get("video_id", evidence_video.get("video_id", ""))),
+        "method": "prior_guided_static_reference_weighted_median",
+        "status": "refined_ego_motion_estimated",
+        "description": (
+            "Refine ego vx/vz using reliable static/low-dynamic reference objects. "
+            "Reference object apparent motion votes for ego motion; votes are combined with a weighted median."
+        ),
+        "num_frames": len(frames_out),
+        "num_frames_with_reference_votes": sum(1 for frame in frames_out if frame["num_supporting_reference_objects"] > 0),
+        "num_reliable_reference_objects": int(reference_result.get("num_reliable_reference_objects", 0)),
+        "correction_confidence": {
+            "mean": float(sum(confidence_values) / max(1, len(confidence_values))),
+            "max": float(max(confidence_values) if confidence_values else 0.0),
+            "frames_with_confidence": int(sum(1 for value in confidence_values if value > 0.0)),
+        },
+        "correction_magnitude": {
+            "mean": float(sum(correction_magnitudes) / max(1, len(correction_magnitudes))),
+            "max": float(max(correction_magnitudes) if correction_magnitudes else 0.0),
+        },
+        "frames": frames_out,
     }
 
 
@@ -2325,12 +3255,34 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
             if track_id >= 0:
                 evidence_by_track[track_id] = dict(row)
         evidence_by_video[video_id] = evidence_by_track
+    refined_ego_by_video = {
+        str(row.get("video_id", "")): row
+        for row in relative_motion_state.get("refined_ego_motion", [])
+        if str(row.get("video_id", ""))
+    }
     all_rendered = []
     all_skipped = []
+    ego_motion_chart_pdfs = []
+    ego_motion_chart_skipped = []
     progress = tqdm(relative_motion, desc="[step 8visual] relative_motion_tracks", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
+        refined_ego_video = refined_ego_by_video.get(video_id, {})
+        pdf_path, pdf_status = _save_ego_motion_comparison_pdf(
+            refined_ego_video,
+            output_root / video_id / "ego_motion_comparison.pdf",
+        )
+        pdf_row = {
+            "video_id": video_id,
+            "status": pdf_status,
+            "methods": ["original", "weighted_median", "refined", "ransac_if_available"],
+        }
+        if pdf_path:
+            pdf_row["pdf_path"] = pdf_path
+            ego_motion_chart_pdfs.append(pdf_row)
+        else:
+            ego_motion_chart_skipped.append(pdf_row)
         rendered, skipped = _render_relative_motion_track_videos(
             relative_motion_video_result=video_result,
             output_root=output_root,
@@ -2347,6 +3299,13 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
         "num_track_videos_rendered": len(all_rendered),
         "num_track_videos_skipped": len(all_skipped),
         "uses_causal_filter_out": bool(evidence_by_video),
+        "uses_refined_ego_motion": bool(refined_ego_by_video),
+        "ego_motion_charts_in_track_videos": False,
+        "ego_motion_chart_methods": ["original", "weighted_median", "refined", "ransac_if_available"],
+        "num_ego_motion_chart_pdfs_rendered": len(ego_motion_chart_pdfs),
+        "num_ego_motion_chart_pdfs_skipped": len(ego_motion_chart_skipped),
+        "ego_motion_chart_pdfs": ego_motion_chart_pdfs,
+        "ego_motion_chart_skipped": ego_motion_chart_skipped,
         "rendered": all_rendered,
         "skipped": all_skipped,
     }
@@ -2362,6 +3321,8 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
         **relative_motion_state,
         "relative_motion_visualizations": all_rendered,
         "relative_motion_visualization_skipped": all_skipped,
+        "ego_motion_chart_pdfs": ego_motion_chart_pdfs,
+        "ego_motion_chart_skipped": ego_motion_chart_skipped,
         "relative_motion_visualization_output_root": output_root,
     }
 
@@ -2534,6 +3495,101 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
         "relative_object_motion": relative_motion,
         "filtered_relative_object_motion": relative_motion,
         "ego_motion": ego_state.get("ego_motion", []),
+    }
+
+
+def step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state):
+    videos = relative_motion_state.get("videos", ego_state.get("videos", []))
+    trajectory_motion_evidence = relative_motion_state.get("trajectory_motion_evidence", [])
+    if not videos or not trajectory_motion_evidence:
+        print("[step 8c] no trajectory motion evidence, skip prior-guided ego refinement")
+        return {
+            **relative_motion_state,
+            "reliable_reference_objects": [],
+            "prior_guided_ego_refinement_output_root": None,
+        }
+
+    output_root = get_pipeline_output_root() / "08c_prior_guided_ego_motion_refinement"
+    output_root.mkdir(parents=True, exist_ok=True)
+    ego_by_video = {
+        str(row.get("video_id", "")): row
+        for row in ego_state.get("ego_motion", relative_motion_state.get("ego_motion", []))
+        if str(row.get("video_id", ""))
+    }
+    reliable_reference_results = []
+    refined_ego_motion_results = []
+    for evidence_video in trajectory_motion_evidence:
+        video_id = str(evidence_video.get("video_id", ""))
+        result = _reliable_reference_objects_video(evidence_video)
+        refined_ego_motion = _refined_ego_motion_video(
+            ego_video=ego_by_video.get(video_id, {}),
+            evidence_video=evidence_video,
+            reference_result=result,
+        )
+        out_dir = output_root / video_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with (out_dir / "reliable_reference_objects.json").open("w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+        with (out_dir / "refined_ego_motion.json").open("w", encoding="utf-8") as f:
+            json.dump(refined_ego_motion, f, indent=2)
+        reliable_reference_results.append(result)
+        refined_ego_motion_results.append(refined_ego_motion)
+
+    manifest = {
+        "version": _EGO_REFINEMENT_VERSION,
+        "method": "prior_guided_static_reference_weighted_median",
+        "num_videos": len(reliable_reference_results),
+        "num_trajectories": sum(int(row.get("num_trajectories", 0)) for row in reliable_reference_results),
+        "num_reliable_reference_objects": sum(
+            int(row.get("num_reliable_reference_objects", 0))
+            for row in reliable_reference_results
+        ),
+        "num_frames": sum(int(row.get("num_frames", 0)) for row in refined_ego_motion_results),
+        "num_frames_with_reference_votes": sum(
+            int(row.get("num_frames_with_reference_votes", 0))
+            for row in refined_ego_motion_results
+        ),
+        "mean_correction_confidence": float(
+            sum(float(row.get("correction_confidence", {}).get("mean", 0.0)) for row in refined_ego_motion_results)
+            / max(1, len(refined_ego_motion_results))
+        ),
+        "max_correction_magnitude": float(
+            max([float(row.get("correction_magnitude", {}).get("max", 0.0)) for row in refined_ego_motion_results] or [0.0])
+        ),
+        "videos": [
+            {
+                "video_id": row["video_id"],
+                "num_trajectories": row.get("num_trajectories", 0),
+                "num_reliable_reference_objects": row.get("num_reliable_reference_objects", 0),
+                "num_frames": refined_ego_motion_results[idx].get("num_frames", 0),
+                "num_frames_with_reference_votes": refined_ego_motion_results[idx].get("num_frames_with_reference_votes", 0),
+                "mean_correction_confidence": refined_ego_motion_results[idx].get("correction_confidence", {}).get("mean", 0.0),
+                "max_correction_magnitude": refined_ego_motion_results[idx].get("correction_magnitude", {}).get("max", 0.0),
+                "status": row.get("status", ""),
+            }
+            for idx, row in enumerate(reliable_reference_results)
+        ],
+    }
+    with (output_root / "reliable_reference_objects_manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    with (output_root / "refined_ego_motion_manifest.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(
+        f"[step 8c] prior_guided_ego_motion_refinement "
+        f"videos={len(reliable_reference_results)} "
+        f"reference_objects={manifest['num_reliable_reference_objects']}/"
+        f"{manifest['num_trajectories']} "
+        f"frames_with_votes={manifest['num_frames_with_reference_votes']}/"
+        f"{manifest['num_frames']} "
+        f"mean_conf={manifest['mean_correction_confidence']:.3f} "
+        f"output_root={output_root}"
+    )
+    return {
+        **relative_motion_state,
+        "reliable_reference_objects": reliable_reference_results,
+        "refined_ego_motion": refined_ego_motion_results,
+        "prior_guided_ego_refinement_output_root": output_root,
+        "ego_motion": ego_state.get("ego_motion", relative_motion_state.get("ego_motion", [])),
     }
 
 

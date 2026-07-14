@@ -47,6 +47,8 @@ _SPEC.loader.exec_module(_PIPELINE)
 _repair_video_tracklets = _PIPELINE._repair_video_tracklets
 _relative_motion_video = _PIPELINE._relative_motion_video
 _trajectory_motion_evidence_video = _PIPELINE._trajectory_motion_evidence_video
+_reliable_reference_objects_video = _PIPELINE._reliable_reference_objects_video
+_refined_ego_motion_video = _PIPELINE._refined_ego_motion_video
 
 
 def _frame(frame_index, boxes=None, scores=None, labels=None, track_ids=None, positions_3d=None):
@@ -290,3 +292,106 @@ def test_motion_significance_marks_stable_motion_high():
     assert assessment["is_high_significance"] is True
     assert trajectory["fact_decision_status"] == "Keep"
     assert trajectory["fact_decision"]["symbolic_layer_eligible"] is True
+
+
+def test_trajectory_validation_keeps_reverse_ego_static_apparent_motion():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.95], ["traffic light"], [3], [[0, 0, 10]]),
+            _frame(1, [[0, 0, 10, 10]], [0.95], ["traffic light"], [3], [[0, 0, 30]]),
+            _frame(2, [[0, 0, 10, 10]], [0.95], ["traffic light"], [3], [[0, 0, 50]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": -20.0},
+            {"frame_index": 2, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": -20.0},
+        ],
+    }
+
+    trajectory = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)["trajectory_motion_evidence"][0]
+
+    validation = trajectory["causal_motion_fact_validation"]
+    assert validation["validation_status"] == "valid"
+    assert validation["invalid"] is False
+    assert "speed_abnormal_change" not in validation["rejection_reasons"]
+    assert "depth_jump" not in validation["rejection_reasons"]
+    assert validation["ego_motion_consistency"]["selected_velocity_profile"] == "ego_plus"
+    assert validation["step_metrics"]["legacy_max_rel_speed"] > 25.0
+    assert validation["step_metrics"]["max_rel_speed"] < 1e-9
+    assert trajectory["fact_decision_status"] == "Keep"
+
+    evidence = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)
+    references = _reliable_reference_objects_video(evidence)
+    assert references["num_reliable_reference_objects"] == 1
+    assert references["reliable_reference_objects"][0]["metrics"]["selected_velocity_profile"] == "ego_plus"
+
+    refined = _refined_ego_motion_video(ego, evidence, references)
+    frame_one = refined["frames"][1]
+    assert frame_one["supporting_reference_objects"][0]["ego_vote_sign_convention"] == "negative_object_velocity"
+    assert abs(frame_one["reference_estimated_ego_vz"] + 20.0) < 1e-9
+
+
+def test_prior_guided_reference_selection_uses_static_object_prior():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.95], ["traffic light"], [3], [[0, 0, 10]]),
+            _frame(1, [[0.5, 0, 10.5, 10]], [0.95], ["traffic light"], [3], [[0.01, 0, 10.01]]),
+            _frame(2, [[1.0, 0, 11.0, 10]], [0.95], ["traffic light"], [3], [[0.02, 0, 10.02]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 2, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+    evidence = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)
+
+    references = _reliable_reference_objects_video(evidence)
+
+    assert references["num_reliable_reference_objects"] == 1
+    reference = references["reliable_reference_objects"][0]
+    assert reference["track_id"] == 3
+    assert reference["expected_motion"] == "static"
+    assert reference["is_reliable_reference"] is True
+    assert "object_motion_prior=static" in reference["selection_reasons"]
+
+
+def test_prior_guided_ego_refinement_uses_static_reference_votes():
+    video = {
+        "video_id": "vid",
+        "frames": [
+            _frame(0, [[0, 0, 10, 10]], [0.95], ["traffic light"], [3], [[0, 0, 10]]),
+            _frame(1, [[1, 0, 11, 10]], [0.95], ["traffic light"], [3], [[0.4, 0, 9.8]]),
+            _frame(2, [[2, 0, 12, 10]], [0.95], ["traffic light"], [3], [[0.8, 0, 9.6]]),
+        ],
+    }
+    ego = {
+        "video_id": "vid",
+        "frames": [
+            {"frame_index": 0, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 1, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+            {"frame_index": 2, "ego_vx_smoothed": 0.0, "ego_vz_smoothed": 0.0},
+        ],
+    }
+    evidence = _trajectory_motion_evidence_video(_relative_motion_video(video, ego), ego)
+    references = _reliable_reference_objects_video(evidence)
+
+    refined = _refined_ego_motion_video(ego, evidence, references)
+
+    assert refined["num_reliable_reference_objects"] == 1
+    assert refined["num_frames_with_reference_votes"] == 2
+    frame_one = refined["frames"][1]
+    assert frame_one["num_supporting_reference_objects"] == 1
+    assert frame_one["supporting_reference_objects"][0]["track_id"] == 3
+    assert frame_one["correction_confidence"] > 0.0
+    assert abs(frame_one["reference_estimated_ego_vx"] - 0.4) < 1e-9
+    assert abs(frame_one["reference_estimated_ego_vz"] + 0.2) < 1e-9
+    assert frame_one["refined_ego_vx"] > 0.0
