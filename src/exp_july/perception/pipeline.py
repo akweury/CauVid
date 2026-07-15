@@ -1009,10 +1009,12 @@ def _pdf_rect(commands, x, y, w, h, color=(0.0, 0.0, 0.0), width=1.0):
     commands.append(f"{_pdf_num(x)} {_pdf_num(y)} {_pdf_num(w)} {_pdf_num(h)} re S")
 
 
-def _build_ego_chart_series(axis_field, frame_indices, frame_rows, methods):
+def _build_ego_chart_series(axis_field, frame_indices, frame_rows, methods, method_names=None):
     chart_series = []
     all_values = []
-    for method_name in ("original", "weighted_median", "refined", "ransac"):
+    if method_names is None:
+        method_names = ("original", "weighted_median", "refined", "ransac")
+    for method_name in method_names:
         meta = dict(methods.get(method_name, {}))
         values = _series_values_for_field(frame_indices, frame_rows, meta.get(axis_field, ""))
         if not values:
@@ -1029,6 +1031,20 @@ def _build_ego_chart_series(axis_field, frame_indices, frame_rows, methods):
             }
         )
     return chart_series, all_values
+
+
+def _ego_motion_chart_rows():
+    """Return Step 8 chart rows in display order.
+
+    Each row is rendered with vx in the left column and vz in the right
+    column.  The final row retains the original all-method comparison.
+    """
+    return (
+        ("original", ("original",)),
+        ("median vote", ("weighted_median",)),
+        ("refined", ("refined",)),
+        ("combined comparison", ("original", "weighted_median", "refined", "ransac")),
+    )
 
 
 def _draw_pdf_ego_axis(commands, x, y, w, h, title, frame_indices, chart_series, all_values):
@@ -1098,19 +1114,38 @@ def _save_ego_motion_comparison_pdf_simple(refined_ego_motion_video, output_path
         return None, "no_refined_ego_motion"
     frame_indices = sorted(frame_rows)
     methods = dict(ego_series.get("methods", {}))
-    vx_series, vx_values = _build_ego_chart_series("vx_field", frame_indices, frame_rows, methods)
-    vz_series, vz_values = _build_ego_chart_series("vz_field", frame_indices, frame_rows, methods)
-    if not vx_series and not vz_series:
+    chart_rows = []
+    for row_label, method_names in _ego_motion_chart_rows():
+        vx_series, vx_values = _build_ego_chart_series(
+            "vx_field", frame_indices, frame_rows, methods, method_names
+        )
+        vz_series, vz_values = _build_ego_chart_series(
+            "vz_field", frame_indices, frame_rows, methods, method_names
+        )
+        chart_rows.append((row_label, vx_series, vx_values, vz_series, vz_values))
+    if not any(vx_series or vz_series for _, vx_series, _, vz_series, _ in chart_rows):
         return None, "no_available_chart_series"
 
     page_w = 792.0
     page_h = 612.0
     commands = []
     video_id = str((refined_ego_motion_video or {}).get("video_id", ""))
-    _pdf_text(commands, 56, page_h - 42, f"ego motion comparison | {video_id}", size=15, color=(0.0, 0.0, 0.0))
-    _draw_pdf_ego_axis(commands, 78, 330, 640, 165, "ego vx", frame_indices, vx_series, vx_values)
-    _draw_pdf_ego_axis(commands, 78, 95, 640, 165, "ego vz", frame_indices, vz_series, vz_values)
-    _pdf_text(commands, 350, 48, "frame", size=10, color=(0.0, 0.0, 0.0))
+    _pdf_text(commands, 42, page_h - 30, f"ego motion comparison | {video_id}", size=15, color=(0.0, 0.0, 0.0))
+    chart_w = 328.0
+    chart_h = 92.0
+    left_x = 48.0
+    right_x = 432.0
+    for row_index, (row_label, vx_series, vx_values, vz_series, vz_values) in enumerate(chart_rows):
+        chart_y = 438.0 - row_index * 132.0
+        _draw_pdf_ego_axis(
+            commands, left_x, chart_y, chart_w, chart_h,
+            f"{row_label} | ego vx", frame_indices, vx_series, vx_values,
+        )
+        _draw_pdf_ego_axis(
+            commands, right_x, chart_y, chart_w, chart_h,
+            f"{row_label} | ego vz", frame_indices, vz_series, vz_values,
+        )
+    _pdf_text(commands, 378, 12, "frame", size=10, color=(0.0, 0.0, 0.0))
 
     content = "\n".join(commands).encode("ascii", errors="replace")
     objects = [
@@ -1151,40 +1186,47 @@ def _save_ego_motion_comparison_pdf(refined_ego_motion_video, output_path):
 
     frame_indices = sorted(frame_rows)
     methods = dict(ego_series.get("methods", {}))
-    fig, axes = plt.subplots(2, 1, figsize=(11.0, 7.0), sharex=True)
+    chart_rows = _ego_motion_chart_rows()
+    fig, axes = plt.subplots(4, 2, figsize=(14.0, 12.0), sharex=True, squeeze=False)
     plotted = False
-    for axis, axis_name, field_name in (
-        (axes[0], "ego vx", "vx_field"),
-        (axes[1], "ego vz", "vz_field"),
-    ):
-        for method_name in ("original", "weighted_median", "refined", "ransac"):
-            meta = dict(methods.get(method_name, {}))
-            values = _series_values_for_field(frame_indices, frame_rows, meta.get(field_name, ""))
-            if not values:
-                continue
-            xs = [frame for frame, value in zip(frame_indices, values) if value is not None]
-            ys = [value for value in values if value is not None]
-            if not xs:
-                continue
-            axis.plot(
-                xs,
-                ys,
-                label=str(meta.get("label", method_name)),
-                color=_bgr_to_mpl_rgb(meta.get("color", (220, 220, 220))),
-                linewidth=1.8,
-            )
-            plotted = True
-        axis.axhline(0.0, color="#888888", linewidth=0.8, alpha=0.55)
-        axis.set_ylabel(axis_name)
-        axis.grid(True, color="#dddddd", linewidth=0.6, alpha=0.75)
-        axis.legend(loc="best", frameon=True)
+    for row_index, (row_label, method_names) in enumerate(chart_rows):
+        for column_index, (axis_name, field_name) in enumerate((("ego vx", "vx_field"), ("ego vz", "vz_field"))):
+            axis = axes[row_index][column_index]
+            axis_plotted = False
+            for method_name in method_names:
+                meta = dict(methods.get(method_name, {}))
+                values = _series_values_for_field(frame_indices, frame_rows, meta.get(field_name, ""))
+                if not values:
+                    continue
+                xs = [frame for frame, value in zip(frame_indices, values) if value is not None]
+                ys = [value for value in values if value is not None]
+                if not xs:
+                    continue
+                axis.plot(
+                    xs,
+                    ys,
+                    label=str(meta.get("label", method_name)),
+                    color=_bgr_to_mpl_rgb(meta.get("color", (220, 220, 220))),
+                    linewidth=1.8,
+                )
+                plotted = True
+                axis_plotted = True
+            axis.axhline(0.0, color="#888888", linewidth=0.8, alpha=0.55)
+            axis.set_title(f"{row_label} | {axis_name}")
+            axis.set_ylabel(axis_name)
+            axis.grid(True, color="#dddddd", linewidth=0.6, alpha=0.75)
+            if axis_plotted:
+                axis.legend(loc="best", frameon=True)
+            else:
+                axis.text(0.5, 0.5, "ego refinement unavailable", ha="center", va="center", transform=axis.transAxes)
 
     if not plotted:
         plt.close(fig)
         return None, "no_available_chart_series"
 
     video_id = str((refined_ego_motion_video or {}).get("video_id", ""))
-    axes[1].set_xlabel("frame")
+    axes[-1][0].set_xlabel("frame")
+    axes[-1][1].set_xlabel("frame")
     fig.suptitle(f"ego motion comparison | {video_id}".strip(), fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     output_path = Path(output_path)
