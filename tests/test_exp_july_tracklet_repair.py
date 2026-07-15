@@ -130,6 +130,47 @@ def test_tracklet_repair_rejects_overlap_conflict():
     assert repaired["frames"][1]["track_ids"] == [8]
 
 
+def test_tracklet_repair_splits_large_gaps_and_repairs_short_gaps_per_segment():
+    frames = [_frame(frame_index) for frame_index in range(14)]
+    observations = {
+        0: ([0, 0, 10, 10], [0, 0, 10]),
+        2: ([2, 0, 12, 10], [0.2, 0, 10]),
+        6: ([30, 0, 40, 10], [3.0, 0, 10]),
+        7: ([31, 0, 41, 10], [3.1, 0, 10]),
+        11: ([60, 0, 70, 10], [6.0, 0, 10]),
+        13: ([62, 0, 72, 10], [6.2, 0, 10]),
+    }
+    for frame_index, (box, position) in observations.items():
+        frames[frame_index] = _frame(frame_index, [box], [0.9], ["car"], [7], [position])
+    video = {
+        "video_id": "vid",
+        "num_frames": len(frames),
+        "num_tracks": 1,
+        "num_objects": len(observations),
+        "num_objects_with_3d": len(observations),
+        "frames": frames,
+    }
+
+    repaired = _repair_video_tracklets(video, {"video_id": "vid"})
+
+    metadata = repaired["tracklet_repair"]
+    assert metadata["num_split_events"] == 2
+    assert metadata["num_new_track_ids"] == 2
+    assert [event["new_track_id"] for event in metadata["split_events"]] == [8, 9]
+    assert repaired["num_tracks"] == 3
+    assert repaired["frames"][0]["track_ids"] == [7]
+    assert repaired["frames"][2]["track_ids"] == [7]
+    assert repaired["frames"][6]["track_ids"] == [8]
+    assert repaired["frames"][7]["track_ids"] == [8]
+    assert repaired["frames"][11]["track_ids"] == [9]
+    assert repaired["frames"][13]["track_ids"] == [9]
+    assert repaired["frames"][6]["objects"][0]["track_id"] == 8
+    assert repaired["frames"][11]["objects"][0]["track_id"] == 9
+    assert metadata["num_repaired_gaps"] == 2
+    assert repaired["frames"][1]["track_ids"] == [7]
+    assert repaired["frames"][12]["track_ids"] == [9]
+
+
 def test_relative_motion_marks_observed_and_repaired_sources_with_frame_labels():
     video = {
         "video_id": "vid",

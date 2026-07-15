@@ -428,11 +428,75 @@ def _append_repaired_object(frame, repair):
     frame["has_3d_positions"] = bool(frame.get("positions_3d", []))
 
 
+def _split_tracklets_at_large_gaps(video_result, cfg):
+    """Give post-gap track segments new IDs before short-gap interpolation."""
+    tracks, _, _ = _frame_object_observations(video_result)
+    used_track_ids = {
+        int(track_id)
+        for frame in video_result.get("frames", [])
+        for track_id in frame.get("track_ids", [])
+        if str(track_id).lstrip("-").isdigit() and int(track_id) >= 0
+    }
+    next_track_id = max(used_track_ids, default=-1) + 1
+    split_events = []
+
+    for original_track_id, track_obs in sorted(tracks.items()):
+        segments = [[track_obs[0]]] if track_obs else []
+        boundary_gaps = []
+        for prev_obs, obs in zip(track_obs, track_obs[1:]):
+            gap_size = int(obs["frame_index"]) - int(prev_obs["frame_index"]) - 1
+            if gap_size > int(cfg["max_gap_frames"]):
+                segments.append([obs])
+                boundary_gaps.append(
+                    {
+                        "gap_start_frame_index": int(prev_obs["frame_index"]),
+                        "gap_end_frame_index": int(obs["frame_index"]),
+                        "gap_size": int(gap_size),
+                    }
+                )
+            else:
+                segments[-1].append(obs)
+
+        for segment_index, segment in enumerate(segments[1:], start=1):
+            new_track_id = next_track_id
+            next_track_id += 1
+            for obs in segment:
+                frame = video_result["frames"][int(obs["frame_pos"])]
+                object_index = int(obs["object_index"])
+                frame["track_ids"][object_index] = int(new_track_id)
+                objects = frame.get("objects", [])
+                if object_index < len(objects):
+                    objects[object_index]["track_id"] = int(new_track_id)
+                    objects[object_index]["track_split_provenance"] = {
+                        "version": _TRACKLET_REPAIR_VERSION,
+                        "method": "split_at_large_temporal_gap",
+                        "original_track_id": int(original_track_id),
+                        "segment_index": int(segment_index),
+                    }
+            boundary = boundary_gaps[segment_index - 1]
+            split_events.append(
+                {
+                    "original_track_id": int(original_track_id),
+                    "new_track_id": int(new_track_id),
+                    "segment_index": int(segment_index),
+                    "segment_start_frame_index": int(segment[0]["frame_index"]),
+                    "segment_end_frame_index": int(segment[-1]["frame_index"]),
+                    **boundary,
+                    "method": "split_at_large_temporal_gap",
+                }
+            )
+
+    if "num_tracks" in video_result:
+        video_result["num_tracks"] = int(video_result.get("num_tracks", 0)) + len(split_events)
+    return split_events
+
+
 def _repair_video_tracklets(video_result, ego_result=None, repair_cfg=None):
     cfg = dict(_TRACKLET_REPAIR_DEFAULT_CFG)
     if repair_cfg:
         cfg.update(repair_cfg)
     repaired = copy.deepcopy(video_result)
+    split_events = _split_tracklets_at_large_gaps(repaired, cfg)
     frames = repaired.get("frames", [])
     tracks, frame_indices, duplicate_track_frames = _frame_object_observations(repaired)
     repair_events = []
@@ -494,6 +558,9 @@ def _repair_video_tracklets(video_result, ego_result=None, repair_cfg=None):
         "num_repaired_gaps": len(repair_events),
         "num_interpolated_objects": num_interpolated,
         "repair_events": repair_events,
+        "num_split_events": len(split_events),
+        "num_new_track_ids": len(split_events),
+        "split_events": split_events,
         "num_skipped_gaps": len(skipped_gaps),
         "skipped_gaps": skipped_gaps,
     }
@@ -3213,6 +3280,14 @@ def step7b_tracklet_repair(position_state, ego_state):
             int(row.get("tracklet_repair", {}).get("num_interpolated_objects", 0))
             for row in repaired_positions_3d
         ),
+        "num_split_events": sum(
+            int(row.get("tracklet_repair", {}).get("num_split_events", 0))
+            for row in repaired_positions_3d
+        ),
+        "num_new_track_ids": sum(
+            int(row.get("tracklet_repair", {}).get("num_new_track_ids", 0))
+            for row in repaired_positions_3d
+        ),
         "num_repaired_frames_total": total_repaired_frames,
         "num_frames_total": total_frames,
         "repaired_frame_ratio_total": repaired_frame_ratio_total,
@@ -3224,6 +3299,8 @@ def step7b_tracklet_repair(position_state, ego_state):
                 "num_frames": row.get("num_frames", 0),
                 "num_repaired_gaps": row.get("tracklet_repair", {}).get("num_repaired_gaps", 0),
                 "num_interpolated_objects": row.get("tracklet_repair", {}).get("num_interpolated_objects", 0),
+                "num_split_events": row.get("tracklet_repair", {}).get("num_split_events", 0),
+                "num_new_track_ids": row.get("tracklet_repair", {}).get("num_new_track_ids", 0),
                 "num_repaired_frames": repaired_frame_stats_by_video.get(str(row.get("video_id", "")), {}).get(
                     "num_repaired_frames",
                     0,
@@ -3243,6 +3320,8 @@ def step7b_tracklet_repair(position_state, ego_state):
         f"[step 7b] done videos={len(repaired_positions_3d)} "
         f"repaired_gaps={manifest['num_repaired_gaps']} "
         f"interpolated_objects={manifest['num_interpolated_objects']} "
+        f"split_events={manifest['num_split_events']} "
+        f"new_track_ids={manifest['num_new_track_ids']} "
         f"avg_repaired_frame_pct={manifest['average_repaired_frame_percentage']:.2f}% "
         f"repaired_frames={manifest['num_repaired_frames_total']}/{manifest['num_frames_total']} "
         f"({manifest['repaired_frame_percentage_total']:.2f}%)"
