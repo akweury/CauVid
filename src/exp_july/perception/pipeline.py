@@ -866,11 +866,11 @@ def _put_text_with_background(cv2, image, text, org, scale, color, thickness=1):
 
 
 def _draw_track_progress_bar(cv2, panel, frame_indices, current_frame_index, track_frames, width):
-    panel_h = panel.shape[0]
     bar_x = 18
     bar_w = max(1, width - 2 * bar_x)
     bar_h = 18
-    bar_y = panel_h - 34
+    # Keep the temporal presence/source bar immediately below the video.
+    bar_y = 8
     n = max(1, len(frame_indices))
     for idx, frame_index in enumerate(frame_indices):
         x1 = bar_x + int(round(idx * bar_w / n))
@@ -909,6 +909,95 @@ def _trajectory_filter_reason_codes(trajectory_evidence):
     for reason in significance.get("reasons", []):
         add(dict(reason or {}).get("kind"))
     return reason_codes
+
+
+def _trajectory_decision_reason_table(trajectory_evidence):
+    """Build the fixed eight-cell quantitative decision-reason table."""
+    evidence = dict(trajectory_evidence or {})
+    fact_decision = dict(evidence.get("fact_decision", {}))
+    validation = dict(evidence.get("causal_motion_fact_validation", {}))
+    significance = dict(evidence.get("motion_significance_assessment", {}))
+    provenance = dict(evidence.get("provenance", {}))
+    active_codes = {
+        str(reason.get("kind", ""))
+        for reason in fact_decision.get("decision_reasons", [])
+        if isinstance(reason, dict)
+    }
+    validation_status = str(validation.get("validation_status", validation.get("status", "uncertain")))
+    significance_status = str(significance.get("significance", evidence.get("motion_significance", "low_significance")))
+    invalid_count = len(validation.get("rejection_reasons", []))
+    uncertain_count = len(validation.get("uncertain_reasons", []))
+    significance_count = len(significance.get("reasons", []))
+    repaired_count = int(provenance.get("repaired_count", 0))
+    merged_count = int(provenance.get("merged_count", 0))
+    valid_flag = int(validation_status == "valid")
+    high_flag = int(significance_status == "high_significance")
+    low_flag = int(significance_status == "low_significance")
+    credibility_uncertainty_count = uncertain_count + int(validation_status == "uncertain") + significance_count
+    specs = (
+        ("invalid_trajectory", invalid_count, 1, f"invalid_issues={invalid_count}"),
+        ("repaired_trajectory_kept", repaired_count + merged_count, 1, f"repairs+merges={repaired_count + merged_count}"),
+        ("low_motion_significance", significance_count, 1, f"low_motion_reasons={significance_count}"),
+        ("valid_high_significance", valid_flag + high_flag, 2, f"valid={valid_flag}, high={high_flag}"),
+        ("valid_low_motion_retained", valid_flag + low_flag, 2, f"valid={valid_flag}, low={low_flag}"),
+        ("credible_but_uncertain", credibility_uncertainty_count, 1, f"uncertainty_evidence={credibility_uncertainty_count}"),
+        ("validation_uncertainty", uncertain_count, 1, f"uncertain_issues={uncertain_count}"),
+        ("significance_uncertainty", significance_count, 1, f"significance_reasons={significance_count}"),
+    )
+    rows = []
+    for reason_name, measured_value, threshold, evidence_text in specs:
+        active = reason_name in active_codes
+        rows.append(
+            {
+                "reason": reason_name,
+                "active": active,
+                "measured_value": float(measured_value),
+                "threshold": float(threshold),
+                "distance_to_threshold": float(measured_value - threshold),
+                "evidence": evidence_text,
+            }
+        )
+    return rows
+
+
+def _draw_decision_reason_table(cv2, panel, entries, x, y, width, row_height=88):
+    columns = 4
+    cell_width = max(1, width // columns)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for index, entry in enumerate(entries):
+        row = index // columns
+        column = index % columns
+        cell_x = x + column * cell_width
+        cell_y = y + row * row_height
+        cell_w = cell_width if column < columns - 1 else width - column * cell_width
+        active = bool(entry.get("active", False))
+        border_color = (80, 220, 80) if active else (92, 92, 92)
+        fill_color = (34, 58, 34) if active else (32, 32, 32)
+        cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), fill_color, -1)
+        cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), border_color, 2 if active else 1)
+        reason = str(entry.get("reason", ""))
+        words = reason.split("_")
+        midpoint = max(1, (len(words) + 1) // 2)
+        title_lines = ["_".join(words[:midpoint]), "_".join(words[midpoint:])]
+        title_lines = [line for line in title_lines if line]
+        for line_index, title_line in enumerate(title_lines[:2]):
+            cv2.putText(panel, title_line, (cell_x + 6, cell_y + 15 + line_index * 13), font, 0.32, (235, 235, 235), 1, cv2.LINE_AA)
+        status_color = (100, 255, 100) if active else (165, 165, 165)
+        cv2.putText(panel, "ACTIVE" if active else "inactive", (cell_x + 6, cell_y + 43), font, 0.38, status_color, 1, cv2.LINE_AA)
+        value = float(entry.get("measured_value", 0.0))
+        threshold = float(entry.get("threshold", 1.0))
+        distance = float(entry.get("distance_to_threshold", value - threshold))
+        cv2.putText(
+            panel,
+            f"value={value:.0f}  threshold={threshold:.0f}  delta={distance:+.0f}",
+            (cell_x + 6, cell_y + 61),
+            font,
+            0.31,
+            (215, 215, 215),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(panel, str(entry.get("evidence", "")), (cell_x + 6, cell_y + 79), font, 0.30, (190, 190, 190), 1, cv2.LINE_AA)
 
 
 def _ego_refinement_series(refined_ego_motion_video):
@@ -1364,7 +1453,7 @@ def _render_relative_motion_track_video(
         return None, "missing_frame_images"
 
     frame_h, frame_w = first_img.shape[:2]
-    panel_h = max(244, int(frame_h * 0.34))
+    panel_h = max(400, int(frame_h * 0.55))
     total_h = frame_h + panel_h
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -1384,7 +1473,7 @@ def _render_relative_motion_track_video(
     trajectory_evidence = dict(trajectory_evidence or {})
     fact_decision = dict(trajectory_evidence.get("fact_decision", {}))
     decision_status = str(fact_decision.get("decision", trajectory_evidence.get("fact_decision_status", "not_available")))
-    filter_reason_codes = _trajectory_filter_reason_codes(trajectory_evidence)
+    decision_reason_entries = _trajectory_decision_reason_table(trajectory_evidence)
     decision_color = _VIS_DECISION_COLORS.get(decision_status, (180, 180, 180))
 
     try:
@@ -1429,11 +1518,12 @@ def _render_relative_motion_track_video(
 
             panel = cv2.resize(first_img[:1, :1], (frame_w, panel_h))
             panel[:] = (24, 24, 24)
-            cv2.rectangle(panel, (0, 0), (frame_w, 8), decision_color, -1)
+            _draw_track_progress_bar(cv2, panel, frame_indices, frame_index, track_frames, frame_w)
+            cv2.rectangle(panel, (0, 38), (frame_w, 46), decision_color, -1)
             cv2.putText(
                 panel,
                 f"relative motion: {motion_state}",
-                (18, 34),
+                (18, 70),
                 font,
                 0.7,
                 (235, 235, 235),
@@ -1448,26 +1538,19 @@ def _render_relative_motion_track_video(
                 )
             else:
                 metrics = "source=absent"
-            cv2.putText(panel, metrics, (18, 62), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
+            cv2.putText(panel, metrics, (18, 98), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
             decision_text = f"causal filter: {decision_status}"
-            cv2.putText(panel, decision_text, (18, 88), font, 0.56, decision_color, 2, cv2.LINE_AA)
-            reason_chunks = [filter_reason_codes[idx:idx + 3] for idx in range(0, len(filter_reason_codes), 3)]
-            if not reason_chunks:
-                reason_chunks = [["no_additional_reason"]]
-            for line_index, reason_chunk in enumerate(reason_chunks[:2]):
-                prefix = "reasons: " if line_index == 0 else "         "
-                cv2.putText(
-                    panel,
-                    prefix + ", ".join(reason_chunk),
-                    (18, 114 + line_index * 24),
-                    font,
-                    0.50,
-                    (220, 220, 220),
-                    1,
-                    cv2.LINE_AA,
-                )
-            if len(reason_chunks) > 2:
-                cv2.putText(panel, "         ...", (18, 162), font, 0.50, (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.putText(panel, decision_text, (18, 124), font, 0.56, decision_color, 2, cv2.LINE_AA)
+            cv2.putText(panel, "decision reason diagnostics (2 x 4)", (18, 148), font, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+            _draw_decision_reason_table(
+                cv2,
+                panel,
+                decision_reason_entries,
+                x=18,
+                y=158,
+                width=max(1, frame_w - 36),
+                row_height=88,
+            )
             legend_y = panel_h - 62
             cv2.rectangle(panel, (18, legend_y), (42, legend_y + 16), _VIS_OBSERVED_COLOR, -1)
             cv2.putText(panel, "observed", (48, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
@@ -1477,7 +1560,6 @@ def _render_relative_motion_track_video(
             cv2.putText(panel, "absent", (296, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
             cv2.rectangle(panel, (382, legend_y), (406, legend_y + 16), decision_color, -1)
             cv2.putText(panel, decision_status, (412, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            _draw_track_progress_bar(cv2, panel, frame_indices, frame_index, track_frames, frame_w)
             writer.write(cv2.vconcat([img, panel]))
     finally:
         writer.release()
