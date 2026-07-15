@@ -262,8 +262,9 @@ def test_motion_significance_marks_static_short_track_low():
     assert trajectory["motion_significance"] == "low_significance"
     assert assessment["is_low_significance"] is True
     assert {reason["kind"] for reason in assessment["reasons"]} & {"extremely_short_trajectory", "nearly_static", "below_estimated_noise"}
-    assert trajectory["fact_decision_status"] == "Keep with uncertainty"
+    assert trajectory["fact_decision_status"] == "Keep"
     assert trajectory["fact_decision"]["symbolic_layer_eligible"] is True
+    assert trajectory["fact_decision"]["decision_reasons"][0]["kind"] == "valid_low_motion_retained"
 
 
 def test_motion_significance_marks_stable_motion_high():

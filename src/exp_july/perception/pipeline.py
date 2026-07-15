@@ -816,6 +816,34 @@ def _draw_track_progress_bar(cv2, panel, frame_indices, current_frame_index, tra
     cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (210, 210, 210), 1)
 
 
+def _trajectory_filter_reason_codes(trajectory_evidence):
+    """Collect the concrete Step 8B reason codes shown in track videos."""
+    evidence = dict(trajectory_evidence or {})
+    fact_decision = dict(evidence.get("fact_decision", {}))
+    validation = dict(evidence.get("causal_motion_fact_validation", {}))
+    significance = dict(evidence.get("motion_significance_assessment", {}))
+    reason_codes = []
+
+    def add(value):
+        value = str(value or "").strip()
+        if value and value not in reason_codes:
+            reason_codes.append(value)
+
+    for reason in fact_decision.get("decision_reasons", []):
+        reason = dict(reason or {})
+        add(reason.get("kind"))
+        for key in ("validation_reasons", "uncertain_reasons", "significance_reasons"):
+            for nested_reason in reason.get(key, []):
+                add(nested_reason)
+    for reason in validation.get("rejection_reasons", []):
+        add(reason)
+    for reason in validation.get("uncertain_reasons", []):
+        add(reason)
+    for reason in significance.get("reasons", []):
+        add(dict(reason or {}).get("kind"))
+    return reason_codes
+
+
 def _ego_refinement_series(refined_ego_motion_video):
     frame_rows = {
         int(frame.get("frame_index", idx)): dict(frame)
@@ -1269,7 +1297,7 @@ def _render_relative_motion_track_video(
         return None, "missing_frame_images"
 
     frame_h, frame_w = first_img.shape[:2]
-    panel_h = max(150, int(frame_h * 0.22))
+    panel_h = max(244, int(frame_h * 0.34))
     total_h = frame_h + panel_h
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -1289,9 +1317,7 @@ def _render_relative_motion_track_video(
     trajectory_evidence = dict(trajectory_evidence or {})
     fact_decision = dict(trajectory_evidence.get("fact_decision", {}))
     decision_status = str(fact_decision.get("decision", trajectory_evidence.get("fact_decision_status", "not_available")))
-    validation_status = str(trajectory_evidence.get("validation_status", "not_available"))
-    motion_significance = str(trajectory_evidence.get("motion_significance", "not_available"))
-    symbolic_eligible = bool(trajectory_evidence.get("symbolic_layer_eligible", False))
+    filter_reason_codes = _trajectory_filter_reason_codes(trajectory_evidence)
     decision_color = _VIS_DECISION_COLORS.get(decision_status, (180, 180, 180))
 
     try:
@@ -1356,19 +1382,34 @@ def _render_relative_motion_track_video(
             else:
                 metrics = "source=absent"
             cv2.putText(panel, metrics, (18, 62), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
-            decision_text = (
-                f"causal filter: {decision_status} | validation={validation_status} | "
-                f"significance={motion_significance} | symbolic={str(symbolic_eligible).lower()}"
-            )
+            decision_text = f"causal filter: {decision_status}"
             cv2.putText(panel, decision_text, (18, 88), font, 0.56, decision_color, 2, cv2.LINE_AA)
-            cv2.rectangle(panel, (18, 104), (42, 120), _VIS_OBSERVED_COLOR, -1)
-            cv2.putText(panel, "observed", (48, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (142, 104), (166, 120), _VIS_REPAIRED_COLOR, -1)
-            cv2.putText(panel, "repaired", (172, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (266, 104), (290, 120), _VIS_ABSENT_COLOR, -1)
-            cv2.putText(panel, "absent", (296, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
-            cv2.rectangle(panel, (382, 104), (406, 120), decision_color, -1)
-            cv2.putText(panel, decision_status, (412, 119), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            reason_chunks = [filter_reason_codes[idx:idx + 3] for idx in range(0, len(filter_reason_codes), 3)]
+            if not reason_chunks:
+                reason_chunks = [["no_additional_reason"]]
+            for line_index, reason_chunk in enumerate(reason_chunks[:2]):
+                prefix = "reasons: " if line_index == 0 else "         "
+                cv2.putText(
+                    panel,
+                    prefix + ", ".join(reason_chunk),
+                    (18, 114 + line_index * 24),
+                    font,
+                    0.50,
+                    (220, 220, 220),
+                    1,
+                    cv2.LINE_AA,
+                )
+            if len(reason_chunks) > 2:
+                cv2.putText(panel, "         ...", (18, 162), font, 0.50, (220, 220, 220), 1, cv2.LINE_AA)
+            legend_y = panel_h - 62
+            cv2.rectangle(panel, (18, legend_y), (42, legend_y + 16), _VIS_OBSERVED_COLOR, -1)
+            cv2.putText(panel, "observed", (48, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (142, legend_y), (166, legend_y + 16), _VIS_REPAIRED_COLOR, -1)
+            cv2.putText(panel, "repaired", (172, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (266, legend_y), (290, legend_y + 16), _VIS_ABSENT_COLOR, -1)
+            cv2.putText(panel, "absent", (296, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (382, legend_y), (406, legend_y + 16), decision_color, -1)
+            cv2.putText(panel, decision_status, (412, legend_y + 15), font, 0.48, (230, 230, 230), 1, cv2.LINE_AA)
             _draw_track_progress_bar(cv2, panel, frame_indices, frame_index, track_frames, frame_w)
             writer.write(cv2.vconcat([img, panel]))
     finally:
@@ -2181,6 +2222,19 @@ def _fact_decision_for_trajectory(validation, significance, provenance, uncertai
             {
                 "kind": "valid_high_significance",
                 "message": "Trajectory is realistic and has enough motion information.",
+            }
+        )
+    elif validation_status == "valid" and motion_significance == "low_significance":
+        decision = "Keep"
+        symbolic_layer_eligible = True
+        reasons.append(
+            {
+                "kind": "valid_low_motion_retained",
+                "message": (
+                    "Trajectory is realistic and retained even though its motion is low; "
+                    "static objects remain valid facts and can support ego-motion refinement."
+                ),
+                "significance_reasons": [row.get("kind", "") for row in significance.get("reasons", [])],
             }
         )
     else:
