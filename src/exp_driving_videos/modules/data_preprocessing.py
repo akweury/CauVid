@@ -28,16 +28,18 @@ logger = logging.getLogger(__name__)
 def get_video_rotation(video_path):
     """
     Get the rotation metadata from a video file using ffprobe.
-    Returns rotation angle in degrees (0, 90, 180, 270) or 0 if not found.
-    
-    Falls back to checking frame dimensions if ffprobe is not available.
+    Returns the signed display rotation in degrees (-90, 0, 90, or 180).
+
+    Modern MOV/MP4 files commonly store orientation in Display Matrix side
+    data instead of the legacy ``rotate`` tag.  The sign matters: +90 and
+    -90 require opposite transformations.
     """
     try:
         cmd = [
             'ffprobe',
             '-v', 'error',
             '-select_streams', 'v:0',
-            '-show_entries', 'stream_tags=rotate',
+            '-show_entries', 'stream_tags=rotate:stream_side_data=rotation',
             '-of', 'json',
             str(video_path)
         ]
@@ -46,30 +48,39 @@ def get_video_rotation(video_path):
         if result.returncode == 0:
             data = json.loads(result.stdout)
             if 'streams' in data and len(data['streams']) > 0:
-                tags = data['streams'][0].get('tags', {})
-                rotation = int(tags.get('rotate', 0))
-                if rotation > 0:
-                    return rotation
+                stream = data['streams'][0]
+                rotation = None
+                for side_data in stream.get('side_data_list', []):
+                    if side_data.get('rotation') is not None:
+                        rotation = float(side_data['rotation'])
+                        break
+                if rotation is None:
+                    rotation = float(stream.get('tags', {}).get('rotate', 0))
+
+                # Normalize equivalent values such as 270 to -90 and avoid
+                # small floating-point deviations in display matrices.
+                rotation = ((rotation + 180.0) % 360.0) - 180.0
+                if abs(rotation + 90.0) < 1.0:
+                    return -90
+                if abs(rotation - 90.0) < 1.0:
+                    return 90
+                if abs(abs(rotation) - 180.0) < 1.0:
+                    return 180
+                return 0
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, ValueError, KeyError):
-        logger.debug("ffprobe not available or failed, checking frame dimensions")
+        logger.debug("ffprobe rotation lookup was unavailable or failed")
     
-    # Fallback: check if video dimensions suggest it needs rotation
-    # If width < height, it's likely a portrait/rotated video that needs correction
-    try:
-        cap = cv2.VideoCapture(str(video_path))
-        if cap.isOpened():
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
-            
-            # If portrait orientation (width < height), assume 90 degree rotation
-            if width < height:
-                logger.info(f"  Video dimensions {width}x{height} suggest 90° rotation needed")
-                return 90
-    except Exception:
-        pass
-    
+    # Dimensions alone cannot distinguish clockwise from counter-clockwise
+    # orientation. Guessing here makes one half of mixed-orientation datasets
+    # upside down, so leave videos without metadata unchanged.
     return 0
+
+
+def _disable_opencv_autorotation(cap):
+    """Decode stored pixels unchanged when rotation is handled explicitly."""
+    orientation_auto = getattr(cv2, 'CAP_PROP_ORIENTATION_AUTO', None)
+    if orientation_auto is not None:
+        cap.set(orientation_auto, 0)
 
 def rotate_frame(frame, rotation):
     """
@@ -77,18 +88,16 @@ def rotate_frame(frame, rotation):
     
     Args:
         frame: Input frame (numpy array)
-        rotation: Rotation angle in degrees (90, 180, 270)
+        rotation: Signed display rotation from ffprobe.
     
     Returns:
         Rotated frame
     """
-    if rotation == 90:
-        # Rotate 90 degrees counter-clockwise
+    if rotation == -90:
         return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    elif rotation == 180:
+    elif rotation in (180, -180):
         return cv2.rotate(frame, cv2.ROTATE_180)
-    elif rotation == 270:
-        # Rotate 90 degrees clockwise (or 270 counter-clockwise)
+    elif rotation == 90:
         return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     return frame
 
@@ -108,10 +117,11 @@ def extract_frames(video_path, output_dir):
     
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+    _disable_opencv_autorotation(cap)
     
     # Get rotation metadata
     rotation = get_video_rotation(video_path)
-    if rotation > 0:
+    if rotation:
         logger.info(f"  Detected rotation: {rotation} degrees - will correct during extraction")
     
     frame_count = 0
@@ -123,7 +133,7 @@ def extract_frames(video_path, output_dir):
             break
         
         # Apply rotation correction if needed
-        if rotation > 0:
+        if rotation:
             frame = rotate_frame(frame, rotation)
         
         # Save frame with zero-indexed numbering
@@ -219,6 +229,7 @@ def convert_videos_to_frames(
             if not cap.isOpened():
                 logger.error(f"Could not open video: {video_path}")
                 continue
+            _disable_opencv_autorotation(cap)
             
             # Get video properties
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -226,7 +237,7 @@ def convert_videos_to_frames(
             
             # Get video rotation metadata
             rotation = get_video_rotation(video_path)
-            if rotation > 0:
+            if rotation:
                 logger.info(f"  Detected rotation: {rotation} degrees - will correct during extraction")
             
             # Calculate frame skip interval to achieve target fps
@@ -252,7 +263,7 @@ def convert_videos_to_frames(
                         break
                     
                     # Apply rotation correction if needed
-                    if rotation > 0:
+                    if rotation:
                         frame = rotate_frame(frame, rotation)
                     
                     # Save frame (zero-indexed)

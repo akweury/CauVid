@@ -131,7 +131,11 @@ def extract_video_frames(
     skip_existing: bool,
 ) -> dict[int, int]:
     import cv2
-    from src.exp_driving_videos.modules.data_preprocessing import get_video_rotation, rotate_frame
+    from src.exp_driving_videos.modules.data_preprocessing import (
+        _disable_opencv_autorotation,
+        get_video_rotation,
+        rotate_frame,
+    )
 
     existing = sorted(frame_output_dir.glob("frame_*.jpg"))
     if skip_existing and existing:
@@ -141,6 +145,7 @@ def extract_video_frames(
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+    _disable_opencv_autorotation(cap)
 
     original_fps = cap.get(cv2.CAP_PROP_FPS) or target_fps
     frame_skip = max(1, int(round(original_fps / target_fps)))
@@ -158,7 +163,7 @@ def extract_video_frames(
         if original_index % frame_skip == 0:
             if max_frames is not None and extracted_index >= max_frames:
                 break
-            if rotation > 0:
+            if rotation:
                 frame = rotate_frame(frame, rotation)
             frame_path = frame_output_dir / f"frame_{extracted_index:05d}.jpg"
             if not cv2.imwrite(str(frame_path), frame):
