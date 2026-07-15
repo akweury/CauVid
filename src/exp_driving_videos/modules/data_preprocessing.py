@@ -94,11 +94,13 @@ def rotate_frame(frame, rotation):
         Rotated frame
     """
     if rotation == -90:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        # FFprobe Display Matrix uses the opposite sign convention from
+        # OpenCV's named display transforms: -90 displays clockwise.
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     elif rotation in (180, -180):
         return cv2.rotate(frame, cv2.ROTATE_180)
     elif rotation == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return frame
 
 
