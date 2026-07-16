@@ -134,7 +134,12 @@ _REFERENCE_OBJECT_THRESHOLDS = {
 
 
 def get_pipeline_output_root():
-    return Path(os.environ.get("CAUVID_PIPELINE_OUTPUT_PATH", ROOT / "output_july"))
+    return Path(
+        os.environ.get(
+            "CAUVID_PIPELINE_OUTPUT_PATH",
+            str(config.get_output_path("pipeline_output")),
+        )
+    )
 
 
 def normalize_detection_image_paths(video_result, dataset_root):

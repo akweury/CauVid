@@ -10,14 +10,35 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.absolute()
 driving_demo_video_id = "0153f03b-8fbdc1ad"
 # driving_demo_video_id = "01118704-e91b1b1c"
+
+
+def _resolve_path_from_candidates(*candidates: Path | str | None, default: Path) -> Path:
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        resolved = Path(str(candidate)).expanduser()
+        if resolved.exists():
+            return resolved
+    return Path(default).expanduser()
+
+
+def _resolve_env_path(env_name: str, *, default: Path, candidates: list[Path | str | None] | None = None) -> Path:
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return Path(env_value).expanduser()
+    return _resolve_path_from_candidates(*(candidates or []), default=default)
+
+
 DEFAULT_STORAGE_ROOT_CANDIDATES = [
     Path(os.environ["CAUVID_STORAGE_ROOT"]) if os.environ.get("CAUVID_STORAGE_ROOT") else None,
-    Path("/storage-02/ml-jsha"),
+    Path("/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data"),
+    Path("/mnt/remote/dgx-g/storage-01/CauVid_Data"),
     Path("/storage-01/ml-jsha/CauVid_Data"),
-]
-DEFAULT_STORAGE_ROOT = next(
-    (path for path in DEFAULT_STORAGE_ROOT_CANDIDATES if path is not None and path.exists()),
     Path("/storage-02/ml-jsha"),
+]
+DEFAULT_STORAGE_ROOT = _resolve_path_from_candidates(
+    *DEFAULT_STORAGE_ROOT_CANDIDATES,
+    default=Path("/storage-02/ml-jsha"),
 )
 DEFAULT_RAW_DRIVING_DATASET = Path(
     os.environ.get(
@@ -25,19 +46,41 @@ DEFAULT_RAW_DRIVING_DATASET = Path(
         DEFAULT_STORAGE_ROOT / "driving-video-with-object-tracking",
     )
 )
-DEFAULT_OUTPUT_ROOT = Path(os.environ.get("CAUVID_OUTPUT_PATH", PROJECT_ROOT / "output"))
-DEFAULT_PIPELINE_OUTPUT_ROOT = Path(
-    os.environ.get(
-        "CAUVID_PIPELINE_OUTPUT_PATH",
-        "/storage-01/ml-jsha/CauVid_output/pipeline_output",
-    )
+DEFAULT_OUTPUT_ROOT = _resolve_env_path(
+    "CAUVID_OUTPUT_PATH",
+    default=PROJECT_ROOT / "output",
+    candidates=[
+        Path("/home/sha/mnt/remote/dgx-g/storage-01/CauVid_output"),
+        Path("/mnt/remote/dgx-g/storage-01/CauVid_output"),
+        Path("/storage-01/ml-jsha/CauVid_output"),
+        PROJECT_ROOT / "output",
+    ],
+)
+DEFAULT_PIPELINE_OUTPUT_ROOT = _resolve_env_path(
+    "CAUVID_PIPELINE_OUTPUT_PATH",
+    default=DEFAULT_OUTPUT_ROOT / "pipeline_output",
+    candidates=[
+        DEFAULT_OUTPUT_ROOT / "pipeline_output",
+        Path("/home/sha/mnt/remote/dgx-g/storage-01/CauVid_output/pipeline_output"),
+        Path("/mnt/remote/dgx-g/storage-01/CauVid_output/pipeline_output"),
+        Path("/storage-01/ml-jsha/CauVid_output/pipeline_output"),
+    ],
 )
 DEFAULT_TEMP_ROOT = Path(os.environ.get("CAUVID_TEMP_PATH", PROJECT_ROOT / "temp"))
 
 # Dataset paths
 DATASET_PATHS = {
     # Mini driving dataset path
-    "driving_mini": Path(os.environ.get("CAUVID_DRIVING_MINI_PATH", PROJECT_ROOT / "dataset" / "driving_mini")),
+    "driving_mini": _resolve_env_path(
+        "CAUVID_DRIVING_MINI_PATH",
+        default=PROJECT_ROOT / "dataset" / "driving_mini",
+        candidates=[
+            Path("/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/driving_mini"),
+            Path("/mnt/remote/dgx-g/storage-01/CauVid_Data/driving_mini"),
+            Path("/storage-01/ml-jsha/CauVid_Data/driving_mini"),
+            PROJECT_ROOT / "dataset" / "driving_mini",
+        ],
+    ),
     # Raw driving dataset path containing .mov videos and mot_labels.csv
     "driving_raw": Path(os.environ.get(
         "CAUVID_RAW_DRIVING_DATASET",

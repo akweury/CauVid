@@ -1,7 +1,4 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
@@ -144,6 +141,28 @@
             "cwd": "${workspaceFolder}",
             "env": {
                 "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+        ,
+        {
+            "name": "Python Debugger: exp_july pipeline (local, 10 files)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/cauvid/bin/python",
+            "program": "${workspaceFolder}/src/exp_july/pipeline.py",
+            "args": [
+                "--video-count",
+                "10",
+                "--max-step",
+                "18"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "CAUVID_DRIVING_MINI_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_Data/driving_mini",
+                "CAUVID_PIPELINE_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output/pipeline_output",
+                "CAUVID_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output"
             }
         }
     ]

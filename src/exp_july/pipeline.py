@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 
@@ -162,8 +163,23 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     return refined_state
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Run the exp_july pipeline locally")
+    parser.add_argument("--video-ids", nargs="*", default=None, help="Specific video IDs to process")
+    parser.add_argument("--video-count", type=int, default=None, help="Limit the run to this many videos")
+    parser.add_argument("--rounds", type=int, default=3, help="Number of causal refinement rounds")
+    parser.add_argument("--max-step", type=int, default=18, help="Highest pipeline step to execute")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    result = main()
+    args = _parse_args()
+    result = main(
+        video_ids=args.video_ids,
+        video_count=args.video_count,
+        rounds=args.rounds,
+        max_step=args.max_step,
+    )
     print("done")
     print(f"videos={len(result['videos'])}")
     if "rounds" in result:
