@@ -1,14 +1,34 @@
 {
     "version": "0.2.0",
     "configurations": [
+        
+
+        
+
+
+
+
+
         {
-            "name": "Python Debugger: Current File",
+            "name": "Python Debugger: exp_july pipeline (local, 10 files)",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "python": "/home/sha/miniforge3/envs/cauvid/bin/python",
+            "program": "${workspaceFolder}/src/exp_july/pipeline.py",
+            "args": [
+                "--video-count",
+                "10",
+                "--max-step",
+                "18"
+            ],
             "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
             "env": {
-                "PYTHONPATH": "${workspaceFolder}"
+                "PYTHONPATH": "${workspaceFolder}",
+                "CAUVID_DRIVING_MINI_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_Data/driving_mini",
+                "CAUVID_PIPELINE_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output/pipeline_output",
+                "CAUVID_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output",
+                "CUDA_VISIBLE_DEVICES": "0"
             }
         }
         ,
@@ -148,7 +168,7 @@
             "name": "Python Debugger: exp_july pipeline (local, 10 files)",
             "type": "debugpy",
             "request": "launch",
-            "python": "${workspaceFolder}/cauvid/bin/python",
+            "python": "/home/sha/miniforge3/envs/cauvid/bin/python",
             "program": "${workspaceFolder}/src/exp_july/pipeline.py",
             "args": [
                 "--video-count",
@@ -162,7 +182,8 @@
                 "PYTHONPATH": "${workspaceFolder}",
                 "CAUVID_DRIVING_MINI_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_Data/driving_mini",
                 "CAUVID_PIPELINE_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output/pipeline_output",
-                "CAUVID_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output"
+                "CAUVID_OUTPUT_PATH": "${env:HOME}/mnt/remote/dgx-g/storage-01/CauVid_output",
+                "CUDA_VISIBLE_DEVICES": "0"
             }
         }
     ]

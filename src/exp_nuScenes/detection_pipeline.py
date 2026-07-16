@@ -198,7 +198,7 @@ class YOLOWorldDetector(ObjectDetector):
         confidence_threshold: Minimum score to keep a detection.
         nms_iou_threshold: IoU threshold for NMS suppression.
         device: Inference device override, e.g. "cpu", "cuda:0", "mps".
-            If None, ultralytics auto-selects.
+            If None, this defaults to CUDA device 0 when available and falls back to CPU otherwise.
     """
 
     def __init__(
@@ -220,7 +220,15 @@ class YOLOWorldDetector(ObjectDetector):
         self.classes = list(classes) if classes else []
         self.confidence_threshold = confidence_threshold
         self.nms_iou_threshold = nms_iou_threshold
-        self.device = device
+        try:
+            import torch
+
+            if device is None:
+                self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            else:
+                self.device = device
+        except Exception:
+            self.device = device or "cpu"
         self.candidate_confidence_threshold = candidate_confidence_threshold
         self.candidate_nms_iou_threshold = candidate_nms_iou_threshold
         self.borderline_confidence_margin = borderline_confidence_margin
@@ -347,10 +355,13 @@ class YOLOWorldDetector(ObjectDetector):
         if self._resolved_predict_batch_size is not None:
             predict_kwargs["batch"] = int(self._resolved_predict_batch_size)
         if self._resolved_half_precision is not None:
-            predict_kwargs["half"] = bool(self._resolved_half_precision)
-        if self._runtime_device is not None:
-            predict_kwargs["device"] = str(self._runtime_device)
-        return self._model.predict(
+            predict_kwargs["quantize"] = 16 if bool(self._resolved_half_precision) else None
+        runtime_device = str(self._runtime_device or self.device or "cpu").strip()
+        if runtime_device.lower() == "auto":
+            runtime_device = "cpu"
+        if runtime_device:
+            predict_kwargs["device"] = runtime_device
+        return  self._model.predict(
             **predict_kwargs,
         )
 

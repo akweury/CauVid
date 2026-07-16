@@ -16,6 +16,16 @@ temp/
 .DS_Store
 **/.DS_Store
 
+# Generated or downloaded ML model artifacts
+# Already-tracked weights remain tracked; these rules block accidental new additions.
+weights/**
+checkpoints/**
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
 # Large video files
 *.mov
 

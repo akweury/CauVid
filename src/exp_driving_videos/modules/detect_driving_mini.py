@@ -1052,6 +1052,9 @@ def run(
         if detector is not None:
             return detector
         ensure_detector_runtime_available(render_video=effective_render_video)
+        resolved_device = str(device or "cpu").strip() or "cpu"
+        if resolved_device.lower() == "auto":
+            resolved_device = "cpu"
         detector = YOLOWorldDetector(
             model_name=model_name,
             classes=effective_classes,
@@ -1060,7 +1063,7 @@ def run(
             candidate_confidence_threshold=candidate_confidence_threshold,
             candidate_nms_iou_threshold=candidate_nms_iou_threshold,
             borderline_confidence_margin=borderline_confidence_margin,
-            device=device,
+            device=resolved_device,
             predict_batch_size=predict_batch_size,
             inference_imgsz=inference_imgsz,
             use_half_precision=use_half_precision,

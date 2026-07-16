@@ -45,7 +45,7 @@ _REL_SPEED_THRESHOLD = 0.3
 _DISTANCE_NEAR_THRESHOLD = 15.0
 _DISTANCE_MEDIUM_THRESHOLD = 30.0
 _X_POSITION_THRESHOLD = 2.0
-_RELATIVE_MOTION_VIS_VERSION = 1
+_RELATIVE_MOTION_VIS_VERSION = 2
 _VIS_OBSERVED_COLOR = (70, 220, 70)
 _VIS_REPAIRED_COLOR = (220, 60, 255)
 _VIS_ABSENT_COLOR = (58, 58, 58)
@@ -965,45 +965,46 @@ def _trajectory_decision_reason_table(trajectory_evidence):
     return rows
 
 
-def _draw_decision_reason_table(cv2, panel, entries, x, y, width, row_height=88):
-    columns = 4
+def _draw_decision_reason_table(cv2, panel, entries, x, y, width, row_height=68):
+    active_entries = [entry for entry in entries if bool(entry.get("active", False))]
+    visible_entries = active_entries[:4]
+    if not visible_entries:
+        visible_entries = sorted(
+            entries,
+            key=lambda entry: abs(float(entry.get("distance_to_threshold", 0.0))),
+        )[:2]
+    columns = max(1, len(visible_entries))
     cell_width = max(1, width // columns)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    for index, entry in enumerate(entries):
-        row = index // columns
-        column = index % columns
+    for index, entry in enumerate(visible_entries):
+        column = index
         cell_x = x + column * cell_width
-        cell_y = y + row * row_height
+        cell_y = y
         cell_w = cell_width if column < columns - 1 else width - column * cell_width
         active = bool(entry.get("active", False))
         border_color = (80, 220, 80) if active else (92, 92, 92)
         fill_color = (34, 58, 34) if active else (32, 32, 32)
         cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), fill_color, -1)
         cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), border_color, 2 if active else 1)
-        reason = str(entry.get("reason", ""))
-        words = reason.split("_")
-        midpoint = max(1, (len(words) + 1) // 2)
-        title_lines = ["_".join(words[:midpoint]), "_".join(words[midpoint:])]
-        title_lines = [line for line in title_lines if line]
-        for line_index, title_line in enumerate(title_lines[:2]):
-            cv2.putText(panel, title_line, (cell_x + 6, cell_y + 15 + line_index * 13), font, 0.32, (235, 235, 235), 1, cv2.LINE_AA)
-        status_color = (100, 255, 100) if active else (165, 165, 165)
-        cv2.putText(panel, "ACTIVE" if active else "inactive", (cell_x + 6, cell_y + 43), font, 0.38, status_color, 1, cv2.LINE_AA)
+        reason = str(entry.get("reason", "")).replace("_", " ")
+        max_chars = max(12, int(cell_w / 10))
+        if len(reason) > max_chars:
+            reason = reason[: max(1, max_chars - 1)].rstrip() + "…"
+        cv2.putText(panel, reason, (cell_x + 8, cell_y + 25), font, 0.48, (240, 240, 240), 1, cv2.LINE_AA)
         value = float(entry.get("measured_value", 0.0))
         threshold = float(entry.get("threshold", 1.0))
         distance = float(entry.get("distance_to_threshold", value - threshold))
+        status_color = (100, 255, 100) if active else (175, 175, 175)
         cv2.putText(
             panel,
-            f"value={value:.0f}  threshold={threshold:.0f}  delta={distance:+.0f}",
-            (cell_x + 6, cell_y + 61),
+            f">={threshold:.0f} | {value:.0f} | {distance:+.0f}",
+            (cell_x + 8, cell_y + 53),
             font,
-            0.31,
-            (215, 215, 215),
+            0.44,
+            status_color,
             1,
             cv2.LINE_AA,
         )
-        cv2.putText(panel, str(entry.get("evidence", "")), (cell_x + 6, cell_y + 79), font, 0.30, (190, 190, 190), 1, cv2.LINE_AA)
-
 
 def _ego_refinement_series(refined_ego_motion_video):
     frame_rows = {
@@ -1525,36 +1526,25 @@ def _render_relative_motion_track_video(
             panel[:] = (24, 24, 24)
             _draw_track_progress_bar(cv2, panel, frame_indices, frame_index, track_frames, frame_w)
             cv2.rectangle(panel, (0, 38), (frame_w, 46), decision_color, -1)
-            cv2.putText(
-                panel,
-                f"relative motion: {motion_state}",
-                (18, 70),
-                font,
-                0.7,
-                (235, 235, 235),
-                2,
-                cv2.LINE_AA,
-            )
             if obj is not None:
-                metrics = (
-                    f"source={source_label}  rel_vx={_safe_float(obj.get('rel_vx', 0.0)):+.3f}  "
-                    f"rel_vz={_safe_float(obj.get('rel_vz', 0.0)):+.3f}  "
-                    f"speed={_safe_float(obj.get('rel_speed', 0.0)):.3f}"
+                summary = (
+                    f"motion={motion_state} | source={source_label} | filter={decision_status} | "
+                    f"vx={_safe_float(obj.get('rel_vx', 0.0)):+.2f}  "
+                    f"vz={_safe_float(obj.get('rel_vz', 0.0)):+.2f}  "
+                    f"speed={_safe_float(obj.get('rel_speed', 0.0)):.2f}"
                 )
             else:
-                metrics = "source=absent"
-            cv2.putText(panel, metrics, (18, 98), font, 0.58, (210, 210, 210), 1, cv2.LINE_AA)
-            decision_text = f"causal filter: {decision_status}"
-            cv2.putText(panel, decision_text, (18, 124), font, 0.56, decision_color, 2, cv2.LINE_AA)
-            cv2.putText(panel, "decision reason diagnostics (2 x 4)", (18, 148), font, 0.48, (220, 220, 220), 1, cv2.LINE_AA)
+                summary = f"motion=not present | source=absent | filter={decision_status}"
+            cv2.putText(panel, summary, (18, 78), font, 0.58, (235, 235, 235), 1, cv2.LINE_AA)
+            cv2.putText(panel, "decision reasons", (18, 108), font, 0.55, (225, 225, 225), 1, cv2.LINE_AA)
             _draw_decision_reason_table(
                 cv2,
                 panel,
                 decision_reason_entries,
                 x=18,
-                y=158,
+                y=120,
                 width=max(1, frame_w - 36),
-                row_height=88,
+                row_height=68,
             )
             legend_y = panel_h - 62
             cv2.rectangle(panel, (18, legend_y), (42, legend_y + 16), _VIS_OBSERVED_COLOR, -1)
@@ -2963,6 +2953,7 @@ def step1_init(video_ids=None, video_count=None):
         "classes": driving_pipeline_config.DRIVING_MINI_OD_CLASSES,
         "output_root": get_pipeline_output_root() / "01_driving_mini_detection",
         "od_calibration_policy": {},
+        "device": "cuda:0",
         "force_recompute": False,
         "render_video": driving_pipeline_config.get_detection_render_video_enabled(default=True),
         "check_cache": driving_pipeline_config.get_detection_check_cache_enabled(default=False),
@@ -2980,7 +2971,7 @@ def step1_init(video_ids=None, video_count=None):
         "output_root": get_pipeline_output_root() / "06_driving_mini_3d_positions",
         "model_name": "depth-anything/DA3-Large",
         "batch_size": 4,
-        "device": "auto",
+        "device": "cuda:0",
         "force_recompute": False,
         "force_recompute_depth": False,
     }
@@ -2990,7 +2981,7 @@ def step1_init(video_ids=None, video_count=None):
         "smoothing_window": driving_pipeline_config.get_ego_motion_smoothing_window(default=5),
         "static_adjust_cfg": driving_pipeline_config.get_ego_static_adjustment_cfg(),
         "render_video": driving_pipeline_config.get_ego_motion_render_video_enabled(default=True),
-        "flow_device": "auto",
+        "flow_device": "cuda:0",
     }
     return {
         "videos": videos,
