@@ -966,20 +966,15 @@ def _trajectory_decision_reason_table(trajectory_evidence):
 
 
 def _draw_decision_reason_table(cv2, panel, entries, x, y, width, row_height=68):
-    active_entries = [entry for entry in entries if bool(entry.get("active", False))]
-    visible_entries = active_entries[:4]
-    if not visible_entries:
-        visible_entries = sorted(
-            entries,
-            key=lambda entry: abs(float(entry.get("distance_to_threshold", 0.0))),
-        )[:2]
-    columns = max(1, len(visible_entries))
+    visible_entries = list(entries)
+    columns = min(4, max(1, len(visible_entries)))
     cell_width = max(1, width // columns)
     font = cv2.FONT_HERSHEY_SIMPLEX
     for index, entry in enumerate(visible_entries):
-        column = index
+        row = index // columns
+        column = index % columns
         cell_x = x + column * cell_width
-        cell_y = y
+        cell_y = y + row * row_height
         cell_w = cell_width if column < columns - 1 else width - column * cell_width
         active = bool(entry.get("active", False))
         border_color = (80, 220, 80) if active else (92, 92, 92)
