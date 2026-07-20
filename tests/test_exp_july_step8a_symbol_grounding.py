@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,16 +71,7 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                         "supporting_atoms": [support],
                         "justification": "object_class is pedestrian in the supplied symbol.",
                     }
-                ],
-                "important_objects": [
-                    {
-                        "target": "important_obj",
-                        "track_id": 1,
-                        "important": True,
-                        "supporting_atoms": [support],
-                        "justification": "The supplied object_class atom marks this track.",
-                    }
-                ],
+                ]
             }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -88,8 +80,30 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                 Path(tmp),
                 llm_generate=llm,
             )
+            payload = json.loads(
+                (Path(tmp) / "demo" / "symbol_grounded_refinement.json").read_text()
+            )
+        self.assertEqual(
+            set(payload),
+            {
+                "status",
+                "rule_head_predicate",
+                "grounded_tracks",
+                "semantic_protection_rules",
+                "rejected_rules",
+                "important_objects",
+                "protected_objects",
+                "uncovered_track_ids",
+            },
+        )
         self.assertEqual([row["track_id"] for row in result["protected_objects"]], [1])
+        self.assertEqual([row["track_id"] for row in result["important_objects"]], [1])
+        self.assertEqual(result["symbol_grounded_refinement"][0]["uncovered_track_ids"], [2])
         self.assertEqual(len(result["semantic_protection_rules"]), 1)
+        protected = result["protected_objects"][0]
+        self.assertEqual(protected["matched_rule_ids"], ["protect_pedestrian"])
+        self.assertTrue(protected["grounding_evidence"])
+        self.assertEqual(protected["trajectory_decision"], "pending_step8b")
 
     def test_invented_predicate_and_threshold_are_rejected(self):
         video = _video()
@@ -105,8 +119,7 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                         "supporting_atoms": [support],
                         "justification": "Invented numeric threshold.",
                     }
-                ],
-                "important_objects": [],
+                ]
             }
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,8 +130,60 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
             )
         video_result = result["symbol_grounded_refinement"][0]
         self.assertEqual(video_result["semantic_protection_rules"], [])
-        self.assertIn("ungrounded_condition", video_result["rejected_rules"][0]["rejection_reasons"])
+        self.assertIn("unknown_predicate", video_result["rejected_rules"][0]["rejection_reasons"])
         self.assertEqual(result["protected_objects"], [])
+
+    def test_redundant_and_overly_general_rules_are_rejected(self):
+        video = _video()
+        tracks = build_grounded_tracks(video)
+        pedestrian_support = next(
+            atom
+            for atom in tracks[0]["atoms"]
+            if atom.startswith("object_class(")
+        )
+        confidence_support = next(
+            atom
+            for atom in tracks[0]["atoms"]
+            if atom.startswith("detection_confidence(")
+        )
+
+        def llm(_prompt):
+            return {
+                "rules": [
+                    {
+                        "rule_id": "pedestrian_one",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}],
+                        "supporting_atoms": [pedestrian_support],
+                        "justification": "Grounded pedestrian class.",
+                    },
+                    {
+                        "rule_id": "pedestrian_duplicate",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}],
+                        "supporting_atoms": [pedestrian_support],
+                        "justification": "Duplicate grounded pedestrian class.",
+                    },
+                    {
+                        "rule_id": "all_high_confidence",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "detection_confidence", "value": "high"}],
+                        "supporting_atoms": [confidence_support],
+                        "justification": "Grounded high confidence.",
+                    },
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_symbol_grounded_refinement(
+                {"videos": [], "relative_object_motion": [video]},
+                Path(tmp),
+                llm_generate=llm,
+            )
+        rejected = result["symbol_grounded_refinement"][0]["rejected_rules"]
+        reasons = {reason for rule in rejected for reason in rule["rejection_reasons"]}
+        self.assertIn("redundant_body", reasons)
+        self.assertIn("overly_general_coverage", reasons)
 
     def test_protection_overrides_discard_but_preserves_audit_decision(self):
         frames = []
@@ -142,7 +207,11 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                     "video_id": "unsafe",
                     "track_id": 9,
                     "matched_rule_ids": ["protect_pedestrian"],
-                    "justifications": ["grounded pedestrian rule"],
+                    "grounding_evidence": [{"rule_id": "protect_pedestrian"}],
+                    "protection_reason": "grounded pedestrian rule",
+                    "original_decision_before_protection": None,
+                    "trajectory_decision": "pending_step8b",
+                    "final_decision_after_protection": "pending_step8b",
                 }
             },
         )
@@ -150,6 +219,12 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
         self.assertEqual(row["fact_decision_status"], "Keep with uncertainty")
         self.assertTrue(row["symbolic_layer_eligible"])
         self.assertEqual(row["fact_decision"]["original_decision_before_protection"], "Discard")
+        self.assertEqual(row["fact_decision"]["trajectory_decision"], "Discard")
+        self.assertEqual(
+            row["fact_decision"]["final_decision_after_protection"],
+            "Keep_with_uncertainty",
+        )
+        self.assertTrue(row["fact_decision"]["send_to_motion_signal_refinement"])
 
 
 if __name__ == "__main__":

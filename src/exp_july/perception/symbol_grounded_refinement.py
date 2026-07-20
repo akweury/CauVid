@@ -35,6 +35,7 @@ _PERSISTENCE_THRESHOLDS = {"brief_max_ratio": 0.10, "persistent_min_ratio": 0.60
 _CONFIDENCE_THRESHOLDS = {"low_max": 0.35, "high_min": 0.70}
 _MAX_RULES = 12
 _MAX_CONDITIONS = 4
+_MAX_RULE_COVERAGE_RATIO = 0.75
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -198,7 +199,6 @@ def build_grounded_tracks(relative_video: Dict[str, Any]) -> List[Dict[str, Any]
             {
                 "video_id": video_id,
                 "track_id": track_id,
-                "target_atom": f"{_TARGET_PREDICATE}({_sym(video_id)},track_{track_id}).",
                 "features": features,
                 "atoms": atoms,
                 "num_observations": len(observations),
@@ -210,22 +210,19 @@ def build_grounded_tracks(relative_video: Dict[str, Any]) -> List[Dict[str, Any]
 def _prompt(video_id: str, tracks: Sequence[Dict[str, Any]]) -> str:
     payload = [{"track_id": row["track_id"], "atoms": row["atoms"]} for row in tracks]
     return (
-        "You are a symbolic rule synthesizer. Determine which supplied object tracks are important "
-        "for understanding this specific driving scene, and produce a compact semantic protection "
-        "rule set. You may reason ONLY from the supplied ground atoms. Do not introduce predicates, "
-        "values, numeric thresholds, comparisons, latent visual claims, or general traffic rules. "
-        f"The only classification target is {_TARGET_PREDICATE}(video,track_id). Every executable "
-        f"rule head must be exactly {_RULE_HEAD}. Allowed body predicates are: "
+        "You are a symbolic rule synthesizer. Generate only a compact set of semantic protection "
+        "rules. Never classify individual tracks and never emit important_obj judgments. You may "
+        "reason ONLY from the supplied ground atoms. Do not introduce predicates, constants, numeric "
+        "thresholds, comparisons, latent visual claims, or general traffic rules. Every rule head "
+        f"must be exactly {_RULE_HEAD}. Allowed body predicates are: "
         + ", ".join(_ALLOWED_PREDICATES)
-        + ". Rule conditions are equality matches over categorical values already present in the "
-        "supplied atoms. Return exactly one important_objects decision for every supplied track. "
-        "Every justification must cite the available symbols, and every supporting_atom must be copied "
-        "exactly from the input. Return JSON only with this schema: "
+        + ". Conditions are exact categorical equality matches using values already present in the "
+        "supplied atoms. Avoid duplicate conditions, duplicate rule bodies, and rules broad enough to "
+        "protect most tracks. Every justification must cite available symbols, and every supporting_atom "
+        "must be copied exactly from the input. Return JSON only with this schema: "
         '{"rules":[{"rule_id":"r1","target":"protected_object","conditions":'
         '[{"predicate":"object_class","value":"pedestrian"}],"supporting_atoms":["exact atom"],'
-        '"justification":"short symbol-linked reason"}],"important_objects":'
-        '[{"target":"important_obj","track_id":1,"important":true,'
-        '"supporting_atoms":["exact atom"],"justification":"short symbol-linked reason"}]}. '
+        '"justification":"short symbol-linked reason"}]}. '
         f"video_id={video_id}; grounded_tracks="
         + json.dumps(payload, separators=(",", ":"))
     )
@@ -288,93 +285,122 @@ def _atom_supports_condition(atom: str, condition: Dict[str, Any]) -> bool:
 
 def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     atom_set = {atom for track in tracks for atom in track["atoms"]}
-    track_by_id = {int(track["track_id"]): track for track in tracks}
     domains = {
         predicate: {str(track["features"][predicate]) for track in tracks}
         for predicate in _ALLOWED_PREDICATES
     }
+    raw_rules = raw.get("rules", [])
+    if not isinstance(raw_rules, list):
+        return {
+            "rules": [],
+            "rejected_rules": [
+                {
+                    "rule_id": "invalid_rules_payload",
+                    "target": _RULE_HEAD,
+                    "conditions": [],
+                    "supporting_atoms": [],
+                    "justification": "",
+                    "rejection_reason": "invalid_syntax",
+                    "rejection_reasons": ["invalid_syntax"],
+                }
+            ],
+        }
+
     accepted_rules = []
     rejected_rules = []
     seen_rule_ids = set()
-    for index, candidate in enumerate(list(raw.get("rules", []))[:_MAX_RULES]):
-        rule = dict(candidate) if isinstance(candidate, dict) else {}
+    seen_body_signatures = set()
+    for index, candidate in enumerate(raw_rules):
+        syntax_valid = isinstance(candidate, dict)
+        rule = dict(candidate) if syntax_valid else {}
         reasons = []
         rule_id = _sym(rule.get("rule_id", f"rule_{index + 1}"))
-        conditions = list(rule.get("conditions", []))
-        supporting_atoms = [str(atom) for atom in rule.get("supporting_atoms", [])]
+        conditions_value = rule.get("conditions", [])
+        conditions = list(conditions_value) if isinstance(conditions_value, list) else []
+        supporting_value = rule.get("supporting_atoms", [])
+        supporting_atoms = [str(atom) for atom in supporting_value] if isinstance(supporting_value, list) else []
         justification = str(rule.get("justification", "")).strip()
+        if index >= _MAX_RULES:
+            reasons.append("rule_budget_exceeded")
+        if not syntax_valid or not isinstance(conditions_value, list) or not isinstance(supporting_value, list):
+            reasons.append("invalid_syntax")
         if str(rule.get("target", "")) != _RULE_HEAD:
             reasons.append("invalid_target")
         if rule_id in seen_rule_ids:
             reasons.append("duplicate_rule_id")
         if not conditions or len(conditions) > _MAX_CONDITIONS:
             reasons.append("invalid_condition_count")
-        if not all(isinstance(condition, dict) and _condition_supported(condition, domains) for condition in conditions):
-            reasons.append("ungrounded_condition")
+
+        normalized_conditions = []
+        condition_syntax_valid = True
+        for condition in conditions:
+            if (
+                not isinstance(condition, dict)
+                or set(condition) != {"predicate", "value"}
+                or not isinstance(condition.get("predicate"), str)
+                or not isinstance(condition.get("value"), str)
+            ):
+                condition_syntax_valid = False
+                continue
+            predicate = str(condition["predicate"])
+            value = _sym(condition["value"])
+            normalized_conditions.append({"predicate": predicate, "value": value})
+            if predicate not in _ALLOWED_PREDICATES:
+                reasons.append("unknown_predicate")
+            elif value not in domains.get(predicate, set()):
+                reasons.append("unsupported_constant")
+        if not condition_syntax_valid:
+            reasons.append("invalid_syntax")
+
+        body_signature = tuple(
+            sorted((condition["predicate"], condition["value"]) for condition in normalized_conditions)
+        )
+        if len(body_signature) != len(set(body_signature)) or body_signature in seen_body_signatures:
+            reasons.append("redundant_body")
+
         if not supporting_atoms or any(atom not in atom_set for atom in supporting_atoms):
-            reasons.append("ungrounded_supporting_atom")
+            reasons.append("ungrounded_atoms")
         elif any(
             not any(_atom_supports_condition(atom, condition) for atom in supporting_atoms)
-            for condition in conditions
-            if isinstance(condition, dict)
+            for condition in normalized_conditions
         ):
-            reasons.append("condition_missing_support")
+            reasons.append("ungrounded_atoms")
         if not justification:
             reasons.append("missing_justification")
+
         normalized = {
             "rule_id": rule_id,
             "target": _RULE_HEAD,
-            "conditions": [
-                {"predicate": str(condition.get("predicate", "")), "value": _sym(condition.get("value", ""))}
-                for condition in conditions if isinstance(condition, dict)
-            ],
+            "conditions": normalized_conditions,
             "supporting_atoms": supporting_atoms,
             "justification": justification[:400],
         }
+        matched_track_ids = [
+            int(track["track_id"]) for track in tracks if normalized_conditions and _rule_matches(normalized, track)
+        ]
+        coverage_ratio = len(matched_track_ids) / max(1, len(tracks))
+        normalized["matched_track_ids"] = matched_track_ids
+        normalized["coverage_ratio"] = float(coverage_ratio)
+        if tracks and coverage_ratio > _MAX_RULE_COVERAGE_RATIO:
+            reasons.append("overly_general_coverage")
+
+        reasons = list(dict.fromkeys(reasons))
         if reasons:
-            rejected_rules.append({**normalized, "rejection_reasons": reasons})
+            rejected_rules.append(
+                {
+                    **normalized,
+                    "rejection_reason": reasons[0],
+                    "rejection_reasons": reasons,
+                }
+            )
         else:
             seen_rule_ids.add(rule_id)
+            seen_body_signatures.add(body_signature)
             accepted_rules.append(normalized)
 
-    important_objects = []
-    rejected_decisions = []
-    seen_tracks = set()
-    for candidate in raw.get("important_objects", []):
-        decision = dict(candidate) if isinstance(candidate, dict) else {}
-        try:
-            track_id = int(decision.get("track_id", -1))
-        except (TypeError, ValueError):
-            track_id = -1
-        supporting_atoms = [str(atom) for atom in decision.get("supporting_atoms", [])]
-        reasons = []
-        if str(decision.get("target", "")) != _TARGET_PREDICATE:
-            reasons.append("invalid_target")
-        if track_id not in track_by_id or track_id in seen_tracks:
-            reasons.append("invalid_track_id")
-        if not supporting_atoms or any(atom not in set(track_by_id.get(track_id, {}).get("atoms", [])) for atom in supporting_atoms):
-            reasons.append("ungrounded_supporting_atom")
-        justification = str(decision.get("justification", "")).strip()
-        if not justification:
-            reasons.append("missing_justification")
-        normalized = {
-            "target": _TARGET_PREDICATE,
-            "track_id": track_id,
-            "important": bool(decision.get("important", False)),
-            "supporting_atoms": supporting_atoms,
-            "justification": justification[:400],
-        }
-        if reasons:
-            rejected_decisions.append({**normalized, "rejection_reasons": reasons})
-        else:
-            seen_tracks.add(track_id)
-            important_objects.append(normalized)
     return {
         "rules": accepted_rules,
         "rejected_rules": rejected_rules,
-        "important_objects": important_objects,
-        "rejected_important_objects": rejected_decisions,
-        "missing_decision_track_ids": sorted(set(track_by_id) - seen_tracks),
     }
 
 
@@ -383,30 +409,74 @@ def _rule_matches(rule: Dict[str, Any], track: Dict[str, Any]) -> bool:
     return all(features.get(condition["predicate"]) == condition["value"] for condition in rule.get("conditions", []))
 
 
-def _execute_rules(validated: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    direct = {int(row["track_id"]): row for row in validated.get("important_objects", []) if row.get("important")}
-    protected = []
+def _execute_rules(
+    validated: Dict[str, Any],
+    tracks: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
+    important_objects = []
+    protected_objects = []
+    uncovered_track_ids = []
     for track in tracks:
         track_id = int(track["track_id"])
         matched = [rule for rule in validated.get("rules", []) if _rule_matches(rule, track)]
-        if track_id not in direct and not matched:
+        if not matched:
+            uncovered_track_ids.append(track_id)
             continue
-        justifications = [direct[track_id]["justification"]] if track_id in direct else []
-        justifications.extend(rule["justification"] for rule in matched)
-        protected.append(
+
+        grounding_evidence = []
+        for rule in matched:
+            condition_evidence = []
+            for condition in rule.get("conditions", []):
+                ground_atom = next(
+                    atom
+                    for atom in track.get("atoms", [])
+                    if _atom_supports_condition(atom, condition)
+                )
+                condition_evidence.append(
+                    {
+                        "predicate": condition["predicate"],
+                        "value": condition["value"],
+                        "ground_atom": ground_atom,
+                    }
+                )
+            grounding_evidence.append(
+                {
+                    "rule_id": rule["rule_id"],
+                    "conditions": condition_evidence,
+                    "justification": rule["justification"],
+                }
+            )
+
+        matched_rule_ids = [rule["rule_id"] for rule in matched]
+        reasons = list(dict.fromkeys(rule["justification"] for rule in matched))
+        protection_reason = " | ".join(reasons)
+        protected = {
+            "video_id": track["video_id"],
+            "track_id": track_id,
+            "atom": f"{_RULE_HEAD}({_sym(track['video_id'])},track_{track_id}).",
+            "matched_rule_ids": matched_rule_ids,
+            "grounding_evidence": grounding_evidence,
+            "protection_reason": protection_reason,
+            "original_decision_before_protection": None,
+            "trajectory_decision": "pending_step8b",
+            "final_decision_after_protection": "pending_step8b",
+        }
+        protected_objects.append(protected)
+        important_objects.append(
             {
                 "video_id": track["video_id"],
                 "track_id": track_id,
-                "atom": f"{_RULE_HEAD}({_sym(track['video_id'])},track_{track_id}).",
-                "matched_rule_ids": [rule["rule_id"] for rule in matched],
-                "direct_important_obj": track_id in direct,
-                "justifications": list(dict.fromkeys(justifications)),
+                "atom": f"{_TARGET_PREDICATE}({_sym(track['video_id'])},track_{track_id}).",
+                "derived_from": _RULE_HEAD,
+                "matched_rule_ids": matched_rule_ids,
+                "grounding_evidence": grounding_evidence,
+                "protection_reason": protection_reason,
             }
         )
-    return protected
+    return important_objects, protected_objects, uncovered_track_ids
 
 
-def _annotate_motion_signals(
+def _annotate_protection_prior(
     relative_video: Dict[str, Any],
     protected_objects: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -420,13 +490,6 @@ def _annotate_motion_signals(
             enriched["symbol_grounded_protected"] = bool(protection)
             if protection:
                 enriched["symbol_grounded_protection"] = protection
-                enriched["motion_signal_refinement"] = {
-                    "method": "semantic_protection_no_numeric_rewrite",
-                    "preserve_motion_signal": True,
-                    "rel_vx": _safe_float(obj.get("rel_vx", 0.0)),
-                    "rel_vz": _safe_float(obj.get("rel_vz", 0.0)),
-                    "rel_speed": _safe_float(obj.get("rel_speed", 0.0)),
-                }
             objects.append(enriched)
         frames.append({**dict(frame), "objects": objects})
     return {**dict(relative_video), "frames": frames}
@@ -441,9 +504,11 @@ def run_symbol_grounded_refinement(
     output_root.mkdir(parents=True, exist_ok=True)
     generator = llm_generate or _http_llm
     video_results = []
+    all_important = []
     all_protected = []
     all_rules = []
-    refined_relative_motion = []
+    all_uncovered = []
+    protection_annotated_relative_motion = []
     for relative_video in relative_motion_state.get("relative_object_motion", []):
         video_id = str(relative_video.get("video_id", ""))
         tracks = build_grounded_tracks(relative_video)
@@ -456,45 +521,29 @@ def run_symbol_grounded_refinement(
         except Exception as exc:
             status = "llm_unavailable" if "not configured" in str(exc) else "llm_error"
             error = str(exc)
-            validated = {
-                "rules": [],
-                "rejected_rules": [],
-                "important_objects": [],
-                "rejected_important_objects": [],
-                "missing_decision_track_ids": [int(track["track_id"]) for track in tracks],
-            }
-        if status == "completed" and validated.get("missing_decision_track_ids"):
-            status = "completed_with_missing_decisions"
-        protected = _execute_rules(validated, tracks)
-        refined_relative_motion.append(_annotate_motion_signals(relative_video, protected))
+            validated = {"rules": [], "rejected_rules": []}
+        important, protected, uncovered = _execute_rules(validated, tracks)
+        protection_annotated_relative_motion.append(
+            _annotate_protection_prior(relative_video, protected)
+        )
         result = {
-            "version": _VERSION,
-            "video_id": video_id,
             "status": status,
-            "error": error,
-            "target_predicate": _TARGET_PREDICATE,
             "rule_head_predicate": _RULE_HEAD,
-            "allowed_predicates": list(_ALLOWED_PREDICATES),
-            "grounding_thresholds": {
-                "bbox_size": dict(_BBOX_SIZE_THRESHOLDS),
-                "temporal_persistence": dict(_PERSISTENCE_THRESHOLDS),
-                "detection_confidence": dict(_CONFIDENCE_THRESHOLDS),
-            },
             "grounded_tracks": tracks,
             "semantic_protection_rules": validated["rules"],
             "rejected_rules": validated["rejected_rules"],
-            "important_objects": validated["important_objects"],
-            "rejected_important_objects": validated["rejected_important_objects"],
-            "missing_decision_track_ids": validated["missing_decision_track_ids"],
+            "important_objects": important,
             "protected_objects": protected,
-            "raw_llm_response": raw,
+            "uncovered_track_ids": uncovered,
         }
         video_dir = output_root / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
         with (video_dir / "symbol_grounded_refinement.json").open("w", encoding="utf-8") as file:
             json.dump(result, file, indent=2)
-        video_results.append(result)
+        video_results.append({**result, "video_id": video_id, "error": error})
+        all_important.extend(important)
         all_protected.extend(protected)
+        all_uncovered.extend({"video_id": video_id, "track_id": track_id} for track_id in uncovered)
         all_rules.extend({**rule, "video_id": video_id} for rule in validated["rules"])
 
     manifest = {
@@ -504,6 +553,7 @@ def run_symbol_grounded_refinement(
         "num_rules": len(all_rules),
         "num_rejected_rules": sum(len(row["rejected_rules"]) for row in video_results),
         "num_protected_objects": len(all_protected),
+        "num_uncovered_tracks": len(all_uncovered),
         "status_counts": dict(Counter(row["status"] for row in video_results)),
         "videos": [
             {
@@ -511,7 +561,9 @@ def run_symbol_grounded_refinement(
                 "status": row["status"],
                 "num_grounded_tracks": len(row["grounded_tracks"]),
                 "num_rules": len(row["semantic_protection_rules"]),
+                "num_rejected_rules": len(row["rejected_rules"]),
                 "num_protected_objects": len(row["protected_objects"]),
+                "num_uncovered_tracks": len(row["uncovered_track_ids"]),
                 "error": row["error"],
             }
             for row in video_results
@@ -521,11 +573,13 @@ def run_symbol_grounded_refinement(
         json.dump(manifest, file, indent=2)
     return {
         **relative_motion_state,
-        "relative_object_motion": refined_relative_motion,
-        "refined_relative_object_motion": refined_relative_motion,
+        "relative_object_motion": protection_annotated_relative_motion,
+        "protection_annotated_relative_motion": protection_annotated_relative_motion,
         "symbol_grounded_refinement": video_results,
         "semantic_protection_rules": all_rules,
+        "important_objects": all_important,
         "protected_objects": all_protected,
+        "uncovered_tracks": all_uncovered,
         "symbol_grounded_refinement_output_root": output_root,
     }
 

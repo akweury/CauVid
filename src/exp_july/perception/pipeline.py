@@ -2843,17 +2843,30 @@ def _trajectory_motion_evidence_video(relative_video, ego_video=None, protected_
         }
         significance = _motion_significance_assessment(statistics, provenance, uncertainty, validation)
         fact_decision = _fact_decision_for_trajectory(validation, significance, provenance, uncertainty)
-        protection = dict(protected_by_track.get(int(track_id), {}))
+        protection = protected_by_track.get(int(track_id), {})
         original_fact_decision = str(fact_decision.get("decision", ""))
         if protection:
+            final_protection_decision = (
+                "Keep_with_uncertainty"
+                if original_fact_decision == "Discard"
+                else original_fact_decision
+            )
+            protection["original_decision_before_protection"] = original_fact_decision
+            protection["trajectory_decision"] = original_fact_decision
+            protection["final_decision_after_protection"] = final_protection_decision
+            protection["send_to_motion_signal_refinement"] = original_fact_decision == "Discard"
             fact_decision["symbol_grounded_protected"] = True
             fact_decision["original_decision_before_protection"] = original_fact_decision
+            fact_decision["trajectory_decision"] = original_fact_decision
+            fact_decision["final_decision_after_protection"] = final_protection_decision
+            fact_decision["send_to_motion_signal_refinement"] = original_fact_decision == "Discard"
             fact_decision["decision_reasons"].append(
                 {
                     "kind": "symbol_grounded_protection",
-                    "message": "A validated Step 8A semantic rule protects this grounded object track.",
+                    "message": "A deterministically grounded Step 8A semantic rule protects this object track.",
                     "matched_rule_ids": list(protection.get("matched_rule_ids", [])),
-                    "justifications": list(protection.get("justifications", [])),
+                    "grounding_evidence": list(protection.get("grounding_evidence", [])),
+                    "protection_reason": str(protection.get("protection_reason", "")),
                 }
             )
             if original_fact_decision == "Discard":
@@ -3538,12 +3551,14 @@ def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
         output_root=output_root,
         llm_generate=llm_generate,
     )
+    video_results = result.get("symbol_grounded_refinement", [])
     print(
         f"[step 8a] symbol_grounded_refinement "
-        f"videos={len(result.get('symbol_grounded_refinement', []))} "
-        f"rules={len(result.get('semantic_protection_rules', []))} "
+        f"videos={len(video_results)} "
+        f"accepted_rules={sum(len(row.get('semantic_protection_rules', [])) for row in video_results)} "
+        f"rejected_rules={sum(len(row.get('rejected_rules', [])) for row in video_results)} "
         f"protected={len(result.get('protected_objects', []))} "
-        f"output_root={output_root}"
+        f"uncovered={sum(len(row.get('uncovered_track_ids', [])) for row in video_results)}"
     )
     return result
 
@@ -3671,7 +3686,7 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
         except (TypeError, ValueError):
             continue
         if video_id and track_id >= 0:
-            protected_by_video.setdefault(video_id, {})[track_id] = dict(row)
+            protected_by_video.setdefault(video_id, {})[track_id] = row
 
     trajectory_motion_evidence = []
     for relative_video in relative_motion:
@@ -3744,6 +3759,17 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
         # Keep the older filename as an alias while 8B's downstream contract settles.
         with (out_dir / "causal_filter_out.json").open("w", encoding="utf-8") as f:
             json.dump(evidence, f, indent=2)
+
+        step8a_root = relative_motion_state.get("symbol_grounded_refinement_output_root")
+        if step8a_root:
+            step8a_path = Path(step8a_root) / video_id / "symbol_grounded_refinement.json"
+            step8a_payload = load_json_if_exists(step8a_path)
+            if isinstance(step8a_payload, dict):
+                step8a_payload["protected_objects"] = list(
+                    protected_by_video.get(video_id, {}).values()
+                )
+                with step8a_path.open("w", encoding="utf-8") as f:
+                    json.dump(step8a_payload, f, indent=2)
         trajectory_motion_evidence.append(evidence)
 
     manifest = {
@@ -3822,6 +3848,11 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
     )
     return {
         **relative_motion_state,
+        "motion_signal_refinement_queue": [
+            row
+            for row in relative_motion_state.get("protected_objects", [])
+            if bool(row.get("send_to_motion_signal_refinement", False))
+        ],
         "trajectory_motion_evidence": trajectory_motion_evidence,
         "trajectory_motion_evidence_output_root": output_root,
         "causal_filter_out": trajectory_motion_evidence,
