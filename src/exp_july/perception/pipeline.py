@@ -45,7 +45,7 @@ _REL_SPEED_THRESHOLD = 0.3
 _DISTANCE_NEAR_THRESHOLD = 15.0
 _DISTANCE_MEDIUM_THRESHOLD = 30.0
 _X_POSITION_THRESHOLD = 2.0
-_RELATIVE_MOTION_VIS_VERSION = 2
+_RELATIVE_MOTION_VIS_VERSION = 4
 _VIS_OBSERVED_COLOR = (70, 220, 70)
 _VIS_REPAIRED_COLOR = (220, 60, 255)
 _VIS_ABSENT_COLOR = (58, 58, 58)
@@ -917,7 +917,7 @@ def _trajectory_filter_reason_codes(trajectory_evidence):
 
 
 def _trajectory_decision_reason_table(trajectory_evidence):
-    """Build the fixed eight-cell quantitative decision-reason table."""
+    """Build the fixed decision-grouped reason rows used by the track video."""
     evidence = dict(trajectory_evidence or {})
     fact_decision = dict(evidence.get("fact_decision", {}))
     validation = dict(evidence.get("causal_motion_fact_validation", {}))
@@ -940,20 +940,21 @@ def _trajectory_decision_reason_table(trajectory_evidence):
     low_flag = int(significance_status == "low_significance")
     credibility_uncertainty_count = uncertain_count + int(validation_status == "uncertain") + significance_count
     specs = (
-        ("invalid_trajectory", invalid_count, 1, f"invalid_issues={invalid_count}"),
-        ("repaired_trajectory_kept", repaired_count + merged_count, 1, f"repairs+merges={repaired_count + merged_count}"),
-        ("low_motion_significance", significance_count, 1, f"low_motion_reasons={significance_count}"),
-        ("valid_high_significance", valid_flag + high_flag, 2, f"valid={valid_flag}, high={high_flag}"),
-        ("valid_low_motion_retained", valid_flag + low_flag, 2, f"valid={valid_flag}, low={low_flag}"),
-        ("credible_but_uncertain", credibility_uncertainty_count, 1, f"uncertainty_evidence={credibility_uncertainty_count}"),
-        ("validation_uncertainty", uncertain_count, 1, f"uncertain_issues={uncertain_count}"),
-        ("significance_uncertainty", significance_count, 1, f"significance_reasons={significance_count}"),
+        ("Discard", "invalid_trajectory", invalid_count, 1, f"invalid_issues={invalid_count}"),
+        ("Repair", "repaired_trajectory_kept", repaired_count + merged_count, 1, f"repairs+merges={repaired_count + merged_count}"),
+        ("Repair", "low_motion_significance", significance_count, 1, f"low_motion_reasons={significance_count}"),
+        ("Keep", "valid_high_significance", valid_flag + high_flag, 2, f"valid={valid_flag}, high={high_flag}"),
+        ("Keep", "valid_low_motion_retained", valid_flag + low_flag, 2, f"valid={valid_flag}, low={low_flag}"),
+        ("Keep with uncertainty", "credible_but_uncertain", credibility_uncertainty_count, 1, f"uncertainty_evidence={credibility_uncertainty_count}"),
+        ("Keep with uncertainty", "validation_uncertainty", uncertain_count, 1, f"uncertain_issues={uncertain_count}"),
+        ("Keep with uncertainty", "significance_uncertainty", significance_count, 1, f"significance_reasons={significance_count}"),
     )
     rows = []
-    for reason_name, measured_value, threshold, evidence_text in specs:
+    for decision, reason_name, measured_value, threshold, evidence_text in specs:
         active = reason_name in active_codes
         rows.append(
             {
+                "decision": decision,
                 "reason": reason_name,
                 "active": active,
                 "measured_value": float(measured_value),
@@ -965,41 +966,71 @@ def _trajectory_decision_reason_table(trajectory_evidence):
     return rows
 
 
-def _draw_decision_reason_table(cv2, panel, entries, x, y, width, row_height=68):
-    visible_entries = list(entries)
-    columns = min(4, max(1, len(visible_entries)))
-    cell_width = max(1, width // columns)
+def _draw_decision_reason_table(cv2, panel, entries, active_decision, x, y, width, row_height=142):
+    """Draw decision groups as ``reason, reason -> decision`` flows."""
+    decision_order = ("Discard", "Repair", "Keep", "Keep with uncertainty")
+    groups = {
+        decision: [entry for entry in entries if entry.get("decision") == decision]
+        for decision in decision_order
+    }
     font = cv2.FONT_HERSHEY_SIMPLEX
-    for index, entry in enumerate(visible_entries):
-        row = index // columns
-        column = index % columns
-        cell_x = x + column * cell_width
-        cell_y = y + row * row_height
-        cell_w = cell_width if column < columns - 1 else width - column * cell_width
-        active = bool(entry.get("active", False))
-        border_color = (80, 220, 80) if active else (92, 92, 92)
-        fill_color = (34, 58, 34) if active else (32, 32, 32)
-        cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), fill_color, -1)
-        cv2.rectangle(panel, (cell_x, cell_y), (cell_x + cell_w, cell_y + row_height), border_color, 2 if active else 1)
-        reason = str(entry.get("reason", "")).replace("_", " ")
-        max_chars = max(12, int(cell_w / 10))
-        if len(reason) > max_chars:
-            reason = reason[: max(1, max_chars - 1)].rstrip() + "…"
-        cv2.putText(panel, reason, (cell_x + 8, cell_y + 25), font, 0.48, (240, 240, 240), 1, cv2.LINE_AA)
-        value = float(entry.get("measured_value", 0.0))
-        threshold = float(entry.get("threshold", 1.0))
-        distance = float(entry.get("distance_to_threshold", value - threshold))
-        status_color = (100, 255, 100) if active else (175, 175, 175)
-        cv2.putText(
-            panel,
-            f">={threshold:.0f} | {value:.0f} | {distance:+.0f}",
-            (cell_x + 8, cell_y + 53),
-            font,
-            0.44,
-            status_color,
-            1,
-            cv2.LINE_AA,
-        )
+    decision_w = max(190, int(width * 0.22))
+    arrow_w = 58
+    reasons_w = max(1, width - decision_w - arrow_w)
+    inactive_color = (105, 105, 105)
+    active_reason_color = (80, 220, 80)
+
+    for row, decision in enumerate(decision_order):
+        row_y = y + row * row_height
+        row_mid = row_y + row_height // 2
+        group = groups[decision]
+        card_gap = 12
+        card_width = max(1, (reasons_w - card_gap * max(0, len(group) - 1)) // max(1, len(group)))
+        for index, entry in enumerate(group):
+            reason = str(entry.get("reason", "")).replace("_", " ")
+            active = bool(entry.get("active", False))
+            color = active_reason_color if active else inactive_color
+            thickness = 2 if active else 1
+            card_x = x + index * (card_width + card_gap)
+            card_right = card_x + card_width
+            border_color = color if active else (70, 70, 70)
+            fill_color = (30, 52, 30) if active else (29, 29, 29)
+            cv2.rectangle(panel, (card_x, row_y + 9), (card_right, row_y + row_height - 9), fill_color, -1)
+            cv2.rectangle(panel, (card_x, row_y + 9), (card_right, row_y + row_height - 9), border_color, thickness)
+
+            name_scale = 0.88
+            max_name_width = max(1, card_width - 16)
+            while name_scale > 0.68 and cv2.getTextSize(reason, font, name_scale, thickness)[0][0] > max_name_width:
+                name_scale -= 0.04
+            cv2.putText(panel, reason, (card_x + 8, row_y + 48), font, name_scale, color, thickness, cv2.LINE_AA)
+
+            value = float(entry.get("measured_value", 0.0))
+            threshold = float(entry.get("threshold", 1.0))
+            distance = float(entry.get("distance_to_threshold", value - threshold))
+            metrics = f"value={value:.0f} | threshold>={threshold:.0f} | delta={distance:+.0f}"
+            metric_scale = 0.58
+            while metric_scale > 0.40 and cv2.getTextSize(metrics, font, metric_scale, 1)[0][0] > max_name_width:
+                metric_scale -= 0.03
+            cv2.putText(panel, metrics, (card_x + 8, row_y + 91), font, metric_scale, color, 1, cv2.LINE_AA)
+
+            if index < len(group) - 1:
+                cv2.putText(panel, ",", (card_right + 2, row_mid + 8), font, 0.82, (180, 180, 180), 2, cv2.LINE_AA)
+
+        arrow_start = x + reasons_w + 8
+        arrow_end = x + reasons_w + arrow_w - 10
+        arrow_color = _VIS_DECISION_COLORS.get(decision, inactive_color) if decision == active_decision else inactive_color
+        cv2.arrowedLine(panel, (arrow_start, row_mid), (arrow_end, row_mid), arrow_color, 3, cv2.LINE_AA, tipLength=0.25)
+
+        box_x = x + reasons_w + arrow_w
+        box_active = decision == active_decision
+        decision_color = _VIS_DECISION_COLORS.get(decision, inactive_color)
+        fill_color = tuple(max(18, int(channel * 0.24)) for channel in decision_color) if box_active else (32, 32, 32)
+        border_color = decision_color if box_active else inactive_color
+        cv2.rectangle(panel, (box_x, row_y + 9), (x + width, row_y + row_height - 9), fill_color, -1)
+        cv2.rectangle(panel, (box_x, row_y + 9), (x + width, row_y + row_height - 9), border_color, 3 if box_active else 1)
+        text_color = decision_color if box_active else inactive_color
+        decision_scale = 0.82 if decision == "Keep with uncertainty" else 0.94
+        cv2.putText(panel, decision, (box_x + 12, row_mid + 10), font, decision_scale, text_color, 3 if box_active else 2, cv2.LINE_AA)
 
 def _ego_refinement_series(refined_ego_motion_video):
     frame_rows = {
@@ -1454,7 +1485,7 @@ def _render_relative_motion_track_video(
         return None, "missing_frame_images"
 
     frame_h, frame_w = first_img.shape[:2]
-    panel_h = max(400, int(frame_h * 0.55))
+    panel_h = max(820, int(frame_h * 0.75))
     total_h = frame_h + panel_h
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
@@ -1531,15 +1562,16 @@ def _render_relative_motion_track_video(
             else:
                 summary = f"motion=not present | source=absent | filter={decision_status}"
             cv2.putText(panel, summary, (18, 78), font, 0.58, (235, 235, 235), 1, cv2.LINE_AA)
-            cv2.putText(panel, "decision reasons", (18, 108), font, 0.55, (225, 225, 225), 1, cv2.LINE_AA)
+            cv2.putText(panel, "reasons -> corresponding decision", (18, 108), font, 0.55, (225, 225, 225), 1, cv2.LINE_AA)
             _draw_decision_reason_table(
                 cv2,
                 panel,
                 decision_reason_entries,
+                active_decision=decision_status,
                 x=18,
                 y=120,
                 width=max(1, frame_w - 36),
-                row_height=68,
+                row_height=142,
             )
             legend_y = panel_h - 62
             cv2.rectangle(panel, (18, legend_y), (42, legend_y + 16), _VIS_OBSERVED_COLOR, -1)
@@ -3474,6 +3506,12 @@ def step8_relative_object_motion(position_state, repaired_state):
         "tracklet_repair": repaired_state.get("tracklet_repair", []),
         "ego_motion": ego_motion,
     }
+
+
+def step8a_symbol_grounded_refinement(relative_motion_state):
+    """Placeholder for symbol-grounded object retention and motion refinement."""
+    print("[step 8a] symbol_grounded_refinement placeholder (no-op)")
+    return relative_motion_state
 
 
 def step8_visual_relative_motion(relative_motion_state, fps=10.0):

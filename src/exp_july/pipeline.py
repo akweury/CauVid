@@ -13,6 +13,7 @@ from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step7b_tracklet_repair
 from src.exp_july.perception import step8_relative_object_motion
+from src.exp_july.perception import step8a_symbol_grounded_refinement
 from src.exp_july.perception import step8_visual_relative_motion
 from src.exp_july.perception import step8b_causal_filter_out
 from src.exp_july.perception import step8c_prior_guided_ego_motion_refinement
@@ -113,6 +114,9 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     repaired_state = step7b_tracklet_repair(position_state, ego_state)
     # Step 8: compute relative object motion.
     relative_motion_state = step8_relative_object_motion(position_state, repaired_state)
+    # Step 8A: retain symbol-grounded important objects and refine motion signals.
+    # Placeholder only; it currently preserves Step 8 state unchanged.
+    relative_motion_state = step8a_symbol_grounded_refinement(relative_motion_state)
     # Step 8B: validate trajectory motion facts and decide symbolic-layer eligibility.
     relative_motion_state = step8b_causal_filter_out(ego_state, relative_motion_state)
     # Step 8C: select reliable static/low-dynamic references for future ego refinement.
