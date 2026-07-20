@@ -2819,8 +2819,9 @@ def _refined_ego_motion_video(ego_video, evidence_video, reference_result):
     }
 
 
-def _trajectory_motion_evidence_video(relative_video, ego_video=None):
+def _trajectory_motion_evidence_video(relative_video, ego_video=None, protected_by_track=None):
     frame_indices, tracks = _relative_motion_track_index(relative_video)
+    protected_by_track = dict(protected_by_track or {})
     video_num_frames = int(relative_video.get("num_frames", len(frame_indices)))
     trajectories = []
     for track_id, track_data in sorted(tracks.items()):
@@ -2842,9 +2843,28 @@ def _trajectory_motion_evidence_video(relative_video, ego_video=None):
         }
         significance = _motion_significance_assessment(statistics, provenance, uncertainty, validation)
         fact_decision = _fact_decision_for_trajectory(validation, significance, provenance, uncertainty)
+        protection = dict(protected_by_track.get(int(track_id), {}))
+        original_fact_decision = str(fact_decision.get("decision", ""))
+        if protection:
+            fact_decision["symbol_grounded_protected"] = True
+            fact_decision["original_decision_before_protection"] = original_fact_decision
+            fact_decision["decision_reasons"].append(
+                {
+                    "kind": "symbol_grounded_protection",
+                    "message": "A validated Step 8A semantic rule protects this grounded object track.",
+                    "matched_rule_ids": list(protection.get("matched_rule_ids", [])),
+                    "justifications": list(protection.get("justifications", [])),
+                }
+            )
+            if original_fact_decision == "Discard":
+                fact_decision["decision"] = "Keep with uncertainty"
+                fact_decision["status"] = "Keep with uncertainty"
+                fact_decision["symbolic_layer_eligible"] = True
         trajectories.append(
             {
                 "track_id": int(track_id),
+                "symbol_grounded_protected": bool(protection),
+                "symbol_grounded_protection": protection,
                 "primary_label": str(statistics.get("primary_label", track_data.get("label", "unknown"))),
                 "trajectory_observations": observations,
                 "trajectory_statistics": statistics,
@@ -3508,10 +3528,24 @@ def step8_relative_object_motion(position_state, repaired_state):
     }
 
 
-def step8a_symbol_grounded_refinement(relative_motion_state):
-    """Placeholder for symbol-grounded object retention and motion refinement."""
-    print("[step 8a] symbol_grounded_refinement placeholder (no-op)")
-    return relative_motion_state
+def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
+    """Generate and execute symbol-grounded semantic protection rules."""
+    from src.exp_july.perception.symbol_grounded_refinement import run_symbol_grounded_refinement
+
+    output_root = get_pipeline_output_root() / "08a_symbol_grounded_refinement"
+    result = run_symbol_grounded_refinement(
+        relative_motion_state,
+        output_root=output_root,
+        llm_generate=llm_generate,
+    )
+    print(
+        f"[step 8a] symbol_grounded_refinement "
+        f"videos={len(result.get('symbol_grounded_refinement', []))} "
+        f"rules={len(result.get('semantic_protection_rules', []))} "
+        f"protected={len(result.get('protected_objects', []))} "
+        f"output_root={output_root}"
+    )
+    return result
 
 
 def step8_visual_relative_motion(relative_motion_state, fps=10.0):
@@ -3629,10 +3663,24 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
         if str(row.get("video_id", ""))
     }
 
+    protected_by_video = {}
+    for row in relative_motion_state.get("protected_objects", []):
+        video_id = str(row.get("video_id", ""))
+        try:
+            track_id = int(row.get("track_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if video_id and track_id >= 0:
+            protected_by_video.setdefault(video_id, {})[track_id] = dict(row)
+
     trajectory_motion_evidence = []
     for relative_video in relative_motion:
         video_id = str(relative_video.get("video_id", ""))
-        evidence = _trajectory_motion_evidence_video(relative_video, ego_by_video.get(video_id))
+        evidence = _trajectory_motion_evidence_video(
+            relative_video,
+            ego_by_video.get(video_id),
+            protected_by_track=protected_by_video.get(video_id, {}),
+        )
         num_objects_in = int(evidence.get("num_observations", 0))
         num_tracks_in = int(evidence.get("num_trajectories", 0))
         evidence.update(
