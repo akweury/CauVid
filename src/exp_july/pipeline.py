@@ -18,6 +18,7 @@ from src.exp_july.perception import step8a_visual_symbol_grounded
 from src.exp_july.perception import step8_visual_relative_motion
 from src.exp_july.perception import step8b_causal_filter_out
 from src.exp_july.perception import step8c_prior_guided_ego_motion_refinement
+from src.exp_july.perception import step8d_adaptive_protected_object_motion_repair
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -122,6 +123,8 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     relative_motion_state = step8b_causal_filter_out(ego_state, relative_motion_state)
     # Step 8C: select reliable static/low-dynamic references for future ego refinement.
     relative_motion_state = step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state)
+    # Step 8D: diagnostically repair protected tracks rejected by 8B.
+    relative_motion_state = step8d_adaptive_protected_object_motion_repair(relative_motion_state)
     # Step 8 visual: render per-track relative motion videos with causal filter decisions.
     relative_motion_state = step8_visual_relative_motion(relative_motion_state)
     if max_step <= 8:

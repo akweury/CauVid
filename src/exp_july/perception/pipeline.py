@@ -3975,5 +3975,24 @@ def step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state):
     }
 
 
+def step8d_adaptive_protected_object_motion_repair(relative_motion_state):
+    """Run diagnostic repairs without mutating Step 8B trajectory evidence."""
+    from src.exp_july.perception.adaptive_motion_repair import run_adaptive_motion_repair
+
+    output_root = get_pipeline_output_root() / "08d_adaptive_protected_object_motion_repair"
+    result = run_adaptive_motion_repair(relative_motion_state, output_root)
+    manifest = dict(result.get("adaptive_motion_repair_manifest", {}))
+    print(
+        f"[step 8d] adaptive_motion_repair "
+        f"videos={int(manifest.get('num_videos', 0))} "
+        f"queued={int(manifest.get('queued', 0))} "
+        f"attempted={int(manifest.get('attempted', 0))} "
+        f"repaired={int(manifest.get('repaired', 0))} "
+        f"uncertain={int(manifest.get('uncertain', 0))} "
+        f"unrepairable={int(manifest.get('unrepairable', 0))}"
+    )
+    return result
+
+
 def step10_segment_object_motion(segment_state):
     return {"videos": segment_state["videos"], "segment_object_motion": []}
