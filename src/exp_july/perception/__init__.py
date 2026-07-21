@@ -6,6 +6,7 @@ from src.exp_july.perception.pipeline import step7_ego_motion
 from src.exp_july.perception.pipeline import step7b_tracklet_repair
 from src.exp_july.perception.pipeline import step8_relative_object_motion
 from src.exp_july.perception.pipeline import step8a_symbol_grounded_refinement
+from src.exp_july.perception.pipeline import step8a_visual_symbol_grounded
 from src.exp_july.perception.pipeline import step8_visual_relative_motion
 from src.exp_july.perception.pipeline import step8b_causal_filter_out
 from src.exp_july.perception.pipeline import step8c_prior_guided_ego_motion_refinement

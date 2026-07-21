@@ -6,6 +6,7 @@ from pathlib import Path
 from src.exp_july.perception.pipeline import _trajectory_motion_evidence_video
 from src.exp_july.perception.symbol_grounded_refinement import (
     build_grounded_tracks,
+    render_symbol_grounded_visualizations,
     run_symbol_grounded_refinement,
 )
 
@@ -48,6 +49,8 @@ def _video():
                 "objects": [
                     _obj(1, "pedestrian", [40, 20, 70, 90], frame_index),
                     _obj(2, "car", [150, 30, 240, 110], frame_index),
+                    _obj(3, "pedestrian", [75, 22, 105, 92], frame_index),
+                    _obj(4, "car", [145, 35, 235, 115], frame_index),
                 ],
             }
         )
@@ -60,6 +63,8 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
         tracks = build_grounded_tracks(video)
         pedestrian = next(row for row in tracks if row["track_id"] == 1)
         support = next(atom for atom in pedestrian["atoms"] if atom.startswith("object_class("))
+        observation_support = next(atom for atom in tracks[0]["atoms"] if atom.startswith("observation_source("))
+        confidence_support = next(atom for atom in pedestrian["atoms"] if atom.startswith("detection_confidence("))
 
         def llm(_prompt):
             return {
@@ -67,8 +72,11 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                     {
                         "rule_id": "protect_pedestrian",
                         "target": "protected_object",
-                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}],
-                        "supporting_atoms": [support],
+                        "conditions": [
+                            {"predicate": "object_class", "value": "pedestrian"},
+                            {"predicate": "detection_confidence", "value": "high"},
+                        ],
+                        "supporting_atoms": [support, confidence_support],
                         "justification": "object_class is pedestrian in the supplied symbol.",
                     }
                 ]
@@ -96,14 +104,79 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                 "uncovered_track_ids",
             },
         )
-        self.assertEqual([row["track_id"] for row in result["protected_objects"]], [1])
-        self.assertEqual([row["track_id"] for row in result["important_objects"]], [1])
-        self.assertEqual(result["symbol_grounded_refinement"][0]["uncovered_track_ids"], [2])
+        self.assertEqual([row["track_id"] for row in result["protected_objects"]], [1, 3])
+        protected = result["protected_objects"][0]
+        self.assertEqual([row["track_id"] for row in result["important_objects"]], [1, 3])
+        self.assertEqual(result["symbol_grounded_refinement"][0]["uncovered_track_ids"], [2, 4])
         self.assertEqual(len(result["semantic_protection_rules"]), 1)
         protected = result["protected_objects"][0]
         self.assertEqual(protected["matched_rule_ids"], ["protect_pedestrian"])
         self.assertTrue(protected["grounding_evidence"])
         self.assertEqual(protected["trajectory_decision"], "pending_step8b")
+
+    def test_per_track_visualization_renders_grounded_facts_and_rule_result(self):
+        import cv2
+        import numpy as np
+
+        video = _video()
+        tracks = build_grounded_tracks(video)
+        pedestrian = next(row for row in tracks if row["track_id"] == 1)
+        car = next(row for row in tracks if row["track_id"] == 2)
+        support = next(atom for atom in pedestrian["atoms"] if atom.startswith("object_class("))
+        observation_support = next(atom for atom in tracks[0]["atoms"] if atom.startswith("observation_source("))
+        confidence_support = next(atom for atom in pedestrian["atoms"] if atom.startswith("detection_confidence("))
+        car_support = next(atom for atom in car["atoms"] if atom.startswith("object_class("))
+
+        def llm(_prompt):
+            return {
+                "rules": [
+                    {
+                        "rule_id": "protect_pedestrian",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}, {"predicate": "detection_confidence", "value": "high"}],
+                        "supporting_atoms": [support],
+                        "justification": "object_class is pedestrian in the supplied symbol.",
+                    },
+                    {
+                        "rule_id": "protect_car",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "object_class", "value": "car"}],
+                        "supporting_atoms": [car_support],
+                        "justification": "object_class is car in the supplied symbol.",
+                    },
+                    {
+                        "rule_id": "duplicate_car",
+                        "target": "protected_object",
+                        "conditions": [{"predicate": "object_class", "value": "car"}],
+                        "supporting_atoms": [car_support],
+                        "justification": "duplicate car rule for rejected-rule rendering.",
+                    },
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            frame_path = tmp_path / "frame.png"
+            self.assertTrue(cv2.imwrite(str(frame_path), np.full((160, 280, 3), 80, dtype=np.uint8)))
+            for frame in video["frames"]:
+                frame["image_path"] = str(frame_path)
+            state = run_symbol_grounded_refinement(
+                {"videos": [], "relative_object_motion": [video]},
+                tmp_path / "step8a",
+                llm_generate=llm,
+            )
+            visual_state = render_symbol_grounded_visualizations(
+                state,
+                tmp_path / "step8a_visual",
+            )
+            self.assertEqual(len(visual_state["symbol_grounded_visualizations"]), 4)
+            self.assertEqual(visual_state["symbol_grounded_visualization_skipped"], [])
+            rendered_path = Path(
+                visual_state["symbol_grounded_visualizations"][0]["visualization_path"]
+            )
+            rendered = cv2.imread(str(rendered_path))
+            self.assertIsNotNone(rendered)
+            self.assertGreater(rendered.shape[0], 160)
 
     def test_invented_predicate_and_threshold_are_rejected(self):
         video = _video()
@@ -115,7 +188,10 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                     {
                         "rule_id": "invented",
                         "target": "protected_object",
-                        "conditions": [{"predicate": "distance_less_than", "value": "5m"}],
+                        "conditions": [
+                            {"predicate": "distance_less_than", "value": "5m"},
+                            {"predicate": "object_class", "value": "pedestrian"},
+                        ],
                         "supporting_atoms": [support],
                         "justification": "Invented numeric threshold.",
                     }
@@ -141,6 +217,7 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
             for atom in tracks[0]["atoms"]
             if atom.startswith("object_class(")
         )
+        observation_support = next(atom for atom in tracks[0]["atoms"] if atom.startswith("observation_source("))
         confidence_support = next(
             atom
             for atom in tracks[0]["atoms"]
@@ -153,22 +230,22 @@ class Step8ASymbolGroundingTests(unittest.TestCase):
                     {
                         "rule_id": "pedestrian_one",
                         "target": "protected_object",
-                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}],
-                        "supporting_atoms": [pedestrian_support],
+                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}, {"predicate": "detection_confidence", "value": "high"}],
+                        "supporting_atoms": [pedestrian_support, confidence_support],
                         "justification": "Grounded pedestrian class.",
                     },
                     {
                         "rule_id": "pedestrian_duplicate",
                         "target": "protected_object",
-                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}],
-                        "supporting_atoms": [pedestrian_support],
+                        "conditions": [{"predicate": "object_class", "value": "pedestrian"}, {"predicate": "detection_confidence", "value": "high"}],
+                        "supporting_atoms": [pedestrian_support, confidence_support],
                         "justification": "Duplicate grounded pedestrian class.",
                     },
                     {
                         "rule_id": "all_high_confidence",
                         "target": "protected_object",
-                        "conditions": [{"predicate": "detection_confidence", "value": "high"}],
-                        "supporting_atoms": [confidence_support],
+                        "conditions": [{"predicate": "detection_confidence", "value": "high"}, {"predicate": "observation_source", "value": "observed"}],
+                        "supporting_atoms": [confidence_support, observation_support],
                         "justification": "Grounded high confidence.",
                     },
                 ]

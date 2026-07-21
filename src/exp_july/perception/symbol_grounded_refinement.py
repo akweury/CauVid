@@ -26,7 +26,6 @@ _ALLOWED_PREDICATES = (
     "screen_region",
     "relative_position",
     "temporal_persistence",
-    "relative_motion",
     "observation_source",
     "detection_confidence",
 )
@@ -34,8 +33,20 @@ _BBOX_SIZE_THRESHOLDS = {"small_max_area_ratio": 0.01, "medium_max_area_ratio": 
 _PERSISTENCE_THRESHOLDS = {"brief_max_ratio": 0.10, "persistent_min_ratio": 0.60}
 _CONFIDENCE_THRESHOLDS = {"low_max": 0.35, "high_min": 0.70}
 _MAX_RULES = 12
+_MIN_CONDITIONS = 2
 _MAX_CONDITIONS = 4
 _MAX_RULE_COVERAGE_RATIO = 0.75
+_FORBIDDEN_MOTION_PREDICATES = {
+    "relative_motion",
+    "vx",
+    "vz",
+    "object_vx_state",
+    "object_vz_state",
+    "trajectory_validity",
+    "trajectory_decision",
+    "keep",
+    "discard",
+}
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -129,7 +140,7 @@ def _screen_region(observations: Sequence[Dict[str, Any]], width: int, height: i
         cx = (_safe_float(box[0]) + _safe_float(box[2])) / 2.0
         cy = (_safe_float(box[1]) + _safe_float(box[3])) / 2.0
         horizontal = "left" if cx < width / 3.0 else "right" if cx > 2.0 * width / 3.0 else "center"
-        vertical = "top" if cy < height / 3.0 else "bottom" if cy > 2.0 * height / 3.0 else "middle"
+        vertical = "upper" if cy < height / 3.0 else "lower" if cy > 2.0 * height / 3.0 else "middle"
         regions.append(f"{vertical}_{horizontal}")
     return _mode(regions)
 
@@ -148,12 +159,6 @@ def _temporal_persistence(observations: Sequence[Dict[str, Any]], num_frames: in
         return "persistent"
     return "intermittent"
 
-
-def _relative_motion(observations: Sequence[Dict[str, Any]]) -> str:
-    speed = _mode(obs.get("speed_state", "speed_unknown") for obs in observations)
-    vx = _mode(obs.get("vx_state", "vx_unknown") for obs in observations)
-    vz = _mode(obs.get("vz_state", "vz_unknown") for obs in observations)
-    return f"{speed}_{vx}_{vz}"
 
 
 def _observation_source(observations: Sequence[Dict[str, Any]]) -> str:
@@ -190,7 +195,6 @@ def build_grounded_tracks(relative_video: Dict[str, Any]) -> List[Dict[str, Any]
             "screen_region": _screen_region(observations, width, height),
             "relative_position": _relative_position(observations),
             "temporal_persistence": _temporal_persistence(observations, num_frames),
-            "relative_motion": _relative_motion(observations),
             "observation_source": _observation_source(observations),
             "detection_confidence": _detection_confidence(observations),
         }
@@ -210,18 +214,31 @@ def build_grounded_tracks(relative_video: Dict[str, Any]) -> List[Dict[str, Any]
 def _prompt(video_id: str, tracks: Sequence[Dict[str, Any]]) -> str:
     payload = [{"track_id": row["track_id"], "atoms": row["atoms"]} for row in tracks]
     return (
-        "You are a symbolic rule synthesizer. Generate only a compact set of semantic protection "
-        "rules. Never classify individual tracks and never emit important_obj judgments. You may "
-        "reason ONLY from the supplied ground atoms. Do not introduce predicates, constants, numeric "
-        "thresholds, comparisons, latent visual claims, or general traffic rules. Every rule head "
-        f"must be exactly {_RULE_HEAD}. Allowed body predicates are: "
+        "You are a symbolic rule synthesizer. Generate only a compact, diverse set of executable "
+        "semantic protection rules that identify potentially important objects independently of "
+        "unreliable motion estimates. Never classify individual tracks and never emit important_obj "
+        "judgments. Every rule head is protected_object(Video,Track). Each body must contain 2-4 "
+        "robust semantic atoms. You may use ONLY these grounded body predicates: "
         + ", ".join(_ALLOWED_PREDICATES)
-        + ". Conditions are exact categorical equality matches using values already present in the "
-        "supplied atoms. Avoid duplicate conditions, duplicate rule bodies, and rules broad enough to "
-        "protect most tracks. Every justification must cite available symbols, and every supporting_atom "
-        "must be copied exactly from the input. Return JSON only with this schema: "
+        + ". Never use relative_motion, vx, vz, trajectory validity, existing keep/discard decisions, "
+        "numeric thresholds, comparisons, latent visual claims, unknown predicates, or constants absent "
+        "from the supplied atoms. Prioritize object category, screen position, relative position, and "
+        "bounding-box size. Prefer general rules preserving safety-relevant objects: vehicles near the "
+        "ego path, large frontal vehicles, pedestrians or cyclists near the driving region, and visible "
+        "traffic-control objects ahead. Do not generate near-duplicate rules differing only in bbox_size. "
+        "Do not create isolated conjunctions matching only one supplied track. When proposing a specific "
+        "rule, also consider a simpler semantically meaningful parent rule. Reject contradictory atoms "
+        "and overly narrow conjunctions. Desired forms include protected_object(V,O) :- "
+        "object_class(V,O,car), bbox_size(V,O,large), relative_position(V,O,near_centered); "
+        "protected_object(V,O) :- object_class(V,O,traffic_light), "
+        "screen_region(V,O,upper_center); and protected_object(V,O) :- "
+        "object_class(V,O,pedestrian), relative_position(V,O,near_centered). Use example constants only "
+        "when they occur in the supplied atoms. Every supporting_atom must be copied exactly from the "
+        "input and every justification must be short and symbol-linked. Return JSON only with this schema: "
         '{"rules":[{"rule_id":"r1","target":"protected_object","conditions":'
-        '[{"predicate":"object_class","value":"pedestrian"}],"supporting_atoms":["exact atom"],'
+        '[{"predicate":"object_class","value":"car"},'
+        '{"predicate":"relative_position","value":"near_centered"}],'
+        '"supporting_atoms":["exact input atom for each condition"],'
         '"justification":"short symbol-linked reason"}]}. '
         f"video_id={video_id}; grounded_tracks="
         + json.dumps(payload, separators=(",", ":"))
@@ -310,6 +327,7 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
     rejected_rules = []
     seen_rule_ids = set()
     seen_body_signatures = set()
+    seen_semantic_signatures = set()
     for index, candidate in enumerate(raw_rules):
         syntax_valid = isinstance(candidate, dict)
         rule = dict(candidate) if syntax_valid else {}
@@ -328,7 +346,7 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
             reasons.append("invalid_target")
         if rule_id in seen_rule_ids:
             reasons.append("duplicate_rule_id")
-        if not conditions or len(conditions) > _MAX_CONDITIONS:
+        if len(conditions) < _MIN_CONDITIONS or len(conditions) > _MAX_CONDITIONS:
             reasons.append("invalid_condition_count")
 
         normalized_conditions = []
@@ -345,7 +363,12 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
             predicate = str(condition["predicate"])
             value = _sym(condition["value"])
             normalized_conditions.append({"predicate": predicate, "value": value})
-            if predicate not in _ALLOWED_PREDICATES:
+            if predicate in _FORBIDDEN_MOTION_PREDICATES or any(
+                token in predicate.lower()
+                for token in ("relative_motion", "_vx", "_vz", "trajectory", "discard", "keep")
+            ):
+                reasons.append("motion_dependent_condition")
+            elif predicate not in _ALLOWED_PREDICATES:
                 reasons.append("unknown_predicate")
             elif value not in domains.get(predicate, set()):
                 reasons.append("unsupported_constant")
@@ -357,6 +380,16 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
         )
         if len(body_signature) != len(set(body_signature)) or body_signature in seen_body_signatures:
             reasons.append("redundant_body")
+        values_by_predicate: Dict[str, set] = {}
+        for predicate, value in body_signature:
+            values_by_predicate.setdefault(predicate, set()).add(value)
+        if any(len(values) > 1 for values in values_by_predicate.values()):
+            reasons.append("contradictory_atoms")
+        semantic_signature = tuple(
+            literal for literal in body_signature if literal[0] != "bbox_size"
+        )
+        if semantic_signature in seen_semantic_signatures:
+            reasons.append("near_duplicate_bbox_variant")
 
         if not supporting_atoms or any(atom not in atom_set for atom in supporting_atoms):
             reasons.append("ungrounded_atoms")
@@ -381,6 +414,8 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
         coverage_ratio = len(matched_track_ids) / max(1, len(tracks))
         normalized["matched_track_ids"] = matched_track_ids
         normalized["coverage_ratio"] = float(coverage_ratio)
+        if len(tracks) > 1 and len(matched_track_ids) < 2:
+            reasons.append("overly_narrow_coverage")
         if tracks and coverage_ratio > _MAX_RULE_COVERAGE_RATIO:
             reasons.append("overly_general_coverage")
 
@@ -396,6 +431,7 @@ def validate_response(raw: Dict[str, Any], tracks: Sequence[Dict[str, Any]]) -> 
         else:
             seen_rule_ids.add(rule_id)
             seen_body_signatures.add(body_signature)
+            seen_semantic_signatures.add(semantic_signature)
             accepted_rules.append(normalized)
 
     return {
@@ -409,6 +445,44 @@ def _rule_matches(rule: Dict[str, Any], track: Dict[str, Any]) -> bool:
     return all(features.get(condition["predicate"]) == condition["value"] for condition in rule.get("conditions", []))
 
 
+def _rule_activation(rule: Dict[str, Any], track: Dict[str, Any]) -> Dict[str, Any]:
+    track_atoms = list(track.get("atoms", []))
+    matched_atoms = []
+    missing_atoms = []
+    missing_conditions = []
+    for condition in rule.get("conditions", []):
+        matching_atom = next(
+            (atom for atom in track_atoms if _atom_supports_condition(atom, condition)),
+            None,
+        )
+        if matching_atom is not None:
+            matched_atoms.append(matching_atom)
+        else:
+            missing_atoms.append(
+                _atom(
+                    condition["predicate"],
+                    str(track.get("video_id", "")),
+                    int(track.get("track_id", -1)),
+                    condition["value"],
+                )
+            )
+            missing_conditions.append(
+                f"{condition['predicate']}={condition['value']}"
+            )
+    active = not missing_atoms
+    return {
+        "rule_id": str(rule.get("rule_id", "")),
+        "active": active,
+        "matched_atoms": matched_atoms,
+        "missing_atoms": missing_atoms,
+        "activation_failure_reason": (
+            ""
+            if active
+            else "missing_required_atoms: " + ", ".join(missing_conditions)
+        ),
+    }
+
+
 def _execute_rules(
     validated: Dict[str, Any],
     tracks: Sequence[Dict[str, Any]],
@@ -418,7 +492,21 @@ def _execute_rules(
     uncovered_track_ids = []
     for track in tracks:
         track_id = int(track["track_id"])
-        matched = [rule for rule in validated.get("rules", []) if _rule_matches(rule, track)]
+        activations = [
+            _rule_activation(rule, track)
+            for rule in validated.get("rules", [])
+        ]
+        track["rule_activations"] = activations
+        active_rule_ids = {
+            activation["rule_id"]
+            for activation in activations
+            if bool(activation.get("active", False))
+        }
+        matched = [
+            rule
+            for rule in validated.get("rules", [])
+            if str(rule.get("rule_id", "")) in active_rule_ids
+        ]
         if not matched:
             uncovered_track_ids.append(track_id)
             continue
@@ -581,5 +669,278 @@ def run_symbol_grounded_refinement(
         "protected_objects": all_protected,
         "uncovered_tracks": all_uncovered,
         "symbol_grounded_refinement_output_root": output_root,
+    }
+
+
+
+def _representative_track_frame(
+    relative_video: Dict[str, Any],
+    track_id: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    candidates = []
+    for frame in relative_video.get("frames", []):
+        for obj in frame.get("objects", []):
+            if int(obj.get("track_id", -1)) != int(track_id):
+                continue
+            box = list(obj.get("bbox", obj.get("box", [])))
+            area = 0.0
+            if len(box) >= 4:
+                area = max(0.0, _safe_float(box[2]) - _safe_float(box[0]))
+                area *= max(0.0, _safe_float(box[3]) - _safe_float(box[1]))
+            candidates.append(
+                (
+                    int(bool(obj.get("is_observed", False))),
+                    area,
+                    int(frame.get("frame_index", 0)),
+                    frame,
+                    obj,
+                )
+            )
+    if not candidates:
+        return None, None
+    _, _, _, frame, obj = max(candidates, key=lambda row: (row[0], row[1], row[2]))
+    return frame, obj
+
+
+def _wrap_visual_text(cv2: Any, text: str, width: int, scale: float, thickness: int) -> List[str]:
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if cv2.getTextSize(candidate, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0] <= width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _rule_summary(rule: Dict[str, Any]) -> str:
+    body = ", ".join(
+        f"{condition.get('predicate')}={condition.get('value')}"
+        for condition in rule.get("conditions", [])
+    )
+    return f"{rule.get('rule_id')}: {body}"
+
+
+def _render_track_grounding_image(
+    relative_video: Dict[str, Any],
+    video_result: Dict[str, Any],
+    track: Dict[str, Any],
+    output_path: Path,
+) -> Tuple[Optional[str], str]:
+    try:
+        import cv2
+        import numpy as np
+    except ModuleNotFoundError:
+        return None, "missing_cv2_or_numpy"
+
+    track_id = int(track.get("track_id", -1))
+    frame, obj = _representative_track_frame(relative_video, track_id)
+    if frame is None or obj is None:
+        return None, "track_not_found"
+    image = cv2.imread(str(frame.get("image_path", "")))
+    if image is None:
+        return None, "missing_frame_image"
+
+    frame_h, frame_w = image.shape[:2]
+    protected_by_track = {
+        int(row.get("track_id", -1)): row
+        for row in video_result.get("protected_objects", [])
+    }
+    protection = protected_by_track.get(track_id)
+    is_protected = protection is not None
+    status_color = (70, 220, 70) if is_protected else (80, 180, 255)
+    box = list(obj.get("bbox", obj.get("box", [])))
+    if len(box) >= 4:
+        x1, y1, x2, y2 = [int(round(_safe_float(value))) for value in box]
+        x1, x2 = sorted((max(0, min(frame_w - 1, x1)), max(0, min(frame_w - 1, x2))))
+        y1, y2 = sorted((max(0, min(frame_h - 1, y1)), max(0, min(frame_h - 1, y2))))
+        thickness = max(3, int(round(min(frame_w, frame_h) / 180.0)))
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 0), thickness + 3)
+        cv2.rectangle(image, (x1, y1), (x2, y2), status_color, thickness)
+        label = (
+            f"track {track_id} | {track.get('features', {}).get('object_class', 'unknown')} | "
+            f"{'PROTECTED' if is_protected else 'UNCOVERED'}"
+        )
+        text_y = max(32, y1 - 10)
+        cv2.rectangle(image, (x1, text_y - 28), (min(frame_w - 1, x1 + 600), text_y + 7), status_color, -1)
+        cv2.putText(
+            image,
+            label,
+            (x1 + 6, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    accepted_rules = list(video_result.get("semantic_protection_rules", []))
+    rejected_rules = list(video_result.get("rejected_rules", []))
+    panel_h = max(440, 275 + len(accepted_rules) * 155 + len(rejected_rules) * 92)
+    panel = np.full((panel_h, frame_w, 3), (24, 24, 24), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    margin = 22
+    right_x = margin
+    right_w = max(1, frame_w - 2 * margin)
+
+    cv2.putText(
+        panel,
+        "LLM semantic protection rules and per-track activations",
+        (right_x, 38),
+        font,
+        0.76,
+        (245, 245, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    result_y = 76
+    result_lines = [
+        f"status: {video_result.get('status', 'unknown')}",
+        f"accepted rules: {len(video_result.get('semantic_protection_rules', []))}",
+        f"rejected rules: {len(video_result.get('rejected_rules', []))}",
+        f"track result: {'protected_object' if is_protected else 'uncovered'}",
+    ]
+    for line in result_lines:
+        color = status_color if line.startswith("track result") else (215, 215, 215)
+        cv2.putText(panel, line, (right_x, result_y), font, 0.60, color, 2 if line.startswith("track result") else 1, cv2.LINE_AA)
+        result_y += 42
+
+    matched_ids = set(protection.get("matched_rule_ids", [])) if protection else set()
+    activation_by_rule = {
+        str(row.get("rule_id", "")): row
+        for row in track.get("rule_activations", [])
+    }
+    cv2.putText(
+        panel,
+        "Accepted rules: activation for this track",
+        (right_x, result_y),
+        font,
+        0.54,
+        (225, 225, 225),
+        2,
+        cv2.LINE_AA,
+    )
+    result_y += 36
+    if not accepted_rules:
+        cv2.putText(panel, "none", (right_x, result_y), font, 0.50, (150, 150, 150), 1, cv2.LINE_AA)
+        result_y += 34
+    for rule in accepted_rules:
+        rule_id = str(rule.get("rule_id", ""))
+        active = rule_id in matched_ids
+        activation = "ACTIVE" if active else "INACTIVE"
+        rule_color = (70, 230, 70) if active else (145, 145, 145)
+        summary = f"[{activation}] {_rule_summary(rule)}"
+        rule_thickness = 3 if active else 2
+        for line in _wrap_visual_text(cv2, summary, right_w, 0.70, rule_thickness):
+            cv2.putText(
+                panel,
+                line,
+                (right_x, result_y),
+                font,
+                0.70,
+                rule_color,
+                rule_thickness,
+                cv2.LINE_AA,
+            )
+            result_y += 38
+        justification = f"why: {str(rule.get('justification', ''))[:140]}"
+        for line in _wrap_visual_text(cv2, justification, right_w, 0.43, 1)[:2]:
+            cv2.putText(panel, line, (right_x, result_y), font, 0.43, rule_color, 1, cv2.LINE_AA)
+            result_y += 25
+        if not active:
+            failure = str(
+                activation_by_rule.get(rule_id, {}).get(
+                    "activation_failure_reason",
+                    "required semantic atoms did not match",
+                )
+            )
+            for line in _wrap_visual_text(cv2, f"failure: {failure}", right_w, 0.42, 1)[:2]:
+                cv2.putText(panel, line, (right_x, result_y), font, 0.42, (120, 120, 220), 1, cv2.LINE_AA)
+                result_y += 24
+        result_y += 10
+
+    if rejected_rules:
+        result_y += 4
+        cv2.putText(
+            panel,
+            "Rejected LLM-generated rules",
+            (right_x, result_y),
+            font,
+            0.54,
+            (90, 110, 240),
+            2,
+            cv2.LINE_AA,
+        )
+        result_y += 36
+        for rule in rejected_rules:
+            reasons = ", ".join(rule.get("rejection_reasons", [])) or str(
+                rule.get("rejection_reason", "validation_failed")
+            )
+            summary = f"[REJECTED] {_rule_summary(rule)}"
+            for line in _wrap_visual_text(cv2, summary, right_w, 0.65, 2)[:2]:
+                cv2.putText(panel, line, (right_x, result_y), font, 0.65, (105, 125, 235), 2, cv2.LINE_AA)
+                result_y += 36
+            for line in _wrap_visual_text(cv2, f"reason: {reasons}", right_w, 0.42, 1)[:2]:
+                cv2.putText(panel, line, (right_x, result_y), font, 0.42, (105, 125, 235), 1, cv2.LINE_AA)
+                result_y += 24
+            result_y += 8
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined = cv2.vconcat([image, panel])
+    if not cv2.imwrite(str(output_path), combined):
+        return None, "image_write_failed"
+    return str(output_path), "rendered"
+
+
+def render_symbol_grounded_visualizations(
+    relative_motion_state: Dict[str, Any],
+    output_root: Path,
+) -> Dict[str, Any]:
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    relative_by_video = {
+        str(row.get("video_id", "")): row
+        for row in relative_motion_state.get("relative_object_motion", [])
+    }
+    rendered = []
+    skipped = []
+    for video_result in relative_motion_state.get("symbol_grounded_refinement", []):
+        video_id = str(video_result.get("video_id", ""))
+        relative_video = relative_by_video.get(video_id, {})
+        for track in video_result.get("grounded_tracks", []):
+            track_id = int(track.get("track_id", -1))
+            path, status = _render_track_grounding_image(
+                relative_video,
+                video_result,
+                track,
+                output_root / video_id / f"track_{track_id:04d}_symbol_grounded.png",
+            )
+            row = {"video_id": video_id, "track_id": track_id, "status": status}
+            if path:
+                row["visualization_path"] = path
+                rendered.append(row)
+            else:
+                skipped.append(row)
+
+    manifest = {
+        "version": _VERSION,
+        "num_images_rendered": len(rendered),
+        "num_images_skipped": len(skipped),
+        "rendered": rendered,
+        "skipped": skipped,
+    }
+    with (output_root / "symbol_grounded_visualization_manifest.json").open("w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2)
+    return {
+        **relative_motion_state,
+        "symbol_grounded_visualizations": rendered,
+        "symbol_grounded_visualization_skipped": skipped,
+        "symbol_grounded_visualization_output_root": output_root,
     }
 

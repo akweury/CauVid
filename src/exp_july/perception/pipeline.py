@@ -3563,6 +3563,23 @@ def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
     return result
 
 
+def step8a_visual_symbol_grounded(relative_motion_state):
+    """Render one grounded-input and rule-result image per Step 8A track."""
+    from src.exp_july.perception.symbol_grounded_refinement import (
+        render_symbol_grounded_visualizations,
+    )
+
+    output_root = get_pipeline_output_root() / "08a_visual_symbol_grounded"
+    result = render_symbol_grounded_visualizations(relative_motion_state, output_root)
+    print(
+        f"[step 8a visual] symbol_grounded "
+        f"rendered={len(result.get('symbol_grounded_visualizations', []))} "
+        f"skipped={len(result.get('symbol_grounded_visualization_skipped', []))} "
+        f"output_root={output_root}"
+    )
+    return result
+
+
 def step8_visual_relative_motion(relative_motion_state, fps=10.0):
     videos = relative_motion_state.get("videos", [])
     relative_motion = relative_motion_state.get("relative_object_motion", [])
