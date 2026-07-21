@@ -355,7 +355,10 @@ class YOLOWorldDetector(ObjectDetector):
         if self._resolved_predict_batch_size is not None:
             predict_kwargs["batch"] = int(self._resolved_predict_batch_size)
         if self._resolved_half_precision is not None:
-            predict_kwargs["quantize"] = 16 if bool(self._resolved_half_precision) else None
+            # Ultralytics predict() controls FP16 inference with the boolean
+            # ``half`` argument. ``quantize`` is an export-oriented concept and
+            # is not a valid prediction override in current Ultralytics releases.
+            predict_kwargs["half"] = bool(self._resolved_half_precision)
         runtime_device = str(self._runtime_device or self.device or "cpu").strip()
         if runtime_device.lower() == "auto":
             runtime_device = "cpu"
