@@ -30,6 +30,15 @@ def stage2(rows):
 
 
 class Step8CBatchTests(unittest.TestCase):
+    def test_low_confidence_alone_does_not_trigger_review(self):
+        calls=[]
+        with tempfile.TemporaryDirectory() as tmp:
+            _,telemetry,_=process_tracks([item(confidence=.2)],Path(tmp),lambda kind,prompt:calls.append(kind),10)
+        row=telemetry["video::track_1"]
+        self.assertFalse(row["needs_llm_review"])
+        self.assertTrue(row["llm_skipped"])
+        self.assertEqual(calls,[])
+
     def test_clear_track_bypasses_llm(self):
         calls=[]
         with tempfile.TemporaryDirectory() as tmp:

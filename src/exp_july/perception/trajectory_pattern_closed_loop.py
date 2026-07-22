@@ -1,7 +1,7 @@
 """Step 8C: reproducible trajectory-pattern recognition and repair loop."""
 
 from __future__ import annotations
-import copy, hashlib, json, math, os, statistics, urllib.error, urllib.request
+import copy, hashlib, json, math, os, statistics, time, urllib.error, urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -57,7 +57,8 @@ def quantile(v,q):
     p=max(0,min(1,q))*(len(a)-1); lo=int(p); hi=math.ceil(p); r=p-lo
     return a[lo]*(1-r)+a[hi]*r
 
-def http_llm(prompt):
+def http_llm(prompt,return_metadata=False):
+    started=time.perf_counter();timeout_occurred=False
     key=os.environ.get("OPENAI_API_KEY","").strip()
     if not key: raise RuntimeError("OPENAI_API_KEY is not configured")
     base=os.environ.get("OPENAI_BASE_URL","https://api.openai.com/v1").rstrip("/")
@@ -68,39 +69,78 @@ def http_llm(prompt):
         {"role":"user","content":prompt}]}
     req=urllib.request.Request(url,data=json.dumps(request_body).encode(),headers={
         "Authorization":f"Bearer {key}","Content-Type":"application/json"},method="POST")
-    try:
-        with urllib.request.urlopen(req,timeout=120) as res: payload=json.loads(res.read().decode())
-    except urllib.error.HTTPError as exc:
-        try: detail=exc.read().decode("utf-8",errors="replace")[:2000]
-        except Exception: detail="response body unavailable"
-        raise RuntimeError(
-            f"LLM request failed: HTTP {exc.code}; model={model}; endpoint={url}; "
-            f"prompt_chars={len(prompt)}; response={detail}"
-        ) from exc
-    except (urllib.error.URLError,TimeoutError) as exc:
-        raise RuntimeError(f"LLM request failed: model={model}; endpoint={url}; error={exc}") from exc
+    timeout=max(1.0,float(os.environ.get("CAUVID_STEP8C_LLM_TIMEOUT_SECONDS","120")))
+    max_attempts=max(1,int(os.environ.get("CAUVID_STEP8C_LLM_MAX_ATTEMPTS","3")))
+    backoff=max(0.0,float(os.environ.get("CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS","2")))
+    payload=None;last_error=None
+    for attempt in range(1,max_attempts+1):
+        try:
+            with urllib.request.urlopen(req,timeout=timeout) as res: payload=json.loads(res.read().decode())
+            break
+        except urllib.error.HTTPError as exc:
+            try: detail=exc.read().decode("utf-8",errors="replace")[:2000]
+            except Exception: detail="response body unavailable"
+            last_error=exc
+            transient=exc.code in {408,409,429} or 500<=exc.code<600
+            if not transient or attempt>=max_attempts:
+                raise RuntimeError(
+                    f"LLM request failed after {attempt} attempt(s): HTTP {exc.code}; "
+                    f"model={model}; endpoint={url}; prompt_chars={len(prompt)}; response={detail}"
+                ) from exc
+        except (urllib.error.URLError,TimeoutError) as exc:
+            timeout_occurred=timeout_occurred or isinstance(exc,TimeoutError) or "timed out" in str(exc).lower()
+            last_error=exc
+            if attempt>=max_attempts:
+                raise RuntimeError(
+                    f"LLM request failed after {attempt} attempt(s): model={model}; "
+                    f"endpoint={url}; timeout={timeout}s; error={exc}"
+                ) from exc
+        print(
+            f"[step 8c] transient LLM failure; retry={attempt + 1}/{max_attempts} "
+            f"backoff={backoff * attempt:.1f}s error={last_error}"
+        )
+        if backoff:time.sleep(backoff*attempt)
     text=str(payload["choices"][0]["message"]["content"]).strip()
     fence=chr(96)*3
     if text.startswith(fence):
         text=text.removeprefix(fence+"json").removeprefix(fence).removesuffix(fence).strip()
     out=json.loads(text)
     if not isinstance(out,dict): raise ValueError("LLM response must be an object")
-    return out
+    usage=payload.get("usage",{}) if isinstance(payload,dict) else {}
+    metadata={"real_llm_call":True,"backend":"openai_chat_completions","model":model,
+      "heuristic_fallback":False,"timeout_occurred":timeout_occurred,"attempt_count":attempt,
+      "prompt_tokens":int(usage.get("prompt_tokens",0) or 0),
+      "completion_tokens":int(usage.get("completion_tokens",0) or 0),
+      "total_tokens":int(usage.get("total_tokens",0) or 0),
+      "true_latency_seconds":time.perf_counter()-started}
+    return (out,metadata) if return_metadata else out
 
 def llm_call(kind,prompt,root,generator):
     rid=hashlib.sha256((kind+"\n"+prompt).encode()).hexdigest()
     path=root/kind/f"{rid}.json"
-    if path.exists(): return json.loads(path.read_text())["response"]
+    expose_metadata=kind.startswith("batch_") or kind.endswith("_individual")
+    if path.exists():
+        cached=json.loads(path.read_text());response=dict(cached["response"]);prior=dict(cached.get("llm_call_metadata",{}))
+        if expose_metadata:
+            response["__llm_call_metadata__"]={**prior,"real_llm_call":False,"audit_cache_hit":True,
+              "backend":"llm_audit_cache","true_latency_seconds":0.0,"timeout_occurred":False}
+        return response
     if generator is None:
-        response=http_llm(prompt)
+        response,call_metadata=http_llm(prompt,return_metadata=True)
     else:
+        started=time.perf_counter()
         try: response=generator(kind,prompt)
         except TypeError: response=generator(prompt)
+        supplied=response.pop("__llm_call_metadata__",{}) if isinstance(response,dict) else {}
+        call_metadata={"real_llm_call":False,"backend":"callable_generator",
+          "model":getattr(generator,"__name__",type(generator).__name__),"heuristic_fallback":True,
+          "timeout_occurred":False,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,
+          "true_latency_seconds":time.perf_counter()-started,**supplied}
     if not isinstance(response,dict): raise ValueError(f"invalid {kind} response")
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps({"version":VERSION,"kind":kind,"request_id":rid,
-                                "prompt":prompt,"response":response},indent=2))
-    return response
+                                "prompt":prompt,"response":response,"llm_call_metadata":call_metadata},indent=2))
+    return {**response,"__llm_call_metadata__":call_metadata} if expose_metadata else response
 
 def symbolic_tracks(evidence):
     out=[]
@@ -479,8 +519,9 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         uid=compact_track(item["track"],item["candidates"])["track_uid"]
         runtime_monitor.interpretation_complete(llm_telemetry[uid],compact_inputs[uid])
     records=[];material=defaultdict(list)
-    for item in track_items:
+    for track_index,item in enumerate(track_items,1):
         track=item["track"];candidates=item["candidates"]
+        runtime_monitor.track_start(track["video_id"],track["track_id"],track_index,len(track_items))
         uid=compact_track(track,candidates)["track_uid"]
         interp=interpretations[uid]
         repairs=repair_candidates(track,candidates,interp,ego.get(track["video_id"],{}),current)

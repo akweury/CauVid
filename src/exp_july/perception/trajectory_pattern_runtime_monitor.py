@@ -35,7 +35,7 @@ class Step8CRuntimeMonitor:
         self.csv_path=self.root/"batch_metrics.csv";self.jsonl_path=self.root/"batch_metrics.jsonl"
         self.alert_path=self.root/"anomaly_alerts.jsonl";self.sample_path=self.root/"recent_qualitative_samples.json"
         self.summary_path=self.root/"runtime_summary.json";self.dashboard_path=self.root/"runtime_dashboard.html"
-        fields=("timestamp","stage","batch_size","retry_level","latency","input_count","valid_count","failed_count","malformed_count","token_cost","error")
+        fields=("timestamp","event_type","call_status","stage","batch_size","batch_index","batches_in_attempt","retry_level","latency","true_latency_seconds","input_count","valid_count","failed_count","malformed_count","real_llm_call","backend","model","heuristic_fallback","timeout_occurred","prompt_tokens","completion_tokens","total_tokens","estimated_tokens","token_counts_source","token_cost","error","track_uids")
         with self.csv_path.open("w",newline="",encoding="utf-8") as file:csv.DictWriter(file,fieldnames=fields).writeheader()
         self.jsonl_path.touch();self.alert_path.touch()
         self.progress=tqdm(total=self.total_units,desc="[step 8c] live",unit="unit",dynamic_ncols=True)
@@ -51,7 +51,7 @@ class Step8CRuntimeMonitor:
           "uncertainty_rate":sum(row=="uncertain" for row in self.outcomes)/max(1,len(self.outcomes))}
 
     def _postfix(self):
-        r=self._rolling();return {"thr":f"{r['throughput_units_per_second']:.2f}/s","eta":f"{r['eta_seconds']:.0f}s",
+        r=self._rolling();return {"thr":f"{r['throughput_units_per_second']:.2f}/s","eta":("estimating" if self.units==0 else f"{r['eta_seconds']:.0f}s"),
           "call":self.counts["llm_called"],"skip":self.counts["llm_skipped"],"cache":self.counts["cache_hit"],
           "accept":self.counts["repair_accepted"],"unc":self.counts["uncertain"],"fail":self.counts["failure"],
           "lat":f"{r['mean_latency']:.2f}s"}
@@ -62,27 +62,54 @@ class Step8CRuntimeMonitor:
         with self.alert_path.open("a",encoding="utf-8") as file:file.write(json.dumps(row,default=str)+"\n")
 
     def handle_batch_event(self,event):
-        event={"timestamp":_now(),**dict(event)};latency=_safe(event.get("latency"));self.latencies.append(latency)
-        self.batches.appendleft(event);self.counts["batch_events"]+=1
-        self.counts["batch_failures"]+=int(event.get("failed_count",0));self.counts["llm_requests"]+=1
+        event={"timestamp":_now(),**dict(event)};event_type=str(event.get("event_type","batch_complete"))
+        stage=str(event.get("stage","unknown"));uids=list(event.get("track_uids",[]));sample=", ".join(uids[:4])
+        if len(uids)>4:sample+=f", ... (+{len(uids)-4})"
+        if event_type=="gate_summary":
+            self.counts["llm_skipped"]=int(event.get("skipped_count",0));self.counts["cache_hit"]=int(event.get("cache_hit_count",0))
+            self.progress.set_description_str("[step 8c] LLM review queue")
+            tqdm.write(
+                f"[step 8c] review gate total={event.get('total_tracks',0)} "
+                f"review={event.get('review_count',0)} skipped={event.get('skipped_count',0)} "
+                f"cache_hits={event.get('cache_hit_count',0)} batch_size={event.get('batch_size',0)}"
+            )
+            self.batches.appendleft(event);self.progress.set_postfix(self._postfix(),refresh=True);self._write(force=True);return
+        batch_index=event.get("batch_index",1);batch_total=event.get("batches_in_attempt",1);retry=event.get("retry_level",0)
+        if event_type=="batch_start":
+            self.counts["llm_requests"]+=1
+            self.progress.set_description_str(f"[step 8c] {stage} batch {batch_index}/{batch_total}")
+            tqdm.write(
+                f"[step 8c] START stage={stage} batch={batch_index}/{batch_total} retry={retry} "
+                f"tracks={event.get('input_count',0)} ids=[{sample}]"
+            )
+            self.batches.appendleft(event)
+            with self.jsonl_path.open("a",encoding="utf-8") as file:file.write(json.dumps(event,default=str)+"\n")
+            self.progress.set_postfix(self._postfix(),refresh=True);self._write(force=True);return
+        latency=_safe(event.get("true_latency_seconds",event.get("latency")));self.latencies.append(latency);self.batches.appendleft(event);self.counts["batch_events"]+=1
+        self.counts["batch_failures"]+=int(event.get("failed_count",0))
+        tqdm.write(
+            f"[step 8c] DONE stage={stage} batch={batch_index}/{batch_total} retry={retry} "
+            f"valid={event.get('valid_count',0)}/{event.get('input_count',0)} "
+            f"failed={event.get('failed_count',0)} latency={latency:.2f}s "
+            f"llm={bool(event.get('real_llm_call',False))} backend={event.get('backend','unknown')} "
+            f"model={event.get('model','unknown')} fallback={bool(event.get('heuristic_fallback',False))} "
+            f"timeout={bool(event.get('timeout_occurred',False))} tokens={event.get('total_tokens',0)} "
+            f"token_source={event.get('token_counts_source','unknown')} ids=[{sample}]"
+        )
         if event.get("error"):self.counts["failure"]+=1;self._alert("llm_request_error",str(event["error"]),"critical",event)
         rolling=list(self.latencies)
         if len(rolling)>=5:
             baseline=statistics.mean(rolling[:-1]);spread=statistics.pstdev(rolling[:-1])
             if latency>max(10.0,baseline+3*max(.01,spread)):self._alert("latency_spike",f"batch latency {latency:.2f}s",context=event)
         if int(event.get("failed_count",0))>0:self._alert("batch_validation_failure",f"{event['failed_count']} failed outputs",context=event)
-        exists=self.csv_path.exists()
-        fields=("timestamp","stage","batch_size","retry_level","latency","input_count","valid_count","failed_count","malformed_count","token_cost","error")
-        with self.csv_path.open("a",newline="",encoding="utf-8") as file:
-            writer=csv.DictWriter(file,fieldnames=fields,extrasaction="ignore")
-            if not exists:writer.writeheader()
-            writer.writerow(event)
+        fields=("timestamp","event_type","call_status","stage","batch_size","batch_index","batches_in_attempt","retry_level","latency","true_latency_seconds","input_count","valid_count","failed_count","malformed_count","real_llm_call","backend","model","heuristic_fallback","timeout_occurred","prompt_tokens","completion_tokens","total_tokens","estimated_tokens","token_counts_source","token_cost","error","track_uids")
+        with self.csv_path.open("a",newline="",encoding="utf-8") as file:csv.DictWriter(file,fieldnames=fields,extrasaction="ignore").writerow(event)
         with self.jsonl_path.open("a",encoding="utf-8") as file:file.write(json.dumps(event,default=str)+"\n")
-        self.progress.set_postfix(self._postfix(),refresh=True);self._write()
+        self.progress.set_postfix(self._postfix(),refresh=True);self._write(force=True)
 
     def interpretation_complete(self,telemetry,compact):
         self.units+=1;self.progress.update(1)
-        for key in ("llm_called","llm_skipped","cache_hit","escalated_to_single"):
+        for key in ("llm_called","escalated_to_single"):
             self.counts[key]+=bool(telemetry.get(key))
         outcome=str(telemetry.get("validation_outcome",""));failed=outcome.startswith("failed")
         self.outcomes.append("failure" if failed else "ok");self.counts["failure"]+=failed
@@ -92,6 +119,12 @@ class Step8CRuntimeMonitor:
           "object_class":compact.get("object_class"),"top_patterns":compact.get("top_candidate_patterns",[]),
           "gate_reasons":telemetry.get("gate_reasons",[]),"outcome":outcome})
         self.progress.set_postfix(self._postfix(),refresh=True);self._write()
+
+    def track_start(self,video_id,track_id,index,total):
+        self.progress.set_description_str(f"[step 8c] repair {index}/{total} {video_id} track={track_id}")
+        if index==1 or index%25==0 or index==total:
+            tqdm.write(f"[step 8c] REPAIR track={index}/{total} video={video_id} track_id={track_id}")
+        self.progress.set_postfix(self._postfix(),refresh=True)
 
     def track_complete(self,record):
         self.units+=1;self.progress.update(1);accepted=bool(record.get("repair_applied"));uncertain=str(record.get("resolution_status"))!="validated"

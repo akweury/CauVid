@@ -52,15 +52,14 @@ def compact_track(track,candidates):
 
 def needs_llm_review(compact):
     top=list(compact["top_candidate_patterns"]);unc=compact["uncertainty_indicators"]
-    issues=compact["validation_issues"];state=compact["validation_state"].lower()
+    issues=[str(value).lower() for value in compact["validation_issues"]];state=compact["validation_state"].lower()
     reasons=[]
-    if _f(unc["track_confidence"])<.8:reasons.append("low_confidence")
-    if _f(unc["top_margin"])<.25:reasons.append("ambiguous_pattern_margin")
-    if issues:reasons.append("validation_issues")
-    if state not in {"valid","keep"}:reasons.append("validation_conflict")
+    if _f(unc["top_margin"])<.08:reasons.append("ambiguous_pattern_margin")
+    if state in {"invalid","discard","uncertain","conflict","conflicting","unknown"}:reasons.append("invalid_or_uncertain_validation")
+    if issues:reasons.append("validation_conflict")
+    if state in {"repair","repaired","repairable","keep_with_uncertainty"}:reasons.append("repairable_track")
     if top and top[0]=="unknown":reasons.append("unknown_top_pattern")
     return bool(reasons),reasons
-
 
 def _value_bucket(value):
     value=_f(value)
@@ -159,17 +158,54 @@ def _invoke_batch(kind,rows,invoke,validator,batch_size,telemetry,event_callback
         next_pending=[]
         for offset in range(0,len(pending),size):
             chunk=pending[offset:offset+size];uids={row["track_uid"] for row in chunk};start=time.perf_counter()
+            batch_index=offset//size+1;batches_in_attempt=(len(pending)+size-1)//size
             prompt=_stage1_prompt(chunk) if kind=="stage1" else _stage2_prompt(chunk)
-            try:payload=invoke(f"batch_{kind}",prompt);response_text=json.dumps(payload,separators=(",",":"),default=str)
-            except (ValueError,json.JSONDecodeError):payload={};response_text="{}"
-            elapsed=time.perf_counter()-start;valid,errors=validator(payload,uids);output.update(valid)
             if event_callback:
-                event_callback({"stage":kind,"batch_size":len(chunk),"retry_level":attempt,
+                event_callback({"event_type":"batch_start","stage":kind,"batch_size":len(chunk),
+                  "batch_index":batch_index,"batches_in_attempt":batches_in_attempt,"retry_level":attempt,
+                  "call_status":"pending","real_llm_call":False,"backend":"pending",
+                  "model":os.environ.get("CAUVID_STEP8_PATTERN_LLM_MODEL",os.environ.get("OPENAI_MODEL","gpt-4.1-mini")),"input_count":len(chunk),"track_uids":sorted(uids)})
+            call_metadata={}
+            try:
+                payload=invoke(f"batch_{kind}",prompt)
+                if isinstance(payload,dict):payload=dict(payload);call_metadata=dict(payload.pop("__llm_call_metadata__",{}))
+                response_text=json.dumps(payload,separators=(",",":"),default=str)
+            except (ValueError,json.JSONDecodeError):payload={};response_text="{}";call_metadata={"heuristic_fallback":True}
+            except RuntimeError as exc:
+                elapsed=time.perf_counter()-start
+                if event_callback:
+                    event_callback({"event_type":"batch_complete","call_status":"failed","stage":kind,"batch_size":len(chunk),
+                      "batch_index":batch_index,"batches_in_attempt":batches_in_attempt,"retry_level":attempt,
+                      "latency":elapsed,"true_latency_seconds":elapsed,"input_count":len(chunk),"valid_count":0,
+                      "failed_count":len(chunk),"malformed_count":0,"real_llm_call":True,
+                      "backend":"request_failed","model":os.environ.get("CAUVID_STEP8_PATTERN_LLM_MODEL",os.environ.get("OPENAI_MODEL","gpt-4.1-mini")),
+                      "heuristic_fallback":False,"timeout_occurred":"timed out" in str(exc).lower(),
+                      "prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"token_counts_source":"unavailable",
+                      "error":str(exc),"track_uids":sorted(uids)})
+                raise
+            elapsed=time.perf_counter()-start;valid,errors=validator(payload,uids);output.update(valid)
+            actual_total=int(call_metadata.get("total_tokens",0) or 0);estimated_total=(len(prompt)+len(response_text))/4
+            event_metadata={"real_llm_call":bool(call_metadata.get("real_llm_call",False)),
+              "backend":str(call_metadata.get("backend","unknown")),"model":str(call_metadata.get("model","unknown")),
+              "heuristic_fallback":bool(call_metadata.get("heuristic_fallback",False)),
+              "timeout_occurred":bool(call_metadata.get("timeout_occurred",False)),
+              "prompt_tokens":int(call_metadata.get("prompt_tokens",0) or 0),
+              "completion_tokens":int(call_metadata.get("completion_tokens",0) or 0),"total_tokens":actual_total,
+              "estimated_tokens":estimated_total,"token_counts_source":"api_usage" if actual_total else "estimated",
+              "audit_cache_hit":bool(call_metadata.get("audit_cache_hit",False)),"true_latency_seconds":float(call_metadata.get("true_latency_seconds",elapsed) or elapsed)}
+            if event_callback:
+                event_callback({"event_type":"batch_complete","call_status":"completed","stage":kind,"batch_size":len(chunk),
+                  "batch_index":batch_index,"batches_in_attempt":batches_in_attempt,"retry_level":attempt,
                   "latency":elapsed,"input_count":len(chunk),"valid_count":len(valid),
                   "failed_count":len(errors),"malformed_count":len(errors),
-                  "token_cost":(len(prompt)+len(response_text))/4,"track_uids":sorted(uids)})
+                  "token_cost":actual_total or estimated_total,"track_uids":sorted(uids),**event_metadata})
             for uid in uids:
-                telemetry[uid]["llm_called"]=True;telemetry[uid]["batch_size"]=len(chunk);telemetry[uid]["latency"]+=elapsed/len(chunk)
+                telemetry[uid]["llm_called"] = telemetry[uid]["llm_called"] or event_metadata["real_llm_call"]
+                telemetry[uid]["heuristic_fallback"] = telemetry[uid]["heuristic_fallback"] or event_metadata["heuristic_fallback"]
+                telemetry[uid]["timeout_occurred"] = telemetry[uid]["timeout_occurred"] or event_metadata["timeout_occurred"]
+                telemetry[uid]["llm_backend"] = event_metadata["backend"];telemetry[uid]["llm_model"] = event_metadata["model"]
+                if event_metadata["audit_cache_hit"]:telemetry[uid]["cache_hit"]=True;telemetry[uid]["llm_skipped"]=True
+                telemetry[uid]["batch_size"]=len(chunk);telemetry[uid]["latency"]+=event_metadata["true_latency_seconds"]/len(chunk)
                 telemetry[uid]["estimated_token_cost"]+=(len(prompt)+len(response_text))/4/len(chunk)
                 if uid in errors:
                     telemetry[uid]["retry_count"]+=1;telemetry[uid]["validation_outcome"]="failed:"+"|".join(errors[uid])
@@ -179,14 +215,51 @@ def _invoke_batch(kind,rows,invoke,validator,batch_size,telemetry,event_callback
     for row in pending:
         uid=row["track_uid"];telemetry[uid]["escalated_to_single"]=True
         prompt=_stage1_prompt([row]) if kind=="stage1" else _stage2_prompt([row]);start=time.perf_counter()
-        try:payload=invoke(f"{kind}_individual",prompt);response_text=json.dumps(payload,separators=(",",":"),default=str)
-        except (ValueError,json.JSONDecodeError):payload={};response_text="{}"
-        elapsed=time.perf_counter()-start;valid,errors=validator(payload,{uid})
-        telemetry[uid]["latency"]+=elapsed;telemetry[uid]["estimated_token_cost"]+=(len(prompt)+len(response_text))/4
         if event_callback:
-            event_callback({"stage":kind+"_individual","batch_size":1,"retry_level":"individual",
+            event_callback({"event_type":"batch_start","stage":kind+"_individual","batch_size":1,
+              "batch_index":1,"batches_in_attempt":1,"retry_level":"individual",
+              "call_status":"pending","real_llm_call":False,"backend":"pending",
+              "model":os.environ.get("CAUVID_STEP8_PATTERN_LLM_MODEL",os.environ.get("OPENAI_MODEL","gpt-4.1-mini")),"input_count":1,"track_uids":[uid]})
+        call_metadata={}
+        try:
+            payload=invoke(f"{kind}_individual",prompt)
+            if isinstance(payload,dict):payload=dict(payload);call_metadata=dict(payload.pop("__llm_call_metadata__",{}))
+            response_text=json.dumps(payload,separators=(",",":"),default=str)
+        except (ValueError,json.JSONDecodeError):payload={};response_text="{}";call_metadata={"heuristic_fallback":True}
+        except RuntimeError as exc:
+            elapsed=time.perf_counter()-start
+            if event_callback:
+                event_callback({"event_type":"batch_complete","call_status":"failed","stage":kind+"_individual","batch_size":1,
+                  "batch_index":1,"batches_in_attempt":1,"retry_level":"individual","latency":elapsed,
+                  "true_latency_seconds":elapsed,"input_count":1,"valid_count":0,"failed_count":1,
+                  "malformed_count":0,"real_llm_call":True,"backend":"request_failed",
+                  "model":os.environ.get("CAUVID_STEP8_PATTERN_LLM_MODEL",os.environ.get("OPENAI_MODEL","gpt-4.1-mini")),
+                  "heuristic_fallback":False,"timeout_occurred":"timed out" in str(exc).lower(),
+                  "prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"token_counts_source":"unavailable",
+                  "error":str(exc),"track_uids":[uid]})
+            raise
+        elapsed=time.perf_counter()-start;valid,errors=validator(payload,{uid})
+        actual_total=int(call_metadata.get("total_tokens",0) or 0);estimated_total=(len(prompt)+len(response_text))/4
+        event_metadata={"real_llm_call":bool(call_metadata.get("real_llm_call",False)),
+          "backend":str(call_metadata.get("backend","unknown")),"model":str(call_metadata.get("model","unknown")),
+          "heuristic_fallback":bool(call_metadata.get("heuristic_fallback",False)),
+          "timeout_occurred":bool(call_metadata.get("timeout_occurred",False)),
+          "prompt_tokens":int(call_metadata.get("prompt_tokens",0) or 0),
+          "completion_tokens":int(call_metadata.get("completion_tokens",0) or 0),"total_tokens":actual_total,
+          "estimated_tokens":estimated_total,"token_counts_source":"api_usage" if actual_total else "estimated",
+          "audit_cache_hit":bool(call_metadata.get("audit_cache_hit",False)),
+          "true_latency_seconds":float(call_metadata.get("true_latency_seconds",elapsed) or elapsed)}
+        telemetry[uid]["llm_called"] = telemetry[uid]["llm_called"] or event_metadata["real_llm_call"]
+        telemetry[uid]["heuristic_fallback"] = telemetry[uid]["heuristic_fallback"] or event_metadata["heuristic_fallback"]
+        telemetry[uid]["timeout_occurred"] = telemetry[uid]["timeout_occurred"] or event_metadata["timeout_occurred"]
+        telemetry[uid]["llm_backend"] = event_metadata["backend"];telemetry[uid]["llm_model"] = event_metadata["model"]
+        if event_metadata["audit_cache_hit"]:telemetry[uid]["cache_hit"]=True;telemetry[uid]["llm_skipped"]=True
+        telemetry[uid]["latency"]+=event_metadata["true_latency_seconds"];telemetry[uid]["estimated_token_cost"]+=(len(prompt)+len(response_text))/4
+        if event_callback:
+            event_callback({"event_type":"batch_complete","call_status":"completed","stage":kind+"_individual","batch_size":1,
+              "batch_index":1,"batches_in_attempt":1,"retry_level":"individual",
               "latency":elapsed,"input_count":1,"valid_count":len(valid),"failed_count":len(errors),
-              "malformed_count":len(errors),"token_cost":(len(prompt)+len(response_text))/4,"track_uids":[uid]})
+              "malformed_count":len(errors),"token_cost":actual_total or estimated_total,"track_uids":[uid],**event_metadata})
         if uid in valid:output[uid]=valid[uid];telemetry[uid]["validation_outcome"]="valid_after_single"
         else:telemetry[uid]["validation_outcome"]="failed_after_single:"+"|".join(errors.get(uid,["unknown"]))
     return output
@@ -217,12 +290,16 @@ def process_tracks(items,cache_root,invoke,batch_size=10,use_cache=True,event_ca
         compact=compact_track(item["track"],item["candidates"]);uid=compact["track_uid"];compacts[uid]=compact
         gate,reasons=needs_llm_review(compact);signature=_signature(compact);path=cache_root/f"{signature}.json"
         telemetry[uid]={"track_uid":uid,"needs_llm_review":gate,"gate_reasons":reasons,"llm_called":False,"llm_skipped":not gate,
-          "cache_hit":False,"batch_size":0,"retry_count":0,"escalated_to_single":False,"latency":0.0,"estimated_token_cost":0.0,"validation_outcome":"deterministic_bypass"}
+          "cache_hit":False,"heuristic_fallback":False,"timeout_occurred":False,"llm_backend":"none","llm_model":"none","batch_size":0,"retry_count":0,"escalated_to_single":False,"latency":0.0,"estimated_token_cost":0.0,"validation_outcome":"deterministic_bypass"}
         if not gate:results[uid]=deterministic_assessments(item["candidates"]);continue
         if use_cache and path.exists():
             try:cached=json.loads(path.read_text());results[uid]=cached["interpretation"];telemetry[uid].update({"cache_hit":True,"llm_skipped":True,"validation_outcome":"signature_cache_hit"});continue
             except (OSError,json.JSONDecodeError,KeyError):pass
         review.append(compact)
+    if event_callback:
+        event_callback({"event_type":"gate_summary","stage":"review_gate","total_tracks":len(items),
+          "review_count":len(review),"skipped_count":sum(row["llm_skipped"] for row in telemetry.values()),
+          "cache_hit_count":sum(row["cache_hit"] for row in telemetry.values()),"batch_size":batch_size})
     stage1=_invoke_batch("stage1",review,invoke,_validate_stage1,batch_size,telemetry,event_callback) if review else {}
     escalation=[compacts[uid] for uid,row in stage1.items() if _unstable(row)]
     if escalation:

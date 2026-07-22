@@ -16,6 +16,11 @@ class Step8CRuntimeMonitorTests(unittest.TestCase):
                 "stage": "batch_stage1", "batch_size": 1, "retry_level": 0,
                 "latency": 0.25, "input_count": 1, "valid_count": 0,
                 "failed_count": 1, "malformed_count": 1, "token_cost": 12,
+                "real_llm_call": True, "backend": "openai_chat_completions",
+                "model": "gpt-4.1-mini", "heuristic_fallback": False,
+                "timeout_occurred": False, "prompt_tokens": 8,
+                "completion_tokens": 4, "total_tokens": 12,
+                "token_counts_source": "api_usage", "true_latency_seconds": 0.25,
             })
             monitor.interpretation_complete({
                 "track_uid": "video::track_1", "llm_called": True,
@@ -40,6 +45,10 @@ class Step8CRuntimeMonitorTests(unittest.TestCase):
             with (root / "batch_metrics.csv").open(newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["stage"], "batch_stage1")
+            self.assertEqual(rows[0]["real_llm_call"], "True")
+            self.assertEqual(rows[0]["backend"], "openai_chat_completions")
+            self.assertEqual(rows[0]["model"], "gpt-4.1-mini")
+            self.assertEqual(rows[0]["total_tokens"], "12")
             self.assertTrue((root / "batch_metrics.jsonl").read_text().strip())
             self.assertEqual(result["completed_units"], 2)
             self.assertEqual(result["counts"]["llm_called"], 1)
