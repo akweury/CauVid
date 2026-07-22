@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+import re
 import sys
 from collections import Counter
 from contextlib import redirect_stderr
@@ -140,6 +141,103 @@ def get_pipeline_output_root():
             str(config.get_output_path("pipeline_output")),
         )
     )
+
+
+_CACHE_STEP_DIR_PATTERN = re.compile(r"^\d{2}[a-z]?_.+")
+
+
+def _relocated_cache_path(
+    value,
+    dataset_root,
+    pipeline_root,
+    *,
+    video_id="",
+    key_hint="",
+):
+    text = str(value).strip()
+    if not text or "://" in text:
+        return text
+    source = Path(text)
+    if source.exists() or not source.is_absolute():
+        return text
+
+    normalized = text.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    candidates = []
+    dataset_root = Path(dataset_root) if dataset_root else None
+    pipeline_root = Path(pipeline_root) if pipeline_root else None
+
+    if dataset_root is not None:
+        for marker in ("frames", "depth_maps"):
+            if marker in parts:
+                marker_index = parts.index(marker)
+                candidates.append(dataset_root / marker / Path(*parts[marker_index + 1 :]))
+        filename = source.name
+        hint = str(key_hint).lower()
+        if video_id and filename:
+            if "image" in hint or source.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                candidates.append(dataset_root / "frames" / str(video_id) / filename)
+            if "depth" in hint or filename.endswith("_depth.npz"):
+                candidates.append(dataset_root / "depth_maps" / str(video_id) / filename)
+
+    if pipeline_root is not None:
+        for index, part in enumerate(parts):
+            if _CACHE_STEP_DIR_PATTERN.match(part):
+                candidates.append(pipeline_root / Path(*parts[index:]))
+                break
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return text
+
+
+def relocate_cached_payload(payload, dataset_root=None, pipeline_root=None):
+    """Relocate absolute paths embedded by another host after cache copying."""
+
+    changed_paths = []
+
+    def visit(value, key_hint="", video_id=""):
+        if isinstance(value, dict):
+            current_video_id = str(value.get("video_id", video_id) or video_id)
+            return {
+                key: visit(child, key_hint=str(key), video_id=current_video_id)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [visit(child, key_hint=key_hint, video_id=video_id) for child in value]
+        if isinstance(value, str):
+            relocated = _relocated_cache_path(
+                value,
+                dataset_root,
+                pipeline_root,
+                video_id=video_id,
+                key_hint=key_hint,
+            )
+            if relocated != value:
+                changed_paths.append({"from": value, "to": relocated})
+            return relocated
+        return value
+
+    relocated_payload = visit(payload)
+    return relocated_payload, changed_paths
+
+
+def relocate_json_cache_file(path, dataset_root=None, pipeline_root=None):
+    path = Path(path)
+    if not path.exists():
+        return None, []
+    with path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    relocated, changes = relocate_cached_payload(
+        payload,
+        dataset_root=dataset_root,
+        pipeline_root=pipeline_root,
+    )
+    if changes:
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(relocated, file, indent=2)
+    return relocated, changes
 
 
 def normalize_detection_image_paths(video_result, dataset_root):
@@ -3019,6 +3117,10 @@ def step1_init(video_ids=None, video_count=None):
         "check_cache": driving_pipeline_config.get_detection_check_cache_enabled(default=False),
         "enable_candidate_branch": driving_pipeline_config.get_detection_candidate_branch_enabled(default=False),
         "skip_step": driving_pipeline_config.get_detection_skip_step_enabled(default=False),
+        "reuse_copied_cache": os.environ.get(
+            "CAUVID_REUSE_COPIED_STEP1_7_CACHE",
+            "1",
+        ).strip().lower() not in {"0", "false", "no", "off"},
     }
     tracking_args = {
         "output_root": get_pipeline_output_root() / "02_driving_mini_tracking",
@@ -3063,6 +3165,7 @@ def step2_detection(env, args):
     model_name = run_args["model_name"]
     classes = run_args["classes"]
     skip_step = bool(run_args.pop("skip_step", False))
+    reuse_copied_cache = bool(run_args.pop("reuse_copied_cache", True))
     render_video = bool(run_args.get("render_video", True))
     check_cache = bool(run_args.get("check_cache", False))
     candidate_branch_enabled = bool(run_args.get("enable_candidate_branch", False))
@@ -3073,8 +3176,11 @@ def step2_detection(env, args):
     print(f"[step 2] classes={len(classes)} render_video={render_video} check_cache={check_cache}")
     print(f"[step 2] output_root={output_root}")
 
-    if skip_step:
-        manifest_path = output_root / "detection_manifest.json"
+    manifest_path = output_root / "detection_manifest.json"
+    use_cached_detection = skip_step or (
+        reuse_copied_cache and manifest_path.exists()
+    )
+    if use_cached_detection:
         with manifest_path.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
         video_entries = {
@@ -3085,13 +3191,27 @@ def step2_detection(env, args):
         detections = []
         for video_id in videos:
             entry = video_entries[video_id]
-            detections_path = Path(str(entry.get("detections_json", "")).strip() or output_root / video_id / "detections.json")
+            local_detections_path = output_root / video_id / "detections.json"
+            stored_path = str(entry.get("detections_json", "")).strip()
+            detections_path = local_detections_path if local_detections_path.exists() else Path(
+                _relocated_cache_path(
+                    stored_path,
+                    env["dataset_root"],
+                    get_pipeline_output_root(),
+                    video_id=video_id,
+                    key_hint="detections_json",
+                )
+            )
             with detections_path.open("r", encoding="utf-8") as f:
                 video_result = json.load(f)
             if hasattr(detect_driving_mini, "_apply_candidate_branch_mode"):
                 video_result = detect_driving_mini._apply_candidate_branch_mode(video_result, candidate_branch_enabled)
             detections.append(video_result)
-        print(f"[step 2] loaded cached detection results for {len(detections)} videos")
+        cache_reason = "configured_skip" if skip_step else "copied_cache_detected"
+        print(
+            f"[step 2] loaded cached detection results for {len(detections)} videos "
+            f"reason={cache_reason}"
+        )
     else:
         detections = detect_driving_mini.run(**run_args)
         print(f"[step 2] completed detection for {len(detections)} videos")
@@ -3101,8 +3221,16 @@ def step2_detection(env, args):
     normalized_detections = []
     rewritten_count = 0
     for video_result in detections:
-        normalized_video_result, changed = normalize_detection_image_paths(video_result, env["dataset_root"])
-        if changed:
+        relocated_video_result, path_changes = relocate_cached_payload(
+            video_result,
+            dataset_root=env["dataset_root"],
+            pipeline_root=get_pipeline_output_root(),
+        )
+        normalized_video_result, changed = normalize_detection_image_paths(
+            relocated_video_result,
+            env["dataset_root"],
+        )
+        if changed or path_changes:
             rewritten_count += 1
             write_detection_cache_if_needed(
                 normalized_video_result,
@@ -3117,6 +3245,7 @@ def step2_detection(env, args):
         "videos": videos,
         "detections": detections,
         "detection_output_root": output_root,
+        "dataset_root": env["dataset_root"],
         "model_name": model_name,
         "classes": classes,
         "tracking_args": env["tracking_args"],
@@ -3144,17 +3273,30 @@ def step3_tracking(detection_state):
     tracking_results = []
     progress = tqdm(detections, desc="[step 3] tracking", unit="video")
     for video_result in progress:
-        progress.set_postfix_str(str(video_result.get("video_id", "")), refresh=False)
-        tracking_results.append(
-            tracking_driving_mini.track_video(
-                video_result=video_result,
-                output_root=output_root,
-                frame_rate=int(run_args.get("frame_rate", 10)),
-                tracker_args=run_args.get("tracker_args"),
-                force_recompute=bool(run_args.get("force_recompute", False)),
-                render_video=render_video,
-            )
+        video_id = str(video_result.get("video_id", ""))
+        progress.set_postfix_str(video_id, refresh=False)
+        tracks_cache = output_root / video_id / "tracks.json"
+        _, cache_path_changes = relocate_json_cache_file(
+            tracks_cache,
+            dataset_root=detection_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
         )
+        if cache_path_changes:
+            print(f"[step 3] relocated cached paths video_id={video_id} paths={len(cache_path_changes)}")
+        tracking_result = tracking_driving_mini.track_video(
+            video_result=video_result,
+            output_root=output_root,
+            frame_rate=int(run_args.get("frame_rate", 10)),
+            tracker_args=run_args.get("tracker_args"),
+            force_recompute=bool(run_args.get("force_recompute", False)),
+            render_video=render_video,
+        )
+        tracking_result, _ = relocate_cached_payload(
+            tracking_result,
+            dataset_root=detection_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
+        )
+        tracking_results.append(tracking_result)
 
     manifest = {
         "schema_version": getattr(tracking_driving_mini, "_TRACKING_SCHEMA_VERSION", 7),
@@ -3192,6 +3334,7 @@ def step3_tracking(detection_state):
         "videos": videos,
         "tracks": tracking_results,
         "tracking_output_root": output_root,
+        "dataset_root": detection_state.get("dataset_root"),
         "positions_3d_args": detection_state["positions_3d_args"],
         "ego_motion_args": detection_state["ego_motion_args"],
     }
@@ -3220,7 +3363,13 @@ def step6_positions_3d(tracking_state):
         cache_path = output_root / video_id / "positions_3d.json"
         cached_result = None
         if not bool(run_args.get("force_recompute", False)):
-            payload = load_json_if_exists(cache_path)
+            payload, cache_path_changes = relocate_json_cache_file(
+                cache_path,
+                dataset_root=tracking_state.get("dataset_root"),
+                pipeline_root=get_pipeline_output_root(),
+            )
+            if cache_path_changes:
+                print(f"[step 6] relocated cached paths video_id={video_id} paths={len(cache_path_changes)}")
             if is_step6_cache_payload(payload, video_id):
                 cached_result = payload
         if cached_result is not None:
@@ -3269,6 +3418,7 @@ def step6_positions_3d(tracking_state):
         "videos": videos,
         "positions_3d": positions_3d,
         "positions_3d_output_root": output_root,
+        "dataset_root": tracking_state.get("dataset_root"),
         "ego_motion_args": tracking_state["ego_motion_args"],
     }
 
@@ -3292,7 +3442,13 @@ def step7_ego_motion(position_state):
         cache_path = output_root / video_id / "ego_motion.json"
         cached_result = None
         if not bool(run_args.get("force_recompute", False)):
-            payload = load_json_if_exists(cache_path)
+            payload, cache_path_changes = relocate_json_cache_file(
+                cache_path,
+                dataset_root=position_state.get("dataset_root"),
+                pipeline_root=get_pipeline_output_root(),
+            )
+            if cache_path_changes:
+                print(f"[step 7] relocated cached paths video_id={video_id} paths={len(cache_path_changes)}")
             if (
                 payload
                 and int(payload.get("version", 0)) == getattr(ego_motion_driving_mini, "_EGO_MOTION_VERSION", 0)
@@ -3340,12 +3496,19 @@ def step7_ego_motion(position_state):
     }
 
 
-def step7b_tracklet_repair(position_state, ego_state):
+def step7b_tracklet_repair(
+    position_state,
+    ego_state,
+    *,
+    output_subdir="07b_driving_mini_tracklet_repair",
+    step_label="7b",
+    repair_cfg=None,
+):
     videos = position_state["videos"]
     positions_3d = position_state.get("positions_3d", [])
     ego_motion = ego_state.get("ego_motion", [])
     if not videos or not positions_3d:
-        print("[step 7b] no 3d positions, skip tracklet repair")
+        print(f"[step {step_label}] no 3d positions, skip tracklet repair")
         return {
             "videos": videos,
             "tracklet_repair": [],
@@ -3355,7 +3518,7 @@ def step7b_tracklet_repair(position_state, ego_state):
             "ego_motion_output_root": ego_state.get("ego_motion_output_root"),
         }
 
-    output_root = get_pipeline_output_root() / "07b_driving_mini_tracklet_repair"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     ego_by_video = {
         str(row.get("video_id", "")): row
@@ -3363,11 +3526,11 @@ def step7b_tracklet_repair(position_state, ego_state):
         if str(row.get("video_id", ""))
     }
     repaired_positions_3d = []
-    progress = tqdm(positions_3d, desc="[step 7b] tracklet_repair", unit="video")
+    progress = tqdm(positions_3d, desc=f"[step {step_label}] tracklet_repair", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
-        repaired = _repair_video_tracklets(video_result, ego_by_video.get(video_id))
+        repaired = _repair_video_tracklets(video_result, ego_by_video.get(video_id), repair_cfg)
         out_dir = output_root / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
         with (out_dir / "tracklet_repair.json").open("w", encoding="utf-8") as f:
@@ -3455,7 +3618,7 @@ def step7b_tracklet_repair(position_state, ego_state):
     with (output_root / "tracklet_repair_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(
-        f"[step 7b] done videos={len(repaired_positions_3d)} "
+        f"[step {step_label}] done videos={len(repaired_positions_3d)} "
         f"repaired_gaps={manifest['num_repaired_gaps']} "
         f"interpolated_objects={manifest['num_interpolated_objects']} "
         f"split_events={manifest['num_split_events']} "
@@ -3475,15 +3638,21 @@ def step7b_tracklet_repair(position_state, ego_state):
     }
 
 
-def step8_relative_object_motion(position_state, repaired_state):
+def step8_relative_object_motion(
+    position_state,
+    repaired_state,
+    *,
+    output_subdir="08_driving_mini_relative_object_motion",
+    step_label="8",
+):
     videos = position_state["videos"]
     repaired_positions = repaired_state.get("positions_3d", repaired_state.get("tracklet_repair", []))
     ego_motion = repaired_state.get("ego_motion", [])
     if not videos or not repaired_positions:
-        print("[step 8] no repaired object positions, skip relative object motion")
+        print(f"[step {step_label}] no repaired object positions, skip relative object motion")
         return {"videos": videos, "relative_object_motion": []}
 
-    output_root = get_pipeline_output_root() / "08_driving_mini_relative_object_motion"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     ego_by_video = {
         str(row.get("video_id", "")): row
@@ -3491,7 +3660,7 @@ def step8_relative_object_motion(position_state, repaired_state):
         if str(row.get("video_id", ""))
     }
     relative_motion = []
-    progress = tqdm(repaired_positions, desc="[step 8] relative_object_motion", unit="video")
+    progress = tqdm(repaired_positions, desc=f"[step {step_label}] relative_object_motion", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
@@ -3525,7 +3694,7 @@ def step8_relative_object_motion(position_state, repaired_state):
     with (output_root / "relative_object_motion_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(
-        f"[step 8] done videos={len(relative_motion)} "
+        f"[step {step_label}] done videos={len(relative_motion)} "
         f"objects={manifest['num_objects_total']} "
         f"observed={manifest['num_observed_objects_total']} "
         f"repaired={manifest['num_repaired_objects_total']} "
@@ -3541,11 +3710,17 @@ def step8_relative_object_motion(position_state, repaired_state):
     }
 
 
-def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
+def step8a_symbol_grounded_refinement(
+    relative_motion_state,
+    llm_generate=None,
+    *,
+    output_subdir="08a_symbol_grounded_refinement",
+    step_label="8a",
+):
     """Generate and execute symbol-grounded semantic protection rules."""
     from src.exp_july.perception.symbol_grounded_refinement import run_symbol_grounded_refinement
 
-    output_root = get_pipeline_output_root() / "08a_symbol_grounded_refinement"
+    output_root = get_pipeline_output_root() / output_subdir
     result = run_symbol_grounded_refinement(
         relative_motion_state,
         output_root=output_root,
@@ -3553,7 +3728,7 @@ def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
     )
     video_results = result.get("symbol_grounded_refinement", [])
     print(
-        f"[step 8a] symbol_grounded_refinement "
+        f"[step {step_label}] symbol_grounded_refinement "
         f"videos={len(video_results)} "
         f"accepted_rules={sum(len(row.get('semantic_protection_rules', [])) for row in video_results)} "
         f"rejected_rules={sum(len(row.get('rejected_rules', [])) for row in video_results)} "
@@ -3563,16 +3738,21 @@ def step8a_symbol_grounded_refinement(relative_motion_state, llm_generate=None):
     return result
 
 
-def step8a_visual_symbol_grounded(relative_motion_state):
+def step8a_visual_symbol_grounded(
+    relative_motion_state,
+    *,
+    output_subdir="08a_visual_symbol_grounded",
+    step_label="8a visual",
+):
     """Render one grounded-input and rule-result image per Step 8A track."""
     from src.exp_july.perception.symbol_grounded_refinement import (
         render_symbol_grounded_visualizations,
     )
 
-    output_root = get_pipeline_output_root() / "08a_visual_symbol_grounded"
+    output_root = get_pipeline_output_root() / output_subdir
     result = render_symbol_grounded_visualizations(relative_motion_state, output_root)
     print(
-        f"[step 8a visual] symbol_grounded "
+        f"[step {step_label}] symbol_grounded "
         f"rendered={len(result.get('symbol_grounded_visualizations', []))} "
         f"skipped={len(result.get('symbol_grounded_visualization_skipped', []))} "
         f"output_root={output_root}"
@@ -3580,18 +3760,24 @@ def step8a_visual_symbol_grounded(relative_motion_state):
     return result
 
 
-def step8_visual_relative_motion(relative_motion_state, fps=10.0):
+def step8_visual_relative_motion(
+    relative_motion_state,
+    fps=10.0,
+    *,
+    output_subdir="08visual_relative_motion_tracks",
+    step_label="8visual",
+):
     videos = relative_motion_state.get("videos", [])
     relative_motion = relative_motion_state.get("relative_object_motion", [])
     if not videos or not relative_motion:
-        print("[step 8visual] no relative object motion, skip visualization")
+        print(f"[step {step_label}] no relative object motion, skip visualization")
         return {
             **relative_motion_state,
             "relative_motion_visualizations": [],
             "relative_motion_visualization_output_root": None,
         }
 
-    output_root = get_pipeline_output_root() / "08visual_relative_motion_tracks"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     evidence_by_video = {}
     for evidence_video in relative_motion_state.get("trajectory_motion_evidence", []):
@@ -3616,7 +3802,7 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
     all_skipped = []
     ego_motion_chart_pdfs = []
     ego_motion_chart_skipped = []
-    progress = tqdm(relative_motion, desc="[step 8visual] relative_motion_tracks", unit="video")
+    progress = tqdm(relative_motion, desc=f"[step {step_label}] relative_motion_tracks", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
@@ -3664,7 +3850,7 @@ def step8_visual_relative_motion(relative_motion_state, fps=10.0):
     with (output_root / "relative_motion_track_visualization_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(
-        f"[step 8visual] done videos={len(relative_motion)} "
+        f"[step {step_label}] done videos={len(relative_motion)} "
         f"track_videos={manifest['num_track_videos_rendered']} "
         f"skipped={manifest['num_track_videos_skipped']} "
         f"output_root={output_root}"
@@ -3683,10 +3869,19 @@ def step9_temporal_segmentation(ego_state, relative_motion_state):
     return {"videos": ego_state["videos"], "temporal_segments": []}
 
 
-def step8b_causal_filter_out(ego_state, relative_motion_state):
+def step8b_causal_filter_out(
+    ego_state,
+    relative_motion_state,
+    *,
+    phase="final",
+    output_subdir=None,
+    step_label=None,
+):
     videos = relative_motion_state.get("videos", ego_state.get("videos", []))
     relative_motion = relative_motion_state.get("relative_object_motion", [])
-    output_root = get_pipeline_output_root() / "08b_driving_mini_causal_filter_out"
+    output_root = get_pipeline_output_root() / (
+        output_subdir or "08b_driving_mini_causal_filter_out"
+    )
     output_root.mkdir(parents=True, exist_ok=True)
 
     ego_by_video = {
@@ -3706,8 +3901,39 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
             protected_by_video.setdefault(video_id, {})[track_id] = row
 
     trajectory_motion_evidence = []
-    for relative_video in relative_motion:
+    cached_videos = 0
+    progress = tqdm(
+        relative_motion,
+        desc=f"[step {step_label}] trajectory_validation",
+        unit="video",
+    )
+    for relative_video in progress:
         video_id = str(relative_video.get("video_id", ""))
+        progress.set_postfix_str(video_id, refresh=False)
+        cache_path = output_root / video_id / "trajectory_motion_evidence.json"
+        if not cache_path.exists():
+            cache_path = output_root / video_id / "causal_filter_out.json"
+        cached_evidence, cache_path_changes = relocate_json_cache_file(
+            cache_path,
+            dataset_root=relative_motion_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
+        )
+        cache_valid = (
+            isinstance(cached_evidence, dict)
+            and int(cached_evidence.get("version", 0)) == _CAUSAL_FILTER_OUT_VERSION
+            and str(cached_evidence.get("video_id", "")) == video_id
+            and cached_evidence.get("evidence_type") == "trajectory_motion_evidence"
+            and isinstance(cached_evidence.get("trajectory_motion_evidence"), list)
+        )
+        if cache_valid:
+            cached_videos += 1
+            trajectory_motion_evidence.append(cached_evidence)
+            if cache_path_changes:
+                print(
+                    f"[step {step_label or ('8b:' + phase)}] relocated cached paths "
+                    f"video_id={video_id} paths={len(cache_path_changes)}"
+                )
+            continue
         evidence = _trajectory_motion_evidence_video(
             relative_video,
             ego_by_video.get(video_id),
@@ -3846,8 +4072,9 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
     with (output_root / "causal_filter_out_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(
-        f"[step 8b] trajectory_motion_evidence "
+        f"[step {step_label or ('8b:' + phase)}] trajectory_motion_evidence "
         f"videos={len(trajectory_motion_evidence)} "
+        f"cached={cached_videos} "
         f"trajectories={manifest['num_trajectories']} "
         f"valid={manifest['num_valid_trajectories']} "
         f"repaired={manifest['num_repaired_trajectories']} "
@@ -3872,6 +4099,9 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
         ],
         "trajectory_motion_evidence": trajectory_motion_evidence,
         "trajectory_motion_evidence_output_root": output_root,
+        "trajectory_motion_evidence_phase": phase,
+        f"{phase}_trajectory_motion_evidence": trajectory_motion_evidence,
+        f"{phase}_trajectory_motion_evidence_output_root": output_root,
         "causal_filter_out": trajectory_motion_evidence,
         "causal_filter_out_output_root": output_root,
         "relative_object_motion": relative_motion,
@@ -3880,18 +4110,24 @@ def step8b_causal_filter_out(ego_state, relative_motion_state):
     }
 
 
-def step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state):
+def step8c_prior_guided_ego_motion_refinement(
+    ego_state,
+    relative_motion_state,
+    *,
+    output_subdir="08c_prior_guided_ego_motion_refinement",
+    step_label="8c",
+):
     videos = relative_motion_state.get("videos", ego_state.get("videos", []))
     trajectory_motion_evidence = relative_motion_state.get("trajectory_motion_evidence", [])
     if not videos or not trajectory_motion_evidence:
-        print("[step 8c] no trajectory motion evidence, skip prior-guided ego refinement")
+        print(f"[step {step_label}] no trajectory motion evidence, skip prior-guided ego refinement")
         return {
             **relative_motion_state,
             "reliable_reference_objects": [],
             "prior_guided_ego_refinement_output_root": None,
         }
 
-    output_root = get_pipeline_output_root() / "08c_prior_guided_ego_motion_refinement"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     ego_by_video = {
         str(row.get("video_id", "")): row
@@ -3957,7 +4193,7 @@ def step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state):
     with (output_root / "refined_ego_motion_manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(
-        f"[step 8c] prior_guided_ego_motion_refinement "
+        f"[step {step_label}] prior_guided_ego_motion_refinement "
         f"videos={len(reliable_reference_results)} "
         f"reference_objects={manifest['num_reliable_reference_objects']}/"
         f"{manifest['num_trajectories']} "
@@ -3975,15 +4211,67 @@ def step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state):
     }
 
 
-def step8d_adaptive_protected_object_motion_repair(relative_motion_state):
-    """Run diagnostic repairs without mutating Step 8B trajectory evidence."""
+def step8e_iterative_trajectory_pattern_repair(
+    relative_motion_state,
+    llm_generate=None,
+    *,
+    output_subdir="08e_trajectory_pattern_closed_loop",
+    step_label="8e",
+):
+    """Run the cached and auditable trajectory-pattern repair loop."""
+    from src.exp_july.perception.trajectory_pattern_closed_loop import (
+        run_trajectory_pattern_closed_loop,
+    )
+
+    output_root = get_pipeline_output_root() / output_subdir
+    result = run_trajectory_pattern_closed_loop(
+        relative_motion_state,
+        output_root,
+        llm_generate=llm_generate,
+    )
+    manifest = dict(result.get("trajectory_pattern_manifest", {}))
+    visualizations = list(result.get("trajectory_pattern_visualizations", []))
+    summaries = list(result.get("trajectory_pattern_video_summaries", []))
+    skipped = list(result.get("trajectory_pattern_visualization_skipped", []))
+    dashboard_path = str(result.get("trajectory_pattern_dashboard_path", ""))
+    runtime_dashboard_path = str(result.get("trajectory_pattern_runtime_dashboard_path", ""))
+    print(
+        f"[step {step_label}] trajectory_pattern_closed_loop "
+        f"videos={int(manifest.get('num_videos', 0))} "
+        f"tracks={int(manifest.get('num_tracks', 0))} "
+        f"patterns={int(manifest.get('num_patterns', 0))} "
+        f"candidates={int(manifest.get('num_candidates', 0))} "
+        f"repairs={int(manifest.get('num_repairs_applied', 0))} "
+        f"stats_version={int(manifest.get('statistics_version', 0))} "
+        f"promotion={dict(manifest.get('promotion', {})).get('decision', '')} "
+        f"llm_batch={int(manifest.get('llm_batch_size', 0))} "
+        f"llm_called={int(manifest.get('llm_called', 0))} "
+        f"llm_skipped={int(manifest.get('llm_skipped', 0))} "
+        f"cache_hits={int(manifest.get('llm_cache_hits', 0))} "
+        f"single_escalations={int(manifest.get('llm_escalated_to_single', 0))} "
+        f"track_visuals={len(visualizations)} "
+        f"video_summaries={len(summaries)} "
+        f"visual_skipped={len(skipped)} "
+        f"dashboard={dashboard_path} "
+        f"runtime_dashboard={runtime_dashboard_path}"
+    )
+    return result
+
+
+def step8d_adaptive_protected_object_motion_repair(
+    relative_motion_state,
+    *,
+    output_subdir="08d_adaptive_trajectory_motion_repair",
+    step_label="8d",
+):
+    """Repair initially invalid trajectories without overwriting Step 8B evidence."""
     from src.exp_july.perception.adaptive_motion_repair import run_adaptive_motion_repair
 
-    output_root = get_pipeline_output_root() / "08d_adaptive_protected_object_motion_repair"
+    output_root = get_pipeline_output_root() / output_subdir
     result = run_adaptive_motion_repair(relative_motion_state, output_root)
     manifest = dict(result.get("adaptive_motion_repair_manifest", {}))
     print(
-        f"[step 8d] adaptive_motion_repair "
+        f"[step {step_label}] adaptive_motion_repair "
         f"videos={int(manifest.get('num_videos', 0))} "
         f"queued={int(manifest.get('queued', 0))} "
         f"attempted={int(manifest.get('attempted', 0))} "
@@ -3992,6 +4280,100 @@ def step8d_adaptive_protected_object_motion_repair(relative_motion_state):
         f"unrepairable={int(manifest.get('unrepairable', 0))}"
     )
     return result
+
+
+# Canonical Step 8 sequence: ID repair precedes every trajectory validation.
+def step8_trajectory_repair(position_state, ego_state):
+    return step7b_tracklet_repair(
+        position_state,
+        ego_state,
+        output_subdir="08_trajectory_repair",
+        step_label="8",
+        repair_cfg={"max_gap_frames": 0},
+    )
+
+
+def step8a_relative_object_motion(position_state, repaired_state):
+    return step8_relative_object_motion(
+        position_state,
+        repaired_state,
+        output_subdir="08a_relative_object_motion",
+        step_label="8a",
+    )
+
+
+def step8b_trajectory_validation(ego_state, state):
+    return step8b_causal_filter_out(
+        ego_state,
+        state,
+        phase="repaired",
+        output_subdir="08b_trajectory_validation",
+        step_label="8b",
+    )
+
+
+def step8c_trajectory_pattern_closed_loop(state, llm_generate=None):
+    return step8e_iterative_trajectory_pattern_repair(
+        state,
+        llm_generate=llm_generate,
+        output_subdir="08c_trajectory_pattern_closed_loop",
+        step_label="8c",
+    )
+
+
+def step8d_pattern_refined_validation(ego_state, state):
+    return step8b_causal_filter_out(
+        ego_state,
+        state,
+        phase="pattern_refined",
+        output_subdir="08d_pattern_refined_trajectory_validation",
+        step_label="8d",
+    )
+
+
+def step8e_semantic_protection(state, llm_generate=None):
+    return step8a_symbol_grounded_refinement(
+        state,
+        llm_generate=llm_generate,
+        output_subdir="08e_symbol_grounded_refinement",
+        step_label="8e",
+    )
+
+
+def step8e_visual_semantic_protection(state):
+    return step8a_visual_symbol_grounded(
+        state,
+        output_subdir="08e_visual_symbol_grounded",
+        step_label="8e visual",
+    )
+
+
+def step8f_final_trajectory_validation(ego_state, state):
+    return step8b_causal_filter_out(
+        ego_state,
+        state,
+        phase="final",
+        output_subdir="08f_final_trajectory_validation",
+        step_label="8f",
+    )
+
+
+def step8g_prior_guided_ego_motion_refinement(ego_state, state):
+    return step8c_prior_guided_ego_motion_refinement(
+        ego_state,
+        state,
+        output_subdir="08g_prior_guided_ego_motion_refinement",
+        step_label="8g",
+    )
+
+
+def step8h_visual_relative_motion(state, fps=10.0):
+    return step8_visual_relative_motion(
+        state,
+        fps=fps,
+        output_subdir="08h_relative_motion_tracks",
+        step_label="8h",
+    )
 
 
 def step10_segment_object_motion(segment_state):

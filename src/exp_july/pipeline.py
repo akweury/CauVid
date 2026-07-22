@@ -11,14 +11,16 @@ from src.exp_july.perception import step2_detection
 from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
-from src.exp_july.perception import step7b_tracklet_repair
-from src.exp_july.perception import step8_relative_object_motion
-from src.exp_july.perception import step8a_symbol_grounded_refinement
-from src.exp_july.perception import step8a_visual_symbol_grounded
-from src.exp_july.perception import step8_visual_relative_motion
-from src.exp_july.perception import step8b_causal_filter_out
-from src.exp_july.perception import step8c_prior_guided_ego_motion_refinement
-from src.exp_july.perception import step8d_adaptive_protected_object_motion_repair
+from src.exp_july.perception import step8_trajectory_repair
+from src.exp_july.perception import step8a_relative_object_motion
+from src.exp_july.perception import step8b_trajectory_validation
+from src.exp_july.perception import step8c_trajectory_pattern_closed_loop
+from src.exp_july.perception import step8d_pattern_refined_validation
+from src.exp_july.perception import step8e_semantic_protection
+from src.exp_july.perception import step8e_visual_semantic_protection
+from src.exp_july.perception import step8f_final_trajectory_validation
+from src.exp_july.perception import step8g_prior_guided_ego_motion_refinement
+from src.exp_july.perception import step8h_visual_relative_motion
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -112,21 +114,25 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     ego_state = step7_ego_motion(position_state)
     if max_step <= 7:
         return ego_state
-    # Step 7B: repair broken tracklets after ego estimation.
-    repaired_state = step7b_tracklet_repair(position_state, ego_state)
-    # Step 8: compute relative object motion.
-    relative_motion_state = step8_relative_object_motion(position_state, repaired_state)
-    # Step 8A: generate grounded semantic protection rules and apply the protection prior.
-    relative_motion_state = step8a_symbol_grounded_refinement(relative_motion_state)
-    relative_motion_state = step8a_visual_symbol_grounded(relative_motion_state)
-    # Step 8B: validate trajectory motion facts and decide symbolic-layer eligibility.
-    relative_motion_state = step8b_causal_filter_out(ego_state, relative_motion_state)
-    # Step 8C: select reliable static/low-dynamic references for future ego refinement.
-    relative_motion_state = step8c_prior_guided_ego_motion_refinement(ego_state, relative_motion_state)
-    # Step 8D: diagnostically repair protected tracks rejected by 8B.
-    relative_motion_state = step8d_adaptive_protected_object_motion_repair(relative_motion_state)
-    # Step 8 visual: render per-track relative motion videos with causal filter decisions.
-    relative_motion_state = step8_visual_relative_motion(relative_motion_state)
+    # Step 8: repair trajectories first; split events receive new track IDs.
+    repaired_state = step8_trajectory_repair(position_state, ego_state)
+    # Step 8A: compute relative motion from the repaired, canonical track IDs.
+    relative_motion_state = step8a_relative_object_motion(position_state, repaired_state)
+    # Step 8B: validate trajectories once, after ID-producing repair.
+    relative_motion_state = step8b_trajectory_validation(ego_state, relative_motion_state)
+    # Step 8C: run the iterative trajectory-pattern residual and repair loop.
+    relative_motion_state = step8c_trajectory_pattern_closed_loop(relative_motion_state)
+    # Step 8D: validate accepted pattern-guided repairs.
+    relative_motion_state = step8d_pattern_refined_validation(ego_state, relative_motion_state)
+    # Step 8E: generate and visualize semantic protection.
+    relative_motion_state = step8e_semantic_protection(relative_motion_state)
+    relative_motion_state = step8e_visual_semantic_protection(relative_motion_state)
+    # Step 8F: attach semantic protection overrides to final decisions.
+    relative_motion_state = step8f_final_trajectory_validation(ego_state, relative_motion_state)
+    # Step 8G: refine ego motion from final repaired and protected evidence.
+    relative_motion_state = step8g_prior_guided_ego_motion_refinement(ego_state, relative_motion_state)
+    # Step 8H: render final per-track relative-motion videos.
+    relative_motion_state = step8h_visual_relative_motion(relative_motion_state)
     if max_step <= 8:
         return relative_motion_state
     # Step 9: segment videos into temporal chunks.

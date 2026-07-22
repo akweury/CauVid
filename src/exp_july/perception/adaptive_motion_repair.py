@@ -1,4 +1,4 @@
-"""Diagnostic Step 8D adaptive repair for semantically protected trajectories."""
+"""Restricted Step 8B identity/fragment and outlier repair before semantic analysis."""
 
 from __future__ import annotations
 
@@ -23,14 +23,27 @@ _DEPENDENCY_ORDER = (
     "speed_abnormal_change",
     "motion_direction_abrupt_change",
 )
+_ENABLED_STRATEGIES = (
+    "track_split",
+    "fragment_reassociation",
+    "outlier_removal",
+)
+_DISABLED_STRATEGIES = (
+    "gap_interpolation",
+    "kalman_smoothing",
+    "robust_polynomial_regression",
+    "bbox_stabilization",
+    "depth_reestimation",
+    "multi_frame_velocity_recomputation",
+)
 _STRATEGIES = {
     "id_switch": ("track_split", "fragment_reassociation"),
-    "trajectory_discontinuity": ("gap_interpolation", "kalman_smoothing", "robust_polynomial_regression"),
-    "track_drift": ("outlier_removal", "bbox_stabilization", "kalman_smoothing", "robust_polynomial_regression"),
-    "bbox_jump": ("bbox_stabilization", "kalman_smoothing"),
-    "depth_jump": ("depth_reestimation", "outlier_removal", "robust_polynomial_regression", "kalman_smoothing"),
-    "speed_abnormal_change": ("multi_frame_velocity_recomputation", "outlier_removal", "robust_polynomial_regression", "kalman_smoothing"),
-    "motion_direction_abrupt_change": ("multi_frame_velocity_recomputation", "kalman_smoothing", "robust_polynomial_regression"),
+    "trajectory_discontinuity": (),
+    "track_drift": ("outlier_removal",),
+    "bbox_jump": ("outlier_removal",),
+    "depth_jump": ("outlier_removal",),
+    "speed_abnormal_change": ("outlier_removal",),
+    "motion_direction_abrupt_change": ("outlier_removal",),
 }
 _DEFAULT_PARAMETERS = {
     "track_split": {"minimum_segment_length": 2},
@@ -530,7 +543,7 @@ def _repair_track(
     elif selected:
         final_decision = "Keep_with_uncertainty"
     else:
-        final_decision = "Unrepairable_but_semantically_retained"
+        final_decision = "Unrepairable"
     improvement = _f(selected.get("improvement", 0.0)) if selected else 0.0
     confidence = max(0.0, min(1.0, improvement / max(_IMPROVEMENT_MARGIN, _issue_cost(original_eval)))) if selected else 0.0
     return {
@@ -558,7 +571,125 @@ def _repair_track(
         "repair_confidence": float(confidence),
         "remaining_uncertainty": dict(final_eval.get("uncertainty", {})),
         "diagnostic_only": True,
+        "_repair_selected": selected is not None,
+        "_final_observations": final_observations,
     }
+
+
+def _observation_as_motion_object(
+    observation: Dict[str, Any],
+    template: Dict[str, Any],
+    *,
+    repaired: bool,
+) -> Dict[str, Any]:
+    row = copy.deepcopy(template)
+    bbox = list(observation.get("bbox", row.get("bbox", row.get("box", []))))
+    position = list(observation.get("position_3d", row.get("position_3d", [])))
+    motion = dict(observation.get("motion", {}))
+    provenance = dict(observation.get("provenance", {}))
+    row.update(
+        {
+            "frame_index": int(observation.get("frame_index", row.get("frame_index", -1))),
+            "frame_label": str(observation.get("frame_label", row.get("frame_label", row.get("label", "unknown")))),
+            "label": str(observation.get("frame_label", row.get("label", "unknown"))),
+            "bbox": bbox,
+            "box": bbox,
+            "position_3d": position,
+            "relative_position_3d": position,
+            "source": "repaired" if repaired else str(provenance.get("source", row.get("source", "observed"))),
+            "source_type": "step8d_adaptive_motion_repair" if repaired else str(provenance.get("source_type", row.get("source_type", ""))),
+            "is_observed": not repaired and bool(provenance.get("is_observed", row.get("is_observed", True))),
+            "is_repaired": repaired or bool(provenance.get("is_repaired", False)),
+            "step8d_repaired": repaired,
+        }
+    )
+    for key in (
+        "obj_vx",
+        "obj_vz",
+        "ego_vx",
+        "ego_vz",
+        "rel_vx",
+        "rel_vz",
+        "rel_speed",
+        "has_rel_motion",
+        "motion_state",
+        "vx_state",
+        "vz_state",
+        "speed_state",
+        "distance_meters",
+        "distance_state",
+        "x_position_state",
+    ):
+        if key in motion:
+            row[key] = motion[key]
+    if len(position) >= 3:
+        row["distance_meters"] = _f(position[2])
+    return row
+
+
+def _materialize_repaired_relative_video(
+    relative_video: Dict[str, Any],
+    track_repairs: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    repaired_video = copy.deepcopy(relative_video)
+    applicable = {
+        int(row.get("track_id", -1)): row
+        for row in track_repairs
+        if bool(row.get("_repair_selected", False))
+    }
+    if not applicable:
+        repaired_video["step8d_modified_track_ids"] = []
+        return repaired_video
+
+    templates = {}
+    for frame in repaired_video.get("frames", []):
+        for obj in frame.get("objects", []):
+            track_id = int(obj.get("track_id", -1))
+            if track_id in applicable and track_id not in templates:
+                templates[track_id] = copy.deepcopy(obj)
+
+    observations_by_track = {
+        track_id: {
+            int(obs.get("frame_index", -1)): obs
+            for obs in repair.get("_final_observations", [])
+        }
+        for track_id, repair in applicable.items()
+    }
+    modified_by_track = {
+        track_id: set(int(value) for value in repair.get("modified_frame_ids", []))
+        for track_id, repair in applicable.items()
+    }
+    for frame_index, frame in enumerate(repaired_video.get("frames", [])):
+        frame_id = int(frame.get("frame_index", frame_index))
+        objects = list(frame.get("objects", []))
+        object_index_by_track = {
+            int(obj.get("track_id", -1)): index
+            for index, obj in enumerate(objects)
+        }
+        for track_id, observations in observations_by_track.items():
+            observation = observations.get(frame_id)
+            if observation is None:
+                continue
+            existing_index = object_index_by_track.get(track_id)
+            template = (
+                objects[existing_index]
+                if existing_index is not None
+                else templates.get(track_id, {"track_id": track_id})
+            )
+            updated = _observation_as_motion_object(
+                observation,
+                template,
+                repaired=frame_id in modified_by_track.get(track_id, set()),
+            )
+            updated["track_id"] = track_id
+            if existing_index is None:
+                objects.append(updated)
+            else:
+                objects[existing_index] = updated
+        frame["objects"] = objects
+    repaired_video["step8d_modified_track_ids"] = sorted(applicable)
+    repaired_video["step8d_repair_applied"] = True
+    return repaired_video
 
 
 def run_adaptive_motion_repair(
@@ -568,9 +699,18 @@ def run_adaptive_motion_repair(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     evidence_videos = list(relative_motion_state.get("trajectory_motion_evidence", []))
+    ego_sources = (
+        relative_motion_state.get("refined_ego_motion", [])
+        or relative_motion_state.get("ego_motion", [])
+    )
     refined_by_video = {
         str(row.get("video_id", "")): row
-        for row in relative_motion_state.get("refined_ego_motion", [])
+        for row in ego_sources
+    }
+    relative_videos = list(relative_motion_state.get("relative_object_motion", []))
+    relative_by_video = {
+        str(row.get("video_id", "")): row
+        for row in relative_videos
     }
     calibration = _calibrate(evidence_videos, refined_by_video)
     with (output_root / "repair_strategy_calibration.json").open("w", encoding="utf-8") as file:
@@ -582,24 +722,37 @@ def run_adaptive_motion_repair(
         queued = []
         for trajectory in evidence_video.get("trajectory_motion_evidence", []):
             fact = dict(trajectory.get("fact_decision", {}))
-            original_decision = str(fact.get("original_decision_before_protection", trajectory.get("fact_decision_status", "")))
-            if bool(trajectory.get("symbol_grounded_protected", False)) and original_decision == "Discard":
+            original_decision = str(
+                fact.get(
+                    "original_decision_before_protection",
+                    trajectory.get("fact_decision_status", ""),
+                )
+            )
+            if original_decision == "Discard":
                 queued.append(trajectory)
-        tracks = [
+        track_repairs = [
             _repair_track(trajectory, refined_by_video.get(video_id, {}), calibration)
             for trajectory in queued
+        ]
+        tracks = [
+            {key: value for key, value in row.items() if not key.startswith("_")}
+            for row in track_repairs
         ]
         result = {
             "version": _VERSION,
             "video_id": video_id,
             "status": "diagnostic_completed",
+            "repair_profile": "identity_fragment_and_outlier_only",
+            "enabled_strategies": list(_ENABLED_STRATEGIES),
+            "disabled_strategies": list(_DISABLED_STRATEGIES),
             "diagnostic_only": True,
             "source_step8b_preserved": True,
+            "applied_to_downstream_relative_motion": True,
             "num_queued": len(queued),
             "num_attempted": sum(len(row.get("attempted_strategies", [])) for row in tracks),
             "num_repaired": sum(row.get("final_decision") == "Repair" for row in tracks),
             "num_uncertain": sum(row.get("final_decision") == "Keep_with_uncertainty" for row in tracks),
-            "num_unrepairable": sum(row.get("final_decision") == "Unrepairable_but_semantically_retained" for row in tracks),
+            "num_unrepairable": sum(row.get("final_decision") == "Unrepairable" for row in tracks),
             "tracks": tracks,
         }
         video_dir = output_root / video_id
@@ -608,10 +761,23 @@ def run_adaptive_motion_repair(
             json.dump(result, file, indent=2)
         video_results.append(result)
         all_tracks.extend({"video_id": video_id, **row} for row in tracks)
+        source_relative_video = relative_by_video.get(video_id, {})
+        result["_materialized_relative_video"] = _materialize_repaired_relative_video(
+            source_relative_video,
+            track_repairs,
+        )
+    repaired_relative_motion = [
+        row.pop("_materialized_relative_video")
+        for row in video_results
+    ]
     manifest = {
         "version": _VERSION,
-        "method": "adaptive_protected_object_motion_repair",
+        "method": "adaptive_invalid_trajectory_motion_repair",
+        "repair_profile": "identity_fragment_and_outlier_only",
+        "enabled_strategies": list(_ENABLED_STRATEGIES),
+        "disabled_strategies": list(_DISABLED_STRATEGIES),
         "diagnostic_only": True,
+        "applied_to_downstream_relative_motion": True,
         "num_videos": len(video_results),
         "queued": sum(row["num_queued"] for row in video_results),
         "attempted": sum(row["num_attempted"] for row in video_results),
@@ -625,6 +791,9 @@ def run_adaptive_motion_repair(
         json.dump(manifest, file, indent=2)
     return {
         **relative_motion_state,
+        "pre_repair_relative_object_motion": relative_videos,
+        "relative_object_motion": repaired_relative_motion,
+        "filtered_relative_object_motion": repaired_relative_motion,
         "adaptive_motion_repair": video_results,
         "adaptive_motion_repair_tracks": all_tracks,
         "adaptive_motion_repair_calibration": calibration,

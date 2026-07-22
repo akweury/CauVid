@@ -10,6 +10,17 @@ from src.exp_july.perception.pipeline import step8a_visual_symbol_grounded
 from src.exp_july.perception.pipeline import step8_visual_relative_motion
 from src.exp_july.perception.pipeline import step8b_causal_filter_out
 from src.exp_july.perception.pipeline import step8c_prior_guided_ego_motion_refinement
+from src.exp_july.perception.pipeline import step8e_iterative_trajectory_pattern_repair
 from src.exp_july.perception.pipeline import step8d_adaptive_protected_object_motion_repair
 from src.exp_july.perception.pipeline import step9_temporal_segmentation
 from src.exp_july.perception.pipeline import step10_segment_object_motion
+from src.exp_july.perception.pipeline import step8_trajectory_repair
+from src.exp_july.perception.pipeline import step8a_relative_object_motion
+from src.exp_july.perception.pipeline import step8b_trajectory_validation
+from src.exp_july.perception.pipeline import step8c_trajectory_pattern_closed_loop
+from src.exp_july.perception.pipeline import step8d_pattern_refined_validation
+from src.exp_july.perception.pipeline import step8e_semantic_protection
+from src.exp_july.perception.pipeline import step8e_visual_semantic_protection
+from src.exp_july.perception.pipeline import step8f_final_trajectory_validation
+from src.exp_july.perception.pipeline import step8g_prior_guided_ego_motion_refinement
+from src.exp_july.perception.pipeline import step8h_visual_relative_motion

@@ -82,10 +82,39 @@ def _trajectory(track_id, observations, protected=False):
     }
 
 
+def _relative_video(track_id, observations):
+    frames = []
+    for observation in observations:
+        motion = dict(observation.get("motion", {}))
+        frames.append(
+            {
+                "frame_index": int(observation["frame_index"]),
+                "image_path": "",
+                "objects": [
+                    {
+                        "track_id": track_id,
+                        "frame_label": observation["frame_label"],
+                        "label": observation["frame_label"],
+                        "bbox": list(observation["bbox"]),
+                        "box": list(observation["bbox"]),
+                        "position_3d": list(observation["position_3d"]),
+                        "relative_position_3d": list(observation["position_3d"]),
+                        "score": 0.95,
+                        "source": "observed",
+                        "is_observed": True,
+                        "is_repaired": False,
+                        **motion,
+                    }
+                ],
+            }
+        )
+    return {"video_id": "demo", "num_frames": 8, "frames": frames}
+
+
 class Step8DAdaptiveMotionRepairTests(unittest.TestCase):
     def test_diagnostic_repair_preserves_step8b_and_writes_comparison(self):
         reliable = _trajectory(1, _observations(False))
-        invalid = _trajectory(2, _observations(True), protected=True)
+        invalid = _trajectory(2, _observations(True), protected=False)
         self.assertIn(
             "depth_jump",
             invalid["causal_motion_fact_validation"]["rejection_reasons"],
@@ -99,7 +128,8 @@ class Step8DAdaptiveMotionRepairTests(unittest.TestCase):
                     "trajectory_motion_evidence": [reliable, invalid],
                 }
             ],
-            "refined_ego_motion": [{"video_id": "demo", "frames": []}],
+            "relative_object_motion": [_relative_video(2, invalid["trajectory_observations"])],
+            "ego_motion": [{"video_id": "demo", "frames": []}],
         }
         original = json.dumps(state["trajectory_motion_evidence"], sort_keys=True)
         with tempfile.TemporaryDirectory() as tmp:
@@ -116,9 +146,39 @@ class Step8DAdaptiveMotionRepairTests(unittest.TestCase):
         track = report["tracks"][0]
         self.assertEqual(track["original_decision"], "Discard")
         self.assertTrue(track["attempted_strategies"])
+        attempted = {
+            stage["strategy"]
+            for candidate in track["attempted_strategies"]
+            for stage in candidate["strategies"]
+        }
+        self.assertTrue(
+            attempted.issubset(
+                {"track_split", "fragment_reassociation", "outlier_removal"}
+            )
+        )
+        self.assertEqual(
+            report["repair_profile"],
+            "identity_fragment_and_outlier_only",
+        )
+        self.assertEqual(
+            set(report["enabled_strategies"]),
+            {"track_split", "fragment_reassociation", "outlier_removal"},
+        )
         self.assertIn("before_signals", track)
         self.assertIn("after_signals", track)
         self.assertTrue(track["diagnostic_only"])
+        self.assertEqual(track["final_decision"], "Repair")
+        self.assertEqual(
+            result["relative_object_motion"][0]["step8d_modified_track_ids"],
+            [2],
+        )
+        before_depth = state["relative_object_motion"][0]["frames"][4]["objects"][0]["position_3d"][2]
+        after_depth = result["relative_object_motion"][0]["frames"][4]["objects"][0]["position_3d"][2]
+        self.assertNotEqual(before_depth, after_depth)
+        self.assertEqual(
+            result["pre_repair_relative_object_motion"],
+            state["relative_object_motion"],
+        )
 
 
 if __name__ == "__main__":

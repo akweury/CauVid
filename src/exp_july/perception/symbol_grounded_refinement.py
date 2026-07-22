@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -605,11 +606,16 @@ def run_symbol_grounded_refinement(
         raw: Dict[str, Any] = {}
         try:
             raw = generator(_prompt(video_id, tracks))
+            if not isinstance(raw.get("rules"), list) or not raw.get("rules"):
+                raise ValueError("LLM returned no semantic protection rules")
             validated = validate_response(raw, tracks)
         except Exception as exc:
-            status = "llm_unavailable" if "not configured" in str(exc) else "llm_error"
-            error = str(exc)
-            validated = {"rules": [], "rejected_rules": []}
+            message = (
+                f"[step 8a][error] LLM rule generation failed "
+                f"video_id={video_id}: {type(exc).__name__}: {exc}"
+            )
+            print(message, file=sys.stderr, flush=True)
+            raise RuntimeError(message) from exc
         important, protected, uncovered = _execute_rules(validated, tracks)
         protection_annotated_relative_motion.append(
             _annotate_protection_prior(relative_video, protected)
@@ -782,7 +788,16 @@ def _render_track_grounding_image(
 
     accepted_rules = list(video_result.get("semantic_protection_rules", []))
     rejected_rules = list(video_result.get("rejected_rules", []))
-    panel_h = max(440, 275 + len(accepted_rules) * 155 + len(rejected_rules) * 92)
+    accepted_atom_rows = sum(max(1, len(rule.get("conditions", []))) for rule in accepted_rules)
+    rejected_atom_rows = sum(max(1, len(rule.get("conditions", []))) for rule in rejected_rules)
+    panel_h = max(
+        480,
+        310
+        + len(accepted_rules) * 155
+        + accepted_atom_rows * 82
+        + len(rejected_rules) * 125
+        + rejected_atom_rows * 82,
+    )
     panel = np.full((panel_h, frame_w, 3), (24, 24, 24), dtype=np.uint8)
     font = cv2.FONT_HERSHEY_SIMPLEX
     margin = 22
@@ -830,25 +845,44 @@ def _render_track_grounding_image(
     if not accepted_rules:
         cv2.putText(panel, "none", (right_x, result_y), font, 0.50, (150, 150, 150), 1, cv2.LINE_AA)
         result_y += 34
+    track_features = dict(track.get("features", {}))
+    atom_valid_color = (70, 230, 70)
+    atom_invalid_color = (60, 80, 240)
     for rule in accepted_rules:
         rule_id = str(rule.get("rule_id", ""))
         active = rule_id in matched_ids
         activation = "ACTIVE" if active else "INACTIVE"
-        rule_color = (70, 230, 70) if active else (145, 145, 145)
-        summary = f"[{activation}] {_rule_summary(rule)}"
-        rule_thickness = 3 if active else 2
-        for line in _wrap_visual_text(cv2, summary, right_w, 0.70, rule_thickness):
-            cv2.putText(
-                panel,
-                line,
-                (right_x, result_y),
-                font,
-                0.70,
-                rule_color,
-                rule_thickness,
-                cv2.LINE_AA,
+        rule_color = atom_valid_color if active else (190, 190, 190)
+        header = f"[{activation}] {rule_id} -> protected_object"
+        cv2.putText(
+            panel,
+            header,
+            (right_x, result_y),
+            font,
+            0.70,
+            rule_color,
+            3 if active else 2,
+            cv2.LINE_AA,
+        )
+        result_y += 40
+        for atom_index, condition in enumerate(rule.get("conditions", []), start=1):
+            predicate = str(condition.get("predicate", ""))
+            value = str(condition.get("value", ""))
+            atom_grounded = any(
+                _atom_supports_condition(atom, condition)
+                for atom in rule.get("supporting_atoms", [])
             )
-            result_y += 38
+            atom_matches = (
+                predicate in _ALLOWED_PREDICATES
+                and atom_grounded
+                and track_features.get(predicate) == value
+            )
+            atom_color = atom_valid_color if atom_matches else atom_invalid_color
+            atom_status = "VALID / MATCH" if atom_matches else "INVALID / NO MATCH"
+            atom_text = f"  atom {atom_index}: {predicate}={value} [{atom_status}]"
+            for line in _wrap_visual_text(cv2, atom_text, right_w - 12, 0.58, 2):
+                cv2.putText(panel, line, (right_x + 12, result_y), font, 0.58, atom_color, 2, cv2.LINE_AA)
+                result_y += 33
         justification = f"why: {str(rule.get('justification', ''))[:140]}"
         for line in _wrap_visual_text(cv2, justification, right_w, 0.43, 1)[:2]:
             cv2.putText(panel, line, (right_x, result_y), font, 0.43, rule_color, 1, cv2.LINE_AA)
@@ -861,9 +895,9 @@ def _render_track_grounding_image(
                 )
             )
             for line in _wrap_visual_text(cv2, f"failure: {failure}", right_w, 0.42, 1)[:2]:
-                cv2.putText(panel, line, (right_x, result_y), font, 0.42, (120, 120, 220), 1, cv2.LINE_AA)
+                cv2.putText(panel, line, (right_x, result_y), font, 0.42, atom_invalid_color, 1, cv2.LINE_AA)
                 result_y += 24
-        result_y += 10
+        result_y += 12
 
     if rejected_rules:
         result_y += 4
@@ -882,14 +916,45 @@ def _render_track_grounding_image(
             reasons = ", ".join(rule.get("rejection_reasons", [])) or str(
                 rule.get("rejection_reason", "validation_failed")
             )
-            summary = f"[REJECTED] {_rule_summary(rule)}"
-            for line in _wrap_visual_text(cv2, summary, right_w, 0.65, 2)[:2]:
-                cv2.putText(panel, line, (right_x, result_y), font, 0.65, (105, 125, 235), 2, cv2.LINE_AA)
-                result_y += 36
-            for line in _wrap_visual_text(cv2, f"reason: {reasons}", right_w, 0.42, 1)[:2]:
-                cv2.putText(panel, line, (right_x, result_y), font, 0.42, (105, 125, 235), 1, cv2.LINE_AA)
-                result_y += 24
-            result_y += 8
+            rule_id = str(rule.get("rule_id", ""))
+            cv2.putText(
+                panel,
+                f"[REJECTED] {rule_id} -> protected_object",
+                (right_x, result_y),
+                font,
+                0.65,
+                atom_invalid_color,
+                2,
+                cv2.LINE_AA,
+            )
+            result_y += 38
+            conditions = list(rule.get("conditions", []))
+            if not conditions:
+                cv2.putText(
+                    panel,
+                    "  atom list invalid or empty [INVALID]",
+                    (right_x + 12, result_y),
+                    font,
+                    0.55,
+                    atom_invalid_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+                result_y += 33
+            for atom_index, condition in enumerate(conditions, start=1):
+                predicate = str(condition.get("predicate", ""))
+                value = str(condition.get("value", ""))
+                atom_matches = predicate in _ALLOWED_PREDICATES and track_features.get(predicate) == value
+                atom_color = atom_valid_color if atom_matches else atom_invalid_color
+                atom_status = "VALID / MATCH" if atom_matches else "INVALID / NO MATCH"
+                atom_text = f"  atom {atom_index}: {predicate}={value} [{atom_status}]"
+                for line in _wrap_visual_text(cv2, atom_text, right_w - 12, 0.58, 2):
+                    cv2.putText(panel, line, (right_x + 12, result_y), font, 0.58, atom_color, 2, cv2.LINE_AA)
+                    result_y += 33
+            for line in _wrap_visual_text(cv2, f"rule rejection: {reasons}", right_w, 0.45, 1)[:3]:
+                cv2.putText(panel, line, (right_x, result_y), font, 0.45, atom_invalid_color, 1, cv2.LINE_AA)
+                result_y += 25
+            result_y += 10
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     combined = cv2.vconcat([image, panel])

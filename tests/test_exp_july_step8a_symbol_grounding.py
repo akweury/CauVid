@@ -58,6 +58,30 @@ def _video():
 
 
 class Step8ASymbolGroundingTests(unittest.TestCase):
+    def test_llm_failure_prints_error_and_stops_pipeline(self):
+        import contextlib
+        import io
+
+        def unavailable(_prompt):
+            raise ConnectionError("remote LLM endpoint refused connection")
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, "LLM rule generation failed"):
+                    run_symbol_grounded_refinement(
+                        {"videos": [], "relative_object_motion": [_video()]},
+                        Path(tmp),
+                        llm_generate=unavailable,
+                    )
+            self.assertFalse(
+                (Path(tmp) / "demo" / "symbol_grounded_refinement.json").exists()
+            )
+        output = stderr.getvalue()
+        self.assertIn("[step 8a][error]", output)
+        self.assertIn("video_id=demo", output)
+        self.assertIn("refused connection", output)
+
     def test_valid_grounded_rule_executes(self):
         video = _video()
         tracks = build_grounded_tracks(video)
