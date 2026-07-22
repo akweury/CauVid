@@ -63,6 +63,7 @@ run_container() {
   [[ -n "${CAUVID_STEP8C_LLM_TIMEOUT_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_TIMEOUT_SECONDS)
   [[ -n "${CAUVID_STEP8C_LLM_MAX_ATTEMPTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_MAX_ATTEMPTS)
   [[ -n "${CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS)
+  [[ -n "${CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS)
 
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")

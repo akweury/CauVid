@@ -13,7 +13,7 @@ from src.exp_july.perception.adaptive_motion_repair import (
     _modified_frames, _recompute_motion, _snapshot,
 )
 
-VERSION = 2
+VERSION = 3
 PATTERNS = ("stationary","same_direction","opposite_direction","approaching","receding",
             "crossing","turning","lane_entry","overtaking","unknown")
 RESIDUALS = ("position","direction","speed","acceleration","path_intersection","ttc",
@@ -478,10 +478,12 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     root=Path(output_root);root.mkdir(parents=True,exist_ok=True); audit=root/"llm_audit";statsroot=root/"statistics"
     current=json.loads((statsroot/"current_table.json").read_text()) if (statsroot/"current_table.json").exists() else {}
     tracks=symbolic_tracks(state.get("trajectory_motion_evidence",[]))
-    patterns=validate_patterns(llm_call("pattern_enumeration",pattern_prompt(tracks,current),audit,llm_generate))
+    patterns=validate_patterns({})
     ego={str(x.get("video_id","")):ego_frames(x) for x in state.get("ego_motion",[])}
-    from src.exp_july.perception.trajectory_pattern_llm_batch import (
-        compact_track, evaluate_batch_sizes, process_tracks,
+    from src.exp_july.perception.trajectory_pattern_llm_batch import compact_track
+    from src.exp_july.perception.trajectory_pattern_epoch import (
+        begin_epoch, compile_patch, deterministic_interpretation, evaluate_and_stage,
+        fixed_video_split, review_package, review_prompt as epoch_review_prompt,
     )
     from src.exp_july.perception.trajectory_pattern_runtime_monitor import (
         Step8CRuntimeMonitor,
@@ -491,32 +493,23 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         candidates=[{"pattern_id":p["pattern_id"],"pattern_definition":p,
                      "residual_vector":residual(p["pattern_id"],track)} for p in patterns]
         track_items.append({"track":track,"candidates":candidates})
-    invoke=lambda kind,prompt:llm_call(kind,prompt,audit,llm_generate)
-    evaluation_path=root/"batch_evaluation.json"
-    configured_batch_size=max(1,int(os.environ.get("CAUVID_STEP8C_LLM_BATCH_SIZE","10")))
-    batch_evaluation={}
-    if evaluation_path.exists():
-        try:
-            batch_evaluation=json.loads(evaluation_path.read_text())
-            configured_batch_size=int(batch_evaluation.get("chosen_batch_size",configured_batch_size))
-        except (OSError,json.JSONDecodeError,TypeError,ValueError):batch_evaluation={}
-    if os.environ.get("CAUVID_STEP8C_BATCH_EVALUATION","0").strip().lower() in {"1","true","yes"}:
-        batch_evaluation=evaluate_batch_sizes(track_items,invoke,evaluation_path)
-        configured_batch_size=int(batch_evaluation["chosen_batch_size"])
+    policy_root=root/"policies"
+    epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
+    review_interval=max(1,int(os.environ.get("CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS","500")))
     runtime_monitor=Step8CRuntimeMonitor(
         root/"runtime_monitor",len(track_items),
         rolling_window=max(5,int(os.environ.get("CAUVID_STEP8C_MONITOR_WINDOW","50"))),
     )
-    try:
-        interpretations,llm_telemetry,compact_inputs=process_tracks(
-            track_items,root/"llm_signature_cache",invoke,configured_batch_size,
-            event_callback=runtime_monitor.handle_batch_event,
-        )
-    except Exception as exc:
-        runtime_monitor.abort(exc)
-        raise
+    interpretations={};llm_telemetry={};compact_inputs={}
     for item in track_items:
         uid=compact_track(item["track"],item["candidates"])["track_uid"]
+        compact_inputs[uid]=compact_track(item["track"],item["candidates"])
+        interpretations[uid]=deterministic_interpretation(item["candidates"],frozen_policy)
+        llm_telemetry[uid]={"track_uid":uid,"needs_llm_review":False,"gate_reasons":[],
+          "llm_called":False,"llm_skipped":True,"cache_hit":False,"heuristic_fallback":False,
+          "timeout_occurred":False,"llm_backend":"frozen_epoch_policy","llm_model":f"policy_v{frozen_policy['version']}",
+          "batch_size":0,"retry_count":0,"escalated_to_single":False,"latency":0.0,
+          "estimated_token_cost":0.0,"validation_outcome":"deterministic_epoch_policy"}
         runtime_monitor.interpretation_complete(llm_telemetry[uid],compact_inputs[uid])
     records=[];material=defaultdict(list)
     for track_index,item in enumerate(track_items,1):
@@ -556,7 +549,8 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
                                       "persistence":len(finalobs)/max(1,len(track["observations"]))},
           "record_status":"completed_validated" if selected else "completed_unresolved",
           "final_selection_reason":reason,"provenance":{"source_step":state.get("trajectory_motion_evidence_phase","repaired"),
-          "llm_role":"interpretation_only","numeric_repair_role":"deterministic_executor","original_observations_preserved":True}}
+          "llm_role":"interval_policy_review_only","numeric_repair_role":"deterministic_executor",
+          "epoch_id":epoch_id,"frozen_policy_version":frozen_policy["version"],"original_observations_preserved":True}}
         records.append(rec);material[track["video_id"]].append({"track_id":track["track_id"],
           "_repair_selected":applied,"_final_observations":finalobs,
           "modified_frame_ids":selected.get("modified_frame_ids",[]) if selected else []})
@@ -566,7 +560,10 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     original=list(state.get("relative_object_motion",[]))
     refined=[_materialize_repaired_relative_video(v,material[str(v.get("video_id",""))]) for v in original]
     version=int(current.get("version",0))+1
-    update_records,validation_records,update_video_ids,validation_video_ids=partition_records(records)
+    update_video_ids,validation_video_ids=fixed_video_split([row["video_id"] for row in records])
+    update_set=set(update_video_ids);validation_set=set(validation_video_ids)
+    update_records=[row for row in records if row["video_id"] in update_set]
+    validation_records=[row for row in records if row["video_id"] in validation_set]
     completed_update=[row for row in update_records if row.get("record_status")=="completed_validated"]
     candidate_rows=stat_rows(dataset,completed_update,version)
     validation_evaluated=evaluate_candidate_table(validation_records,candidate_rows)
@@ -576,29 +573,61 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
                "update_video_ids":update_video_ids,"validation_video_ids":validation_video_ids,
                "num_completed_validated_update_records":len(completed_update),
                "num_independent_validation_records":len(validation_evaluated)}
-    review=llm_call("statistics_review",review_prompt(current,candidate,metrics),audit,llm_generate)
-    promotion=promote(statsroot,candidate,review,metrics)
+    statsroot.mkdir(parents=True,exist_ok=True)
+    (statsroot/f"candidate_table_v{version:04d}.json").write_text(json.dumps(candidate,indent=2))
+    review_root=root/"epoch_reviews";review_root.mkdir(parents=True,exist_ok=True)
+    reviews=[];promotion_decisions=[]
+    for offset in range(0,len(update_records),review_interval):
+        interval_index=offset//review_interval+1;interval_records=update_records[offset:offset+review_interval]
+        package=review_package(interval_records,epoch_id,interval_index,frozen_policy,validation_video_ids)
+        package_path=review_root/f"epoch_{epoch_id:04d}_interval_{interval_index:04d}_package.json"
+        package_path.write_text(json.dumps(package,indent=2))
+        response=llm_call("policy_interval_review",epoch_review_prompt(package),audit,llm_generate)
+        review_row={"interval_index":interval_index,"package":package,"response":response}
+        try:
+            candidate_policy=compile_patch(frozen_policy,response)
+            candidate_policy["version"]=int(frozen_policy["version"])+interval_index
+            decision=evaluate_and_stage(policy_root,frozen_policy,candidate_policy,validation_records,response)
+        except (TypeError,ValueError,KeyError) as exc:
+            decision={"promoted":False,"decision":"reject","reason":"patch_compilation_failed","error":str(exc),
+                      "active_policy_version":frozen_policy["version"],"activation_epoch":None}
+        review_row["promotion"]=decision;reviews.append(review_row);promotion_decisions.append(decision)
+        (review_root/f"epoch_{epoch_id:04d}_interval_{interval_index:04d}_review.json").write_text(json.dumps(review_row,indent=2))
+    promotion={"promoted":any(row.get("promoted") for row in promotion_decisions),
+      "decision":"stage_for_next_epoch" if any(row.get("promoted") for row in promotion_decisions) else "rollback",
+      "reason":next((row.get("reason") for row in reversed(promotion_decisions) if row.get("promoted")),
+                    promotion_decisions[-1].get("reason") if promotion_decisions else "no_update_records"),
+      "epoch_id":epoch_id,"active_policy_version":frozen_policy["version"],
+      "activation_epoch":"next_epoch" if any(row.get("promoted") for row in promotion_decisions) else None,
+      "interval_decisions":promotion_decisions,"update_video_ids":update_video_ids,"validation_video_ids":validation_video_ids,
+      "independent_split":bool(update_video_ids and validation_video_ids and not set(update_video_ids)&set(validation_video_ids))}
+    epoch_snapshot.update({"status":"completed","review_interval_tracks":review_interval,
+      "review_count":len(reviews),"promotion":promotion})
+    (policy_root/f"epoch_{epoch_id:04d}.json").write_text(json.dumps(epoch_snapshot,indent=2))
     runtime_state=runtime_monitor.finalize()
-    manifest={"version":VERSION,"method":"iterative_trajectory_pattern_residual_repair",
-      "execution_flow":["symbolic_abstraction","pattern_enumeration","residual_computation",
-      "llm_residual_interpretation","multi_hypothesis_repair","symbolic_validation",
-      "statistical_aggregation","llm_review","re_evaluation","accept_or_rollback"],
+    manifest={"version":VERSION,"method":"deterministic_epoch_trajectory_pattern_repair",
+      "execution_flow":["epoch_boundary_activation","freeze_versioned_policy","symbolic_abstraction",
+      "deterministic_policy_interpretation","multi_hypothesis_repair","symbolic_validation",
+      "interval_statistical_aggregation","single_llm_policy_patch_review","compile_candidate_policy",
+      "fixed_split_validation","stage_for_next_epoch_or_reject"],
       "num_videos":len({x["video_id"] for x in records}),"num_tracks":len(records),
       "num_patterns":len(patterns),"num_candidates":sum(len(x["candidate_repairs"]) for x in records),
       "num_repairs_applied":sum(x["repair_applied"] for x in records),
       "statistics_version":version,"statistics_update_video_ids":update_video_ids,
       "statistics_validation_video_ids":validation_video_ids,"promotion":promotion,"patterns":patterns,
-      "llm_batch_size":configured_batch_size,"llm_called":sum(row["llm_called"] for row in llm_telemetry.values()),
+      "epoch_id":epoch_id,"frozen_policy_version":frozen_policy["version"],"policy_frozen":True,
+      "review_interval_tracks":review_interval,"interval_review_count":len(reviews),
+      "llm_batch_size":0,"llm_called":len(reviews),
       "llm_skipped":sum(row["llm_skipped"] for row in llm_telemetry.values()),
       "llm_cache_hits":sum(row["cache_hit"] for row in llm_telemetry.values()),
-      "llm_escalated_to_single":sum(row["escalated_to_single"] for row in llm_telemetry.values()),
-      "batch_evaluation":batch_evaluation,"runtime_monitor":runtime_state}
+      "llm_escalated_to_single":0,"batch_evaluation":{},"runtime_monitor":runtime_state}
     (root/"trajectory_pattern_manifest.json").write_text(json.dumps(manifest,indent=2))
     (root/"symbolic_tracks.json").write_text(json.dumps([{k:v for k,v in x.items() if k!="observations"} for x in tracks],indent=2))
     result={**state,"pre_pattern_relative_object_motion":original,"relative_object_motion":refined,
       "filtered_relative_object_motion":refined,"trajectory_pattern_records":records,
       "trajectory_pattern_definitions":patterns,"trajectory_pattern_statistics_candidate":candidate,
-      "trajectory_pattern_statistics_review":review,"trajectory_pattern_statistics_promotion":promotion,
+      "trajectory_pattern_statistics_review":reviews,"trajectory_pattern_statistics_promotion":promotion,
+      "trajectory_pattern_epoch_policy":frozen_policy,"trajectory_pattern_epoch_reviews":reviews,
       "trajectory_pattern_manifest":manifest,"trajectory_pattern_output_root":root,
       "trajectory_pattern_runtime_monitor":runtime_state,
       "trajectory_pattern_runtime_dashboard_path":runtime_state["runtime_dashboard_path"],

@@ -46,6 +46,18 @@ export OPENAI_API_KEY="..."
 For a compatible non-default endpoint, also set `OPENAI_BASE_URL` and either
 `OPENAI_MODEL` or `CAUVID_STEP8_PATTERN_LLM_MODEL`.
 
+Step 8C processes each epoch deterministically with a frozen versioned policy.
+It aggregates track outcomes and requests one candidate policy patch per review
+interval (500 tracks by default). Configure the interval on the host with:
+
+```bash
+export CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS=500
+```
+
+Candidate patches are compiled and compared with the active policy on a stable,
+video-disjoint validation split. A successful candidate is staged as pending;
+it is activated only when the next Step 8C epoch starts.
+
 Example:
 ```bash
 ./d2.sh --gpu 1 --step 2 --data 20

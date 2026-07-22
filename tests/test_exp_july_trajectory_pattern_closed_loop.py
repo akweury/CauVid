@@ -10,6 +10,7 @@ from src.exp_july.perception.trajectory_pattern_closed_loop import (
     RESIDUALS,
     run_trajectory_pattern_closed_loop,
 )
+from src.exp_july.perception.trajectory_pattern_epoch import begin_epoch, default_policy
 
 
 def observations():
@@ -82,6 +83,16 @@ def state():
 
 
 def llm(kind, _prompt):
+    if kind == "policy_interval_review":
+        return {
+            "policy_patch": {
+                "residual_weights": {"depth_consistency": 1.1},
+                "pattern_biases": {},
+                "repair_preferences": {"approaching": ["motion_recomputation"]},
+            },
+            "rationale": "aggregated interval evidence supports a small candidate change",
+            "critical_regressions": [],
+        }
     if kind in {"batch_stage1", "stage1_individual"}:
         inputs = json.loads(_prompt.split("inputs=", 1)[1])
         return {"results": [
@@ -153,6 +164,24 @@ def llm(kind, _prompt):
 
 
 class TrajectoryPatternClosedLoopTests(unittest.TestCase):
+    def test_pending_policy_activates_only_at_the_next_epoch_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            epoch_id, frozen, _ = begin_epoch(root)
+            self.assertEqual(epoch_id, 1)
+            self.assertEqual(frozen["version"], 1)
+            pending = default_policy()
+            pending.update({"version": 2, "parent_version": 1, "status": "pending"})
+            pending["residual_weights"]["depth_consistency"] = 1.2
+            (root / "pending_policy.json").write_text(json.dumps(pending), encoding="utf-8")
+            # Epoch 1 remains frozen even after a candidate has been staged.
+            self.assertEqual(frozen["residual_weights"]["depth_consistency"], 1.0)
+            epoch_id, next_frozen, snapshot = begin_epoch(root)
+            self.assertEqual(epoch_id, 2)
+            self.assertTrue(snapshot["activated_pending_policy"])
+            self.assertEqual(next_frozen["version"], 2)
+            self.assertEqual(next_frozen["residual_weights"]["depth_consistency"], 1.2)
+
     def test_all_patterns_residuals_audit_statistics_and_original_branch_are_saved(self):
         source = state()
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,12 +198,12 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
                 result["trajectory_pattern_statistics_promotion"]["reason"],
                 "independent_validation_split_unavailable",
             )
-            self.assertTrue(list((root / "llm_audit" / "pattern_enumeration").glob("*.json")))
-            self.assertTrue(
-                list((root / "llm_audit" / "batch_stage1").glob("*.json"))
-                or result["trajectory_pattern_records"][0]["llm_processing"]["llm_skipped"]
-            )
-            self.assertTrue(list((root / "llm_audit" / "statistics_review").glob("*.json")))
+            self.assertTrue(list((root / "llm_audit" / "policy_interval_review").glob("*.json")))
+            self.assertEqual(result["trajectory_pattern_manifest"]["interval_review_count"], 1)
+            self.assertTrue(result["trajectory_pattern_manifest"]["policy_frozen"])
+            self.assertTrue((root / "policies" / "active_policy.json").exists())
+            self.assertTrue((root / "policies" / "epoch_0001.json").exists())
+            self.assertTrue(list((root / "epoch_reviews").glob("*_package.json")))
             self.assertTrue(
                 (root / "visualizations" / "demo" / "track_0007_pattern_process.png").exists()
             )
@@ -221,6 +250,8 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
         self.assertIn("mandatory_unknown_baseline", sources)
         self.assertIn("minimum_residual_baseline", sources)
         self.assertIn("LLM_preferred_pattern", record)
+        self.assertEqual(record["provenance"]["frozen_policy_version"], 1)
+        self.assertEqual(record["provenance"]["epoch_id"], 1)
         self.assertIn("validated_pattern", record)
         self.assertIn(record["final_selection_reason"], {
             "highest_ranked_after_hard_constraints",
