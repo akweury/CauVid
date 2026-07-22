@@ -52,6 +52,17 @@ run_container() {
   local rounds="${2:-3}"
   local max_step="${3:-18}"
   local model_mounts=()
+  local llm_env_args=()
+
+  # Forward LLM configuration from the host. Using `-e NAME` keeps secrets out
+  # of this script and lets Docker read the value from the current environment.
+  [[ -n "${OPENAI_API_KEY:-}" ]] && llm_env_args+=(-e OPENAI_API_KEY)
+  [[ -n "${OPENAI_BASE_URL:-}" ]] && llm_env_args+=(-e OPENAI_BASE_URL)
+  [[ -n "${OPENAI_MODEL:-}" ]] && llm_env_args+=(-e OPENAI_MODEL)
+  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
+  [[ -n "${CAUVID_STEP8C_LLM_TIMEOUT_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_TIMEOUT_SECONDS)
+  [[ -n "${CAUVID_STEP8C_LLM_MAX_ATTEMPTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_MAX_ATTEMPTS)
+  [[ -n "${CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS)
 
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
@@ -70,6 +81,7 @@ run_container() {
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/.cache/torch" \
     "${model_mounts[@]}" \
+    "${llm_env_args[@]}" \
     -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \
@@ -88,6 +100,11 @@ run_container() {
 
 shell_container() {
   local model_mounts=()
+  local llm_env_args=()
+  [[ -n "${OPENAI_API_KEY:-}" ]] && llm_env_args+=(-e OPENAI_API_KEY)
+  [[ -n "${OPENAI_BASE_URL:-}" ]] && llm_env_args+=(-e OPENAI_BASE_URL)
+  [[ -n "${OPENAI_MODEL:-}" ]] && llm_env_args+=(-e OPENAI_MODEL)
+  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
 
@@ -105,6 +122,7 @@ shell_container() {
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/.cache/torch" \
     "${model_mounts[@]}" \
+    "${llm_env_args[@]}" \
     -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \

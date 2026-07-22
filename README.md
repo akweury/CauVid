@@ -35,6 +35,17 @@ video reasoning by nesy and causal models
 
 Use `d2.sh` to run the lightweight `exp_july` pipeline in Docker on the remote server.
 
+Steps 8C and 8E call an OpenAI-compatible LLM. Export the API key before
+running through Step 8 or later; `d2.sh` forwards it into the container:
+
+```bash
+export OPENAI_API_KEY="..."
+./d2.sh run --gpu 0 --step 8
+```
+
+For a compatible non-default endpoint, also set `OPENAI_BASE_URL` and either
+`OPENAI_MODEL` or `CAUVID_STEP8_PATTERN_LLM_MODEL`.
+
 Example:
 ```bash
 ./d2.sh --gpu 1 --step 2 --data 20
