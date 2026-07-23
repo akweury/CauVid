@@ -64,6 +64,11 @@ run_container() {
   [[ -n "${CAUVID_STEP8C_LLM_MAX_ATTEMPTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_MAX_ATTEMPTS)
   [[ -n "${CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS)
   [[ -n "${CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
 
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
@@ -106,6 +111,11 @@ shell_container() {
   [[ -n "${OPENAI_BASE_URL:-}" ]] && llm_env_args+=(-e OPENAI_BASE_URL)
   [[ -n "${OPENAI_MODEL:-}" ]] && llm_env_args+=(-e OPENAI_MODEL)
   [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
 

@@ -12,6 +12,7 @@ from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step8_trajectory_repair
+from src.exp_july.perception import step8_threshold_epoch_begin
 from src.exp_july.perception import step8a_relative_object_motion
 from src.exp_july.perception import step8b_trajectory_validation
 from src.exp_july.perception import step8c_trajectory_pattern_closed_loop
@@ -21,6 +22,7 @@ from src.exp_july.perception import step8e_visual_semantic_protection
 from src.exp_july.perception import step8f_final_trajectory_validation
 from src.exp_july.perception import step8g_prior_guided_ego_motion_refinement
 from src.exp_july.perception import step8h_visual_relative_motion
+from src.exp_july.perception import step8i_threshold_calibration
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -118,6 +120,8 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     repaired_state = step8_trajectory_repair(position_state, ego_state)
     # Step 8A: compute relative motion from the repaired, canonical track IDs.
     relative_motion_state = step8a_relative_object_motion(position_state, repaired_state)
+    # Activate a pending threshold policy once and freeze it for Steps 8B-8F.
+    relative_motion_state = step8_threshold_epoch_begin(relative_motion_state)
     # Step 8B: validate trajectories once, after ID-producing repair.
     relative_motion_state = step8b_trajectory_validation(ego_state, relative_motion_state)
     # Step 8C: run the iterative trajectory-pattern residual and repair loop.
@@ -133,6 +137,8 @@ def main(video_ids=None, video_count=None, rounds=3, max_step=18):
     relative_motion_state = step8g_prior_guided_ego_motion_refinement(ego_state, relative_motion_state)
     # Step 8H: render final per-track relative-motion videos.
     relative_motion_state = step8h_visual_relative_motion(relative_motion_state)
+    # Step 8I: learn a bounded pending threshold patch from batched conflicts.
+    relative_motion_state = step8i_threshold_calibration(relative_motion_state)
     if max_step <= 8:
         return relative_motion_state
     # Step 9: segment videos into temporal chunks.

@@ -58,6 +58,24 @@ Candidate patches are compiled and compared with the active policy on a stable,
 video-disjoint validation split. A successful candidate is staged as pending;
 it is activated only when the next Step 8C epoch starts.
 
+Step 8I also aggregates final Step 8F conflicts where a grounded semantic rule
+protects a trajectory that the raw validator would discard. It deterministically
+calibrates only bounded soft motion thresholds, validates the candidate on a
+fixed video split, and activates successful patches at the next Step 8 boundary.
+Semantic protection is treated as a weak retention label, not proof that a
+trajectory is physically valid. Identity, continuity, malformed geometry, and
+abrupt direction-change checks remain locked.
+
+Optional calibration controls:
+
+```bash
+export CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS=10
+export CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE=0.90
+export CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE=0.10
+export CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE=0.02
+export CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION=0.20
+```
+
 Example:
 ```bash
 ./d2.sh --gpu 1 --step 2 --data 20

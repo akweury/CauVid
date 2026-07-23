@@ -7,7 +7,7 @@ import json
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 _VERSION = 1
@@ -265,13 +265,23 @@ def _recompute_motion(
     return rows
 
 
-def _evaluate(observations: Sequence[Dict[str, Any]], num_frames: int) -> Dict[str, Any]:
+def _evaluate(
+    observations: Sequence[Dict[str, Any]],
+    num_frames: int,
+    *,
+    thresholds: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     from src.exp_july.perception import pipeline as core
 
     rows = list(observations)
     statistics = core._trajectory_statistics(rows, num_frames)
     uncertainty = core._trajectory_uncertainty(rows, statistics)
-    validation = core._trajectory_reality_validation(rows, statistics, uncertainty)
+    validation = core._trajectory_reality_validation(
+        rows,
+        statistics,
+        uncertainty,
+        thresholds=thresholds,
+    )
     provenance = {
         "observed_count": int(statistics.get("observed_count", 0)),
         "repaired_count": int(statistics.get("repaired_count", 0)),
@@ -381,6 +391,7 @@ def _parameter_candidates(strategy: str) -> List[Dict[str, Any]]:
 def _calibrate(
     evidence_videos: Sequence[Dict[str, Any]],
     refined_by_video: Dict[str, Dict[str, Any]],
+    validation_thresholds: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     reliable = []
     for video in evidence_videos:
@@ -407,7 +418,11 @@ def _calibrate(
                         ego,
                         velocity_window=window,
                     )
-                    evaluation = _evaluate(repaired, int(trajectory.get("trajectory_statistics", {}).get("video_num_frames", len(repaired))))
+                    evaluation = _evaluate(
+                        repaired,
+                        int(trajectory.get("trajectory_statistics", {}).get("video_num_frames", len(repaired))),
+                        thresholds=validation_thresholds,
+                    )
                     success = rejection not in evaluation["validation"].get("rejection_reasons", []) and evaluation["validation"].get("validation_status") != "invalid"
                     signature = json.dumps(parameters, sort_keys=True)
                     measurements[(rejection, strategy, group, signature)].append((success, _rmse(original, repaired)))
@@ -470,10 +485,13 @@ def _repair_track(
     trajectory: Dict[str, Any],
     refined_ego: Dict[str, Any],
     calibration: Dict[str, Any],
+    validation_thresholds: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     original = copy.deepcopy(list(trajectory.get("trajectory_observations", [])))
     num_frames = int(trajectory.get("trajectory_statistics", {}).get("video_num_frames", len(original)))
-    original_eval = _evaluate(original, num_frames)
+    original_eval = _evaluate(
+        original, num_frames, thresholds=validation_thresholds
+    )
     reasons = list(dict(trajectory.get("causal_motion_fact_validation", {})).get("rejection_reasons", original_eval["validation"].get("rejection_reasons", [])))
     group = _rule_group(trajectory)
     ego = _refined_ego_by_frame(refined_ego)
@@ -493,7 +511,9 @@ def _repair_track(
             if strategy == "multi_frame_velocity_recomputation":
                 velocity_window = max(2, int(parameters.get("window", 3)))
             repaired = _recompute_motion(repaired, ego, velocity_window=velocity_window)
-            stage_eval = _evaluate(repaired, num_frames)
+            stage_eval = _evaluate(
+                repaired, num_frames, thresholds=validation_thresholds
+            )
             stages.append({
                 "strategy": strategy,
                 "parameters": parameters,
@@ -501,7 +521,9 @@ def _repair_track(
                 "rejection_reasons_after_stage": list(stage_eval["validation"].get("rejection_reasons", [])),
                 "validation_status_after_stage": stage_eval["validation"].get("validation_status"),
             })
-        evaluation = _evaluate(repaired, num_frames)
+        evaluation = _evaluate(
+            repaired, num_frames, thresholds=validation_thresholds
+        )
         remaining = list(evaluation["validation"].get("rejection_reasons", []))
         original_cost = _issue_cost(original_eval)
         repaired_cost = _issue_cost(evaluation)
@@ -707,12 +729,19 @@ def run_adaptive_motion_repair(
         str(row.get("video_id", "")): row
         for row in ego_sources
     }
+    validation_thresholds = dict(
+        relative_motion_state.get(
+            "trajectory_validation_threshold_policy", {}
+        ).get("thresholds", {})
+    ) or None
     relative_videos = list(relative_motion_state.get("relative_object_motion", []))
     relative_by_video = {
         str(row.get("video_id", "")): row
         for row in relative_videos
     }
-    calibration = _calibrate(evidence_videos, refined_by_video)
+    calibration = _calibrate(
+        evidence_videos, refined_by_video, validation_thresholds
+    )
     with (output_root / "repair_strategy_calibration.json").open("w", encoding="utf-8") as file:
         json.dump(calibration, file, indent=2)
     video_results = []
@@ -731,7 +760,12 @@ def run_adaptive_motion_repair(
             if original_decision == "Discard":
                 queued.append(trajectory)
         track_repairs = [
-            _repair_track(trajectory, refined_by_video.get(video_id, {}), calibration)
+            _repair_track(
+                trajectory,
+                refined_by_video.get(video_id, {}),
+                calibration,
+                validation_thresholds,
+            )
             for trajectory in queued
         ]
         tracks = [

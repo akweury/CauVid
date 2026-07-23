@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -46,7 +47,7 @@ _REL_SPEED_THRESHOLD = 0.3
 _DISTANCE_NEAR_THRESHOLD = 15.0
 _DISTANCE_MEDIUM_THRESHOLD = 30.0
 _X_POSITION_THRESHOLD = 2.0
-_RELATIVE_MOTION_VIS_VERSION = 4
+_RELATIVE_MOTION_VIS_VERSION = 5
 _VIS_OBSERVED_COLOR = (70, 220, 70)
 _VIS_REPAIRED_COLOR = (220, 60, 255)
 _VIS_ABSENT_COLOR = (58, 58, 58)
@@ -62,7 +63,7 @@ _VIS_EGO_METHOD_COLORS = {
     "refined": (80, 220, 80),
     "ransac": (60, 140, 255),
 }
-_CAUSAL_FILTER_OUT_VERSION = 1
+_CAUSAL_FILTER_OUT_VERSION = 2
 _TRAJECTORY_VALIDATION_THRESHOLDS = {
     "max_valid_frame_gap": 3,
     "max_uncertain_frame_gap": 1,
@@ -2140,8 +2141,23 @@ def _validation_issue(kind, severity, message, value=None, threshold=None):
     return issue
 
 
-def _trajectory_reality_validation(observations, statistics, uncertainty):
-    thresholds = dict(_TRAJECTORY_VALIDATION_THRESHOLDS)
+def _trajectory_reality_validation(
+    observations,
+    statistics,
+    uncertainty,
+    *,
+    thresholds=None,
+):
+    active_thresholds = dict(_TRAJECTORY_VALIDATION_THRESHOLDS)
+    if thresholds:
+        active_thresholds.update(
+            {
+                key: value
+                for key, value in dict(thresholds).items()
+                if key in active_thresholds
+            }
+        )
+    thresholds = active_thresholds
     step_metrics = _trajectory_step_metrics(observations)
     issues = []
     label_counts = dict(statistics.get("label_counts", {}))
@@ -2151,6 +2167,40 @@ def _trajectory_reality_validation(observations, statistics, uncertainty):
     repaired_count = int(statistics.get("repaired_count", 0))
     merged_count = int(statistics.get("merged_count", 0))
 
+    physically_invalid = []
+    for row in observations:
+        position = list(row.get("position_3d", []))
+        try:
+            position_values = [float(value) for value in position]
+        except (TypeError, ValueError):
+            position_values = []
+        bbox = list(row.get("bbox", row.get("box", [])))
+        try:
+            bbox_values = [float(value) for value in bbox]
+        except (TypeError, ValueError):
+            bbox_values = []
+        invalid_position = (
+            len(position_values) < 3
+            or not all(math.isfinite(value) for value in position_values)
+            or position_values[2] < 0
+        )
+        invalid_bbox = bool(bbox) and (
+            len(bbox_values) != 4
+            or not all(math.isfinite(value) for value in bbox_values)
+            or bbox_values[2] <= bbox_values[0]
+            or bbox_values[3] <= bbox_values[1]
+        )
+        if invalid_position or invalid_bbox:
+            physically_invalid.append(int(row.get("frame_index", -1)))
+    if physically_invalid:
+        issues.append(
+            _validation_issue(
+                "physical_invalidity",
+                "invalid",
+                "Trajectory contains nonfinite, negative-depth, or malformed geometry.",
+                {"frame_ids": physically_invalid[:20], "count": len(physically_invalid)},
+            )
+        )
     if num_observations < 2:
         issues.append(_validation_issue("trajectory_too_short", "uncertain", "Only one observation; continuity cannot be verified.", num_observations, 2))
     if len(label_counts) > 1:
@@ -2917,7 +2967,12 @@ def _refined_ego_motion_video(ego_video, evidence_video, reference_result):
     }
 
 
-def _trajectory_motion_evidence_video(relative_video, ego_video=None, protected_by_track=None):
+def _trajectory_motion_evidence_video(
+    relative_video,
+    ego_video=None,
+    protected_by_track=None,
+    validation_thresholds=None,
+):
     frame_indices, tracks = _relative_motion_track_index(relative_video)
     protected_by_track = dict(protected_by_track or {})
     video_num_frames = int(relative_video.get("num_frames", len(frame_indices)))
@@ -2929,7 +2984,12 @@ def _trajectory_motion_evidence_video(relative_video, ego_video=None, protected_
         ]
         statistics = _trajectory_statistics(observations, video_num_frames)
         uncertainty = _trajectory_uncertainty(observations, statistics)
-        validation = _trajectory_reality_validation(observations, statistics, uncertainty)
+        validation = _trajectory_reality_validation(
+            observations,
+            statistics,
+            uncertainty,
+            thresholds=validation_thresholds,
+        )
         provenance = {
             "source_counts": dict(statistics.get("source_counts", {})),
             "observed_count": int(statistics.get("observed_count", 0)),
@@ -3766,16 +3826,44 @@ def step8_visual_relative_motion(
     *,
     output_subdir="08visual_relative_motion_tracks",
     step_label="8visual",
+    render_video_ids=None,
 ):
     videos = relative_motion_state.get("videos", [])
-    relative_motion = relative_motion_state.get("relative_object_motion", [])
-    if not videos or not relative_motion:
+    source_relative_motion = list(
+        relative_motion_state.get("relative_object_motion", [])
+    )
+    if not videos or not source_relative_motion:
         print(f"[step {step_label}] no relative object motion, skip visualization")
         return {
             **relative_motion_state,
             "relative_motion_visualizations": [],
             "relative_motion_visualization_output_root": None,
         }
+    source_video_ids = [
+        str(row.get("video_id", "")) for row in source_relative_motion
+    ]
+    selected_video_ids = (
+        None
+        if render_video_ids is None
+        else {str(value) for value in render_video_ids if str(value)}
+    )
+    relative_motion = (
+        source_relative_motion
+        if selected_video_ids is None
+        else [
+            row
+            for row in source_relative_motion
+            if str(row.get("video_id", "")) in selected_video_ids
+        ]
+    )
+    rendered_video_ids = [
+        str(row.get("video_id", "")) for row in relative_motion
+    ]
+    skipped_unimportant_video_ids = [
+        video_id
+        for video_id in source_video_ids
+        if video_id not in set(rendered_video_ids)
+    ]
 
     output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
@@ -3832,7 +3920,13 @@ def step8_visual_relative_motion(
 
     manifest = {
         "version": _RELATIVE_MOTION_VIS_VERSION,
+        "render_scope": (
+            "all_videos" if selected_video_ids is None else "important_videos"
+        ),
+        "num_source_videos": len(source_relative_motion),
         "num_videos": len(relative_motion),
+        "rendered_video_ids": rendered_video_ids,
+        "skipped_unimportant_video_ids": skipped_unimportant_video_ids,
         "fps": float(fps),
         "num_track_videos_rendered": len(all_rendered),
         "num_track_videos_skipped": len(all_skipped),
@@ -3861,6 +3955,12 @@ def step8_visual_relative_motion(
         "relative_motion_visualization_skipped": all_skipped,
         "ego_motion_chart_pdfs": ego_motion_chart_pdfs,
         "ego_motion_chart_skipped": ego_motion_chart_skipped,
+        "relative_motion_visualization_video_selection": {
+            "render_scope": manifest["render_scope"],
+            "source_video_ids": source_video_ids,
+            "rendered_video_ids": rendered_video_ids,
+            "skipped_unimportant_video_ids": skipped_unimportant_video_ids,
+        },
         "relative_motion_visualization_output_root": output_root,
     }
 
@@ -3883,6 +3983,16 @@ def step8b_causal_filter_out(
         output_subdir or "08b_driving_mini_causal_filter_out"
     )
     output_root.mkdir(parents=True, exist_ok=True)
+    threshold_policy = dict(
+        relative_motion_state.get("trajectory_validation_threshold_policy", {})
+    )
+    validation_thresholds = dict(
+        threshold_policy.get("thresholds", _TRAJECTORY_VALIDATION_THRESHOLDS)
+    )
+    threshold_policy_version = int(threshold_policy.get("version", 1))
+    threshold_policy_fingerprint = hashlib.sha256(
+        json.dumps(validation_thresholds, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
     ego_by_video = {
         str(row.get("video_id", "")): row
@@ -3910,6 +4020,15 @@ def step8b_causal_filter_out(
     for relative_video in progress:
         video_id = str(relative_video.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
+        video_protection = protected_by_video.get(video_id, {})
+        protection_fingerprint = hashlib.sha256(
+            json.dumps(
+                video_protection,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()
         cache_path = output_root / video_id / "trajectory_motion_evidence.json"
         if not cache_path.exists():
             cache_path = output_root / video_id / "causal_filter_out.json"
@@ -3924,6 +4043,12 @@ def step8b_causal_filter_out(
             and str(cached_evidence.get("video_id", "")) == video_id
             and cached_evidence.get("evidence_type") == "trajectory_motion_evidence"
             and isinstance(cached_evidence.get("trajectory_motion_evidence"), list)
+            and int(cached_evidence.get("threshold_policy_version", -1))
+            == threshold_policy_version
+            and str(cached_evidence.get("threshold_policy_fingerprint", ""))
+            == threshold_policy_fingerprint
+            and str(cached_evidence.get("semantic_protection_fingerprint", ""))
+            == protection_fingerprint
         )
         if cache_valid:
             cached_videos += 1
@@ -3937,7 +4062,8 @@ def step8b_causal_filter_out(
         evidence = _trajectory_motion_evidence_video(
             relative_video,
             ego_by_video.get(video_id),
-            protected_by_track=protected_by_video.get(video_id, {}),
+            protected_by_track=video_protection,
+            validation_thresholds=validation_thresholds,
         )
         num_objects_in = int(evidence.get("num_observations", 0))
         num_tracks_in = int(evidence.get("num_trajectories", 0))
@@ -3945,6 +4071,14 @@ def step8b_causal_filter_out(
             {
                 "method": "causal_motion_fact_validation_evidence_build",
                 "status": "trajectory_reality_validated",
+                "threshold_policy_version": threshold_policy_version,
+                "threshold_policy_fingerprint": threshold_policy_fingerprint,
+                "semantic_protection_fingerprint": protection_fingerprint,
+                "threshold_policy_frozen": bool(
+                    relative_motion_state.get(
+                        "trajectory_validation_threshold_policy_frozen", False
+                    )
+                ),
                 "description": (
                     "Frame-level relative motion has been aggregated into trajectory-level "
                     "evidence and checked for trajectory realism. Final object removal is not applied yet."
@@ -4067,9 +4201,38 @@ def step8b_causal_filter_out(
             for row in trajectory_motion_evidence
         ],
     }
-    with (output_root / "trajectory_motion_evidence_manifest.json").open("w", encoding="utf-8") as f:
+    final_threshold_conflicts = []
+    if phase == "final":
+        from src.exp_july.perception.trajectory_threshold_calibration import (
+            collect_conflicts,
+        )
+
+        final_threshold_conflicts = collect_conflicts(trajectory_motion_evidence)
+        with (output_root / "protected_invalid_threshold_conflicts.json").open(
+            "w", encoding="utf-8"
+        ) as f:
+            json.dump(final_threshold_conflicts, f, indent=2)
+    manifest.update(
+        {
+            "threshold_policy_version": threshold_policy_version,
+            "threshold_policy_fingerprint": threshold_policy_fingerprint,
+            "threshold_policy_frozen": bool(
+                relative_motion_state.get(
+                    "trajectory_validation_threshold_policy_frozen", False
+                )
+            ),
+            "num_protected_invalid_threshold_conflicts": len(
+                final_threshold_conflicts
+            ),
+        }
+    )
+    with (output_root / "trajectory_motion_evidence_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as f:
         json.dump(manifest, f, indent=2)
-    with (output_root / "causal_filter_out_manifest.json").open("w", encoding="utf-8") as f:
+    with (output_root / "causal_filter_out_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as f:
         json.dump(manifest, f, indent=2)
     print(
         f"[step {step_label or ('8b:' + phase)}] trajectory_motion_evidence "
@@ -4098,6 +4261,7 @@ def step8b_causal_filter_out(
             if bool(row.get("send_to_motion_signal_refinement", False))
         ],
         "trajectory_motion_evidence": trajectory_motion_evidence,
+        "trajectory_threshold_conflicts": final_threshold_conflicts,
         "trajectory_motion_evidence_output_root": output_root,
         "trajectory_motion_evidence_phase": phase,
         f"{phase}_trajectory_motion_evidence": trajectory_motion_evidence,
@@ -4283,6 +4447,38 @@ def step8d_adaptive_protected_object_motion_repair(
 
 
 # Canonical Step 8 sequence: ID repair precedes every trajectory validation.
+def step8_threshold_epoch_begin(state):
+    """Activate pending validation thresholds and freeze them for all Step 8 checks."""
+    from src.exp_july.perception.trajectory_threshold_calibration import (
+        begin_threshold_epoch,
+    )
+
+    output_root = get_pipeline_output_root() / "08i_threshold_calibration"
+    epoch_id, policy, snapshot = begin_threshold_epoch(
+        output_root / "policies",
+        _TRAJECTORY_VALIDATION_THRESHOLDS,
+    )
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            policy["thresholds"], sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+    print(
+        f"[step 8] threshold_epoch_begin epoch={epoch_id} "
+        f"policy_v={policy['version']} "
+        f"activated_pending={bool(snapshot['activated_pending_policy'])} "
+        f"fingerprint={fingerprint[:12]}"
+    )
+    return {
+        **state,
+        "trajectory_validation_threshold_epoch_id": epoch_id,
+        "trajectory_validation_threshold_policy": policy,
+        "trajectory_validation_threshold_policy_frozen": True,
+        "trajectory_validation_threshold_policy_fingerprint": fingerprint,
+        "trajectory_validation_threshold_policy_output_root": output_root / "policies",
+    }
+
+
 def step8_trajectory_repair(position_state, ego_state):
     return step7b_tracklet_repair(
         position_state,
@@ -4368,12 +4564,45 @@ def step8g_prior_guided_ego_motion_refinement(ego_state, state):
 
 
 def step8h_visual_relative_motion(state, fps=10.0):
+    important_video_ids = {
+        str(row.get("video_id", ""))
+        for key in ("important_objects", "protected_objects")
+        for row in state.get(key, [])
+        if str(row.get("video_id", ""))
+    }
     return step8_visual_relative_motion(
         state,
         fps=fps,
         output_subdir="08h_relative_motion_tracks",
         step_label="8h",
+        render_video_ids=important_video_ids,
     )
+
+
+def step8i_threshold_calibration(state):
+    """Calibrate a pending soft-threshold patch from batched semantic conflicts."""
+    from src.exp_july.perception.trajectory_threshold_calibration import (
+        run_threshold_calibration,
+    )
+
+    output_root = get_pipeline_output_root() / "08i_threshold_calibration"
+    result = run_threshold_calibration(
+        state,
+        output_root,
+        _TRAJECTORY_VALIDATION_THRESHOLDS,
+        _trajectory_reality_validation,
+    )
+    manifest = dict(result.get("trajectory_threshold_calibration_manifest", {}))
+    promotion = dict(manifest.get("promotion", {}))
+    print(
+        f"[step 8i] threshold_calibration "
+        f"conflicts={int(manifest.get('num_conflicts', 0))} "
+        f"update_conflicts={int(manifest.get('num_update_conflicts', 0))} "
+        f"changes={len(dict(manifest.get('compilation', {})).get('changes', {}))} "
+        f"decision={promotion.get('decision', 'reject')} "
+        f"reason={promotion.get('reason', '')}"
+    )
+    return result
 
 
 def step10_segment_object_motion(segment_state):

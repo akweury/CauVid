@@ -316,9 +316,16 @@ def _physical_validity(observations):
         if not all(math.isfinite(value) for value in values) or values[2]<0:return False
     return True
 
-def repair_candidates(track,candidates,interp,ego,current_table):
+def repair_candidates(
+    track,
+    candidates,
+    interp,
+    ego,
+    current_table,
+    validation_thresholds=None,
+):
     original=copy.deepcopy(track["observations"]); nf=max([int(x.get("frame_index",0)) for x in original] or [0])+1
-    before_eval=_evaluate(original,nf); bypid={x["pattern_id"]:x["residual_vector"] for x in candidates}
+    before_eval=_evaluate(original,nf,thresholds=validation_thresholds); bypid={x["pattern_id"]:x["residual_vector"] for x in candidates}
     hypotheses=select_pattern_hypotheses(candidates,interp); out=[]
     for hypothesis in hypotheses:
         pid=hypothesis["pattern_id"]
@@ -334,7 +341,7 @@ def repair_candidates(track,candidates,interp,ego,current_table):
             allafter={p["pattern_id"]:residual(p["pattern_id"],aftertrack) for p in candidates}
             bv=bypid[pid];av=allafter[pid]
             improvement=(_residual_score(bv)-_residual_score(av))/max(1e-6,_residual_score(bv))
-            ev=_evaluate(repaired,nf)
+            ev=_evaluate(repaired,nf,thresholds=validation_thresholds)
             retention=len({int(x["frame_index"]) for x in repaired}&{int(x["frame_index"]) for x in original})/max(1,len(original))
             new=sorted(set(ev["validation"].get("rejection_reasons",[]))-set(before_eval["validation"].get("rejection_reasons",[])))
             labels={str(x.get("frame_label","")).strip().lower() for x in repaired if str(x.get("frame_label","")).strip()}
@@ -495,6 +502,9 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         track_items.append({"track":track,"candidates":candidates})
     policy_root=root/"policies"
     epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
+    validation_thresholds=dict(
+        state.get("trajectory_validation_threshold_policy", {}).get("thresholds", {})
+    ) or None
     review_interval=max(1,int(os.environ.get("CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS","500")))
     runtime_monitor=Step8CRuntimeMonitor(
         root/"runtime_monitor",len(track_items),
@@ -517,7 +527,10 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         runtime_monitor.track_start(track["video_id"],track["track_id"],track_index,len(track_items))
         uid=compact_track(track,candidates)["track_uid"]
         interp=interpretations[uid]
-        repairs=repair_candidates(track,candidates,interp,ego.get(track["video_id"],{}),current)
+        repairs=repair_candidates(
+            track,candidates,interp,ego.get(track["video_id"],{}),current,
+            validation_thresholds=validation_thresholds,
+        )
         accepted=[row for row in repairs if row["symbolic_verdict"]=="pass"]
         selected=max(accepted,key=lambda row:f(row["final_score"],-1e9)) if accepted else None
         reason="highest_ranked_after_hard_constraints" if selected else "no_candidate_passed_hard_constraints_original_preserved"
@@ -530,7 +543,9 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
                 failed=[name for name,value in row["hard_constraint_results"].items() if not value]
                 row["final_selection_reason"]="hard_constraints_failed:"+",".join(failed)
         applied=selected is not None; finalobs=selected["_observations"] if applied else track["observations"]
-        finaltrack={**track,"observations":finalobs}; finaleval=_evaluate(finalobs,max([int(x.get("frame_index",0)) for x in finalobs]or[0])+1)
+        finaltrack={**track,"observations":finalobs}; finaleval=_evaluate(
+          finalobs,max([int(x.get("frame_index",0)) for x in finalobs]or[0])+1,
+          thresholds=validation_thresholds)
         llm_preferred=max(interp,key=lambda row:f(row["plausibility"])) ["pattern_id"]
         finalpattern=selected["validated_pattern"] if selected else "unknown"
         publicrep=[{k:v for k,v in x.items() if k!="_observations"} for x in repairs]
