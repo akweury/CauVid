@@ -659,5 +659,28 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     from src.exp_july.perception.trajectory_pattern_dashboard import (
         build_trajectory_pattern_dashboard,
     )
+    postprocess_started=time.perf_counter()
+    print(
+      f"[step 8c] POSTPROCESS_START tracks={len(records)} "
+      f"videos={len({row['video_id'] for row in records})}",
+      flush=True,
+    )
     visualized=render_trajectory_pattern_visualizations(result,root/"visualizations")
-    return build_trajectory_pattern_dashboard(visualized,root/"dashboard",audit)
+    dashboard_started=time.perf_counter()
+    print(
+      f"[step 8c][dashboard] START output_root={root/'dashboard'}",
+      flush=True,
+    )
+    dashboard=build_trajectory_pattern_dashboard(visualized,root/"dashboard",audit)
+    print(
+      f"[step 8c][dashboard] DONE "
+      f"latency={time.perf_counter()-dashboard_started:.2f}s "
+      f"path={dashboard.get('trajectory_pattern_dashboard_path','')}",
+      flush=True,
+    )
+    print(
+      f"[step 8c] POSTPROCESS_DONE "
+      f"latency={time.perf_counter()-postprocess_started:.2f}s",
+      flush=True,
+    )
+    return dashboard

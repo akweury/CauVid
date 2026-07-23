@@ -1,13 +1,17 @@
-"""Image and MP4 diagnostics for the Step 8B/8C trajectory pipeline."""
+"""HTML and MP4 diagnostics for the Step 8B/8C trajectory pipeline."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import html
 import json
 import math
+import time
 from collections import defaultdict
 from pathlib import Path
+
+from tqdm import tqdm
 
 
 PATTERNS = (
@@ -744,6 +748,7 @@ def _render_step8bc_track_video(
     final_video,
     output_path,
     fps=10.0,
+    progress_callback=None,
 ):
     try:
         import cv2
@@ -857,6 +862,8 @@ def _render_step8bc_track_video(
                 1,
             )
             writer.write(cv2.vconcat([scene, panel]))
+            if progress_callback is not None:
+                progress_callback(1)
     finally:
         writer.release()
     return str(output_path), "rendered"
@@ -901,47 +908,110 @@ def render_step8bc_track_videos(
 
     rendered = []
     skipped = []
-    for record in selected_records:
-        video_id = str(record.get("video_id", ""))
-        track_id = int(record.get("track_id", -1))
-        track_root = output_root / video_id / f"track_{track_id:04d}"
-        track_root.mkdir(parents=True, exist_ok=True)
-        payload = build_step8bc_track_video_payload(record)
-        metrics_path = (
-            track_root / f"track_{track_id:04d}_8b_8c_metrics.json"
+    frame_counts_by_video = {}
+    for video_id in set(pre_by_video) | set(final_by_video):
+        frame_counts_by_video[video_id] = len(
+            set(_video_frame_map(pre_by_video.get(video_id, {})))
+            | set(_video_frame_map(final_by_video.get(video_id, {})))
         )
-        metrics_path.write_text(
-            json.dumps(payload, indent=2, default=str), encoding="utf-8"
-        )
-        output_path = track_root / f"track_{track_id:04d}_8b_8c.mp4"
-        try:
-            path, status = _render_step8bc_track_video(
-                record=record,
-                payload=payload,
-                pre_pattern_video=pre_by_video.get(video_id, {}),
-                final_video=final_by_video.get(
-                    video_id, pre_by_video.get(video_id, {})
-                ),
-                output_path=output_path,
-                fps=fps,
+    total_expected_frames = sum(
+        frame_counts_by_video.get(str(record.get("video_id", "")), 0)
+        for record in selected_records
+    )
+    print(
+        f"[step 8c][visualization] MP4_START "
+        f"tracks={len(selected_records)} frames={total_expected_frames} "
+        f"max_tracks_per_video={min(_MAX_TRACK_VIDEOS_PER_VIDEO, max(0, int(max_tracks_per_video)))} "
+        f"fps={float(fps):.2f} output_root={output_root}",
+        flush=True,
+    )
+    mp4_started = time.perf_counter()
+    with tqdm(
+        total=total_expected_frames,
+        desc="[step 8c] 8B+8C MP4",
+        unit="frame",
+        dynamic_ncols=True,
+    ) as frame_progress:
+        for track_index, record in enumerate(selected_records, start=1):
+            video_id = str(record.get("video_id", ""))
+            track_id = int(record.get("track_id", -1))
+            expected_frames = frame_counts_by_video.get(video_id, 0)
+            track_progress = [0]
+
+            def update_frames(count=1):
+                increment = max(0, int(count))
+                track_progress[0] += increment
+                frame_progress.update(increment)
+
+            frame_progress.set_postfix_str(
+                f"track={track_index}/{len(selected_records)} "
+                f"video={video_id} id={track_id}",
+                refresh=True,
             )
-        except Exception as exc:
-            path = None
-            status = (
-                f"render_failed:{type(exc).__name__}:"
-                f"{str(exc)[:240]}"
+            track_started = time.perf_counter()
+            print(
+                f"[step 8c][visualization] MP4_TRACK_START "
+                f"track={track_index}/{len(selected_records)} "
+                f"video={video_id} track_id={track_id} "
+                f"frames={expected_frames}",
+                flush=True,
             )
-        row = {
-            "video_id": video_id,
-            "track_id": track_id,
-            "status": status,
-            "metrics_path": str(metrics_path),
-        }
-        if path:
-            row["visualization_path"] = str(path)
-            rendered.append(row)
-        else:
-            skipped.append(row)
+            track_root = output_root / video_id / f"track_{track_id:04d}"
+            track_root.mkdir(parents=True, exist_ok=True)
+            payload = build_step8bc_track_video_payload(record)
+            metrics_path = (
+                track_root / f"track_{track_id:04d}_8b_8c_metrics.json"
+            )
+            metrics_path.write_text(
+                json.dumps(payload, indent=2, default=str),
+                encoding="utf-8",
+            )
+            output_path = track_root / f"track_{track_id:04d}_8b_8c.mp4"
+            try:
+                path, status = _render_step8bc_track_video(
+                    record=record,
+                    payload=payload,
+                    pre_pattern_video=pre_by_video.get(video_id, {}),
+                    final_video=final_by_video.get(
+                        video_id, pre_by_video.get(video_id, {})
+                    ),
+                    output_path=output_path,
+                    fps=fps,
+                    progress_callback=update_frames,
+                )
+            except Exception as exc:
+                path = None
+                status = (
+                    f"render_failed:{type(exc).__name__}:"
+                    f"{str(exc)[:240]}"
+                )
+            if track_progress[0] < expected_frames:
+                frame_progress.update(expected_frames - track_progress[0])
+            row = {
+                "video_id": video_id,
+                "track_id": track_id,
+                "status": status,
+                "metrics_path": str(metrics_path),
+            }
+            if path:
+                row["visualization_path"] = str(path)
+                rendered.append(row)
+            else:
+                skipped.append(row)
+            print(
+                f"[step 8c][visualization] MP4_TRACK_DONE "
+                f"track={track_index}/{len(selected_records)} "
+                f"video={video_id} track_id={track_id} "
+                f"status={status} encoded_frames={track_progress[0]} "
+                f"latency={time.perf_counter() - track_started:.2f}s",
+                flush=True,
+            )
+    print(
+        f"[step 8c][visualization] MP4_DONE "
+        f"rendered={len(rendered)} skipped={len(skipped)} "
+        f"latency={time.perf_counter() - mp4_started:.2f}s",
+        flush=True,
+    )
 
     selections = []
     for video_id in sorted(available_by_video):
@@ -997,193 +1067,512 @@ def render_step8bc_track_videos(
     return {**manifest, "manifest_path": str(manifest_path)}
 
 
-def _render_track(record, output_path):
-    try:
-        import cv2
-        import numpy as np
-    except ModuleNotFoundError:
-        return False, "missing_cv2_or_numpy"
+_HTML_REPORT_STYLE = """
+:root {
+  color-scheme: dark;
+  --bg: #11151b;
+  --panel: #1b222c;
+  --panel-2: #242d39;
+  --line: #344050;
+  --text: #edf2f7;
+  --muted: #aab4c2;
+  --good: #54d98c;
+  --bad: #ff6b76;
+  --warn: #ffc857;
+  --blue: #62b5ff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main { max-width: 1700px; margin: 0 auto; padding: 24px; }
+h1 { margin: 0 0 6px; font-size: 24px; }
+h2 { margin: 0 0 14px; font-size: 18px; }
+a { color: var(--blue); }
+.muted { color: var(--muted); }
+.flow, .cards { display: flex; flex-wrap: wrap; gap: 9px; }
+.flow { margin: 18px 0; counter-reset: stage; }
+.flow li {
+  list-style: none;
+  counter-increment: stage;
+  padding: 10px 13px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+}
+.flow li::before { content: counter(stage) ". "; color: var(--warn); }
+.panel {
+  margin: 14px 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel);
+  overflow-x: auto;
+}
+.card {
+  min-width: 145px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+}
+.card b { display: block; margin-top: 3px; font-size: 16px; }
+.badge {
+  display: inline-block;
+  margin: 1px 3px 1px 0;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: #313b48;
+}
+.good { color: var(--good); }
+.bad { color: var(--bad); }
+.warn { color: var(--warn); }
+.selected { background: #21382e; }
+.alert {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border-left: 4px solid var(--warn);
+  background: #2d291a;
+}
+.alert.bad { border-color: var(--bad); background: #331d22; }
+table { width: 100%; border-collapse: collapse; }
+th, td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+th { position: sticky; top: 0; background: var(--panel); color: var(--muted); }
+code, pre { font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
+pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: #10151b;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.bar-track {
+  width: min(620px, 70vw);
+  height: 14px;
+  border-radius: 7px;
+  background: #10151b;
+  overflow: hidden;
+}
+.bar { height: 100%; min-width: 0; background: var(--blue); }
+video { width: min(100%, 1200px); max-height: 72vh; background: #090b0e; }
+@media (max-width: 760px) {
+  main { padding: 14px; }
+  th, td { padding: 6px; }
+}
+"""
 
-    image = np.full((1500, 1800, 3), (22, 24, 28), dtype=np.uint8)
-    white = (242, 242, 242)
-    muted = (170, 175, 185)
-    green = (70, 220, 100)
-    red = (75, 90, 235)
-    amber = (60, 190, 245)
-    cyan = (225, 190, 70)
 
+def _html_text(value):
+    if isinstance(value, (dict, list, tuple)):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    return html.escape(str(value if value is not None else "-"), quote=True)
+
+
+def _html_json(value):
+    return html.escape(
+        json.dumps(value, indent=2, ensure_ascii=False, default=str),
+        quote=True,
+    )
+
+
+def _status_class(value):
+    normalized = str(value).strip().lower()
+    if normalized in {
+        "accept", "accepted", "completed", "keep", "pass", "passed",
+        "rendered", "valid",
+    }:
+        return "good"
+    if normalized in {
+        "fail", "failed", "invalid", "reject", "rejected",
+    }:
+        return "bad"
+    return "warn"
+
+
+def _html_document(title, body):
+    return (
+        "<!doctype html>\n"
+        "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<meta http-equiv=\"Content-Security-Policy\" "
+        "content=\"default-src 'none'; style-src 'unsafe-inline'; "
+        "media-src 'self' file:; base-uri 'none'; form-action 'none'\">"
+        f"<title>{_html_text(title)}</title><style>{_HTML_REPORT_STYLE}</style>"
+        f"</head><body><main>{body}</main></body></html>\n"
+    )
+
+
+def _residual_total(vector):
+    return sum(_number(value) for value in dict(vector).values())
+
+
+def _render_track_html(record, output_path, media=None):
     video_id = str(record.get("video_id", ""))
     track_id = int(record.get("track_id", -1))
-    _text(
-        cv2, image,
-        f"STEP 8C | TRAJECTORY PATTERN CLOSED LOOP | video {video_id} | track {track_id}",
-        28, 48, 0.78, white, 2,
-    )
-
-    flow = (
-        "symbolic abstraction", "all-pattern residuals", "LLM interpretation",
-        "multi-repair", "symbolic validation", "final selection",
-    )
-    x = 28
-    for index, label in enumerate(flow):
-        box_width = 260 if index < 5 else 250
-        cv2.rectangle(image, (x, 72), (x + box_width, 122), (55, 60, 70), -1)
-        _text(cv2, image, label, x + 12, 104, 0.45, white)
-        if index < len(flow) - 1:
-            cv2.arrowedLine(
-                image, (x + box_width + 5, 97), (x + box_width + 33, 97),
-                amber, 2, tipLength=0.25,
-            )
-        x += box_width + 38
-
     track = dict(record.get("symbolic_track", {}))
-    source_validation = dict(track.get("source_validation", {})).get(
+    validation = dict(track.get("source_validation", {}))
+    source_validation = validation.get(
         "validation_status", track.get("source_decision", "unknown")
     )
-    facts = (
-        f"class={track.get('object_class', 'unknown')}  "
-        f"direction={track.get('direction', 'unknown')}  "
-        f"persistence={_number(track.get('persistence')):.3f}  "
-        f"confidence={_number(track.get('confidence')):.3f}  "
-        f"source_validation={source_validation}"
-    )
-    _text(cv2, image, "1. SYMBOLIC TRACK", 28, 162, 0.58, cyan, 2)
-    _text(cv2, image, facts, 48, 198, 0.50, white)
-
+    final_pattern = str(record.get("final_pattern", "unknown"))
+    selected = dict(record.get("selected_candidate", {}))
+    selected_id = str(selected.get("candidate_id", ""))
+    llm_preferred = str(record.get("LLM_preferred_pattern", "unknown"))
+    validated = str(record.get("validated_pattern", final_pattern))
     interpretations = {
-        str(row.get("pattern_id", "")): row
+        str(row.get("pattern_id", "")): dict(row)
         for row in record.get("llm_residual_interpretation", [])
     }
-    candidates = list(record.get("pattern_candidates", []))
-    _text(
-        cv2, image,
-        "2-3. EVERY PATTERN: NUMERICAL RESIDUAL VECTOR + LLM INTERPRETATION",
-        28, 248, 0.58, cyan, 2,
-    )
-    for heading, hx in (
-        ("pattern", 48), ("plausibility", 285), ("residual sum", 470),
-        ("largest residual components", 650), ("LLM conflicts / explanation", 1120),
-    ):
-        _text(cv2, image, heading, hx, 282, 0.43, muted)
-
-    row_y = 318
-    for candidate in candidates:
-        pattern_id = str(candidate.get("pattern_id", "unknown"))
-        residuals = dict(candidate.get("residual_vector", {}))
-        interpretation = interpretations.get(pattern_id, {})
-        plausibility = _number(interpretation.get("plausibility"))
-        residual_sum = sum(_number(value) for value in residuals.values())
-        largest = sorted(
-            residuals.items(), key=lambda item: _number(item[1]), reverse=True
-        )[:3]
-        residual_text = " | ".join(
-            f"{name}={_number(value):.3g}" for name, value in largest
+    before_by_pattern = {
+        str(row.get("pattern_id", "unknown")): dict(
+            row.get("residual_vector", {})
         )
-        conflicts = ", ".join(
-            map(str, interpretation.get("structural_conflicts", []))
-        ) or str(interpretation.get("explanation", "no conflict reported"))
-        final = pattern_id == str(record.get("final_pattern", ""))
-        cv2.rectangle(
-            image, (32, row_y - 23), (1760, row_y + 17),
-            (42, 46, 54) if final else (29, 32, 38), -1,
+        for row in record.get("pattern_candidates", [])
+    }
+    final_by_pattern = {
+        str(row.get("pattern_id", "unknown")): dict(
+            row.get("residual_vector", {})
         )
-        _text(
-            cv2, image, ("* " if final else "  ") + pattern_id,
-            48, row_y, 0.47, green if final else white, 2 if final else 1,
-        )
-        _text(
-            cv2, image, f"{plausibility:.3f}", 305, row_y, 0.47,
-            green if plausibility >= 0.5 else amber,
-        )
-        _text(cv2, image, f"{residual_sum:.3g}", 490, row_y, 0.47, white)
-        _text(cv2, image, residual_text, 650, row_y, 0.42, white)
-        _text(cv2, image, _fit_text(cv2, conflicts, 610), 1120, row_y, 0.40, muted)
-        row_y += 43
-
+        for row in record.get("final_pattern_candidates", [])
+    }
     repairs = sorted(
         record.get("candidate_repairs", []),
-        key=lambda row: _number(row.get("final_score"), -1e9), reverse=True,
+        key=lambda row: _number(row.get("final_score"), -1e9),
+        reverse=True,
     )
-    y = max(790, row_y + 30)
-    _text(
-        cv2, image,
-        "4-5. DETERMINISTIC REPAIR CANDIDATES + SYMBOLIC VALIDATION",
-        28, y, 0.58, cyan, 2,
-    )
-    y += 38
-    for heading, hx in (
-        ("candidate", 48), ("decision", 400), ("score", 565),
-        ("residual improvement", 690), ("retention", 955),
-        ("new anomalies / modified frames", 1120),
-    ):
-        _text(cv2, image, heading, hx, y, 0.43, muted)
-    y += 34
 
-    selected_id = str(record.get("selected_candidate", {}).get("candidate_id", ""))
-    shown = repairs[:10]
-    for repair in shown:
-        decision = str(repair.get("symbolic_verdict", repair.get("decision", "unknown")))
-        candidate_id = str(repair.get("candidate_id", ""))
-        selected = candidate_id == selected_id
-        decision_color = green if decision in {"accept", "pass"} else amber if decision == "uncertain" else red
-        cv2.rectangle(
-            image, (32, y - 23), (1760, y + 17),
-            (42, 55, 45) if selected else (29, 32, 38), -1,
-        )
-        _text(
-            cv2, image, ("SELECTED  " if selected else "") + candidate_id,
-            48, y, 0.43, green if selected else white, 2 if selected else 1,
-        )
-        _text(cv2, image, decision.upper(), 400, y, 0.43, decision_color, 2)
-        _text(cv2, image, f"{_number(repair.get('final_score')):.3f}", 565, y, 0.43, white)
-        _text(cv2, image, f"{_number(repair.get('residual_improvement')):+.3f}", 740, y, 0.43, white)
-        _text(cv2, image, f"{_number(repair.get('observation_retention')):.3f}", 970, y, 0.43, white)
-        details = (
-            (", ".join(map(str, repair.get("new_anomalies", []))) or "none")
-            + f" | frames={repair.get('modified_frame_ids', [])}"
-        )
-        _text(cv2, image, _fit_text(cv2, details, 620, 0.38), 1120, y, 0.38, muted)
-        y += 42
-    if len(repairs) > len(shown):
-        _text(
-            cv2, image,
-            f"+ {len(repairs) - len(shown)} additional candidates in the per-track JSON",
-            48, y, 0.40, muted,
-        )
-        y += 34
-
-    y = min(1300, max(y + 18, 1240))
-    cv2.rectangle(image, (28, y), (1770, 1472), (38, 44, 54), -1)
-    _text(cv2, image, "6. FINAL RESULT", 48, y + 40, 0.62, (230, 135, 75), 2)
-    repair_applied = bool(record.get("repair_applied", False))
-    llm_preferred = str(record.get("LLM_preferred_pattern", "unknown"))
-    validated = str(record.get("validated_pattern", record.get("final_pattern", "unknown")))
-    mismatch = llm_preferred != validated
-    selected_score = min((sum(_number(v) for v in row.get("post_repair_pattern_scores", {}).get(row.get("pattern_id"), {}).values()) for row in repairs if row.get("candidate_id") == selected_id), default=float("inf"))
-    lower_rejected = any(row.get("symbolic_verdict") == "reject" and sum(_number(v) for v in row.get("post_repair_pattern_scores", {}).get(row.get("pattern_id"), {}).values()) < selected_score for row in repairs)
-    result = (
-        f"pattern={record.get('final_pattern', 'unknown')} | "
-        f"repair_applied={repair_applied} | "
-        f"validation={record.get('final_validation_status', 'unknown')} | "
-        f"selected={selected_id or 'none'}"
+    selected_score = min(
+        (
+            _residual_total(
+                dict(row.get("post_repair_pattern_scores", {})).get(
+                    row.get("pattern_id"), {}
+                )
+            )
+            for row in repairs
+            if str(row.get("candidate_id", "")) == selected_id
+        ),
+        default=float("inf"),
     )
-    _text(cv2, image, result, 48, y + 82, 0.58, green if repair_applied else amber, 2)
-    alert = f"LLM preferred={llm_preferred} | validated={validated}"
+    lower_rejected = any(
+        str(row.get("symbolic_verdict", "")) == "reject"
+        and _residual_total(
+            dict(row.get("post_repair_pattern_scores", {})).get(
+                row.get("pattern_id"), {}
+            )
+        )
+        < selected_score
+        for row in repairs
+    )
+
+    pattern_rows = []
+    interpretation_rows = []
+    pattern_order = list(PATTERNS)
+    pattern_order.extend(
+        pattern_id
+        for pattern_id in before_by_pattern
+        if pattern_id not in PATTERNS
+    )
+    for pattern_id in pattern_order:
+        before = before_by_pattern.get(pattern_id, {})
+        final = final_by_pattern.get(pattern_id, before)
+        interpretation = interpretations.get(pattern_id, {})
+        plausibility = interpretation.get("plausibility")
+        residual_cells = []
+        for residual_id in RESIDUALS:
+            before_value = before.get(residual_id)
+            final_value = final.get(residual_id, before_value)
+            residual_cells.append(
+                f'<td data-residual="{_html_text(residual_id)}">'
+                f"{_html_text(_display_value(before_value))}"
+                " &rarr; "
+                f"{_html_text(_display_value(final_value))}</td>"
+            )
+        conflicts = list(interpretation.get("structural_conflicts", []))
+        explanation = interpretation.get(
+            "explanation", "no interpretation reported"
+        )
+        pattern_rows.append(
+            f'<tr data-pattern="{_html_text(pattern_id)}" '
+            f'class="{"selected" if pattern_id == final_pattern else ""}">'
+            f"<td><b>{'* ' if pattern_id == final_pattern else ''}"
+            f"{_html_text(pattern_id)}</b></td>"
+            f"<td>{_html_text(_display_value(plausibility))}</td>"
+            f"<td>{_html_text(_display_value(_residual_total(before)))}"
+            " &rarr; "
+            f"{_html_text(_display_value(_residual_total(final)))}</td>"
+            + "".join(residual_cells)
+            + f"<td>{_html_text(conflicts or explanation)}</td></tr>"
+        )
+        interpretation_rows.append(
+            f'<details data-pattern="{_html_text(pattern_id)}">'
+            f"<summary>{_html_text(pattern_id)} — plausibility "
+            f"{_html_text(_display_value(plausibility))}</summary>"
+            f"<p><b>Structural conflicts:</b> "
+            f"{_html_text(conflicts or 'none')}</p>"
+            f"<p><b>Explanation:</b> {_html_text(explanation)}</p>"
+            "</details>"
+        )
+
+    repair_rows = []
+    for repair in repairs:
+        candidate_id = str(repair.get("candidate_id", "unknown"))
+        verdict = str(
+            repair.get("symbolic_verdict", repair.get("decision", "unknown"))
+        )
+        repair_hypothesis = dict(repair.get("repair_hypothesis", {}))
+        operation = repair.get(
+            "repair_operation", repair_hypothesis.get("operation", "unknown")
+        )
+        score = repair.get("final_score")
+        repair_rows.append(
+            f'<tr data-candidate-id="{_html_text(candidate_id)}" '
+            f'class="{"selected" if candidate_id == selected_id else ""}">'
+            f"<td><b>{'SELECTED — ' if candidate_id == selected_id else ''}"
+            f"{_html_text(candidate_id)}</b></td>"
+            f"<td>{_html_text(repair.get('pattern_id', 'unknown'))}</td>"
+            f"<td>{_html_text(operation)}</td>"
+            f'<td class="{_status_class(verdict)}">{_html_text(verdict)}</td>'
+            f"<td>{_html_text(_display_value(score))}</td>"
+            f"<td>{_html_text(_display_value(repair.get('residual_improvement')))}</td>"
+            f"<td>{_html_text(_display_value(repair.get('observation_retention')))}</td>"
+            f"<td>{_html_text(repair.get('new_anomalies', []) or 'none')}</td>"
+            f"<td>{_html_text(repair.get('modified_frame_ids', []))}</td>"
+            f"<td>{_html_text(repair.get('final_selection_reason', ''))}</td>"
+            "</tr>"
+        )
+    if not repair_rows:
+        repair_rows.append(
+            '<tr><td colspan="10" class="muted">No repair candidates</td></tr>'
+        )
+
+    hard_constraints = dict(selected.get("hard_constraint_results", {}))
+    constraint_rows = "".join(
+        "<tr>"
+        f"<td>{_html_text(constraint_id)}</td>"
+        f'<td class="{_status_class("pass" if passed else "fail")}">'
+        f"{'PASS' if passed else 'FAIL'}</td></tr>"
+        for constraint_id, passed in sorted(hard_constraints.items())
+    ) or '<tr><td colspan="2" class="muted">No selected candidate</td></tr>'
+
+    media_section = ""
+    media = dict(media or {})
+    if media.get("video_href"):
+        media_section = (
+            '<section class="panel" id="track-video"><h2>8B/8C track video</h2>'
+            f'<video controls preload="metadata" src="{_html_text(media["video_href"])}">'
+            "Your browser cannot play this MP4.</video>"
+            f'<p><a href="{_html_text(media["video_href"])}">Download MP4</a>'
+        )
+        if media.get("metrics_href"):
+            media_section += (
+                f' · <a href="{_html_text(media["metrics_href"])}">'
+                "Open complete metrics JSON</a>"
+            )
+        media_section += "</p></section>"
+    elif media.get("metrics_href"):
+        media_section = (
+            '<section class="panel" id="track-video"><h2>8B/8C track video</h2>'
+            '<p class="warn">MP4 encoding was skipped or failed. '
+            f'<a href="{_html_text(media["metrics_href"])}">'
+            "Open complete metrics JSON</a>.</p></section>"
+        )
+    else:
+        media_section = (
+            '<section class="panel" id="track-video"><h2>8B/8C track video</h2>'
+            '<p class="muted">Not selected by the deterministic '
+            f"{_MAX_TRACK_VIDEOS_PER_VIDEO}-track-per-video cap.</p></section>"
+        )
+
+    alert_rows = []
+    if llm_preferred != validated:
+        alert_rows.append(
+            '<div class="alert bad">LLM preferred '
+            f"<b>{_html_text(llm_preferred)}</b>, but symbolic validation "
+            f"selected <b>{_html_text(validated)}</b>.</div>"
+        )
     if lower_rejected:
-        alert += " | LOWER-RESIDUAL CANDIDATE REJECTED BY HARD CONSTRAINTS"
-    _text(cv2, image, alert, 48, y + 120, 0.46, red if mismatch or lower_rejected else green, 2)
-    _text(cv2, image, f"reason: {record.get('final_selection_reason', '')}", 48, y + 150, 0.43, white)
-    provenance = dict(record.get("provenance", {}))
-    provenance_text = (
-        f"provenance: LLM={provenance.get('llm_role', '')} | "
-        f"repair={provenance.get('numeric_repair_role', '')} | "
-        f"original preserved={provenance.get('original_observations_preserved', False)}"
-    )
-    _text(cv2, image, provenance_text, 900, y + 150, 0.38, muted)
+        alert_rows.append(
+            '<div class="alert bad">A lower-residual candidate was rejected '
+            "by hard symbolic constraints.</div>"
+        )
 
+    residual_headers = "".join(
+        f"<th>{_html_text(residual_id)}<br><span class=\"muted\">before → final</span></th>"
+        for residual_id in RESIDUALS
+    )
+    body = (
+        f"<h1>Step 8C trajectory pattern process</h1>"
+        f'<p class="muted">Video {_html_text(video_id)} · track {track_id}</p>'
+        '<ol class="flow"><li>symbolic abstraction</li>'
+        "<li>all-pattern residuals</li><li>LLM interpretation</li>"
+        "<li>multi-repair</li><li>symbolic validation</li>"
+        "<li>final selection</li></ol>"
+        + "".join(alert_rows)
+        + '<section class="panel" id="symbolic-track"><h2>Symbolic track</h2>'
+        '<div class="cards">'
+        f'<div class="card">Class<b>{_html_text(track.get("object_class", "unknown"))}</b></div>'
+        f'<div class="card">Direction<b>{_html_text(track.get("direction", "unknown"))}</b></div>'
+        f'<div class="card">Persistence<b>{_html_text(_display_value(track.get("persistence")))}</b></div>'
+        f'<div class="card">Confidence<b>{_html_text(_display_value(track.get("confidence")))}</b></div>'
+        f'<div class="card">Source validation<b class="{_status_class(source_validation)}">'
+        f"{_html_text(source_validation)}</b></div></div>"
+        "<details><summary>Complete Step 8B validation</summary>"
+        f"<pre>{_html_json(validation)}</pre></details></section>"
+        + media_section
+        + '<section class="panel" id="pattern-residuals">'
+        "<h2>All-pattern residual distances</h2>"
+        '<p class="muted">Each cell shows before → final.</p><table><thead><tr>'
+        "<th>Pattern</th><th>Plausibility</th><th>Residual sum</th>"
+        + residual_headers
+        + "<th>LLM conflicts / explanation</th></tr></thead><tbody>"
+        + "".join(pattern_rows)
+        + "</tbody></table></section>"
+        + '<section class="panel" id="llm-interpretation">'
+        "<h2>LLM interpretation</h2>"
+        + "".join(interpretation_rows)
+        + "</section>"
+        + '<section class="panel" id="repair-candidates">'
+        "<h2>Deterministic repair candidates</h2><table><thead><tr>"
+        "<th>Candidate</th><th>Pattern</th><th>Operation</th><th>Verdict</th>"
+        "<th>Score</th><th>Improvement</th><th>Retention</th>"
+        "<th>New anomalies</th><th>Modified frames</th><th>Reason</th>"
+        "</tr></thead><tbody>"
+        + "".join(repair_rows)
+        + "</tbody></table></section>"
+        + '<section class="panel" id="symbolic-validation">'
+        "<h2>Symbolic validation</h2><table><thead><tr>"
+        "<th>Hard constraint</th><th>Result</th></tr></thead><tbody>"
+        + constraint_rows
+        + "</tbody></table></section>"
+        + '<section class="panel" id="final-result"><h2>Final result</h2>'
+        '<div class="cards">'
+        f'<div class="card">Final pattern<b>{_html_text(final_pattern)}</b></div>'
+        f'<div class="card">Repair applied<b>{_html_text(bool(record.get("repair_applied", False)))}</b></div>'
+        f'<div class="card">Validation<b class="{_status_class(record.get("final_validation_status", "unknown"))}">'
+        f'{_html_text(record.get("final_validation_status", "unknown"))}</b></div>'
+        f'<div class="card">Selected candidate<b>{_html_text(selected_id or "none")}</b></div>'
+        f'<div class="card">LLM preferred<b>{_html_text(llm_preferred)}</b></div>'
+        f'<div class="card">Validated pattern<b>{_html_text(validated)}</b></div>'
+        "</div><p><b>Reason:</b> "
+        f'{_html_text(record.get("final_selection_reason", ""))}</p></section>'
+        + '<section class="panel" id="provenance"><h2>Provenance</h2>'
+        f'<pre>{_html_json(dict(record.get("provenance", {})))}</pre></section>'
+    )
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(output_path), image):
-        return False, "image_write_failed"
+    try:
+        output_path.write_text(
+            _html_document(
+                f"Step 8C pattern process — {video_id} / track {track_id}",
+                body,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return False, f"html_write_failed:{type(exc).__name__}:{str(exc)[:160]}"
+    return True, "rendered"
+
+
+def _render_video_summary_html(
+    video_id,
+    video_records,
+    promotion,
+    output_path,
+    track_media=None,
+):
+    repaired = sum(bool(row.get("repair_applied")) for row in video_records)
+    disagreements = sum(
+        str(row.get("LLM_preferred_pattern"))
+        != str(row.get("validated_pattern"))
+        for row in video_records
+    )
+    non_invalid = sum(
+        str(row.get("final_validation_status", "")) != "invalid"
+        for row in video_records
+    )
+    counts = defaultdict(int)
+    for record in video_records:
+        counts[str(record.get("final_pattern", "unknown"))] += 1
+    total = max(1, len(video_records))
+    distribution_rows = "".join(
+        f'<tr data-pattern="{_html_text(pattern_id)}">'
+        f"<td>{_html_text(pattern_id)}</td><td>{counts[pattern_id]}</td>"
+        '<td><div class="bar-track"><div class="bar" '
+        f'style="width:{100.0 * counts[pattern_id] / total:.3f}%"></div>'
+        "</div></td></tr>"
+        for pattern_id in PATTERNS
+    )
+
+    track_media = dict(track_media or {})
+    track_rows = []
+    for record in sorted(
+        video_records, key=lambda row: int(row.get("track_id", -1))
+    ):
+        track_id = int(record.get("track_id", -1))
+        report_href = f"track_{track_id:04d}_pattern_process.html"
+        media = dict(track_media.get((video_id, track_id), {}))
+        media_link = (
+            f'<a href="{_html_text(media["video_href"])}">MP4</a>'
+            if media.get("video_href")
+            else '<span class="muted">not rendered</span>'
+        )
+        track_rows.append(
+            f'<tr data-track-id="{track_id}"><td>{track_id}</td>'
+            f'<td><a href="{report_href}">pattern process</a></td>'
+            f"<td>{_html_text(record.get('final_pattern', 'unknown'))}</td>"
+            f'<td class="{_status_class(record.get("final_validation_status", "unknown"))}">'
+            f'{_html_text(record.get("final_validation_status", "unknown"))}</td>'
+            f"<td>{_html_text(bool(record.get('repair_applied', False)))}</td>"
+            f"<td>{media_link}</td></tr>"
+        )
+
+    decision = str(promotion.get("decision", "unknown"))
+    body = (
+        f"<h1>Step 8C video pattern summary</h1>"
+        f'<p class="muted">Video {_html_text(video_id)}</p>'
+        '<section class="panel"><div class="cards">'
+        f'<div class="card">Tracks<b>{len(video_records)}</b></div>'
+        f'<div class="card">Repairs applied<b>{repaired}</b></div>'
+        f'<div class="card">Final non-invalid<b>{non_invalid}</b></div>'
+        f'<div class="card">LLM/validated disagreements<b>{disagreements}</b></div>'
+        "</div></section>"
+        '<section class="panel" id="pattern-distribution">'
+        "<h2>Final pattern distribution</h2><table><thead><tr>"
+        "<th>Pattern</th><th>Count</th><th>Share</th>"
+        "</tr></thead><tbody>"
+        + distribution_rows
+        + "</tbody></table></section>"
+        + '<section class="panel" id="tracks"><h2>Track reports</h2>'
+        "<table><thead><tr><th>Track</th><th>HTML report</th>"
+        "<th>Final pattern</th><th>Validation</th><th>Repair</th>"
+        "<th>Video</th></tr></thead><tbody>"
+        + "".join(track_rows)
+        + "</tbody></table></section>"
+        + '<section class="panel" id="statistics-promotion">'
+        "<h2>Statistics promotion</h2>"
+        f'<p><span class="badge {_status_class(decision)}">'
+        f"{_html_text(decision)}</span> "
+        f'{_html_text(promotion.get("reason", ""))}</p>'
+        f"<pre>{_html_json(promotion)}</pre></section>"
+    )
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.write_text(
+            _html_document(f"Step 8C summary — {video_id}", body),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return False, f"html_write_failed:{type(exc).__name__}:{str(exc)[:160]}"
     return True, "rendered"
 
 
@@ -1193,6 +1582,10 @@ def render_trajectory_pattern_visualizations(state, output_root):
         import cv2
         import numpy as np
     except ModuleNotFoundError:
+        print(
+            "[step 8c][visualization] SKIP reason=missing_cv2_or_numpy",
+            flush=True,
+        )
         return {
             **state,
             "trajectory_pattern_visualizations": [],
@@ -1206,10 +1599,23 @@ def render_trajectory_pattern_visualizations(state, output_root):
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+    visualization_started = time.perf_counter()
+    records = list(state.get("trajectory_pattern_records", []))
+    print(
+        f"[step 8c][visualization] START tracks={len(records)} "
+        f"output_root={output_root}",
+        flush=True,
+    )
     rendered = []
     skipped = []
     by_video = defaultdict(list)
-    for record in state.get("trajectory_pattern_records", []):
+    sheet_started = time.perf_counter()
+    for record in tqdm(
+        records,
+        desc="[step 8c] diagnostic sheets",
+        unit="track",
+        dynamic_ncols=True,
+    ):
         video_id = str(record.get("video_id", ""))
         track_id = int(record.get("track_id", -1))
         by_video[video_id].append(record)
@@ -1221,32 +1627,51 @@ def render_trajectory_pattern_visualizations(state, output_root):
             rendered.append(row)
         else:
             skipped.append(row)
+    print(
+        f"[step 8c][visualization] SHEETS_DONE "
+        f"rendered={len(rendered)} skipped={len(skipped)} "
+        f"latency={time.perf_counter() - sheet_started:.2f}s",
+        flush=True,
+    )
 
     summaries = []
-    for video_id, records in sorted(by_video.items()):
+    summary_started = time.perf_counter()
+    for video_id, video_records in tqdm(
+        sorted(by_video.items()),
+        desc="[step 8c] video summaries",
+        unit="video",
+        dynamic_ncols=True,
+    ):
         image = np.full((720, 1400, 3), (22, 24, 28), dtype=np.uint8)
         white = (242, 242, 242)
         green = (70, 220, 100)
         amber = (60, 190, 245)
         _text(cv2, image, f"STEP 8C VIDEO SUMMARY | {video_id}", 30, 50, 0.82, white, 2)
-        repaired = sum(bool(row.get("repair_applied")) for row in records)
-        disagreements = sum(str(row.get("LLM_preferred_pattern")) != str(row.get("validated_pattern")) for row in records)
+        repaired = sum(
+            bool(row.get("repair_applied")) for row in video_records
+        )
+        disagreements = sum(
+            str(row.get("LLM_preferred_pattern"))
+            != str(row.get("validated_pattern"))
+            for row in video_records
+        )
         non_invalid = sum(
-            str(row.get("final_validation_status", "")) != "invalid" for row in records
+            str(row.get("final_validation_status", "")) != "invalid"
+            for row in video_records
         )
         _text(
             cv2, image,
-            f"tracks={len(records)}  repairs_applied={repaired}  final_non_invalid={non_invalid}  LLM_validated_disagreements={disagreements}",
+            f"tracks={len(video_records)}  repairs_applied={repaired}  final_non_invalid={non_invalid}  LLM_validated_disagreements={disagreements}",
             30, 95, 0.58, green,
         )
         counts = defaultdict(int)
-        for record in records:
+        for record in video_records:
             counts[str(record.get("final_pattern", "unknown"))] += 1
         _text(cv2, image, "Final pattern distribution", 30, 150, 0.58, amber, 2)
         y = 190
         for pattern_id in PATTERNS:
             count = counts[pattern_id]
-            bar_width = int(700 * count / max(1, len(records)))
+            bar_width = int(700 * count / max(1, len(video_records)))
             _text(cv2, image, pattern_id, 50, y, 0.46, white)
             cv2.rectangle(image, (270, y - 19), (270 + bar_width, y + 4), (70, 150, 220), -1)
             _text(cv2, image, count, 990, y, 0.46, white)
@@ -1261,6 +1686,12 @@ def render_trajectory_pattern_visualizations(state, output_root):
         path.parent.mkdir(parents=True, exist_ok=True)
         if cv2.imwrite(str(path), image):
             summaries.append({"video_id": video_id, "visualization_path": str(path)})
+    print(
+        f"[step 8c][visualization] SUMMARIES_DONE "
+        f"rendered={len(summaries)} "
+        f"latency={time.perf_counter() - summary_started:.2f}s",
+        flush=True,
+    )
 
     track_video_manifest = render_step8bc_track_videos(
         state,
@@ -1294,6 +1725,15 @@ def render_trajectory_pattern_visualizations(state, output_root):
     }
     (output_root / "trajectory_pattern_visualization_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(
+        f"[step 8c][visualization] DONE "
+        f"track_sheets={len(rendered)} summaries={len(summaries)} "
+        f"track_videos={len(track_video_manifest.get('rendered', []))} "
+        f"track_video_skipped={len(track_video_manifest.get('skipped', []))} "
+        f"latency={time.perf_counter() - visualization_started:.2f}s "
+        f"manifest={output_root / 'trajectory_pattern_visualization_manifest.json'}",
+        flush=True,
     )
     return {
         **state,

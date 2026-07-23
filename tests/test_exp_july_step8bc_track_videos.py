@@ -1,7 +1,9 @@
+import io
 import json
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -231,22 +233,31 @@ class Step8BCTrackVideoTests(unittest.TestCase):
         ) as render:
             first_root = Path(tmp) / "first"
             second_root = Path(tmp) / "second"
-            render_step8bc_track_videos(
-                state,
-                first_root,
-                fps=7.5,
-                max_tracks_per_video=10,
-            )
-            reversed_state = {
-                **state,
-                "trajectory_pattern_records": list(reversed(records)),
-            }
-            render_step8bc_track_videos(
-                reversed_state,
-                second_root,
-                fps=7.5,
-                max_tracks_per_video=10,
-            )
+            log_output = io.StringIO()
+            with redirect_stdout(log_output):
+                render_step8bc_track_videos(
+                    state,
+                    first_root,
+                    fps=7.5,
+                    max_tracks_per_video=10,
+                )
+                reversed_state = {
+                    **state,
+                    "trajectory_pattern_records": list(reversed(records)),
+                }
+                render_step8bc_track_videos(
+                    reversed_state,
+                    second_root,
+                    fps=7.5,
+                    max_tracks_per_video=10,
+                )
+            for marker in (
+                "MP4_START",
+                "MP4_TRACK_START",
+                "MP4_TRACK_DONE",
+                "MP4_DONE",
+            ):
+                self.assertIn(marker, log_output.getvalue())
 
             self.assertEqual(render.call_count, 20)
             first_mp4s = sorted(
