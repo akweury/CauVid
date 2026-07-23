@@ -14,6 +14,7 @@ from src.exp_july.perception.trajectory_pattern_closed_loop import (
 from src.exp_july.perception.trajectory_pattern_visualization import (
     build_step8bc_track_video_payload,
     render_step8bc_track_videos,
+    render_trajectory_pattern_visualizations,
     select_deterministic_track_records,
 )
 
@@ -131,6 +132,105 @@ def _record(video_id, track_id):
 
 
 class Step8BCTrackVideoTests(unittest.TestCase):
+    def test_pattern_reports_are_offline_html_complete_and_escaped(self):
+        record = _record("scene", 7)
+        record["symbolic_track"]["object_class"] = "<script>bad()</script>"
+        record["llm_residual_interpretation"] = [
+            {
+                "pattern_id": pattern_id,
+                "plausibility": 0.5,
+                "structural_conflicts": [],
+                "explanation": (
+                    "<script>explanation()</script>"
+                    if pattern_id == "approaching"
+                    else f"full explanation for {pattern_id}"
+                ),
+            }
+            for pattern_id in PATTERNS
+        ]
+        state = {
+            "trajectory_pattern_records": [record],
+            "trajectory_pattern_statistics_promotion": {
+                "decision": "reject",
+                "reason": "validation_regression",
+            },
+        }
+        empty_video_manifest = {
+            "num_selected_tracks": 0,
+            "num_rendered_videos": 0,
+            "num_skipped_videos": 0,
+            "rendered": [],
+            "skipped": [],
+            "selections": [],
+            "manifest_path": "",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "src.exp_july.perception.trajectory_pattern_visualization."
+            "render_step8bc_track_videos",
+            return_value=empty_video_manifest,
+        ):
+            root = Path(tmp)
+            result = render_trajectory_pattern_visualizations(state, root)
+            track_path = (
+                root / "scene" / "track_0007_pattern_process.html"
+            )
+            summary_path = root / "scene" / "video_pattern_summary.html"
+            self.assertTrue(track_path.exists())
+            self.assertTrue(summary_path.exists())
+            self.assertFalse(list(root.rglob("*.png")))
+
+            track_html = track_path.read_text(encoding="utf-8")
+            self.assertIn("<!doctype html>", track_html)
+            self.assertNotIn("<script>bad()</script>", track_html)
+            self.assertIn("&lt;script&gt;bad()&lt;/script&gt;", track_html)
+            self.assertNotIn("<script>explanation()</script>", track_html)
+            self.assertIn(
+                "&lt;script&gt;explanation()&lt;/script&gt;", track_html
+            )
+            self.assertNotIn("http://", track_html)
+            self.assertNotIn("https://", track_html)
+            for section_id in (
+                "symbolic-track",
+                "pattern-residuals",
+                "llm-interpretation",
+                "repair-candidates",
+                "symbolic-validation",
+                "final-result",
+                "provenance",
+            ):
+                self.assertIn(f'id="{section_id}"', track_html)
+            for pattern_id in PATTERNS:
+                self.assertIn(f'data-pattern="{pattern_id}"', track_html)
+            for residual_id in RESIDUALS:
+                self.assertIn(f'data-residual="{residual_id}"', track_html)
+            for repair in record["candidate_repairs"]:
+                self.assertIn(
+                    f'data-candidate-id="{repair["candidate_id"]}"',
+                    track_html,
+                )
+
+            summary_html = summary_path.read_text(encoding="utf-8")
+            self.assertIn("track_0007_pattern_process.html", summary_html)
+            for pattern_id in PATTERNS:
+                self.assertIn(f'data-pattern="{pattern_id}"', summary_html)
+
+            manifest = json.loads(
+                (
+                    root / "trajectory_pattern_visualization_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["version"], 4)
+            self.assertEqual(manifest["report_format"], "html")
+            self.assertEqual(manifest["num_track_reports"], 1)
+            self.assertEqual(manifest["num_summary_reports"], 1)
+            self.assertEqual(
+                result["trajectory_pattern_visualizations"][0][
+                    "media_type"
+                ],
+                "text/html",
+            )
+
     def test_selection_is_stable_order_independent_and_capped_per_video(self):
         records = (
             [_record("scene_b", track_id) for track_id in range(17)]

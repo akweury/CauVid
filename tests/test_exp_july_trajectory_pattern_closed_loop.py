@@ -204,14 +204,68 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             self.assertTrue((root / "policies" / "active_policy.json").exists())
             self.assertTrue((root / "policies" / "epoch_0001.json").exists())
             self.assertTrue(list((root / "epoch_reviews").glob("*_package.json")))
-            self.assertTrue(
-                (root / "visualizations" / "demo" / "track_0007_pattern_process.png").exists()
+            track_report = (
+                root
+                / "visualizations"
+                / "demo"
+                / "track_0007_pattern_process.html"
             )
-            self.assertTrue(
-                (root / "visualizations" / "demo" / "video_pattern_summary.png").exists()
+            summary_report = (
+                root
+                / "visualizations"
+                / "demo"
+                / "video_pattern_summary.html"
             )
+            self.assertTrue(track_report.exists())
+            self.assertTrue(summary_report.exists())
+            self.assertFalse(
+                (
+                    root
+                    / "visualizations"
+                    / "demo"
+                    / "track_0007_pattern_process.png"
+                ).exists()
+            )
+            self.assertFalse(
+                (
+                    root
+                    / "visualizations"
+                    / "demo"
+                    / "video_pattern_summary.png"
+                ).exists()
+            )
+            track_html = track_report.read_text(encoding="utf-8")
+            for marker in (
+                'id="symbolic-track"',
+                'id="pattern-residuals"',
+                'id="llm-interpretation"',
+                'id="repair-candidates"',
+                'id="symbolic-validation"',
+                'id="final-result"',
+                'id="provenance"',
+            ):
+                self.assertIn(marker, track_html)
+            self.assertNotIn("https://", track_html)
+            summary_html = summary_report.read_text(encoding="utf-8")
+            self.assertIn("Step 8C video pattern summary", summary_html)
+            self.assertIn("track_0007_pattern_process.html", summary_html)
+            self.assertNotIn("https://", summary_html)
+            visualization_manifest_path = (
+                root
+                / "visualizations"
+                / "trajectory_pattern_visualization_manifest.json"
+            )
+            self.assertTrue(visualization_manifest_path.exists())
+            visualization_manifest = json.loads(
+                visualization_manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(visualization_manifest["report_format"], "html")
+            self.assertEqual(visualization_manifest["num_track_reports"], 1)
+            self.assertEqual(visualization_manifest["num_summary_reports"], 1)
             self.assertTrue(
-                (root / "visualizations" / "trajectory_pattern_visualization_manifest.json").exists()
+                visualization_manifest["track_reports"][0][
+                    "visualization_path"
+                ].endswith(".html")
             )
             dashboard = root / "dashboard" / "index.html"
             self.assertTrue(dashboard.exists())

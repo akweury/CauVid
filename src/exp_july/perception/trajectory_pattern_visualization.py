@@ -1577,26 +1577,7 @@ def _render_video_summary_html(
 
 
 def render_trajectory_pattern_visualizations(state, output_root):
-    """Render Step 8C sheets plus capped per-track Step 8B/8C MP4s."""
-    try:
-        import cv2
-        import numpy as np
-    except ModuleNotFoundError:
-        print(
-            "[step 8c][visualization] SKIP reason=missing_cv2_or_numpy",
-            flush=True,
-        )
-        return {
-            **state,
-            "trajectory_pattern_visualizations": [],
-            "trajectory_pattern_video_summaries": [],
-            "trajectory_pattern_track_videos": [],
-            "trajectory_pattern_track_video_skipped": [],
-            "trajectory_pattern_track_video_selections": [],
-            "trajectory_pattern_visualization_skipped": [{"reason": "missing_cv2_or_numpy"}],
-            "trajectory_pattern_visualization_output_root": None,
-        }
-
+    """Write Step 8C HTML reports plus capped per-track Step 8B/8C MP4s."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     visualization_started = time.perf_counter()
@@ -1606,103 +1587,121 @@ def render_trajectory_pattern_visualizations(state, output_root):
         f"output_root={output_root}",
         flush=True,
     )
+
+    by_video = defaultdict(list)
+    for record in records:
+        by_video[str(record.get("video_id", ""))].append(record)
+
+    track_video_manifest = render_step8bc_track_videos(
+        state,
+        output_root,
+        fps=max(
+            0.1,
+            _number(state.get("step8bc_visualization_fps", 10.0), 10.0),
+        ),
+        max_tracks_per_video=_MAX_TRACK_VIDEOS_PER_VIDEO,
+    )
+    track_media = {}
+    for row in (
+        list(track_video_manifest.get("rendered", []))
+        + list(track_video_manifest.get("skipped", []))
+    ):
+        video_id = str(row.get("video_id", ""))
+        track_id = int(row.get("track_id", -1))
+        track_dir = f"track_{track_id:04d}"
+        media = {
+            "metrics_href": (
+                f"{track_dir}/track_{track_id:04d}_8b_8c_metrics.json"
+            ),
+            "status": str(row.get("status", "unknown")),
+        }
+        if row.get("visualization_path"):
+            media["video_href"] = (
+                f"{track_dir}/track_{track_id:04d}_8b_8c.mp4"
+            )
+        track_media[(video_id, track_id)] = media
+
     rendered = []
     skipped = []
-    by_video = defaultdict(list)
-    sheet_started = time.perf_counter()
+    report_started = time.perf_counter()
     for record in tqdm(
         records,
-        desc="[step 8c] diagnostic sheets",
+        desc="[step 8c] HTML track reports",
         unit="track",
         dynamic_ncols=True,
     ):
         video_id = str(record.get("video_id", ""))
         track_id = int(record.get("track_id", -1))
-        by_video[video_id].append(record)
-        path = output_root / video_id / f"track_{track_id:04d}_pattern_process.png"
-        success, status = _render_track(record, path)
-        row = {"video_id": video_id, "track_id": track_id, "status": status}
+        path = (
+            output_root
+            / video_id
+            / f"track_{track_id:04d}_pattern_process.html"
+        )
+        success, status = _render_track_html(
+            record,
+            path,
+            media=track_media.get((video_id, track_id)),
+        )
+        row = {
+            "video_id": video_id,
+            "track_id": track_id,
+            "status": status,
+            "media_type": "text/html",
+        }
         if success:
             row["visualization_path"] = str(path)
+            row["report_path"] = str(path)
             rendered.append(row)
         else:
             skipped.append(row)
     print(
-        f"[step 8c][visualization] SHEETS_DONE "
+        f"[step 8c][visualization] HTML_REPORTS_DONE "
         f"rendered={len(rendered)} skipped={len(skipped)} "
-        f"latency={time.perf_counter() - sheet_started:.2f}s",
+        f"latency={time.perf_counter() - report_started:.2f}s",
         flush=True,
     )
 
     summaries = []
+    summary_skipped = []
     summary_started = time.perf_counter()
     for video_id, video_records in tqdm(
         sorted(by_video.items()),
-        desc="[step 8c] video summaries",
+        desc="[step 8c] HTML video summaries",
         unit="video",
         dynamic_ncols=True,
     ):
-        image = np.full((720, 1400, 3), (22, 24, 28), dtype=np.uint8)
-        white = (242, 242, 242)
-        green = (70, 220, 100)
-        amber = (60, 190, 245)
-        _text(cv2, image, f"STEP 8C VIDEO SUMMARY | {video_id}", 30, 50, 0.82, white, 2)
-        repaired = sum(
-            bool(row.get("repair_applied")) for row in video_records
+        path = output_root / video_id / "video_pattern_summary.html"
+        success, status = _render_video_summary_html(
+            video_id,
+            video_records,
+            dict(state.get("trajectory_pattern_statistics_promotion", {})),
+            path,
+            track_media=track_media,
         )
-        disagreements = sum(
-            str(row.get("LLM_preferred_pattern"))
-            != str(row.get("validated_pattern"))
-            for row in video_records
-        )
-        non_invalid = sum(
-            str(row.get("final_validation_status", "")) != "invalid"
-            for row in video_records
-        )
-        _text(
-            cv2, image,
-            f"tracks={len(video_records)}  repairs_applied={repaired}  final_non_invalid={non_invalid}  LLM_validated_disagreements={disagreements}",
-            30, 95, 0.58, green,
-        )
-        counts = defaultdict(int)
-        for record in video_records:
-            counts[str(record.get("final_pattern", "unknown"))] += 1
-        _text(cv2, image, "Final pattern distribution", 30, 150, 0.58, amber, 2)
-        y = 190
-        for pattern_id in PATTERNS:
-            count = counts[pattern_id]
-            bar_width = int(700 * count / max(1, len(video_records)))
-            _text(cv2, image, pattern_id, 50, y, 0.46, white)
-            cv2.rectangle(image, (270, y - 19), (270 + bar_width, y + 4), (70, 150, 220), -1)
-            _text(cv2, image, count, 990, y, 0.46, white)
-            y += 42
-        promotion = dict(state.get("trajectory_pattern_statistics_promotion", {}))
-        _text(
-            cv2, image,
-            f"statistics table: {promotion.get('decision', 'unknown')} | {promotion.get('reason', '')}",
-            30, 650, 0.50, green if promotion.get("decision") == "accept" else red if promotion.get("reason") == "validation_regression" else amber, 2,
-        )
-        path = output_root / video_id / "video_pattern_summary.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if cv2.imwrite(str(path), image):
-            summaries.append({"video_id": video_id, "visualization_path": str(path)})
+        row = {
+            "video_id": video_id,
+            "status": status,
+            "media_type": "text/html",
+        }
+        if success:
+            row["visualization_path"] = str(path)
+            row["report_path"] = str(path)
+            summaries.append(row)
+        else:
+            summary_skipped.append(row)
     print(
-        f"[step 8c][visualization] SUMMARIES_DONE "
-        f"rendered={len(summaries)} "
+        f"[step 8c][visualization] HTML_SUMMARIES_DONE "
+        f"rendered={len(summaries)} skipped={len(summary_skipped)} "
         f"latency={time.perf_counter() - summary_started:.2f}s",
         flush=True,
     )
 
-    track_video_manifest = render_step8bc_track_videos(
-        state,
-        output_root,
-        fps=max(0.1, _number(state.get("step8bc_visualization_fps", 10.0), 10.0)),
-        max_tracks_per_video=_MAX_TRACK_VIDEOS_PER_VIDEO,
-    )
     manifest = {
-        "version": 3,
-        "num_track_images": len(rendered),
-        "num_summary_images": len(summaries),
+        "version": 4,
+        "report_format": "html",
+        "self_contained_reports": True,
+        "num_track_reports": len(rendered),
+        "num_summary_reports": len(summaries),
         "num_selected_track_videos": int(
             track_video_manifest.get("num_selected_tracks", 0)
         ),
@@ -1713,22 +1712,23 @@ def render_trajectory_pattern_visualizations(state, output_root):
             track_video_manifest.get("num_skipped_videos", 0)
         ),
         "max_track_videos_per_video": _MAX_TRACK_VIDEOS_PER_VIDEO,
-        "num_skipped": len(skipped),
-        "track_images": rendered,
-        "summary_images": summaries,
+        "num_skipped": len(skipped) + len(summary_skipped),
+        "track_reports": rendered,
+        "summary_reports": summaries,
         "track_videos": list(track_video_manifest.get("rendered", [])),
         "track_video_skipped": list(track_video_manifest.get("skipped", [])),
         "track_video_selections": list(
             track_video_manifest.get("selections", [])
         ),
-        "skipped": skipped,
+        "skipped": skipped + summary_skipped,
     }
     (output_root / "trajectory_pattern_visualization_manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
     print(
         f"[step 8c][visualization] DONE "
-        f"track_sheets={len(rendered)} summaries={len(summaries)} "
+        f"track_html_reports={len(rendered)} "
+        f"summary_html_reports={len(summaries)} "
         f"track_videos={len(track_video_manifest.get('rendered', []))} "
         f"track_video_skipped={len(track_video_manifest.get('skipped', []))} "
         f"latency={time.perf_counter() - visualization_started:.2f}s "
@@ -1751,6 +1751,6 @@ def render_trajectory_pattern_visualizations(state, output_root):
         "trajectory_pattern_track_video_manifest_path": str(
             track_video_manifest.get("manifest_path", "")
         ),
-        "trajectory_pattern_visualization_skipped": skipped,
+        "trajectory_pattern_visualization_skipped": skipped + summary_skipped,
         "trajectory_pattern_visualization_output_root": output_root,
     }
