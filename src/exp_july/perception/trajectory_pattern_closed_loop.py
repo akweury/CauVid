@@ -142,36 +142,92 @@ def llm_call(kind,prompt,root,generator):
                                 "prompt":prompt,"response":response,"llm_call_metadata":call_metadata},indent=2))
     return {**response,"__llm_call_metadata__":call_metadata} if expose_metadata else response
 
-def symbolic_tracks(evidence):
-    out=[]
+def _relative_observations_by_track(relative_motion):
+    from src.exp_july.perception.pipeline import (
+        _trajectory_observation_from_motion_object,
+    )
+
+    indexed={}
+    for video in relative_motion or []:
+        video_id=str(video.get("video_id",""))
+        for frame_offset,frame in enumerate(video.get("frames",[])):
+            frame_index=int(frame.get("frame_index",frame_offset))
+            for obj in frame.get("objects",[]):
+                try:track_id=int(obj.get("track_id",-1))
+                except (TypeError,ValueError):continue
+                if track_id<0:continue
+                indexed.setdefault((video_id,track_id),[]).append(
+                    _trajectory_observation_from_motion_object(frame_index,obj)
+                )
+    for key in indexed:
+        indexed[key].sort(key=lambda row:int(row.get("frame_index",-1)))
+    return indexed
+
+
+def symbolic_tracks(evidence,relative_motion=None):
+    """Infer Step 8C symbolic inputs from low-level Step 8B evidence."""
+    from src.exp_july.perception.pipeline import _trajectory_statistics
+
+    out=[];joined=_relative_observations_by_track(relative_motion)
     for video in evidence:
-        vid=str(video.get("video_id","")); nf=int(video.get("num_frames",0))
-        for tr in video.get("trajectory_motion_evidence",[]):
-            obs=sorted(copy.deepcopy(tr.get("trajectory_observations",[])),
-                       key=lambda x:int(x.get("frame_index",-1)))
-            stats=dict(tr.get("trajectory_statistics",{})); unc=dict(tr.get("uncertainty",{}))
+        vid=str(video.get("video_id",""));nf=int(video.get("num_frames",0))
+        low_level=str(video.get("evidence_type",""))=="uncertain_signal_evidence"
+        rows=video.get(
+            "track_signal_evidence" if low_level else "trajectory_motion_evidence",
+            [],
+        )
+        for tr in rows:
+            track_id=int(tr.get("track_id",-1))
+            if low_level:
+                obs=copy.deepcopy(joined.get((vid,track_id),[]))
+                stats=_trajectory_statistics(obs,nf)
+                confidence=f(tr.get("evidence_confidence",0))
+                unc={
+                    "confidence_score":confidence,
+                    "uncertainty_score":max(0.0,min(1.0,1.0-confidence)),
+                    "source":"step8b_uncertain_signal_evidence",
+                }
+            else:
+                obs=sorted(copy.deepcopy(tr.get("trajectory_observations",[])),
+                           key=lambda x:int(x.get("frame_index",-1)))
+                stats=dict(tr.get("trajectory_statistics",{}))
+                unc=dict(tr.get("uncertainty",{}))
+                confidence=f(unc.get("confidence_score",0))
             start=list(obs[0].get("position_3d",[])) if obs else []
             end=list(obs[-1].get("position_3d",[])) if obs else []
             dx=(f(end[0])-f(start[0])) if len(start)>=3 and len(end)>=3 else 0
             dz=(f(end[2])-f(start[2])) if len(start)>=3 and len(end)>=3 else 0
             direction=("rightward" if dx>0 else "leftward") if abs(dx)>abs(dz) else ("receding" if dz>0 else "approaching")
-            out.append({"video_id":vid,"track_id":int(tr.get("track_id",-1)),
+            track={"video_id":vid,"track_id":track_id,
                 "object_class":str(tr.get("primary_label","unknown")),
                 "label_counts":dict(stats.get("label_counts",{})),
                 "position":{"start":start,"end":end,"path_length_xz":f(stats.get("path_length_xz",0))},
                 "bbox_size":dict(stats.get("bbox_area",{})),
                 "relative_motion":dict(stats.get("rel_speed",{})),"direction":direction,
                 "persistence":f(stats.get("temporal_coverage_in_video",len(obs)/max(1,nf))),
-                "confidence":f(unc.get("confidence_score",0)),
+                "confidence":confidence,
                 "trajectory_statistics":copy.deepcopy(stats),
                 "uncertainty":copy.deepcopy(unc),
-                "motion_significance_assessment":copy.deepcopy(
-                    tr.get("motion_significance_assessment",{})
-                ),
-                "fact_decision":copy.deepcopy(tr.get("fact_decision",{})),
-                "provenance":copy.deepcopy(tr.get("provenance",{})),"observations":obs,
-                "source_validation":copy.deepcopy(tr.get("causal_motion_fact_validation",{})),
-                "source_decision":str(tr.get("fact_decision_status",""))})
+                "provenance":copy.deepcopy(tr.get("provenance",{})),
+                "observations":obs}
+            if low_level:
+                track.update({
+                    "source_evidence_type":"uncertain_signal_evidence",
+                    "source_signal_evidence":copy.deepcopy(tr),
+                    "signal_descriptors":copy.deepcopy(tr.get("descriptors",{})),
+                })
+            else:
+                track.update({
+                    "motion_significance_assessment":copy.deepcopy(
+                        tr.get("motion_significance_assessment",{})
+                    ),
+                    "fact_decision":copy.deepcopy(tr.get("fact_decision",{})),
+                    "source_validation":copy.deepcopy(
+                        tr.get("causal_motion_fact_validation",{})
+                    ),
+                    "source_decision":str(tr.get("fact_decision_status","")),
+                })
+            out.append(track)
     return out
 
 def statistics_summary(table, object_class=None):
@@ -254,7 +310,8 @@ def residual(pid,track):
 
 def interpretation_prompt(track,candidates,table):
     public={key:track.get(key) for key in ("video_id","track_id","object_class","position","bbox_size",
-      "relative_motion","direction","persistence","confidence","provenance","source_validation","source_decision")}
+      "relative_motion","direction","persistence","confidence","provenance",
+      "source_evidence_type","signal_descriptors")}
     compact_candidates=[{"pattern_id":row.get("pattern_id"),"residual_vector":row.get("residual_vector",{})}
                         for row in candidates]
     return ("Interpret every pattern residual using only facts, provenance, confidence and statistics. "
@@ -446,7 +503,15 @@ def evaluate_candidate_table(records, candidate_rows):
         evaluated.append(record)
     return evaluated
 def validation_metrics(records):
-    before=sum(row["symbolic_track"]["source_validation"].get("validation_status")=="invalid" for row in records)
+    before=sum(
+      row.get(
+        "initial_8c_validation_status",
+        row.get("symbolic_track",{}).get("source_validation",{}).get(
+          "validation_status"
+        ),
+      )=="invalid"
+      for row in records
+    )
     after=sum(row["final_validation_status"]=="invalid" for row in records)
     retention=mean([f(row.get("selected_candidate",{}).get("observation_retention",1),1) for row in records]) if records else 0.0
     improve=mean([f(row.get("selected_candidate",{}).get("residual_improvement",0)) for row in records]) if records else 0.0
@@ -490,7 +555,14 @@ def promote(root,candidate,review,metrics):
 def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini",llm_generate=None):
     root=Path(output_root);root.mkdir(parents=True,exist_ok=True); audit=root/"llm_audit";statsroot=root/"statistics"
     current=json.loads((statsroot/"current_table.json").read_text()) if (statsroot/"current_table.json").exists() else {}
-    tracks=symbolic_tracks(state.get("trajectory_motion_evidence",[]))
+    input_evidence=state.get(
+        "uncertain_signal_evidence",
+        state.get("trajectory_motion_evidence",[]),
+    )
+    tracks=symbolic_tracks(
+        input_evidence,
+        state.get("relative_object_motion",[]),
+    )
     patterns=validate_patterns({})
     ego={str(x.get("video_id","")):ego_frames(x) for x in state.get("ego_motion",[])}
     from src.exp_july.perception.trajectory_pattern_llm_batch import compact_track
@@ -533,6 +605,14 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         runtime_monitor.track_start(track["video_id"],track["track_id"],track_index,len(track_items))
         uid=compact_track(track,candidates)["track_uid"]
         interp=interpretations[uid]
+        initialeval=_evaluate(
+            track["observations"],
+            max(
+                [int(x.get("frame_index",0)) for x in track["observations"]]
+                or [0]
+            )+1,
+            thresholds=validation_thresholds,
+        )
         repairs=repair_candidates(
             track,candidates,interp,ego.get(track["video_id"],{}),current,
             validation_thresholds=validation_thresholds,
@@ -564,12 +644,13 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
           "repair_hypothesis":selected.get("repair_hypothesis",{}) if selected else {},
           "validated_pattern":finalpattern,"final_pattern":finalpattern,"LLM_preferred_pattern":llm_preferred,
           "resolution_status":"validated" if selected else "unresolved_uncertain",
+          "initial_8c_validation_status":initialeval["validation"].get("validation_status",""),
           "final_pattern_candidates":[{**c,"residual_vector":residual(c["pattern_id"],finaltrack)} for c in candidates],
           "final_validation_status":finaleval["validation"].get("validation_status",""),
           "final_symbolic_predicates":{"direction":finaltrack["direction"],"confidence":finaleval["uncertainty"].get("confidence_score",0),
                                       "persistence":len(finalobs)/max(1,len(track["observations"]))},
           "record_status":"completed_validated" if selected else "completed_unresolved",
-          "final_selection_reason":reason,"provenance":{"source_step":state.get("trajectory_motion_evidence_phase","repaired"),
+          "final_selection_reason":reason,"provenance":{"source_step":state.get("step8b_evidence_type",state.get("trajectory_motion_evidence_phase","repaired")),
           "llm_role":"interval_policy_review_only","numeric_repair_role":"deterministic_executor",
           "epoch_id":epoch_id,"frozen_policy_version":frozen_policy["version"],"original_observations_preserved":True}}
         records.append(rec);material[track["video_id"]].append({"track_id":track["track_id"],
@@ -627,6 +708,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     (policy_root/f"epoch_{epoch_id:04d}.json").write_text(json.dumps(epoch_snapshot,indent=2))
     runtime_state=runtime_monitor.finalize()
     manifest={"version":VERSION,"method":"deterministic_epoch_trajectory_pattern_repair",
+      "input_evidence_type":state.get("step8b_evidence_type","legacy_trajectory_motion_evidence"),
       "execution_flow":["epoch_boundary_activation","freeze_versioned_policy","symbolic_abstraction",
       "deterministic_policy_interpretation","multi_hypothesis_repair","symbolic_validation",
       "interval_statistical_aggregation","single_llm_policy_patch_review","compile_candidate_policy",

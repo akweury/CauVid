@@ -223,6 +223,9 @@ def _threshold_distance_rows(track, validation):
 def build_step8bc_track_video_payload(record):
     """Build the complete, JSON-safe 8B/8C diagnostic payload for one track."""
     track = copy.deepcopy(dict(record.get("symbolic_track", {})))
+    signal_evidence = copy.deepcopy(
+        dict(track.get("source_signal_evidence", {}))
+    )
     validation = copy.deepcopy(dict(track.get("source_validation", {})))
     trajectory_statistics = copy.deepcopy(
         dict(
@@ -278,7 +281,9 @@ def build_step8bc_track_video_payload(record):
         "validation": validation,
         "motion_significance_assessment": motion_significance,
         "fact_decision": fact_decision,
-        "threshold_distances": _threshold_distance_rows(track, validation),
+        "threshold_distances": (
+            _threshold_distance_rows(track, validation) if validation else []
+        ),
     }
     step8c_residual_distances = {
         "pattern_order": list(PATTERNS),
@@ -297,9 +302,10 @@ def build_step8bc_track_video_payload(record):
         ),
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "video_id": str(record.get("video_id", "")),
         "track_id": int(record.get("track_id", -1)),
+        "step8b_signal_evidence": signal_evidence,
         "step8b_metrics": step8b_metrics,
         "step8c_residual_distances": step8c_residual_distances,
         "step8c": {
@@ -534,6 +540,25 @@ def _draw_repair_candidate_table(cv2, panel, payload, x, y, width, height):
 
 
 def _step8b_display_metrics(payload):
+    signal_evidence = copy.deepcopy(
+        dict(payload.get("step8b_signal_evidence", {}))
+    )
+    if signal_evidence:
+        return _flatten_display_scalars(
+            {
+                "evidence_type": "uncertain_signal_evidence",
+                "evidence_confidence": signal_evidence.get(
+                    "evidence_confidence", 0.0
+                ),
+                "signal_reference": dict(
+                    signal_evidence.get("signal_reference", {})
+                ),
+                "descriptors": dict(
+                    signal_evidence.get("descriptors", {})
+                ),
+                "provenance": dict(signal_evidence.get("provenance", {})),
+            }
+        )
     step8b = copy.deepcopy(dict(payload.get("step8b_metrics", {})))
     validation = dict(step8b.get("validation", {}))
     display = {
@@ -565,6 +590,7 @@ def _step8b_display_metrics(payload):
 def _build_step8bc_static_panel(cv2, np, payload, width, height):
     panel = np.full((height, width, 3), (22, 24, 28), dtype=np.uint8)
     step8b = dict(payload.get("step8b_metrics", {}))
+    signal_evidence = dict(payload.get("step8b_signal_evidence", {}))
     validation = dict(step8b.get("validation", {}))
     step8c = dict(payload.get("step8c", {}))
     _text(
@@ -584,9 +610,18 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
         cv2,
         panel,
         (
-            f"8B={validation.get('validation_status', validation.get('status', 'unknown'))} "
-            f"decision={dict(step8b.get('track_facts', {})).get('source_decision', '')} | "
-            f"8C pattern={step8c.get('final_pattern', 'unknown')} "
+            (
+                "8B=uncertain signal evidence "
+                f"confidence={_number(signal_evidence.get('evidence_confidence')):.3f}"
+            )
+            if signal_evidence
+            else (
+                f"8B={validation.get('validation_status', validation.get('status', 'unknown'))} "
+                f"decision={dict(step8b.get('track_facts', {})).get('source_decision', '')}"
+            )
+        )
+        + (
+            f" | 8C pattern={step8c.get('final_pattern', 'unknown')} "
             f"repair={step8c.get('repair_applied', False)} "
             f"validation={step8c.get('final_validation_status', 'unknown')}"
         ),
@@ -599,7 +634,11 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
     _text(
         cv2,
         panel,
-        "8B ALL METRICS, THRESHOLDS, CHECK VALUES, AND SIGNED RULE DISTANCES",
+        (
+            "8B LOW-LEVEL SIGNAL EVIDENCE DESCRIPTORS AND CONFIDENCE"
+            if signal_evidence
+            else "8B ALL METRICS, THRESHOLDS, CHECK VALUES, AND SIGNED RULE DISTANCES"
+        ),
         18,
         108,
         0.39,
@@ -1219,6 +1258,7 @@ def _render_track_html(record, output_path, media=None):
     video_id = str(record.get("video_id", ""))
     track_id = int(record.get("track_id", -1))
     track = dict(record.get("symbolic_track", {}))
+    signal_evidence = dict(track.get("source_signal_evidence", {}))
     validation = dict(track.get("source_validation", {}))
     source_validation = validation.get(
         "validation_status", track.get("source_decision", "unknown")
@@ -1409,6 +1449,22 @@ def _render_track_html(record, output_path, media=None):
         f"<th>{_html_text(residual_id)}<br><span class=\"muted\">before → final</span></th>"
         for residual_id in RESIDUALS
     )
+    if signal_evidence:
+        source_evidence_html = (
+            f'<div class="card">Step 8B evidence<b>'
+            f'{_html_text(signal_evidence.get("evidence_confidence", 0.0))}'
+            "</b></div></div>"
+            "<details><summary>Complete Step 8B low-level signal evidence"
+            "</summary>"
+            f"<pre>{_html_json(signal_evidence)}</pre></details></section>"
+        )
+    else:
+        source_evidence_html = (
+            f'<div class="card">Source validation<b class="{_status_class(source_validation)}">'
+            f"{_html_text(source_validation)}</b></div></div>"
+            "<details><summary>Complete legacy Step 8B validation</summary>"
+            f"<pre>{_html_json(validation)}</pre></details></section>"
+        )
     body = (
         f"<h1>Step 8C trajectory pattern process</h1>"
         f'<p class="muted">Video {_html_text(video_id)} · track {track_id}</p>'
@@ -1423,10 +1479,7 @@ def _render_track_html(record, output_path, media=None):
         f'<div class="card">Direction<b>{_html_text(track.get("direction", "unknown"))}</b></div>'
         f'<div class="card">Persistence<b>{_html_text(_display_value(track.get("persistence")))}</b></div>'
         f'<div class="card">Confidence<b>{_html_text(_display_value(track.get("confidence")))}</b></div>'
-        f'<div class="card">Source validation<b class="{_status_class(source_validation)}">'
-        f"{_html_text(source_validation)}</b></div></div>"
-        "<details><summary>Complete Step 8B validation</summary>"
-        f"<pre>{_html_json(validation)}</pre></details></section>"
+        + source_evidence_html
         + media_section
         + '<section class="panel" id="pattern-residuals">'
         "<h2>All-pattern residual distances</h2>"

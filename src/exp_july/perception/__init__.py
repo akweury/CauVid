@@ -5,6 +5,7 @@ from src.exp_july.perception.pipeline import step6_positions_3d
 from src.exp_july.perception.pipeline import step7_ego_motion
 from src.exp_july.perception.pipeline import step7b_tracklet_repair
 from src.exp_july.perception.pipeline import step8_relative_object_motion
+from src.exp_july.perception.pipeline import step8_trajectory_validation
 from src.exp_july.perception.pipeline import step8a_symbol_grounded_refinement
 from src.exp_july.perception.pipeline import step8a_visual_symbol_grounded
 from src.exp_july.perception.pipeline import step8_visual_relative_motion
@@ -17,6 +18,8 @@ from src.exp_july.perception.pipeline import step10_segment_object_motion
 from src.exp_july.perception.pipeline import step8_trajectory_repair
 from src.exp_july.perception.pipeline import step8_threshold_epoch_begin
 from src.exp_july.perception.pipeline import step8a_relative_object_motion
+from src.exp_july.perception.pipeline import step8b_signal_evidence
+from src.exp_july.perception.pipeline import step8b_uncertain_signal_evidence
 from src.exp_july.perception.pipeline import step8b_trajectory_validation
 from src.exp_july.perception.pipeline import step8c_trajectory_pattern_closed_loop
 from src.exp_july.perception.pipeline import step8d_pattern_refined_validation

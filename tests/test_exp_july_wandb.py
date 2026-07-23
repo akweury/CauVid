@@ -17,7 +17,7 @@ _PERCEPTION_EXPORTS = (
     "step8_trajectory_repair",
     "step8_threshold_epoch_begin",
     "step8a_relative_object_motion",
-    "step8b_trajectory_validation",
+    "step8b_signal_evidence",
     "step8c_trajectory_pattern_closed_loop",
     "step8d_pattern_refined_validation",
     "step8e_semantic_protection",

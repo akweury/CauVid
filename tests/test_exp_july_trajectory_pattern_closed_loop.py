@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.exp_july.perception.adaptive_motion_repair import _evaluate, _recompute_motion
+from src.exp_july.perception.adaptive_motion_repair import _recompute_motion
+from src.exp_july.perception.pipeline import _uncertain_signal_evidence_video
 from src.exp_july.perception.trajectory_pattern_closed_loop import (
     PATTERNS,
     RESIDUALS,
@@ -32,17 +33,6 @@ def observations():
 
 def state():
     obs = observations()
-    ev = _evaluate(obs, 6)
-    trajectory = {
-        "track_id": 7,
-        "primary_label": "car",
-        "trajectory_observations": obs,
-        "trajectory_statistics": ev["statistics"],
-        "uncertainty": ev["uncertainty"],
-        "provenance": ev["decision"]["provenance_summary"],
-        "causal_motion_fact_validation": ev["validation"],
-        "fact_decision_status": ev["decision"]["decision"],
-    }
     frames = []
     for row in obs:
         motion = dict(row["motion"])
@@ -65,19 +55,18 @@ def state():
                 ],
             }
         )
+    relative_video = {
+        "video_id": "demo",
+        "num_frames": 6,
+        "frames": frames,
+    }
     return {
         "videos": ["demo"],
-        "trajectory_motion_evidence_phase": "repaired",
-        "trajectory_motion_evidence": [
-            {
-                "video_id": "demo",
-                "num_frames": 6,
-                "trajectory_motion_evidence": [trajectory],
-            }
+        "step8b_evidence_type": "uncertain_signal_evidence",
+        "uncertain_signal_evidence": [
+            _uncertain_signal_evidence_video(relative_video)
         ],
-        "relative_object_motion": [
-            {"video_id": "demo", "num_frames": 6, "frames": frames}
-        ],
+        "relative_object_motion": [relative_video],
         "ego_motion": [{"video_id": "demo", "frames": []}],
     }
 
@@ -282,6 +271,17 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             self.assertTrue((root / "dashboard" / "dashboard_manifest.json").exists())
 
         record = result["trajectory_pattern_records"][0]
+        self.assertEqual(
+            record["symbolic_track"]["source_evidence_type"],
+            "uncertain_signal_evidence",
+        )
+        self.assertIn("signal_descriptors", record["symbolic_track"])
+        self.assertNotIn("source_validation", record["symbolic_track"])
+        self.assertNotIn("source_decision", record["symbolic_track"])
+        self.assertEqual(
+            result["trajectory_pattern_manifest"]["input_evidence_type"],
+            "uncertain_signal_evidence",
+        )
         self.assertEqual(len(record["pattern_candidates"]), len(PATTERNS))
         for candidate in record["pattern_candidates"]:
             self.assertEqual(set(candidate["residual_vector"]), set(RESIDUALS))
@@ -330,7 +330,11 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
     def test_statistics_update_and_promotion_splits_are_video_disjoint(self):
         source = state()
         source["videos"].append("demo_validation")
-        for key in ("trajectory_motion_evidence", "relative_object_motion", "ego_motion"):
+        for key in (
+            "uncertain_signal_evidence",
+            "relative_object_motion",
+            "ego_motion",
+        ):
             duplicate = copy.deepcopy(source[key][0])
             duplicate["video_id"] = "demo_validation"
             source[key].append(duplicate)

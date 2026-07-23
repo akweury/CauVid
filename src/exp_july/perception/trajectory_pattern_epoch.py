@@ -105,7 +105,12 @@ def _case(record):
     selected = record.get("selected_candidate", {})
     return {"video_id": record.get("video_id"), "track_id": record.get("track_id"),
             "object_class": record.get("symbolic_track", {}).get("object_class"),
-            "source_validation": record.get("symbolic_track", {}).get("source_validation", {}).get("validation_status"),
+            "initial_8c_validation": record.get(
+                "initial_8c_validation_status",
+                record.get("symbolic_track", {}).get(
+                    "source_validation", {}
+                ).get("validation_status"),
+            ),
             "final_validation": record.get("final_validation_status"), "repair_applied": bool(record.get("repair_applied")),
             "pattern": record.get("final_pattern"), "residual_improvement": _f(selected.get("residual_improvement")),
             "observation_retention": _f(selected.get("observation_retention", 1), 1),
@@ -174,7 +179,12 @@ def policy_metrics(records, policy):
             invalid += status == "invalid"; improvement += _f(chosen.get("residual_improvement")); retention += _f(chosen.get("observation_retention", 1), 1)
             critical += bool(chosen.get("new_anomalies")) or not chosen.get("class_consistent", True)
         else:
-            invalid += record.get("symbolic_track", {}).get("source_validation", {}).get("validation_status") == "invalid"
+            invalid += record.get(
+                "initial_8c_validation_status",
+                record.get("symbolic_track", {}).get(
+                    "source_validation", {}
+                ).get("validation_status"),
+            ) == "invalid"
             retention += 1.0
     count = len(records)
     return {"track_count": count, "accepted_repairs": accepted, "invalid_after": invalid,

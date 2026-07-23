@@ -15,7 +15,7 @@ from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step8_trajectory_repair
 from src.exp_july.perception import step8_threshold_epoch_begin
 from src.exp_july.perception import step8a_relative_object_motion
-from src.exp_july.perception import step8b_trajectory_validation
+from src.exp_july.perception import step8b_signal_evidence
 from src.exp_july.perception import step8c_trajectory_pattern_closed_loop
 from src.exp_july.perception import step8d_pattern_refined_validation
 from src.exp_july.perception import step8e_semantic_protection
@@ -161,17 +161,17 @@ def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
         "08a_relative_motion",
         lambda: step8a_relative_object_motion(position_state, repaired_state),
     )
-    # Activate a pending threshold policy once and freeze it for Steps 8B-8F.
+    # Activate a pending threshold policy once and freeze it for Steps 8C-8F.
     relative_motion_state = _tracked_step(
         tracker,
         "08_threshold_epoch_begin",
         lambda: step8_threshold_epoch_begin(relative_motion_state),
     )
-    # Step 8B: validate trajectories once, after ID-producing repair.
+    # Step 8B: abstract uncertain position/vx/vz signals without classifying motion.
     relative_motion_state = _tracked_step(
         tracker,
-        "08b_trajectory_validation",
-        lambda: step8b_trajectory_validation(ego_state, relative_motion_state),
+        "08b_uncertain_signal_evidence",
+        lambda: step8b_signal_evidence(relative_motion_state),
     )
     # Step 8C: run the iterative trajectory-pattern residual and repair loop.
     relative_motion_state = _tracked_step(

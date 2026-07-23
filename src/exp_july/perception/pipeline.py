@@ -63,6 +63,7 @@ _VIS_EGO_METHOD_COLORS = {
     "refined": (80, 220, 80),
     "ransac": (60, 140, 255),
 }
+_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 1
 _CAUSAL_FILTER_OUT_VERSION = 2
 _TRAJECTORY_VALIDATION_THRESHOLDS = {
     "max_valid_frame_gap": 3,
@@ -1978,6 +1979,497 @@ def _trajectory_uncertainty(observations, statistics):
     }
 
 
+def _clamp_unit(value):
+    return float(max(0.0, min(1.0, _safe_float(value))))
+
+
+def _linear_signal_descriptor(samples, evidence_confidence):
+    """Summarize one numeric signal without assigning a motion hypothesis."""
+    points = sorted(
+        (
+            int(frame_index),
+            _safe_float(value),
+        )
+        for frame_index, value in samples
+        if math.isfinite(_safe_float(value))
+    )
+    if not points:
+        return {
+            "trend": "unobserved",
+            "level": "unobserved",
+            "confidence": 0.0,
+            "sample_count": 0,
+            "start": None,
+            "end": None,
+            "delta": None,
+            "slope_per_frame": None,
+            "mean": None,
+            "standard_deviation": None,
+            "step_sign_consistency": 0.0,
+            "linear_fit_coherence": 0.0,
+        }
+
+    frames = [row[0] for row in points]
+    values = [row[1] for row in points]
+    count = len(values)
+    start = values[0]
+    end = values[-1]
+    delta = end - start
+    mean_value = sum(values) / count
+    variance = sum((value - mean_value) ** 2 for value in values) / count
+    standard_deviation = math.sqrt(max(0.0, variance))
+    frame_mean = sum(frames) / count
+    denominator = sum((frame - frame_mean) ** 2 for frame in frames)
+    slope = (
+        sum(
+            (frame - frame_mean) * (value - mean_value)
+            for frame, value in points
+        )
+        / denominator
+        if denominator > 0.0
+        else 0.0
+    )
+    predictions = [
+        mean_value + slope * (frame - frame_mean) for frame in frames
+    ]
+    rmse = math.sqrt(
+        sum(
+            (value - prediction) ** 2
+            for value, prediction in zip(values, predictions)
+        )
+        / count
+    )
+    value_range = max(values) - min(values)
+    fit_scale = max(
+        1e-6,
+        value_range,
+        abs(delta),
+        standard_deviation,
+    )
+    fit_coherence = _clamp_unit(1.0 - rmse / fit_scale)
+
+    steps = [
+        (right_value - left_value) / max(1, right_frame - left_frame)
+        for (left_frame, left_value), (right_frame, right_value)
+        in zip(points, points[1:])
+    ]
+    epsilon = max(
+        1e-6,
+        1e-3 * max(1.0, max(abs(value) for value in values)),
+    )
+    nonzero_steps = [step for step in steps if abs(step) > epsilon]
+    if abs(delta) <= epsilon and abs(slope) <= epsilon:
+        trend = "stable"
+        step_sign_consistency = (
+            1.0
+            if not nonzero_steps
+            else _clamp_unit(1.0 - len(nonzero_steps) / max(1, len(steps)))
+        )
+    else:
+        expected_sign = 1.0 if slope >= 0.0 else -1.0
+        agreeing = sum(
+            1 for step in nonzero_steps if step * expected_sign > 0.0
+        )
+        step_sign_consistency = (
+            agreeing / len(nonzero_steps) if nonzero_steps else 0.0
+        )
+        if step_sign_consistency >= 0.6:
+            trend = "increasing" if expected_sign > 0.0 else "decreasing"
+        else:
+            trend = "mixed"
+
+    positive = sum(value > epsilon for value in values)
+    negative = sum(value < -epsilon for value in values)
+    near_zero = count - positive - negative
+    if near_zero == count:
+        level = "near_zero"
+    elif positive / count >= 0.7:
+        level = "positive"
+    elif negative / count >= 0.7:
+        level = "negative"
+    else:
+        level = "mixed"
+
+    sample_support = min(1.0, max(0.0, (count - 1) / 4.0))
+    confidence = _clamp_unit(
+        evidence_confidence
+        * sample_support
+        * (0.55 * fit_coherence + 0.45 * step_sign_consistency)
+    )
+    return {
+        "trend": trend,
+        "level": level,
+        "confidence": confidence,
+        "sample_count": count,
+        "start": float(start),
+        "end": float(end),
+        "delta": float(delta),
+        "slope_per_frame": float(slope),
+        "mean": float(mean_value),
+        "standard_deviation": float(standard_deviation),
+        "step_sign_consistency": float(step_sign_consistency),
+        "linear_fit_coherence": float(fit_coherence),
+    }
+
+
+def _observation_quality_descriptor(observations, statistics):
+    count = int(statistics.get("num_observations", len(observations)))
+    coverage_span = _safe_float(
+        statistics.get("temporal_coverage_in_span", 0.0)
+    )
+    coverage_video = _safe_float(
+        statistics.get("temporal_coverage_in_video", 0.0)
+    )
+    observed_ratio = _safe_float(statistics.get("observed_ratio", 0.0))
+    repaired_ratio = _safe_float(statistics.get("repaired_ratio", 0.0))
+    merged_ratio = _safe_float(statistics.get("merged_ratio", 0.0))
+    motion_ratio = _safe_float(statistics.get("has_motion_ratio", 0.0))
+    scores = [
+        _safe_float(dict(row.get("uncertainty", {})).get("score", 0.0))
+        for row in observations
+    ]
+    source_uncertainties = [
+        _safe_float(
+            dict(row.get("uncertainty", {})).get(
+                "source_uncertainty", 0.0
+            )
+        )
+        for row in observations
+    ]
+    mean_score = sum(scores) / len(scores) if scores else 0.0
+    mean_source_uncertainty = (
+        sum(source_uncertainties) / len(source_uncertainties)
+        if source_uncertainties
+        else 1.0
+    )
+    sample_support = min(1.0, count / 5.0)
+    confidence = _clamp_unit(
+        sample_support
+        * (
+            0.25 * coverage_span
+            + 0.20 * observed_ratio
+            + 0.20 * mean_score
+            + 0.20 * motion_ratio
+            + 0.15 * (1.0 - mean_source_uncertainty)
+        )
+    )
+    if count < 2:
+        state = "single_observation"
+    elif coverage_span < 0.5:
+        state = "sparse_observations"
+    elif repaired_ratio + merged_ratio >= 0.25:
+        state = "repair_supported_observations"
+    elif observed_ratio >= 0.8 and coverage_span >= 0.8:
+        state = "dense_observed_samples"
+    else:
+        state = "mixed_observation_sources"
+    return {
+        "state": state,
+        "confidence": confidence,
+        "metrics": {
+            "observation_count": count,
+            "temporal_coverage_in_span": float(coverage_span),
+            "temporal_coverage_in_video": float(coverage_video),
+            "observed_ratio": float(observed_ratio),
+            "repaired_ratio": float(repaired_ratio),
+            "merged_ratio": float(merged_ratio),
+            "samples_with_velocity_ratio": float(motion_ratio),
+            "mean_sample_score": float(mean_score),
+            "mean_source_uncertainty": float(mean_source_uncertainty),
+        },
+    }
+
+
+def _axis_signal_descriptor(
+    observations,
+    *,
+    position_index,
+    velocity_key,
+    axis,
+    evidence_confidence,
+):
+    position_samples = []
+    velocity_samples = []
+    for row in observations:
+        frame_index = int(row.get("frame_index", -1))
+        position = list(row.get("position_3d", []))
+        if frame_index >= 0 and len(position) > position_index:
+            position_samples.append((frame_index, position[position_index]))
+        motion = dict(row.get("motion", {}))
+        if frame_index >= 0 and bool(motion.get("has_rel_motion", False)):
+            velocity_samples.append((frame_index, motion.get(velocity_key, 0.0)))
+    position = _linear_signal_descriptor(
+        position_samples, evidence_confidence
+    )
+    velocity = _linear_signal_descriptor(
+        velocity_samples, evidence_confidence
+    )
+    available = [
+        row["confidence"]
+        for row in (position, velocity)
+        if row["sample_count"] > 0
+    ]
+    return {
+        "axis": axis,
+        "state": position["trend"],
+        "confidence": (
+            float(sum(available) / len(available)) if available else 0.0
+        ),
+        "position_signal": position,
+        "velocity_signal": velocity,
+    }
+
+
+def _temporal_coherence_descriptor(
+    observations,
+    statistics,
+    longitudinal,
+    lateral,
+    evidence_confidence,
+):
+    count = len(observations)
+    max_gap = int(statistics.get("max_frame_gap", 0))
+    mean_gap = _safe_float(statistics.get("mean_frame_gap", 0.0))
+    gap_coherence = _clamp_unit(1.0 / (1.0 + max(0.0, mean_gap - 1.0)))
+    signal_coherences = [
+        _safe_float(
+            descriptor.get("position_signal", {}).get(
+                "linear_fit_coherence", 0.0
+            )
+        )
+        for descriptor in (longitudinal, lateral)
+    ]
+    position_coherence = (
+        sum(signal_coherences) / len(signal_coherences)
+        if signal_coherences
+        else 0.0
+    )
+    sample_support = min(1.0, max(0.0, (count - 1) / 4.0))
+    confidence = _clamp_unit(
+        evidence_confidence
+        * sample_support
+        * (0.55 * gap_coherence + 0.45 * position_coherence)
+    )
+    if count < 2:
+        state = "limited_samples"
+    elif max_gap <= 1:
+        state = "continuous_samples"
+    elif max_gap <= 3:
+        state = "intermittent_samples"
+    else:
+        state = "fragmented_samples"
+    return {
+        "state": state,
+        "confidence": confidence,
+        "metrics": {
+            "observation_count": count,
+            "max_frame_gap": max_gap,
+            "mean_frame_gap": float(mean_gap),
+            "gap_coherence": float(gap_coherence),
+            "position_fit_coherence": float(position_coherence),
+        },
+    }
+
+
+def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
+    observations = [
+        _trajectory_observation_from_motion_object(
+            frame_index,
+            track_data["frames"][frame_index],
+        )
+        for frame_index in sorted(track_data.get("frames", {}))
+    ]
+    statistics = _trajectory_statistics(observations, video_num_frames)
+    quality = _observation_quality_descriptor(observations, statistics)
+    evidence_confidence = _safe_float(quality.get("confidence", 0.0))
+    longitudinal = _axis_signal_descriptor(
+        observations,
+        position_index=2,
+        velocity_key="rel_vz",
+        axis="z",
+        evidence_confidence=evidence_confidence,
+    )
+    lateral = _axis_signal_descriptor(
+        observations,
+        position_index=0,
+        velocity_key="rel_vx",
+        axis="x",
+        evidence_confidence=evidence_confidence,
+    )
+    speed_samples = []
+    for row in observations:
+        motion = dict(row.get("motion", {}))
+        if not bool(motion.get("has_rel_motion", False)):
+            continue
+        speed_samples.append(
+            (
+                int(row.get("frame_index", -1)),
+                math.hypot(
+                    _safe_float(motion.get("rel_vx", 0.0)),
+                    _safe_float(motion.get("rel_vz", 0.0)),
+                ),
+            )
+        )
+    speed = _linear_signal_descriptor(speed_samples, evidence_confidence)
+    speed_descriptor = {
+        "state": speed["trend"],
+        "confidence": speed["confidence"],
+        "speed_signal": speed,
+    }
+    coherence = _temporal_coherence_descriptor(
+        observations,
+        statistics,
+        longitudinal,
+        lateral,
+        evidence_confidence,
+    )
+    descriptor_confidences = [
+        _safe_float(row.get("confidence", 0.0))
+        for row in (
+            quality,
+            longitudinal,
+            lateral,
+            speed_descriptor,
+            coherence,
+        )
+    ]
+    frame_indices = [int(row.get("frame_index", -1)) for row in observations]
+    return {
+        "track_id": int(track_id),
+        "primary_label": str(
+            statistics.get(
+                "primary_label", track_data.get("label", "unknown")
+            )
+        ),
+        "observed_label_summary": {
+            "primary_label": str(
+                statistics.get(
+                    "primary_label", track_data.get("label", "unknown")
+                )
+            ),
+            "label_counts": dict(statistics.get("label_counts", {})),
+        },
+        "signal_reference": {
+            "frame_indices": frame_indices,
+            "frame_start": min(frame_indices) if frame_indices else -1,
+            "frame_end": max(frame_indices) if frame_indices else -1,
+            "observation_count": len(frame_indices),
+            "source_state_key": "relative_object_motion",
+        },
+        "evidence_confidence": float(
+            sum(descriptor_confidences)
+            / max(1, len(descriptor_confidences))
+        ),
+        "descriptors": {
+            "observation_quality": quality,
+            "longitudinal_trend": longitudinal,
+            "lateral_trend": lateral,
+            "speed_trend": speed_descriptor,
+            "temporal_coherence": coherence,
+        },
+        "provenance": {
+            "source_counts": dict(statistics.get("source_counts", {})),
+            "observed_count": int(statistics.get("observed_count", 0)),
+            "repaired_count": int(statistics.get("repaired_count", 0)),
+            "merged_count": int(statistics.get("merged_count", 0)),
+            "abstraction_source": "step8a_relative_object_motion",
+        },
+    }
+
+
+def _relative_signal_fingerprint(relative_video):
+    digest = hashlib.sha256()
+    digest.update(
+        str(relative_video.get("video_id", "")).encode("utf-8")
+    )
+    for frame_offset, frame in enumerate(relative_video.get("frames", [])):
+        frame_index = int(frame.get("frame_index", frame_offset))
+        for obj in sorted(
+            frame.get("objects", []),
+            key=lambda row: (
+                str(row.get("track_id", "")),
+                str(row.get("object_index", "")),
+            ),
+        ):
+            payload = {
+                "frame_index": frame_index,
+                "track_id": obj.get("track_id"),
+                "object_index": obj.get("object_index"),
+                "label": obj.get("frame_label", obj.get("label")),
+                "bbox": obj.get("bbox", obj.get("box")),
+                "position_3d": obj.get(
+                    "position_3d", obj.get("relative_position_3d")
+                ),
+                "rel_vx": obj.get("rel_vx"),
+                "rel_vz": obj.get("rel_vz"),
+                "rel_speed": obj.get("rel_speed"),
+                "has_rel_motion": obj.get("has_rel_motion"),
+                "score": obj.get("score"),
+                "source": obj.get("source"),
+                "source_type": obj.get("source_type"),
+            }
+            digest.update(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            )
+    return digest.hexdigest()
+
+
+def _uncertain_signal_evidence_video(
+    relative_video,
+    source_signal_fingerprint=None,
+):
+    frame_indices, tracks = _relative_motion_track_index(relative_video)
+    video_num_frames = int(
+        relative_video.get("num_frames", len(frame_indices))
+    )
+    track_evidence = [
+        _uncertain_track_signal_evidence(
+            track_id,
+            track_data,
+            video_num_frames,
+        )
+        for track_id, track_data in sorted(tracks.items())
+    ]
+    confidences = [
+        _safe_float(row.get("evidence_confidence", 0.0))
+        for row in track_evidence
+    ]
+    return {
+        "version": _UNCERTAIN_SIGNAL_EVIDENCE_VERSION,
+        "evidence_type": "uncertain_signal_evidence",
+        "abstraction_level": "low_level_observable_signal",
+        "video_id": str(relative_video.get("video_id", "")),
+        "source_signal_fingerprint": (
+            source_signal_fingerprint
+            or _relative_signal_fingerprint(relative_video)
+        ),
+        "num_frames": video_num_frames,
+        "num_tracks": len(track_evidence),
+        "num_observations": sum(
+            int(row.get("signal_reference", {}).get("observation_count", 0))
+            for row in track_evidence
+        ),
+        "mean_evidence_confidence": float(
+            sum(confidences) / len(confidences) if confidences else 0.0
+        ),
+        "semantic_motion_classification": False,
+        "symbolic_reasoning": False,
+        "descriptor_names": [
+            "observation_quality",
+            "longitudinal_trend",
+            "lateral_trend",
+            "speed_trend",
+            "temporal_coherence",
+        ],
+        "track_signal_evidence": track_evidence,
+    }
+
+
 def _ratio_larger_to_smaller(value_a, value_b):
     a = max(1e-6, abs(_safe_float(value_a)))
     b = max(1e-6, abs(_safe_float(value_b)))
@@ -2596,7 +3088,7 @@ def _fact_decision_for_trajectory(validation, significance, provenance, uncertai
             "motion_significance": motion_significance,
             "confidence_score": float(confidence_score),
         },
-        "notes": "Final 8B fact decision for symbolic-layer admission; it preserves provenance and reasons for explanation.",
+        "notes": "Post-pattern validation decision for symbolic-layer admission; it preserves provenance and reasons for explanation.",
     }
 
 
@@ -3965,11 +4457,196 @@ def step8_visual_relative_motion(
     }
 
 
+def step8b_uncertain_signal_evidence(
+    relative_motion_state,
+    *,
+    output_subdir="08b_uncertain_signal_evidence",
+    step_label="8b",
+):
+    """Abstract Step 8A samples into low-level uncertainty-aware evidence."""
+    relative_motion = relative_motion_state.get("relative_object_motion", [])
+    output_root = get_pipeline_output_root() / output_subdir
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    evidence_videos = []
+    cached_videos = 0
+    progress = tqdm(
+        relative_motion,
+        desc=f"[step {step_label}] uncertain_signal_evidence",
+        unit="video",
+    )
+    for relative_video in progress:
+        video_id = str(relative_video.get("video_id", ""))
+        progress.set_postfix_str(video_id, refresh=False)
+        output_dir = output_root / video_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = output_dir / "uncertain_signal_evidence.json"
+        source_signal_fingerprint = _relative_signal_fingerprint(
+            relative_video
+        )
+        cached, cache_path_changes = relocate_json_cache_file(
+            cache_path,
+            dataset_root=relative_motion_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
+        )
+        cache_valid = (
+            isinstance(cached, dict)
+            and int(cached.get("version", 0))
+            == _UNCERTAIN_SIGNAL_EVIDENCE_VERSION
+            and str(cached.get("evidence_type", ""))
+            == "uncertain_signal_evidence"
+            and str(cached.get("video_id", "")) == video_id
+            and str(cached.get("source_signal_fingerprint", ""))
+            == source_signal_fingerprint
+            and isinstance(cached.get("track_signal_evidence"), list)
+            and not bool(cached.get("semantic_motion_classification", True))
+            and not bool(cached.get("symbolic_reasoning", True))
+        )
+        if cache_valid:
+            cached_videos += 1
+            evidence = cached
+            if cache_path_changes:
+                print(
+                    f"[step {step_label}] relocated cached signal paths "
+                    f"video_id={video_id} paths={len(cache_path_changes)}"
+                )
+        else:
+            evidence = _uncertain_signal_evidence_video(
+                relative_video,
+                source_signal_fingerprint=source_signal_fingerprint,
+            )
+            cache_path.write_text(
+                json.dumps(evidence, indent=2),
+                encoding="utf-8",
+            )
+        evidence_videos.append(evidence)
+
+    total_tracks = sum(
+        int(row.get("num_tracks", 0)) for row in evidence_videos
+    )
+    manifest = {
+        "version": _UNCERTAIN_SIGNAL_EVIDENCE_VERSION,
+        "method": "uncertainty_aware_low_level_signal_abstraction",
+        "evidence_type": "uncertain_signal_evidence",
+        "abstraction_level": "low_level_observable_signal",
+        "semantic_motion_classification": False,
+        "symbolic_reasoning": False,
+        "descriptor_names": [
+            "observation_quality",
+            "longitudinal_trend",
+            "lateral_trend",
+            "speed_trend",
+            "temporal_coherence",
+        ],
+        "num_videos": len(evidence_videos),
+        "num_tracks": total_tracks,
+        "num_observations": sum(
+            int(row.get("num_observations", 0)) for row in evidence_videos
+        ),
+        "mean_evidence_confidence": (
+            sum(
+                _safe_float(row.get("mean_evidence_confidence", 0.0))
+                * int(row.get("num_tracks", 0))
+                for row in evidence_videos
+            )
+            / max(1, total_tracks)
+        ),
+        "videos": [
+            {
+                "video_id": row.get("video_id", ""),
+                "num_frames": int(row.get("num_frames", 0)),
+                "num_tracks": int(row.get("num_tracks", 0)),
+                "num_observations": int(row.get("num_observations", 0)),
+                "mean_evidence_confidence": _safe_float(
+                    row.get("mean_evidence_confidence", 0.0)
+                ),
+            }
+            for row in evidence_videos
+        ],
+    }
+    from src.exp_july.perception.uncertain_signal_evidence_visualization import (
+        configured_step8b_visualization_limit,
+        render_step8b_signal_evidence_videos,
+    )
+
+    try:
+        visualization_fps = max(
+            0.1,
+            _safe_float(os.environ.get("CAUVID_STEP8B_VIS_FPS", "10")),
+        )
+        visualization_manifest = render_step8b_signal_evidence_videos(
+            relative_motion,
+            evidence_videos,
+            output_root / "visualizations",
+            fps=visualization_fps,
+            max_tracks_per_video=configured_step8b_visualization_limit(),
+        )
+    except Exception as exc:
+        visualization_manifest = {
+            "version": 1,
+            "format": "mp4",
+            "max_tracks_per_video": configured_step8b_visualization_limit(),
+            "num_selected_tracks": 0,
+            "num_rendered_videos": 0,
+            "num_skipped_videos": 0,
+            "status": (
+                f"visualization_failed:{type(exc).__name__}:"
+                f"{str(exc)[:240]}"
+            ),
+        }
+        print(
+            f"[step {step_label}][visualization] "
+            f"{visualization_manifest['status']}",
+            flush=True,
+        )
+    manifest["visualization"] = visualization_manifest
+    manifest_path = output_root / "uncertain_signal_evidence_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        f"[step {step_label}] uncertain_signal_evidence "
+        f"videos={manifest['num_videos']} "
+        f"cached={cached_videos} "
+        f"tracks={manifest['num_tracks']} "
+        f"observations={manifest['num_observations']} "
+        f"mean_confidence={manifest['mean_evidence_confidence']:.3f} "
+        "semantic_classification=False symbolic_reasoning=False"
+    )
+    result = {
+        **relative_motion_state,
+        "uncertain_signal_evidence": evidence_videos,
+        "uncertain_signal_evidence_manifest": manifest,
+        "uncertain_signal_evidence_manifest_path": manifest_path,
+        "uncertain_signal_evidence_output_root": output_root,
+        "uncertain_signal_evidence_visualizations": list(
+            visualization_manifest.get("rendered", [])
+        ),
+        "uncertain_signal_evidence_visualization_manifest": (
+            visualization_manifest
+        ),
+        "uncertain_signal_evidence_visualization_manifest_path": (
+            visualization_manifest.get("manifest_path")
+        ),
+        "step8b_evidence_type": "uncertain_signal_evidence",
+    }
+    for stale_key in (
+        "trajectory_motion_evidence",
+        "trajectory_motion_evidence_output_root",
+        "trajectory_motion_evidence_phase",
+        "causal_filter_out",
+        "causal_filter_out_output_root",
+    ):
+        result.pop(stale_key, None)
+    return result
+
+
 def step9_temporal_segmentation(ego_state, relative_motion_state):
     return {"videos": ego_state["videos"], "temporal_segments": []}
 
 
-def step8b_causal_filter_out(
+def step8_trajectory_validation(
     ego_state,
     relative_motion_state,
     *,
@@ -4274,6 +4951,24 @@ def step8b_causal_filter_out(
     }
 
 
+def step8b_causal_filter_out(
+    ego_state,
+    relative_motion_state,
+    *,
+    phase="final",
+    output_subdir=None,
+    step_label=None,
+):
+    """Compatibility alias for the validator now used only after Step 8C."""
+    return step8_trajectory_validation(
+        ego_state,
+        relative_motion_state,
+        phase=phase,
+        output_subdir=output_subdir,
+        step_label=step_label,
+    )
+
+
 def step8c_prior_guided_ego_motion_refinement(
     ego_state,
     relative_motion_state,
@@ -4504,14 +5199,18 @@ def step8a_relative_object_motion(position_state, repaired_state):
     )
 
 
-def step8b_trajectory_validation(ego_state, state):
-    return step8b_causal_filter_out(
-        ego_state,
+def step8b_signal_evidence(state):
+    return step8b_uncertain_signal_evidence(
         state,
-        phase="repaired",
-        output_subdir="08b_trajectory_validation",
+        output_subdir="08b_uncertain_signal_evidence",
         step_label="8b",
     )
+
+
+def step8b_trajectory_validation(ego_state, state):
+    """Compatibility alias for the refactored non-classifying Step 8B."""
+    del ego_state
+    return step8b_signal_evidence(state)
 
 
 def step8c_trajectory_pattern_closed_loop(state, llm_generate=None):
@@ -4524,7 +5223,7 @@ def step8c_trajectory_pattern_closed_loop(state, llm_generate=None):
 
 
 def step8d_pattern_refined_validation(ego_state, state):
-    return step8b_causal_filter_out(
+    return step8_trajectory_validation(
         ego_state,
         state,
         phase="pattern_refined",
@@ -4551,7 +5250,7 @@ def step8e_visual_semantic_protection(state):
 
 
 def step8f_final_trajectory_validation(ego_state, state):
-    return step8b_causal_filter_out(
+    return step8_trajectory_validation(
         ego_state,
         state,
         phase="final",

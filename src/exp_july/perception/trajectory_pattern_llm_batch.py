@@ -36,28 +36,47 @@ def _residual_summary(candidates):
 
 def compact_track(track,candidates):
     summary=_residual_summary(candidates);validation=dict(track.get("source_validation",{}))
-    return {"track_uid":f"{track.get('video_id','')}::track_{int(track.get('track_id',-1))}",
+    signal_descriptors=dict(track.get("signal_descriptors",{}))
+    compact={"track_uid":f"{track.get('video_id','')}::track_{int(track.get('track_id',-1))}",
       "track_id":int(track.get("track_id",-1)),"video_id":str(track.get("video_id","")),
       "object_class":str(track.get("object_class","unknown")),
       "symbolic_facts":{"direction":track.get("direction"),"persistence":round(_f(track.get("persistence")),4),
         "confidence":round(_f(track.get("confidence")),4),"bbox_size":track.get("bbox_size"),
         "position":track.get("position"),"relative_motion":track.get("relative_motion")},
-      "validation_state":str(validation.get("validation_status",track.get("source_decision","unknown"))),
-      "validation_issues":list(validation.get("rejection_reasons",[])) or list(validation.get("issues",[])),
       "provenance":track.get("provenance",{}),"top_candidate_patterns":summary["ranked_patterns"][:4],
       "normalized_residual_summaries":summary["normalized"],"residual_buckets":summary["buckets"],
       "uncertainty_indicators":{"track_confidence":round(_f(track.get("confidence")),4),
         "top_margin":round((summary["normalized"].get(summary["ranked_patterns"][1],1)-summary["normalized"].get(summary["ranked_patterns"][0],0)) if len(summary["ranked_patterns"])>1 else 1,4)}}
+    if signal_descriptors:
+        compact.update({
+          "source_evidence_type":"uncertain_signal_evidence",
+          "signal_descriptor_states":{
+            key:str(dict(value).get("state","unobserved"))
+            for key,value in signal_descriptors.items()
+          },
+          "signal_descriptor_confidences":{
+            key:round(_f(dict(value).get("confidence",0)),4)
+            for key,value in signal_descriptors.items()
+          },
+        })
+    else:
+        compact.update({
+          "validation_state":str(validation.get("validation_status",track.get("source_decision","unknown"))),
+          "validation_issues":list(validation.get("rejection_reasons",[])) or list(validation.get("issues",[])),
+        })
+    return compact
 
 
 def needs_llm_review(compact):
     top=list(compact["top_candidate_patterns"]);unc=compact["uncertainty_indicators"]
-    issues=[str(value).lower() for value in compact["validation_issues"]];state=compact["validation_state"].lower()
+    issues=[str(value).lower() for value in compact.get("validation_issues",[])];state=str(compact.get("validation_state","")).lower()
     reasons=[]
     if _f(unc["top_margin"])<.08:reasons.append("ambiguous_pattern_margin")
     if state in {"invalid","discard","uncertain","conflict","conflicting","unknown"}:reasons.append("invalid_or_uncertain_validation")
     if issues:reasons.append("validation_conflict")
     if state in {"repair","repaired","repairable","keep_with_uncertainty"}:reasons.append("repairable_track")
+    if any(_f(value)<.35 for value in compact.get("signal_descriptor_confidences",{}).values()):
+        reasons.append("low_confidence_signal_evidence")
     if top and top[0]=="unknown":reasons.append("unknown_top_pattern")
     return bool(reasons),reasons
 
@@ -73,7 +92,8 @@ def _signature(compact):
       "bbox_size_type":type(facts.get("bbox_size")).__name__,
       "top_candidate_patterns":compact.get("top_candidate_patterns",[])[:3]}
     normalized={"object_class":compact["object_class"],"symbolic_facts":normalized_facts,
-      "validation_state":compact["validation_state"],"validation_issues":compact["validation_issues"],
+      "validation_state":compact.get("validation_state"),"validation_issues":compact.get("validation_issues",[]),
+      "signal_descriptor_states":compact.get("signal_descriptor_states",{}),
       "residual_buckets":compact["residual_buckets"]}
     return hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
 

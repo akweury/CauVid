@@ -20,17 +20,45 @@ from src.exp_july.perception.trajectory_pattern_visualization import (
 
 
 def _record(video_id, track_id):
-    step_metrics = {
-        "max_bbox_center_step_px_per_frame": 10.0 + track_id,
-        "max_bbox_center_step_diag_ratio": 0.10 + track_id / 1000.0,
-        "max_bbox_size_ratio": 1.10 + track_id / 1000.0,
-        "max_depth_step_per_frame": 0.20 + track_id / 1000.0,
-        "raw_max_depth_step_per_frame": 0.30 + track_id / 1000.0,
-        "max_rel_velocity_delta": 0.40 + track_id / 1000.0,
-        "max_rel_speed": 0.50 + track_id / 1000.0,
-        "legacy_max_rel_velocity_delta": 0.60 + track_id / 1000.0,
-        "legacy_max_rel_speed": 0.70 + track_id / 1000.0,
-        "direction_reversal_count": track_id % 3,
+    signal_evidence = {
+        "evidence_confidence": 0.8 + track_id / 1000.0,
+        "signal_reference": {
+            "frame_indices": [0, 1, 2],
+            "observation_count": 3,
+        },
+        "descriptors": {
+            "observation_quality": {
+                "state": "dense_observed_samples",
+                "confidence": 0.91,
+                "metrics": {"observed_ratio": 1.0},
+            },
+            "longitudinal_trend": {
+                "state": "decreasing",
+                "confidence": 0.86,
+                "position_signal": {"slope_per_frame": -0.2},
+                "velocity_signal": {"level": "negative"},
+            },
+            "lateral_trend": {
+                "state": "increasing",
+                "confidence": 0.84,
+                "position_signal": {"slope_per_frame": 0.1},
+                "velocity_signal": {"level": "positive"},
+            },
+            "speed_trend": {
+                "state": "stable",
+                "confidence": 0.82,
+                "speed_signal": {"mean": 0.5},
+            },
+            "temporal_coherence": {
+                "state": "continuous_samples",
+                "confidence": 0.93,
+                "metrics": {"max_frame_gap": 1},
+            },
+        },
+        "provenance": {
+            "source_counts": {"observed": 3},
+            "abstraction_source": "step8a_relative_object_motion",
+        },
     }
     pattern_candidates = []
     final_pattern_candidates = []
@@ -67,36 +95,9 @@ def _record(video_id, track_id):
             "relative_motion": {"mean": 1.25, "max": 2.5},
             "persistence": 0.875,
             "confidence": 0.925,
-            "source_decision": "Keep",
-            "source_validation": {
-                "validation_status": "valid",
-                "step_metrics": step_metrics,
-                "thresholds": {
-                    "max_invalid_rel_speed": 20.0,
-                    "max_uncertain_rel_speed": 10.0,
-                },
-                "issues": [
-                    {
-                        "kind": "speed_abnormal_change",
-                        "severity": "uncertain",
-                        "value": 9.875,
-                        "threshold": 10.0,
-                    }
-                ],
-                "checks": {
-                    "speed_abnormal_change": {
-                        "passed": True,
-                        "max_validation_speed": step_metrics["max_rel_speed"],
-                    }
-                },
-                "ego_motion_consistency": {
-                    "selected_velocity_profile": "ego_minus",
-                    "velocity_profiles": [
-                        {"name": "ego_minus", "max_speed": 2.125},
-                        {"name": "ego_plus", "max_speed": 3.375},
-                    ],
-                },
-            },
+            "source_evidence_type": "uncertain_signal_evidence",
+            "source_signal_evidence": signal_evidence,
+            "signal_descriptors": signal_evidence["descriptors"],
         },
         "pattern_candidates": pattern_candidates,
         "final_pattern_candidates": final_pattern_candidates,
@@ -274,28 +275,37 @@ class Step8BCTrackVideoTests(unittest.TestCase):
         counts = Counter(video_id for video_id, _track_id in selected_keys)
         self.assertEqual(counts, {"scene_a": 6, "scene_b": 10})
 
-    def test_payload_keeps_every_8b_metric_and_every_8c_residual_distance(self):
+    def test_payload_keeps_8b_signal_evidence_and_every_8c_residual_distance(self):
         record = _record("scene", 7)
 
         payload = build_step8bc_track_video_payload(record)
 
         self.assertEqual(payload["video_id"], "scene")
         self.assertEqual(payload["track_id"], 7)
+        self.assertEqual(payload["schema_version"], 2)
         serialized = json.dumps(payload, sort_keys=True)
-        step_metrics = record["symbolic_track"]["source_validation"]["step_metrics"]
-        for metric_name, metric_value in step_metrics.items():
-            self.assertIn(metric_name, serialized)
-            self.assertIn(json.dumps(metric_value), serialized)
+        signal_evidence = record["symbolic_track"]["source_signal_evidence"]
+        self.assertEqual(
+            payload["step8b_signal_evidence"], signal_evidence
+        )
+        signal_serialized = json.dumps(
+            payload["step8b_signal_evidence"], sort_keys=True
+        )
         for required_8b_field in (
-            "max_frame_gap",
-            "has_motion_ratio",
-            "checks",
-            "issues",
-            "thresholds",
-            "ego_minus",
-            "ego_plus",
+            "observation_quality",
+            "longitudinal_trend",
+            "lateral_trend",
+            "speed_trend",
+            "temporal_coherence",
+            "evidence_confidence",
         ):
             self.assertIn(required_8b_field, serialized)
+        for forbidden_8b_field in (
+            "validation_status",
+            "source_decision",
+            "fact_decision_status",
+        ):
+            self.assertNotIn(forbidden_8b_field, signal_serialized)
         for candidate_key in ("pattern_candidates", "final_pattern_candidates"):
             for candidate in record[candidate_key]:
                 self.assertIn(candidate["pattern_id"], serialized)
