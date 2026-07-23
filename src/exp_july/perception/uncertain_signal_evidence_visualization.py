@@ -124,61 +124,6 @@ def _fit_text(cv2, text, max_width, scale=0.46, thickness=1):
     return value + suffix
 
 
-def _format_metric_lines(metrics, items_per_line=4):
-    parts = []
-    for key, value in metrics.items():
-        label = str(key).replace("_", " ")
-        if isinstance(value, float):
-            rendered = f"{value:.3f}"
-        else:
-            rendered = str(value)
-        parts.append(f"{label}={rendered}")
-    return [
-        " | ".join(parts[offset : offset + items_per_line])
-        for offset in range(0, len(parts), items_per_line)
-    ] or ["no metrics"]
-
-
-def _signal_summary(prefix, signal):
-    return [
-        (
-            f"{prefix}: trend={signal.get('trend', 'unobserved')} | "
-            f"level={signal.get('level', 'unobserved')} | "
-            f"confidence={_number(signal.get('confidence')):.3f} | "
-            f"n={int(_number(signal.get('sample_count', 0)))} | "
-            f"start={_number(signal.get('start')):+.3f} | "
-            f"end={_number(signal.get('end')):+.3f} | "
-            f"delta={_number(signal.get('delta')):+.3f}"
-        ),
-        (
-            f"{prefix}: slope/frame={_number(signal.get('slope_per_frame')):+.3f} | "
-            f"mean={_number(signal.get('mean')):+.3f} | "
-            f"std={_number(signal.get('standard_deviation')):.3f} | "
-            f"linear fit={_number(signal.get('linear_fit_coherence')):.3f} | "
-            f"step sign consistency={_number(signal.get('step_sign_consistency')):.3f}"
-        ),
-    ]
-
-
-def _descriptor_detail_lines(name, descriptor):
-    if name == "observation_quality":
-        return _format_metric_lines(dict(descriptor.get("metrics", {})))
-    if name in {"longitudinal_trend", "lateral_trend"}:
-        return [
-            *_signal_summary(
-                "position", dict(descriptor.get("position_signal", {}))
-            ),
-            *_signal_summary(
-                "velocity", dict(descriptor.get("velocity_signal", {}))
-            ),
-        ]
-    if name == "speed_trend":
-        return _signal_summary(
-            "speed", dict(descriptor.get("speed_signal", {}))
-        )
-    return _format_metric_lines(dict(descriptor.get("metrics", {})))
-
-
 def _build_evidence_panel(cv2, np, evidence, width, height):
     panel = np.full((height, width, 3), (22, 25, 31), dtype=np.uint8)
     confidence = _number(evidence.get("evidence_confidence", 0.0))
@@ -189,7 +134,7 @@ def _build_evidence_panel(cv2, np, evidence, width, height):
         panel,
         "STEP 8B | UNCERTAIN LOW-LEVEL SIGNAL EVIDENCE",
         margin,
-        38,
+        93,
         0.72,
         (250, 250, 250),
         2,
@@ -203,13 +148,13 @@ def _build_evidence_panel(cv2, np, evidence, width, height):
             f"overall evidence confidence={confidence:.3f}"
         ),
         margin,
-        70,
+        125,
         0.56,
         confidence_color,
         2,
     )
     bar_x = margin
-    bar_y = 86
+    bar_y = 141
     bar_width = width - margin * 2
     cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_width, bar_y + 15), (65, 70, 78), -1)
     cv2.rectangle(
@@ -221,107 +166,44 @@ def _build_evidence_panel(cv2, np, evidence, width, height):
     )
 
     descriptors = dict(evidence.get("descriptors", {}))
-    y = 142
+    y = 231
     for name in _DESCRIPTOR_ORDER:
         descriptor = dict(descriptors.get(name, {}))
         descriptor_confidence = _number(descriptor.get("confidence", 0.0))
         color = _confidence_color(descriptor_confidence)
-        title = (
-            f"{name.replace('_', ' ').upper()} | "
-            f"state={descriptor.get('state', 'unobserved')} | "
-            f"confidence={descriptor_confidence:.3f}"
+        title = name.replace("_", " ").upper()
+        state = str(descriptor.get("state", "unobserved"))
+        _put_text(cv2, panel, title, margin, y, 0.56, (235, 238, 243), 2)
+        _put_text(
+            cv2,
+            panel,
+            f"{state} | confidence {descriptor_confidence:.3f}",
+            370,
+            y,
+            0.56,
+            color,
+            2,
         )
-        _put_text(cv2, panel, title, margin, y, 0.56, color, 2)
-        small_bar_x = max(margin, width - 330)
-        cv2.rectangle(panel, (small_bar_x, y - 16), (width - margin, y - 5), (65, 70, 78), -1)
+        small_bar_x = max(680, int(width * 0.62))
         cv2.rectangle(
             panel,
-            (small_bar_x, y - 16),
+            (small_bar_x, y - 18),
+            (width - margin, y - 4),
+            (65, 70, 78),
+            -1,
+        )
+        cv2.rectangle(
+            panel,
+            (small_bar_x, y - 18),
             (
                 small_bar_x
                 + int(round((width - margin - small_bar_x) * max(0.0, min(1.0, descriptor_confidence)))),
-                y - 5,
+                y - 4,
             ),
             color,
             -1,
         )
-        y += 28
-        for detail in _descriptor_detail_lines(name, descriptor):
-            _put_text(
-                cv2,
-                panel,
-                _fit_text(cv2, detail, width - margin * 2, 0.48),
-                margin + 14,
-                y,
-                0.48,
-                (215, 220, 228),
-                1,
-            )
-            y += 28
-        y += 12
-
-    signal_reference = dict(evidence.get("signal_reference", {}))
-    provenance = dict(evidence.get("provenance", {}))
-    label_summary = dict(evidence.get("observed_label_summary", {}))
-    _put_text(
-        cv2,
-        panel,
-        _fit_text(
-            cv2,
-            (
-                "SIGNAL REFERENCE | "
-                f"frames={signal_reference.get('frame_start', -1)}.."
-                f"{signal_reference.get('frame_end', -1)} | "
-                f"observations={signal_reference.get('observation_count', 0)} | "
-                f"source={signal_reference.get('source_state_key', '')}"
-            ),
-            width - margin * 2,
-            0.43,
-        ),
-        margin,
-        y,
-        0.43,
-        (195, 205, 218),
-        1,
-    )
-    y += 25
-    _put_text(
-        cv2,
-        panel,
-        _fit_text(
-            cv2,
-            (
-                "PROVENANCE | "
-                f"observed={provenance.get('observed_count', 0)} | "
-                f"repaired={provenance.get('repaired_count', 0)} | "
-                f"merged={provenance.get('merged_count', 0)} | "
-                f"sources={provenance.get('source_counts', {})}"
-            ),
-            width - margin * 2,
-            0.43,
-        ),
-        margin,
-        y,
-        0.43,
-        (195, 205, 218),
-        1,
-    )
-    y += 25
-    _put_text(
-        cv2,
-        panel,
-        _fit_text(
-            cv2,
-            f"OBSERVED LABEL COUNTS | {label_summary.get('label_counts', {})}",
-            width - margin * 2,
-            0.43,
-        ),
-        margin,
-        y,
-        0.43,
-        (195, 205, 218),
-        1,
-    )
+        y += 52
 
     legend_y = height - 34
     _put_text(cv2, panel, "confidence magnitude:", margin, legend_y, 0.44, (220, 220, 220), 1)
@@ -377,6 +259,134 @@ def _current_signal_text(frame_index, obj):
     )
 
 
+def _draw_track_progress_bar(
+    cv2,
+    panel,
+    frame_indices,
+    current_frame,
+    track_objects,
+    width,
+    present_color,
+):
+    """Draw frame-level object presence immediately below the scene."""
+    indices = sorted(frame_indices)
+    if not indices:
+        return
+    left = 24
+    right = max(left + 1, width - 24)
+    bar_top = 31
+    bar_bottom = 57
+    bar_width = right - left
+    _put_text(
+        cv2,
+        panel,
+        "TRACK PRESENCE | colored frames contain the object | white marker=current frame",
+        left,
+        22,
+        0.46,
+        (225, 230, 238),
+        1,
+    )
+    cv2.rectangle(
+        panel, (left, bar_top), (right, bar_bottom), (54, 58, 66), -1
+    )
+    count = len(indices)
+    for offset, frame_index in enumerate(indices):
+        x1 = left + int(math.floor(offset * bar_width / count))
+        x2 = left + int(math.ceil((offset + 1) * bar_width / count))
+        color = present_color if frame_index in track_objects else (72, 76, 84)
+        cv2.rectangle(
+            panel,
+            (x1, bar_top + 2),
+            (max(x1, x2 - 1), bar_bottom - 2),
+            color,
+            -1,
+        )
+    try:
+        current_offset = indices.index(current_frame)
+    except ValueError:
+        current_offset = 0
+    marker_x = left + int(
+        round((current_offset + 0.5) * bar_width / count)
+    )
+    cv2.line(
+        panel,
+        (marker_x, bar_top - 4),
+        (marker_x, bar_bottom + 4),
+        (255, 255, 255),
+        4,
+        cv2.LINE_AA,
+    )
+    current_position = current_offset + 1
+    _put_text(
+        cv2,
+        panel,
+        f"{current_position}/{count}",
+        max(left, right - 74),
+        22,
+        0.46,
+        (255, 255, 255),
+        1,
+    )
+
+
+def _draw_bbox_label(
+    cv2,
+    scene,
+    *,
+    box,
+    track_id,
+    object_label,
+    confidence,
+    color,
+):
+    x1, y1, x2, y2 = box
+    scene_height, scene_width = scene.shape[:2]
+    x1 = max(0, min(scene_width - 1, int(x1)))
+    x2 = max(0, min(scene_width - 1, int(x2)))
+    y1 = max(0, min(scene_height - 1, int(y1)))
+    y2 = max(0, min(scene_height - 1, int(y2)))
+    thickness = max(
+        3, int(round(min(scene_width, scene_height) / 260))
+    )
+    cv2.rectangle(
+        scene, (x1, y1), (x2, y2), (0, 0, 0), thickness + 3
+    )
+    cv2.rectangle(scene, (x1, y1), (x2, y2), color, thickness)
+    label = (
+        f"{object_label} | track {track_id} | "
+        f"evidence conf {confidence:.3f}"
+    )
+    font_scale = 0.64
+    text_thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        text_thickness,
+    )
+    text_x = max(4, min(x1, scene_width - text_width - 12))
+    text_y = y1 - 10 if y1 >= text_height + baseline + 18 else y1 + text_height + 16
+    text_y = max(text_height + 8, min(scene_height - baseline - 5, text_y))
+    cv2.rectangle(
+        scene,
+        (text_x - 4, text_y - text_height - 7),
+        (text_x + text_width + 7, text_y + baseline + 5),
+        (0, 0, 0),
+        -1,
+    )
+    _put_text(
+        cv2,
+        scene,
+        label,
+        text_x,
+        text_y,
+        font_scale,
+        color,
+        text_thickness,
+    )
+
+
 def _render_step8b_track_video(
     relative_video,
     evidence,
@@ -410,7 +420,7 @@ def _render_step8b_track_video(
     scene_height = int(round(source_height * canvas_width / source_width))
     if scene_height % 2:
         scene_height += 1
-    panel_height = 900
+    panel_height = 540
     total_height = scene_height + panel_height
     track_id = _track_id(evidence.get("track_id"))
     track_objects = _track_object_map(relative_video, track_id)
@@ -432,7 +442,8 @@ def _render_step8b_track_video(
         return None, "writer_open_failed"
 
     try:
-        for frame_index in sorted(frames):
+        frame_indices = sorted(frames)
+        for frame_index in frame_indices:
             frame = frames[frame_index]
             image_path = str(frame.get("image_path", ""))
             image = cv2.imread(image_path) if image_path else None
@@ -454,9 +465,24 @@ def _render_step8b_track_video(
                         box[3] * scale_y,
                     )
                 ]
-                thickness = max(3, int(round(min(canvas_width, scene_height) / 260)))
-                cv2.rectangle(scene, (x1, y1), (x2, y2), (0, 0, 0), thickness + 3)
-                cv2.rectangle(scene, (x1, y1), (x2, y2), confidence_color, thickness)
+                object_label = str(
+                    obj.get(
+                        "frame_label",
+                        obj.get(
+                            "label",
+                            evidence.get("primary_label", "unknown"),
+                        ),
+                    )
+                )
+                _draw_bbox_label(
+                    cv2,
+                    scene,
+                    box=(x1, y1, x2, y2),
+                    track_id=track_id,
+                    object_label=object_label,
+                    confidence=confidence,
+                    color=confidence_color,
+                )
             header = (
                 f"{relative_video.get('video_id', '')} | track {track_id} | "
                 f"evidence confidence {confidence:.3f}"
@@ -465,7 +491,18 @@ def _render_step8b_track_video(
             _put_text(cv2, scene, header, 14, 33, 0.68, confidence_color, 2)
 
             panel = static_panel.copy()
-            cv2.rectangle(panel, (0, 104), (canvas_width, 128), (33, 37, 44), -1)
+            _draw_track_progress_bar(
+                cv2,
+                panel,
+                frame_indices,
+                frame_index,
+                track_objects,
+                canvas_width,
+                confidence_color,
+            )
+            cv2.rectangle(
+                panel, (0, 167), (canvas_width, 197), (33, 37, 44), -1
+            )
             _put_text(
                 cv2,
                 panel,
@@ -473,13 +510,13 @@ def _render_step8b_track_video(
                     cv2,
                     _current_signal_text(frame_index, obj),
                     canvas_width - 48,
-                    0.48,
+                    0.52,
                 ),
                 24,
-                122,
-                0.48,
+                190,
+                0.52,
                 (245, 245, 245),
-                1,
+                2,
             )
             writer.write(cv2.vconcat([scene, panel]))
             if progress_callback:

@@ -1,9 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.exp_july.perception.uncertain_signal_evidence_visualization import (
+    _build_evidence_panel,
+    _draw_bbox_label,
+    _draw_track_progress_bar,
     render_step8b_signal_evidence_videos,
     select_step8b_visualization_tracks,
 )
@@ -25,6 +28,87 @@ def _evidence_video(video_id, confidences):
 
 
 class Step8BVisualizationTests(unittest.TestCase):
+    def test_panel_shows_key_descriptor_rows_without_detailed_statistics(self):
+        cv2 = MagicMock()
+        cv2.FONT_HERSHEY_SIMPLEX = 0
+        cv2.LINE_AA = 16
+        cv2.getTextSize.return_value = ((100, 20), 5)
+        np = MagicMock()
+        evidence = {
+            "track_id": 7,
+            "primary_label": "car",
+            "evidence_confidence": 0.42,
+            "provenance": {"source_counts": {"detailed-source": 99}},
+            "descriptors": {
+                name: {
+                    "state": "stable",
+                    "confidence": 0.5,
+                    "metrics": {"detailed_metric": 123.456},
+                }
+                for name in (
+                    "observation_quality",
+                    "longitudinal_trend",
+                    "lateral_trend",
+                    "speed_trend",
+                    "temporal_coherence",
+                )
+            },
+        }
+
+        _build_evidence_panel(cv2, np, evidence, 1280, 540)
+        rendered_text = [
+            str(call.args[1]) for call in cv2.putText.call_args_list
+        ]
+        self.assertTrue(any("OBSERVATION QUALITY" in row for row in rendered_text))
+        self.assertTrue(any("TEMPORAL COHERENCE" in row for row in rendered_text))
+        self.assertFalse(any("detailed_metric" in row for row in rendered_text))
+        self.assertFalse(any("detailed-source" in row for row in rendered_text))
+
+    def test_progress_bar_marks_present_frames_and_bbox_shows_object_label(self):
+        cv2 = MagicMock()
+        cv2.FONT_HERSHEY_SIMPLEX = 0
+        cv2.LINE_AA = 16
+        cv2.getTextSize.return_value = ((360, 20), 5)
+        present_color = (20, 220, 60)
+
+        _draw_track_progress_bar(
+            cv2,
+            MagicMock(),
+            [0, 1, 2, 3],
+            2,
+            {1: {}, 3: {}},
+            1280,
+            present_color,
+        )
+        present_rectangles = [
+            call
+            for call in cv2.rectangle.call_args_list
+            if len(call.args) >= 5 and call.args[3] == present_color
+        ]
+        self.assertEqual(len(present_rectangles), 2)
+        cv2.line.assert_called_once()
+
+        scene = MagicMock()
+        scene.shape = (720, 1280, 3)
+        _draw_bbox_label(
+            cv2,
+            scene,
+            box=(100, 120, 240, 300),
+            track_id=7,
+            object_label="pedestrian",
+            confidence=0.42,
+            color=present_color,
+        )
+        rendered_text = [
+            str(call.args[1]) for call in cv2.putText.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                "pedestrian | track 7 | evidence conf 0.420" in text
+                for text in rendered_text
+            )
+        )
+
     def test_selection_is_deterministic_capped_and_prefers_uncertain_tracks(self):
         evidence = [
             _evidence_video(
