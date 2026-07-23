@@ -52,23 +52,41 @@ run_container() {
   local rounds="${2:-3}"
   local max_step="${3:-18}"
   local model_mounts=()
-  local llm_env_args=()
+  local runtime_env_args=()
 
-  # Forward LLM configuration from the host. Using `-e NAME` keeps secrets out
-  # of this script and lets Docker read the value from the current environment.
-  [[ -n "${OPENAI_API_KEY:-}" ]] && llm_env_args+=(-e OPENAI_API_KEY)
-  [[ -n "${OPENAI_BASE_URL:-}" ]] && llm_env_args+=(-e OPENAI_BASE_URL)
-  [[ -n "${OPENAI_MODEL:-}" ]] && llm_env_args+=(-e OPENAI_MODEL)
-  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
-  [[ -n "${CAUVID_STEP8C_LLM_TIMEOUT_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_TIMEOUT_SECONDS)
-  [[ -n "${CAUVID_STEP8C_LLM_MAX_ATTEMPTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_MAX_ATTEMPTS)
-  [[ -n "${CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS)
-  [[ -n "${CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
+  # Forward runtime service configuration from the host. Using `-e NAME`
+  # keeps secrets out of this script and lets Docker read the current value.
+  [[ -n "${OPENAI_API_KEY:-}" ]] && runtime_env_args+=(-e OPENAI_API_KEY)
+  [[ -n "${OPENAI_BASE_URL:-}" ]] && runtime_env_args+=(-e OPENAI_BASE_URL)
+  [[ -n "${OPENAI_MODEL:-}" ]] && runtime_env_args+=(-e OPENAI_MODEL)
+  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
+  [[ -n "${CAUVID_STEP8C_LLM_TIMEOUT_SECONDS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8C_LLM_TIMEOUT_SECONDS)
+  [[ -n "${CAUVID_STEP8C_LLM_MAX_ATTEMPTS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8C_LLM_MAX_ATTEMPTS)
+  [[ -n "${CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8C_LLM_RETRY_BACKOFF_SECONDS)
+  [[ -n "${CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
+  [[ -n "${WANDB_API_KEY:-}" ]] && runtime_env_args+=(-e WANDB_API_KEY)
+  [[ -n "${WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e WANDB_PROJECT)
+  [[ -n "${WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e WANDB_ENTITY)
+  [[ -n "${WANDB_MODE:-}" ]] && runtime_env_args+=(-e WANDB_MODE)
+  [[ -n "${WANDB_BASE_URL:-}" ]] && runtime_env_args+=(-e WANDB_BASE_URL)
+  [[ -n "${WANDB_DIR:-}" ]] && runtime_env_args+=(-e WANDB_DIR)
+  [[ -n "${WANDB_INIT_TIMEOUT:-}" ]] && runtime_env_args+=(-e WANDB_INIT_TIMEOUT)
+  [[ -n "${CAUVID_WANDB_ENABLED:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENABLED)
+  [[ -n "${CAUVID_WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_PROJECT)
+  [[ -n "${CAUVID_WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENTITY)
+  [[ -n "${CAUVID_WANDB_RUN_NAME:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_RUN_NAME)
+  [[ -n "${CAUVID_WANDB_GROUP:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_GROUP)
+  [[ -n "${CAUVID_WANDB_TAGS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_TAGS)
+  [[ -n "${CAUVID_WANDB_MODE:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MODE)
+  [[ -n "${CAUVID_WANDB_DIR:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_DIR)
+  [[ -n "${CAUVID_WANDB_INIT_TIMEOUT_SECONDS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_INIT_TIMEOUT_SECONDS)
+  [[ -n "${CAUVID_WANDB_MAX_VIDEOS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_VIDEOS)
+  [[ -n "${CAUVID_WANDB_MAX_ARTIFACT_FILES:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_ARTIFACT_FILES)
 
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
@@ -87,7 +105,7 @@ run_container() {
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/.cache/torch" \
     "${model_mounts[@]}" \
-    "${llm_env_args[@]}" \
+    "${runtime_env_args[@]}" \
     -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \
@@ -106,16 +124,34 @@ run_container() {
 
 shell_container() {
   local model_mounts=()
-  local llm_env_args=()
-  [[ -n "${OPENAI_API_KEY:-}" ]] && llm_env_args+=(-e OPENAI_API_KEY)
-  [[ -n "${OPENAI_BASE_URL:-}" ]] && llm_env_args+=(-e OPENAI_BASE_URL)
-  [[ -n "${OPENAI_MODEL:-}" ]] && llm_env_args+=(-e OPENAI_MODEL)
-  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
-  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && llm_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
+  local runtime_env_args=()
+  [[ -n "${OPENAI_API_KEY:-}" ]] && runtime_env_args+=(-e OPENAI_API_KEY)
+  [[ -n "${OPENAI_BASE_URL:-}" ]] && runtime_env_args+=(-e OPENAI_BASE_URL)
+  [[ -n "${OPENAI_MODEL:-}" ]] && runtime_env_args+=(-e OPENAI_MODEL)
+  [[ -n "${CAUVID_STEP8_PATTERN_LLM_MODEL:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_PATTERN_LLM_MODEL)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MIN_CONFLICTS)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_TARGET_QUANTILE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_RELATIVE_CHANGE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_MAX_UNPROTECTED_FLIP_RATE)
+  [[ -n "${CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION:-}" ]] && runtime_env_args+=(-e CAUVID_STEP8_THRESHOLD_VALIDATION_FRACTION)
+  [[ -n "${WANDB_API_KEY:-}" ]] && runtime_env_args+=(-e WANDB_API_KEY)
+  [[ -n "${WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e WANDB_PROJECT)
+  [[ -n "${WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e WANDB_ENTITY)
+  [[ -n "${WANDB_MODE:-}" ]] && runtime_env_args+=(-e WANDB_MODE)
+  [[ -n "${WANDB_BASE_URL:-}" ]] && runtime_env_args+=(-e WANDB_BASE_URL)
+  [[ -n "${WANDB_DIR:-}" ]] && runtime_env_args+=(-e WANDB_DIR)
+  [[ -n "${WANDB_INIT_TIMEOUT:-}" ]] && runtime_env_args+=(-e WANDB_INIT_TIMEOUT)
+  [[ -n "${CAUVID_WANDB_ENABLED:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENABLED)
+  [[ -n "${CAUVID_WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_PROJECT)
+  [[ -n "${CAUVID_WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENTITY)
+  [[ -n "${CAUVID_WANDB_RUN_NAME:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_RUN_NAME)
+  [[ -n "${CAUVID_WANDB_GROUP:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_GROUP)
+  [[ -n "${CAUVID_WANDB_TAGS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_TAGS)
+  [[ -n "${CAUVID_WANDB_MODE:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MODE)
+  [[ -n "${CAUVID_WANDB_DIR:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_DIR)
+  [[ -n "${CAUVID_WANDB_INIT_TIMEOUT_SECONDS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_INIT_TIMEOUT_SECONDS)
+  [[ -n "${CAUVID_WANDB_MAX_VIDEOS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_VIDEOS)
+  [[ -n "${CAUVID_WANDB_MAX_ARTIFACT_FILES:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_ARTIFACT_FILES)
   [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
   [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
 
@@ -133,7 +169,7 @@ shell_container() {
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/.cache/torch" \
     "${model_mounts[@]}" \
-    "${llm_env_args[@]}" \
+    "${runtime_env_args[@]}" \
     -e PYTHONPATH=/app:/app/external/Depth-Anything-3/src \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \

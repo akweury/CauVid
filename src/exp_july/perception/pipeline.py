@@ -4396,6 +4396,10 @@ def step8e_iterative_trajectory_pattern_repair(
     manifest = dict(result.get("trajectory_pattern_manifest", {}))
     visualizations = list(result.get("trajectory_pattern_visualizations", []))
     summaries = list(result.get("trajectory_pattern_video_summaries", []))
+    track_videos = list(result.get("trajectory_pattern_track_videos", []))
+    track_video_skipped = list(
+        result.get("trajectory_pattern_track_video_skipped", [])
+    )
     skipped = list(result.get("trajectory_pattern_visualization_skipped", []))
     dashboard_path = str(result.get("trajectory_pattern_dashboard_path", ""))
     runtime_dashboard_path = str(result.get("trajectory_pattern_runtime_dashboard_path", ""))
@@ -4414,6 +4418,8 @@ def step8e_iterative_trajectory_pattern_repair(
         f"cache_hits={int(manifest.get('llm_cache_hits', 0))} "
         f"single_escalations={int(manifest.get('llm_escalated_to_single', 0))} "
         f"track_visuals={len(visualizations)} "
+        f"track_videos={len(track_videos)} "
+        f"track_video_skipped={len(track_video_skipped)} "
         f"video_summaries={len(summaries)} "
         f"visual_skipped={len(skipped)} "
         f"dashboard={dashboard_path} "

@@ -28,6 +28,7 @@ rtpt
 kagglehub
 imageio
 imageio-ffmpeg
+wandb
 
 # Depth Anything 3 dependencies
 omegaconf

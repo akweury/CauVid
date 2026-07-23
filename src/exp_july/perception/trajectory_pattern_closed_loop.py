@@ -163,6 +163,12 @@ def symbolic_tracks(evidence):
                 "relative_motion":dict(stats.get("rel_speed",{})),"direction":direction,
                 "persistence":f(stats.get("temporal_coverage_in_video",len(obs)/max(1,nf))),
                 "confidence":f(unc.get("confidence_score",0)),
+                "trajectory_statistics":copy.deepcopy(stats),
+                "uncertainty":copy.deepcopy(unc),
+                "motion_significance_assessment":copy.deepcopy(
+                    tr.get("motion_significance_assessment",{})
+                ),
+                "fact_decision":copy.deepcopy(tr.get("fact_decision",{})),
                 "provenance":copy.deepcopy(tr.get("provenance",{})),"observations":obs,
                 "source_validation":copy.deepcopy(tr.get("causal_motion_fact_validation",{})),
                 "source_decision":str(tr.get("fact_decision_status",""))})

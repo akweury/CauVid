@@ -46,6 +46,34 @@ export OPENAI_API_KEY="..."
 For a compatible non-default endpoint, also set `OPENAI_BASE_URL` and either
 `OPENAI_MODEL` or `CAUVID_STEP8_PATTERN_LLM_MODEL`.
 
+The pipeline creates one Weights & Biases run per invocation. It records
+per-step latency and compact state/manifest metrics, uploads a capped sample of
+the important Step 8H videos, and stores generated manifests, review packages,
+policy decisions, and threshold-conflict reports as a capped audit artifact.
+With an API key it uses online mode; without one it runs offline and writes W&B
+data below the pipeline output's `wandb` directory. Rebuild an existing Docker
+image once to install the new dependency:
+
+```bash
+./d2.sh build
+```
+
+```bash
+export WANDB_API_KEY="..."
+export CAUVID_WANDB_PROJECT="cauvid-exp-july"
+export CAUVID_WANDB_RUN_NAME="step8-review"
+./d2.sh run --gpu 0 --step 8 --data 50
+```
+
+Tracking is fail-open: an initialization or upload problem is reported but
+does not stop video processing. Use `CAUVID_WANDB_ENABLED=0` to disable it, or
+set `CAUVID_WANDB_MODE=offline` explicitly. `CAUVID_WANDB_MAX_VIDEOS` (default
+4, one representative track per video) and
+`CAUVID_WANDB_MAX_ARTIFACT_FILES` (default 200) control upload volume.
+`CAUVID_WANDB_INIT_TIMEOUT_SECONDS` defaults to 30 seconds. A relative
+`CAUVID_WANDB_DIR` is resolved below the pipeline output; an absolute override
+used with Docker must be a container-visible path.
+
 Step 8C processes each epoch deterministically with a frozen versioned policy.
 It aggregates track outcomes and requests one candidate policy patch per review
 interval (500 tracks by default). Configure the interval on the host with:
