@@ -93,10 +93,175 @@ def step18_causal_refinement(selection_state, rounds=3):
     return {"videos": selection_state["videos"], "refined_final_rules": active_rules, "rounds": history}
 
 
+def _sum_fields(rows, *field_names):
+    total = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        for field_name in field_names:
+            try:
+                total += int(row.get(field_name, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def _step_data_error(step_name, state):
+    """Return a clear error when a completed stage has no processable data."""
+    if not isinstance(state, dict):
+        return f"returned {type(state).__name__}; expected a state dictionary"
+
+    videos = state.get("videos", [])
+    if not videos:
+        detail = ""
+        if step_name == "01_init":
+            detail = (
+                f" under dataset_root={state.get('dataset_root')}; "
+                "check the dataset mount/path and requested video IDs"
+            )
+        return f"produced no videos{detail}"
+
+    if step_name == "02_detection":
+        detections = state.get("detections", [])
+        if not detections:
+            return "produced no per-video detection results"
+        if _sum_fields(
+            detections, "num_detections", "num_candidate_detections"
+        ) <= 0:
+            return "produced zero object detections"
+
+    if step_name == "03_tracking":
+        tracks = state.get("tracks", [])
+        if not tracks:
+            return "produced no per-video tracking results"
+        if _sum_fields(tracks, "num_tracks", "num_candidate_tracks") <= 0:
+            return "produced zero object tracks"
+
+    if step_name == "06_positions_3d":
+        positions = state.get("positions_3d", [])
+        if not positions:
+            return "produced no per-video 3D-position results"
+        if _sum_fields(
+            positions,
+            "num_objects_with_3d",
+            "num_candidate_objects_with_3d",
+        ) <= 0:
+            return "produced zero objects with 3D positions"
+
+    if step_name == "07_ego_motion":
+        ego_motion = state.get("ego_motion", [])
+        if not ego_motion:
+            return "produced no per-video ego-motion results"
+        if _sum_fields(ego_motion, "num_frames_with_ego_motion") <= 0:
+            return "produced zero frames with ego-motion estimates"
+
+    if step_name == "08_trajectory_repair":
+        repaired = state.get("positions_3d", state.get("tracklet_repair", []))
+        if not repaired:
+            return "produced no repaired per-video position results"
+        if _sum_fields(
+            repaired,
+            "num_objects_with_3d",
+            "num_candidate_objects_with_3d",
+            "num_objects_total",
+        ) <= 0:
+            return "produced zero repaired object-position observations"
+
+    if step_name in {
+        "08a_relative_motion",
+        "08_threshold_epoch_begin",
+        "08e_semantic_protection",
+        "08e_semantic_visualization",
+        "08g_ego_refinement",
+        "08h_important_video_visualization",
+        "08i_threshold_calibration",
+    }:
+        relative_motion = state.get("relative_object_motion", [])
+        if not relative_motion:
+            return "contains no per-video relative-motion results"
+        if _sum_fields(
+            relative_motion,
+            "num_objects_with_rel_motion",
+            "num_objects_total",
+        ) <= 0:
+            return "contains zero relative-motion object tracks"
+
+    if step_name == "08b_uncertain_signal_evidence":
+        manifest = state.get("uncertain_signal_evidence_manifest", {})
+        if int(manifest.get("num_videos", 0) or 0) <= 0:
+            return "produced no signal-evidence videos"
+        if int(manifest.get("num_tracks", 0) or 0) <= 0:
+            return "produced zero signal-evidence tracks"
+        if int(manifest.get("num_observations", 0) or 0) <= 0:
+            return "produced zero signal-evidence observations"
+
+    if step_name == "08c_trajectory_pattern":
+        manifest = state.get("trajectory_pattern_manifest", {})
+        if int(manifest.get("num_videos", 0) or 0) <= 0:
+            return "processed no trajectory-pattern videos"
+        if int(manifest.get("num_tracks", 0) or 0) <= 0:
+            return "processed zero trajectory-pattern tracks"
+
+    if step_name in {"08d_pattern_validation", "08f_final_validation"}:
+        evidence = state.get("trajectory_motion_evidence", [])
+        if not evidence:
+            return "produced no per-video trajectory-validation evidence"
+        if _sum_fields(evidence, "num_trajectories") <= 0:
+            return "produced zero validated trajectories"
+
+    required_collections = {
+        "09_temporal_segmentation": (
+            "temporal_segments",
+            "produced no temporal segments",
+        ),
+        "10_segment_motion": (
+            "segment_object_motion",
+            "produced no segment-level object motion",
+        ),
+        "11_important_objects": (
+            "important_objects",
+            "selected no important objects",
+        ),
+        "12_logic_atoms": ("logic_atoms", "produced no logic atoms"),
+        "13_target_heads": ("target_heads", "produced no target heads"),
+        "14_rule_examples": (
+            "temporal_rule_examples",
+            "produced no temporal rule examples",
+        ),
+        "15_candidate_rules": (
+            "candidate_rules",
+            "produced no candidate rules",
+        ),
+        "16_rule_pool": ("ranked_rules", "produced an empty rule pool"),
+        "17_rule_selection": ("final_rules", "selected no final rules"),
+        "18_causal_refinement": (
+            "rounds",
+            "produced no causal-refinement rounds",
+        ),
+    }
+    required = required_collections.get(step_name)
+    if required is not None:
+        field_name, message = required
+        if not state.get(field_name):
+            return message
+
+    return None
+
+
+def _require_step_data(step_name, state):
+    error = _step_data_error(step_name, state)
+    if error is None:
+        return state
+    message = f"[pipeline][error] {step_name}: {error}; stopping pipeline"
+    print(message, file=sys.stderr, flush=True)
+    raise RuntimeError(message)
+
+
 def _tracked_step(tracker, step_name, operation):
     started = time.perf_counter()
     try:
         state = operation()
+        _require_step_data(step_name, state)
     except BaseException as exc:
         tracker.log_failure(
             step_name,
