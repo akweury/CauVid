@@ -29,6 +29,9 @@ services:
       - CAUVID_NUSCENES_PATH=/dataset/nuScenes
       - CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output
       - CAUVID_OUTPUT_PATH=/output/output
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - CAUVID_WANDB_BASE_URL=${CAUVID_WANDB_BASE_URL:-https://api.wandb.ai}
+      - CAUVID_WANDB_MODE=${CAUVID_WANDB_MODE:-online}
       - CAUVID_PIPELINE_ARGS=${CAUVID_PIPELINE_ARGS:-}
     networks:
       - cauvid-network
@@ -62,6 +65,9 @@ services:
       - CAUVID_NUSCENES_PATH=/dataset/nuScenes
       - CAUVID_PIPELINE_OUTPUT_PATH=/output/pipeline_output
       - CAUVID_OUTPUT_PATH=/output/output
+      - WANDB_API_KEY=${WANDB_API_KEY:-}
+      - CAUVID_WANDB_BASE_URL=${CAUVID_WANDB_BASE_URL:-https://api.wandb.ai}
+      - CAUVID_WANDB_MODE=${CAUVID_WANDB_MODE:-online}
     networks:
       - cauvid-network
     stdin_open: true

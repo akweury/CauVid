@@ -74,7 +74,7 @@ def _all_keys(value):
 
 
 class Step8BSignalEvidenceTests(unittest.TestCase):
-    def test_video_abstraction_emits_only_low_level_signal_descriptors(self):
+    def test_video_abstraction_emits_only_six_scalar_observable_cues(self):
         evidence = _uncertain_signal_evidence_video(_relative_video())
 
         self.assertEqual(evidence["evidence_type"], "uncertain_signal_evidence")
@@ -88,36 +88,29 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
         self.assertEqual(track["track_id"], 7)
         self.assertNotIn("trajectory_observations", track)
         self.assertEqual(
-            set(track["descriptors"]),
+            set(track),
+            {"track_id", "primary_label", "observable_cues"},
+        )
+        self.assertEqual(
+            set(track["observable_cues"]),
             {
-                "observation_quality",
-                "longitudinal_trend",
-                "lateral_trend",
-                "speed_trend",
-                "temporal_coherence",
+                "leftness",
+                "rightness",
+                "approach",
+                "recede",
+                "acceleration",
+                "deceleration",
             },
         )
-        self.assertEqual(
-            track["descriptors"]["longitudinal_trend"]["state"],
-            "decreasing",
-        )
-        self.assertEqual(
-            track["descriptors"]["longitudinal_trend"][
-                "velocity_signal"
-            ]["level"],
-            "negative",
-        )
-        self.assertEqual(
-            track["descriptors"]["lateral_trend"]["state"],
-            "increasing",
-        )
-        self.assertEqual(
-            track["descriptors"]["temporal_coherence"]["state"],
-            "continuous_samples",
-        )
-        for descriptor in track["descriptors"].values():
-            self.assertGreaterEqual(descriptor["confidence"], 0.0)
-            self.assertLessEqual(descriptor["confidence"], 1.0)
+        self.assertEqual(track["observable_cues"]["leftness"], 0.0)
+        self.assertGreater(track["observable_cues"]["rightness"], 0.0)
+        self.assertGreater(track["observable_cues"]["approach"], 0.0)
+        self.assertEqual(track["observable_cues"]["recede"], 0.0)
+        self.assertGreater(track["observable_cues"]["acceleration"], 0.0)
+        self.assertEqual(track["observable_cues"]["deceleration"], 0.0)
+        for cue in track["observable_cues"].values():
+            self.assertGreaterEqual(cue, 0.0)
+            self.assertLessEqual(cue, 1.0)
 
         forbidden = {
             "validation_status",
@@ -129,6 +122,14 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
             "symbolic_layer_eligible",
             "trajectory_pattern",
             "driving_fact",
+            "descriptors",
+            "observation_quality",
+            "longitudinal_trend",
+            "lateral_trend",
+            "speed_trend",
+            "temporal_coherence",
+            "signal_reference",
+            "provenance",
         }
         self.assertFalse(forbidden & _all_keys(evidence))
 
@@ -166,6 +167,17 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
         self.assertEqual(manifest["num_tracks"], 1)
         self.assertFalse(manifest["semantic_motion_classification"])
         self.assertFalse(manifest["symbolic_reasoning"])
+        self.assertEqual(
+            manifest["cue_names"],
+            [
+                "leftness",
+                "rightness",
+                "approach",
+                "recede",
+                "acceleration",
+                "deceleration",
+            ],
+        )
         self.assertEqual(
             manifest["visualization"]["max_tracks_per_video"], 3
         )

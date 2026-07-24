@@ -181,7 +181,13 @@ def symbolic_tracks(evidence,relative_motion=None):
             if low_level:
                 obs=copy.deepcopy(joined.get((vid,track_id),[]))
                 stats=_trajectory_statistics(obs,nf)
-                confidence=f(tr.get("evidence_confidence",0))
+                cues={
+                    key:max(0.0,min(1.0,f(value)))
+                    for key,value in dict(
+                        tr.get("observable_cues",{})
+                    ).items()
+                }
+                confidence=max(cues.values(),default=0.0)
                 unc={
                     "confidence_score":confidence,
                     "uncertainty_score":max(0.0,min(1.0,1.0-confidence)),
@@ -214,7 +220,7 @@ def symbolic_tracks(evidence,relative_motion=None):
                 track.update({
                     "source_evidence_type":"uncertain_signal_evidence",
                     "source_signal_evidence":copy.deepcopy(tr),
-                    "signal_descriptors":copy.deepcopy(tr.get("descriptors",{})),
+                    "observable_cues":copy.deepcopy(cues),
                 })
             else:
                 track.update({
@@ -311,7 +317,7 @@ def residual(pid,track):
 def interpretation_prompt(track,candidates,table):
     public={key:track.get(key) for key in ("video_id","track_id","object_class","position","bbox_size",
       "relative_motion","direction","persistence","confidence","provenance",
-      "source_evidence_type","signal_descriptors")}
+      "source_evidence_type","observable_cues")}
     compact_candidates=[{"pattern_id":row.get("pattern_id"),"residual_vector":row.get("residual_vector",{})}
                         for row in candidates]
     return ("Interpret every pattern residual using only facts, provenance, confidence and statistics. "

@@ -19,8 +19,14 @@ def _evidence_video(video_id, confidences):
             {
                 "track_id": track_id,
                 "primary_label": "car",
-                "evidence_confidence": confidence,
-                "descriptors": {},
+                "observable_cues": {
+                    "leftness": confidence,
+                    "rightness": 0.0,
+                    "approach": 0.0,
+                    "recede": 0.0,
+                    "acceleration": 0.0,
+                    "deceleration": 0.0,
+                },
             }
             for track_id, confidence in confidences.items()
         ],
@@ -28,7 +34,7 @@ def _evidence_video(video_id, confidences):
 
 
 class Step8BVisualizationTests(unittest.TestCase):
-    def test_panel_shows_key_descriptor_rows_without_detailed_statistics(self):
+    def test_panel_shows_only_the_six_scalar_cues(self):
         cv2 = MagicMock()
         cv2.FONT_HERSHEY_SIMPLEX = 0
         cv2.LINE_AA = 16
@@ -37,32 +43,47 @@ class Step8BVisualizationTests(unittest.TestCase):
         evidence = {
             "track_id": 7,
             "primary_label": "car",
-            "evidence_confidence": 0.42,
             "provenance": {"source_counts": {"detailed-source": 99}},
-            "descriptors": {
-                name: {
-                    "state": "stable",
-                    "confidence": 0.5,
-                    "metrics": {"detailed_metric": 123.456},
-                }
-                for name in (
-                    "observation_quality",
-                    "longitudinal_trend",
-                    "lateral_trend",
-                    "speed_trend",
-                    "temporal_coherence",
-                )
+            "observable_cues": {
+                "leftness": 0.1,
+                "rightness": 0.2,
+                "approach": 0.3,
+                "recede": 0.4,
+                "acceleration": 0.5,
+                "deceleration": 0.6,
             },
         }
 
-        _build_evidence_panel(cv2, np, evidence, 1280, 540)
+        _build_evidence_panel(cv2, np, evidence, 820, 1440)
         rendered_text = [
             str(call.args[1]) for call in cv2.putText.call_args_list
         ]
-        self.assertTrue(any("OBSERVATION QUALITY" in row for row in rendered_text))
-        self.assertTrue(any("TEMPORAL COHERENCE" in row for row in rendered_text))
-        self.assertFalse(any("detailed_metric" in row for row in rendered_text))
+        for cue_name in (
+            "LEFTNESS",
+            "RIGHTNESS",
+            "APPROACH",
+            "RECEDE",
+            "ACCELERATION",
+            "DECELERATION",
+        ):
+            self.assertTrue(any(cue_name in row for row in rendered_text))
         self.assertFalse(any("detailed-source" in row for row in rendered_text))
+        cv2.rectangle.assert_not_called()
+        cue_calls = [
+            call
+            for call in cv2.putText.call_args_list
+            if str(call.args[1]) in {
+                "LEFTNESS",
+                "RIGHTNESS",
+                "APPROACH",
+                "RECEDE",
+                "ACCELERATION",
+                "DECELERATION",
+            }
+        ]
+        self.assertTrue(
+            all(call.args[4] >= 1.2 and call.args[6] >= 3 for call in cue_calls)
+        )
 
     def test_progress_bar_marks_present_frames_and_bbox_shows_object_label(self):
         cv2 = MagicMock()
@@ -79,7 +100,12 @@ class Step8BVisualizationTests(unittest.TestCase):
             {1: {}, 3: {}},
             1280,
             present_color,
+            bar_left=100,
+            bar_right=900,
         )
+        background_bar = cv2.rectangle.call_args_list[0]
+        self.assertEqual(background_bar.args[1], (100, 47))
+        self.assertEqual(background_bar.args[2], (900, 83))
         present_rectangles = [
             call
             for call in cv2.rectangle.call_args_list
@@ -96,7 +122,6 @@ class Step8BVisualizationTests(unittest.TestCase):
             box=(100, 120, 240, 300),
             track_id=7,
             object_label="pedestrian",
-            confidence=0.42,
             color=present_color,
         )
         rendered_text = [
@@ -104,7 +129,7 @@ class Step8BVisualizationTests(unittest.TestCase):
         ]
         self.assertTrue(
             any(
-                "pedestrian | track 7 | evidence conf 0.420" in text
+                "pedestrian | ID 7" in text
                 for text in rendered_text
             )
         )
@@ -180,6 +205,13 @@ class Step8BVisualizationTests(unittest.TestCase):
             self.assertEqual(result["max_tracks_per_video"], 3)
             self.assertEqual(result["num_selected_tracks"], 3)
             self.assertEqual(result["num_rendered_videos"], 3)
+            self.assertEqual(result["layout"], "scene_left_evidence_right")
+            self.assertEqual(
+                result["track_progress_position"],
+                "directly_below_original_video",
+            )
+            self.assertEqual(result["canvas_resolution"], [1920, 1440])
+            self.assertEqual(result["canvas_aspect_ratio"], "4:3")
             self.assertEqual(result["num_pruned_stale_artifacts"], 2)
             self.assertFalse(stale_video.exists())
             self.assertEqual(

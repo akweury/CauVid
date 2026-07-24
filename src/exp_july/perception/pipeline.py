@@ -63,7 +63,7 @@ _VIS_EGO_METHOD_COLORS = {
     "refined": (80, 220, 80),
     "ransac": (60, 140, 255),
 }
-_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 1
+_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 2
 _CAUSAL_FILTER_OUT_VERSION = 2
 _TRAJECTORY_VALIDATION_THRESHOLDS = {
     "max_valid_frame_gap": 3,
@@ -2311,29 +2311,55 @@ def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
             )
         )
     speed = _linear_signal_descriptor(speed_samples, evidence_confidence)
-    speed_descriptor = {
-        "state": speed["trend"],
-        "confidence": speed["confidence"],
-        "speed_signal": speed,
-    }
-    coherence = _temporal_coherence_descriptor(
-        observations,
-        statistics,
-        longitudinal,
-        lateral,
-        evidence_confidence,
-    )
-    descriptor_confidences = [
-        _safe_float(row.get("confidence", 0.0))
-        for row in (
-            quality,
-            longitudinal,
-            lateral,
-            speed_descriptor,
-            coherence,
+
+    def directional_cue(axis_descriptor, position_trend, velocity_level):
+        sources = []
+        position_signal = dict(
+            axis_descriptor.get("position_signal", {})
         )
-    ]
-    frame_indices = [int(row.get("frame_index", -1)) for row in observations]
+        velocity_signal = dict(
+            axis_descriptor.get("velocity_signal", {})
+        )
+        if int(position_signal.get("sample_count", 0)) > 1:
+            sources.append(
+                _safe_float(position_signal.get("confidence", 0.0))
+                if position_signal.get("trend") == position_trend
+                else 0.0
+            )
+        if int(velocity_signal.get("sample_count", 0)) > 0:
+            sources.append(
+                _safe_float(velocity_signal.get("confidence", 0.0))
+                if velocity_signal.get("level") == velocity_level
+                else 0.0
+            )
+        return _clamp_unit(
+            sum(sources) / len(sources) if sources else 0.0
+        )
+
+    observable_cues = {
+        "leftness": directional_cue(
+            lateral, "decreasing", "negative"
+        ),
+        "rightness": directional_cue(
+            lateral, "increasing", "positive"
+        ),
+        "approach": directional_cue(
+            longitudinal, "decreasing", "negative"
+        ),
+        "recede": directional_cue(
+            longitudinal, "increasing", "positive"
+        ),
+        "acceleration": (
+            _clamp_unit(speed.get("confidence", 0.0))
+            if speed.get("trend") == "increasing"
+            else 0.0
+        ),
+        "deceleration": (
+            _clamp_unit(speed.get("confidence", 0.0))
+            if speed.get("trend") == "decreasing"
+            else 0.0
+        ),
+    }
     return {
         "track_id": int(track_id),
         "primary_label": str(
@@ -2341,39 +2367,7 @@ def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
                 "primary_label", track_data.get("label", "unknown")
             )
         ),
-        "observed_label_summary": {
-            "primary_label": str(
-                statistics.get(
-                    "primary_label", track_data.get("label", "unknown")
-                )
-            ),
-            "label_counts": dict(statistics.get("label_counts", {})),
-        },
-        "signal_reference": {
-            "frame_indices": frame_indices,
-            "frame_start": min(frame_indices) if frame_indices else -1,
-            "frame_end": max(frame_indices) if frame_indices else -1,
-            "observation_count": len(frame_indices),
-            "source_state_key": "relative_object_motion",
-        },
-        "evidence_confidence": float(
-            sum(descriptor_confidences)
-            / max(1, len(descriptor_confidences))
-        ),
-        "descriptors": {
-            "observation_quality": quality,
-            "longitudinal_trend": longitudinal,
-            "lateral_trend": lateral,
-            "speed_trend": speed_descriptor,
-            "temporal_coherence": coherence,
-        },
-        "provenance": {
-            "source_counts": dict(statistics.get("source_counts", {})),
-            "observed_count": int(statistics.get("observed_count", 0)),
-            "repaired_count": int(statistics.get("repaired_count", 0)),
-            "merged_count": int(statistics.get("merged_count", 0)),
-            "abstraction_source": "step8a_relative_object_motion",
-        },
+        "observable_cues": observable_cues,
     }
 
 
@@ -2435,10 +2429,6 @@ def _uncertain_signal_evidence_video(
         )
         for track_id, track_data in sorted(tracks.items())
     ]
-    confidences = [
-        _safe_float(row.get("evidence_confidence", 0.0))
-        for row in track_evidence
-    ]
     return {
         "version": _UNCERTAIN_SIGNAL_EVIDENCE_VERSION,
         "evidence_type": "uncertain_signal_evidence",
@@ -2451,20 +2441,18 @@ def _uncertain_signal_evidence_video(
         "num_frames": video_num_frames,
         "num_tracks": len(track_evidence),
         "num_observations": sum(
-            int(row.get("signal_reference", {}).get("observation_count", 0))
-            for row in track_evidence
-        ),
-        "mean_evidence_confidence": float(
-            sum(confidences) / len(confidences) if confidences else 0.0
+            len(track_data.get("frames", {}))
+            for track_data in tracks.values()
         ),
         "semantic_motion_classification": False,
         "symbolic_reasoning": False,
-        "descriptor_names": [
-            "observation_quality",
-            "longitudinal_trend",
-            "lateral_trend",
-            "speed_trend",
-            "temporal_coherence",
+        "cue_names": [
+            "leftness",
+            "rightness",
+            "approach",
+            "recede",
+            "acceleration",
+            "deceleration",
         ],
         "track_signal_evidence": track_evidence,
     }
@@ -4499,6 +4487,19 @@ def step8b_uncertain_signal_evidence(
             and str(cached.get("source_signal_fingerprint", ""))
             == source_signal_fingerprint
             and isinstance(cached.get("track_signal_evidence"), list)
+            and all(
+                set(row.get("observable_cues", {}))
+                == {
+                    "leftness",
+                    "rightness",
+                    "approach",
+                    "recede",
+                    "acceleration",
+                    "deceleration",
+                }
+                and "descriptors" not in row
+                for row in cached.get("track_signal_evidence", [])
+            )
             and not bool(cached.get("semantic_motion_classification", True))
             and not bool(cached.get("symbolic_reasoning", True))
         )
@@ -4531,25 +4532,18 @@ def step8b_uncertain_signal_evidence(
         "abstraction_level": "low_level_observable_signal",
         "semantic_motion_classification": False,
         "symbolic_reasoning": False,
-        "descriptor_names": [
-            "observation_quality",
-            "longitudinal_trend",
-            "lateral_trend",
-            "speed_trend",
-            "temporal_coherence",
+        "cue_names": [
+            "leftness",
+            "rightness",
+            "approach",
+            "recede",
+            "acceleration",
+            "deceleration",
         ],
         "num_videos": len(evidence_videos),
         "num_tracks": total_tracks,
         "num_observations": sum(
             int(row.get("num_observations", 0)) for row in evidence_videos
-        ),
-        "mean_evidence_confidence": (
-            sum(
-                _safe_float(row.get("mean_evidence_confidence", 0.0))
-                * int(row.get("num_tracks", 0))
-                for row in evidence_videos
-            )
-            / max(1, total_tracks)
         ),
         "videos": [
             {
@@ -4557,9 +4551,6 @@ def step8b_uncertain_signal_evidence(
                 "num_frames": int(row.get("num_frames", 0)),
                 "num_tracks": int(row.get("num_tracks", 0)),
                 "num_observations": int(row.get("num_observations", 0)),
-                "mean_evidence_confidence": _safe_float(
-                    row.get("mean_evidence_confidence", 0.0)
-                ),
             }
             for row in evidence_videos
         ],
@@ -4611,7 +4602,6 @@ def step8b_uncertain_signal_evidence(
         f"cached={cached_videos} "
         f"tracks={manifest['num_tracks']} "
         f"observations={manifest['num_observations']} "
-        f"mean_confidence={manifest['mean_evidence_confidence']:.3f} "
         "semantic_classification=False symbolic_reasoning=False"
     )
     result = {

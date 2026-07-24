@@ -275,7 +275,7 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             record["symbolic_track"]["source_evidence_type"],
             "uncertain_signal_evidence",
         )
-        self.assertIn("signal_descriptors", record["symbolic_track"])
+        self.assertIn("observable_cues", record["symbolic_track"])
         self.assertNotIn("source_validation", record["symbolic_track"])
         self.assertNotIn("source_decision", record["symbolic_track"])
         self.assertEqual(

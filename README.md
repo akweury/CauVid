@@ -59,15 +59,24 @@ image once to install the new dependency:
 ```
 
 ```bash
+# Sign in to hosted W&B in a browser and create/copy an API key:
+# https://wandb.ai/settings
 export WANDB_API_KEY="..."
 export CAUVID_WANDB_PROJECT="cauvid-exp-july"
 export CAUVID_WANDB_RUN_NAME="step8-review"
 ./d2.sh run --gpu 0 --step 8 --data 50
 ```
 
-Tracking is fail-open: an initialization or upload problem is reported but
-does not stop video processing. Use `CAUVID_WANDB_ENABLED=0` to disable it, or
-set `CAUVID_WANDB_MODE=offline` explicitly. `CAUVID_WANDB_MAX_VIDEOS` (default
+W&B defaults to hosted web tracking in online mode at
+`https://api.wandb.ai`; it does not default to a local W&B server. For a remote
+run, authenticate in the browser at `https://wandb.ai/settings`, then export
+the API key on the server before invoking `d2.sh`. A self-hosted endpoint is
+used only when `CAUVID_WANDB_BASE_URL` is explicitly set.
+
+Tracking is fail-open: a missing login, initialization problem, or upload
+problem is reported but does not stop video processing. Use
+`CAUVID_WANDB_ENABLED=0` to disable it, or set `CAUVID_WANDB_MODE=offline`
+explicitly. `CAUVID_WANDB_MAX_VIDEOS` (default
 4, one representative track per video) and
 `CAUVID_WANDB_MAX_ARTIFACT_FILES` (default 200) control upload volume.
 `CAUVID_WANDB_INIT_TIMEOUT_SECONDS` defaults to 30 seconds. A relative

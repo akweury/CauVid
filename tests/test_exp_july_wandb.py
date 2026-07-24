@@ -195,6 +195,43 @@ class ExpJulyWandbTests(unittest.TestCase):
         self.assertEqual(run.summary["pipeline/steps_logged"], 1)
         run.finish.assert_called_once_with(exit_code=0)
 
+    def test_default_online_tracking_uses_hosted_web_service(self):
+        state = {"videos": ["video-a"]}
+        run = _fake_run()
+        run.url = "https://wandb.ai/test-team/test-project/runs/test-run"
+        wandb = _fake_wandb(run)
+        observed = {}
+
+        def initialize(**kwargs):
+            observed["base_url"] = os.environ.get("WANDB_BASE_URL")
+            observed["mode"] = kwargs.get("mode")
+            return run
+
+        wandb.init.side_effect = initialize
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {
+                "CAUVID_PIPELINE_OUTPUT_PATH": tmp,
+                "WANDB_BASE_URL": "http://localhost:8080",
+            },
+            clear=True,
+        ), patch.dict(sys.modules, {"wandb": wandb}), patch.object(
+            pipeline, "step1_init", return_value=state
+        ):
+            result = pipeline.main(max_step=1, wandb_enabled=True)
+
+        self.assertIs(result, state)
+        self.assertEqual(observed["mode"], "online")
+        self.assertEqual(observed["base_url"], "https://api.wandb.ai")
+        self.assertEqual(
+            run.summary["pipeline/wandb_base_url"],
+            "https://api.wandb.ai",
+        )
+        self.assertEqual(
+            run.summary["pipeline/wandb_web_url"],
+            run.url,
+        )
+
     def test_failure_is_finalized_and_original_error_is_reraised(self):
         run = _fake_run()
         wandb = _fake_wandb(run)

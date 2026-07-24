@@ -547,16 +547,9 @@ def _step8b_display_metrics(payload):
         return _flatten_display_scalars(
             {
                 "evidence_type": "uncertain_signal_evidence",
-                "evidence_confidence": signal_evidence.get(
-                    "evidence_confidence", 0.0
+                "observable_cues": dict(
+                    signal_evidence.get("observable_cues", {})
                 ),
-                "signal_reference": dict(
-                    signal_evidence.get("signal_reference", {})
-                ),
-                "descriptors": dict(
-                    signal_evidence.get("descriptors", {})
-                ),
-                "provenance": dict(signal_evidence.get("provenance", {})),
             }
         )
     step8b = copy.deepcopy(dict(payload.get("step8b_metrics", {})))
@@ -611,8 +604,13 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
         panel,
         (
             (
-                "8B=uncertain signal evidence "
-                f"confidence={_number(signal_evidence.get('evidence_confidence')):.3f}"
+                "8B observable cues: "
+                + ", ".join(
+                    f"{key}={_number(value):.2f}"
+                    for key, value in dict(
+                        signal_evidence.get("observable_cues", {})
+                    ).items()
+                )
             )
             if signal_evidence
             else (
@@ -1451,10 +1449,10 @@ def _render_track_html(record, output_path, media=None):
     )
     if signal_evidence:
         source_evidence_html = (
-            f'<div class="card">Step 8B evidence<b>'
-            f'{_html_text(signal_evidence.get("evidence_confidence", 0.0))}'
+            f'<div class="card">Step 8B observable cues<b>'
+            f'{_html_text(signal_evidence.get("observable_cues", {}))}'
             "</b></div></div>"
-            "<details><summary>Complete Step 8B low-level signal evidence"
+            "<details><summary>Complete Step 8B six-cue evidence"
             "</summary>"
             f"<pre>{_html_json(signal_evidence)}</pre></details></section>"
         )

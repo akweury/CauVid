@@ -21,43 +21,15 @@ from src.exp_july.perception.trajectory_pattern_visualization import (
 
 def _record(video_id, track_id):
     signal_evidence = {
-        "evidence_confidence": 0.8 + track_id / 1000.0,
-        "signal_reference": {
-            "frame_indices": [0, 1, 2],
-            "observation_count": 3,
-        },
-        "descriptors": {
-            "observation_quality": {
-                "state": "dense_observed_samples",
-                "confidence": 0.91,
-                "metrics": {"observed_ratio": 1.0},
-            },
-            "longitudinal_trend": {
-                "state": "decreasing",
-                "confidence": 0.86,
-                "position_signal": {"slope_per_frame": -0.2},
-                "velocity_signal": {"level": "negative"},
-            },
-            "lateral_trend": {
-                "state": "increasing",
-                "confidence": 0.84,
-                "position_signal": {"slope_per_frame": 0.1},
-                "velocity_signal": {"level": "positive"},
-            },
-            "speed_trend": {
-                "state": "stable",
-                "confidence": 0.82,
-                "speed_signal": {"mean": 0.5},
-            },
-            "temporal_coherence": {
-                "state": "continuous_samples",
-                "confidence": 0.93,
-                "metrics": {"max_frame_gap": 1},
-            },
-        },
-        "provenance": {
-            "source_counts": {"observed": 3},
-            "abstraction_source": "step8a_relative_object_motion",
+        "track_id": track_id,
+        "primary_label": "car",
+        "observable_cues": {
+            "leftness": 0.0,
+            "rightness": 0.84,
+            "approach": 0.86,
+            "recede": 0.0,
+            "acceleration": 0.52,
+            "deceleration": 0.0,
         },
     }
     pattern_candidates = []
@@ -97,7 +69,7 @@ def _record(video_id, track_id):
             "confidence": 0.925,
             "source_evidence_type": "uncertain_signal_evidence",
             "source_signal_evidence": signal_evidence,
-            "signal_descriptors": signal_evidence["descriptors"],
+            "observable_cues": signal_evidence["observable_cues"],
         },
         "pattern_candidates": pattern_candidates,
         "final_pattern_candidates": final_pattern_candidates,
@@ -292,12 +264,12 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             payload["step8b_signal_evidence"], sort_keys=True
         )
         for required_8b_field in (
-            "observation_quality",
-            "longitudinal_trend",
-            "lateral_trend",
-            "speed_trend",
-            "temporal_coherence",
-            "evidence_confidence",
+            "leftness",
+            "rightness",
+            "approach",
+            "recede",
+            "acceleration",
+            "deceleration",
         ):
             self.assertIn(required_8b_field, serialized)
         for forbidden_8b_field in (

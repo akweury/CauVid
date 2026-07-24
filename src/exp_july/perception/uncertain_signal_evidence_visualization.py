@@ -13,15 +13,19 @@ from pathlib import Path
 from tqdm import tqdm
 
 
-_VISUALIZATION_VERSION = 1
+_VISUALIZATION_VERSION = 2
 _SELECTION_POLICY = "step8b-lowest-confidence-first-v1"
 _MAX_TRACK_VIDEOS_PER_SOURCE_VIDEO = 3
-_DESCRIPTOR_ORDER = (
-    "observation_quality",
-    "longitudinal_trend",
-    "lateral_trend",
-    "speed_trend",
-    "temporal_coherence",
+_OUTPUT_WIDTH = 1920
+_OUTPUT_HEIGHT = 1440
+_LEFT_SCENE_WIDTH = 1100
+_CUE_ORDER = (
+    "leftness",
+    "rightness",
+    "approach",
+    "recede",
+    "acceleration",
+    "deceleration",
 )
 
 
@@ -43,6 +47,11 @@ def _track_id(value):
 def _stable_tie_breaker(video_id, track_id):
     value = f"{_SELECTION_POLICY}\0{video_id}\0{track_id}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
+
+
+def _cue_strength(evidence):
+    cues = dict(evidence.get("observable_cues", {}))
+    return max((_number(cues.get(name, 0.0)) for name in _CUE_ORDER), default=0.0)
 
 
 def select_step8b_visualization_tracks(
@@ -68,7 +77,7 @@ def select_step8b_visualization_tracks(
         ranked = sorted(
             unique.values(),
             key=lambda row: (
-                _number(row.get("evidence_confidence", 0.0)),
+                _cue_strength(row),
                 _stable_tie_breaker(video_id, _track_id(row.get("track_id"))),
                 _track_id(row.get("track_id")),
             ),
@@ -125,94 +134,81 @@ def _fit_text(cv2, text, max_width, scale=0.46, thickness=1):
 
 
 def _build_evidence_panel(cv2, np, evidence, width, height):
-    panel = np.full((height, width, 3), (22, 25, 31), dtype=np.uint8)
-    confidence = _number(evidence.get("evidence_confidence", 0.0))
-    confidence_color = _confidence_color(confidence)
-    margin = 24
+    panel = np.full((height, width, 3), (20, 23, 29), dtype=np.uint8)
+    margin = 38
     _put_text(
         cv2,
         panel,
-        "STEP 8B | UNCERTAIN LOW-LEVEL SIGNAL EVIDENCE",
+        "STEP 8B",
         margin,
-        93,
-        0.72,
+        74,
+        1.80,
         (250, 250, 250),
-        2,
+        4,
+    )
+    _put_text(
+        cv2,
+        panel,
+        "SIGNAL EVIDENCE",
+        margin,
+        137,
+        1.50,
+        (215, 222, 232),
+        3,
     )
     _put_text(
         cv2,
         panel,
         (
             f"track {evidence.get('track_id', -1)} | "
-            f"observed label={evidence.get('primary_label', 'unknown')} | "
-            f"overall evidence confidence={confidence:.3f}"
+            f"{evidence.get('primary_label', 'unknown')}"
         ),
         margin,
-        125,
-        0.56,
-        confidence_color,
-        2,
+        207,
+        1.42,
+        (242, 242, 242),
+        3,
     )
-    bar_x = margin
-    bar_y = 141
-    bar_width = width - margin * 2
-    cv2.rectangle(panel, (bar_x, bar_y), (bar_x + bar_width, bar_y + 15), (65, 70, 78), -1)
-    cv2.rectangle(
+    cv2.line(
         panel,
-        (bar_x, bar_y),
-        (bar_x + int(round(bar_width * max(0.0, min(1.0, confidence)))), bar_y + 15),
-        confidence_color,
-        -1,
+        (margin, 255),
+        (width - margin, 255),
+        (75, 82, 94),
+        3,
+        cv2.LINE_AA,
     )
 
-    descriptors = dict(evidence.get("descriptors", {}))
-    y = 231
-    for name in _DESCRIPTOR_ORDER:
-        descriptor = dict(descriptors.get(name, {}))
-        descriptor_confidence = _number(descriptor.get("confidence", 0.0))
-        color = _confidence_color(descriptor_confidence)
-        title = name.replace("_", " ").upper()
-        state = str(descriptor.get("state", "unobserved"))
-        _put_text(cv2, panel, title, margin, y, 0.56, (235, 238, 243), 2)
+    cues = dict(evidence.get("observable_cues", {}))
+    y = 330
+    for name in _CUE_ORDER:
+        value = max(0.0, min(1.0, _number(cues.get(name, 0.0))))
+        color = _confidence_color(value)
+        title = name.upper()
+        _put_text(
+            cv2, panel, title, margin, y, 1.55, (235, 238, 243), 4
+        )
         _put_text(
             cv2,
             panel,
-            f"{state} | confidence {descriptor_confidence:.3f}",
-            370,
-            y,
-            0.56,
+            f"{value:.3f}",
+            margin,
+            y + 67,
+            1.70,
             color,
-            2,
+            4,
         )
-        small_bar_x = max(680, int(width * 0.62))
-        cv2.rectangle(
-            panel,
-            (small_bar_x, y - 18),
-            (width - margin, y - 4),
-            (65, 70, 78),
-            -1,
-        )
-        cv2.rectangle(
-            panel,
-            (small_bar_x, y - 18),
-            (
-                small_bar_x
-                + int(round((width - margin - small_bar_x) * max(0.0, min(1.0, descriptor_confidence)))),
-                y - 4,
-            ),
-            color,
-            -1,
-        )
-        y += 52
+        y += 170
 
-    legend_y = height - 34
-    _put_text(cv2, panel, "confidence magnitude:", margin, legend_y, 0.44, (220, 220, 220), 1)
-    legend_x = margin + 185
-    for label, value in (("low", 0.15), ("medium", 0.50), ("high", 0.90)):
-        color = _confidence_color(value)
-        cv2.rectangle(panel, (legend_x, legend_y - 14), (legend_x + 24, legend_y + 2), color, -1)
-        _put_text(cv2, panel, label, legend_x + 31, legend_y, 0.42, (220, 220, 220), 1)
-        legend_x += 118
+    _put_text(
+        cv2,
+        panel,
+        "RED low   YELLOW medium   GREEN high",
+        margin,
+        height - 35,
+        0.90,
+        (205, 210, 220),
+        2,
+    )
     return panel
 
 
@@ -245,17 +241,24 @@ def _valid_bbox(obj):
     return values
 
 
-def _current_signal_text(frame_index, obj):
+def _current_signal_lines(frame_index, obj):
     if not obj:
-        return f"frame={frame_index:05d} | track absent in this frame"
-    position = list(obj.get("position_3d", obj.get("relative_position_3d", [])))
+        return (
+            f"frame {frame_index:05d}",
+            "object absent in this frame",
+        )
+    position = list(
+        obj.get("position_3d", obj.get("relative_position_3d", []))
+    )
     x_value = _number(position[0]) if len(position) >= 3 else 0.0
     z_value = _number(position[2]) if len(position) >= 3 else 0.0
     return (
-        f"frame={frame_index:05d} | x={x_value:+.3f} | z={z_value:+.3f} | "
-        f"vx={_number(obj.get('rel_vx')):+.3f} | "
-        f"vz={_number(obj.get('rel_vz')):+.3f} | "
-        f"speed={_number(obj.get('rel_speed')):.3f}"
+        f"frame {frame_index:05d}   x {x_value:+.3f}   z {z_value:+.3f}",
+        (
+            f"vx {_number(obj.get('rel_vx')):+.3f}   "
+            f"vz {_number(obj.get('rel_vz')):+.3f}   "
+            f"speed {_number(obj.get('rel_speed')):.3f}"
+        ),
     )
 
 
@@ -267,25 +270,38 @@ def _draw_track_progress_bar(
     track_objects,
     width,
     present_color,
+    *,
+    top=0,
+    bar_left=None,
+    bar_right=None,
 ):
     """Draw frame-level object presence immediately below the scene."""
     indices = sorted(frame_indices)
     if not indices:
         return
-    left = 24
-    right = max(left + 1, width - 24)
-    bar_top = 31
-    bar_bottom = 57
+    left = (
+        max(0, int(bar_left))
+        if bar_left is not None
+        else 24
+    )
+    right = (
+        min(int(width), int(bar_right))
+        if bar_right is not None
+        else int(width) - 24
+    )
+    right = max(left + 1, right)
+    bar_top = top + 47
+    bar_bottom = top + 83
     bar_width = right - left
     _put_text(
         cv2,
         panel,
-        "TRACK PRESENCE | colored frames contain the object | white marker=current frame",
+        "TRACK PRESENCE | white marker = current frame",
         left,
-        22,
-        0.46,
+        top + 31,
+        1.15,
         (225, 230, 238),
-        1,
+        3,
     )
     cv2.rectangle(
         panel, (left, bar_top), (right, bar_bottom), (54, 58, 66), -1
@@ -322,11 +338,11 @@ def _draw_track_progress_bar(
         cv2,
         panel,
         f"{current_position}/{count}",
-        max(left, right - 74),
-        22,
-        0.46,
+        max(left, right - 120),
+        top + 31,
+        1.10,
         (255, 255, 255),
-        1,
+        3,
     )
 
 
@@ -337,7 +353,6 @@ def _draw_bbox_label(
     box,
     track_id,
     object_label,
-    confidence,
     color,
 ):
     x1, y1, x2, y2 = box
@@ -353,12 +368,9 @@ def _draw_bbox_label(
         scene, (x1, y1), (x2, y2), (0, 0, 0), thickness + 3
     )
     cv2.rectangle(scene, (x1, y1), (x2, y2), color, thickness)
-    label = (
-        f"{object_label} | track {track_id} | "
-        f"evidence conf {confidence:.3f}"
-    )
-    font_scale = 0.64
-    text_thickness = 2
+    label = f"{object_label} | ID {track_id}"
+    font_scale = 1.75
+    text_thickness = 4
     (text_width, text_height), baseline = cv2.getTextSize(
         label,
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -413,21 +425,18 @@ def _render_step8b_track_video(
     if first_image is None:
         return None, "missing_frame_images"
 
-    source_height, source_width = first_image.shape[:2]
-    canvas_width = min(1920, max(1280, int(source_width)))
-    if canvas_width % 2:
-        canvas_width += 1
-    scene_height = int(round(source_height * canvas_width / source_width))
-    if scene_height % 2:
-        scene_height += 1
-    panel_height = 540
-    total_height = scene_height + panel_height
+    canvas_width = _OUTPUT_WIDTH
+    total_height = _OUTPUT_HEIGHT
+    left_width = _LEFT_SCENE_WIDTH
+    panel_width = canvas_width - left_width
+    max_scene_width = left_width - 40
+    max_scene_height = 980
     track_id = _track_id(evidence.get("track_id"))
     track_objects = _track_object_map(relative_video, track_id)
-    confidence = _number(evidence.get("evidence_confidence", 0.0))
-    confidence_color = _confidence_color(confidence)
+    strongest_cue = _cue_strength(evidence)
+    confidence_color = _confidence_color(strongest_cue)
     static_panel = _build_evidence_panel(
-        cv2, np, evidence, canvas_width, panel_height
+        cv2, np, evidence, panel_width, total_height
     )
 
     output_path = Path(output_path)
@@ -450,11 +459,21 @@ def _render_step8b_track_video(
             if image is None:
                 image = np.zeros_like(first_image)
             frame_height, frame_width = image.shape[:2]
-            scene = cv2.resize(image, (canvas_width, scene_height))
+            scale = min(
+                max_scene_width / max(1, frame_width),
+                max_scene_height / max(1, frame_height),
+            )
+            scene_width = max(2, int(round(frame_width * scale)))
+            scene_height = max(2, int(round(frame_height * scale)))
+            if scene_width % 2:
+                scene_width -= 1
+            if scene_height % 2:
+                scene_height -= 1
+            scene = cv2.resize(image, (scene_width, scene_height))
             obj = track_objects.get(frame_index)
             box = _valid_bbox(obj)
             if box:
-                scale_x = canvas_width / max(1, frame_width)
+                scale_x = scene_width / max(1, frame_width)
                 scale_y = scene_height / max(1, frame_height)
                 x1, y1, x2, y2 = [
                     int(round(value))
@@ -480,45 +499,77 @@ def _render_step8b_track_video(
                     box=(x1, y1, x2, y2),
                     track_id=track_id,
                     object_label=object_label,
-                    confidence=confidence,
                     color=confidence_color,
                 )
             header = (
-                f"{relative_video.get('video_id', '')} | track {track_id} | "
-                f"evidence confidence {confidence:.3f}"
+                f"{relative_video.get('video_id', '')} | "
+                f"track {track_id}"
             )
-            cv2.rectangle(scene, (0, 0), (canvas_width, 48), (0, 0, 0), -1)
-            _put_text(cv2, scene, header, 14, 33, 0.68, confidence_color, 2)
+            cv2.rectangle(
+                scene, (0, 0), (scene_width, 78), (0, 0, 0), -1
+            )
+            _put_text(
+                cv2, scene, header, 20, 54, 1.50, confidence_color, 4
+            )
 
-            panel = static_panel.copy()
+            canvas = np.full(
+                (total_height, canvas_width, 3),
+                (12, 14, 18),
+                dtype=np.uint8,
+            )
+            scene_x = (left_width - scene_width) // 2
+            scene_y = 42
+            canvas[
+                scene_y : scene_y + scene_height,
+                scene_x : scene_x + scene_width,
+            ] = scene
+            canvas[:, left_width:] = static_panel
+            cv2.line(
+                canvas,
+                (left_width, 0),
+                (left_width, total_height),
+                (82, 88, 100),
+                4,
+                cv2.LINE_AA,
+            )
+            progress_top = scene_y + scene_height + 12
             _draw_track_progress_bar(
                 cv2,
-                panel,
+                canvas,
                 frame_indices,
                 frame_index,
                 track_objects,
-                canvas_width,
+                left_width,
                 confidence_color,
+                top=progress_top,
+                bar_left=scene_x,
+                bar_right=scene_x + scene_width,
             )
-            cv2.rectangle(
-                panel, (0, 167), (canvas_width, 197), (33, 37, 44), -1
-            )
+            current_title_y = progress_top + 146
             _put_text(
                 cv2,
-                panel,
-                _fit_text(
-                    cv2,
-                    _current_signal_text(frame_index, obj),
-                    canvas_width - 48,
-                    0.52,
-                ),
+                canvas,
+                "CURRENT SIGNAL",
                 24,
-                190,
-                0.52,
-                (245, 245, 245),
-                2,
+                current_title_y,
+                1.40,
+                (225, 230, 238),
+                4,
             )
-            writer.write(cv2.vconcat([scene, panel]))
+            for line_offset, line in enumerate(
+                _current_signal_lines(frame_index, obj)
+            ):
+                _put_text(
+                    cv2,
+                    canvas,
+                    _fit_text(cv2, line, left_width - 48, 1.35, 4),
+                    24,
+                    current_title_y + 67 + line_offset * 62,
+                    1.35,
+                    (245, 245, 245),
+                    4,
+                )
+            writer.write(canvas)
             if progress_callback:
                 progress_callback(1)
     finally:
@@ -652,9 +703,7 @@ def render_step8b_signal_evidence_videos(
             result = {
                 "video_id": video_id,
                 "track_id": track_id,
-                "evidence_confidence": _number(
-                    row["evidence"].get("evidence_confidence", 0.0)
-                ),
+                "strongest_cue": _cue_strength(row["evidence"]),
                 "status": status,
                 "evidence_path": str(evidence_path),
             }
@@ -694,7 +743,10 @@ def render_step8b_signal_evidence_videos(
     manifest = {
         "version": _VISUALIZATION_VERSION,
         "format": "mp4",
-        "layout": "scene_above_evidence_below",
+        "layout": "scene_left_evidence_right",
+        "track_progress_position": "directly_below_original_video",
+        "canvas_resolution": [_OUTPUT_WIDTH, _OUTPUT_HEIGHT],
+        "canvas_aspect_ratio": "4:3",
         "selection_policy": _SELECTION_POLICY,
         "max_tracks_per_video": limit,
         "confidence_color_scale": {

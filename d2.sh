@@ -73,7 +73,9 @@ run_container() {
   [[ -n "${WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e WANDB_PROJECT)
   [[ -n "${WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e WANDB_ENTITY)
   [[ -n "${WANDB_MODE:-}" ]] && runtime_env_args+=(-e WANDB_MODE)
-  [[ -n "${WANDB_BASE_URL:-}" ]] && runtime_env_args+=(-e WANDB_BASE_URL)
+  runtime_env_args+=(
+    -e "CAUVID_WANDB_BASE_URL=${CAUVID_WANDB_BASE_URL:-https://api.wandb.ai}"
+  )
   [[ -n "${WANDB_DIR:-}" ]] && runtime_env_args+=(-e WANDB_DIR)
   [[ -n "${WANDB_INIT_TIMEOUT:-}" ]] && runtime_env_args+=(-e WANDB_INIT_TIMEOUT)
   [[ -n "${CAUVID_WANDB_ENABLED:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENABLED)
@@ -138,7 +140,9 @@ shell_container() {
   [[ -n "${WANDB_PROJECT:-}" ]] && runtime_env_args+=(-e WANDB_PROJECT)
   [[ -n "${WANDB_ENTITY:-}" ]] && runtime_env_args+=(-e WANDB_ENTITY)
   [[ -n "${WANDB_MODE:-}" ]] && runtime_env_args+=(-e WANDB_MODE)
-  [[ -n "${WANDB_BASE_URL:-}" ]] && runtime_env_args+=(-e WANDB_BASE_URL)
+  runtime_env_args+=(
+    -e "CAUVID_WANDB_BASE_URL=${CAUVID_WANDB_BASE_URL:-https://api.wandb.ai}"
+  )
   [[ -n "${WANDB_DIR:-}" ]] && runtime_env_args+=(-e WANDB_DIR)
   [[ -n "${WANDB_INIT_TIMEOUT:-}" ]] && runtime_env_args+=(-e WANDB_INIT_TIMEOUT)
   [[ -n "${CAUVID_WANDB_ENABLED:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_ENABLED)

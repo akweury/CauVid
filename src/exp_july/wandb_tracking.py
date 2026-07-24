@@ -23,6 +23,8 @@ _AUDIT_SUBDIR_PATTERNS = (
     ("policies", "*.json"),
     ("statistics", "candidate_table*.json"),
 )
+_WANDB_PUBLIC_CLOUD_API = "https://api.wandb.ai"
+_WANDB_PUBLIC_CLOUD_SETTINGS = "https://wandb.ai/settings"
 
 
 def _truthy(value: Any, default: bool = True) -> bool:
@@ -156,8 +158,15 @@ class WandbTracker:
             mode
             or os.environ.get("CAUVID_WANDB_MODE")
             or os.environ.get("WANDB_MODE")
-            or ("online" if os.environ.get("WANDB_API_KEY") else "offline")
+            or "online"
         )
+        self.base_url = (
+            os.environ.get("CAUVID_WANDB_BASE_URL")
+            or _WANDB_PUBLIC_CLOUD_API
+        ).rstrip("/")
+        # Do not inherit a stale WANDB_BASE_URL pointing at wandb/local.
+        # CauVid uses hosted W&B unless its dedicated override is explicit.
+        os.environ["WANDB_BASE_URL"] = self.base_url
         self.entity = (
             os.environ.get("CAUVID_WANDB_ENTITY")
             or os.environ.get("WANDB_ENTITY")
@@ -205,6 +214,18 @@ class WandbTracker:
         self._seen_manifest_object_ids = set()
         if not self.enabled:
             return
+        if (
+            self.mode == "online"
+            and self.base_url == _WANDB_PUBLIC_CLOUD_API
+            and not os.environ.get("WANDB_API_KEY")
+        ):
+            print(
+                "[wandb] Hosted cloud login required. Sign in at "
+                f"{_WANDB_PUBLIC_CLOUD_SETTINGS}, create/copy an API key, "
+                "then export WANDB_API_KEY on this server.",
+                file=sys.stderr,
+                flush=True,
+            )
         try:
             self.module = importlib.import_module("wandb")
             self.wandb_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +251,14 @@ class WandbTracker:
             if self.run is not None and hasattr(self.run, "summary"):
                 self.run.summary["pipeline/status"] = "running"
                 self.run.summary["pipeline/tracking_mode"] = self.mode
+                self.run.summary["pipeline/wandb_base_url"] = self.base_url
+                run_url = getattr(self.run, "url", None)
+                if isinstance(run_url, str) and run_url.startswith("http"):
+                    self.run.summary["pipeline/wandb_web_url"] = run_url
+                    print(
+                        f"[wandb] Web dashboard: {run_url}",
+                        flush=True,
+                    )
         except Exception as exc:
             self._record_error("init", exc)
             self.module = None

@@ -36,7 +36,7 @@ def _residual_summary(candidates):
 
 def compact_track(track,candidates):
     summary=_residual_summary(candidates);validation=dict(track.get("source_validation",{}))
-    signal_descriptors=dict(track.get("signal_descriptors",{}))
+    observable_cues=dict(track.get("observable_cues",{}))
     compact={"track_uid":f"{track.get('video_id','')}::track_{int(track.get('track_id',-1))}",
       "track_id":int(track.get("track_id",-1)),"video_id":str(track.get("video_id","")),
       "object_class":str(track.get("object_class","unknown")),
@@ -47,16 +47,12 @@ def compact_track(track,candidates):
       "normalized_residual_summaries":summary["normalized"],"residual_buckets":summary["buckets"],
       "uncertainty_indicators":{"track_confidence":round(_f(track.get("confidence")),4),
         "top_margin":round((summary["normalized"].get(summary["ranked_patterns"][1],1)-summary["normalized"].get(summary["ranked_patterns"][0],0)) if len(summary["ranked_patterns"])>1 else 1,4)}}
-    if signal_descriptors:
+    if observable_cues:
         compact.update({
           "source_evidence_type":"uncertain_signal_evidence",
-          "signal_descriptor_states":{
-            key:str(dict(value).get("state","unobserved"))
-            for key,value in signal_descriptors.items()
-          },
-          "signal_descriptor_confidences":{
-            key:round(_f(dict(value).get("confidence",0)),4)
-            for key,value in signal_descriptors.items()
+          "observable_cues":{
+            key:round(max(0.0,min(1.0,_f(value))),4)
+            for key,value in observable_cues.items()
           },
         })
     else:
@@ -75,8 +71,9 @@ def needs_llm_review(compact):
     if state in {"invalid","discard","uncertain","conflict","conflicting","unknown"}:reasons.append("invalid_or_uncertain_validation")
     if issues:reasons.append("validation_conflict")
     if state in {"repair","repaired","repairable","keep_with_uncertainty"}:reasons.append("repairable_track")
-    if any(_f(value)<.35 for value in compact.get("signal_descriptor_confidences",{}).values()):
-        reasons.append("low_confidence_signal_evidence")
+    cues=compact.get("observable_cues",{})
+    if cues and max((_f(value) for value in cues.values()),default=0)<.35:
+        reasons.append("weak_observable_cues")
     if top and top[0]=="unknown":reasons.append("unknown_top_pattern")
     return bool(reasons),reasons
 
@@ -93,7 +90,7 @@ def _signature(compact):
       "top_candidate_patterns":compact.get("top_candidate_patterns",[])[:3]}
     normalized={"object_class":compact["object_class"],"symbolic_facts":normalized_facts,
       "validation_state":compact.get("validation_state"),"validation_issues":compact.get("validation_issues",[]),
-      "signal_descriptor_states":compact.get("signal_descriptor_states",{}),
+      "observable_cues":compact.get("observable_cues",{}),
       "residual_buckets":compact["residual_buckets"]}
     return hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":"),default=str).encode()).hexdigest()
 
