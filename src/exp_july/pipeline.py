@@ -201,9 +201,9 @@ def _step_data_error(step_name, state):
     if step_name == "08c_trajectory_pattern":
         manifest = state.get("trajectory_pattern_manifest", {})
         if int(manifest.get("num_videos", 0) or 0) <= 0:
-            return "processed no trajectory-pattern videos"
+            return "processed no statistical-cohort repair videos"
         if int(manifest.get("num_tracks", 0) or 0) <= 0:
-            return "processed zero trajectory-pattern tracks"
+            return "processed zero statistical-cohort repair tracks"
 
     if step_name in {"08d_pattern_validation", "08f_final_validation"}:
         evidence = state.get("trajectory_motion_evidence", [])
@@ -341,7 +341,7 @@ def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
         "08b_uncertain_signal_evidence",
         lambda: step8b_signal_evidence(relative_motion_state),
     )
-    # Step 8C: run the iterative trajectory-pattern residual and repair loop.
+    # Step 8C: freeze semantic cohorts, calibrate operators, and repair deterministically.
     relative_motion_state = _tracked_step(
         tracker,
         "08c_trajectory_pattern",

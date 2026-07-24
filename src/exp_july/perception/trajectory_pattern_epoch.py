@@ -103,8 +103,13 @@ def fixed_video_split(video_ids, fraction=0.2):
 
 def _case(record):
     selected = record.get("selected_candidate", {})
+    cohort_plan = dict(record.get("cohort_operator_plan", {}))
     return {"video_id": record.get("video_id"), "track_id": record.get("track_id"),
             "object_class": record.get("symbolic_track", {}).get("object_class"),
+            "cohort_id": record.get("trajectory_cohort_id"),
+            "activated_rule_id": dict(record.get("activated_rule", {})).get("rule_id"),
+            "repair_operator": cohort_plan.get("operator", "no_repair"),
+            "calibrated_parameters": cohort_plan.get("calibrated_parameters", {}),
             "initial_8c_validation": record.get(
                 "initial_8c_validation_status",
                 record.get("symbolic_track", {}).get(
@@ -119,22 +124,40 @@ def _case(record):
 
 def review_package(records, epoch_id, interval_index, policy, validation_video_ids, max_cases=5):
     successes = [row for row in records if row.get("repair_applied") and row.get("final_validation_status") != "invalid"]
-    failures = [row for row in records if not row.get("repair_applied") or row.get("final_validation_status") == "invalid"]
+    failures = [
+        row for row in records
+        if row.get("final_validation_status") == "invalid"
+        or not str(row.get("resolution_status", "")).startswith("validated")
+    ]
+    preserved = [
+        row for row in records
+        if row.get("resolution_status") == "validated_no_repair"
+    ]
     successes.sort(key=lambda row: (-_f(row.get("selected_candidate", {}).get("residual_improvement")), str(row.get("video_id")), int(row.get("track_id", -1))))
     failures.sort(key=lambda row: (str(row.get("final_selection_reason")), str(row.get("video_id")), int(row.get("track_id", -1))))
     pattern_counts = {}
+    cohort_counts = {}
+    operator_counts = {}
     for row in records:
         pattern_counts[row.get("final_pattern", "unknown")] = pattern_counts.get(row.get("final_pattern", "unknown"), 0) + 1
+        cohort_id = str(row.get("trajectory_cohort_id", "unknown"))
+        cohort_counts[cohort_id] = cohort_counts.get(cohort_id, 0) + 1
+        operator = str(dict(row.get("cohort_operator_plan", {})).get("operator", "no_repair"))
+        operator_counts[operator] = operator_counts.get(operator, 0) + 1
     return {"schema_version": SCHEMA_VERSION, "epoch_id": epoch_id, "interval_index": interval_index,
             "frozen_policy_version": policy["version"], "track_count": len(records),
             "video_ids": sorted({str(row.get("video_id")) for row in records}),
             "validation_video_ids": sorted(validation_video_ids), "aggregates": {
                 "repairs_applied": sum(bool(row.get("repair_applied")) for row in records),
+                "validated_without_repair": len(preserved),
                 "invalid_after": sum(row.get("final_validation_status") == "invalid" for row in records),
                 "mean_residual_improvement": sum(_f(row.get("selected_candidate", {}).get("residual_improvement")) for row in records)/max(1, len(records)),
-                "pattern_counts": pattern_counts},
+                "pattern_counts": pattern_counts,
+                "cohort_counts": cohort_counts,
+                "operator_counts": operator_counts},
             "representative_successes": [_case(row) for row in successes[:max_cases]],
-            "representative_failures": [_case(row) for row in failures[:max_cases]]}
+            "representative_failures": [_case(row) for row in failures[:max_cases]],
+            "representative_valid_no_repair": [_case(row) for row in preserved[:max_cases]]}
 
 
 def review_prompt(package):

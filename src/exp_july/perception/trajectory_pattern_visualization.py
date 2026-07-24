@@ -24,6 +24,9 @@ RESIDUALS = (
 )
 _TRACK_VIDEO_SELECTION_NAMESPACE = "step8bc-track-video-v1"
 _MAX_TRACK_VIDEOS_PER_VIDEO = 10
+_OUTPUT_WIDTH = 1920
+_OUTPUT_HEIGHT = 1440
+_LEFT_SCENE_WIDTH = 1100
 
 
 def _number(value, default=0.0):
@@ -302,13 +305,28 @@ def build_step8bc_track_video_payload(record):
         ),
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "video_id": str(record.get("video_id", "")),
         "track_id": int(record.get("track_id", -1)),
         "step8b_signal_evidence": signal_evidence,
         "step8b_metrics": step8b_metrics,
         "step8c_residual_distances": step8c_residual_distances,
         "step8c": {
+            "trajectory_cohort_id": str(
+                record.get("trajectory_cohort_id", "unknown")
+            ),
+            "activated_rule": copy.deepcopy(
+                dict(record.get("activated_rule", {}))
+            ),
+            "cohort_static_metadata": copy.deepcopy(
+                dict(record.get("cohort_static_metadata", {}))
+            ),
+            "cohort_statistical_summary": copy.deepcopy(
+                dict(record.get("cohort_statistical_summary", {}))
+            ),
+            "cohort_operator_plan": copy.deepcopy(
+                dict(record.get("cohort_operator_plan", {}))
+            ),
             "pattern_candidates": copy.deepcopy(
                 list(record.get("pattern_candidates", []))
             ),
@@ -320,6 +338,9 @@ def build_step8bc_track_video_payload(record):
             ),
             "selected_candidate": selected,
             "repair_applied": bool(record.get("repair_applied", False)),
+            "resolution_status": str(
+                record.get("resolution_status", "unknown")
+            ),
             "validated_pattern": str(
                 record.get("validated_pattern", "unknown")
             ),
@@ -581,101 +602,332 @@ def _step8b_display_metrics(payload):
 
 
 def _build_step8bc_static_panel(cv2, np, payload, width, height):
-    panel = np.full((height, width, 3), (22, 24, 28), dtype=np.uint8)
-    step8b = dict(payload.get("step8b_metrics", {}))
-    signal_evidence = dict(payload.get("step8b_signal_evidence", {}))
-    validation = dict(step8b.get("validation", {}))
+    """Build the concise right-side Step 8C cohort and repair panel."""
+    panel = np.full((height, width, 3), (20, 23, 29), dtype=np.uint8)
     step8c = dict(payload.get("step8c", {}))
+    rule = dict(step8c.get("activated_rule", {}))
+    cohort_summary = dict(step8c.get("cohort_statistical_summary", {}))
+    plan = dict(step8c.get("cohort_operator_plan", {}))
+    calibration = dict(plan.get("calibration", {}))
+    selected_measurement = dict(
+        calibration.get("selected_measurement", {})
+    )
+    margin = 38
+
+    _text(
+        cv2,
+        panel,
+        "STEP 8C",
+        margin,
+        74,
+        1.80,
+        (250, 250, 250),
+        4,
+    )
+    _text(
+        cv2,
+        panel,
+        "STATISTICAL REPAIR",
+        margin,
+        137,
+        1.35,
+        (215, 222, 232),
+        3,
+    )
+    object_class = str(
+        dict(payload.get("step8b_metrics", {}))
+        .get("track_facts", {})
+        .get("object_class", "unknown")
+    )
     _text(
         cv2,
         panel,
         (
-            f"STEP 8B + 8C | video {payload.get('video_id', '')} | "
-            f"track {payload.get('track_id', -1)}"
+            f"track {payload.get('track_id', -1)} | {object_class}"
         ),
-        18,
-        32,
-        0.62,
+        margin,
+        204,
+        1.22,
         (242, 242, 242),
+        3,
+    )
+    cv2.line(
+        panel,
+        (margin, 248),
+        (width - margin, 248),
+        (75, 82, 94),
+        3,
+        cv2.LINE_AA,
+    )
+
+    _text(
+        cv2,
+        panel,
+        "SEMANTIC COHORT",
+        margin,
+        306,
+        1.08,
+        (225, 190, 70),
+        3,
+    )
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            step8c.get("trajectory_cohort_id", "unknown"),
+            width - 2 * margin,
+            1.32,
+            3,
+        ),
+        margin,
+        363,
+        1.32,
+        (245, 245, 245),
+        3,
+    )
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            f"rule: {rule.get('rule_id', 'unknown')}",
+            width - 2 * margin,
+            0.92,
+            2,
+        ),
+        margin,
+        415,
+        0.92,
+        (205, 215, 228),
+        2,
+    )
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            rule.get("description", ""),
+            width - 2 * margin,
+            0.78,
+            2,
+        ),
+        margin,
+        458,
+        0.78,
+        (175, 185, 198),
+        2,
+    )
+
+    _text(
+        cv2,
+        panel,
+        "DETERMINISTIC OPERATOR",
+        margin,
+        535,
+        1.08,
+        (225, 190, 70),
+        3,
+    )
+    operator = str(plan.get("operator", "no_repair"))
+    operator_color = (
+        (70, 220, 100) if operator != "no_repair" else (80, 215, 240)
+    )
+    _text(
+        cv2,
+        panel,
+        operator.upper(),
+        margin,
+        596,
+        1.38,
+        operator_color,
+        4,
+    )
+    requested = str(plan.get("llm_requested_operator", operator))
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            f"LLM proposed: {requested}",
+            width - 2 * margin,
+            0.80,
+            2,
+        ),
+        margin,
+        641,
+        0.80,
+        (205, 215, 228),
+        2,
+    )
+    parameters = dict(plan.get("calibrated_parameters", {}))
+    parameter_text = (
+        ", ".join(f"{key}={_display_value(value)}" for key, value in parameters.items())
+        or "none"
+    )
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            f"parameters: {parameter_text}",
+            width - 2 * margin,
+            0.76,
+            2,
+        ),
+        margin,
+        684,
+        0.76,
+        (205, 215, 228),
+        2,
+    )
+
+    _text(
+        cv2,
+        panel,
+        "STATISTICAL VALIDATION",
+        margin,
+        765,
+        1.08,
+        (225, 190, 70),
+        3,
+    )
+    anomalies = list(cohort_summary.get("systematic_anomalies", []))
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            "anomalies: " + (", ".join(map(str, anomalies)) or "none"),
+            width - 2 * margin,
+            0.78,
+            2,
+        ),
+        margin,
+        816,
+        0.78,
+        (225, 228, 234),
         2,
     )
     _text(
         cv2,
         panel,
         (
-            (
-                "8B observable cues: "
-                + ", ".join(
-                    f"{key}={_number(value):.2f}"
-                    for key, value in dict(
-                        signal_evidence.get("observable_cues", {})
-                    ).items()
-                )
-            )
-            if signal_evidence
-            else (
-                f"8B={validation.get('validation_status', validation.get('status', 'unknown'))} "
-                f"decision={dict(step8b.get('track_facts', {})).get('source_decision', '')}"
-            )
-        )
-        + (
-            f" | 8C pattern={step8c.get('final_pattern', 'unknown')} "
-            f"repair={step8c.get('repair_applied', False)} "
-            f"validation={step8c.get('final_validation_status', 'unknown')}"
+            f"cohort tracks: {int(cohort_summary.get('track_count', 0))}    "
+            f"validation samples: {int(selected_measurement.get('sample_count', 0))}"
         ),
-        18,
-        60,
-        0.39,
-        (80, 215, 240),
-        1,
+        margin,
+        860,
+        0.76,
+        (205, 215, 228),
+        2,
     )
     _text(
         cv2,
         panel,
         (
-            "8B LOW-LEVEL SIGNAL EVIDENCE DESCRIPTORS AND CONFIDENCE"
-            if signal_evidence
-            else "8B ALL METRICS, THRESHOLDS, CHECK VALUES, AND SIGNED RULE DISTANCES"
+            f"success: {_number(selected_measurement.get('success_rate')):.3f}    "
+            f"issue gain: {_number(selected_measurement.get('mean_issue_cost_improvement')):+.3f}"
         ),
-        18,
-        108,
-        0.39,
+        margin,
+        903,
+        0.76,
+        (205, 215, 228),
+        2,
+    )
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2,
+            f"decision: {calibration.get('promotion_decision', 'unknown')}",
+            width - 2 * margin,
+            0.82,
+            2,
+        ),
+        margin,
+        949,
+        0.82,
+        operator_color,
+        2,
+    )
+
+    _text(
+        cv2,
+        panel,
+        "FINAL OUTCOME",
+        margin,
+        1042,
+        1.08,
         (225, 190, 70),
-        1,
+        3,
     )
-    _draw_metric_grid(
+    status = str(step8c.get("resolution_status", "unknown"))
+    status_color = (
+        (70, 220, 100)
+        if status.startswith("validated")
+        else (60, 190, 245)
+    )
+    _text(
         cv2,
         panel,
-        _step8b_display_metrics(payload),
-        18,
-        122,
-        width - 36,
-        420,
-    )
-    residual_bottom = _draw_residual_table(
-        cv2, panel, payload, 18, 575, width - 36
-    )
-    _draw_repair_candidate_table(
-        cv2,
-        panel,
-        payload,
-        18,
-        residual_bottom + 15,
-        width - 36,
-        max(120, height - residual_bottom - 70),
+        status.upper(),
+        margin,
+        1103,
+        1.20,
+        status_color,
+        3,
     )
     _text(
         cv2,
         panel,
         (
-            "Residual cells are before/final. Complete unabridged metrics and "
-            "every candidate residual vector are saved in the sibling JSON."
+            f"repair applied: {bool(step8c.get('repair_applied', False))}    "
+            f"validation: {step8c.get('final_validation_status', 'unknown')}"
         ),
-        18,
-        height - 18,
-        0.30,
-        (165, 170, 180),
-        1,
+        margin,
+        1150,
+        0.78,
+        (220, 225, 232),
+        2,
+    )
+    reason = str(step8c.get("final_selection_reason", ""))
+    _text(
+        cv2,
+        panel,
+        _clip_text_to_width(
+            cv2, reason, width - 2 * margin, 0.72, 2
+        ),
+        margin,
+        1194,
+        0.72,
+        (185, 195, 208),
+        2,
+    )
+    fingerprint = str(
+        dict(step8c.get("provenance", {})).get(
+            "cohort_policy_fingerprint", ""
+        )
+    )
+    _text(
+        cv2,
+        panel,
+        f"policy: {fingerprint or 'not available'}",
+        margin,
+        1250,
+        0.72,
+        (165, 175, 188),
+        2,
+    )
+    _text(
+        cv2,
+        panel,
+        "Full cohort statistics and repair provenance are in the JSON.",
+        margin,
+        height - 35,
+        0.64,
+        (165, 175, 188),
+        2,
     )
     return panel
 
@@ -743,7 +995,9 @@ def _draw_scaled_box(
     y1 = max(0, min(image_height - 1, y1))
     y2 = max(0, min(image_height - 1, y2))
     cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 0), 5)
-    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 4)
+    if not label:
+        return
     text_y = max(24, y1 - 8 - text_y_offset)
     cv2.rectangle(
         image,
@@ -774,6 +1028,112 @@ def _current_motion_text(frame_index, pre_obj, final_obj):
     return (
         f"frame={int(frame_index):05d} | 8B {motion(pre_obj)} | "
         f"8C {motion(final_obj)}"
+    )
+
+
+def _draw_step8c_track_progress(
+    cv2,
+    canvas,
+    frame_indices,
+    current_frame,
+    pre_track,
+    final_track,
+    modified_frames,
+    *,
+    top,
+    left,
+    right,
+):
+    """Draw Step 8C track presence directly below the scene."""
+    indices = sorted(frame_indices)
+    if not indices:
+        return
+    left = max(0, int(left))
+    right = max(left + 1, int(right))
+    bar_top = int(top) + 47
+    bar_bottom = int(top) + 83
+    bar_width = right - left
+    _text(
+        cv2,
+        canvas,
+        "TRACK PRESENCE | white marker = current frame",
+        left,
+        int(top) + 31,
+        1.15,
+        (225, 230, 238),
+        3,
+    )
+    cv2.rectangle(
+        canvas, (left, bar_top), (right, bar_bottom), (54, 58, 66), -1
+    )
+    for offset, frame_index in enumerate(indices):
+        x1 = left + int(math.floor(offset * bar_width / len(indices)))
+        x2 = left + int(
+            math.ceil((offset + 1) * bar_width / len(indices))
+        )
+        pre_present = frame_index in pre_track
+        final_present = frame_index in final_track
+        if frame_index in modified_frames or (
+            final_present and not pre_present
+        ):
+            color = (70, 220, 100)
+        elif pre_present:
+            color = (40, 185, 245)
+        else:
+            color = (72, 76, 84)
+        cv2.rectangle(
+            canvas,
+            (x1, bar_top + 2),
+            (max(x1, x2 - 1), bar_bottom - 2),
+            color,
+            -1,
+        )
+    try:
+        current_offset = indices.index(current_frame)
+    except ValueError:
+        current_offset = 0
+    marker_x = left + int(
+        round((current_offset + 0.5) * bar_width / len(indices))
+    )
+    cv2.line(
+        canvas,
+        (marker_x, bar_top - 4),
+        (marker_x, bar_bottom + 4),
+        (255, 255, 255),
+        4,
+        cv2.LINE_AA,
+    )
+    _text(
+        cv2,
+        canvas,
+        f"{current_offset + 1}/{len(indices)}",
+        max(left, right - 120),
+        int(top) + 31,
+        1.10,
+        (255, 255, 255),
+        3,
+    )
+
+
+def _motion_lines(frame_index, pre_obj, final_obj):
+    def values(prefix, obj):
+        if not obj:
+            return f"{prefix}: object absent"
+        position = list(
+            obj.get("position_3d", obj.get("relative_position_3d", []))
+        )
+        x_value = _number(position[0]) if len(position) >= 3 else 0.0
+        z_value = _number(position[2]) if len(position) >= 3 else 0.0
+        return (
+            f"{prefix}: x {x_value:+.3f}   z {z_value:+.3f}   "
+            f"vx {_number(obj.get('rel_vx')):+.3f}   "
+            f"vz {_number(obj.get('rel_vz')):+.3f}"
+        )
+
+    return (
+        f"CURRENT SIGNAL | frame {int(frame_index):05d}",
+        values("ORIGINAL", pre_obj),
+        values("FINAL", final_obj),
     )
 
 
@@ -809,23 +1169,29 @@ def _render_step8bc_track_video(
     if first_image is None:
         return None, "missing_frame_images"
 
-    source_height, source_width = first_image.shape[:2]
-    canvas_width = min(1920, max(1280, int(source_width)))
-    if canvas_width % 2:
-        canvas_width += 1
-    scene_height = int(round(source_height * canvas_width / source_width))
-    if scene_height % 2:
-        scene_height += 1
-    panel_height = 1220
-    total_height = scene_height + panel_height
+    canvas_width = _OUTPUT_WIDTH
+    total_height = _OUTPUT_HEIGHT
+    left_width = _LEFT_SCENE_WIDTH
+    panel_width = canvas_width - left_width
+    max_scene_width = left_width - 40
+    max_scene_height = 980
     pre_track = _track_objects_by_frame(
         pre_pattern_video, int(record.get("track_id", -1))
     )
     final_track = _track_objects_by_frame(
         final_video, int(record.get("track_id", -1))
     )
+    step8c_payload = dict(payload.get("step8c", {}))
+    selected_candidate = dict(
+        step8c_payload.get("selected_candidate", {})
+    )
+    modified_frames = {
+        int(value)
+        for value in selected_candidate.get("modified_frame_ids", [])
+    }
+    repair_applied = bool(step8c_payload.get("repair_applied"))
     static_panel = _build_step8bc_static_panel(
-        cv2, np, payload, canvas_width, panel_height
+        cv2, np, payload, panel_width, total_height
     )
 
     output_path = Path(output_path)
@@ -849,7 +1215,17 @@ def _render_step8bc_track_video(
             if image is None:
                 image = np.zeros_like(first_image)
             source_frame_height, source_frame_width = image.shape[:2]
-            scene = cv2.resize(image, (canvas_width, scene_height))
+            scale = min(
+                max_scene_width / max(1, source_frame_width),
+                max_scene_height / max(1, source_frame_height),
+            )
+            scene_width = max(2, int(round(source_frame_width * scale)))
+            scene_height = max(2, int(round(source_frame_height * scale)))
+            if scene_width % 2:
+                scene_width -= 1
+            if scene_height % 2:
+                scene_height -= 1
+            scene = cv2.resize(image, (scene_width, scene_height))
             pre_obj = pre_track.get(frame_index)
             final_obj = final_track.get(frame_index)
             _draw_scaled_box(
@@ -859,46 +1235,124 @@ def _render_step8bc_track_video(
                 source_frame_width,
                 source_frame_height,
                 (40, 185, 245),
-                "8B original",
-                text_y_offset=23,
+                "",
             )
-            _draw_scaled_box(
-                cv2,
-                scene,
-                final_obj,
-                source_frame_width,
-                source_frame_height,
-                (70, 220, 100),
-                "8C final",
+            draw_repaired_box = bool(
+                repair_applied
+                and (
+                    not modified_frames
+                    or frame_index in modified_frames
+                    or (final_obj is not None and pre_obj is None)
+                )
             )
-            header = (
-                f"{payload.get('video_id', '')} | "
-                f"track {payload.get('track_id', -1)} | "
-                f"frame {frame_index:05d}"
-            )
-            cv2.rectangle(scene, (0, 0), (canvas_width, 42), (0, 0, 0), -1)
-            _text(cv2, scene, header, 12, 29, 0.62, (245, 245, 245), 2)
+            if draw_repaired_box:
+                _draw_scaled_box(
+                    cv2,
+                    scene,
+                    final_obj,
+                    source_frame_width,
+                    source_frame_height,
+                    (70, 220, 100),
+                    "",
+                )
 
-            panel = static_panel.copy()
-            cv2.rectangle(
-                panel, (0, 69), (canvas_width, 94), (31, 35, 42), -1
+            canvas = np.full(
+                (total_height, canvas_width, 3),
+                (12, 14, 18),
+                dtype=np.uint8,
             )
+            scene_x = (left_width - scene_width) // 2
+            scene_y = 42
+            canvas[
+                scene_y : scene_y + scene_height,
+                scene_x : scene_x + scene_width,
+            ] = scene
+            canvas[:, left_width:] = static_panel
+            cv2.line(
+                canvas,
+                (left_width, 0),
+                (left_width, total_height),
+                (82, 88, 100),
+                4,
+                cv2.LINE_AA,
+            )
+            progress_top = scene_y + scene_height + 12
+            _draw_step8c_track_progress(
+                cv2,
+                canvas,
+                frame_indices,
+                frame_index,
+                pre_track,
+                final_track,
+                modified_frames,
+                top=progress_top,
+                left=scene_x,
+                right=scene_x + scene_width,
+            )
+            object_label = str(
+                (final_obj or pre_obj or {}).get(
+                    "frame_label",
+                    (final_obj or pre_obj or {}).get(
+                        "label",
+                        dict(payload.get("step8b_metrics", {}))
+                        .get("track_facts", {})
+                        .get("object_class", "unknown"),
+                    ),
+                )
+            )
+            identity_y = progress_top + 146
             _text(
                 cv2,
-                panel,
+                canvas,
                 _clip_text_to_width(
                     cv2,
-                    _current_motion_text(frame_index, pre_obj, final_obj),
-                    canvas_width - 36,
-                    0.36,
+                    (
+                        f"OBJECT: {object_label}    "
+                        f"TRACK ID: {payload.get('track_id', -1)}"
+                    ),
+                    left_width - 48,
+                    1.45,
+                    4,
                 ),
-                18,
-                87,
-                0.36,
-                (235, 235, 235),
-                1,
+                24,
+                identity_y,
+                1.45,
+                (80, 215, 240),
+                4,
             )
-            writer.write(cv2.vconcat([scene, panel]))
+            for line_offset, line in enumerate(
+                _motion_lines(frame_index, pre_obj, final_obj)
+            ):
+                color = (
+                    (225, 230, 238)
+                    if line_offset == 0
+                    else (40, 185, 245)
+                    if line_offset == 1
+                    else (70, 220, 100)
+                )
+                _text(
+                    cv2,
+                    canvas,
+                    _clip_text_to_width(
+                        cv2, line, left_width - 48, 1.16, 3
+                    ),
+                    24,
+                    identity_y + 65 + line_offset * 58,
+                    1.16,
+                    color,
+                    3,
+                )
+            _text(
+                cv2,
+                canvas,
+                "ORANGE = original bbox    GREEN = repaired bbox",
+                24,
+                min(total_height - 24, identity_y + 252),
+                0.76,
+                (185, 195, 208),
+                2,
+            )
+            writer.write(canvas)
             if progress_callback is not None:
                 progress_callback(1)
     finally:
@@ -912,7 +1366,7 @@ def render_step8bc_track_videos(
     fps=10.0,
     max_tracks_per_video=10,
 ):
-    """Render stable, capped per-track Step 8B/8C diagnostic MP4s."""
+    """Render stable, capped per-track Step 8C statistical-repair MP4s."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     records = list(state.get("trajectory_pattern_records", []))
@@ -965,7 +1419,7 @@ def render_step8bc_track_videos(
     mp4_started = time.perf_counter()
     with tqdm(
         total=total_expected_frames,
-        desc="[step 8c] 8B+8C MP4",
+        desc="[step 8c] statistical repair MP4",
         unit="frame",
         dynamic_ncols=True,
     ) as frame_progress:
@@ -1081,8 +1535,19 @@ def render_step8bc_track_videos(
         )
 
     manifest = {
-        "version": 1,
+        "version": 2,
         "selection_policy": _TRACK_VIDEO_SELECTION_NAMESPACE,
+        "layout": "scene_left_statistical_repair_right",
+        "scene_column_width": _LEFT_SCENE_WIDTH,
+        "track_progress_position": "directly_below_scene",
+        "canvas_resolution": [_OUTPUT_WIDTH, _OUTPUT_HEIGHT],
+        "canvas_aspect_ratio": "4:3",
+        "scene_bbox_labels": False,
+        "progress_colors": {
+            "original_presence": "orange",
+            "modified_or_added": "green",
+            "current_frame": "white",
+        },
         "max_tracks_per_video": min(
             _MAX_TRACK_VIDEOS_PER_VIDEO,
             max(0, int(max_tracks_per_video)),
@@ -1628,7 +2093,7 @@ def _render_video_summary_html(
 
 
 def render_trajectory_pattern_visualizations(state, output_root):
-    """Write Step 8C HTML reports plus capped per-track Step 8B/8C MP4s."""
+    """Write Step 8C HTML reports plus capped statistical-repair MP4s."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     visualization_started = time.perf_counter()
@@ -1763,6 +2228,12 @@ def render_trajectory_pattern_visualizations(state, output_root):
             track_video_manifest.get("num_skipped_videos", 0)
         ),
         "max_track_videos_per_video": _MAX_TRACK_VIDEOS_PER_VIDEO,
+        "track_video_layout": str(
+            track_video_manifest.get("layout", "")
+        ),
+        "track_video_canvas_resolution": list(
+            track_video_manifest.get("canvas_resolution", [])
+        ),
         "num_skipped": len(skipped) + len(summary_skipped),
         "track_reports": rendered,
         "summary_reports": summaries,

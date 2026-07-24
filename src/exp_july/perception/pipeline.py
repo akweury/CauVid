@@ -3946,6 +3946,7 @@ def step1_init(video_ids=None, video_count=None):
     }
     return {
         "videos": videos,
+        "dataset_name": "driving_mini",
         "dataset_root": dataset_root,
         "detection_args": detection_args,
         "tracking_args": tracking_args,
@@ -5378,7 +5379,7 @@ def step8e_iterative_trajectory_pattern_repair(
     output_subdir="08e_trajectory_pattern_closed_loop",
     step_label="8e",
 ):
-    """Run the cached and auditable trajectory-pattern repair loop."""
+    """Run prior-guided cohort analysis and deterministic signal repair."""
     from src.exp_july.perception.trajectory_pattern_closed_loop import (
         run_trajectory_pattern_closed_loop,
     )
@@ -5400,9 +5401,11 @@ def step8e_iterative_trajectory_pattern_repair(
     dashboard_path = str(result.get("trajectory_pattern_dashboard_path", ""))
     runtime_dashboard_path = str(result.get("trajectory_pattern_runtime_dashboard_path", ""))
     print(
-        f"[step {step_label}] trajectory_pattern_closed_loop "
+        f"[step {step_label}] prior_guided_statistical_signal_repair "
         f"videos={int(manifest.get('num_videos', 0))} "
         f"tracks={int(manifest.get('num_tracks', 0))} "
+        f"cohorts={int(manifest.get('num_cohorts', 0))} "
+        f"rules={int(manifest.get('num_cohort_rules', 0))} "
         f"source_tracks={int(manifest.get('input_source_tracks', manifest.get('num_tracks', 0)))} "
         f"quarantined_tracks={int(manifest.get('input_quarantined_tracks', 0))} "
         f"patterns={int(manifest.get('num_patterns', 0))} "
@@ -5517,6 +5520,7 @@ def step8b_trajectory_validation(ego_state, state):
 
 
 def step8c_trajectory_pattern_closed_loop(state, llm_generate=None):
+    """Compatibility entry point for Step 8C statistical cohort repair."""
     return step8e_iterative_trajectory_pattern_repair(
         state,
         llm_generate=llm_generate,
@@ -5600,6 +5604,15 @@ def step8i_threshold_calibration(state):
         _TRAJECTORY_VALIDATION_THRESHOLDS,
         _trajectory_reality_validation,
     )
+    from src.exp_july.perception.trajectory_cohort_policy import (
+        write_downstream_feedback,
+    )
+
+    cohort_feedback = write_downstream_feedback(result)
+    result = {
+        **result,
+        "trajectory_cohort_downstream_feedback": cohort_feedback,
+    }
     manifest = dict(result.get("trajectory_threshold_calibration_manifest", {}))
     promotion = dict(manifest.get("promotion", {}))
     print(
@@ -5608,7 +5621,9 @@ def step8i_threshold_calibration(state):
         f"update_conflicts={int(manifest.get('num_update_conflicts', 0))} "
         f"changes={len(dict(manifest.get('compilation', {})).get('changes', {}))} "
         f"decision={promotion.get('decision', 'reject')} "
-        f"reason={promotion.get('reason', '')}"
+        f"reason={promotion.get('reason', '')} "
+        f"cohort_feedback={len(dict(cohort_feedback.get('cohorts', {})))} "
+        f"critical_regressions={sum(int(row.get('critical_regressions', 0)) for row in dict(cohort_feedback.get('cohorts', {})).values())}"
     )
     return result
 

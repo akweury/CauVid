@@ -101,6 +101,33 @@ def _record(video_id, track_id):
         "final_pattern": "approaching",
         "final_validation_status": "valid",
         "repair_applied": False,
+        "resolution_status": "validated_no_repair",
+        "trajectory_cohort_id": "persistent_vehicle",
+        "activated_rule": {
+            "rule_id": "persistent_vehicle",
+            "description": "Persistent vehicle trajectories",
+        },
+        "cohort_static_metadata": {
+            "category": "car",
+            "track_length_bucket": "medium",
+        },
+        "cohort_statistical_summary": {
+            "track_count": 12,
+            "systematic_anomalies": [],
+        },
+        "cohort_operator_plan": {
+            "operator": "no_repair",
+            "llm_requested_operator": "outlier_removal",
+            "calibrated_parameters": {},
+            "calibration": {
+                "promotion_decision": "no_repair_required",
+                "selected_measurement": {
+                    "sample_count": 0,
+                    "success_rate": 0.0,
+                    "mean_issue_cost_improvement": 0.0,
+                },
+            },
+        },
     }
 
 
@@ -254,7 +281,15 @@ class Step8BCTrackVideoTests(unittest.TestCase):
 
         self.assertEqual(payload["video_id"], "scene")
         self.assertEqual(payload["track_id"], 7)
-        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(
+            payload["step8c"]["trajectory_cohort_id"],
+            "persistent_vehicle",
+        )
+        self.assertEqual(
+            payload["step8c"]["cohort_operator_plan"]["operator"],
+            "no_repair",
+        )
         serialized = json.dumps(payload, sort_keys=True)
         signal_evidence = record["symbolic_track"]["source_signal_evidence"]
         self.assertEqual(
@@ -317,7 +352,7 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             second_root = Path(tmp) / "second"
             log_output = io.StringIO()
             with redirect_stdout(log_output):
-                render_step8bc_track_videos(
+                first_manifest = render_step8bc_track_videos(
                     state,
                     first_root,
                     fps=7.5,
@@ -327,11 +362,29 @@ class Step8BCTrackVideoTests(unittest.TestCase):
                     **state,
                     "trajectory_pattern_records": list(reversed(records)),
                 }
-                render_step8bc_track_videos(
+                second_manifest = render_step8bc_track_videos(
                     reversed_state,
                     second_root,
                     fps=7.5,
                     max_tracks_per_video=10,
+                )
+            for manifest in (first_manifest, second_manifest):
+                self.assertEqual(
+                    manifest["layout"],
+                    "scene_left_statistical_repair_right",
+                )
+                self.assertEqual(
+                    manifest["canvas_resolution"], [1920, 1440]
+                )
+                self.assertEqual(manifest["canvas_aspect_ratio"], "4:3")
+                self.assertFalse(manifest["scene_bbox_labels"])
+                self.assertEqual(
+                    manifest["track_progress_position"],
+                    "directly_below_scene",
+                )
+                self.assertEqual(
+                    manifest["progress_colors"]["modified_or_added"],
+                    "green",
                 )
             for marker in (
                 "MP4_START",

@@ -72,6 +72,62 @@ def state():
 
 
 def llm(kind, _prompt):
+    if kind == "cohort_rule_generation":
+        return {
+            "rules": [
+                {
+                    "rule_id": "persistent_vehicle",
+                    "description": "Persistent vehicle tracks",
+                    "priority": 50,
+                    "all": [
+                        {
+                            "attribute": "category",
+                            "operator": "in",
+                            "value": ["car", "truck", "bus"],
+                        },
+                        {
+                            "attribute": "track_length_bucket",
+                            "operator": "in",
+                            "value": ["medium", "long"],
+                        },
+                    ],
+                },
+                {
+                    "rule_id": "other_tracks",
+                    "description": "Catch all",
+                    "priority": 0,
+                    "all": [],
+                },
+            ],
+            "rationale": "Static metadata cohorts only",
+        }
+    if kind == "cohort_repair_selection":
+        return {
+            "plans": [
+                {
+                    "cohort_id": "persistent_vehicle",
+                    "operator": "outlier_removal",
+                    "initial_parameters": {
+                        "median_radius": 2,
+                        "mad_scale": 3.0,
+                    },
+                    "anomaly_types": [
+                        "track_drift",
+                        "bbox_jump",
+                        "depth_jump",
+                        "speed_abnormal_change",
+                    ],
+                    "rationale": "Robustly remove cohort outliers",
+                },
+                {
+                    "cohort_id": "other_tracks",
+                    "operator": "no_repair",
+                    "initial_parameters": {},
+                    "anomaly_types": [],
+                    "rationale": "No systematic anomaly",
+                },
+            ]
+        }
     if kind == "policy_interval_review":
         return {
             "policy_patch": {
@@ -188,6 +244,21 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
                 "independent_validation_split_unavailable",
             )
             self.assertTrue(list((root / "llm_audit" / "policy_interval_review").glob("*.json")))
+            self.assertTrue(
+                list((root / "llm_audit" / "cohort_rule_generation").glob("*.json"))
+            )
+            self.assertTrue(
+                list((root / "llm_audit" / "cohort_repair_selection").glob("*.json"))
+            )
+            for filename in (
+                "metadata_catalog.json",
+                "compiled_rules.json",
+                "cohort_statistics.json",
+                "operator_library.json",
+                "calibrated_operator_plans.json",
+                "frozen_policy.json",
+            ):
+                self.assertTrue((root / "cohorts" / filename).exists())
             self.assertEqual(result["trajectory_pattern_manifest"]["interval_review_count"], 1)
             self.assertTrue(result["trajectory_pattern_manifest"]["policy_frozen"])
             self.assertTrue((root / "policies" / "active_policy.json").exists())
@@ -260,8 +331,9 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             self.assertTrue(dashboard.exists())
             html = dashboard.read_text(encoding="utf-8")
             for marker in (
-                "Step 8C Static Audit Dashboard", "Raw trajectory playback",
+                "Step 8C Prior-Guided Statistical Repair Dashboard", "Raw trajectory playback",
                 "Repaired trajectory playback", "Interactive signals",
+                "Semantic cohort and calibrated repair policy",
                 "Pattern and residual comparison", "Repair candidates",
                 "Symbolic validation", "LLM audit records",
                 "Dataset-level ablation summary", "READ ONLY",
@@ -281,6 +353,34 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
         self.assertEqual(
             result["trajectory_pattern_manifest"]["input_evidence_type"],
             "uncertain_signal_evidence",
+        )
+        self.assertEqual(
+            result["trajectory_pattern_manifest"]["method"],
+            "prior_guided_statistical_signal_repair",
+        )
+        self.assertFalse(
+            result["trajectory_pattern_manifest"]["llm_direct_trajectory_repair"]
+        )
+        self.assertEqual(record["trajectory_cohort_id"], "persistent_vehicle")
+        self.assertEqual(
+            record["activated_rule"]["source"],
+            "llm_static_metadata_rule",
+        )
+        self.assertEqual(
+            record["cohort_operator_plan"]["operator"],
+            "no_repair",
+        )
+        self.assertEqual(
+            record["cohort_operator_plan"]["llm_requested_operator"],
+            "outlier_removal",
+        )
+        self.assertEqual(record["resolution_status"], "validated_no_repair")
+        self.assertEqual(
+            record["record_status"],
+            "completed_validated_original_preserved",
+        )
+        self.assertIn(
+            "calibrated_parameters", record["cohort_operator_plan"]
         )
         self.assertEqual(len(record["pattern_candidates"]), len(PATTERNS))
         for candidate in record["pattern_candidates"]:
@@ -306,23 +406,30 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
         self.assertIn("LLM_preferred_pattern", record)
         self.assertEqual(record["provenance"]["frozen_policy_version"], 1)
         self.assertEqual(record["provenance"]["epoch_id"], 1)
+        self.assertEqual(
+            record["provenance"]["llm_role"],
+            "static_cohort_rule_generation_and_cohort_operator_selection_only",
+        )
+        self.assertEqual(
+            record["provenance"]["activated_rule_id"],
+            "persistent_vehicle",
+        )
         self.assertIn("validated_pattern", record)
         self.assertIn(record["final_selection_reason"], {
             "highest_ranked_after_hard_constraints",
             "no_candidate_passed_hard_constraints_original_preserved",
+            "no_repair_required_original_preserved",
         })
         self.assertEqual(
             result["pre_pattern_relative_object_motion"],
             source["relative_object_motion"],
         )
-        row = result["trajectory_pattern_statistics_candidate"]["rows"][0]
-        required = {
-            "dataset", "video", "object_class", "trajectory_pattern",
-            "residual_type", "sample_count", "mean", "std", "median",
-            "quantiles", "accepted_count", "rejected_count",
-            "repair_success_rate", "false_match_rate", "LLM_assessment", "version",
-        }
-        self.assertTrue(required.issubset(row))
+        cohort_summary = result["trajectory_cohort_statistics"][
+            "persistent_vehicle"
+        ]
+        self.assertEqual(cohort_summary["track_count"], 1)
+        self.assertIn("motion_statistics", cohort_summary)
+        self.assertIn("systematic_anomalies", cohort_summary)
         self.assertEqual(len(result["trajectory_pattern_visualizations"]), 1)
         self.assertEqual(len(result["trajectory_pattern_video_summaries"]), 1)
 

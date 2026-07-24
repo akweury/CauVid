@@ -1,4 +1,4 @@
-"""Step 8C: reproducible trajectory-pattern recognition and repair loop."""
+"""Step 8C: prior-guided statistical cohort signal repair."""
 
 from __future__ import annotations
 import copy, hashlib, json, math, os, statistics, time, urllib.error, urllib.request
@@ -13,7 +13,7 @@ from src.exp_july.perception.adaptive_motion_repair import (
     _modified_frames, _recompute_motion, _snapshot,
 )
 
-VERSION = 3
+VERSION = 4
 PATTERNS = ("stationary","same_direction","opposite_direction","approaching","receding",
             "crossing","turning","lane_entry","overtaking","unknown")
 RESIDUALS = ("position","direction","speed","acceleration","path_intersection","ttc",
@@ -65,7 +65,7 @@ def http_llm(prompt,return_metadata=False):
     url=base if base.endswith("/chat/completions") else base+"/chat/completions"
     model=os.environ.get("CAUVID_STEP8_PATTERN_LLM_MODEL",os.environ.get("OPENAI_MODEL","gpt-4.1-mini"))
     request_body={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[
-        {"role":"system","content":"Return auditable JSON only; never generate corrected values or thresholds."},
+        {"role":"system","content":"Return auditable JSON only. Never generate corrected trajectory values or make final repair decisions. Numeric parameter proposals are allowed only when the user prompt explicitly requests them."},
         {"role":"user","content":prompt}]}
     req=urllib.request.Request(url,data=json.dumps(request_body).encode(),headers={
         "Authorization":f"Bearer {key}","Content-Type":"application/json"},method="POST")
@@ -121,10 +121,20 @@ def llm_call(kind,prompt,root,generator):
     expose_metadata=kind.startswith("batch_") or kind.endswith("_individual")
     if path.exists():
         cached=json.loads(path.read_text());response=dict(cached["response"]);prior=dict(cached.get("llm_call_metadata",{}))
+        print(
+            f"[step 8c] LLM_CACHE kind={kind} request_id={rid[:12]} "
+            f"prompt_chars={len(prompt)}",
+            flush=True,
+        )
         if expose_metadata:
             response["__llm_call_metadata__"]={**prior,"real_llm_call":False,"audit_cache_hit":True,
               "backend":"llm_audit_cache","true_latency_seconds":0.0,"timeout_occurred":False}
         return response
+    print(
+        f"[step 8c] LLM_START kind={kind} request_id={rid[:12]} "
+        f"prompt_chars={len(prompt)}",
+        flush=True,
+    )
     if generator is None:
         response,call_metadata=http_llm(prompt,return_metadata=True)
     else:
@@ -140,6 +150,13 @@ def llm_call(kind,prompt,root,generator):
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps({"version":VERSION,"kind":kind,"request_id":rid,
                                 "prompt":prompt,"response":response,"llm_call_metadata":call_metadata},indent=2))
+    print(
+        f"[step 8c] LLM_DONE kind={kind} request_id={rid[:12]} "
+        f"latency={f(call_metadata.get('true_latency_seconds',0)):.2f}s "
+        f"backend={call_metadata.get('backend','unknown')} "
+        f"tokens={int(call_metadata.get('total_tokens',0) or 0)}",
+        flush=True,
+    )
     return {**response,"__llm_call_metadata__":call_metadata} if expose_metadata else response
 
 def _relative_observations_by_track(relative_motion):
@@ -392,19 +409,39 @@ def repair_candidates(
     ego,
     current_table,
     validation_thresholds=None,
+    cohort_plan=None,
 ):
     original=copy.deepcopy(track["observations"]); nf=max([int(x.get("frame_index",0)) for x in original] or [0])+1
     before_eval=_evaluate(original,nf,thresholds=validation_thresholds); bypid={x["pattern_id"]:x["residual_vector"] for x in candidates}
     hypotheses=select_pattern_hypotheses(candidates,interp); out=[]
     for hypothesis in hypotheses:
         pid=hypothesis["pattern_id"]
-        ops=list(dict.fromkeys(list(hypothesis["recommended_repairs"])+list(DEFAULT_REPAIRS[pid])))[:5]
+        if cohort_plan:
+            ops=[str(cohort_plan.get("operator","no_repair"))]
+            for source in (
+                "llm_static_metadata_cohort",
+                "cohort_statistical_operator_selection",
+            ):
+                if source not in hypothesis["selection_sources"]:
+                    hypothesis["selection_sources"].append(source)
+        else:
+            ops=list(dict.fromkeys(list(hypothesis["recommended_repairs"])+list(DEFAULT_REPAIRS[pid])))[:5]
         for op in ops:
             repaired=copy.deepcopy(original)
-            if op=="ego_motion_refinement":
+            if op=="no_repair":
+                executor="identity";params={}
+            elif op=="ego_motion_refinement":
                 repaired=_recompute_motion(repaired,ego); executor="ego_motion_refinement";params={"source":"current_ego"}
             else:
-                executor,params=EXECUTORS[op]; repaired=_apply_strategy(repaired,executor,params)
+                executor,default_params=EXECUTORS[op]
+                params=dict(
+                    cohort_plan.get(
+                        "calibrated_parameters",
+                        cohort_plan.get("initial_parameters",default_params),
+                    )
+                    if cohort_plan else default_params
+                )
+                repaired=_apply_strategy(repaired,executor,params)
                 repaired=_recompute_motion(repaired,ego,velocity_window=int(params.get("window",1)))
             aftertrack={**track,"observations":repaired}
             allafter={p["pattern_id"]:residual(p["pattern_id"],aftertrack) for p in candidates}
@@ -416,9 +453,23 @@ def repair_candidates(
             labels={str(x.get("frame_label","")).strip().lower() for x in repaired if str(x.get("frame_label","")).strip()}
             classes=bool(labels) and labels=={str(track.get("object_class","unknown")).strip().lower()}
             status=str(ev["validation"].get("validation_status","invalid"))
+            anomaly_reasons=set(track.get("cohort_anomaly_reasons",[]))
+            planned_anomalies=set(
+                cohort_plan.get("anomaly_types",[]) if cohort_plan else []
+            )
+            anomaly_trigger=(
+                bool(anomaly_reasons & planned_anomalies)
+                if cohort_plan else True
+            )
+            issue_improved=(
+                _issue_cost(ev)<_issue_cost(before_eval)
+                if cohort_plan else True
+            )
             hard={"physical_validity":_physical_validity(repaired),"observation_retention":retention>=.95,
               "class_consistency":classes,"no_critical_new_anomalies":not new,
-              "acceptable_validation_severity":status in {"valid","repaired","uncertain"}}
+              "acceptable_validation_severity":status in {"valid","repaired","uncertain"},
+              "statistical_anomaly_trigger":anomaly_trigger,
+              "cohort_calibrated_issue_improvement":issue_improved}
             passed=all(hard.values())
             matching=[row for row in current_table.get("rows",[]) if row.get("object_class")==track["object_class"] and row.get("trajectory_pattern")==pid]
             stat_prior=mean([f(row.get("repair_success_rate",0)) for row in matching]) if matching else 0.5
@@ -430,6 +481,11 @@ def repair_candidates(
             out.append({"candidate_id":pid+":"+op,"pattern_id":pid,
               "pattern_hypothesis":{"pattern_id":pid,"selection_sources":hypothesis["selection_sources"]},
               "repair_hypothesis":{"operation":op,"executor":executor,"parameters":params},
+              "cohort_id":str(track.get("cohort_id","")),
+              "activated_rule":copy.deepcopy(track.get("activated_cohort_rule",{})),
+              "cohort_operator_plan":copy.deepcopy(cohort_plan or {}),
+              "deterministic_anomaly_trigger":anomaly_trigger,
+              "triggered_anomaly_types":sorted(anomaly_reasons & planned_anomalies),
               "validated_pattern":pid if passed else None,"LLM_prior":llm_prior,
               "llm_plausibility":llm_prior,"repair_operation":op,"executor":executor,
               "parameters":params,"decision":"accept" if passed else "reject","symbolic_verdict":"pass" if passed else "reject",
@@ -560,6 +616,7 @@ def promote(root,candidate,review,metrics):
 
 def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini",llm_generate=None):
     root=Path(output_root);root.mkdir(parents=True,exist_ok=True); audit=root/"llm_audit";statsroot=root/"statistics"
+    dataset=str(state.get("dataset_name",dataset))
     current=json.loads((statsroot/"current_table.json").read_text()) if (statsroot/"current_table.json").exists() else {}
     input_evidence=state.get(
         "uncertain_signal_evidence",
@@ -569,11 +626,107 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         input_evidence,
         state.get("relative_object_motion",[]),
     )
-    patterns=validate_patterns({})
+    validation_thresholds=dict(
+        state.get("trajectory_validation_threshold_policy", {}).get("thresholds", {})
+    ) or None
     ego={str(x.get("video_id","")):ego_frames(x) for x in state.get("ego_motion",[])}
+    from src.exp_july.perception.trajectory_cohort_policy import (
+        assign_cohorts, attach_static_metadata, calibrate_operator_plans,
+        cohort_statistics, compile_operator_plans, compile_rules,
+        operator_library, repair_selection_prompt, rule_generation_prompt,
+    )
+    policy_root=root/"policies"
+    from src.exp_july.perception.trajectory_pattern_epoch import begin_epoch
+    epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
+    metadata_catalog=attach_static_metadata(tracks)
+    raw_rules=llm_call(
+        "cohort_rule_generation",
+        rule_generation_prompt(dataset,metadata_catalog),
+        audit,llm_generate,
+    )
+    compiled_rule_policy=compile_rules(raw_rules)
+    cohorts=assign_cohorts(tracks,compiled_rule_policy["rules"])
+    systematic_anomaly_rate=max(
+        0.05,min(
+            0.80,
+            f(os.environ.get("CAUVID_STEP8C_SYSTEMATIC_ANOMALY_RATE","0.20"),0.20),
+        )
+    )
+    cohort_summaries=cohort_statistics(
+        cohorts,validation_thresholds,systematic_anomaly_rate,
+    )
+    repair_library=operator_library(EXECUTORS)
+    raw_operator_plans=llm_call(
+        "cohort_repair_selection",
+        repair_selection_prompt(cohort_summaries,repair_library),
+        audit,llm_generate,
+    )
+    initial_cohort_plans=compile_operator_plans(
+        raw_operator_plans,cohort_summaries,repair_library,
+    )
+    from src.exp_july.perception.trajectory_pattern_epoch import (
+        fixed_video_split as fixed_cohort_video_split,
+    )
+    cohort_update_video_ids,cohort_validation_video_ids=fixed_cohort_video_split(
+        [track.get("video_id","") for track in tracks]
+    )
+    downstream_feedback_path=policy_root/"downstream_feedback.json"
+    downstream_feedback=(
+        json.loads(downstream_feedback_path.read_text())
+        if downstream_feedback_path.exists() else {}
+    )
+    cohort_plans=calibrate_operator_plans(
+        initial_cohort_plans,cohorts,ego,validation_thresholds,
+        downstream_feedback,
+        calibration_video_ids=cohort_validation_video_ids,
+    )
+    cohort_policy_payload={
+        "version":epoch_id,
+        "schema_version":int(compiled_rule_policy.get("version",0)),
+        "dataset":dataset,
+        "rules":compiled_rule_policy.get("rules",[]),
+        "operator_plans":cohort_plans,
+    }
+    cohort_policy_fingerprint=hashlib.sha256(
+        json.dumps(cohort_policy_payload,sort_keys=True,separators=(",",":")).encode()
+    ).hexdigest()[:16]
+    cohort_root=root/"cohorts";cohort_root.mkdir(parents=True,exist_ok=True)
+    (cohort_root/"metadata_catalog.json").write_text(json.dumps(metadata_catalog,indent=2))
+    (cohort_root/"compiled_rules.json").write_text(json.dumps(compiled_rule_policy,indent=2))
+    (cohort_root/"cohort_statistics.json").write_text(json.dumps(cohort_summaries,indent=2))
+    (cohort_root/"operator_library.json").write_text(json.dumps(repair_library,indent=2))
+    (cohort_root/"calibrated_operator_plans.json").write_text(json.dumps(cohort_plans,indent=2))
+    (cohort_root/"frozen_policy.json").write_text(json.dumps({
+        **cohort_policy_payload,
+        "fingerprint":cohort_policy_fingerprint,
+        "frozen_for_entire_epoch":True,
+    },indent=2))
+    (policy_root/f"cohort_policy_epoch_{epoch_id:04d}.json").write_text(
+        json.dumps({
+            **cohort_policy_payload,
+            "fingerprint":cohort_policy_fingerprint,
+            "frozen_for_entire_epoch":True,
+        },indent=2)
+    )
+    print(
+      f"[step 8c] COHORT_POLICY_FROZEN rules={len(compiled_rule_policy.get('rules',[]))} "
+      f"cohorts={len(cohorts)} fingerprint={cohort_policy_fingerprint}",
+      flush=True,
+    )
+    for cohort_id,plan in sorted(cohort_plans.items()):
+        calibration=dict(plan.get("calibration",{}))
+        selected_measurement=dict(calibration.get("selected_measurement",{}))
+        print(
+          f"[step 8c] COHORT_PLAN id={cohort_id} tracks={len(cohorts.get(cohort_id,[]))} "
+          f"operator={plan.get('operator','no_repair')} "
+          f"calibration_samples={int(selected_measurement.get('sample_count',0))} "
+          f"decision={calibration.get('promotion_decision','')}",
+          flush=True,
+        )
+    patterns=validate_patterns({})
     from src.exp_july.perception.trajectory_pattern_llm_batch import compact_track
     from src.exp_july.perception.trajectory_pattern_epoch import (
-        begin_epoch, compile_patch, deterministic_interpretation, evaluate_and_stage,
+        compile_patch, deterministic_interpretation, evaluate_and_stage,
         fixed_video_split, review_package, review_prompt as epoch_review_prompt,
     )
     from src.exp_july.perception.trajectory_pattern_runtime_monitor import (
@@ -584,11 +737,6 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         candidates=[{"pattern_id":p["pattern_id"],"pattern_definition":p,
                      "residual_vector":residual(p["pattern_id"],track)} for p in patterns]
         track_items.append({"track":track,"candidates":candidates})
-    policy_root=root/"policies"
-    epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
-    validation_thresholds=dict(
-        state.get("trajectory_validation_threshold_policy", {}).get("thresholds", {})
-    ) or None
     review_interval=max(1,int(os.environ.get("CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS","500")))
     runtime_monitor=Step8CRuntimeMonitor(
         root/"runtime_monitor",len(track_items),
@@ -622,6 +770,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         repairs=repair_candidates(
             track,candidates,interp,ego.get(track["video_id"],{}),current,
             validation_thresholds=validation_thresholds,
+            cohort_plan=cohort_plans.get(str(track.get("cohort_id",""))),
         )
         accepted=[row for row in repairs if row["symbolic_verdict"]=="pass"]
         selected=max(accepted,key=lambda row:f(row["final_score"],-1e9)) if accepted else None
@@ -638,26 +787,56 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         finaltrack={**track,"observations":finalobs}; finaleval=_evaluate(
           finalobs,max([int(x.get("frame_index",0)) for x in finalobs]or[0])+1,
           thresholds=validation_thresholds)
+        final_validation_status=finaleval["validation"].get("validation_status","")
+        original_valid_without_repair=(
+            not applied and final_validation_status in {"valid","repaired"}
+        )
+        if original_valid_without_repair:
+            reason="no_repair_required_original_preserved"
         llm_preferred=max(interp,key=lambda row:f(row["plausibility"])) ["pattern_id"]
         finalpattern=selected["validated_pattern"] if selected else "unknown"
         publicrep=[{k:v for k,v in x.items() if k!="_observations"} for x in repairs]
         publicsel={k:v for k,v in selected.items() if k!="_observations"} if selected else {}
+        cohort_id=str(track.get("cohort_id",""))
+        cohort_plan=cohort_plans.get(cohort_id,{})
         rec={"version":VERSION,"video_id":track["video_id"],"track_id":track["track_id"],
+          "trajectory_cohort_id":cohort_id,
+          "activated_rule":copy.deepcopy(track.get("activated_cohort_rule",{})),
+          "cohort_static_metadata":copy.deepcopy(track.get("static_metadata",{})),
+          "cohort_statistical_summary":copy.deepcopy(cohort_summaries.get(cohort_id,{})),
+          "cohort_operator_plan":copy.deepcopy(cohort_plan),
           "symbolic_track":{k:v for k,v in track.items() if k!="observations"},"pattern_candidates":candidates,
           "llm_residual_interpretation":interp,"llm_compact_input":compact_inputs[uid],
           "llm_processing":llm_telemetry[uid],"candidate_repairs":publicrep,"selected_candidate":publicsel,
           "repair_applied":applied,"pattern_hypothesis":selected.get("pattern_hypothesis",{}) if selected else {},
           "repair_hypothesis":selected.get("repair_hypothesis",{}) if selected else {},
           "validated_pattern":finalpattern,"final_pattern":finalpattern,"LLM_preferred_pattern":llm_preferred,
-          "resolution_status":"validated" if selected else "unresolved_uncertain",
+          "resolution_status":(
+              "validated_repaired"
+              if selected else
+              "validated_no_repair"
+              if original_valid_without_repair else
+              "unresolved_uncertain"
+          ),
           "initial_8c_validation_status":initialeval["validation"].get("validation_status",""),
           "final_pattern_candidates":[{**c,"residual_vector":residual(c["pattern_id"],finaltrack)} for c in candidates],
-          "final_validation_status":finaleval["validation"].get("validation_status",""),
+          "final_validation_status":final_validation_status,
           "final_symbolic_predicates":{"direction":finaltrack["direction"],"confidence":finaleval["uncertainty"].get("confidence_score",0),
                                       "persistence":len(finalobs)/max(1,len(track["observations"]))},
-          "record_status":"completed_validated" if selected else "completed_unresolved",
+          "record_status":(
+              "completed_validated_repaired"
+              if selected else
+              "completed_validated_original_preserved"
+              if original_valid_without_repair else
+              "completed_unresolved"
+          ),
           "final_selection_reason":reason,"provenance":{"source_step":state.get("step8b_evidence_type",state.get("trajectory_motion_evidence_phase","repaired")),
-          "llm_role":"interval_policy_review_only","numeric_repair_role":"deterministic_executor",
+          "llm_role":"static_cohort_rule_generation_and_cohort_operator_selection_only",
+          "numeric_repair_role":"cohort_statistics_calibration_and_deterministic_executor",
+          "activated_rule_id":cohort_id,
+          "repair_operator":str(cohort_plan.get("operator","no_repair")),
+          "calibrated_parameters":copy.deepcopy(cohort_plan.get("calibrated_parameters",{})),
+          "cohort_policy_fingerprint":cohort_policy_fingerprint,
           "epoch_id":epoch_id,"frozen_policy_version":frozen_policy["version"],"original_observations_preserved":True}}
         records.append(rec);material[track["video_id"]].append({"track_id":track["track_id"],
           "_repair_selected":applied,"_final_observations":finalobs,
@@ -672,7 +851,10 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     update_set=set(update_video_ids);validation_set=set(validation_video_ids)
     update_records=[row for row in records if row["video_id"] in update_set]
     validation_records=[row for row in records if row["video_id"] in validation_set]
-    completed_update=[row for row in update_records if row.get("record_status")=="completed_validated"]
+    completed_update=[
+        row for row in update_records
+        if str(row.get("record_status","")).startswith("completed_validated")
+    ]
     candidate_rows=stat_rows(dataset,completed_update,version)
     validation_evaluated=evaluate_candidate_table(validation_records,candidate_rows)
     metrics=validation_metrics(validation_evaluated)
@@ -710,19 +892,41 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
       "interval_decisions":promotion_decisions,"update_video_ids":update_video_ids,"validation_video_ids":validation_video_ids,
       "independent_split":bool(update_video_ids and validation_video_ids and not set(update_video_ids)&set(validation_video_ids))}
     epoch_snapshot.update({"status":"completed","review_interval_tracks":review_interval,
+      "cohort_policy_fingerprint":cohort_policy_fingerprint,
+      "cohort_policy_frozen":True,
       "review_count":len(reviews),"promotion":promotion})
     (policy_root/f"epoch_{epoch_id:04d}.json").write_text(json.dumps(epoch_snapshot,indent=2))
     runtime_state=runtime_monitor.finalize()
-    manifest={"version":VERSION,"method":"deterministic_epoch_trajectory_pattern_repair",
+    manifest={"version":VERSION,"method":"prior_guided_statistical_signal_repair",
+      "dataset":dataset,
       "input_evidence_type":state.get("step8b_evidence_type","legacy_trajectory_motion_evidence"),
       "input_source_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_source_tracks",len(records))),
       "input_active_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_active_tracks",len(records))),
       "input_quarantined_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_quarantined_tracks",0)),
       "track_usefulness_policy_version":int(dict(dict(state.get("uncertain_signal_evidence_manifest",{})).get("track_usefulness_filter",{})).get("policy_version",0)),
-      "execution_flow":["epoch_boundary_activation","freeze_versioned_policy","symbolic_abstraction",
-      "deterministic_policy_interpretation","multi_hypothesis_repair","symbolic_validation",
+      "execution_flow":["static_metadata_abstraction","llm_cohort_rule_generation",
+      "compile_rule_dsl","cohort_statistical_analysis","llm_cohort_operator_selection",
+      "deterministic_parameter_calibration","deterministic_anomaly_gate",
+      "deterministic_operator_execution","symbolic_validation",
       "interval_statistical_aggregation","single_llm_policy_patch_review","compile_candidate_policy",
       "fixed_split_validation","stage_for_next_epoch_or_reject"],
+      "cohort_policy_version":epoch_id,
+      "cohort_policy_schema_version":int(compiled_rule_policy.get("version",0)),
+      "systematic_anomaly_rate_threshold":systematic_anomaly_rate,
+      "num_cohort_rules":len(compiled_rule_policy.get("rules",[])),
+      "num_cohorts":len(cohorts),
+      "cohort_track_counts":{key:len(value) for key,value in sorted(cohorts.items())},
+      "cohort_calibration_update_video_ids":cohort_update_video_ids,
+      "cohort_calibration_validation_video_ids":cohort_validation_video_ids,
+      "cohort_calibration_independent_split":bool(
+        cohort_update_video_ids and cohort_validation_video_ids
+        and not set(cohort_update_video_ids)&set(cohort_validation_video_ids)
+      ),
+      "cohort_rule_compile_errors":list(compiled_rule_policy.get("compile_errors",[])),
+      "cohort_operator_plans":copy.deepcopy(cohort_plans),
+      "cohort_policy_fingerprint":cohort_policy_fingerprint,
+      "cohort_policy_frozen":True,
+      "llm_direct_trajectory_repair":False,
       "num_videos":len({x["video_id"] for x in records}),"num_tracks":len(records),
       "num_patterns":len(patterns),"num_candidates":sum(len(x["candidate_repairs"]) for x in records),
       "num_repairs_applied":sum(x["repair_applied"] for x in records),
@@ -730,7 +934,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
       "statistics_validation_video_ids":validation_video_ids,"promotion":promotion,"patterns":patterns,
       "epoch_id":epoch_id,"frozen_policy_version":frozen_policy["version"],"policy_frozen":True,
       "review_interval_tracks":review_interval,"interval_review_count":len(reviews),
-      "llm_batch_size":0,"llm_called":len(reviews),
+      "llm_batch_size":0,"llm_called":len(reviews)+2,
       "llm_skipped":sum(row["llm_skipped"] for row in llm_telemetry.values()),
       "llm_cache_hits":sum(row["cache_hit"] for row in llm_telemetry.values()),
       "llm_escalated_to_single":0,"batch_evaluation":{},"runtime_monitor":runtime_state}
@@ -738,6 +942,11 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     (root/"symbolic_tracks.json").write_text(json.dumps([{k:v for k,v in x.items() if k!="observations"} for x in tracks],indent=2))
     result={**state,"pre_pattern_relative_object_motion":original,"relative_object_motion":refined,
       "filtered_relative_object_motion":refined,"trajectory_pattern_records":records,
+      "trajectory_cohort_metadata_catalog":metadata_catalog,
+      "trajectory_cohort_rule_policy":compiled_rule_policy,
+      "trajectory_cohort_statistics":cohort_summaries,
+      "trajectory_cohort_operator_plans":cohort_plans,
+      "trajectory_cohort_output_root":cohort_root,
       "trajectory_pattern_definitions":patterns,"trajectory_pattern_statistics_candidate":candidate,
       "trajectory_pattern_statistics_review":reviews,"trajectory_pattern_statistics_promotion":promotion,
       "trajectory_pattern_epoch_policy":frozen_policy,"trajectory_pattern_epoch_reviews":reviews,

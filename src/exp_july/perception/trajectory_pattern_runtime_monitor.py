@@ -121,13 +121,13 @@ class Step8CRuntimeMonitor:
         self.progress.set_postfix(self._postfix(),refresh=True);self._write()
 
     def track_start(self,video_id,track_id,index,total):
-        self.progress.set_description_str(f"[step 8c] repair {index}/{total} {video_id} track={track_id}")
+        self.progress.set_description_str(f"[step 8c] cohort process {index}/{total} {video_id} track={track_id}")
         if index==1 or index%25==0 or index==total:
-            tqdm.write(f"[step 8c] REPAIR track={index}/{total} video={video_id} track_id={track_id}")
+            tqdm.write(f"[step 8c] COHORT_PROCESS track={index}/{total} video={video_id} track_id={track_id}")
         self.progress.set_postfix(self._postfix(),refresh=True)
 
     def track_complete(self,record):
-        self.units+=1;self.progress.update(1);accepted=bool(record.get("repair_applied"));uncertain=str(record.get("resolution_status"))!="validated"
+        self.units+=1;self.progress.update(1);accepted=bool(record.get("repair_applied"));uncertain=not str(record.get("resolution_status")).startswith("validated")
         failed=str(record.get("final_validation_status"))=="invalid"
         self.counts["repair_accepted"]+=accepted;self.counts["uncertain"]+=uncertain;self.counts["failure"]+=failed
         self.outcomes.append("failure" if failed else "uncertain" if uncertain else "ok")
