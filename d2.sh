@@ -47,6 +47,26 @@ prepare_dirs() {
   mkdir -p "$DRIVING_MINI" "$NUSCENES" "$PIPELINE_OUTPUT" "$OUTPUT_DIR" "$LOGS_DIR" "$TORCH_CACHE"
 }
 
+validate_driving_mini() {
+  local has_frames=""
+  local has_videos=""
+
+  if [[ -d "$DRIVING_MINI/frames" ]]; then
+    has_frames="$(find "$DRIVING_MINI/frames" -mindepth 2 -maxdepth 2 -type f -name 'frame_*.jpg' -print -quit 2>/dev/null)"
+  fi
+  if [[ -d "$DRIVING_MINI/videos" ]]; then
+    has_videos="$(find "$DRIVING_MINI/videos" -maxdepth 1 -type f \( -name '*.mov' -o -name '*.mp4' -o -name '*.avi' -o -name '*.mkv' \) -print -quit 2>/dev/null)"
+  fi
+
+  if [[ -z "$has_frames" && -z "$has_videos" ]]; then
+    echo "[d2][error] No prepared driving_mini data found at: $DRIVING_MINI" >&2
+    echo "[d2][error] Expected frames/<video_id>/frame_*.jpg or videos/<video_id>.(mov|mp4|avi|mkv)." >&2
+    echo "[d2][error] Set CAUVID_DRIVING_MINI_HOST to the prepared dataset directory, for example:" >&2
+    echo "  export CAUVID_DRIVING_MINI_HOST=/actual/path/to/driving_mini" >&2
+    exit 1
+  fi
+}
+
 run_container() {
   local video_count="${1:-}"
   local rounds="${2:-3}"
@@ -234,8 +254,9 @@ main() {
             usage
             exit 1
             ;;
-        esac
+          esac
       done
+      validate_driving_mini
       ensure_image
       run_container "$video_count" "$rounds" "$max_step"
       ;;
@@ -266,6 +287,7 @@ main() {
       usage
       ;;
     *)
+      validate_driving_mini
       ensure_image
       run_container "" "3" "18"
       ;;

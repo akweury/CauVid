@@ -715,6 +715,10 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     runtime_state=runtime_monitor.finalize()
     manifest={"version":VERSION,"method":"deterministic_epoch_trajectory_pattern_repair",
       "input_evidence_type":state.get("step8b_evidence_type","legacy_trajectory_motion_evidence"),
+      "input_source_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_source_tracks",len(records))),
+      "input_active_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_active_tracks",len(records))),
+      "input_quarantined_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_quarantined_tracks",0)),
+      "track_usefulness_policy_version":int(dict(dict(state.get("uncertain_signal_evidence_manifest",{})).get("track_usefulness_filter",{})).get("policy_version",0)),
       "execution_flow":["epoch_boundary_activation","freeze_versioned_policy","symbolic_abstraction",
       "deterministic_policy_interpretation","multi_hypothesis_repair","symbolic_validation",
       "interval_statistical_aggregation","single_llm_policy_patch_review","compile_candidate_policy",

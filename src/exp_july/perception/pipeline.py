@@ -63,7 +63,53 @@ _VIS_EGO_METHOD_COLORS = {
     "refined": (80, 220, 80),
     "ransac": (60, 140, 255),
 }
-_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 2
+_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 3
+_TRACK_USEFULNESS_POLICY_VERSION = 1
+_TRACK_USEFULNESS_PROTECTED_LABEL_TOKENS = (
+    "traffic light",
+    "traffic sign",
+    "stop sign",
+    "yield sign",
+    "sign",
+    "pedestrian",
+    "person",
+    "cyclist",
+    "bicycle",
+    "motorcycle",
+    "emergency",
+    "ambulance",
+    "police",
+    "fire truck",
+    "construction",
+    "barrier",
+    "cone",
+    "animal",
+)
+_TRACK_USEFULNESS_VEHICLE_LABEL_TOKENS = (
+    "car",
+    "truck",
+    "bus",
+    "van",
+    "trailer",
+    "vehicle",
+)
+_TRACK_USEFULNESS_THRESHOLDS = {
+    "max_short_observations": 3,
+    "max_tiny_bbox_area_px": 625.0,
+    "min_far_depth": 45.0,
+    "max_low_detection_score": 0.65,
+    "max_weak_cue": 0.20,
+    "min_near_depth_protection": 35.0,
+    "max_ego_corridor_abs_x": 4.5,
+    "max_ego_corridor_depth": 120.0,
+    "min_large_bbox_area_px": 900.0,
+    "min_strong_detection_score": 0.65,
+    "min_informative_cue": 0.20,
+    "min_approach_protection": 0.10,
+    "min_raw_approach_depth_change": 0.50,
+    "min_bbox_growth_ratio": 1.25,
+    "min_raw_relative_speed": 1.0,
+}
 _CAUSAL_FILTER_OUT_VERSION = 2
 _TRAJECTORY_VALIDATION_THRESHOLDS = {
     "max_valid_frame_gap": 3,
@@ -2371,6 +2417,178 @@ def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
     }
 
 
+def _normalized_track_label(label):
+    return " ".join(
+        str(label).strip().lower().replace("_", " ").replace("-", " ").split()
+    )
+
+
+def _label_has_token(label, tokens):
+    normalized = _normalized_track_label(label)
+    return any(token in normalized for token in tokens)
+
+
+def _initial_track_usefulness_decision(
+    track_id,
+    track_data,
+    evidence,
+    video_num_frames,
+):
+    """Conservatively quarantine only unanimously weak, far, tiny vehicles."""
+    observations = [
+        _trajectory_observation_from_motion_object(
+            frame_index,
+            track_data["frames"][frame_index],
+        )
+        for frame_index in sorted(track_data.get("frames", {}))
+    ]
+    statistics = _trajectory_statistics(observations, video_num_frames)
+    label = str(evidence.get("primary_label", track_data.get("label", "unknown")))
+    observed_labels = sorted(
+        {
+            str(row.get("frame_label", "")).strip()
+            for row in observations
+            if str(row.get("frame_label", "")).strip()
+        }
+    )
+    cues = {
+        key: _clamp_unit(value)
+        for key, value in dict(evidence.get("observable_cues", {})).items()
+    }
+    bbox_areas = [
+        _bbox_area(row.get("bbox", []))
+        for row in observations
+        if _valid_bbox(row.get("bbox", [])) is not None
+    ]
+    depths = [
+        _safe_float(row.get("position_3d", [0.0, 0.0, 0.0])[2])
+        for row in observations
+        if len(row.get("position_3d", [])) >= 3
+        and _safe_float(row.get("position_3d", [0.0, 0.0, 0.0])[2]) > 0.0
+    ]
+    lateral_positions = [
+        abs(_safe_float(row.get("position_3d", [0.0])[0]))
+        for row in observations
+        if len(row.get("position_3d", [])) >= 3
+    ]
+    scores = [
+        _safe_float(dict(row.get("uncertainty", {})).get("score", 0.0))
+        for row in observations
+    ]
+    relative_speeds = [
+        abs(_safe_float(dict(row.get("motion", {})).get("rel_speed", 0.0)))
+        for row in observations
+        if bool(dict(row.get("motion", {})).get("has_rel_motion", False))
+    ]
+    count = len(observations)
+    max_bbox_area = max(bbox_areas or [0.0])
+    bbox_growth_ratio = (
+        bbox_areas[-1] / max(1e-6, bbox_areas[0])
+        if len(bbox_areas) >= 2
+        else 1.0
+    )
+    min_depth = min(depths or [0.0])
+    depth_change = (
+        depths[-1] - depths[0] if len(depths) >= 2 else 0.0
+    )
+    min_abs_x = min(lateral_positions or [float("inf")])
+    max_score = max(scores or [0.0])
+    max_relative_speed = max(relative_speeds or [0.0])
+    max_cue = max(cues.values(), default=0.0)
+    approach = _safe_float(cues.get("approach", 0.0))
+    source_counts = dict(statistics.get("source_counts", {}))
+    thresholds = _TRACK_USEFULNESS_THRESHOLDS
+
+    protection_reasons = []
+    if any(
+        _label_has_token(
+            observed_label, _TRACK_USEFULNESS_PROTECTED_LABEL_TOKENS
+        )
+        for observed_label in observed_labels or [label]
+    ):
+        protection_reasons.append("protected_semantic_category")
+    vehicle_category = bool(observed_labels or [label]) and all(
+        _label_has_token(
+            observed_label, _TRACK_USEFULNESS_VEHICLE_LABEL_TOKENS
+        )
+        for observed_label in observed_labels or [label]
+    )
+    if not vehicle_category:
+        protection_reasons.append("non_vehicle_category_preserved")
+    if count > int(thresholds["max_short_observations"]):
+        protection_reasons.append("sufficient_observation_count")
+    if int(source_counts.get("repaired", 0)) > 0:
+        protection_reasons.append("repair_supported_track")
+    if depths and min_depth <= float(thresholds["min_near_depth_protection"]):
+        protection_reasons.append("near_ego")
+    if (
+        depths
+        and lateral_positions
+        and min_abs_x <= float(thresholds["max_ego_corridor_abs_x"])
+        and min_depth <= float(thresholds["max_ego_corridor_depth"])
+    ):
+        protection_reasons.append("ego_corridor")
+    if max_bbox_area >= float(thresholds["min_large_bbox_area_px"]):
+        protection_reasons.append("visually_large")
+    if max_score >= float(thresholds["min_strong_detection_score"]):
+        protection_reasons.append("strong_detection")
+    if max_cue >= float(thresholds["min_informative_cue"]):
+        protection_reasons.append("informative_signal_cue")
+    if approach >= float(thresholds["min_approach_protection"]):
+        protection_reasons.append("approach_evidence")
+    if depth_change <= -float(
+        thresholds["min_raw_approach_depth_change"]
+    ):
+        protection_reasons.append("raw_depth_approach")
+    if bbox_growth_ratio >= float(thresholds["min_bbox_growth_ratio"]):
+        protection_reasons.append("growing_bbox")
+    if max_relative_speed >= float(thresholds["min_raw_relative_speed"]):
+        protection_reasons.append("meaningful_raw_relative_speed")
+
+    useless_conditions = {
+        "short": count <= int(thresholds["max_short_observations"]),
+        "tiny": max_bbox_area <= float(thresholds["max_tiny_bbox_area_px"]),
+        "far": bool(depths)
+        and min_depth >= float(thresholds["min_far_depth"]),
+        "low_detection_confidence": max_score
+        < float(thresholds["max_low_detection_score"]),
+        "weak_cues": max_cue < float(thresholds["max_weak_cue"]),
+        "vehicle_category": vehicle_category,
+    }
+    quarantine = not protection_reasons and all(useless_conditions.values())
+    return {
+        "track_id": int(track_id),
+        "primary_label": label,
+        "decision": "quarantine" if quarantine else "active",
+        "protected": not quarantine,
+        "policy_version": _TRACK_USEFULNESS_POLICY_VERSION,
+        "reason_codes": (
+            ["unanimous_short_tiny_far_weak_vehicle"]
+            if quarantine
+            else protection_reasons or ["conservative_default_keep"]
+        ),
+        "features": {
+            "num_observations": count,
+            "temporal_coverage_in_video": _safe_float(
+                statistics.get("temporal_coverage_in_video", 0.0)
+            ),
+            "max_bbox_area_px": float(max_bbox_area),
+            "bbox_growth_ratio": float(bbox_growth_ratio),
+            "min_depth": float(min_depth) if depths else None,
+            "depth_change": float(depth_change),
+            "min_abs_lateral_position": (
+                float(min_abs_x) if lateral_positions else None
+            ),
+            "max_detection_score": float(max_score),
+            "max_relative_speed": float(max_relative_speed),
+            "max_observable_cue": float(max_cue),
+            "approach": float(approach),
+        },
+        "conditions": useless_conditions,
+        "feedback_status": "pending_downstream_review",
+    }
+
+
 def _relative_signal_fingerprint(relative_video):
     digest = hashlib.sha256()
     digest.update(
@@ -2421,13 +2639,39 @@ def _uncertain_signal_evidence_video(
     video_num_frames = int(
         relative_video.get("num_frames", len(frame_indices))
     )
-    track_evidence = [
-        _uncertain_track_signal_evidence(
+    source_track_evidence = [
+        (
             track_id,
             track_data,
-            video_num_frames,
+            _uncertain_track_signal_evidence(
+                track_id,
+                track_data,
+                video_num_frames,
+            ),
         )
         for track_id, track_data in sorted(tracks.items())
+    ]
+    filter_decisions = [
+        _initial_track_usefulness_decision(
+            track_id,
+            track_data,
+            evidence,
+            video_num_frames,
+        )
+        for track_id, track_data, evidence in source_track_evidence
+    ]
+    decision_by_track = {
+        int(row["track_id"]): row for row in filter_decisions
+    }
+    track_evidence = [
+        evidence
+        for track_id, _, evidence in source_track_evidence
+        if decision_by_track[int(track_id)]["decision"] == "active"
+    ]
+    quarantined_evidence = [
+        evidence
+        for track_id, _, evidence in source_track_evidence
+        if decision_by_track[int(track_id)]["decision"] == "quarantine"
     ]
     return {
         "version": _UNCERTAIN_SIGNAL_EVIDENCE_VERSION,
@@ -2439,7 +2683,10 @@ def _uncertain_signal_evidence_video(
             or _relative_signal_fingerprint(relative_video)
         ),
         "num_frames": video_num_frames,
+        "num_source_tracks": len(source_track_evidence),
         "num_tracks": len(track_evidence),
+        "num_active_tracks": len(track_evidence),
+        "num_quarantined_tracks": len(quarantined_evidence),
         "num_observations": sum(
             len(track_data.get("frames", {}))
             for track_data in tracks.values()
@@ -2455,6 +2702,17 @@ def _uncertain_signal_evidence_video(
             "deceleration",
         ],
         "track_signal_evidence": track_evidence,
+        "quarantined_track_signal_evidence": quarantined_evidence,
+        "track_usefulness_filter": {
+            "policy_version": _TRACK_USEFULNESS_POLICY_VERSION,
+            "policy_kind": "conservative_initial_unanimous_evidence_gate",
+            "mode": "quarantine_not_delete",
+            "thresholds": dict(_TRACK_USEFULNESS_THRESHOLDS),
+            "num_source_tracks": len(source_track_evidence),
+            "num_active_tracks": len(track_evidence),
+            "num_quarantined_tracks": len(quarantined_evidence),
+            "decisions": filter_decisions,
+        },
     }
 
 
@@ -3630,7 +3888,8 @@ def save_track_length_histogram(track_lengths, output_root):
 def step1_init(video_ids=None, video_count=None):
     dataset_root = config.get_dataset_path("driving_mini")
     video_dir = dataset_root / "videos"
-    all_videos = sorted(config.get_mini_video_ids()) if video_dir.exists() else []
+    frames_dir = dataset_root / "frames"
+    all_videos = sorted(config.get_mini_video_ids())
     if video_ids:
         videos = []
         for video_id in video_ids:
@@ -3642,7 +3901,7 @@ def step1_init(video_ids=None, video_count=None):
         videos = videos[:video_count]
     print(
         f"[step 1] loaded {len(videos)} videos for this run \n"
-        f"[step 1] from {video_dir} \n"
+        f"[step 1] from videos={video_dir} frames={frames_dir} \n"
         f"[step 1] (dataset=driving_mini, total_in_dataset={len(all_videos)})"
     )
     detection_args = {
@@ -4487,6 +4746,9 @@ def step8b_uncertain_signal_evidence(
             and str(cached.get("source_signal_fingerprint", ""))
             == source_signal_fingerprint
             and isinstance(cached.get("track_signal_evidence"), list)
+            and isinstance(
+                cached.get("quarantined_track_signal_evidence"), list
+            )
             and all(
                 set(row.get("observable_cues", {}))
                 == {
@@ -4500,6 +4762,27 @@ def step8b_uncertain_signal_evidence(
                 and "descriptors" not in row
                 for row in cached.get("track_signal_evidence", [])
             )
+            and all(
+                set(row.get("observable_cues", {}))
+                == {
+                    "leftness",
+                    "rightness",
+                    "approach",
+                    "recede",
+                    "acceleration",
+                    "deceleration",
+                }
+                and "descriptors" not in row
+                for row in cached.get(
+                    "quarantined_track_signal_evidence", []
+                )
+            )
+            and int(
+                dict(cached.get("track_usefulness_filter", {})).get(
+                    "policy_version", 0
+                )
+            )
+            == _TRACK_USEFULNESS_POLICY_VERSION
             and not bool(cached.get("semantic_motion_classification", True))
             and not bool(cached.get("symbolic_reasoning", True))
         )
@@ -4522,8 +4805,16 @@ def step8b_uncertain_signal_evidence(
             )
         evidence_videos.append(evidence)
 
-    total_tracks = sum(
+    total_source_tracks = sum(
+        int(row.get("num_source_tracks", row.get("num_tracks", 0)))
+        for row in evidence_videos
+    )
+    total_active_tracks = sum(
         int(row.get("num_tracks", 0)) for row in evidence_videos
+    )
+    total_quarantined_tracks = sum(
+        int(row.get("num_quarantined_tracks", 0))
+        for row in evidence_videos
     )
     manifest = {
         "version": _UNCERTAIN_SIGNAL_EVIDENCE_VERSION,
@@ -4541,7 +4832,16 @@ def step8b_uncertain_signal_evidence(
             "deceleration",
         ],
         "num_videos": len(evidence_videos),
-        "num_tracks": total_tracks,
+        "num_source_tracks": total_source_tracks,
+        "num_tracks": total_active_tracks,
+        "num_active_tracks": total_active_tracks,
+        "num_quarantined_tracks": total_quarantined_tracks,
+        "track_usefulness_filter": {
+            "policy_version": _TRACK_USEFULNESS_POLICY_VERSION,
+            "policy_kind": "conservative_initial_unanimous_evidence_gate",
+            "mode": "quarantine_not_delete",
+            "thresholds": dict(_TRACK_USEFULNESS_THRESHOLDS),
+        },
         "num_observations": sum(
             int(row.get("num_observations", 0)) for row in evidence_videos
         ),
@@ -4549,7 +4849,16 @@ def step8b_uncertain_signal_evidence(
             {
                 "video_id": row.get("video_id", ""),
                 "num_frames": int(row.get("num_frames", 0)),
+                "num_source_tracks": int(
+                    row.get("num_source_tracks", row.get("num_tracks", 0))
+                ),
                 "num_tracks": int(row.get("num_tracks", 0)),
+                "num_active_tracks": int(
+                    row.get("num_active_tracks", row.get("num_tracks", 0))
+                ),
+                "num_quarantined_tracks": int(
+                    row.get("num_quarantined_tracks", 0)
+                ),
                 "num_observations": int(row.get("num_observations", 0)),
             }
             for row in evidence_videos
@@ -4600,7 +4909,9 @@ def step8b_uncertain_signal_evidence(
         f"[step {step_label}] uncertain_signal_evidence "
         f"videos={manifest['num_videos']} "
         f"cached={cached_videos} "
-        f"tracks={manifest['num_tracks']} "
+        f"source_tracks={manifest['num_source_tracks']} "
+        f"active_tracks={manifest['num_active_tracks']} "
+        f"quarantined_tracks={manifest['num_quarantined_tracks']} "
         f"observations={manifest['num_observations']} "
         "semantic_classification=False symbolic_reasoning=False"
     )
@@ -5092,6 +5403,8 @@ def step8e_iterative_trajectory_pattern_repair(
         f"[step {step_label}] trajectory_pattern_closed_loop "
         f"videos={int(manifest.get('num_videos', 0))} "
         f"tracks={int(manifest.get('num_tracks', 0))} "
+        f"source_tracks={int(manifest.get('input_source_tracks', manifest.get('num_tracks', 0)))} "
+        f"quarantined_tracks={int(manifest.get('input_quarantined_tracks', 0))} "
         f"patterns={int(manifest.get('num_patterns', 0))} "
         f"candidates={int(manifest.get('num_candidates', 0))} "
         f"repairs={int(manifest.get('num_repairs_applied', 0))} "

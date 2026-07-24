@@ -61,6 +61,40 @@ def _relative_video():
     }
 
 
+def _short_track_video(
+    label="car", *, depth=70.0, score=0.30, depth_step=0.0
+):
+    frames = []
+    for frame_index in range(2):
+        frames.append(
+            {
+                "frame_index": frame_index,
+                "objects": [
+                    {
+                        "track_id": 11,
+                        "object_index": 0,
+                        "frame_label": label,
+                        "label": label,
+                        "bbox": [100, 80, 110, 90],
+                        "position_3d": [
+                            8.0,
+                            0.0,
+                            depth + depth_step * frame_index,
+                        ],
+                        "rel_vx": 0.0,
+                        "rel_vz": 0.0,
+                        "rel_speed": 0.0,
+                        "has_rel_motion": frame_index > 0,
+                        "score": score,
+                        "source": "observed",
+                        "source_type": "detector_track",
+                    }
+                ],
+            }
+        )
+    return {"video_id": "short", "num_frames": 200, "frames": frames}
+
+
 def _all_keys(value):
     keys = set()
     if isinstance(value, dict):
@@ -74,6 +108,73 @@ def _all_keys(value):
 
 
 class Step8BSignalEvidenceTests(unittest.TestCase):
+    def test_initial_filter_quarantines_only_unanimously_weak_far_vehicle(self):
+        evidence = _uncertain_signal_evidence_video(_short_track_video())
+
+        self.assertEqual(evidence["num_source_tracks"], 1)
+        self.assertEqual(evidence["num_active_tracks"], 0)
+        self.assertEqual(evidence["num_quarantined_tracks"], 1)
+        self.assertEqual(evidence["track_signal_evidence"], [])
+        quarantined = evidence["quarantined_track_signal_evidence"][0]
+        self.assertEqual(
+            set(quarantined),
+            {"track_id", "primary_label", "observable_cues"},
+        )
+        decision = evidence["track_usefulness_filter"]["decisions"][0]
+        self.assertEqual(decision["decision"], "quarantine")
+        self.assertEqual(
+            decision["reason_codes"],
+            ["unanimous_short_tiny_far_weak_vehicle"],
+        )
+        self.assertTrue(all(decision["conditions"].values()))
+
+    def test_initial_filter_never_quarantines_short_traffic_control(self):
+        evidence = _uncertain_signal_evidence_video(
+            _short_track_video("traffic sign")
+        )
+
+        self.assertEqual(evidence["num_active_tracks"], 1)
+        self.assertEqual(evidence["num_quarantined_tracks"], 0)
+        decision = evidence["track_usefulness_filter"]["decisions"][0]
+        self.assertEqual(decision["decision"], "active")
+        self.assertIn(
+            "protected_semantic_category", decision["reason_codes"]
+        )
+
+    def test_initial_filter_preserves_near_or_strong_short_vehicle(self):
+        near = _uncertain_signal_evidence_video(
+            _short_track_video(depth=20.0)
+        )
+        strong = _uncertain_signal_evidence_video(
+            _short_track_video(score=0.90)
+        )
+
+        self.assertEqual(near["num_active_tracks"], 1)
+        self.assertIn(
+            "near_ego",
+            near["track_usefulness_filter"]["decisions"][0]["reason_codes"],
+        )
+        self.assertEqual(strong["num_active_tracks"], 1)
+        self.assertIn(
+            "strong_detection",
+            strong["track_usefulness_filter"]["decisions"][0][
+                "reason_codes"
+            ],
+        )
+
+    def test_initial_filter_preserves_raw_short_approach(self):
+        approaching = _uncertain_signal_evidence_video(
+            _short_track_video(depth_step=-2.0)
+        )
+
+        self.assertEqual(approaching["num_active_tracks"], 1)
+        self.assertIn(
+            "raw_depth_approach",
+            approaching["track_usefulness_filter"]["decisions"][0][
+                "reason_codes"
+            ],
+        )
+
     def test_video_abstraction_emits_only_six_scalar_observable_cues(self):
         evidence = _uncertain_signal_evidence_video(_relative_video())
 
@@ -165,6 +266,11 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
         self.assertNotIn("causal_filter_out", result)
         self.assertEqual(payload["num_tracks"], 1)
         self.assertEqual(manifest["num_tracks"], 1)
+        self.assertEqual(manifest["num_source_tracks"], 1)
+        self.assertEqual(manifest["num_quarantined_tracks"], 0)
+        self.assertEqual(
+            manifest["track_usefulness_filter"]["policy_version"], 1
+        )
         self.assertFalse(manifest["semantic_motion_classification"])
         self.assertFalse(manifest["symbolic_reasoning"])
         self.assertEqual(

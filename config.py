@@ -190,9 +190,19 @@ def ensure_directories():
             path.mkdir(parents=True, exist_ok=True)
 
 def get_mini_video_ids():
-    folder_path = get_dataset_path('driving_mini') / "videos"
-    video_ids = [f.stem for f in folder_path.glob("*.mov")]
-    return video_ids
+    dataset_root = get_dataset_path("driving_mini")
+    video_ids = {
+        path.stem
+        for pattern in ("*.mov", "*.mp4", "*.avi", "*.mkv")
+        for path in (dataset_root / "videos").glob(pattern)
+        if path.is_file()
+    }
+    video_ids.update(
+        path.name
+        for path in (dataset_root / "frames").glob("*")
+        if path.is_dir() and any(path.glob("frame_*.jpg"))
+    )
+    return sorted(video_ids)
 
 # Ensure directories exist when config is imported
 if __name__ == "__main__":

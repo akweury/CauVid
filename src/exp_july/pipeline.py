@@ -115,9 +115,12 @@ def _step_data_error(step_name, state):
     if not videos:
         detail = ""
         if step_name == "01_init":
+            dataset_root = state.get("dataset_root")
             detail = (
-                f" under dataset_root={state.get('dataset_root')}; "
-                "check the dataset mount/path and requested video IDs"
+                f" under dataset_root={dataset_root}; expected either "
+                f"{dataset_root}/frames/<video_id>/frame_*.jpg or "
+                f"{dataset_root}/videos/<video_id>.(mov|mp4|avi|mkv); "
+                "check CAUVID_DRIVING_MINI_HOST and requested video IDs"
             )
         return f"produced no videos{detail}"
 
