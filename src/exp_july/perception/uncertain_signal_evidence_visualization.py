@@ -346,13 +346,11 @@ def _draw_track_progress_bar(
     )
 
 
-def _draw_bbox_label(
+def _draw_bbox(
     cv2,
     scene,
     *,
     box,
-    track_id,
-    object_label,
     color,
 ):
     x1, y1, x2, y2 = box
@@ -368,34 +366,28 @@ def _draw_bbox_label(
         scene, (x1, y1), (x2, y2), (0, 0, 0), thickness + 3
     )
     cv2.rectangle(scene, (x1, y1), (x2, y2), color, thickness)
-    label = f"{object_label} | ID {track_id}"
-    font_scale = 1.75
-    text_thickness = 4
-    (text_width, text_height), baseline = cv2.getTextSize(
-        label,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        text_thickness,
-    )
-    text_x = max(4, min(x1, scene_width - text_width - 12))
-    text_y = y1 - 10 if y1 >= text_height + baseline + 18 else y1 + text_height + 16
-    text_y = max(text_height + 8, min(scene_height - baseline - 5, text_y))
-    cv2.rectangle(
-        scene,
-        (text_x - 4, text_y - text_height - 7),
-        (text_x + text_width + 7, text_y + baseline + 5),
-        (0, 0, 0),
-        -1,
-    )
+
+
+def _draw_object_identity(
+    cv2,
+    panel,
+    *,
+    object_label,
+    track_id,
+    top,
+    max_width,
+    color,
+):
+    identity = f"OBJECT: {object_label}    TRACK ID: {track_id}"
     _put_text(
         cv2,
-        scene,
-        label,
-        text_x,
-        text_y,
-        font_scale,
+        panel,
+        _fit_text(cv2, identity, max_width, 1.45, 4),
+        24,
+        top,
+        1.45,
         color,
-        text_thickness,
+        4,
     )
 
 
@@ -471,6 +463,15 @@ def _render_step8b_track_video(
                 scene_height -= 1
             scene = cv2.resize(image, (scene_width, scene_height))
             obj = track_objects.get(frame_index)
+            object_label = str(
+                (obj or {}).get(
+                    "frame_label",
+                    (obj or {}).get(
+                        "label",
+                        evidence.get("primary_label", "unknown"),
+                    ),
+                )
+            )
             box = _valid_bbox(obj)
             if box:
                 scale_x = scene_width / max(1, frame_width)
@@ -484,33 +485,12 @@ def _render_step8b_track_video(
                         box[3] * scale_y,
                     )
                 ]
-                object_label = str(
-                    obj.get(
-                        "frame_label",
-                        obj.get(
-                            "label",
-                            evidence.get("primary_label", "unknown"),
-                        ),
-                    )
-                )
-                _draw_bbox_label(
+                _draw_bbox(
                     cv2,
                     scene,
                     box=(x1, y1, x2, y2),
-                    track_id=track_id,
-                    object_label=object_label,
                     color=confidence_color,
                 )
-            header = (
-                f"{relative_video.get('video_id', '')} | "
-                f"track {track_id}"
-            )
-            cv2.rectangle(
-                scene, (0, 0), (scene_width, 78), (0, 0, 0), -1
-            )
-            _put_text(
-                cv2, scene, header, 20, 54, 1.50, confidence_color, 4
-            )
 
             canvas = np.full(
                 (total_height, canvas_width, 3),
@@ -545,7 +525,17 @@ def _render_step8b_track_video(
                 bar_left=scene_x,
                 bar_right=scene_x + scene_width,
             )
-            current_title_y = progress_top + 146
+            identity_y = progress_top + 146
+            _draw_object_identity(
+                cv2,
+                canvas,
+                object_label=object_label,
+                track_id=track_id,
+                top=identity_y,
+                max_width=left_width - 48,
+                color=confidence_color,
+            )
+            current_title_y = identity_y + 64
             _put_text(
                 cv2,
                 canvas,

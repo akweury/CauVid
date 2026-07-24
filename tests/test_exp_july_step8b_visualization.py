@@ -5,7 +5,8 @@ from unittest.mock import MagicMock, patch
 
 from src.exp_july.perception.uncertain_signal_evidence_visualization import (
     _build_evidence_panel,
-    _draw_bbox_label,
+    _draw_bbox,
+    _draw_object_identity,
     _draw_track_progress_bar,
     render_step8b_signal_evidence_videos,
     select_step8b_visualization_tracks,
@@ -85,7 +86,7 @@ class Step8BVisualizationTests(unittest.TestCase):
             all(call.args[4] >= 1.2 and call.args[6] >= 3 for call in cue_calls)
         )
 
-    def test_progress_bar_marks_present_frames_and_bbox_shows_object_label(self):
+    def test_progress_bar_bbox_and_identity_use_separate_regions(self):
         cv2 = MagicMock()
         cv2.FONT_HERSHEY_SIMPLEX = 0
         cv2.LINE_AA = 16
@@ -116,12 +117,23 @@ class Step8BVisualizationTests(unittest.TestCase):
 
         scene = MagicMock()
         scene.shape = (720, 1280, 3)
-        _draw_bbox_label(
+        text_call_count = cv2.putText.call_count
+        _draw_bbox(
             cv2,
             scene,
             box=(100, 120, 240, 300),
-            track_id=7,
+            color=present_color,
+        )
+        self.assertEqual(cv2.putText.call_count, text_call_count)
+
+        panel = MagicMock()
+        _draw_object_identity(
+            cv2,
+            panel,
             object_label="pedestrian",
+            track_id=7,
+            top=240,
+            max_width=900,
             color=present_color,
         )
         rendered_text = [
@@ -129,7 +141,7 @@ class Step8BVisualizationTests(unittest.TestCase):
         ]
         self.assertTrue(
             any(
-                "pedestrian | ID 7" in text
+                "OBJECT: pedestrian    TRACK ID: 7" in text
                 for text in rendered_text
             )
         )
