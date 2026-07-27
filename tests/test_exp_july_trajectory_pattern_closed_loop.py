@@ -230,6 +230,21 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             self.assertTrue(
                 all(track.get("cohort_id") for track in clustered["trajectory_clustered_tracks"])
             )
+            self.assertFalse(
+                clustered["trajectory_clustering_manifest"]["whole_step_cache_hit"]
+            )
+            clustered_cached = step8c_trajectory_clustering(
+                source, llm_generate=llm
+            )
+            self.assertTrue(
+                clustered_cached["trajectory_clustering_manifest"][
+                    "whole_step_cache_hit"
+                ]
+            )
+            self.assertEqual(
+                clustered_cached["trajectory_clustered_tracks"],
+                clustered["trajectory_clustered_tracks"],
+            )
 
             repaired = step8d_closed_loop_trajectory_repair(
                 clustered,

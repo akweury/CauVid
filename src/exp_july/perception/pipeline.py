@@ -30,6 +30,35 @@ from tqdm import tqdm
 
 
 _TRACKLET_REPAIR_VERSION = 1
+_EGO_SYMBOL_PRIOR_VERSION = 2
+_EGO_CUE_NAMES = (
+    "ego_static",
+    "ego_driving_forward",
+    "ego_driving_backward",
+    "ego_turning_left",
+    "ego_turning_right",
+    "ego_straight",
+    "ego_accelerating",
+    "ego_decelerating",
+    "ego_motion_uncertain",
+)
+_EGO_SYMBOL_DEFAULT_CONFIG = {
+    "candidate_static_speed_thresholds": [0.15, 0.25, 0.40],
+    "candidate_lateral_thresholds": [0.08, 0.15, 0.30, 0.50],
+    "candidate_yaw_thresholds": [0.015, 0.030, 0.060, 0.100],
+    "acceleration_threshold": 0.12,
+    "min_short_segment_frames": 3,
+    "rapid_reversal_window_frames": 6,
+    "max_candidates": 64,
+    "score_weights": {
+        "signal_fit_error": 1.0,
+        "state_transitions": 0.75,
+        "short_segment_count": 1.25,
+        "short_segment_duration": 0.75,
+        "rapid_left_right_reversals": 1.50,
+        "action_complexity": 0.25,
+    },
+}
 _TRACKLET_REPAIR_DEFAULT_CFG = {
     "max_gap_frames": 2,
     "min_endpoint_score": 0.2,
@@ -4386,6 +4415,864 @@ def step7_ego_motion(position_state):
     }
 
 
+
+def _median(values):
+    rows = sorted(float(value) for value in values)
+    if not rows:
+        return 0.0
+    middle = len(rows) // 2
+    return rows[middle] if len(rows) % 2 else 0.5 * (rows[middle - 1] + rows[middle])
+
+
+def _ego_frame_signal(frame, names):
+    for name in names:
+        if name not in frame:
+            continue
+        try:
+            value = float(frame[name])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _ego_symbol_config(config=None):
+    merged = copy.deepcopy(_EGO_SYMBOL_DEFAULT_CONFIG)
+    supplied = dict(config or {})
+    for key, value in supplied.items():
+        if key == "score_weights":
+            merged[key].update(dict(value or {}))
+        else:
+            merged[key] = copy.deepcopy(value)
+    for key in (
+        "candidate_static_speed_thresholds",
+        "candidate_lateral_thresholds",
+        "candidate_yaw_thresholds",
+    ):
+        values = sorted(
+            {
+                float(value)
+                for value in merged.get(key, [])
+                if math.isfinite(float(value)) and float(value) > 0.0
+            }
+        )
+        if not values:
+            raise ValueError(f"Step 7A requires at least one positive value for {key}")
+        merged[key] = values
+    merged["max_candidates"] = max(1, int(merged.get("max_candidates", 64)))
+    merged["min_short_segment_frames"] = max(
+        1, int(merged.get("min_short_segment_frames", 3))
+    )
+    merged["rapid_reversal_window_frames"] = max(
+        1, int(merged.get("rapid_reversal_window_frames", 6))
+    )
+    merged["acceleration_threshold"] = max(
+        0.0, float(merged.get("acceleration_threshold", 0.12))
+    )
+    return merged
+
+
+def _ego_continuous_samples(ego_video):
+    samples = []
+    previous_speed = None
+    for offset, source in enumerate(ego_video.get("frames", [])):
+        frame = dict(source)
+        vx = _ego_frame_signal(
+            frame, ("refined_ego_vx", "ego_vx_smoothed", "ego_vx")
+        )
+        vz = _ego_frame_signal(
+            frame, ("refined_ego_vz", "ego_vz_smoothed", "ego_vz")
+        )
+        yaw = _ego_frame_signal(
+            frame,
+            (
+                "refined_ego_yaw_rate",
+                "ego_yaw_rate_smoothed",
+                "ego_yaw_rate",
+            ),
+        )
+        available = vx is not None and vz is not None and bool(
+            frame.get("has_ego_motion", vx is not None and vz is not None)
+        )
+        speed = math.hypot(vx, vz) if available else None
+        speed_delta = (
+            None
+            if speed is None or previous_speed is None
+            else float(speed - previous_speed)
+        )
+        if speed is not None:
+            previous_speed = speed
+        samples.append(
+            {
+                "frame_index": int(frame.get("frame_index", offset)),
+                "ego_vx": vx,
+                "ego_vz": vz,
+                "ego_yaw_rate": yaw,
+                "ego_speed": speed,
+                "ego_speed_delta": speed_delta,
+                "available": available,
+            }
+        )
+    return samples
+
+
+def _ego_threshold_candidates(config):
+    candidates = []
+    for static_threshold in config["candidate_static_speed_thresholds"]:
+        for lateral_threshold in config["candidate_lateral_thresholds"]:
+            for yaw_threshold in config["candidate_yaw_thresholds"]:
+                candidates.append(
+                    {
+                        "static_speed_threshold": float(static_threshold),
+                        "lateral_threshold": float(lateral_threshold),
+                        "yaw_threshold": float(yaw_threshold),
+                    }
+                )
+    candidates.sort(
+        key=lambda row: (
+            row["static_speed_threshold"],
+            row["lateral_threshold"],
+            row["yaw_threshold"],
+        )
+    )
+    return candidates[: config["max_candidates"]]
+
+
+def _ego_action(sample, thresholds):
+    if not sample.get("available", False):
+        return "unknown"
+    speed = float(sample.get("ego_speed", 0.0))
+    vx = float(sample.get("ego_vx", 0.0))
+    vz = float(sample.get("ego_vz", 0.0))
+    yaw = sample.get("ego_yaw_rate")
+    if speed <= thresholds["static_speed_threshold"]:
+        return "static"
+    if yaw is not None and float(yaw) > thresholds["yaw_threshold"]:
+        return "turning_left"
+    if yaw is not None and float(yaw) < -thresholds["yaw_threshold"]:
+        return "turning_right"
+    if vx > thresholds["lateral_threshold"]:
+        return "left"
+    if vx < -thresholds["lateral_threshold"]:
+        return "right"
+    if vz > thresholds["static_speed_threshold"]:
+        return "forward"
+    if vz < -thresholds["static_speed_threshold"]:
+        return "backward"
+    return "unknown"
+
+
+def _contiguous_action_segments(samples, actions):
+    if not samples:
+        return []
+    segments = []
+    start = 0
+    for index in range(1, len(actions) + 1):
+        temporally_contiguous = bool(
+            index < len(actions)
+            and int(samples[index]["frame_index"])
+            == int(samples[index - 1]["frame_index"]) + 1
+        )
+        if (
+            index < len(actions)
+            and actions[index] == actions[start]
+            and temporally_contiguous
+        ):
+            continue
+        segment_samples = samples[start:index]
+        segments.append(
+            {
+                "segment_id": len(segments),
+                "action": actions[start],
+                "start_frame": int(segment_samples[0]["frame_index"]),
+                "end_frame": int(segment_samples[-1]["frame_index"]),
+                "duration_frames": len(segment_samples),
+                "sample_indices": list(range(start, index)),
+            }
+        )
+        start = index
+    return segments
+
+
+def _within_action_signal_fit_error(samples, actions):
+    available_indices = [
+        index for index, sample in enumerate(samples) if sample.get("available", False)
+    ]
+    if len(available_indices) <= 1:
+        return 0.0
+    dimensions = ("ego_vx", "ego_vz", "ego_yaw_rate")
+    numerator = 0.0
+    denominator = 0.0
+    for dimension in dimensions:
+        observed = [
+            float(samples[index][dimension])
+            for index in available_indices
+            if samples[index].get(dimension) is not None
+        ]
+        if len(observed) <= 1:
+            continue
+        global_mean = sum(observed) / len(observed)
+        total = sum((value - global_mean) ** 2 for value in observed)
+        denominator += total
+        grouped = {}
+        for index in available_indices:
+            value = samples[index].get(dimension)
+            if value is not None:
+                grouped.setdefault(actions[index], []).append(float(value))
+        for values in grouped.values():
+            mean = sum(values) / len(values)
+            numerator += sum((value - mean) ** 2 for value in values)
+    if denominator <= 1e-12:
+        return 0.0
+    return float(max(0.0, min(1.0, numerator / denominator)))
+
+
+def _score_ego_threshold_candidate(samples, thresholds, config, candidate_id):
+    actions = [_ego_action(sample, thresholds) for sample in samples]
+    segments = _contiguous_action_segments(samples, actions)
+    frame_count = max(1, len(samples))
+    transitions = max(0, len(segments) - 1)
+    short_segments = [
+        segment
+        for segment in segments
+        if int(segment["duration_frames"]) < config["min_short_segment_frames"]
+    ]
+    direction_family = {
+        "left": "left",
+        "turning_left": "left",
+        "right": "right",
+        "turning_right": "right",
+    }
+    reversals = 0
+    directional_segments = [
+        segment for segment in segments if segment["action"] in direction_family
+    ]
+    for left, right in zip(directional_segments, directional_segments[1:]):
+        if (
+            direction_family[left["action"]] != direction_family[right["action"]]
+            and int(left["duration_frames"]) + int(right["duration_frames"])
+            <= config["rapid_reversal_window_frames"]
+        ):
+            reversals += 1
+    unique_actions = {
+        action for action in actions if action not in {"unknown"}
+    }
+    components = {
+        "signal_fit_error": _within_action_signal_fit_error(samples, actions),
+        "state_transitions": float(transitions / max(1, frame_count - 1)),
+        "short_segment_count": float(len(short_segments) / max(1, len(segments))),
+        "short_segment_duration": float(
+            sum(int(segment["duration_frames"]) for segment in short_segments)
+            / frame_count
+        ),
+        "rapid_left_right_reversals": float(
+            reversals / max(1, len(directional_segments) - 1)
+        ),
+        "action_complexity": float(
+            0.5 * len(unique_actions) / 7.0
+            + 0.5 * len(segments) / frame_count
+        ),
+    }
+    weights = config["score_weights"]
+    weighted = {
+        name: float(value * float(weights.get(name, 0.0)))
+        for name, value in components.items()
+    }
+    score = float(sum(weighted.values()))
+    counts = Counter(actions)
+    return {
+        "candidate_id": candidate_id,
+        "thresholds": copy.deepcopy(thresholds),
+        "score": score,
+        "score_components": components,
+        "weighted_score_components": weighted,
+        "num_segments": len(segments),
+        "num_transitions": transitions,
+        "num_short_segments": len(short_segments),
+        "short_segment_total_duration": sum(
+            int(segment["duration_frames"]) for segment in short_segments
+        ),
+        "num_rapid_left_right_reversals": reversals,
+        "action_counts": dict(sorted(counts.items())),
+        "actions": actions,
+        "segments": segments,
+    }
+
+
+def _select_ego_thresholds(samples, config):
+    scores = []
+    for index, thresholds in enumerate(_ego_threshold_candidates(config)):
+        scores.append(
+            _score_ego_threshold_candidate(
+                samples,
+                thresholds,
+                config,
+                candidate_id=f"ego_threshold_{index:03d}",
+            )
+        )
+    if not scores:
+        raise RuntimeError("Step 7A generated no threshold candidates")
+    selected = min(scores, key=lambda row: (float(row["score"]), row["candidate_id"]))
+    return selected, scores
+
+
+def _ego_symbol_prior_video(ego_video, config=None):
+    """Select and freeze per-video thresholds before producing ego cues."""
+    resolved_config = _ego_symbol_config(config)
+    samples = _ego_continuous_samples(ego_video)
+    selected, candidate_scores = _select_ego_thresholds(samples, resolved_config)
+    selected_thresholds = dict(selected["thresholds"])
+    acceleration_threshold = float(resolved_config["acceleration_threshold"])
+    output_frames = []
+    for sample, action in zip(samples, selected["actions"]):
+        cues = {name: 0.0 for name in _EGO_CUE_NAMES}
+        if action == "unknown":
+            cues["ego_motion_uncertain"] = 1.0
+        elif action == "static":
+            cues["ego_static"] = 1.0
+        else:
+            vz = float(sample.get("ego_vz", 0.0))
+            if vz > selected_thresholds["static_speed_threshold"]:
+                cues["ego_driving_forward"] = 1.0
+            elif vz < -selected_thresholds["static_speed_threshold"]:
+                cues["ego_driving_backward"] = 1.0
+            if action in {"left", "turning_left"}:
+                cues["ego_turning_left"] = 1.0
+            elif action in {"right", "turning_right"}:
+                cues["ego_turning_right"] = 1.0
+            else:
+                cues["ego_straight"] = 1.0
+            delta = sample.get("ego_speed_delta")
+            if delta is not None and float(delta) > acceleration_threshold:
+                cues["ego_accelerating"] = 1.0
+            elif delta is not None and float(delta) < -acceleration_threshold:
+                cues["ego_decelerating"] = 1.0
+        output_frames.append(
+            {
+                "frame_index": int(sample["frame_index"]),
+                "action": action,
+                "observable_cues": cues,
+                "signal_evidence": {
+                    key: sample.get(key)
+                    for key in (
+                        "ego_vx",
+                        "ego_vz",
+                        "ego_yaw_rate",
+                        "ego_speed",
+                        "ego_speed_delta",
+                    )
+                },
+            }
+        )
+    aggregate = {
+        name: float(
+            sum(frame["observable_cues"][name] for frame in output_frames)
+            / max(1, len(output_frames))
+        )
+        for name in _EGO_CUE_NAMES
+    }
+    audit = (
+        f"Selected {selected['candidate_id']} with minimum global score "
+        f"{selected['score']:.6f} from {len(candidate_scores)} deterministic "
+        "threshold candidates. The score combines within-segment signal fit, "
+        "state transitions, short-segment count and duration, rapid left-right "
+        "reversals, and overall action complexity. Thresholds are frozen for "
+        "this run and use no Step 8 object evidence."
+    )
+    speed_values = [
+        float(sample["ego_speed"])
+        for sample in samples
+        if sample.get("ego_speed") is not None
+    ]
+    speed_median = _median(speed_values)
+    speed_mad = _median([abs(value - speed_median) for value in speed_values])
+    return {
+        "version": _EGO_SYMBOL_PRIOR_VERSION,
+        "video_id": str(ego_video.get("video_id", "")),
+        "status": "completed",
+        "source_step": "07_ego_motion",
+        "role": "provisional_ego_symbol_hypothesis",
+        "label_status": "provisional",
+        "downstream_usable_as_final": False,
+        "threshold_status": "provisional_frozen_for_evidence_validation",
+        "num_frames": len(output_frames),
+        "continuous_signals": copy.deepcopy(samples),
+        "frames": output_frames,
+        "aggregate_cues": aggregate,
+        "selected_threshold": copy.deepcopy(selected_thresholds),
+        "selected_thresholds": copy.deepcopy(selected_thresholds),
+        "selected_candidate_id": selected["candidate_id"],
+        "selected_candidate_score": float(selected["score"]),
+        "candidate_scores": [
+            {key: copy.deepcopy(value) for key, value in row.items() if key not in {"actions", "segments"}}
+            for row in candidate_scores
+        ],
+        "final_action_segments": [
+            {key: copy.deepcopy(value) for key, value in segment.items() if key != "sample_indices"}
+            for segment in selected["segments"]
+        ],
+        "audit_explanation": audit,
+        "configuration": copy.deepcopy(resolved_config),
+        "calibration": {
+            "static_speed_band": float(selected_thresholds["static_speed_threshold"]),
+            "lateral_turn_band": float(selected_thresholds["lateral_threshold"]),
+            "yaw_turn_band": float(selected_thresholds["yaw_threshold"]),
+            "acceleration_band": acceleration_threshold,
+            "speed_median": float(speed_median),
+            "speed_mad": float(speed_mad),
+            "selection_method": "minimum_global_temporal_segmentation_score",
+        },
+    }
+
+
+def step7a_ego_symbol_prior(ego_state, config=None):
+    """Build and cache a per-video automatically calibrated ego-symbol prior."""
+    ego_motion = list(ego_state.get("ego_motion", []))
+    resolved_config = _ego_symbol_config(
+        config if config is not None else ego_state.get("ego_symbol_prior_config")
+    )
+    config_fingerprint = hashlib.sha256(
+        json.dumps(resolved_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    output_root = get_pipeline_output_root() / "07a_ego_symbol_prior"
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    cached_videos = 0
+    for ego_video in tqdm(
+        ego_motion, desc="[step 7a] ego_symbol_prior", unit="video"
+    ):
+        video_id = str(ego_video.get("video_id", ""))
+        source_fingerprint = hashlib.sha256(
+            json.dumps(
+                ego_video.get("frames", []),
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()
+        path = output_root / video_id / "ego_symbol_prior.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    int(candidate.get("version", 0))
+                    == _EGO_SYMBOL_PRIOR_VERSION
+                    and str(candidate.get("source_fingerprint", ""))
+                    == source_fingerprint
+                    and str(candidate.get("config_fingerprint", ""))
+                    == config_fingerprint
+                    and set(candidate.get("aggregate_cues", {}))
+                    == set(_EGO_CUE_NAMES)
+                    and candidate.get("threshold_status")
+                    == "provisional_frozen_for_evidence_validation"
+                    and candidate.get("label_status") == "provisional"
+                ):
+                    cached = candidate
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                cached = None
+        if cached is not None:
+            cached_videos += 1
+            results.append(cached)
+            continue
+        result = _ego_symbol_prior_video(ego_video, resolved_config)
+        result["source_fingerprint"] = source_fingerprint
+        result["config_fingerprint"] = config_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        results.append(result)
+    manifest = {
+        "version": _EGO_SYMBOL_PRIOR_VERSION,
+        "num_videos": len(results),
+        "num_frames": sum(int(row.get("num_frames", 0)) for row in results),
+        "cached_videos": cached_videos,
+        "cue_names": list(_EGO_CUE_NAMES),
+        "role": "provisional_ego_symbol_hypothesis",
+        "label_status": "provisional",
+        "downstream_usable_as_final": False,
+        "threshold_selection": "per_video_minimum_global_score",
+        "config_fingerprint": config_fingerprint,
+        "selected_thresholds_by_video": {
+            str(row.get("video_id", "")): copy.deepcopy(
+                row.get("selected_thresholds", {})
+            )
+            for row in results
+        },
+    }
+    (output_root / "ego_symbol_prior_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(
+        f"[step 7a] ego_symbol_prior videos={manifest['num_videos']} "
+        f"frames={manifest['num_frames']} cached={cached_videos} "
+        f"thresholds=per_video_auto"
+    )
+    return {
+        **ego_state,
+        "ego_symbol_prior": results,
+        "ego_symbol_prior_manifest": manifest,
+        "ego_symbol_prior_output_root": output_root,
+        "ego_symbol_prior_config": resolved_config,
+    }
+
+
+def step7b_background_motion_evidence(position_state, ego_symbol_state, config=None):
+    """Extract independent background patch motion for provisional 7A segments."""
+    from src.exp_july.perception.background_motion_evidence import (
+        VERSION,
+        extract_video_evidence,
+        resolved_config,
+    )
+
+    cfg = resolved_config(config)
+    output_root = get_pipeline_output_root() / "07b_background_motion_evidence"
+    output_root.mkdir(parents=True, exist_ok=True)
+    positions_by_video = {
+        str(row.get("video_id", "")): row
+        for row in position_state.get("positions_3d", [])
+    }
+    provisional_videos = list(ego_symbol_state.get("ego_symbol_prior", []))
+    results = []
+    cached_videos = 0
+    for provisional in tqdm(
+        provisional_videos,
+        desc="[step 7b] background_motion_evidence",
+        unit="video",
+    ):
+        video_id = str(provisional.get("video_id", ""))
+        position_video = positions_by_video.get(video_id, {"video_id": video_id, "frames": []})
+        frame_sources = []
+        for offset, frame in enumerate(position_video.get("frames", [])):
+            image_path = str(frame.get("image_path", ""))
+            image_metadata = None
+            if image_path and Path(image_path).exists():
+                stat = Path(image_path).stat()
+                image_metadata = [int(stat.st_size), int(stat.st_mtime_ns)]
+            frame_sources.append({
+                "frame_index": int(frame.get("frame_index", offset)),
+                "image_path": image_path,
+                "image_metadata": image_metadata,
+                "boxes": frame.get("boxes", frame.get("bboxes", [])),
+                "objects": [
+                    {"bbox": obj.get("bbox", obj.get("box"))}
+                    for obj in frame.get("objects", [])
+                ],
+            })
+        source_fingerprint = _step8_cache_fingerprint({
+            "schema": "step7b-background-motion-evidence-v1",
+            "video_id": video_id,
+            "provisional_segments": provisional.get("final_action_segments", []),
+            "frame_sources": frame_sources,
+            "config": cfg,
+        })
+        path = output_root / video_id / "background_motion_evidence.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    int(candidate.get("version", 0)) == VERSION
+                    and str(candidate.get("source_fingerprint", "")) == source_fingerprint
+                    and candidate.get("input_label_status") == "provisional"
+                ):
+                    cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+        if cached is not None:
+            cached_videos += 1
+            results.append(cached)
+            continue
+        result = extract_video_evidence(position_video, provisional, cfg)
+        result["source_fingerprint"] = source_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        results.append(result)
+    manifest = {
+        "version": VERSION,
+        "stage": "7b_background_motion_evidence",
+        "input_label_status": "provisional",
+        "output_role": "independent_evidence_not_final_labels",
+        "num_videos": len(results),
+        "num_segments": sum(int(row.get("num_segments", 0)) for row in results),
+        "num_patch_vectors": sum(int(row.get("num_patch_vectors", 0)) for row in results),
+        "cached_videos": cached_videos,
+        "configuration": cfg,
+    }
+    manifest_path = output_root / "background_motion_evidence_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        f"[step 7b] background_motion_evidence videos={manifest['num_videos']} "
+        f"segments={manifest['num_segments']} patches={manifest['num_patch_vectors']} "
+        f"cached={cached_videos}",
+        flush=True,
+    )
+    return {
+        **ego_symbol_state,
+        "background_motion_evidence": results,
+        "background_motion_evidence_manifest": manifest,
+        "background_motion_evidence_manifest_path": str(manifest_path),
+        "background_motion_evidence_output_root": output_root,
+    }
+
+
+def step7c_video_local_evidence_calibration(evidence_state):
+    """Normalize Step 7B segment evidence within each video without labels."""
+    from src.exp_july.perception.video_local_evidence_calibration import VERSION, calibrate_video
+
+    output_root = get_pipeline_output_root() / "07c_video_local_evidence_calibration"
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    cached_videos = 0
+    for raw_video in tqdm(
+        evidence_state.get("background_motion_evidence", []),
+        desc="[step 7c] video_local_evidence_calibration",
+        unit="video",
+    ):
+        video_id = str(raw_video.get("video_id", ""))
+        source_fingerprint = _step8_cache_fingerprint({
+            "schema": "step7c-video-local-evidence-calibration-v1",
+            "raw_background_evidence": raw_video,
+        })
+        path = output_root / video_id / "normalized_background_evidence.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    int(candidate.get("version", 0)) == VERSION
+                    and str(candidate.get("source_fingerprint", "")) == source_fingerprint
+                    and candidate.get("calibration_scope") == "video_local"
+                    and not bool(candidate.get("dataset_specific_absolute_thresholds_used", True))
+                ):
+                    cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+        if cached is not None:
+            cached_videos += 1
+            results.append(cached)
+            continue
+        result = calibrate_video(raw_video)
+        result["source_fingerprint"] = source_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        results.append(result)
+    manifest = {
+        "version": VERSION,
+        "stage": "7c_video_local_evidence_calibration",
+        "input_label_status": "provisional",
+        "output_role": "normalized_evidence_not_final_labels",
+        "calibration_scope": "video_local",
+        "dataset_specific_absolute_thresholds_used": False,
+        "num_videos": len(results),
+        "num_segments": sum(int(row.get("num_segments", 0)) for row in results),
+        "num_patch_vectors": sum(int(row.get("num_patch_vectors", 0)) for row in results),
+        "cached_videos": cached_videos,
+    }
+    manifest_path = output_root / "video_local_evidence_calibration_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        f"[step 7c] video_local_evidence_calibration videos={manifest['num_videos']} "
+        f"segments={manifest['num_segments']} patches={manifest['num_patch_vectors']} "
+        f"cached={cached_videos} dataset_thresholds=False",
+        flush=True,
+    )
+    return {
+        **evidence_state,
+        "video_local_calibrated_evidence": results,
+        "video_local_evidence_calibration_manifest": manifest,
+        "video_local_evidence_calibration_manifest_path": str(manifest_path),
+        "video_local_evidence_calibration_output_root": output_root,
+    }
+
+
+def step7d_global_symbolic_rule_evaluation(calibrated_state):
+    """Evaluate shared symbolic ego hypotheses without modifying labels."""
+    from src.exp_july.perception.global_ego_symbolic_rules import (
+        RULE_POLICY_ID,
+        VERSION,
+        evaluate_video,
+    )
+
+    output_root = get_pipeline_output_root() / "07d_global_symbolic_rule_evaluation"
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    cached_videos = 0
+    for calibrated_video in tqdm(
+        calibrated_state.get("video_local_calibrated_evidence", []),
+        desc="[step 7d] global_symbolic_rule_evaluation",
+        unit="video",
+    ):
+        video_id = str(calibrated_video.get("video_id", ""))
+        source_fingerprint = _step8_cache_fingerprint({
+            "schema": "step7d-global-symbolic-rule-evaluation-v1",
+            "rule_policy_id": RULE_POLICY_ID,
+            "normalized_evidence": calibrated_video,
+        })
+        path = output_root / video_id / "global_symbolic_rule_evaluation.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if (
+                    int(candidate.get("version", 0)) == VERSION
+                    and candidate.get("rule_policy_id") == RULE_POLICY_ID
+                    and str(candidate.get("source_fingerprint", "")) == source_fingerprint
+                    and dict(candidate.get("provenance", {})).get("labels_modified") is False
+                ):
+                    cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+        if cached is not None:
+            cached_videos += 1
+            results.append(cached)
+            continue
+        result = evaluate_video(calibrated_video)
+        result["source_fingerprint"] = source_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        results.append(result)
+    manifest = {
+        "version": VERSION,
+        "stage": "7d_global_symbolic_rule_evaluation",
+        "rule_policy_id": RULE_POLICY_ID,
+        "rule_scope": "global_shared_across_all_videos",
+        "input_label_status": "provisional",
+        "labels_modified": False,
+        "num_videos": len(results),
+        "num_segments": sum(int(row.get("num_segments", 0)) for row in results),
+        "num_fired_rules": sum(int(row.get("num_fired_rules", 0)) for row in results),
+        "num_violated_rules": sum(int(row.get("num_violated_rules", 0)) for row in results),
+        "num_conflicts": sum(int(row.get("num_conflicts", 0)) for row in results),
+        "cached_videos": cached_videos,
+    }
+    manifest_path = output_root / "global_symbolic_rule_evaluation_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        f"[step 7d] global_symbolic_rule_evaluation videos={manifest['num_videos']} "
+        f"segments={manifest['num_segments']} fired={manifest['num_fired_rules']} "
+        f"violated={manifest['num_violated_rules']} conflicts={manifest['num_conflicts']} "
+        f"cached={cached_videos}",
+        flush=True,
+    )
+    return {
+        **calibrated_state,
+        "global_ego_symbolic_rule_evaluations": results,
+        "global_ego_symbolic_rule_evaluation_manifest": manifest,
+        "global_ego_symbolic_rule_evaluation_manifest_path": str(manifest_path),
+        "global_ego_symbolic_rule_evaluation_output_root": output_root,
+    }
+
+
+def step7e_threshold_label_refinement(rule_state):
+    """Search bounded thresholds until labels and thresholds stabilize."""
+    from src.exp_july.perception.ego_threshold_label_refinement import VERSION, refine_video
+
+    output_root = get_pipeline_output_root() / "07e_threshold_label_refinement"
+    output_root.mkdir(parents=True, exist_ok=True)
+    provisional_by_video = {str(row.get("video_id", "")): row for row in rule_state.get("ego_symbol_prior", [])}
+    raw_by_video = {str(row.get("video_id", "")): row for row in rule_state.get("background_motion_evidence", [])}
+    results = []
+    cached_videos = 0
+    max_iterations = max(2, int(os.environ.get("CAUVID_STEP7E_MAX_ITERATIONS", "4")))
+    for video_id, provisional in tqdm(
+        sorted(provisional_by_video.items()), desc="[step 7e] threshold_label_refinement", unit="video"
+    ):
+        raw_video = raw_by_video.get(video_id, {"video_id": video_id, "segments": []})
+        config = _ego_symbol_config(provisional.get("configuration", {}))
+        samples = list(provisional.get("continuous_signals", []))
+        candidates = [
+            _score_ego_threshold_candidate(samples, thresholds, config, f"ego_threshold_{index:03d}")
+            for index, thresholds in enumerate(_ego_threshold_candidates(config))
+        ]
+        source_fingerprint = _step8_cache_fingerprint({
+            "schema": "step7e-threshold-label-refinement-v1",
+            "provisional": provisional,
+            "raw_evidence": raw_video,
+            "candidate_thresholds": [row["thresholds"] for row in candidates],
+            "max_iterations": max_iterations,
+        })
+        path = output_root / video_id / "threshold_label_refinement.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if int(candidate.get("version", 0)) == VERSION and str(candidate.get("source_fingerprint", "")) == source_fingerprint:
+                    cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+        if cached is not None:
+            cached_videos += 1; results.append(cached); continue
+        result = refine_video(video_id, candidates, raw_video, provisional, max_iterations=max_iterations)
+        result["source_fingerprint"] = source_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(result, indent=2), encoding="utf-8"); results.append(result)
+    manifest = {
+        "version": VERSION, "stage": "7e_threshold_label_refinement", "deterministic": True,
+        "num_videos": len(results), "cached_videos": cached_videos,
+        "num_candidates": sum(len(row.get("candidate_rankings", [])) for row in results),
+        "num_corrections": sum(len(row.get("corrections", [])) for row in results),
+        "num_uncertain_segments": sum(len(row.get("uncertain_segments", [])) for row in results),
+        "num_stabilized": sum(bool(row.get("stabilized")) for row in results),
+        "max_iterations": max_iterations,
+    }
+    manifest_path = output_root / "threshold_label_refinement_manifest.json"; manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[step 7e] threshold_label_refinement videos={manifest['num_videos']} candidates={manifest['num_candidates']} corrections={manifest['num_corrections']} uncertain={manifest['num_uncertain_segments']} stabilized={manifest['num_stabilized']} cached={cached_videos}", flush=True)
+    return {**rule_state, "ego_threshold_label_refinement": results, "ego_threshold_label_refinement_manifest": manifest, "ego_threshold_label_refinement_manifest_path": str(manifest_path), "ego_threshold_label_refinement_output_root": output_root}
+
+
+def step7f_ego_symbol_finalization(position_state, refinement_state):
+    """Publish validated final ego symbols and offline HTML/MP4 audit artifacts."""
+    from src.exp_july.perception.ego_symbol_finalization import VERSION, build_html, finalize_video, render_mp4s
+
+    output_root = get_pipeline_output_root() / "07f_ego_symbol_finalization"; output_root.mkdir(parents=True, exist_ok=True)
+    provisional = list(refinement_state.get("ego_symbol_prior", [])); provisional_by_video = {str(row.get("video_id", "")): row for row in provisional}
+    results = []; cached_videos = 0; recomputed_video_ids = set()
+    for refinement in tqdm(refinement_state.get("ego_threshold_label_refinement", []), desc="[step 7f] ego_symbol_finalization", unit="video"):
+        video_id = str(refinement.get("video_id", "")); prior = provisional_by_video.get(video_id, {})
+        source_fingerprint = _step8_cache_fingerprint({"schema": "step7f-ego-symbol-finalization-v1", "refinement": refinement, "provisional": prior})
+        path = output_root / video_id / "final_ego_symbols.json"; cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if int(candidate.get("version", 0)) == VERSION and str(candidate.get("source_fingerprint", "")) == source_fingerprint and candidate.get("label_status") == "final": cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError): cached = None
+        if cached is not None: cached_videos += 1; results.append(cached); continue
+        recomputed_video_ids.add(video_id)
+        result = finalize_video(refinement, prior); result["source_fingerprint"] = source_fingerprint
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(result, indent=2), encoding="utf-8"); results.append(result)
+    audit_root = output_root / "audit"; html_path = build_html(results, audit_root)
+    position_by_video = {str(row.get("video_id", "")): row for row in position_state.get("positions_3d", [])}
+    video_audit_root = audit_root / "videos"
+    for video_id in recomputed_video_ids:
+        stale_path = video_audit_root / f"{video_id}_ego_symbol_audit.mp4"
+        if stale_path.exists():
+            stale_path.unlink()
+    mp4_manifest = render_mp4s(results, position_by_video, video_audit_root, fps=max(.1, float(os.environ.get("CAUVID_STEP7F_VIS_FPS", "10"))), limit=5)
+    manifest = {
+        "version": VERSION, "stage": "7f_ego_symbol_finalization", "label_status": "final", "downstream_usable_as_final": True,
+        "num_videos": len(results), "num_frames": sum(int(row.get("num_frames", 0)) for row in results),
+        "num_validated_segments": sum(sum(seg.get("validation_status") == "validated" for seg in row.get("final_action_segments", [])) for row in results),
+        "num_uncertain_segments": sum(sum(seg.get("validation_status") != "validated" for seg in row.get("final_action_segments", [])) for row in results),
+        "num_corrections": sum(len(row.get("corrections", [])) for row in results), "cached_videos": cached_videos,
+        "html_audit_path": html_path, "mp4_audit": mp4_manifest,
+    }
+    manifest_path = output_root / "ego_symbol_finalization_manifest.json"; manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[step 7f] ego_symbol_finalization videos={manifest['num_videos']} validated={manifest['num_validated_segments']} uncertain={manifest['num_uncertain_segments']} corrections={manifest['num_corrections']} cached={cached_videos} html={html_path} mp4={len(mp4_manifest['rendered'])}", flush=True)
+    return {
+        **refinement_state,
+        "provisional_ego_symbol_prior": provisional,
+        "ego_symbol_prior": results,
+        "final_ego_symbols": results,
+        "ego_symbol_prior_manifest": manifest,
+        "final_ego_symbol_manifest": manifest,
+        "final_ego_symbol_manifest_path": str(manifest_path),
+        "ego_symbol_prior_output_root": output_root,
+        "final_ego_symbol_output_root": output_root,
+        "ego_symbol_audit_html_path": html_path,
+        "ego_symbol_audit_mp4_manifest": mp4_manifest,
+    }
+
+
 def step7b_tracklet_repair(
     position_state,
     ego_state,
@@ -4406,6 +5293,24 @@ def step7b_tracklet_repair(
             "positions_3d_output_root": position_state.get("positions_3d_output_root"),
             "ego_motion": ego_motion,
             "ego_motion_output_root": ego_state.get("ego_motion_output_root"),
+            "ego_symbol_prior": copy.deepcopy(ego_state.get("ego_symbol_prior", [])),
+            "ego_symbol_prior_manifest": copy.deepcopy(ego_state.get("ego_symbol_prior_manifest", {})),
+            "ego_symbol_prior_output_root": ego_state.get("ego_symbol_prior_output_root"),
+            "background_motion_evidence": copy.deepcopy(ego_state.get("background_motion_evidence", [])),
+            "background_motion_evidence_manifest": copy.deepcopy(ego_state.get("background_motion_evidence_manifest", {})),
+            "background_motion_evidence_output_root": ego_state.get("background_motion_evidence_output_root"),
+        "video_local_calibrated_evidence": copy.deepcopy(ego_state.get("video_local_calibrated_evidence", [])),
+        "video_local_evidence_calibration_manifest": copy.deepcopy(ego_state.get("video_local_evidence_calibration_manifest", {})),
+        "video_local_evidence_calibration_output_root": ego_state.get("video_local_evidence_calibration_output_root"),
+        "global_ego_symbolic_rule_evaluations": copy.deepcopy(ego_state.get("global_ego_symbolic_rule_evaluations", [])),
+        "global_ego_symbolic_rule_evaluation_manifest": copy.deepcopy(ego_state.get("global_ego_symbolic_rule_evaluation_manifest", {})),
+        "global_ego_symbolic_rule_evaluation_output_root": ego_state.get("global_ego_symbolic_rule_evaluation_output_root"),
+        "ego_threshold_label_refinement": copy.deepcopy(ego_state.get("ego_threshold_label_refinement", [])),
+        "ego_threshold_label_refinement_manifest": copy.deepcopy(ego_state.get("ego_threshold_label_refinement_manifest", {})),
+        "final_ego_symbols": copy.deepcopy(ego_state.get("final_ego_symbols", [])),
+        "final_ego_symbol_manifest": copy.deepcopy(ego_state.get("final_ego_symbol_manifest", {})),
+        "ego_symbol_audit_html_path": ego_state.get("ego_symbol_audit_html_path"),
+        "ego_symbol_audit_mp4_manifest": copy.deepcopy(ego_state.get("ego_symbol_audit_mp4_manifest", {})),
         }
 
     output_root = get_pipeline_output_root() / output_subdir
@@ -4416,15 +5321,53 @@ def step7b_tracklet_repair(
         if str(row.get("video_id", ""))
     }
     repaired_positions_3d = []
+    cached_videos = 0
+    resolved_repair_cfg = {
+        **_TRACKLET_REPAIR_DEFAULT_CFG,
+        **dict(repair_cfg or {}),
+    }
     progress = tqdm(positions_3d, desc=f"[step {step_label}] tracklet_repair", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
-        repaired = _repair_video_tracklets(video_result, ego_by_video.get(video_id), repair_cfg)
+        ego_video = ego_by_video.get(video_id)
+        source_fingerprint = _step8_cache_fingerprint(
+            {
+                "schema": "step8-tracklet-repair-v2",
+                "video": video_result,
+                "ego_motion": ego_video,
+                "repair_config": resolved_repair_cfg,
+            }
+        )
         out_dir = output_root / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        with (out_dir / "tracklet_repair.json").open("w", encoding="utf-8") as f:
-            json.dump(repaired, f, indent=2)
+        cache_path = out_dir / "tracklet_repair.json"
+        repaired = None
+        cached, cache_path_changes = relocate_json_cache_file(
+            cache_path,
+            dataset_root=position_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
+        )
+        if (
+            isinstance(cached, dict)
+            and int(cached.get("whole_step_cache_version", 0)) == 1
+            and str(cached.get("source_fingerprint", ""))
+            == source_fingerprint
+        ):
+            repaired = cached
+            cached_videos += 1
+            if cache_path_changes:
+                print(
+                    f"[step {step_label}] relocated cached tracklet paths "
+                    f"video_id={video_id} paths={len(cache_path_changes)}"
+                )
+        if repaired is None:
+            repaired = _repair_video_tracklets(video_result, ego_video, repair_cfg)
+            repaired["whole_step_cache_version"] = 1
+            repaired["source_fingerprint"] = source_fingerprint
+            cache_path.write_text(
+                json.dumps(repaired, indent=2), encoding="utf-8"
+            )
         repaired_positions_3d.append(repaired)
 
     repaired_frame_stats = []
@@ -4513,6 +5456,7 @@ def step7b_tracklet_repair(
         f"interpolated_objects={manifest['num_interpolated_objects']} "
         f"split_events={manifest['num_split_events']} "
         f"new_track_ids={manifest['num_new_track_ids']} "
+        f"cached={cached_videos}/{len(repaired_positions_3d)} "
         f"avg_repaired_frame_pct={manifest['average_repaired_frame_percentage']:.2f}% "
         f"repaired_frames={manifest['num_repaired_frames_total']}/{manifest['num_frames_total']} "
         f"({manifest['repaired_frame_percentage_total']:.2f}%)"
@@ -4525,6 +5469,24 @@ def step7b_tracklet_repair(
         "tracklet_repair_output_root": output_root,
         "ego_motion": ego_motion,
         "ego_motion_output_root": ego_state.get("ego_motion_output_root"),
+        "ego_symbol_prior": copy.deepcopy(ego_state.get("ego_symbol_prior", [])),
+        "ego_symbol_prior_manifest": copy.deepcopy(ego_state.get("ego_symbol_prior_manifest", {})),
+        "ego_symbol_prior_output_root": ego_state.get("ego_symbol_prior_output_root"),
+        "background_motion_evidence": copy.deepcopy(ego_state.get("background_motion_evidence", [])),
+        "background_motion_evidence_manifest": copy.deepcopy(ego_state.get("background_motion_evidence_manifest", {})),
+        "background_motion_evidence_output_root": ego_state.get("background_motion_evidence_output_root"),
+        "video_local_calibrated_evidence": copy.deepcopy(ego_state.get("video_local_calibrated_evidence", [])),
+        "video_local_evidence_calibration_manifest": copy.deepcopy(ego_state.get("video_local_evidence_calibration_manifest", {})),
+        "video_local_evidence_calibration_output_root": ego_state.get("video_local_evidence_calibration_output_root"),
+        "global_ego_symbolic_rule_evaluations": copy.deepcopy(ego_state.get("global_ego_symbolic_rule_evaluations", [])),
+        "global_ego_symbolic_rule_evaluation_manifest": copy.deepcopy(ego_state.get("global_ego_symbolic_rule_evaluation_manifest", {})),
+        "global_ego_symbolic_rule_evaluation_output_root": ego_state.get("global_ego_symbolic_rule_evaluation_output_root"),
+        "ego_threshold_label_refinement": copy.deepcopy(ego_state.get("ego_threshold_label_refinement", [])),
+        "ego_threshold_label_refinement_manifest": copy.deepcopy(ego_state.get("ego_threshold_label_refinement_manifest", {})),
+        "final_ego_symbols": copy.deepcopy(ego_state.get("final_ego_symbols", [])),
+        "final_ego_symbol_manifest": copy.deepcopy(ego_state.get("final_ego_symbol_manifest", {})),
+        "ego_symbol_audit_html_path": ego_state.get("ego_symbol_audit_html_path"),
+        "ego_symbol_audit_mp4_manifest": copy.deepcopy(ego_state.get("ego_symbol_audit_mp4_manifest", {})),
     }
 
 
@@ -4550,16 +5512,49 @@ def step8_relative_object_motion(
         if str(row.get("video_id", ""))
     }
     relative_motion = []
+    cached_videos = 0
     progress = tqdm(repaired_positions, desc=f"[step {step_label}] relative_object_motion", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
         progress.set_postfix_str(video_id, refresh=False)
         ego_result = ego_by_video.get(video_id, {})
-        result = _relative_motion_video(video_result, ego_result)
+        source_fingerprint = _step8_cache_fingerprint(
+            {
+                "schema": "step8a-relative-object-motion-v2",
+                "relative_motion_version": _RELATIVE_OBJECT_MOTION_VERSION,
+                "repaired_positions": video_result,
+                "ego_motion": ego_result,
+            }
+        )
         out_dir = output_root / video_id
         out_dir.mkdir(parents=True, exist_ok=True)
-        with (out_dir / "relative_object_motion.json").open("w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2)
+        cache_path = out_dir / "relative_object_motion.json"
+        result = None
+        cached, cache_path_changes = relocate_json_cache_file(
+            cache_path,
+            dataset_root=position_state.get("dataset_root"),
+            pipeline_root=get_pipeline_output_root(),
+        )
+        if (
+            isinstance(cached, dict)
+            and int(cached.get("whole_step_cache_version", 0)) == 1
+            and str(cached.get("source_fingerprint", ""))
+            == source_fingerprint
+        ):
+            result = cached
+            cached_videos += 1
+            if cache_path_changes:
+                print(
+                    f"[step {step_label}] relocated cached relative-motion paths "
+                    f"video_id={video_id} paths={len(cache_path_changes)}"
+                )
+        if result is None:
+            result = _relative_motion_video(video_result, ego_result)
+            result["whole_step_cache_version"] = 1
+            result["source_fingerprint"] = source_fingerprint
+            cache_path.write_text(
+                json.dumps(result, indent=2), encoding="utf-8"
+            )
         relative_motion.append(result)
 
     manifest = {
@@ -4588,7 +5583,8 @@ def step8_relative_object_motion(
         f"objects={manifest['num_objects_total']} "
         f"observed={manifest['num_observed_objects_total']} "
         f"repaired={manifest['num_repaired_objects_total']} "
-        f"with_rel_motion={manifest['num_objects_with_rel_motion']}"
+        f"with_rel_motion={manifest['num_objects_with_rel_motion']} "
+        f"cached={cached_videos}/{len(relative_motion)}"
     )
     return {
         "videos": videos,
@@ -4597,6 +5593,24 @@ def step8_relative_object_motion(
         "positions_3d": repaired_positions,
         "tracklet_repair": repaired_state.get("tracklet_repair", []),
         "ego_motion": ego_motion,
+        "ego_symbol_prior": copy.deepcopy(repaired_state.get("ego_symbol_prior", [])),
+        "ego_symbol_prior_manifest": copy.deepcopy(repaired_state.get("ego_symbol_prior_manifest", {})),
+        "ego_symbol_prior_output_root": repaired_state.get("ego_symbol_prior_output_root"),
+        "background_motion_evidence": copy.deepcopy(repaired_state.get("background_motion_evidence", [])),
+        "background_motion_evidence_manifest": copy.deepcopy(repaired_state.get("background_motion_evidence_manifest", {})),
+        "background_motion_evidence_output_root": repaired_state.get("background_motion_evidence_output_root"),
+        "video_local_calibrated_evidence": copy.deepcopy(repaired_state.get("video_local_calibrated_evidence", [])),
+        "video_local_evidence_calibration_manifest": copy.deepcopy(repaired_state.get("video_local_evidence_calibration_manifest", {})),
+        "video_local_evidence_calibration_output_root": repaired_state.get("video_local_evidence_calibration_output_root"),
+        "global_ego_symbolic_rule_evaluations": copy.deepcopy(repaired_state.get("global_ego_symbolic_rule_evaluations", [])),
+        "global_ego_symbolic_rule_evaluation_manifest": copy.deepcopy(repaired_state.get("global_ego_symbolic_rule_evaluation_manifest", {})),
+        "global_ego_symbolic_rule_evaluation_output_root": repaired_state.get("global_ego_symbolic_rule_evaluation_output_root"),
+        "ego_threshold_label_refinement": copy.deepcopy(repaired_state.get("ego_threshold_label_refinement", [])),
+        "ego_threshold_label_refinement_manifest": copy.deepcopy(repaired_state.get("ego_threshold_label_refinement_manifest", {})),
+        "final_ego_symbols": copy.deepcopy(repaired_state.get("final_ego_symbols", [])),
+        "final_ego_symbol_manifest": copy.deepcopy(repaired_state.get("final_ego_symbol_manifest", {})),
+        "ego_symbol_audit_html_path": repaired_state.get("ego_symbol_audit_html_path"),
+        "ego_symbol_audit_mp4_manifest": copy.deepcopy(repaired_state.get("ego_symbol_audit_mp4_manifest", {})),
     }
 
 
@@ -4849,6 +5863,9 @@ def step8b_uncertain_signal_evidence(
                     "recede",
                     "acceleration",
                     "deceleration",
+                    "relative_static",
+                    "relative_moving",
+                    "relative_motion_uncertain",
                 }
                 and "descriptors" not in row
                 for row in cached.get("track_signal_evidence", [])
@@ -4862,6 +5879,9 @@ def step8b_uncertain_signal_evidence(
                     "recede",
                     "acceleration",
                     "deceleration",
+                    "relative_static",
+                    "relative_moving",
+                    "relative_motion_uncertain",
                 }
                 and "descriptors" not in row
                 for row in cached.get(
@@ -5616,6 +6636,88 @@ def step8b_trajectory_validation(ego_state, state):
     return step8b_signal_evidence(state)
 
 
+_STEP8_WHOLE_CACHE_VERSION = 1
+
+
+def _step8_cache_fingerprint(payload):
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_step8_whole_cache(path, fingerprint, required_paths=()):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        int(cached.get("cache_version", 0)) != _STEP8_WHOLE_CACHE_VERSION
+        or str(cached.get("input_fingerprint", "")) != fingerprint
+        or not isinstance(cached.get("outputs"), dict)
+    ):
+        return None
+    if any(not Path(required).exists() for required in required_paths if required):
+        return None
+    return dict(cached["outputs"])
+
+
+def _write_step8_whole_cache(path, fingerprint, outputs):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "cache_version": _STEP8_WHOLE_CACHE_VERSION,
+                "input_fingerprint": fingerprint,
+                "outputs": outputs,
+            },
+            indent=2,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _step8c_input_fingerprint(state):
+    evidence = state.get(
+        "uncertain_signal_evidence",
+        state.get("trajectory_motion_evidence", []),
+    )
+    evidence_rows = [
+        {
+            "video_id": row.get("video_id", ""),
+            "version": row.get("version", 0),
+            "source_signal_fingerprint": row.get(
+                "source_signal_fingerprint", ""
+            ),
+            "num_tracks": row.get("num_tracks", 0),
+            "num_observations": row.get("num_observations", 0),
+            "track_signal_evidence": row.get("track_signal_evidence", []),
+            "quarantined_track_signal_evidence": row.get(
+                "quarantined_track_signal_evidence", []
+            ),
+        }
+        for row in evidence
+    ]
+    return _step8_cache_fingerprint(
+        {
+            "schema": "step8c-trajectory-clustering-v2",
+            "dataset": state.get("dataset_name", "driving_mini"),
+            "evidence": evidence_rows,
+        }
+    )
+
+
 def _write_step8_stage_manifest(output_subdir, filename, payload):
     output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
@@ -5642,6 +6744,32 @@ def step8c_trajectory_clustering(state, llm_generate=None):
     audit_root = output_root / "llm_audit"
     output_root.mkdir(parents=True, exist_ok=True)
     dataset = str(state.get("dataset_name", "driving_mini"))
+    input_fingerprint = _step8c_input_fingerprint(state)
+    whole_cache_path = output_root / "whole_step_cache.json"
+    cached_outputs = _load_step8_whole_cache(
+        whole_cache_path,
+        input_fingerprint,
+        required_paths=(
+            output_root / "clustered_tracks.json",
+            output_root / "compiled_cohort_rules.json",
+            output_root / "cohort_statistics.json",
+            output_root / "trajectory_clustering_manifest.json",
+        ),
+    )
+    if cached_outputs is not None:
+        manifest = dict(cached_outputs.get("trajectory_clustering_manifest", {}))
+        manifest["whole_step_cache_hit"] = True
+        cached_outputs["trajectory_clustering_manifest"] = manifest
+        cached_outputs["trajectory_clustering_output_root"] = output_root
+        print(
+            f"[step 8c] trajectory_clustering WHOLE_STEP_CACHE_HIT "
+            f"videos={manifest.get('num_videos', 0)} "
+            f"tracks={manifest.get('num_tracks', 0)} "
+            f"rules={manifest.get('num_rules', 0)} "
+            f"cohorts={manifest.get('num_cohorts', 0)}",
+            flush=True,
+        )
+        return {**state, **cached_outputs}
     evidence = state.get(
         "uncertain_signal_evidence",
         state.get("trajectory_motion_evidence", []),
@@ -5668,6 +6796,8 @@ def step8c_trajectory_clustering(state, llm_generate=None):
         "cohort_track_counts": {
             key: len(value) for key, value in sorted(cohorts.items())
         },
+        "input_fingerprint": input_fingerprint,
+        "whole_step_cache_hit": False,
     }
     (output_root / "clustered_tracks.json").write_text(
         json.dumps(tracks, indent=2, default=str), encoding="utf-8"
@@ -5686,26 +6816,103 @@ def step8c_trajectory_clustering(state, llm_generate=None):
         f"tracks={manifest['num_tracks']} rules={manifest['num_rules']} "
         f"cohorts={manifest['num_cohorts']} repairs=0"
     )
-    return {
-        **state,
+    outputs = {
         "trajectory_clustered_tracks": tracks,
         "trajectory_cohort_metadata_catalog": metadata_catalog,
         "trajectory_cohort_rule_policy": compiled_policy,
         "trajectory_cohort_statistics": summaries,
         "trajectory_clustering_manifest": manifest,
-        "trajectory_clustering_output_root": output_root,
+        "trajectory_clustering_output_root": str(output_root),
     }
+    _write_step8_whole_cache(whole_cache_path, input_fingerprint, outputs)
+    outputs["trajectory_clustering_output_root"] = output_root
+    return {**state, **outputs}
+
+
+_STEP8D_CACHE_OUTPUT_KEYS = (
+    "pre_pattern_relative_object_motion",
+    "relative_object_motion",
+    "filtered_relative_object_motion",
+    "trajectory_pattern_records",
+    "trajectory_cohort_metadata_catalog",
+    "trajectory_cohort_rule_policy",
+    "trajectory_cohort_statistics",
+    "trajectory_cohort_operator_plans",
+    "trajectory_cohort_output_root",
+    "trajectory_pattern_definitions",
+    "trajectory_pattern_statistics_candidate",
+    "trajectory_pattern_statistics_review",
+    "trajectory_pattern_statistics_promotion",
+    "trajectory_pattern_epoch_policy",
+    "trajectory_pattern_epoch_reviews",
+    "trajectory_pattern_manifest",
+    "trajectory_pattern_output_root",
+    "trajectory_pattern_runtime_monitor",
+    "trajectory_pattern_runtime_dashboard_path",
+    "trajectory_pattern_runtime_output_root",
+)
 
 
 def step8d_closed_loop_trajectory_repair(state, llm_generate=None):
     """Consume frozen Step 8C cohorts and run deterministic repair candidates."""
-    return step8e_iterative_trajectory_pattern_repair(
+    output_root = get_pipeline_output_root() / "08d_closed_loop_trajectory_repair"
+    clustering_manifest = dict(state.get("trajectory_clustering_manifest", {}))
+    input_fingerprint = _step8_cache_fingerprint(
+        {
+            "schema": "step8d-closed-loop-repair-v2",
+            "step8c_input_fingerprint": clustering_manifest.get(
+                "input_fingerprint", ""
+            ),
+            "clustered_tracks": state.get("trajectory_clustered_tracks", []),
+            "cohort_rule_policy": state.get("trajectory_cohort_rule_policy", {}),
+            "ego_motion": state.get("ego_motion", []),
+        }
+    )
+    whole_cache_path = output_root / "whole_step_cache.json"
+    cached_outputs = _load_step8_whole_cache(
+        whole_cache_path,
+        input_fingerprint,
+        required_paths=(output_root / "trajectory_pattern_manifest.json",),
+    )
+    if cached_outputs is not None:
+        manifest = dict(cached_outputs.get("trajectory_pattern_manifest", {}))
+        manifest["whole_step_cache_hit"] = True
+        records = list(cached_outputs.get("trajectory_pattern_records", []))
+        for record in records:
+            llm_processing = dict(record.get("llm_processing", {}))
+            llm_processing["repair_cache_hit"] = True
+            record["llm_processing"] = llm_processing
+        cached_outputs["trajectory_pattern_records"] = records
+        manifest["repair_cache_hits"] = len(records)
+        manifest["repair_tracks_computed"] = 0
+        cached_outputs["trajectory_pattern_manifest"] = manifest
+        print(
+            f"[step 8d] closed_loop_trajectory_repair WHOLE_STEP_CACHE_HIT "
+            f"videos={manifest.get('num_videos', 0)} "
+            f"tracks={manifest.get('num_tracks', 0)} "
+            f"repairs={manifest.get('num_repairs_applied', 0)}",
+            flush=True,
+        )
+        return {**state, **cached_outputs}
+    result = step8e_iterative_trajectory_pattern_repair(
         state,
         llm_generate=llm_generate,
         output_subdir="08d_closed_loop_trajectory_repair",
         step_label="8d",
         postprocess=False,
     )
+    outputs = {
+        key: result[key]
+        for key in _STEP8D_CACHE_OUTPUT_KEYS
+        if key in result
+    }
+    manifest = dict(outputs.get("trajectory_pattern_manifest", {}))
+    manifest["whole_step_cache_hit"] = False
+    manifest["whole_step_input_fingerprint"] = input_fingerprint
+    outputs["trajectory_pattern_manifest"] = manifest
+    result["trajectory_pattern_manifest"] = manifest
+    _write_step8_whole_cache(whole_cache_path, input_fingerprint, outputs)
+    return result
 
 
 def step8e_repaired_trajectory_validation(state):
@@ -5780,6 +6987,38 @@ def step8g_repaired_track_materialization(state):
     return {**state, "step8g_materialization_manifest": payload, "step8g_materialization_path": str(path), "step8g_materialization_output_root": root}
 
 
+_STEP8H_CACHE_OUTPUT_KEYS = (
+    "trajectory_pattern_visualizations",
+    "trajectory_pattern_video_summaries",
+    "trajectory_pattern_statistical_pdf_reports",
+    "trajectory_pattern_statistical_summary",
+    "trajectory_pattern_statistical_summary_path",
+    "trajectory_pattern_statistical_pdf_output_root",
+    "trajectory_pattern_track_videos",
+    "trajectory_pattern_track_video_skipped",
+    "trajectory_pattern_track_video_selections",
+    "trajectory_pattern_track_video_manifest_path",
+    "trajectory_pattern_visualization_skipped",
+    "trajectory_pattern_visualization_output_root",
+)
+
+
+def _step8h_media_paths(outputs):
+    paths = []
+    for key in (
+        "trajectory_pattern_statistical_pdf_reports",
+        "trajectory_pattern_track_videos",
+    ):
+        for row in outputs.get(key, []):
+            if isinstance(row, str):
+                paths.append(row)
+            elif isinstance(row, dict):
+                candidate = row.get("path", row.get("output_path", ""))
+                if candidate:
+                    paths.append(candidate)
+    return paths
+
+
 def step8h_trajectory_repair_visualization(state):
     """Render Step 8C–8G comparison MP4 videos and statistical PDFs only."""
     from src.exp_july.perception.trajectory_pattern_visualization import (
@@ -5787,7 +7026,40 @@ def step8h_trajectory_repair_visualization(state):
     )
 
     root = get_pipeline_output_root() / "08h_trajectory_repair_visualization"
+    input_fingerprint = _step8_cache_fingerprint(
+        {
+            "schema": "step8h-trajectory-repair-visualization-v2",
+            "records": state.get("trajectory_pattern_records", []),
+            "relative_object_motion": state.get("relative_object_motion", []),
+            "pre_pattern_relative_object_motion": state.get(
+                "pre_pattern_relative_object_motion", []
+            ),
+            "ego_motion": state.get("ego_motion", []),
+            "ego_symbol_prior": state.get("ego_symbol_prior", []),
+            "statistics_promotion": state.get(
+                "trajectory_pattern_statistics_promotion", {}
+            ),
+            "fps": state.get("step8bc_visualization_fps", 10.0),
+        }
+    )
+    cache_path = root / "whole_step_cache.json"
+    cached_outputs = _load_step8_whole_cache(cache_path, input_fingerprint)
+    if cached_outputs is not None and all(
+        Path(path).exists() for path in _step8h_media_paths(cached_outputs)
+    ):
+        cached_outputs["trajectory_pattern_visualization_output_root"] = root
+        print(
+            f"[step 8h] trajectory_repair_visualization WHOLE_STEP_CACHE_HIT "
+            f"mp4s={len(cached_outputs.get('trajectory_pattern_track_videos', []))} "
+            f"pdfs={len(cached_outputs.get('trajectory_pattern_statistical_pdf_reports', []))}",
+            flush=True,
+        )
+        return {**state, **cached_outputs}
     result = render_trajectory_pattern_visualizations(state, root)
+    outputs = {
+        key: result[key] for key in _STEP8H_CACHE_OUTPUT_KEYS if key in result
+    }
+    _write_step8_whole_cache(cache_path, input_fingerprint, outputs)
     print(
         f"[step 8h] trajectory_repair_visualization "
         f"reports={len(result.get('trajectory_pattern_visualizations', []))} "
@@ -5804,7 +7076,45 @@ def step8i_trajectory_audit_dashboard(state):
 
     root = get_pipeline_output_root() / "08i_trajectory_audit_dashboard"
     audit_root = Path(state.get("trajectory_pattern_output_root", root)) / "llm_audit"
+    input_fingerprint = _step8_cache_fingerprint(
+        {
+            "schema": "step8i-trajectory-audit-dashboard-v2",
+            "records": state.get("trajectory_pattern_records", []),
+            "manifest": state.get("trajectory_pattern_manifest", {}),
+            "promotion": state.get("trajectory_pattern_statistics_promotion", {}),
+            "llm_audit_files": sorted(
+                (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+                for path in audit_root.glob("*.json")
+                if path.is_file()
+            ) if audit_root.exists() else [],
+        }
+    )
+    cache_path = root / "whole_step_cache.json"
+    cached_outputs = _load_step8_whole_cache(
+        cache_path,
+        input_fingerprint,
+        required_paths=(root / "index.html", root / "dashboard_manifest.json"),
+    )
+    if cached_outputs is not None:
+        cached_outputs["trajectory_pattern_dashboard_path"] = root / "index.html"
+        cached_outputs["trajectory_pattern_dashboard_output_root"] = root
+        print(
+            f"[step 8i] trajectory_audit_dashboard WHOLE_STEP_CACHE_HIT "
+            f"path={root / 'index.html'}",
+            flush=True,
+        )
+        return {**state, **cached_outputs}
     result = build_trajectory_pattern_dashboard(state, root, audit_root)
+    outputs = {
+        key: result[key]
+        for key in (
+            "trajectory_pattern_dashboard",
+            "trajectory_pattern_dashboard_path",
+            "trajectory_pattern_dashboard_output_root",
+        )
+        if key in result
+    }
+    _write_step8_whole_cache(cache_path, input_fingerprint, outputs)
     print(f"[step 8i] trajectory_audit_dashboard path={result.get('trajectory_pattern_dashboard_path', '')}")
     return result
 

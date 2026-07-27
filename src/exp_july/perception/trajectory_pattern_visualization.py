@@ -24,9 +24,27 @@ RESIDUALS = (
 )
 _TRACK_VIDEO_SELECTION_NAMESPACE = "step8bc-global-track-video-five-v2"
 _MAX_TRACK_VIDEOS_TOTAL = 5
-_OUTPUT_WIDTH = 1920
+_OUTPUT_WIDTH = 2480
 _OUTPUT_HEIGHT = 1440
 _LEFT_SCENE_WIDTH = 1100
+_PROCESS_PANEL_WIDTH = 820
+_TRACK_SIGNAL_PANEL_WIDTH = 560
+_EGO_LABEL_CUE_COLORS = {
+    "ego_static": (190, 190, 190),
+    "ego_driving_forward": (70, 220, 100),
+    "ego_driving_backward": (210, 130, 220),
+    "ego_turning_left": (60, 180, 255),
+    "ego_turning_right": (255, 150, 70),
+    "ego_straight": (220, 210, 80),
+    "ego_accelerating": (40, 230, 250),
+    "ego_decelerating": (220, 90, 240),
+    "ego_motion_uncertain": (70, 80, 240),
+}
+_EGO_LABEL_GROUPS = (
+    ("MOTION", ("ego_static", "ego_driving_forward", "ego_driving_backward")),
+    ("HEADING", ("ego_turning_left", "ego_turning_right", "ego_straight")),
+    ("SPEED CHANGE", ("ego_accelerating", "ego_decelerating", "ego_motion_uncertain")),
+)
 
 
 def _number(value, default=0.0):
@@ -41,6 +59,160 @@ def _text(cv2, image, text, x, y, scale=0.46, color=(225, 225, 225), thickness=1
         image, str(text), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
         scale, color, thickness, cv2.LINE_AA,
     )
+
+
+def _build_ego_label_states_panel(
+    cv2,
+    np,
+    ego_cues_by_frame,
+    frame_indices,
+    current_frame,
+    width,
+    height,
+    selected_thresholds=None,
+):
+    """Render a full-video Step 7A ego-state timeline and frozen thresholds."""
+    panel = np.full((height, width, 3), (20, 23, 29), dtype=np.uint8)
+    margin = 30
+    _text(
+        cv2, panel, "EGO LABEL STATES [7F FINAL]", margin, 58,
+        1.35, (250, 250, 250), 3,
+    )
+    _text(
+        cv2, panel, f"CURRENT FRAME  {current_frame}", margin, 96,
+        0.78, (235, 235, 235), 2,
+    )
+
+    frames = list(frame_indices)
+    if not frames:
+        _text(
+            cv2, panel, "No video frames", margin, 150,
+            0.85, (120, 130, 145), 2,
+        )
+        return panel
+
+    label_width = 190
+    bar_left = margin + label_width
+    bar_right = width - margin
+    bar_width = max(1, bar_right - bar_left)
+    legend_top = 124
+    legend_x = margin
+    for cue, color in _EGO_LABEL_CUE_COLORS.items():
+        label = cue.removeprefix("ego_").replace("_", " ").upper()
+        label_width_px = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.39, 1
+        )[0][0]
+        item_width = label_width_px + 43
+        if legend_x + item_width > width - margin:
+            legend_top += 31
+            legend_x = margin
+        cv2.rectangle(
+            panel,
+            (legend_x, legend_top - 14),
+            (legend_x + 13, legend_top - 1),
+            color,
+            -1,
+        )
+        _text(cv2, panel, label, legend_x + 18, legend_top, 0.39, color, 1)
+        legend_x += item_width
+
+    row_top = legend_top + 50
+    row_pitch = 82
+    bar_height = 42
+    inactive_color = (45, 49, 58)
+    frame_count = len(frames)
+
+    for row_index, (group_label, group_cues) in enumerate(_EGO_LABEL_GROUPS):
+        y1 = row_top + row_index * row_pitch
+        y2 = y1 + bar_height
+        _text(
+            cv2, panel, group_label, margin, y1 + 29,
+            0.65, (215, 222, 232), 2,
+        )
+        cv2.rectangle(panel, (bar_left, y1), (bar_right, y2), inactive_color, -1)
+        for offset, frame_index in enumerate(frames):
+            frame_cues = dict(ego_cues_by_frame.get(frame_index, {}))
+            active_cue = next(
+                (
+                    cue
+                    for cue in group_cues
+                    if _number(frame_cues.get(cue)) > 0.0
+                ),
+                None,
+            )
+            if active_cue is None:
+                continue
+            x1 = bar_left + int(math.floor(offset * bar_width / frame_count))
+            x2 = bar_left + int(
+                math.ceil((offset + 1) * bar_width / frame_count)
+            )
+            cv2.rectangle(
+                panel,
+                (x1, y1),
+                (max(x1 + 1, x2), y2),
+                _EGO_LABEL_CUE_COLORS[active_cue],
+                -1,
+            )
+        cv2.rectangle(
+            panel, (bar_left, y1), (bar_right, y2), (82, 88, 100), 1
+        )
+
+    try:
+        current_offset = frames.index(current_frame)
+    except ValueError:
+        current_offset = 0
+    marker_x = bar_left + int(
+        round((current_offset + 0.5) * bar_width / frame_count)
+    )
+    last_bottom = (
+        row_top
+        + (len(_EGO_LABEL_GROUPS) - 1) * row_pitch
+        + bar_height
+    )
+    cv2.line(
+        panel,
+        (marker_x, row_top - 10),
+        (marker_x, last_bottom + 10),
+        (255, 255, 255),
+        4,
+        cv2.LINE_AA,
+    )
+    _text(
+        cv2, panel, "white line = current frame", margin, last_bottom + 54,
+        0.68, (235, 235, 235), 2,
+    )
+
+    thresholds = dict(selected_thresholds or {})
+    threshold_top = last_bottom + 105
+    cv2.line(
+        panel,
+        (margin, threshold_top - 32),
+        (width - margin, threshold_top - 32),
+        (75, 82, 94),
+        2,
+        cv2.LINE_AA,
+    )
+    _text(
+        cv2, panel, "SELECTED THRESHOLDS [7F]  (FINAL)", margin,
+        threshold_top, 0.82, (245, 245, 245), 2,
+    )
+    threshold_rows = (
+        ("STATIC SPEED", "static_speed_threshold"),
+        ("LATERAL TURN", "lateral_threshold"),
+        ("YAW TURN", "yaw_threshold"),
+        ("ACCELERATION", "acceleration_threshold"),
+    )
+    row_y = threshold_top + 48
+    for label, key in threshold_rows:
+        value = thresholds.get(key)
+        display_value = f"{_number(value):.4f}" if value is not None else "unavailable"
+        _text(cv2, panel, label, margin, row_y, 0.70, (190, 199, 212), 2)
+        _text(
+            cv2, panel, display_value, width - margin - 175, row_y,
+            0.74, (80, 220, 245) if value is not None else (120, 130, 145), 2,
+        )
+        row_y += 43
+    return panel
 
 
 def _fit_text(cv2, text, width, scale=0.40, thickness=1):
@@ -1068,6 +1240,71 @@ def _cue_visual_state(name, raw_value, object_observed):
     return f"{name}={cue_value:.2f}", (145, 152, 163), 1, False
 
 
+
+def _draw_cue_table(
+    cv2,
+    canvas,
+    *,
+    title,
+    cue_groups,
+    cues,
+    context_active,
+    top,
+    left,
+    right,
+):
+    """Draw one compact 3-column cue table and return its bottom edge."""
+    left = int(left)
+    right = int(right)
+    top = int(top)
+    header_height = 40
+    row_height = 38
+    rows = len(cue_groups)
+    bottom = top + header_height + rows * row_height
+    column_width = max(1, (right - left) // 3)
+    cv2.rectangle(canvas, (left, top), (right, bottom), (65, 72, 84), 2)
+    cv2.rectangle(canvas, (left, top), (right, top + header_height), (34, 41, 52), -1)
+    cv2.line(canvas, (left, top + header_height), (right, top + header_height), (82, 90, 104), 2, cv2.LINE_AA)
+    _text(
+        cv2,
+        canvas,
+        title,
+        left + 10,
+        top + 28,
+        0.68,
+        (225, 230, 238) if context_active else (145, 152, 163),
+        2,
+    )
+    for row_index, names in enumerate(cue_groups):
+        row_top = top + header_height + row_index * row_height
+        if row_index:
+            cv2.line(canvas, (left, row_top), (right, row_top), (55, 62, 74), 1, cv2.LINE_AA)
+        for column_index, name in enumerate(names):
+            cell_left = left + column_index * column_width
+            if column_index:
+                cv2.line(canvas, (cell_left, row_top), (cell_left, row_top + row_height), (55, 62, 74), 1, cv2.LINE_AA)
+            cue_text, cue_color, cue_thickness, _ = _cue_visual_state(
+                name, cues.get(name), context_active
+            )
+            display_thickness = max(2, cue_thickness)
+            _text(
+                cv2,
+                canvas,
+                _clip_text_to_width(
+                    cv2,
+                    cue_text,
+                    column_width - 16,
+                    0.56,
+                    display_thickness,
+                ),
+                cell_left + 8,
+                row_top + 27,
+                0.56,
+                cue_color,
+                display_thickness,
+            )
+    return bottom
+
 def _bbox_difference_metrics(pre_obj, final_obj):
     if not pre_obj or not final_obj:
         return None
@@ -1378,6 +1615,218 @@ def _draw_step8c_track_progress(
     )
 
 
+
+def _appearance_marker_offset(appearance_frames, current_frame):
+    """Advance only on an observed slot; absent frames use the start position."""
+    indices = list(sorted(int(value) for value in appearance_frames))
+    if not indices:
+        return 0
+    try:
+        return indices.index(int(current_frame))
+    except ValueError:
+        return 0
+
+
+def _object_track_velocity_series(track, axis):
+    """Return appearance-slot frame IDs and object-velocity samples."""
+    indices = sorted(int(frame_index) for frame_index in dict(track or {}))
+    values = []
+    key = f"obj_v{axis}"
+    fallback = f"object_v{axis}"
+    for frame_index in indices:
+        obj = dict(track.get(frame_index, {}))
+        motion = dict(obj.get("motion", {}))
+        value = None
+        for source in (obj, motion):
+            for name in (key, fallback):
+                if name not in source:
+                    continue
+                try:
+                    candidate = float(source[name])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(candidate):
+                    value = candidate
+                    break
+            if value is not None:
+                break
+        values.append(value)
+    return indices, values
+
+
+def _draw_object_velocity_chart(
+    cv2,
+    panel,
+    *,
+    track,
+    axis,
+    current_frame,
+    title,
+    color,
+    top,
+    height,
+    placeholder=False,
+):
+    """Draw one persistent full-track chart on appearance-slot x coordinates."""
+    left = 18
+    right = panel.shape[1] - 18
+    bottom = int(top) + int(height)
+    cv2.rectangle(panel, (left, int(top)), (right, bottom), (55, 62, 74), 2)
+    _text(cv2, panel, title, left + 10, int(top) + 29, 0.60, color, 2)
+    plot_left = left + 18
+    plot_right = right - 12
+    plot_top = int(top) + 44
+    plot_bottom = bottom - 18
+    if placeholder:
+        _text(
+            cv2,
+            panel,
+            "NO REPAIR",
+            left + 150,
+            plot_top + max(35, (plot_bottom - plot_top) // 2),
+            0.86,
+            (145, 152, 163),
+            2,
+        )
+        return
+    indices, values = _object_track_velocity_series(track, axis)
+    valid_values = [value for value in values if value is not None]
+
+    def x_position(offset):
+        return plot_left + int(
+            round(offset * (plot_right - plot_left) / max(1, len(indices) - 1))
+        )
+
+    point = None
+    if valid_values:
+        minimum = min(valid_values + [0.0])
+        maximum = max(valid_values + [0.0])
+        padding = max(0.05, (maximum - minimum) * 0.12)
+        minimum -= padding
+        maximum += padding
+
+        def point(offset, value):
+            y = plot_bottom - int(
+                round(
+                    (value - minimum)
+                    * (plot_bottom - plot_top)
+                    / max(1e-9, maximum - minimum)
+                )
+            )
+            return x_position(offset), y
+
+        zero_y = point(0, 0.0)[1]
+        _draw_bright_zero_baseline(
+            cv2, panel, plot_left, plot_right, zero_y
+        )
+        previous = None
+        previous_offset = None
+        for offset, value in enumerate(values):
+            if value is None:
+                previous = None
+                previous_offset = None
+                continue
+            current_point = point(offset, value)
+            if previous is not None and previous_offset == offset - 1:
+                cv2.line(
+                    panel,
+                    previous,
+                    current_point,
+                    color,
+                    3,
+                    cv2.LINE_AA,
+                )
+            previous = current_point
+            previous_offset = offset
+
+    marker_offset = _appearance_marker_offset(indices, current_frame)
+    marker_x = x_position(marker_offset)
+    cv2.line(
+        panel,
+        (marker_x, plot_top),
+        (marker_x, plot_bottom),
+        (255, 255, 255),
+        3,
+        cv2.LINE_AA,
+    )
+    if (
+        int(current_frame) in indices
+        and marker_offset < len(values)
+        and values[marker_offset] is not None
+        and point is not None
+    ):
+        cv2.circle(
+            panel,
+            point(marker_offset, values[marker_offset]),
+            5,
+            (255, 255, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+
+
+def _build_track_signal_versions_panel(
+    cv2,
+    np,
+    *,
+    frame_index,
+    original_track,
+    repaired_track,
+    repair_applied,
+    width,
+    height,
+):
+    """Show persistent original and optional repaired object vx/vz charts."""
+    panel = np.full((height, width, 3), (17, 20, 26), dtype=np.uint8)
+    _text(
+        cv2,
+        panel,
+        "TRACK SIGNAL VERSIONS",
+        18,
+        42,
+        0.82,
+        (235, 239, 245),
+        2,
+    )
+    specifications = [
+        (original_track, "x", "ORIGINAL OBJ VX [8A]", (40, 185, 245), False),
+        (original_track, "z", "ORIGINAL OBJ VZ [8A]", (40, 185, 245), False),
+        (
+            repaired_track if repair_applied else {},
+            "x",
+            "REPAIRED OBJ VX [8D]",
+            (70, 220, 100) if repair_applied else (145, 152, 163),
+            not repair_applied,
+        ),
+        (
+            repaired_track if repair_applied else {},
+            "z",
+            "REPAIRED OBJ VZ [8D]",
+            (70, 220, 100) if repair_applied else (145, 152, 163),
+            not repair_applied,
+        ),
+    ]
+    gap = 12
+    top = 62
+    chart_height = max(
+        120,
+        int((height - top - 18 - gap * (len(specifications) - 1)) / len(specifications)),
+    )
+    for chart_index, (track, axis, title, color, placeholder) in enumerate(specifications):
+        _draw_object_velocity_chart(
+            cv2,
+            panel,
+            track=track,
+            axis=axis,
+            current_frame=frame_index,
+            title=title,
+            color=color,
+            top=top + chart_index * (chart_height + gap),
+            height=chart_height,
+            placeholder=placeholder,
+        )
+    return panel
+
 def _render_step8bc_track_video(
     *,
     record,
@@ -1385,6 +1834,7 @@ def _render_step8bc_track_video(
     pre_pattern_video,
     final_video,
     ego_video,
+    ego_symbol_video,
     output_path,
     fps=10.0,
     progress_callback=None,
@@ -1414,7 +1864,8 @@ def _render_step8bc_track_video(
     canvas_width = _OUTPUT_WIDTH
     total_height = _OUTPUT_HEIGHT
     left_width = _LEFT_SCENE_WIDTH
-    panel_width = canvas_width - left_width
+    process_panel_width = _PROCESS_PANEL_WIDTH
+    signal_panel_width = _TRACK_SIGNAL_PANEL_WIDTH
     max_scene_width = left_width - 40
     max_scene_height = 620
     pre_track = _track_objects_by_frame(
@@ -1432,14 +1883,29 @@ def _render_step8bc_track_video(
         for value in selected_candidate.get("modified_frame_ids", [])
     }
     repair_applied = bool(step8c_payload.get("repair_applied"))
-    static_panel = _build_step8bc_static_panel(
-        cv2, np, payload, panel_width, total_height
-    )
     observable_cues = dict(
         dict(payload.get("step8b_signal_evidence", {})).get(
             "observable_cues", {}
         )
     )
+    ego_symbol_payload = dict(ego_symbol_video or {})
+    ego_cues_by_frame = {
+        int(frame.get("frame_index", offset)): dict(
+            frame.get("observable_cues", {})
+        )
+        for offset, frame in enumerate(ego_symbol_payload.get("frames", []))
+    }
+    ego_selected_thresholds = dict(
+        ego_symbol_payload.get(
+            "selected_thresholds",
+            ego_symbol_payload.get("selected_threshold", {}),
+        )
+    )
+    acceleration_band = dict(ego_symbol_payload.get("calibration", {})).get(
+        "acceleration_band"
+    )
+    if acceleration_band is not None:
+        ego_selected_thresholds["acceleration_threshold"] = acceleration_band
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1535,15 +2001,38 @@ def _render_step8bc_track_video(
                 scene_y : scene_y + scene_height,
                 scene_x : scene_x + scene_width,
             ] = scene
-            canvas[:, left_width:] = static_panel
-            cv2.line(
-                canvas,
-                (left_width, 0),
-                (left_width, total_height),
-                (82, 88, 100),
-                4,
-                cv2.LINE_AA,
+            process_panel_right = left_width + process_panel_width
+            ego_label_panel = _build_ego_label_states_panel(
+                cv2,
+                np,
+                ego_cues_by_frame,
+                frame_indices,
+                frame_index,
+                process_panel_width,
+                total_height,
+                selected_thresholds=ego_selected_thresholds,
             )
+            canvas[:, left_width:process_panel_right] = ego_label_panel
+            signal_panel = _build_track_signal_versions_panel(
+                cv2,
+                np,
+                frame_index=frame_index,
+                original_track=pre_track,
+                repaired_track=final_track,
+                repair_applied=repair_applied,
+                width=signal_panel_width,
+                height=total_height,
+            )
+            canvas[:, process_panel_right:process_panel_right + signal_panel_width] = signal_panel
+            for divider_x in (left_width, process_panel_right):
+                cv2.line(
+                    canvas,
+                    (divider_x, 0),
+                    (divider_x, total_height),
+                    (82, 88, 100),
+                    4,
+                    cv2.LINE_AA,
+                )
             motion_chart_top = scene_y + scene_height + 10
             motion_chart_height = 286
             _draw_motion_speed_charts(
@@ -1582,198 +2071,54 @@ def _render_step8bc_track_video(
                     ),
                 )
             )
-            info_top = progress_top + 112
-            _text(
-                cv2,
-                canvas,
-                _clip_text_to_width(
-                    cv2,
-                    (
-                        f"[8B] {object_label} | "
-                        f"track {payload.get('track_id', -1)}"
-                    ),
-                    left_width - 48,
-                    0.88,
-                    2,
-                ),
-                24,
-                info_top,
-                0.88,
-                (80, 215, 240),
-                2,
+            ego_cue_groups = (
+                ("ego_static", "ego_driving_forward", "ego_driving_backward"),
+                ("ego_turning_left", "ego_turning_right", "ego_straight"),
+                ("ego_accelerating", "ego_decelerating", "ego_motion_uncertain"),
             )
-
-            table_top = info_top + 32
-            table_left = 24
-            table_right = left_width - 24
-            row_height = 34
-            column_x = (table_left + 8, 235, 395, 555, 715, 875)
-            headers = ("SOURCE", "x", "z", "vx", "vz", "speed")
-            for column, header in enumerate(headers):
-                _text(
-                    cv2,
-                    canvas,
-                    header,
-                    column_x[column],
-                    table_top + 23,
-                    0.56,
-                    (185, 195, 208),
-                    2,
-                )
-            cv2.line(
-                canvas,
-                (table_left, table_top + row_height),
-                (table_right, table_top + row_height),
-                (65, 72, 84),
-                2,
-                cv2.LINE_AA,
-            )
-
-            before_values = _signal_values(pre_obj)
-            after_values = _signal_values(final_obj)
-
-            def formatted_signal(values):
-                if values is None:
-                    return ("—", "—", "—", "—", "—")
-                return (
-                    f"{values[0]:+.2f}",
-                    f"{values[1]:+.2f}",
-                    f"{values[2]:+.2f}",
-                    f"{values[3]:+.2f}",
-                    f"{values[4]:.2f}",
-                )
-
-            if before_values is not None and after_values is not None:
-                delta_values = tuple(
-                    abs(after - before)
-                    for before, after in zip(before_values, after_values)
-                )
-                delta_text = tuple(f"{value:.2f}" for value in delta_values)
-                position_delta = math.hypot(delta_values[0], delta_values[1])
-                velocity_delta = math.hypot(delta_values[2], delta_values[3])
-            else:
-                delta_values = None
-                delta_text = ("N/A", "N/A", "N/A", "N/A", "N/A")
-                position_delta = None
-                velocity_delta = None
-
-            signal_rows = (
-                ("ORIGINAL [8A]", formatted_signal(before_values), (40, 185, 245)),
-                ("REPAIRED [8C]", formatted_signal(after_values), (70, 220, 100)),
-                ("ABS DELTA", delta_text, (80, 215, 240)),
-            )
-            for row_index, (row_label, row_values, color) in enumerate(signal_rows):
-                baseline = table_top + row_height * (row_index + 1) + 24
-                values = (row_label,) + row_values
-                for column, value in enumerate(values):
-                    _text(
-                        cv2,
-                        canvas,
-                        str(value),
-                        column_x[column],
-                        baseline,
-                        0.58,
-                        color,
-                        2,
-                    )
-            table_bottom = table_top + row_height * 4
-            cv2.rectangle(
-                canvas,
-                (table_left, table_top),
-                (table_right, table_bottom),
-                (65, 72, 84),
-                2,
-            )
-            cue_groups = (
+            object_cue_groups = (
                 ("leftness", "rightness", "approach"),
                 ("recede", "acceleration", "deceleration"),
-                (
-                    "relative_static",
-                    "relative_moving",
-                    "relative_motion_uncertain",
+                ("relative_static", "relative_moving", "relative_motion_uncertain"),
+            )
+            cue_left = 24
+            cue_right = left_width - 24
+            ego_cues = dict(ego_cues_by_frame.get(frame_index, {}))
+            ego_table_bottom = _draw_cue_table(
+                cv2,
+                canvas,
+                title=(
+                    "EGO CUES [7A] (green=active)"
+                    if ego_cues
+                    else "EGO CUES [7A] (unavailable)"
                 ),
+                cue_groups=ego_cue_groups,
+                cues=ego_cues,
+                context_active=bool(ego_cues),
+                top=progress_top + 106,
+                left=cue_left,
+                right=cue_right,
             )
             object_observed_in_current_frame = pre_obj is not None
-            cue_header = (
-                "CUES [8B] (green=active)"
-                if object_observed_in_current_frame
-                else "CUES [8B] (inactive: object absent)"
-            )
-            _text(
+            _draw_cue_table(
                 cv2,
                 canvas,
-                cue_header,
-                24,
-                table_bottom + 24,
-                0.50,
-                (
-                    (220, 225, 232)
-                    if object_observed_in_current_frame
-                    else (145, 152, 163)
+                title=(
+                    f"OBJECT CUES [8B] {object_label} | track {payload.get('track_id', -1)} "
+                    + (
+                        "(green=active)"
+                        if object_observed_in_current_frame
+                        else "(inactive: object absent)"
+                    )
                 ),
-                1,
+                cue_groups=object_cue_groups,
+                cues=observable_cues,
+                context_active=object_observed_in_current_frame,
+                top=ego_table_bottom + 10,
+                left=cue_left,
+                right=cue_right,
             )
-            cue_column_x = (285, 555, 825)
-            for cue_row, cue_names in enumerate(cue_groups):
-                for cue_column, name in enumerate(cue_names):
-                    cue_text, cue_color, cue_thickness, _ = _cue_visual_state(
-                        name,
-                        observable_cues.get(name),
-                        object_observed_in_current_frame,
-                    )
-                    _text(
-                        cv2,
-                        canvas,
-                        cue_text,
-                        cue_column_x[cue_column],
-                        table_bottom + 24 + cue_row * 25,
-                        0.54,
-                        cue_color,
-                        cue_thickness,
-                    )
 
-            bbox_difference = _bbox_difference_metrics(pre_obj, final_obj)
-            magnitude_parts = [
-                (
-                    f"|Δposition|={position_delta:.3f}m"
-                    if position_delta is not None
-                    else "|Δposition|=N/A"
-                ),
-                (
-                    f"|Δvelocity|={velocity_delta:.3f}m/s"
-                    if velocity_delta is not None
-                    else "|Δvelocity|=N/A"
-                ),
-            ]
-            if bbox_difference is not None:
-                magnitude_parts.extend(
-                    (
-                        f"bbox shift={bbox_difference['center_shift_px']:.1f}px",
-                        f"bbox IoU={bbox_difference['iou']:.3f}",
-                    )
-                )
-            else:
-                magnitude_parts.extend(("bbox shift=N/A", "bbox IoU=N/A"))
-            _text(
-                cv2,
-                canvas,
-                "   |   ".join(magnitude_parts),
-                24,
-                min(total_height - 38, table_bottom + 78),
-                0.55,
-                (225, 228, 234),
-                1,
-            )
-            _text(
-                cv2,
-                canvas,
-                "paths/bboxes: ORANGE original [8A] | GREEN repaired [8C]",
-                24,
-                min(total_height - 16, table_bottom + 101),
-                0.54,
-                (185, 195, 208),
-                1,
-            )
             writer.write(canvas)
             if progress_callback is not None:
                 progress_callback(1)
@@ -1806,6 +2151,10 @@ def render_step8bc_track_videos(
     ego_by_video = {
         str(video.get("video_id", "")): video
         for video in state.get("ego_motion", [])
+    }
+    ego_symbols_by_video = {
+        str(video.get("video_id", "")): video
+        for video in state.get("ego_symbol_prior", [])
     }
     available_by_video = defaultdict(set)
     selected_by_video = defaultdict(list)
@@ -1896,6 +2245,7 @@ def render_step8bc_track_videos(
                         video_id, pre_by_video.get(video_id, {})
                     ),
                     ego_video=ego_by_video.get(video_id, {}),
+                    ego_symbol_video=ego_symbols_by_video.get(video_id, {}),
                     output_path=output_path,
                     fps=fps,
                     progress_callback=update_frames,
@@ -1949,11 +2299,15 @@ def render_step8bc_track_videos(
     manifest = {
         "version": 3,
         "selection_policy": _TRACK_VIDEO_SELECTION_NAMESPACE,
-        "layout": "scene_left_statistical_repair_right",
+        "layout": "scene_left_ego_states_middle_track_signals_right",
         "scene_column_width": _LEFT_SCENE_WIDTH,
+        "process_panel_width": _PROCESS_PANEL_WIDTH,
+        "ego_state_panel_width": _PROCESS_PANEL_WIDTH,
+        "middle_panel_role": "step7f_final_ego_label_state_timeline",
+        "track_signal_panel_width": _TRACK_SIGNAL_PANEL_WIDTH,
         "track_progress_position": "directly_below_scene",
         "canvas_resolution": [_OUTPUT_WIDTH, _OUTPUT_HEIGHT],
-        "canvas_aspect_ratio": "4:3",
+        "canvas_aspect_ratio": "31:18",
         "scene_bbox_labels": False,
         "progress_colors": {
             "original_presence": "orange",

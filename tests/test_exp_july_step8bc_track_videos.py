@@ -12,9 +12,12 @@ from src.exp_july.perception.trajectory_pattern_closed_loop import (
     RESIDUALS,
 )
 from src.exp_july.perception.trajectory_pattern_visualization import (
+    _appearance_marker_offset,
     _bbox_difference_metrics,
+    _build_track_signal_versions_panel,
     _cue_visual_state,
     _ego_speed_series,
+    _object_track_velocity_series,
     _signal_values,
     _track_motion_series,
     build_step8bc_track_video_payload,
@@ -156,6 +159,80 @@ class Step8BCTrackVideoTests(unittest.TestCase):
         series = _ego_speed_series(ego_video, [0, 1, 2])
         self.assertEqual(series["vx"], [1.0, None, 3.0])
         self.assertEqual(series["vz"], [2.0, None, -1.0])
+
+    def test_third_panel_persists_original_and_optional_repaired_charts(self):
+        import cv2
+        import numpy as np
+
+        original_track = {
+            10: {"obj_vx": 0.2, "obj_vz": 1.1},
+            12: {"obj_vx": 0.4, "obj_vz": 1.3},
+            15: {"motion": {"obj_vx": 0.3, "obj_vz": 1.2}},
+        }
+        repaired_track = {
+            10: {"obj_vx": 0.2, "obj_vz": 1.0},
+            12: {"obj_vx": 0.3, "obj_vz": 1.1},
+            15: {"obj_vx": 0.25, "obj_vz": 1.05},
+        }
+        indices, values = _object_track_velocity_series(original_track, "x")
+        self.assertEqual(indices, [10, 12, 15])
+        self.assertEqual(values, [0.2, 0.4, 0.3])
+        self.assertEqual(_appearance_marker_offset(indices, 9), 0)
+        self.assertEqual(_appearance_marker_offset(indices, 11), 0)
+        self.assertEqual(_appearance_marker_offset(indices, 12), 1)
+        self.assertEqual(_appearance_marker_offset(indices, 15), 2)
+
+        with patch(
+            "src.exp_july.perception.trajectory_pattern_visualization._text"
+        ) as draw_text:
+            _build_track_signal_versions_panel(
+                cv2,
+                np,
+                frame_index=12,
+                original_track=original_track,
+                repaired_track=repaired_track,
+                repair_applied=True,
+                width=560,
+                height=1440,
+            )
+            rendered = [str(call.args[2]) for call in draw_text.call_args_list]
+        self.assertEqual(
+            rendered,
+            [
+                "TRACK SIGNAL VERSIONS",
+                "ORIGINAL OBJ VX [8A]",
+                "ORIGINAL OBJ VZ [8A]",
+                "REPAIRED OBJ VX [8D]",
+                "REPAIRED OBJ VZ [8D]",
+            ],
+        )
+
+        with patch(
+            "src.exp_july.perception.trajectory_pattern_visualization._text"
+        ) as draw_text:
+            _build_track_signal_versions_panel(
+                cv2,
+                np,
+                frame_index=9,
+                original_track=original_track,
+                repaired_track=repaired_track,
+                repair_applied=False,
+                width=560,
+                height=1440,
+            )
+            rendered = [str(call.args[2]) for call in draw_text.call_args_list]
+        self.assertEqual(
+            rendered,
+            [
+                "TRACK SIGNAL VERSIONS",
+                "ORIGINAL OBJ VX [8A]",
+                "ORIGINAL OBJ VZ [8A]",
+                "REPAIRED OBJ VX [8D]",
+                "NO REPAIR",
+                "REPAIRED OBJ VZ [8D]",
+                "NO REPAIR",
+            ],
+        )
 
     def test_track_motion_series_aligns_object_and_relative_velocity(self):
         track = {
@@ -399,12 +476,19 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             for manifest in (first_manifest, second_manifest):
                 self.assertEqual(
                     manifest["layout"],
-                    "scene_left_statistical_repair_right",
+                    "scene_left_ego_states_middle_track_signals_right",
                 )
                 self.assertEqual(
-                    manifest["canvas_resolution"], [1920, 1440]
+                    manifest["canvas_resolution"], [2480, 1440]
                 )
-                self.assertEqual(manifest["canvas_aspect_ratio"], "4:3")
+                self.assertEqual(manifest["canvas_aspect_ratio"], "31:18")
+                self.assertEqual(manifest["process_panel_width"], 820)
+                self.assertEqual(manifest["ego_state_panel_width"], 820)
+                self.assertEqual(
+                    manifest["middle_panel_role"],
+                    "step7f_final_ego_label_state_timeline",
+                )
+                self.assertEqual(manifest["track_signal_panel_width"], 560)
                 self.assertFalse(manifest["scene_bbox_labels"])
                 self.assertEqual(
                     manifest["track_progress_position"],

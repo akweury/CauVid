@@ -10,7 +10,7 @@ media, and audit artifacts.
 
 ```text
 1 Init → 2 Detection → 3 Tracking → 6 3D Positions → 7 Ego Motion
-→ 8 Trajectory Repair → 8A Relative Motion → Threshold Epoch
+→ 7A Ego Symbol Prior → 8 Trajectory Repair → 8A Relative Motion → Threshold Epoch
 → 8B Signal Evidence → 8C Pattern/Cohort Repair → 8D Validation
 → 8E Semantic Protection → 8F Final Validation → 8G Ego Refinement
 → 8H Visualization → 8I Threshold Calibration
@@ -67,6 +67,26 @@ reused.
 
 **Output directory:** `07_driving_mini_ego_motion/`
 
+### Step 7A — Ego-symbol prior
+
+```text
+Step 7 vx/vz/yaw → bounded threshold search → temporal action segments
+→ minimum global score → frozen frame-aligned ego-cue prior
+```
+
+Threshold candidates and scoring weights are configuration-driven. Each video
+stores its continuous signals, selected threshold bundle, per-candidate score
+components, final contiguous action segments, and deterministic audit explanation.
+
+| Output group | Symbols |
+|---|---|
+| Motion state | `ego_static`, `ego_driving_forward`, `ego_driving_backward` |
+| Direction | `ego_turning_left`, `ego_turning_right`, `ego_straight` |
+| Speed change | `ego_accelerating`, `ego_decelerating` |
+| Uncertainty | `ego_motion_uncertain` |
+
+**Output directory:** `07a_ego_symbol_prior/`
+
 ## Step 8 — High-level flow
 
 ### Step 8 — Track repair
@@ -107,7 +127,7 @@ raw measurements → observable signal symbols → active/quarantined evidence
 | Symbol group | Symbols |
 |---|---|
 | Identity | `track_id`, `primary_label` |
-| Observable cues | `leftness`, `rightness`, `approach`, `recede`, `acceleration`, `deceleration` |
+| Observable cues | `leftness`, `rightness`, `approach`, `recede`, `acceleration`, `deceleration`, `relative_static`, `relative_moving`, `relative_motion_uncertain` |
 | Usefulness features | `num_observations`, `temporal_coverage_in_video`, `max_bbox_area_px`, `bbox_growth_ratio`, `min_depth`, `depth_change`, `min_abs_lateral_position`, `max_detection_score`, `max_relative_speed`, `max_observable_cue`, `approach` |
 | Usefulness conditions | `short`, `tiny`, `far`, `low_detection_confidence`, `weak_cues`, `vehicle_category` |
 | Usefulness decisions | `active`, `quarantine` |
@@ -154,7 +174,7 @@ accepted repairs → downstream relative-motion tracks
 ### Step 8H — Repair visualization
 
 ```text
-original vs repaired tracks → MP4 + HTML + statistical PDFs
+scene/cues + repair process + signal versions → MP4 + statistical PDFs
 ```
 
 ### Step 8I — Audit dashboard

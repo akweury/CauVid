@@ -12,6 +12,12 @@ from src.exp_july.perception import step2_detection
 from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
+from src.exp_july.perception import step7a_ego_symbol_prior
+from src.exp_july.perception import step7b_background_motion_evidence
+from src.exp_july.perception import step7c_video_local_evidence_calibration
+from src.exp_july.perception import step7d_global_symbolic_rule_evaluation
+from src.exp_july.perception import step7e_threshold_label_refinement
+from src.exp_july.perception import step7f_ego_symbol_finalization
 from src.exp_july.perception import step8_trajectory_repair
 from src.exp_july.perception import step8a_relative_object_motion
 from src.exp_july.perception import step8b_signal_evidence
@@ -157,6 +163,13 @@ def _step_data_error(step_name, state):
             return "produced no per-video ego-motion results"
         if _sum_fields(ego_motion, "num_frames_with_ego_motion") <= 0:
             return "produced zero frames with ego-motion estimates"
+
+    if step_name == "07a_ego_symbol_prior":
+        manifest = state.get("ego_symbol_prior_manifest", {})
+        if int(manifest.get("num_videos", 0) or 0) <= 0:
+            return "produced no ego-symbol-prior videos"
+        if int(manifest.get("num_frames", 0) or 0) <= 0:
+            return "produced zero ego-symbol-prior frames"
 
     if step_name == "08_trajectory_repair":
         repaired = state.get("positions_3d", state.get("tracklet_repair", []))
@@ -314,11 +327,47 @@ def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
     )
     if max_step <= 7:
         return ego_state
+    # Step 7A: freeze an initial ego-symbol prior before object processing.
+    ego_symbol_state = _tracked_step(
+        tracker,
+        "07a_ego_symbol_prior",
+        lambda: step7a_ego_symbol_prior(ego_state),
+    )
+    # Step 7B: extract independent background motion evidence for provisional labels.
+    ego_evidence_state = _tracked_step(
+        tracker,
+        "07b_background_motion_evidence",
+        lambda: step7b_background_motion_evidence(position_state, ego_symbol_state),
+    )
+    # Step 7C: calibrate raw background evidence within each video.
+    ego_calibrated_state = _tracked_step(
+        tracker,
+        "07c_video_local_evidence_calibration",
+        lambda: step7c_video_local_evidence_calibration(ego_evidence_state),
+    )
+    # Step 7D: evaluate shared symbolic rules over normalized evidence.
+    ego_rule_state = _tracked_step(
+        tracker,
+        "07d_global_symbolic_rule_evaluation",
+        lambda: step7d_global_symbolic_rule_evaluation(ego_calibrated_state),
+    )
+    # Step 7E: refine thresholds and labels in a deterministic rule loop.
+    ego_refined_state = _tracked_step(
+        tracker,
+        "07e_threshold_label_refinement",
+        lambda: step7e_threshold_label_refinement(ego_rule_state),
+    )
+    # Step 7F: publish only validated final ego symbols and audit artifacts.
+    ego_final_state = _tracked_step(
+        tracker,
+        "07f_ego_symbol_finalization",
+        lambda: step7f_ego_symbol_finalization(position_state, ego_refined_state),
+    )
     # Step 8: repair trajectories first; split events receive new track IDs.
     repaired_state = _tracked_step(
         tracker,
         "08_trajectory_repair",
-        lambda: step8_trajectory_repair(position_state, ego_state),
+        lambda: step8_trajectory_repair(position_state, ego_final_state),
     )
     # Step 8A: compute relative motion from the repaired, canonical track IDs.
     relative_motion_state = _tracked_step(
