@@ -13,17 +13,17 @@ from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_ego_motion
 from src.exp_july.perception import step8_trajectory_repair
-from src.exp_july.perception import step8_threshold_epoch_begin
 from src.exp_july.perception import step8a_relative_object_motion
 from src.exp_july.perception import step8b_signal_evidence
-from src.exp_july.perception import step8c_trajectory_pattern_closed_loop
-from src.exp_july.perception import step8d_pattern_refined_validation
-from src.exp_july.perception import step8e_semantic_protection
-from src.exp_july.perception import step8e_visual_semantic_protection
-from src.exp_july.perception import step8f_final_trajectory_validation
-from src.exp_july.perception import step8g_prior_guided_ego_motion_refinement
-from src.exp_july.perception import step8h_visual_relative_motion
-from src.exp_july.perception import step8i_threshold_calibration
+from src.exp_july.perception import step8c_trajectory_clustering
+from src.exp_july.perception import step8d_closed_loop_trajectory_repair
+from src.exp_july.perception import step8e_repaired_trajectory_validation
+from src.exp_july.perception import step8f_trajectory_statistics
+from src.exp_july.perception import step8g_repaired_track_materialization
+from src.exp_july.perception import step8h_trajectory_repair_visualization
+from src.exp_july.perception import step8i_trajectory_audit_dashboard
+from src.exp_july.perception import step8j_trajectory_provenance_audit
+from src.exp_july.perception import step8k_trajectory_handoff
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
 
@@ -170,15 +170,7 @@ def _step_data_error(step_name, state):
         ) <= 0:
             return "produced zero repaired object-position observations"
 
-    if step_name in {
-        "08a_relative_motion",
-        "08_threshold_epoch_begin",
-        "08e_semantic_protection",
-        "08e_semantic_visualization",
-        "08g_ego_refinement",
-        "08h_important_video_visualization",
-        "08i_threshold_calibration",
-    }:
+    if step_name == "08a_relative_motion":
         relative_motion = state.get("relative_object_motion", [])
         if not relative_motion:
             return "contains no per-video relative-motion results"
@@ -198,19 +190,24 @@ def _step_data_error(step_name, state):
         if int(manifest.get("num_observations", 0) or 0) <= 0:
             return "produced zero signal-evidence observations"
 
-    if step_name == "08c_trajectory_pattern":
+    if step_name == "08c_trajectory_clustering":
+        manifest = state.get("trajectory_clustering_manifest", {})
+        if int(manifest.get("num_videos", 0) or 0) <= 0:
+            return "clustered no trajectory videos"
+        if int(manifest.get("num_tracks", 0) or 0) <= 0:
+            return "clustered zero trajectory tracks"
+
+    if step_name == "08d_closed_loop_trajectory_repair":
         manifest = state.get("trajectory_pattern_manifest", {})
         if int(manifest.get("num_videos", 0) or 0) <= 0:
-            return "processed no statistical-cohort repair videos"
+            return "repaired no trajectory videos"
         if int(manifest.get("num_tracks", 0) or 0) <= 0:
-            return "processed zero statistical-cohort repair tracks"
+            return "processed zero tracks for closed-loop repair"
 
-    if step_name in {"08d_pattern_validation", "08f_final_validation"}:
-        evidence = state.get("trajectory_motion_evidence", [])
-        if not evidence:
-            return "produced no per-video trajectory-validation evidence"
-        if _sum_fields(evidence, "num_trajectories") <= 0:
-            return "produced zero validated trajectories"
+    if step_name == "08e_repaired_trajectory_validation":
+        manifest = state.get("step8e_validation_manifest", {})
+        if int(manifest.get("num_tracks", 0) or 0) <= 0:
+            return "published zero repaired-trajectory validation records"
 
     required_collections = {
         "09_temporal_segmentation": (
@@ -329,66 +326,66 @@ def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
         "08a_relative_motion",
         lambda: step8a_relative_object_motion(position_state, repaired_state),
     )
-    # Activate a pending threshold policy once and freeze it for Steps 8C-8F.
-    relative_motion_state = _tracked_step(
-        tracker,
-        "08_threshold_epoch_begin",
-        lambda: step8_threshold_epoch_begin(relative_motion_state),
-    )
+    # Legacy threshold-epoch activation is archived and intentionally disabled.
     # Step 8B: abstract uncertain position/vx/vz signals without classifying motion.
     relative_motion_state = _tracked_step(
         tracker,
         "08b_uncertain_signal_evidence",
         lambda: step8b_signal_evidence(relative_motion_state),
     )
-    # Step 8C: freeze semantic cohorts, calibrate operators, and repair deterministically.
+    # Step 8C: symbolic trajectory abstraction and cohort assignment only.
     relative_motion_state = _tracked_step(
         tracker,
-        "08c_trajectory_pattern",
-        lambda: step8c_trajectory_pattern_closed_loop(relative_motion_state),
+        "08c_trajectory_clustering",
+        lambda: step8c_trajectory_clustering(relative_motion_state),
     )
-    # Step 8D: validate accepted pattern-guided repairs.
+    # Step 8D: deterministic closed-loop repair using frozen Step 8C cohorts.
     relative_motion_state = _tracked_step(
         tracker,
-        "08d_pattern_validation",
-        lambda: step8d_pattern_refined_validation(ego_state, relative_motion_state),
+        "08d_closed_loop_trajectory_repair",
+        lambda: step8d_closed_loop_trajectory_repair(relative_motion_state),
     )
-    # Step 8E: generate and visualize semantic protection.
+    # Step 8E: publish repaired-trajectory validation outcomes.
     relative_motion_state = _tracked_step(
         tracker,
-        "08e_semantic_protection",
-        lambda: step8e_semantic_protection(relative_motion_state),
+        "08e_repaired_trajectory_validation",
+        lambda: step8e_repaired_trajectory_validation(relative_motion_state),
     )
+    # Step 8F: publish versioned statistical aggregation and promotion results.
     relative_motion_state = _tracked_step(
         tracker,
-        "08e_semantic_visualization",
-        lambda: step8e_visual_semantic_protection(relative_motion_state),
+        "08f_trajectory_statistics",
+        lambda: step8f_trajectory_statistics(relative_motion_state),
     )
-    # Step 8F: attach semantic protection overrides to final decisions.
+    # Step 8G: checkpoint repaired tracks for downstream use.
     relative_motion_state = _tracked_step(
         tracker,
-        "08f_final_validation",
-        lambda: step8f_final_trajectory_validation(ego_state, relative_motion_state),
+        "08g_repaired_track_materialization",
+        lambda: step8g_repaired_track_materialization(relative_motion_state),
     )
-    # Step 8G: refine ego motion from final repaired and protected evidence.
+    # Step 8H: render comparison videos, HTML reports, and statistical PDFs.
     relative_motion_state = _tracked_step(
         tracker,
-        "08g_ego_refinement",
-        lambda: step8g_prior_guided_ego_motion_refinement(
-            ego_state, relative_motion_state
-        ),
+        "08h_trajectory_repair_visualization",
+        lambda: step8h_trajectory_repair_visualization(relative_motion_state),
     )
-    # Step 8H: render final per-track relative-motion videos.
+    # Step 8I: build the offline read-only audit dashboard.
     relative_motion_state = _tracked_step(
         tracker,
-        "08h_important_video_visualization",
-        lambda: step8h_visual_relative_motion(relative_motion_state),
+        "08i_trajectory_audit_dashboard",
+        lambda: step8i_trajectory_audit_dashboard(relative_motion_state),
     )
-    # Step 8I: learn a bounded pending threshold patch from batched conflicts.
+    # Step 8J: persist cross-stage provenance.
     relative_motion_state = _tracked_step(
         tracker,
-        "08i_threshold_calibration",
-        lambda: step8i_threshold_calibration(relative_motion_state),
+        "08j_trajectory_provenance_audit",
+        lambda: step8j_trajectory_provenance_audit(relative_motion_state),
+    )
+    # Step 8K: finalize the new Step 8 branch for downstream stages.
+    relative_motion_state = _tracked_step(
+        tracker,
+        "08k_trajectory_handoff",
+        lambda: step8k_trajectory_handoff(relative_motion_state),
     )
     if max_step <= 8:
         return relative_motion_state

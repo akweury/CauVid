@@ -63,8 +63,8 @@ _VIS_EGO_METHOD_COLORS = {
     "refined": (80, 220, 80),
     "ransac": (60, 140, 255),
 }
-_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 3
-_TRACK_USEFULNESS_POLICY_VERSION = 1
+_UNCERTAIN_SIGNAL_EVIDENCE_VERSION = 4
+_TRACK_USEFULNESS_POLICY_VERSION = 2
 _TRACK_USEFULNESS_PROTECTED_LABEL_TOKENS = (
     "traffic light",
     "traffic sign",
@@ -94,7 +94,7 @@ _TRACK_USEFULNESS_VEHICLE_LABEL_TOKENS = (
     "vehicle",
 )
 _TRACK_USEFULNESS_THRESHOLDS = {
-    "max_short_observations": 3,
+    "max_short_observations": 10,
     "max_tiny_bbox_area_px": 625.0,
     "min_far_depth": 45.0,
     "max_low_detection_score": 0.65,
@@ -2317,6 +2317,71 @@ def _temporal_coherence_descriptor(
     }
 
 
+def _relative_motion_state_cues(speed_samples, evidence_confidence):
+    """Classify whole-track ego-relative motion with an uncertainty-aware zero band."""
+    speeds = sorted(
+        max(0.0, _safe_float(value))
+        for _, value in speed_samples
+        if math.isfinite(_safe_float(value))
+    )
+    confidence = _clamp_unit(evidence_confidence)
+    if not speeds:
+        return {
+            "relative_static": 0.0,
+            "relative_moving": 0.0,
+            "relative_motion_uncertain": 1.0,
+        }
+
+    middle = len(speeds) // 2
+    median_speed = (
+        speeds[middle]
+        if len(speeds) % 2
+        else 0.5 * (speeds[middle - 1] + speeds[middle])
+    )
+    deviations = sorted(abs(value - median_speed) for value in speeds)
+    deviation_middle = len(deviations) // 2
+    mad = (
+        deviations[deviation_middle]
+        if len(deviations) % 2
+        else 0.5 * (
+            deviations[deviation_middle - 1] + deviations[deviation_middle]
+        )
+    )
+    zero_band = (
+        _REL_SPEED_THRESHOLD
+        + min(0.7, 2.5 * mad)
+        + 0.3 * (1.0 - confidence)
+    )
+    within_ratio = sum(value <= zero_band for value in speeds) / len(speeds)
+    above_ratio = sum(value > zero_band for value in speeds) / len(speeds)
+    sample_support = min(1.0, len(speeds) / 5.0)
+    reliable = confidence >= 0.35 and len(speeds) >= 3
+
+    if reliable and median_speed <= zero_band and within_ratio >= 0.7:
+        static_score = _clamp_unit(confidence * sample_support * within_ratio)
+        return {
+            "relative_static": static_score,
+            "relative_moving": 0.0,
+            "relative_motion_uncertain": 0.0,
+        }
+    if reliable and median_speed > zero_band and above_ratio >= 0.7:
+        moving_score = _clamp_unit(confidence * sample_support * above_ratio)
+        return {
+            "relative_static": 0.0,
+            "relative_moving": moving_score,
+            "relative_motion_uncertain": 0.0,
+        }
+    ambiguity = 1.0 - abs(within_ratio - above_ratio)
+    uncertain_score = _clamp_unit(
+        max(0.25, 1.0 - confidence, ambiguity * sample_support)
+    )
+    return {
+        "relative_static": 0.0,
+        "relative_moving": 0.0,
+        "relative_motion_uncertain": uncertain_score,
+    }
+
+
 def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
     observations = [
         _trajectory_observation_from_motion_object(
@@ -2382,6 +2447,9 @@ def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
             sum(sources) / len(sources) if sources else 0.0
         )
 
+    relative_state_cues = _relative_motion_state_cues(
+        speed_samples, evidence_confidence
+    )
     observable_cues = {
         "leftness": directional_cue(
             lateral, "decreasing", "negative"
@@ -2405,7 +2473,18 @@ def _uncertain_track_signal_evidence(track_id, track_data, video_num_frames):
             if speed.get("trend") == "decreasing"
             else 0.0
         ),
+        **relative_state_cues,
     }
+    if relative_state_cues["relative_static"] > 0.0:
+        for cue_name in (
+            "leftness",
+            "rightness",
+            "approach",
+            "recede",
+            "acceleration",
+            "deceleration",
+        ):
+            observable_cues[cue_name] = 0.0
     return {
         "track_id": int(track_id),
         "primary_label": str(
@@ -2494,7 +2573,18 @@ def _initial_track_usefulness_decision(
     min_abs_x = min(lateral_positions or [float("inf")])
     max_score = max(scores or [0.0])
     max_relative_speed = max(relative_speeds or [0.0])
-    max_cue = max(cues.values(), default=0.0)
+    directional_cue_names = (
+        "leftness",
+        "rightness",
+        "approach",
+        "recede",
+        "acceleration",
+        "deceleration",
+    )
+    max_cue = max(
+        (cues.get(name, 0.0) for name in directional_cue_names),
+        default=0.0,
+    )
     approach = _safe_float(cues.get("approach", 0.0))
     source_counts = dict(statistics.get("source_counts", {}))
     thresholds = _TRACK_USEFULNESS_THRESHOLDS
@@ -4886,7 +4976,8 @@ def step8b_uncertain_signal_evidence(
         visualization_manifest = {
             "version": 1,
             "format": "mp4",
-            "max_tracks_per_video": configured_step8b_visualization_limit(),
+            "max_tracks_per_video": None,
+            "max_visualization_videos_total": configured_step8b_visualization_limit(),
             "num_selected_tracks": 0,
             "num_rendered_videos": 0,
             "num_skipped_videos": 0,
@@ -5378,6 +5469,7 @@ def step8e_iterative_trajectory_pattern_repair(
     *,
     output_subdir="08e_trajectory_pattern_closed_loop",
     step_label="8e",
+    postprocess=True,
 ):
     """Run prior-guided cohort analysis and deterministic signal repair."""
     from src.exp_july.perception.trajectory_pattern_closed_loop import (
@@ -5389,6 +5481,7 @@ def step8e_iterative_trajectory_pattern_repair(
         relative_motion_state,
         output_root,
         llm_generate=llm_generate,
+        postprocess=postprocess,
     )
     manifest = dict(result.get("trajectory_pattern_manifest", {}))
     visualizations = list(result.get("trajectory_pattern_visualizations", []))
@@ -5416,7 +5509,11 @@ def step8e_iterative_trajectory_pattern_repair(
         f"llm_batch={int(manifest.get('llm_batch_size', 0))} "
         f"llm_called={int(manifest.get('llm_called', 0))} "
         f"llm_skipped={int(manifest.get('llm_skipped', 0))} "
-        f"cache_hits={int(manifest.get('llm_cache_hits', 0))} "
+        f"llm_cache_hits={int(manifest.get('llm_cache_hits', 0))} "
+        f"repair_cache_hits={int(manifest.get('repair_cache_hits', 0))} "
+        f"repair_computed={int(manifest.get('repair_tracks_computed', 0))} "
+        f"repair_fast_path={int(manifest.get('repair_fast_path_tracks', 0))} "
+        f"workers={int(manifest.get('repair_worker_count', 1))} "
         f"single_escalations={int(manifest.get('llm_escalated_to_single', 0))} "
         f"track_visuals={len(visualizations)} "
         f"track_videos={len(track_videos)} "
@@ -5517,6 +5614,240 @@ def step8b_trajectory_validation(ego_state, state):
     """Compatibility alias for the refactored non-classifying Step 8B."""
     del ego_state
     return step8b_signal_evidence(state)
+
+
+def _write_step8_stage_manifest(output_subdir, filename, payload):
+    output_root = get_pipeline_output_root() / output_subdir
+    output_root.mkdir(parents=True, exist_ok=True)
+    path = output_root / filename
+    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return output_root, path
+
+
+def step8c_trajectory_clustering(state, llm_generate=None):
+    """Build symbolic tracks and assign cohorts; never repair a trajectory."""
+    from src.exp_july.perception.trajectory_pattern_closed_loop import (
+        llm_call,
+        symbolic_tracks,
+    )
+    from src.exp_july.perception.trajectory_cohort_policy import (
+        assign_cohorts,
+        attach_static_metadata,
+        cohort_statistics,
+        compile_rules,
+        rule_generation_prompt,
+    )
+
+    output_root = get_pipeline_output_root() / "08c_trajectory_clustering"
+    audit_root = output_root / "llm_audit"
+    output_root.mkdir(parents=True, exist_ok=True)
+    dataset = str(state.get("dataset_name", "driving_mini"))
+    evidence = state.get(
+        "uncertain_signal_evidence",
+        state.get("trajectory_motion_evidence", []),
+    )
+    tracks = symbolic_tracks(evidence, state.get("relative_object_motion", []))
+    metadata_catalog = attach_static_metadata(tracks)
+    raw_rules = llm_call(
+        "cohort_rule_generation",
+        rule_generation_prompt(dataset, metadata_catalog),
+        audit_root,
+        llm_generate,
+    )
+    compiled_policy = compile_rules(raw_rules)
+    cohorts = assign_cohorts(tracks, compiled_policy["rules"])
+    summaries = cohort_statistics(cohorts, None)
+    manifest = {
+        "version": 1,
+        "stage": "8c_trajectory_clustering",
+        "repairs_performed": 0,
+        "num_tracks": len(tracks),
+        "num_videos": len({str(row.get("video_id", "")) for row in tracks}),
+        "num_rules": len(compiled_policy.get("rules", [])),
+        "num_cohorts": len(cohorts),
+        "cohort_track_counts": {
+            key: len(value) for key, value in sorted(cohorts.items())
+        },
+    }
+    (output_root / "clustered_tracks.json").write_text(
+        json.dumps(tracks, indent=2, default=str), encoding="utf-8"
+    )
+    (output_root / "compiled_cohort_rules.json").write_text(
+        json.dumps(compiled_policy, indent=2), encoding="utf-8"
+    )
+    (output_root / "cohort_statistics.json").write_text(
+        json.dumps(summaries, indent=2), encoding="utf-8"
+    )
+    (output_root / "trajectory_clustering_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(
+        f"[step 8c] trajectory_clustering videos={manifest['num_videos']} "
+        f"tracks={manifest['num_tracks']} rules={manifest['num_rules']} "
+        f"cohorts={manifest['num_cohorts']} repairs=0"
+    )
+    return {
+        **state,
+        "trajectory_clustered_tracks": tracks,
+        "trajectory_cohort_metadata_catalog": metadata_catalog,
+        "trajectory_cohort_rule_policy": compiled_policy,
+        "trajectory_cohort_statistics": summaries,
+        "trajectory_clustering_manifest": manifest,
+        "trajectory_clustering_output_root": output_root,
+    }
+
+
+def step8d_closed_loop_trajectory_repair(state, llm_generate=None):
+    """Consume frozen Step 8C cohorts and run deterministic repair candidates."""
+    return step8e_iterative_trajectory_pattern_repair(
+        state,
+        llm_generate=llm_generate,
+        output_subdir="08d_closed_loop_trajectory_repair",
+        step_label="8d",
+        postprocess=False,
+    )
+
+
+def step8e_repaired_trajectory_validation(state):
+    """Publish repair validation outcomes as an independent audit stage."""
+    rows = [
+        {
+            "video_id": row.get("video_id"),
+            "track_id": row.get("track_id"),
+            "repair_applied": bool(row.get("repair_applied")),
+            "initial_validation_status": row.get("initial_8c_validation_status"),
+            "final_validation_status": row.get("final_validation_status"),
+            "resolution_status": row.get("resolution_status"),
+            "validated_pattern": row.get("validated_pattern"),
+            "selected_candidate_id": dict(row.get("selected_candidate", {})).get("candidate_id"),
+            "final_selection_reason": row.get("final_selection_reason"),
+        }
+        for row in state.get("trajectory_pattern_records", [])
+    ]
+    payload = {
+        "version": 1,
+        "stage": "8e_repaired_trajectory_validation",
+        "num_tracks": len(rows),
+        "num_repaired": sum(row["repair_applied"] for row in rows),
+        "num_unresolved": sum(row["resolution_status"] == "unresolved_uncertain" for row in rows),
+        "tracks": rows,
+    }
+    root, path = _write_step8_stage_manifest(
+        "08e_repaired_trajectory_validation",
+        "repaired_trajectory_validation.json",
+        payload,
+    )
+    print(
+        f"[step 8e] repaired_trajectory_validation tracks={len(rows)} "
+        f"repaired={payload['num_repaired']} unresolved={payload['num_unresolved']}"
+    )
+    return {**state, "step8e_validation_manifest": payload, "step8e_validation_path": str(path), "step8e_validation_output_root": root}
+
+
+def step8f_trajectory_statistics(state):
+    """Expose versioned statistical aggregation and promotion independently."""
+    payload = {
+        "version": 1,
+        "stage": "8f_trajectory_statistics",
+        "candidate_table": state.get("trajectory_pattern_statistics_candidate", {}),
+        "reviews": state.get("trajectory_pattern_statistics_review", []),
+        "promotion": state.get("trajectory_pattern_statistics_promotion", {}),
+    }
+    root, path = _write_step8_stage_manifest(
+        "08f_trajectory_statistics", "trajectory_statistics.json", payload
+    )
+    print(
+        f"[step 8f] trajectory_statistics reviews={len(payload['reviews'])} "
+        f"promotion={dict(payload['promotion']).get('decision', 'unknown')}"
+    )
+    return {**state, "step8f_statistics_manifest": payload, "step8f_statistics_path": str(path), "step8f_statistics_output_root": root}
+
+
+def step8g_repaired_track_materialization(state):
+    """Checkpoint the repaired relative-motion tracks for downstream consumers."""
+    videos = list(state.get("relative_object_motion", []))
+    payload = {
+        "version": 1,
+        "stage": "8g_repaired_track_materialization",
+        "num_videos": len(videos),
+        "num_tracks": len(state.get("trajectory_pattern_records", [])),
+        "source_step": "8d_closed_loop_trajectory_repair",
+    }
+    root, path = _write_step8_stage_manifest(
+        "08g_repaired_track_materialization", "materialization_manifest.json", payload
+    )
+    print(f"[step 8g] repaired_track_materialization videos={len(videos)} tracks={payload['num_tracks']}")
+    return {**state, "step8g_materialization_manifest": payload, "step8g_materialization_path": str(path), "step8g_materialization_output_root": root}
+
+
+def step8h_trajectory_repair_visualization(state):
+    """Render Step 8C–8G comparison MP4 videos and statistical PDFs only."""
+    from src.exp_july.perception.trajectory_pattern_visualization import (
+        render_trajectory_pattern_visualizations,
+    )
+
+    root = get_pipeline_output_root() / "08h_trajectory_repair_visualization"
+    result = render_trajectory_pattern_visualizations(state, root)
+    print(
+        f"[step 8h] trajectory_repair_visualization "
+        f"reports={len(result.get('trajectory_pattern_visualizations', []))} "
+        f"pdfs={len(result.get('trajectory_pattern_statistical_pdf_reports', []))}"
+    )
+    return result
+
+
+def step8i_trajectory_audit_dashboard(state):
+    """Build the read-only offline audit dashboard in its own stage."""
+    from src.exp_july.perception.trajectory_pattern_dashboard import (
+        build_trajectory_pattern_dashboard,
+    )
+
+    root = get_pipeline_output_root() / "08i_trajectory_audit_dashboard"
+    audit_root = Path(state.get("trajectory_pattern_output_root", root)) / "llm_audit"
+    result = build_trajectory_pattern_dashboard(state, root, audit_root)
+    print(f"[step 8i] trajectory_audit_dashboard path={result.get('trajectory_pattern_dashboard_path', '')}")
+    return result
+
+
+def step8j_trajectory_provenance_audit(state):
+    """Persist the cross-stage provenance map without changing decisions."""
+    payload = {
+        "version": 1,
+        "stage": "8j_trajectory_provenance_audit",
+        "flow": ["8c_clustering", "8d_repair", "8e_validation", "8f_statistics", "8g_materialization", "8h_visualization", "8i_dashboard"],
+        "clustering_manifest": state.get("trajectory_clustering_manifest", {}),
+        "repair_manifest": state.get("trajectory_pattern_manifest", {}),
+        "validation_manifest": state.get("step8e_validation_manifest", {}),
+        "statistics_promotion": state.get("trajectory_pattern_statistics_promotion", {}),
+        "dashboard_path": state.get("trajectory_pattern_dashboard_path", ""),
+    }
+    root, path = _write_step8_stage_manifest(
+        "08j_trajectory_provenance_audit", "trajectory_provenance.json", payload
+    )
+    print(f"[step 8j] trajectory_provenance_audit path={path}")
+    return {**state, "step8j_provenance_manifest": payload, "step8j_provenance_path": str(path), "step8j_provenance_output_root": root}
+
+
+def step8k_trajectory_handoff(state):
+    """Finalize the new Step 8 branch and expose its downstream handoff."""
+    payload = {
+        "version": 1,
+        "stage": "8k_trajectory_handoff",
+        "status": "completed",
+        "num_videos": len(state.get("relative_object_motion", [])),
+        "num_tracks": len(state.get("trajectory_pattern_records", [])),
+        "num_repairs": sum(bool(row.get("repair_applied")) for row in state.get("trajectory_pattern_records", [])),
+        "legacy_steps_8d_through_8i_enabled": False,
+        "threshold_epoch_enabled": False,
+    }
+    root, path = _write_step8_stage_manifest(
+        "08k_trajectory_handoff", "trajectory_handoff_manifest.json", payload
+    )
+    print(
+        f"[step 8k] trajectory_handoff videos={payload['num_videos']} "
+        f"tracks={payload['num_tracks']} repairs={payload['num_repairs']}"
+    )
+    return {**state, "step8k_handoff_manifest": payload, "step8k_handoff_path": str(path), "step8k_handoff_output_root": root}
 
 
 def step8c_trajectory_pattern_closed_loop(state, llm_generate=None):

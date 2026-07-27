@@ -3,6 +3,7 @@
 from __future__ import annotations
 import copy, hashlib, json, math, os, statistics, time, urllib.error, urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -501,6 +502,168 @@ def repair_candidates(
               "validation":ev,"_observations":repaired})
     return out
 
+def _repair_job_signature(job):
+    """Hash every input that can change deterministic repair output."""
+    payload = {
+        "schema": "step8d-repair-cache-v1",
+        "code_version": VERSION,
+        "track": job["track"],
+        "candidates": job["candidates"],
+        "interpretation": job["interpretation"],
+        "ego": job["ego"],
+        "statistics_fingerprint": job["statistics_fingerprint"],
+        "validation_thresholds": job.get("validation_thresholds"),
+        "cohort_plan": job.get("cohort_plan", {}),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _process_track_repair_job(job):
+    """Pure, picklable Step 8D numerical worker; performs no file writes."""
+    started = time.perf_counter()
+    track = copy.deepcopy(job["track"])
+    candidates = copy.deepcopy(job["candidates"])
+    interp = copy.deepcopy(job["interpretation"])
+    thresholds = copy.deepcopy(job.get("validation_thresholds"))
+    observations = track.get("observations", [])
+    num_frames = max(
+        [int(row.get("frame_index", 0)) for row in observations] or [0]
+    ) + 1
+    initial_eval = _evaluate(
+        observations,
+        num_frames,
+        thresholds=thresholds,
+    )
+    initial_status = str(
+        initial_eval["validation"].get("validation_status", "invalid")
+    )
+    cohort_plan = copy.deepcopy(job.get("cohort_plan") or {})
+    operator = str(cohort_plan.get("operator", "no_repair"))
+    fast_path = initial_status in {"valid", "repaired"} and operator == "no_repair"
+
+    if fast_path:
+        repairs = []
+        selected = None
+        reason = "valid_no_repair_fast_path_original_preserved"
+    else:
+        repairs = repair_candidates(
+            track,
+            candidates,
+            interp,
+            job.get("ego", {}),
+            job.get("statistics_table", {}),
+            validation_thresholds=thresholds,
+            cohort_plan=cohort_plan,
+        )
+        accepted = [
+            row for row in repairs if row.get("symbolic_verdict") == "pass"
+        ]
+        selected = (
+            max(accepted, key=lambda row: f(row.get("final_score"), -1e9))
+            if accepted
+            else None
+        )
+        reason = (
+            "highest_ranked_after_hard_constraints"
+            if selected
+            else "no_candidate_passed_hard_constraints_original_preserved"
+        )
+        for row in repairs:
+            if selected and row.get("candidate_id") == selected.get("candidate_id"):
+                row["final_selection_reason"] = (
+                    "selected_highest_final_score_after_hard_constraints"
+                )
+            elif row.get("symbolic_verdict") == "pass":
+                row["final_selection_reason"] = "eligible_but_lower_final_score"
+            else:
+                failed = [
+                    name
+                    for name, value in dict(
+                        row.get("hard_constraint_results", {})
+                    ).items()
+                    if not value
+                ]
+                row["final_selection_reason"] = (
+                    "hard_constraints_failed:" + ",".join(failed)
+                )
+
+    applied = selected is not None
+    final_observations = (
+        selected["_observations"] if applied else copy.deepcopy(observations)
+    )
+    final_track = {**track, "observations": final_observations}
+    final_num_frames = max(
+        [int(row.get("frame_index", 0)) for row in final_observations] or [0]
+    ) + 1
+    final_eval = _evaluate(
+        final_observations,
+        final_num_frames,
+        thresholds=thresholds,
+    )
+    final_status = str(
+        final_eval["validation"].get("validation_status", "")
+    )
+    original_valid_without_repair = (
+        not applied and final_status in {"valid", "repaired"}
+    )
+    if original_valid_without_repair and not fast_path:
+        reason = "no_repair_required_original_preserved"
+    llm_preferred = max(
+        interp,
+        key=lambda row: f(row.get("plausibility")),
+    )["pattern_id"]
+    final_pattern = selected["validated_pattern"] if selected else "unknown"
+    return {
+        "job_index": int(job["job_index"]),
+        "cache_signature": str(job["cache_signature"]),
+        "video_id": str(track.get("video_id", "")),
+        "track_id": int(track.get("track_id", -1)),
+        "initial_eval": initial_eval,
+        "repairs": repairs,
+        "selected_candidate_id": (
+            str(selected.get("candidate_id")) if selected else None
+        ),
+        "final_observations": final_observations,
+        "final_eval": final_eval,
+        "final_pattern_candidates": [
+            {
+                **candidate,
+                "residual_vector": residual(
+                    candidate["pattern_id"], final_track
+                ),
+            }
+            for candidate in candidates
+        ],
+        "final_direction": final_track.get("direction", "unknown"),
+        "final_pattern": final_pattern,
+        "llm_preferred_pattern": llm_preferred,
+        "repair_applied": applied,
+        "original_valid_without_repair": original_valid_without_repair,
+        "final_selection_reason": reason,
+        "fast_path": fast_path,
+        "worker_latency_seconds": time.perf_counter() - started,
+    }
+
+
+def _write_repair_cache(path, result):
+    """Atomically publish a complete deterministic repair result."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(result, separators=(",", ":"), default=str),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def stat_rows(dataset,records,version):
     buckets=defaultdict(lambda:{"v":[],"a":0,"r":0,"llm":[]})
     for rec in records:
@@ -614,7 +777,7 @@ def promote(root,candidate,review,metrics):
     (root/f"promotion_decision_v{candidate['version']:04d}.json").write_text(json.dumps(decision,indent=2))
     return decision
 
-def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini",llm_generate=None):
+def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini",llm_generate=None,postprocess=True):
     root=Path(output_root);root.mkdir(parents=True,exist_ok=True); audit=root/"llm_audit";statsroot=root/"statistics"
     dataset=str(state.get("dataset_name",dataset))
     current=json.loads((statsroot/"current_table.json").read_text()) if (statsroot/"current_table.json").exists() else {}
@@ -622,10 +785,12 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         "uncertain_signal_evidence",
         state.get("trajectory_motion_evidence",[]),
     )
-    tracks=symbolic_tracks(
-        input_evidence,
-        state.get("relative_object_motion",[]),
-    )
+    tracks=copy.deepcopy(list(state.get("trajectory_clustered_tracks", [])))
+    if not tracks:
+        tracks=symbolic_tracks(
+            input_evidence,
+            state.get("relative_object_motion",[]),
+        )
     validation_thresholds=dict(
         state.get("trajectory_validation_threshold_policy", {}).get("thresholds", {})
     ) or None
@@ -638,14 +803,30 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     policy_root=root/"policies"
     from src.exp_july.perception.trajectory_pattern_epoch import begin_epoch
     epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
-    metadata_catalog=attach_static_metadata(tracks)
-    raw_rules=llm_call(
-        "cohort_rule_generation",
-        rule_generation_prompt(dataset,metadata_catalog),
-        audit,llm_generate,
-    )
-    compiled_rule_policy=compile_rules(raw_rules)
-    cohorts=assign_cohorts(tracks,compiled_rule_policy["rules"])
+    precomputed_rules = dict(state.get("trajectory_cohort_rule_policy", {}))
+    if precomputed_rules and tracks:
+        metadata_catalog=copy.deepcopy(
+            dict(state.get("trajectory_cohort_metadata_catalog", {}))
+        )
+        compiled_rule_policy=copy.deepcopy(precomputed_rules)
+        cohorts=defaultdict(list)
+        for track in tracks:
+            cohorts[str(track.get("cohort_id", "unknown"))].append(track)
+        cohorts=dict(cohorts)
+        print(
+          f"[step 8d] REUSE_CLUSTER_CACHE rules={len(compiled_rule_policy.get('rules',[]))} "
+          f"cohorts={len(cohorts)} tracks={len(tracks)}",
+          flush=True,
+        )
+    else:
+        metadata_catalog=attach_static_metadata(tracks)
+        raw_rules=llm_call(
+            "cohort_rule_generation",
+            rule_generation_prompt(dataset,metadata_catalog),
+            audit,llm_generate,
+        )
+        compiled_rule_policy=compile_rules(raw_rules)
+        cohorts=assign_cohorts(tracks,compiled_rule_policy["rules"])
     systematic_anomaly_rate=max(
         0.05,min(
             0.80,
@@ -753,50 +934,134 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
           "batch_size":0,"retry_count":0,"escalated_to_single":False,"latency":0.0,
           "estimated_token_cost":0.0,"validation_outcome":"deterministic_epoch_policy"}
         runtime_monitor.interpretation_complete(llm_telemetry[uid],compact_inputs[uid])
+    repair_cache_root=root/"repair_cache"
+    repair_cache_root.mkdir(parents=True,exist_ok=True)
+    statistics_fingerprint=hashlib.sha256(
+        json.dumps(current,sort_keys=True,separators=(",",":"),default=str).encode()
+    ).hexdigest()
+    configured_workers=max(
+        1,
+        int(
+            os.environ.get(
+                "CAUVID_STEP8D_WORKERS",
+                min(16,max(1,(os.cpu_count() or 1)-1)),
+            )
+        ),
+    )
+    repair_results={};repair_cache_hits=0;pending_jobs=[]
+    for job_index,item in enumerate(track_items):
+        track=item["track"];candidates=item["candidates"]
+        uid=compact_track(track,candidates)["track_uid"]
+        job={
+          "job_index":job_index,"track":track,"candidates":candidates,
+          "interpretation":interpretations[uid],
+          "ego":ego.get(track["video_id"],{}),
+          "statistics_table":current,
+          "statistics_fingerprint":statistics_fingerprint,
+          "validation_thresholds":validation_thresholds,
+          "cohort_plan":cohort_plans.get(str(track.get("cohort_id","")),{}),
+        }
+        signature=_repair_job_signature(job);job["cache_signature"]=signature
+        cache_path=repair_cache_root/f"{signature}.json"
+        if cache_path.exists():
+            try:
+                cached=json.loads(cache_path.read_text(encoding="utf-8"))
+                if str(cached.get("cache_signature",""))!=signature:
+                    raise ValueError("signature_mismatch")
+                cached["repair_cache_hit"]=True
+                repair_results[job_index]=cached;repair_cache_hits+=1
+                continue
+            except (OSError,ValueError,TypeError,json.JSONDecodeError):
+                pass
+        job["cache_path"]=str(cache_path);pending_jobs.append(job)
+
+    active_workers=min(configured_workers,max(1,len(pending_jobs)))
+    print(
+      f"[step 8d] REPAIR_EXECUTION_START tracks={len(track_items)} "
+      f"cache_hits={repair_cache_hits} pending={len(pending_jobs)} "
+      f"workers={active_workers} cpu_count={os.cpu_count() or 1} "
+      f"cache_root={repair_cache_root}",
+      flush=True,
+    )
+    repair_progress=tqdm(
+        total=len(track_items),initial=repair_cache_hits,
+        desc="[step 8d] repair workers",unit="track",dynamic_ncols=True,
+    )
+    repair_started=time.perf_counter()
+    try:
+        if active_workers==1:
+            for job in pending_jobs:
+                result=_process_track_repair_job(job)
+                result["repair_cache_hit"]=False
+                _write_repair_cache(job["cache_path"],result)
+                repair_results[job["job_index"]]=result
+                repair_progress.update(1)
+                repair_progress.set_postfix(
+                    workers=1,cache=repair_cache_hits,
+                    video=result["video_id"],track=result["track_id"],
+                )
+        elif pending_jobs:
+            with ProcessPoolExecutor(max_workers=active_workers) as executor:
+                futures={
+                    executor.submit(_process_track_repair_job,job):job
+                    for job in pending_jobs
+                }
+                for future in as_completed(futures):
+                    job=futures[future]
+                    result=future.result()
+                    result["repair_cache_hit"]=False
+                    _write_repair_cache(job["cache_path"],result)
+                    repair_results[job["job_index"]]=result
+                    repair_progress.update(1)
+                    repair_progress.set_postfix(
+                        workers=active_workers,cache=repair_cache_hits,
+                        video=result["video_id"],track=result["track_id"],
+                    )
+    finally:
+        repair_progress.close()
+    missing_results=sorted(set(range(len(track_items)))-set(repair_results))
+    if missing_results:
+        raise RuntimeError(f"Step 8D repair workers returned no results for indices {missing_results[:20]}")
+    print(
+      f"[step 8d] REPAIR_EXECUTION_DONE tracks={len(track_items)} "
+      f"cache_hits={repair_cache_hits} computed={len(pending_jobs)} "
+      f"workers={active_workers} latency={time.perf_counter()-repair_started:.2f}s",
+      flush=True,
+    )
+
     records=[];material=defaultdict(list)
     for track_index,item in enumerate(track_items,1):
         track=item["track"];candidates=item["candidates"]
         runtime_monitor.track_start(track["video_id"],track["track_id"],track_index,len(track_items))
         uid=compact_track(track,candidates)["track_uid"]
         interp=interpretations[uid]
-        initialeval=_evaluate(
-            track["observations"],
-            max(
-                [int(x.get("frame_index",0)) for x in track["observations"]]
-                or [0]
-            )+1,
-            thresholds=validation_thresholds,
+        job_result=repair_results[track_index-1]
+        initialeval=dict(job_result["initial_eval"])
+        repairs=list(job_result.get("repairs",[]))
+        selected_id=job_result.get("selected_candidate_id")
+        selected=next(
+            (row for row in repairs if row.get("candidate_id")==selected_id),
+            None,
         )
-        repairs=repair_candidates(
-            track,candidates,interp,ego.get(track["video_id"],{}),current,
-            validation_thresholds=validation_thresholds,
-            cohort_plan=cohort_plans.get(str(track.get("cohort_id",""))),
-        )
-        accepted=[row for row in repairs if row["symbolic_verdict"]=="pass"]
-        selected=max(accepted,key=lambda row:f(row["final_score"],-1e9)) if accepted else None
-        reason="highest_ranked_after_hard_constraints" if selected else "no_candidate_passed_hard_constraints_original_preserved"
-        for row in repairs:
-            if selected and row["candidate_id"]==selected["candidate_id"]:
-                row["final_selection_reason"]="selected_highest_final_score_after_hard_constraints"
-            elif row["symbolic_verdict"]=="pass":
-                row["final_selection_reason"]="eligible_but_lower_final_score"
-            else:
-                failed=[name for name,value in row["hard_constraint_results"].items() if not value]
-                row["final_selection_reason"]="hard_constraints_failed:"+",".join(failed)
-        applied=selected is not None; finalobs=selected["_observations"] if applied else track["observations"]
-        finaltrack={**track,"observations":finalobs}; finaleval=_evaluate(
-          finalobs,max([int(x.get("frame_index",0)) for x in finalobs]or[0])+1,
-          thresholds=validation_thresholds)
+        reason=str(job_result.get("final_selection_reason",""))
+        applied=bool(job_result.get("repair_applied",False))
+        finalobs=list(job_result.get("final_observations",track["observations"]))
+        finaltrack={**track,"observations":finalobs}
+        finaleval=dict(job_result["final_eval"])
         final_validation_status=finaleval["validation"].get("validation_status","")
-        original_valid_without_repair=(
-            not applied and final_validation_status in {"valid","repaired"}
+        original_valid_without_repair=bool(
+            job_result.get("original_valid_without_repair",False)
         )
-        if original_valid_without_repair:
-            reason="no_repair_required_original_preserved"
-        llm_preferred=max(interp,key=lambda row:f(row["plausibility"])) ["pattern_id"]
-        finalpattern=selected["validated_pattern"] if selected else "unknown"
+        llm_preferred=str(job_result.get("llm_preferred_pattern","unknown"))
+        finalpattern=str(job_result.get("final_pattern","unknown"))
         publicrep=[{k:v for k,v in x.items() if k!="_observations"} for x in repairs]
         publicsel={k:v for k,v in selected.items() if k!="_observations"} if selected else {}
+        llm_telemetry[uid].update({
+          "repair_cache_hit":bool(job_result.get("repair_cache_hit",False)),
+          "repair_worker_latency_seconds":f(job_result.get("worker_latency_seconds",0)),
+          "repair_fast_path":bool(job_result.get("fast_path",False)),
+          "repair_worker_count":active_workers,
+        })
         cohort_id=str(track.get("cohort_id",""))
         cohort_plan=cohort_plans.get(cohort_id,{})
         rec={"version":VERSION,"video_id":track["video_id"],"track_id":track["track_id"],
@@ -819,7 +1084,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
               "unresolved_uncertain"
           ),
           "initial_8c_validation_status":initialeval["validation"].get("validation_status",""),
-          "final_pattern_candidates":[{**c,"residual_vector":residual(c["pattern_id"],finaltrack)} for c in candidates],
+          "final_pattern_candidates":list(job_result.get("final_pattern_candidates",[])),
           "final_validation_status":final_validation_status,
           "final_symbolic_predicates":{"direction":finaltrack["direction"],"confidence":finaleval["uncertainty"].get("confidence_score",0),
                                       "persistence":len(finalobs)/max(1,len(track["observations"]))},
@@ -937,7 +1202,16 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
       "llm_batch_size":0,"llm_called":len(reviews)+2,
       "llm_skipped":sum(row["llm_skipped"] for row in llm_telemetry.values()),
       "llm_cache_hits":sum(row["cache_hit"] for row in llm_telemetry.values()),
-      "llm_escalated_to_single":0,"batch_evaluation":{},"runtime_monitor":runtime_state}
+      "llm_escalated_to_single":0,"batch_evaluation":{},
+      "repair_worker_count":active_workers,
+      "repair_workers_configured":configured_workers,
+      "repair_cache_hits":repair_cache_hits,
+      "repair_tracks_computed":len(pending_jobs),
+      "repair_fast_path_tracks":sum(
+        bool(result.get("fast_path",False)) for result in repair_results.values()
+      ),
+      "repair_cache_root":str(repair_cache_root),
+      "runtime_monitor":runtime_state}
     (root/"trajectory_pattern_manifest.json").write_text(json.dumps(manifest,indent=2))
     (root/"symbolic_tracks.json").write_text(json.dumps([{k:v for k,v in x.items() if k!="observations"} for x in tracks],indent=2))
     result={**state,"pre_pattern_relative_object_motion":original,"relative_object_motion":refined,
@@ -966,6 +1240,12 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
       f"videos={len({row['video_id'] for row in records})}",
       flush=True,
     )
+    if not postprocess:
+        print(
+          f"[step 8d] POSTPROCESS_DEFERRED tracks={len(records)}",
+          flush=True,
+        )
+        return result
     visualized=render_trajectory_pattern_visualizations(result,root/"visualizations")
     dashboard_started=time.perf_counter()
     print(

@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.exp_july.perception.pipeline import (
+    _relative_motion_state_cues,
     _uncertain_signal_evidence_video,
     step8b_uncertain_signal_evidence,
 )
@@ -175,7 +176,29 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
             ],
         )
 
-    def test_video_abstraction_emits_only_six_scalar_observable_cues(self):
+    def test_relative_motion_state_cues_are_exclusive_and_uncertainty_aware(self):
+        static = _relative_motion_state_cues(
+            [(index, value) for index, value in enumerate((0.03, 0.04, 0.02, 0.05, 0.03))],
+            0.9,
+        )
+        self.assertGreater(static["relative_static"], 0.0)
+        self.assertEqual(static["relative_moving"], 0.0)
+        self.assertEqual(static["relative_motion_uncertain"], 0.0)
+
+        moving = _relative_motion_state_cues(
+            [(index, value) for index, value in enumerate((1.2, 1.3, 1.1, 1.4, 1.25))],
+            0.9,
+        )
+        self.assertEqual(moving["relative_static"], 0.0)
+        self.assertGreater(moving["relative_moving"], 0.0)
+        self.assertEqual(moving["relative_motion_uncertain"], 0.0)
+
+        uncertain = _relative_motion_state_cues([(0, 0.1), (1, 0.9)], 0.2)
+        self.assertEqual(uncertain["relative_static"], 0.0)
+        self.assertEqual(uncertain["relative_moving"], 0.0)
+        self.assertGreater(uncertain["relative_motion_uncertain"], 0.0)
+
+    def test_video_abstraction_emits_nine_scalar_observable_cues(self):
         evidence = _uncertain_signal_evidence_video(_relative_video())
 
         self.assertEqual(evidence["evidence_type"], "uncertain_signal_evidence")
@@ -201,6 +224,9 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
                 "recede",
                 "acceleration",
                 "deceleration",
+                "relative_static",
+                "relative_moving",
+                "relative_motion_uncertain",
             },
         )
         self.assertEqual(track["observable_cues"]["leftness"], 0.0)
@@ -269,7 +295,7 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
         self.assertEqual(manifest["num_source_tracks"], 1)
         self.assertEqual(manifest["num_quarantined_tracks"], 0)
         self.assertEqual(
-            manifest["track_usefulness_filter"]["policy_version"], 1
+            manifest["track_usefulness_filter"]["policy_version"], 2
         )
         self.assertFalse(manifest["semantic_motion_classification"])
         self.assertFalse(manifest["symbolic_reasoning"])
@@ -284,12 +310,15 @@ class Step8BSignalEvidenceTests(unittest.TestCase):
                 "deceleration",
             ],
         )
+        self.assertIsNone(
+            manifest["visualization"]["max_tracks_per_video"]
+        )
         self.assertEqual(
-            manifest["visualization"]["max_tracks_per_video"], 3
+            manifest["visualization"]["max_visualization_videos_total"], 5
         )
         self.assertEqual(
             manifest["visualization"]["selection_policy"],
-            "step8b-lowest-confidence-first-v1",
+            "step8b-global-lowest-confidence-five-v2",
         )
         self.assertEqual(
             result[

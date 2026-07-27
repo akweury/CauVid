@@ -12,6 +12,11 @@ from src.exp_july.perception.trajectory_pattern_closed_loop import (
     RESIDUALS,
 )
 from src.exp_july.perception.trajectory_pattern_visualization import (
+    _bbox_difference_metrics,
+    _cue_visual_state,
+    _ego_speed_series,
+    _signal_values,
+    _track_motion_series,
     build_step8bc_track_video_payload,
     render_step8bc_track_videos,
     render_trajectory_pattern_visualizations,
@@ -132,22 +137,88 @@ def _record(video_id, track_id):
 
 
 class Step8BCTrackVideoTests(unittest.TestCase):
-    def test_pattern_reports_are_offline_html_complete_and_escaped(self):
+    def test_ego_speed_series_prefers_refined_values_and_aligns_frames(self):
+        ego_video = {
+            "frames": [
+                {
+                    "frame_index": 0,
+                    "ego_vx": 1.0,
+                    "ego_vz": 2.0,
+                },
+                {
+                    "frame_index": 2,
+                    "refined_ego_vx": 3.0,
+                    "ego_vx_smoothed": 2.5,
+                    "refined_ego_vz": -1.0,
+                },
+            ]
+        }
+        series = _ego_speed_series(ego_video, [0, 1, 2])
+        self.assertEqual(series["vx"], [1.0, None, 3.0])
+        self.assertEqual(series["vz"], [2.0, None, -1.0])
+
+    def test_track_motion_series_aligns_object_and_relative_velocity(self):
+        track = {
+            0: {
+                "obj_vx": 1.25,
+                "obj_vz": -0.5,
+                "rel_vx": 0.75,
+                "rel_vz": -1.5,
+            },
+            2: {
+                "motion": {
+                    "obj_vx": 2.0,
+                    "obj_vz": 3.0,
+                    "rel_vx": 1.0,
+                    "rel_vz": 1.5,
+                }
+            },
+        }
+        series = _track_motion_series(track, [0, 1, 2])
+        self.assertEqual(series["obj_vx"], [1.25, None, 2.0])
+        self.assertEqual(series["obj_vz"], [-0.5, None, 3.0])
+        self.assertEqual(series["rel_vx"], [0.75, None, 1.0])
+        self.assertEqual(series["rel_vz"], [-1.5, None, 1.5])
+
+    def test_cues_activate_only_when_object_is_observed_in_current_frame(self):
+        text, color, thickness, active = _cue_visual_state(
+            "approach", 0.8, True
+        )
+        self.assertTrue(active)
+        self.assertEqual(color, (70, 220, 100))
+        self.assertEqual(thickness, 2)
+        self.assertEqual(text, "approach=0.80")
+
+        text, color, thickness, active = _cue_visual_state(
+            "approach", 0.8, False
+        )
+        self.assertFalse(active)
+        self.assertEqual(color, (145, 152, 163))
+        self.assertEqual(thickness, 1)
+        self.assertEqual(text, "approach=0.80")
+
+    def test_original_repaired_difference_metrics(self):
+        original = {
+            "position_3d": [1.0, 0.0, 10.0],
+            "rel_vx": 2.0,
+            "rel_vz": -1.0,
+            "rel_speed": 2.25,
+            "bbox": [10.0, 20.0, 30.0, 40.0],
+        }
+        repaired = {
+            "position_3d": [2.0, 0.0, 8.0],
+            "rel_vx": 1.0,
+            "rel_vz": -3.0,
+            "rel_speed": 3.2,
+            "bbox": [12.0, 20.0, 32.0, 40.0],
+        }
+        self.assertEqual(_signal_values(original), (1.0, 10.0, 2.0, -1.0, 2.25))
+        difference = _bbox_difference_metrics(original, repaired)
+        self.assertAlmostEqual(difference["center_shift_px"], 2.0)
+        self.assertAlmostEqual(difference["iou"], 18.0 / 22.0)
+
+    def test_step8h_saves_only_mp4_and_pdf_artifacts(self):
         record = _record("scene", 7)
-        record["symbolic_track"]["object_class"] = "<script>bad()</script>"
-        record["llm_residual_interpretation"] = [
-            {
-                "pattern_id": pattern_id,
-                "plausibility": 0.5,
-                "structural_conflicts": [],
-                "explanation": (
-                    "<script>explanation()</script>"
-                    if pattern_id == "approaching"
-                    else f"full explanation for {pattern_id}"
-                ),
-            }
-            for pattern_id in PATTERNS
-        ]
         state = {
             "trajectory_pattern_records": [record],
             "trajectory_pattern_statistics_promotion": {
@@ -171,67 +242,25 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             return_value=empty_video_manifest,
         ):
             root = Path(tmp)
+            (root / "stale.json").write_text("{}", encoding="utf-8")
+            (root / "stale.html").write_text("stale", encoding="utf-8")
             result = render_trajectory_pattern_visualizations(state, root)
-            track_path = (
-                root / "scene" / "track_0007_pattern_process.html"
-            )
-            summary_path = root / "scene" / "video_pattern_summary.html"
-            self.assertTrue(track_path.exists())
-            self.assertTrue(summary_path.exists())
-            self.assertFalse(list(root.rglob("*.png")))
-
-            track_html = track_path.read_text(encoding="utf-8")
-            self.assertIn("<!doctype html>", track_html)
-            self.assertNotIn("<script>bad()</script>", track_html)
-            self.assertIn("&lt;script&gt;bad()&lt;/script&gt;", track_html)
-            self.assertNotIn("<script>explanation()</script>", track_html)
-            self.assertIn(
-                "&lt;script&gt;explanation()&lt;/script&gt;", track_html
-            )
-            self.assertNotIn("http://", track_html)
-            self.assertNotIn("https://", track_html)
-            for section_id in (
-                "symbolic-track",
-                "pattern-residuals",
-                "llm-interpretation",
-                "repair-candidates",
-                "symbolic-validation",
-                "final-result",
-                "provenance",
-            ):
-                self.assertIn(f'id="{section_id}"', track_html)
-            for pattern_id in PATTERNS:
-                self.assertIn(f'data-pattern="{pattern_id}"', track_html)
-            for residual_id in RESIDUALS:
-                self.assertIn(f'data-residual="{residual_id}"', track_html)
-            for repair in record["candidate_repairs"]:
-                self.assertIn(
-                    f'data-candidate-id="{repair["candidate_id"]}"',
-                    track_html,
-                )
-
-            summary_html = summary_path.read_text(encoding="utf-8")
-            self.assertIn("track_0007_pattern_process.html", summary_html)
-            for pattern_id in PATTERNS:
-                self.assertIn(f'data-pattern="{pattern_id}"', summary_html)
-
-            manifest = json.loads(
-                (
-                    root / "trajectory_pattern_visualization_manifest.json"
-                ).read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["version"], 4)
-            self.assertEqual(manifest["report_format"], "html")
-            self.assertEqual(manifest["num_track_reports"], 1)
-            self.assertEqual(manifest["num_summary_reports"], 1)
+            pdf_paths = sorted((root / "statistics_pdfs").glob("*.pdf"))
+            self.assertEqual(len(pdf_paths), 3)
+            self.assertTrue(all(path.stat().st_size > 0 for path in pdf_paths))
+            files = [path for path in root.rglob("*") if path.is_file()]
+            self.assertTrue(files)
+            self.assertEqual({path.suffix.lower() for path in files}, {".pdf"})
             self.assertEqual(
-                result["trajectory_pattern_visualizations"][0][
-                    "media_type"
-                ],
-                "text/html",
+                len(result["trajectory_pattern_statistical_pdf_reports"]),
+                3,
+            )
+            self.assertEqual(result["trajectory_pattern_visualizations"], [])
+            self.assertEqual(
+                result["trajectory_pattern_statistical_summary_path"], ""
             )
 
-    def test_selection_is_stable_order_independent_and_capped_per_video(self):
+    def test_selection_is_stable_order_independent_and_capped_globally(self):
         records = (
             [_record("scene_b", track_id) for track_id in range(17)]
             + [_record("scene_a", track_id) for track_id in range(6)]
@@ -271,8 +300,7 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(selected_keys), len(set(selected_keys)))
-        counts = Counter(video_id for video_id, _track_id in selected_keys)
-        self.assertEqual(counts, {"scene_a": 6, "scene_b": 10})
+        self.assertEqual(len(selected_keys), 5)
 
     def test_payload_keeps_8b_signal_evidence_and_every_8c_residual_distance(self):
         record = _record("scene", 7)
@@ -327,7 +355,7 @@ class Step8BCTrackVideoTests(unittest.TestCase):
                 json.dumps(repair["residual_improvement"]), serialized
             )
 
-    def test_renderer_writes_same_ten_track_folders_mp4s_and_metrics_each_run(self):
+    def test_renderer_writes_same_five_flat_mp4s_each_run(self):
         records = [_record("scene", track_id) for track_id in range(14)]
         state = {
             "trajectory_pattern_records": records,
@@ -386,6 +414,8 @@ class Step8BCTrackVideoTests(unittest.TestCase):
                     manifest["progress_colors"]["modified_or_added"],
                     "green",
                 )
+                self.assertIsNone(manifest["max_tracks_per_video"])
+                self.assertEqual(manifest["max_visualization_videos_total"], 5)
             for marker in (
                 "MP4_START",
                 "MP4_TRACK_START",
@@ -394,35 +424,22 @@ class Step8BCTrackVideoTests(unittest.TestCase):
             ):
                 self.assertIn(marker, log_output.getvalue())
 
-            self.assertEqual(render.call_count, 20)
+            self.assertEqual(render.call_count, 10)
             first_mp4s = sorted(
                 path.relative_to(first_root)
-                for path in first_root.glob("scene/track_*/*.mp4")
+                for path in first_root.glob("*_track_*_8b_8c.mp4")
             )
             second_mp4s = sorted(
                 path.relative_to(second_root)
-                for path in second_root.glob("scene/track_*/*.mp4")
+                for path in second_root.glob("*_track_*_8b_8c.mp4")
             )
             self.assertEqual(first_mp4s, second_mp4s)
-            self.assertEqual(len(first_mp4s), 10)
-            for relative_path in first_mp4s:
-                track_folder = relative_path.parent
-                track_id = int(track_folder.name.removeprefix("track_"))
-                self.assertEqual(
-                    relative_path.name, f"track_{track_id:04d}_8b_8c.mp4"
-                )
-                metrics_files = list(
-                    (first_root / track_folder).glob("*.json")
-                )
-                self.assertEqual(len(metrics_files), 1)
-                metrics = json.loads(
-                    metrics_files[0].read_text(encoding="utf-8")
-                )
-                self.assertEqual(metrics["video_id"], "scene")
-                self.assertEqual(metrics["track_id"], track_id)
-                serialized = json.dumps(metrics, sort_keys=True)
-                for residual_name in RESIDUALS:
-                    self.assertIn(residual_name, serialized)
+            self.assertEqual(len(first_mp4s), 5)
+            self.assertEqual({path.parent for path in first_root.glob("*_track_*_8b_8c.mp4")}, {first_root})
+            for root in (first_root, second_root):
+                files = [path for path in root.rglob("*") if path.is_file()]
+                self.assertEqual(len(files), 5)
+                self.assertEqual({path.suffix.lower() for path in files}, {".mp4"})
 
 
 if __name__ == "__main__":

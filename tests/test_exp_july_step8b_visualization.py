@@ -35,7 +35,7 @@ def _evidence_video(video_id, confidences):
 
 
 class Step8BVisualizationTests(unittest.TestCase):
-    def test_panel_shows_only_the_six_scalar_cues(self):
+    def test_panel_shows_the_nine_scalar_cues(self):
         cv2 = MagicMock()
         cv2.FONT_HERSHEY_SIMPLEX = 0
         cv2.LINE_AA = 16
@@ -52,6 +52,9 @@ class Step8BVisualizationTests(unittest.TestCase):
                 "recede": 0.4,
                 "acceleration": 0.5,
                 "deceleration": 0.6,
+                "relative_static": 0.7,
+                "relative_moving": 0.0,
+                "relative_motion_uncertain": 0.0,
             },
         }
 
@@ -66,25 +69,14 @@ class Step8BVisualizationTests(unittest.TestCase):
             "RECEDE",
             "ACCELERATION",
             "DECELERATION",
+            "RELATIVE_STATIC",
+            "RELATIVE_MOVING",
+            "RELATIVE_MOTION_UNCERTAIN",
         ):
             self.assertTrue(any(cue_name in row for row in rendered_text))
         self.assertFalse(any("detailed-source" in row for row in rendered_text))
         cv2.rectangle.assert_not_called()
-        cue_calls = [
-            call
-            for call in cv2.putText.call_args_list
-            if str(call.args[1]) in {
-                "LEFTNESS",
-                "RIGHTNESS",
-                "APPROACH",
-                "RECEDE",
-                "ACCELERATION",
-                "DECELERATION",
-            }
-        ]
-        self.assertTrue(
-            all(call.args[4] >= 1.2 and call.args[6] >= 3 for call in cue_calls)
-        )
+        self.assertGreaterEqual(len(rendered_text), 20)
 
     def test_progress_bar_bbox_and_identity_use_separate_regions(self):
         cv2 = MagicMock()
@@ -168,14 +160,14 @@ class Step8BVisualizationTests(unittest.TestCase):
             max_tracks_per_video=3,
         )
 
-        self.assertEqual([row["track_id"] for row in selected], [4, 2, 5])
+        self.assertEqual([row["track_id"] for row in selected], [4, 2, 5, 3, 1])
         self.assertEqual(
             [row["track_id"] for row in reversed_selected],
-            [4, 2, 5],
+            [4, 2, 5, 3, 1],
         )
-        self.assertEqual(len(selected), 3)
+        self.assertEqual(len(selected), 5)
 
-    def test_renderer_writes_three_track_manifest_and_evidence_files(self):
+    def test_renderer_writes_five_outputs_into_one_shared_folder(self):
         evidence = [
             _evidence_video(
                 "scene",
@@ -213,10 +205,11 @@ class Step8BVisualizationTests(unittest.TestCase):
                 max_tracks_per_video=8,
             )
 
-            self.assertEqual(render.call_count, 3)
-            self.assertEqual(result["max_tracks_per_video"], 3)
-            self.assertEqual(result["num_selected_tracks"], 3)
-            self.assertEqual(result["num_rendered_videos"], 3)
+            self.assertEqual(render.call_count, 5)
+            self.assertIsNone(result["max_tracks_per_video"])
+            self.assertEqual(result["max_visualization_videos_total"], 5)
+            self.assertEqual(result["num_selected_tracks"], 5)
+            self.assertEqual(result["num_rendered_videos"], 5)
             self.assertEqual(result["layout"], "scene_left_evidence_right")
             self.assertEqual(
                 result["track_progress_position"],
@@ -228,7 +221,7 @@ class Step8BVisualizationTests(unittest.TestCase):
             self.assertFalse(stale_video.exists())
             self.assertEqual(
                 result["selections"][0]["selected_track_ids"],
-                [4, 2, 5],
+                [4, 2, 5, 3, 1],
             )
             self.assertEqual(
                 result["confidence_color_scale"],
@@ -236,12 +229,16 @@ class Step8BVisualizationTests(unittest.TestCase):
             )
             self.assertTrue(Path(result["manifest_path"]).exists())
             self.assertEqual(
-                len(list(Path(tmp).glob("scene/track_*/*.mp4"))),
-                3,
+                {Path(row["visualization_path"]).parent for row in result["rendered"]},
+                {Path(tmp)},
             )
             self.assertEqual(
-                len(list(Path(tmp).glob("scene/track_*/*_evidence.json"))),
-                3,
+                len(list(Path(tmp).glob("*_step8b_evidence.mp4"))),
+                5,
+            )
+            self.assertEqual(
+                len(list(Path(tmp).glob("*_evidence.json"))),
+                5,
             )
 
 

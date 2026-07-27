@@ -8,7 +8,7 @@ import html
 import json
 import math
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from tqdm import tqdm
@@ -22,8 +22,8 @@ RESIDUALS = (
     "position", "direction", "speed", "acceleration", "path_intersection",
     "ttc", "continuity", "depth_consistency", "ego_motion_consistency",
 )
-_TRACK_VIDEO_SELECTION_NAMESPACE = "step8bc-track-video-v1"
-_MAX_TRACK_VIDEOS_PER_VIDEO = 10
+_TRACK_VIDEO_SELECTION_NAMESPACE = "step8bc-global-track-video-five-v2"
+_MAX_TRACK_VIDEOS_TOTAL = 5
 _OUTPUT_WIDTH = 1920
 _OUTPUT_HEIGHT = 1440
 _LEFT_SCENE_WIDTH = 1100
@@ -63,34 +63,23 @@ def _stable_track_rank(video_id, track_id):
     return hashlib.sha256(payload).hexdigest(), int(track_id)
 
 
-def select_deterministic_track_records(records, max_tracks_per_video=10):
-    """Select a stable, order-independent sample capped separately per video."""
-    limit = min(
-        _MAX_TRACK_VIDEOS_PER_VIDEO,
-        max(0, int(max_tracks_per_video)),
-    )
-    records_by_video = defaultdict(dict)
+def select_deterministic_track_records(records, max_tracks_per_video=5):
+    """Select at most five stable track records across the complete run."""
+    del max_tracks_per_video  # Retained for compatibility; global budget is fixed.
+    unique = {}
     for record in records:
         video_id = str(record.get("video_id", ""))
         try:
             track_id = int(record.get("track_id", -1))
         except (TypeError, ValueError):
             continue
-        if not video_id or track_id < 0:
-            continue
-        records_by_video[video_id].setdefault(track_id, record)
-
-    selected = []
-    for video_id in sorted(records_by_video):
-        ranked_track_ids = sorted(
-            records_by_video[video_id],
-            key=lambda track_id: _stable_track_rank(video_id, track_id),
-        )
-        selected.extend(
-            records_by_video[video_id][track_id]
-            for track_id in ranked_track_ids[:limit]
-        )
-    return selected
+        if video_id and track_id >= 0:
+            unique.setdefault((video_id, track_id), record)
+    ranked_keys = sorted(
+        unique,
+        key=lambda key: (_stable_track_rank(key[0], key[1]), key[0], key[1]),
+    )
+    return [unique[key] for key in ranked_keys[:_MAX_TRACK_VIDEOS_TOTAL]]
 
 
 def _residual_map(candidates):
@@ -643,7 +632,7 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
         cv2,
         panel,
         (
-            f"track {payload.get('track_id', -1)} | {object_class}"
+            f"[8B] track {payload.get('track_id', -1)} | class {object_class}"
         ),
         margin,
         204,
@@ -663,7 +652,7 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
     _text(
         cv2,
         panel,
-        "SEMANTIC COHORT",
+        "SEMANTIC COHORT  [8C]",
         margin,
         306,
         1.08,
@@ -722,7 +711,7 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
     _text(
         cv2,
         panel,
-        "DETERMINISTIC OPERATOR",
+        "DETERMINISTIC OPERATOR  [8C]",
         margin,
         535,
         1.08,
@@ -785,7 +774,7 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
     _text(
         cv2,
         panel,
-        "STATISTICAL VALIDATION",
+        "STATISTICAL VALIDATION  [8C]",
         margin,
         765,
         1.08,
@@ -855,7 +844,7 @@ def _build_step8bc_static_panel(cv2, np, payload, width, height):
     _text(
         cv2,
         panel,
-        "FINAL OUTCOME",
+        "FINAL OUTCOME  [8C]",
         margin,
         1042,
         1.08,
@@ -1009,6 +998,101 @@ def _draw_scaled_box(
     _text(cv2, image, label, x1 + 3, text_y, 0.43, color, 1)
 
 
+def _draw_scaled_track_path(
+    cv2,
+    image,
+    track,
+    frame_indices,
+    current_frame,
+    source_width,
+    source_height,
+    color,
+):
+    """Overlay the observed bbox-center path up to the current frame."""
+    image_height, image_width = image.shape[:2]
+    scale_x = image_width / max(1.0, float(source_width))
+    scale_y = image_height / max(1.0, float(source_height))
+    points = []
+    for frame_index in frame_indices:
+        if int(frame_index) > int(current_frame):
+            break
+        obj = track.get(frame_index)
+        if not obj:
+            continue
+        box = _valid_box(obj.get("bbox", obj.get("box", [])))
+        if box is None:
+            continue
+        center_x = int(round((box[0] + box[2]) * 0.5 * scale_x))
+        center_y = int(round((box[1] + box[3]) * 0.5 * scale_y))
+        points.append(
+            (
+                max(0, min(image_width - 1, center_x)),
+                max(0, min(image_height - 1, center_y)),
+            )
+        )
+    points = points[-80:]
+    for start, end in zip(points, points[1:]):
+        cv2.line(image, start, end, color, 3, cv2.LINE_AA)
+    if points:
+        cv2.circle(image, points[-1], 6, color, -1, cv2.LINE_AA)
+
+
+def _signal_values(obj):
+    if not obj:
+        return None
+    position = list(
+        obj.get("position_3d", obj.get("relative_position_3d", []))
+    )
+    x_value = _number(position[0]) if len(position) >= 3 else 0.0
+    z_value = _number(position[2]) if len(position) >= 3 else 0.0
+    vx_value = _number(obj.get("rel_vx"))
+    vz_value = _number(obj.get("rel_vz"))
+    speed_value = _number(
+        obj.get("rel_speed", math.hypot(vx_value, vz_value))
+    )
+    return (x_value, z_value, vx_value, vz_value, speed_value)
+
+
+def _cue_visual_state(name, raw_value, object_observed):
+    """Return cue text/style; absent objects can never activate a cue."""
+    try:
+        cue_value = float(raw_value)
+        cue_available = math.isfinite(cue_value)
+    except (TypeError, ValueError):
+        cue_value = 0.0
+        cue_available = False
+    if not cue_available:
+        return f"{name}=N/A", (70, 90, 235), 2, False
+    if object_observed and cue_value > 0.0:
+        return f"{name}={cue_value:.2f}", (70, 220, 100), 2, True
+    return f"{name}={cue_value:.2f}", (145, 152, 163), 1, False
+
+
+def _bbox_difference_metrics(pre_obj, final_obj):
+    if not pre_obj or not final_obj:
+        return None
+    before = _valid_box(pre_obj.get("bbox", pre_obj.get("box", [])))
+    after = _valid_box(final_obj.get("bbox", final_obj.get("box", [])))
+    if before is None or after is None:
+        return None
+    before_center = ((before[0] + before[2]) * 0.5, (before[1] + before[3]) * 0.5)
+    after_center = ((after[0] + after[2]) * 0.5, (after[1] + after[3]) * 0.5)
+    center_shift = math.hypot(
+        after_center[0] - before_center[0],
+        after_center[1] - before_center[1],
+    )
+    intersection_width = max(0.0, min(before[2], after[2]) - max(before[0], after[0]))
+    intersection_height = max(0.0, min(before[3], after[3]) - max(before[1], after[1]))
+    intersection = intersection_width * intersection_height
+    before_area = (before[2] - before[0]) * (before[3] - before[1])
+    after_area = (after[2] - after[0]) * (after[3] - after[1])
+    union = before_area + after_area - intersection
+    return {
+        "center_shift_px": center_shift,
+        "iou": intersection / union if union > 0.0 else 0.0,
+    }
+
+
 def _current_motion_text(frame_index, pre_obj, final_obj):
     def motion(obj):
         if not obj:
@@ -1029,6 +1113,185 @@ def _current_motion_text(frame_index, pre_obj, final_obj):
         f"frame={int(frame_index):05d} | 8B {motion(pre_obj)} | "
         f"8C {motion(final_obj)}"
     )
+
+
+def _ego_speed_series(ego_video, frame_indices):
+    """Return frame-aligned ego vx/vz values using the best available fields."""
+    frames = {
+        int(frame.get("frame_index", index)): dict(frame)
+        for index, frame in enumerate(dict(ego_video or {}).get("frames", []))
+    }
+
+    def value(frame, names):
+        for name in names:
+            if name not in frame:
+                continue
+            try:
+                result = float(frame[name])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(result):
+                return result
+        return None
+
+    vx_names = ("refined_ego_vx", "ego_vx_smoothed", "ego_vx")
+    vz_names = ("refined_ego_vz", "ego_vz_smoothed", "ego_vz")
+    return {
+        "vx": [value(frames.get(int(frame_index), {}), vx_names) for frame_index in frame_indices],
+        "vz": [value(frames.get(int(frame_index), {}), vz_names) for frame_index in frame_indices],
+    }
+
+
+def _track_motion_series(track, frame_indices):
+    """Return aligned object and relative velocities for one rendered track."""
+    track = dict(track or {})
+
+    def value(obj, names):
+        if not obj:
+            return None
+        motion = dict(obj.get("motion", {}))
+        for source in (obj, motion):
+            for name in names:
+                if name not in source:
+                    continue
+                try:
+                    result = float(source[name])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(result):
+                    return result
+        return None
+
+    indices = list(frame_indices)
+    return {
+        "obj_vx": [value(track.get(int(index)), ("obj_vx", "object_vx")) for index in indices],
+        "obj_vz": [value(track.get(int(index)), ("obj_vz", "object_vz")) for index in indices],
+        "rel_vx": [value(track.get(int(index)), ("rel_vx",)) for index in indices],
+        "rel_vz": [value(track.get(int(index)), ("rel_vz",)) for index in indices],
+    }
+
+
+def _draw_bright_zero_baseline(cv2, canvas, left, right, y):
+    """Draw a high-contrast dashed zero reference without masking the signal."""
+    dash_length = 12
+    gap_length = 7
+    cursor = int(left)
+    while cursor <= int(right):
+        segment_right = min(int(right), cursor + dash_length)
+        cv2.line(
+            canvas,
+            (cursor, int(y)),
+            (segment_right, int(y)),
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cursor = segment_right + gap_length
+
+
+def _draw_motion_speed_charts(
+    cv2,
+    canvas,
+    ego_video,
+    object_track,
+    frame_indices,
+    current_frame,
+    *,
+    top,
+    left,
+    right,
+    height,
+):
+    """Draw a synchronized 3x2 ego/object/relative vx-vz chart grid."""
+    indices = list(sorted(frame_indices))
+    if not indices:
+        return
+    column_gap = 14
+    row_gap = 8
+    total_width = max(2, int(right) - int(left))
+    panel_width = max(1, (total_width - column_gap) // 2)
+    row_height = max(62, (int(height) - row_gap * 2) // 3)
+    ego = _ego_speed_series(ego_video, indices)
+    track = _track_motion_series(object_track, indices)
+    series = {
+        "ego_vx": ego["vx"],
+        "ego_vz": ego["vz"],
+        **track,
+    }
+    specifications = (
+        (0, 0, "ego_vx", "EGO VX [7]", (80, 215, 240)),
+        (0, 1, "ego_vz", "EGO VZ [7]", (80, 220, 130)),
+        (1, 0, "obj_vx", "OBJ VX [8C]", (245, 180, 70)),
+        (1, 1, "obj_vz", "OBJ VZ [8C]", (210, 125, 245)),
+        (2, 0, "rel_vx", "REL VX [8A/8C]", (70, 220, 100)),
+        (2, 1, "rel_vz", "REL VZ [8A/8C]", (245, 125, 90)),
+    )
+    try:
+        current_offset = indices.index(current_frame)
+    except ValueError:
+        current_offset = 0
+
+    for row, column, series_id, title, color in specifications:
+        panel_left = int(left) + column * (panel_width + column_gap)
+        panel_right = panel_left + panel_width
+        panel_top = int(top) + row * (row_height + row_gap)
+        panel_bottom = panel_top + row_height
+        cv2.rectangle(canvas, (panel_left, panel_top), (panel_right, panel_bottom), (55, 62, 74), 2)
+        _text(cv2, canvas, title, panel_left + 8, panel_top + 19, 0.43, (220, 225, 232), 2)
+        values = series[series_id]
+        current_value = values[current_offset] if current_offset < len(values) else None
+        value_text = f"{current_value:+.2f} m/s" if current_value is not None else "N/A"
+        _text(
+            cv2,
+            canvas,
+            value_text,
+            max(panel_left + 120, panel_right - 112),
+            panel_top + 19,
+            0.39,
+            color if current_value is not None else (145, 152, 163),
+            1,
+        )
+        plot_left = panel_left + 38
+        plot_right = panel_right - 10
+        plot_top = panel_top + 27
+        plot_bottom = panel_bottom - 14
+        valid_values = [value for value in values if value is not None]
+
+        def x_position(offset):
+            return plot_left + int(round(offset * (plot_right - plot_left) / max(1, len(indices) - 1)))
+
+        if valid_values:
+            minimum = min(valid_values + [0.0])
+            maximum = max(valid_values + [0.0])
+            padding = max(0.05, (maximum - minimum) * 0.12)
+            minimum -= padding
+            maximum += padding
+
+            def point(offset, value):
+                y = plot_bottom - int(round((value - minimum) * (plot_bottom - plot_top) / max(1e-9, maximum - minimum)))
+                return x_position(offset), y
+
+            zero_y = point(0, 0.0)[1]
+            _draw_bright_zero_baseline(cv2, canvas, plot_left, plot_right, zero_y)
+            previous = None
+            previous_offset = None
+            for offset, value_row in enumerate(values):
+                if value_row is None:
+                    previous = None
+                    previous_offset = None
+                    continue
+                current_point = point(offset, value_row)
+                if previous is not None and previous_offset == offset - 1:
+                    cv2.line(canvas, previous, current_point, color, 2, cv2.LINE_AA)
+                previous = current_point
+                previous_offset = offset
+        else:
+            _text(cv2, canvas, "no samples", plot_left + 12, plot_top + 22, 0.39, (145, 152, 163), 1)
+
+        marker_x = x_position(current_offset)
+        cv2.line(canvas, (marker_x, plot_top), (marker_x, plot_bottom), (255, 255, 255), 2, cv2.LINE_AA)
+        if current_value is not None and valid_values:
+            cv2.circle(canvas, point(current_offset, current_value), 4, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def _draw_step8c_track_progress(
@@ -1056,7 +1319,7 @@ def _draw_step8c_track_progress(
     _text(
         cv2,
         canvas,
-        "TRACK PRESENCE | white marker = current frame",
+        "TRACK PRESENCE [8B -> 8C]",
         left,
         int(top) + 31,
         1.15,
@@ -1106,34 +1369,12 @@ def _draw_step8c_track_progress(
     _text(
         cv2,
         canvas,
-        f"{current_offset + 1}/{len(indices)}",
-        max(left, right - 120),
-        int(top) + 31,
-        1.10,
+        f"frame {current_offset + 1}/{len(indices)}",
+        max(left, right - 185),
+        int(top) + 29,
+        0.78,
         (255, 255, 255),
         3,
-    )
-
-
-def _motion_lines(frame_index, pre_obj, final_obj):
-    def values(prefix, obj):
-        if not obj:
-            return f"{prefix}: object absent"
-        position = list(
-            obj.get("position_3d", obj.get("relative_position_3d", []))
-        )
-        x_value = _number(position[0]) if len(position) >= 3 else 0.0
-        z_value = _number(position[2]) if len(position) >= 3 else 0.0
-        return (
-            f"{prefix}: x {x_value:+.3f}   z {z_value:+.3f}   "
-            f"vx {_number(obj.get('rel_vx')):+.3f}   "
-            f"vz {_number(obj.get('rel_vz')):+.3f}"
-        )
-
-    return (
-        f"CURRENT SIGNAL | frame {int(frame_index):05d}",
-        values("ORIGINAL", pre_obj),
-        values("FINAL", final_obj),
     )
 
 
@@ -1143,6 +1384,7 @@ def _render_step8bc_track_video(
     payload,
     pre_pattern_video,
     final_video,
+    ego_video,
     output_path,
     fps=10.0,
     progress_callback=None,
@@ -1174,7 +1416,7 @@ def _render_step8bc_track_video(
     left_width = _LEFT_SCENE_WIDTH
     panel_width = canvas_width - left_width
     max_scene_width = left_width - 40
-    max_scene_height = 980
+    max_scene_height = 620
     pre_track = _track_objects_by_frame(
         pre_pattern_video, int(record.get("track_id", -1))
     )
@@ -1192,6 +1434,11 @@ def _render_step8bc_track_video(
     repair_applied = bool(step8c_payload.get("repair_applied"))
     static_panel = _build_step8bc_static_panel(
         cv2, np, payload, panel_width, total_height
+    )
+    observable_cues = dict(
+        dict(payload.get("step8b_signal_evidence", {})).get(
+            "observable_cues", {}
+        )
     )
 
     output_path = Path(output_path)
@@ -1228,6 +1475,27 @@ def _render_step8bc_track_video(
             scene = cv2.resize(image, (scene_width, scene_height))
             pre_obj = pre_track.get(frame_index)
             final_obj = final_track.get(frame_index)
+            _draw_scaled_track_path(
+                cv2,
+                scene,
+                pre_track,
+                frame_indices,
+                frame_index,
+                source_frame_width,
+                source_frame_height,
+                (40, 185, 245),
+            )
+            if repair_applied:
+                _draw_scaled_track_path(
+                    cv2,
+                    scene,
+                    final_track,
+                    frame_indices,
+                    frame_index,
+                    source_frame_width,
+                    source_frame_height,
+                    (70, 220, 100),
+                )
             _draw_scaled_box(
                 cv2,
                 scene,
@@ -1276,7 +1544,21 @@ def _render_step8bc_track_video(
                 4,
                 cv2.LINE_AA,
             )
-            progress_top = scene_y + scene_height + 12
+            motion_chart_top = scene_y + scene_height + 10
+            motion_chart_height = 286
+            _draw_motion_speed_charts(
+                cv2,
+                canvas,
+                ego_video,
+                final_track,
+                frame_indices,
+                frame_index,
+                top=motion_chart_top,
+                left=scene_x,
+                right=scene_x + scene_width,
+                height=motion_chart_height,
+            )
+            progress_top = motion_chart_top + motion_chart_height + 8
             _draw_step8c_track_progress(
                 cv2,
                 canvas,
@@ -1300,57 +1582,197 @@ def _render_step8bc_track_video(
                     ),
                 )
             )
-            identity_y = progress_top + 146
+            info_top = progress_top + 112
             _text(
                 cv2,
                 canvas,
                 _clip_text_to_width(
                     cv2,
                     (
-                        f"OBJECT: {object_label}    "
-                        f"TRACK ID: {payload.get('track_id', -1)}"
+                        f"[8B] {object_label} | "
+                        f"track {payload.get('track_id', -1)}"
                     ),
                     left_width - 48,
-                    1.45,
-                    4,
+                    0.88,
+                    2,
                 ),
                 24,
-                identity_y,
-                1.45,
+                info_top,
+                0.88,
                 (80, 215, 240),
-                4,
+                2,
             )
-            for line_offset, line in enumerate(
-                _motion_lines(frame_index, pre_obj, final_obj)
-            ):
-                color = (
-                    (225, 230, 238)
-                    if line_offset == 0
-                    else (40, 185, 245)
-                    if line_offset == 1
-                    else (70, 220, 100)
-                )
+
+            table_top = info_top + 32
+            table_left = 24
+            table_right = left_width - 24
+            row_height = 34
+            column_x = (table_left + 8, 235, 395, 555, 715, 875)
+            headers = ("SOURCE", "x", "z", "vx", "vz", "speed")
+            for column, header in enumerate(headers):
                 _text(
                     cv2,
                     canvas,
-                    _clip_text_to_width(
-                        cv2, line, left_width - 48, 1.16, 3
-                    ),
-                    24,
-                    identity_y + 65 + line_offset * 58,
-                    1.16,
-                    color,
-                    3,
+                    header,
+                    column_x[column],
+                    table_top + 23,
+                    0.56,
+                    (185, 195, 208),
+                    2,
                 )
+            cv2.line(
+                canvas,
+                (table_left, table_top + row_height),
+                (table_right, table_top + row_height),
+                (65, 72, 84),
+                2,
+                cv2.LINE_AA,
+            )
+
+            before_values = _signal_values(pre_obj)
+            after_values = _signal_values(final_obj)
+
+            def formatted_signal(values):
+                if values is None:
+                    return ("—", "—", "—", "—", "—")
+                return (
+                    f"{values[0]:+.2f}",
+                    f"{values[1]:+.2f}",
+                    f"{values[2]:+.2f}",
+                    f"{values[3]:+.2f}",
+                    f"{values[4]:.2f}",
+                )
+
+            if before_values is not None and after_values is not None:
+                delta_values = tuple(
+                    abs(after - before)
+                    for before, after in zip(before_values, after_values)
+                )
+                delta_text = tuple(f"{value:.2f}" for value in delta_values)
+                position_delta = math.hypot(delta_values[0], delta_values[1])
+                velocity_delta = math.hypot(delta_values[2], delta_values[3])
+            else:
+                delta_values = None
+                delta_text = ("N/A", "N/A", "N/A", "N/A", "N/A")
+                position_delta = None
+                velocity_delta = None
+
+            signal_rows = (
+                ("ORIGINAL [8A]", formatted_signal(before_values), (40, 185, 245)),
+                ("REPAIRED [8C]", formatted_signal(after_values), (70, 220, 100)),
+                ("ABS DELTA", delta_text, (80, 215, 240)),
+            )
+            for row_index, (row_label, row_values, color) in enumerate(signal_rows):
+                baseline = table_top + row_height * (row_index + 1) + 24
+                values = (row_label,) + row_values
+                for column, value in enumerate(values):
+                    _text(
+                        cv2,
+                        canvas,
+                        str(value),
+                        column_x[column],
+                        baseline,
+                        0.58,
+                        color,
+                        2,
+                    )
+            table_bottom = table_top + row_height * 4
+            cv2.rectangle(
+                canvas,
+                (table_left, table_top),
+                (table_right, table_bottom),
+                (65, 72, 84),
+                2,
+            )
+            cue_groups = (
+                ("leftness", "rightness", "approach"),
+                ("recede", "acceleration", "deceleration"),
+                (
+                    "relative_static",
+                    "relative_moving",
+                    "relative_motion_uncertain",
+                ),
+            )
+            object_observed_in_current_frame = pre_obj is not None
+            cue_header = (
+                "CUES [8B] (green=active)"
+                if object_observed_in_current_frame
+                else "CUES [8B] (inactive: object absent)"
+            )
             _text(
                 cv2,
                 canvas,
-                "ORANGE = original bbox    GREEN = repaired bbox",
+                cue_header,
                 24,
-                min(total_height - 24, identity_y + 252),
-                0.76,
+                table_bottom + 24,
+                0.50,
+                (
+                    (220, 225, 232)
+                    if object_observed_in_current_frame
+                    else (145, 152, 163)
+                ),
+                1,
+            )
+            cue_column_x = (285, 555, 825)
+            for cue_row, cue_names in enumerate(cue_groups):
+                for cue_column, name in enumerate(cue_names):
+                    cue_text, cue_color, cue_thickness, _ = _cue_visual_state(
+                        name,
+                        observable_cues.get(name),
+                        object_observed_in_current_frame,
+                    )
+                    _text(
+                        cv2,
+                        canvas,
+                        cue_text,
+                        cue_column_x[cue_column],
+                        table_bottom + 24 + cue_row * 25,
+                        0.54,
+                        cue_color,
+                        cue_thickness,
+                    )
+
+            bbox_difference = _bbox_difference_metrics(pre_obj, final_obj)
+            magnitude_parts = [
+                (
+                    f"|Δposition|={position_delta:.3f}m"
+                    if position_delta is not None
+                    else "|Δposition|=N/A"
+                ),
+                (
+                    f"|Δvelocity|={velocity_delta:.3f}m/s"
+                    if velocity_delta is not None
+                    else "|Δvelocity|=N/A"
+                ),
+            ]
+            if bbox_difference is not None:
+                magnitude_parts.extend(
+                    (
+                        f"bbox shift={bbox_difference['center_shift_px']:.1f}px",
+                        f"bbox IoU={bbox_difference['iou']:.3f}",
+                    )
+                )
+            else:
+                magnitude_parts.extend(("bbox shift=N/A", "bbox IoU=N/A"))
+            _text(
+                cv2,
+                canvas,
+                "   |   ".join(magnitude_parts),
+                24,
+                min(total_height - 38, table_bottom + 78),
+                0.55,
+                (225, 228, 234),
+                1,
+            )
+            _text(
+                cv2,
+                canvas,
+                "paths/bboxes: ORANGE original [8A] | GREEN repaired [8C]",
+                24,
+                min(total_height - 16, table_bottom + 101),
+                0.54,
                 (185, 195, 208),
-                2,
+                1,
             )
             writer.write(canvas)
             if progress_callback is not None:
@@ -1370,10 +1792,9 @@ def render_step8bc_track_videos(
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     records = list(state.get("trajectory_pattern_records", []))
-    selected_records = select_deterministic_track_records(
-        records,
-        max_tracks_per_video=max_tracks_per_video,
-    )
+    del max_tracks_per_video  # The visualization budget is global and fixed.
+    limit = _MAX_TRACK_VIDEOS_TOTAL
+    selected_records = select_deterministic_track_records(records)
     pre_by_video = {
         str(video.get("video_id", "")): video
         for video in state.get("pre_pattern_relative_object_motion", [])
@@ -1381,6 +1802,10 @@ def render_step8bc_track_videos(
     final_by_video = {
         str(video.get("video_id", "")): video
         for video in state.get("relative_object_motion", [])
+    }
+    ego_by_video = {
+        str(video.get("video_id", "")): video
+        for video in state.get("ego_motion", [])
     }
     available_by_video = defaultdict(set)
     selected_by_video = defaultdict(list)
@@ -1397,6 +1822,17 @@ def render_step8bc_track_videos(
             int(record.get("track_id", -1))
         )
 
+    selected_stems = {
+        f"{record.get('video_id','')}_track_{int(record.get('track_id',-1)):04d}"
+        for record in selected_records
+    }
+    pruned_artifacts = []
+    for artifact in list(output_root.glob("*/track_*/*_8b_8c.mp4")):
+        if artifact.is_file():artifact.unlink();pruned_artifacts.append(str(artifact))
+    for artifact in list(output_root.glob("*_track_*_8b_8c.mp4")):
+        stem=artifact.name.removesuffix("_8b_8c.mp4")
+        if stem not in selected_stems and artifact.is_file():artifact.unlink();pruned_artifacts.append(str(artifact))
+
     rendered = []
     skipped = []
     frame_counts_by_video = {}
@@ -1412,7 +1848,7 @@ def render_step8bc_track_videos(
     print(
         f"[step 8c][visualization] MP4_START "
         f"tracks={len(selected_records)} frames={total_expected_frames} "
-        f"max_tracks_per_video={min(_MAX_TRACK_VIDEOS_PER_VIDEO, max(0, int(max_tracks_per_video)))} "
+        f"max_videos_total={limit} output_layout=flat "
         f"fps={float(fps):.2f} output_root={output_root}",
         flush=True,
     )
@@ -1447,17 +1883,10 @@ def render_step8bc_track_videos(
                 f"frames={expected_frames}",
                 flush=True,
             )
-            track_root = output_root / video_id / f"track_{track_id:04d}"
-            track_root.mkdir(parents=True, exist_ok=True)
+            artifact_stem = f"{video_id}_track_{track_id:04d}"
+            track_root = output_root
             payload = build_step8bc_track_video_payload(record)
-            metrics_path = (
-                track_root / f"track_{track_id:04d}_8b_8c_metrics.json"
-            )
-            metrics_path.write_text(
-                json.dumps(payload, indent=2, default=str),
-                encoding="utf-8",
-            )
-            output_path = track_root / f"track_{track_id:04d}_8b_8c.mp4"
+            output_path = track_root / f"{artifact_stem}_8b_8c.mp4"
             try:
                 path, status = _render_step8bc_track_video(
                     record=record,
@@ -1466,6 +1895,7 @@ def render_step8bc_track_videos(
                     final_video=final_by_video.get(
                         video_id, pre_by_video.get(video_id, {})
                     ),
+                    ego_video=ego_by_video.get(video_id, {}),
                     output_path=output_path,
                     fps=fps,
                     progress_callback=update_frames,
@@ -1482,7 +1912,6 @@ def render_step8bc_track_videos(
                 "video_id": video_id,
                 "track_id": track_id,
                 "status": status,
-                "metrics_path": str(metrics_path),
             }
             if path:
                 row["visualization_path"] = str(path)
@@ -1517,25 +1946,8 @@ def render_step8bc_track_videos(
             ),
         }
         selections.append(selection)
-        video_root = output_root / video_id
-        video_root.mkdir(parents=True, exist_ok=True)
-        (video_root / "step8bc_track_video_selection.json").write_text(
-            json.dumps(
-                {
-                    "selection_policy": _TRACK_VIDEO_SELECTION_NAMESPACE,
-                    "max_tracks_per_video": min(
-                        _MAX_TRACK_VIDEOS_PER_VIDEO,
-                        max(0, int(max_tracks_per_video)),
-                    ),
-                    **selection,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
     manifest = {
-        "version": 2,
+        "version": 3,
         "selection_policy": _TRACK_VIDEO_SELECTION_NAMESPACE,
         "layout": "scene_left_statistical_repair_right",
         "scene_column_width": _LEFT_SCENE_WIDTH,
@@ -1548,25 +1960,22 @@ def render_step8bc_track_videos(
             "modified_or_added": "green",
             "current_frame": "white",
         },
-        "max_tracks_per_video": min(
-            _MAX_TRACK_VIDEOS_PER_VIDEO,
-            max(0, int(max_tracks_per_video)),
-        ),
+        "max_tracks_per_video": None,
+        "max_visualization_videos_total": limit,
+        "output_folder": str(output_root),
         "num_available_tracks": sum(
             len(values) for values in available_by_video.values()
         ),
         "num_selected_tracks": len(selected_records),
         "num_rendered_videos": len(rendered),
         "num_skipped_videos": len(skipped),
+        "num_pruned_stale_artifacts": len(pruned_artifacts),
+        "pruned_stale_artifacts": pruned_artifacts,
         "selections": selections,
         "rendered": rendered,
         "skipped": skipped,
     }
-    manifest_path = output_root / "step8bc_track_video_manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
-    return {**manifest, "manifest_path": str(manifest_path)}
+    return {**manifest, "manifest_path": ""}
 
 
 _HTML_REPORT_STYLE = """
@@ -1892,7 +2301,7 @@ def _render_track_html(record, output_path, media=None):
         media_section = (
             '<section class="panel" id="track-video"><h2>8B/8C track video</h2>'
             '<p class="muted">Not selected by the deterministic '
-            f"{_MAX_TRACK_VIDEOS_PER_VIDEO}-track-per-video cap.</p></section>"
+            f"{_MAX_TRACK_VIDEOS_TOTAL}-video global cap.</p></section>"
         )
 
     alert_rows = []
@@ -1917,7 +2326,7 @@ def _render_track_html(record, output_path, media=None):
             f'<div class="card">Step 8B observable cues<b>'
             f'{_html_text(signal_evidence.get("observable_cues", {}))}'
             "</b></div></div>"
-            "<details><summary>Complete Step 8B six-cue evidence"
+            "<details><summary>Complete Step 8B nine-cue evidence"
             "</summary>"
             f"<pre>{_html_json(signal_evidence)}</pre></details></section>"
         )
@@ -1931,21 +2340,21 @@ def _render_track_html(record, output_path, media=None):
     body = (
         f"<h1>Step 8C trajectory pattern process</h1>"
         f'<p class="muted">Video {_html_text(video_id)} · track {track_id}</p>'
-        '<ol class="flow"><li>symbolic abstraction</li>'
-        "<li>all-pattern residuals</li><li>LLM interpretation</li>"
-        "<li>multi-repair</li><li>symbolic validation</li>"
-        "<li>final selection</li></ol>"
+        '<ol class="flow"><li>[8B → 8C] symbolic abstraction</li>'
+        "<li>[8C] all-pattern residuals</li><li>[8C] LLM interpretation</li>"
+        "<li>[8C] multi-repair</li><li>[8C] symbolic validation</li>"
+        "<li>[8C] final selection</li></ol>"
         + "".join(alert_rows)
-        + '<section class="panel" id="symbolic-track"><h2>Symbolic track</h2>'
+        + '<section class="panel" id="symbolic-track"><h2>Symbolic track [8B → 8C]</h2>'
         '<div class="cards">'
-        f'<div class="card">Class<b>{_html_text(track.get("object_class", "unknown"))}</b></div>'
-        f'<div class="card">Direction<b>{_html_text(track.get("direction", "unknown"))}</b></div>'
-        f'<div class="card">Persistence<b>{_html_text(_display_value(track.get("persistence")))}</b></div>'
-        f'<div class="card">Confidence<b>{_html_text(_display_value(track.get("confidence")))}</b></div>'
+        f'<div class="card">Class [8B]<b>{_html_text(track.get("object_class", "unknown"))}</b></div>'
+        f'<div class="card">Direction [8A → 8C]<b>{_html_text(track.get("direction", "unknown"))}</b></div>'
+        f'<div class="card">Persistence [8B]<b>{_html_text(_display_value(track.get("persistence")))}</b></div>'
+        f'<div class="card">Confidence [8B]<b>{_html_text(_display_value(track.get("confidence")))}</b></div>'
         + source_evidence_html
         + media_section
         + '<section class="panel" id="pattern-residuals">'
-        "<h2>All-pattern residual distances</h2>"
+        "<h2>All-pattern residual distances [8C]</h2>"
         '<p class="muted">Each cell shows before → final.</p><table><thead><tr>'
         "<th>Pattern</th><th>Plausibility</th><th>Residual sum</th>"
         + residual_headers
@@ -1953,11 +2362,11 @@ def _render_track_html(record, output_path, media=None):
         + "".join(pattern_rows)
         + "</tbody></table></section>"
         + '<section class="panel" id="llm-interpretation">'
-        "<h2>LLM interpretation</h2>"
+        "<h2>LLM interpretation [8C]</h2>"
         + "".join(interpretation_rows)
         + "</section>"
         + '<section class="panel" id="repair-candidates">'
-        "<h2>Deterministic repair candidates</h2><table><thead><tr>"
+        "<h2>Deterministic repair candidates [8C]</h2><table><thead><tr>"
         "<th>Candidate</th><th>Pattern</th><th>Operation</th><th>Verdict</th>"
         "<th>Score</th><th>Improvement</th><th>Retention</th>"
         "<th>New anomalies</th><th>Modified frames</th><th>Reason</th>"
@@ -2092,187 +2501,272 @@ def _render_video_summary_html(
     return True, "rendered"
 
 
+def _percentage_summary(counts):
+    """Return JSON-safe counts and percentages for one categorical result."""
+    total = sum(int(value) for value in counts.values())
+    return {
+        str(key): {
+            "count": int(value),
+            "percentage": (100.0 * int(value) / total) if total else 0.0,
+        }
+        for key, value in counts.items()
+    }
+
+
+def _plot_percentage_bars(ax, counts, title, *, max_items=14):
+    """Draw a readable horizontal count/percentage chart."""
+    rows = sorted(
+        ((str(key), int(value)) for key, value in counts.items()),
+        key=lambda row: (-row[1], row[0]),
+    )
+    if len(rows) > max_items:
+        kept = rows[: max_items - 1]
+        kept.append(("other", sum(value for _, value in rows[max_items - 1 :])))
+        rows = kept
+    total = sum(value for _, value in rows)
+    ax.set_title(title, loc="left", fontsize=12, fontweight="bold")
+    if not rows or total <= 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        return
+    rows = list(reversed(rows))
+    labels = [label for label, _ in rows]
+    values = [value for _, value in rows]
+    bars = ax.barh(range(len(rows)), values, color="#4C9F70")
+    ax.set_yticks(range(len(rows)), labels=labels)
+    ax.set_xlabel("tracks / candidates")
+    ax.grid(axis="x", alpha=0.22)
+    maximum = max(values)
+    ax.set_xlim(0, max(1.0, maximum * 1.32))
+    for bar, value in zip(bars, values):
+        ax.text(
+            value + max(0.05, maximum * 0.015),
+            bar.get_y() + bar.get_height() / 2,
+            f"{value} ({100.0 * value / total:.1f}%)",
+            va="center",
+            fontsize=9,
+        )
+
+
+def render_step8c_statistical_pdfs(records, promotion, output_root):
+    """Render read-only dataset-level Step 8C statistical PDF reports."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    records = list(records)
+    output_root = Path(output_root) / "statistics_pdfs"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    repair_counts = Counter(
+        "repaired" if bool(row.get("repair_applied")) else "not_repaired"
+        for row in records
+    )
+    resolution_counts = Counter(
+        str(row.get("resolution_status", "unknown")) for row in records
+    )
+    final_validation_counts = Counter(
+        str(row.get("final_validation_status", "unknown")) for row in records
+    )
+    validation_transition_counts = Counter(
+        f"{row.get('initial_8c_validation_status', 'unknown')} → "
+        f"{row.get('final_validation_status', 'unknown')}"
+        for row in records
+    )
+    final_pattern_counts = Counter(
+        str(row.get("final_pattern", "unknown")) for row in records
+    )
+    llm_agreement_counts = Counter(
+        "agree"
+        if str(row.get("LLM_preferred_pattern", "unknown"))
+        == str(row.get("validated_pattern", "unknown"))
+        else "disagree"
+        for row in records
+    )
+    class_counts = Counter(
+        str(dict(row.get("symbolic_track", {})).get("object_class", "unknown"))
+        for row in records
+    )
+    cohort_counts = Counter(
+        str(row.get("trajectory_cohort_id", "unknown")) for row in records
+    )
+    selected_operator_counts = Counter()
+    candidate_verdict_counts = Counter()
+    hard_constraint_failure_counts = Counter()
+    record_status_counts = Counter(
+        str(row.get("record_status", "unknown")) for row in records
+    )
+    for row in records:
+        if bool(row.get("repair_applied")):
+            selected = dict(row.get("selected_candidate", {}))
+            hypothesis = dict(selected.get("repair_hypothesis", {}))
+            operator = selected.get(
+                "repair_operation", hypothesis.get("operation", "unknown")
+            )
+            selected_operator_counts[str(operator)] += 1
+        else:
+            selected_operator_counts["no_repair"] += 1
+        for candidate in row.get("candidate_repairs", []):
+            verdict = str(
+                candidate.get("symbolic_verdict", candidate.get("decision", "unknown"))
+            )
+            candidate_verdict_counts[verdict] += 1
+            for constraint, passed in dict(
+                candidate.get("hard_constraint_results", {})
+            ).items():
+                if not bool(passed):
+                    hard_constraint_failure_counts[str(constraint)] += 1
+
+    chart_groups = (
+        (
+            "01_track_outcomes.pdf",
+            "Step 8C — Track outcomes",
+            (
+                (repair_counts, "Repair application"),
+                (resolution_counts, "Resolution status"),
+                (final_validation_counts, "Final validation status"),
+                (validation_transition_counts, "Initial → final validation"),
+            ),
+        ),
+        (
+            "02_patterns_and_cohorts.pdf",
+            "Step 8C — Patterns and semantic groups",
+            (
+                (final_pattern_counts, "Validated trajectory patterns"),
+                (llm_agreement_counts, "LLM prior vs validated pattern"),
+                (class_counts, "Object classes"),
+                (cohort_counts, "Trajectory cohorts"),
+            ),
+        ),
+        (
+            "03_repair_and_validation.pdf",
+            "Step 8C — Repair and validation diagnostics",
+            (
+                (selected_operator_counts, "Selected repair operation"),
+                (candidate_verdict_counts, "Candidate symbolic verdicts"),
+                (hard_constraint_failure_counts, "Hard-constraint failures"),
+                (record_status_counts, "Completed record status"),
+            ),
+        ),
+    )
+
+    reports = []
+    for filename, title, plots in chart_groups:
+        figure, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+        figure.suptitle(
+            f"{title}\ntracks={len(records)}",
+            fontsize=17,
+            fontweight="bold",
+        )
+        for axis, (counts, subtitle) in zip(axes.flat, plots):
+            _plot_percentage_bars(axis, counts, subtitle)
+        path = output_root / filename
+        figure.savefig(path, format="pdf", bbox_inches="tight")
+        plt.close(figure)
+        reports.append(
+            {
+                "report_id": path.stem,
+                "visualization_path": str(path),
+                "report_path": str(path),
+                "media_type": "application/pdf",
+                "num_tracks": len(records),
+            }
+        )
+
+    summary = {
+        "schema_version": 1,
+        "num_tracks": len(records),
+        "repair_application": _percentage_summary(repair_counts),
+        "resolution_status": _percentage_summary(resolution_counts),
+        "final_validation_status": _percentage_summary(final_validation_counts),
+        "validation_transitions": _percentage_summary(validation_transition_counts),
+        "final_patterns": _percentage_summary(final_pattern_counts),
+        "llm_validated_pattern_agreement": _percentage_summary(llm_agreement_counts),
+        "object_classes": _percentage_summary(class_counts),
+        "trajectory_cohorts": _percentage_summary(cohort_counts),
+        "selected_repair_operations": _percentage_summary(selected_operator_counts),
+        "candidate_symbolic_verdicts": _percentage_summary(candidate_verdict_counts),
+        "hard_constraint_failures": _percentage_summary(hard_constraint_failure_counts),
+        "record_status": _percentage_summary(record_status_counts),
+        "statistics_promotion": copy.deepcopy(dict(promotion or {})),
+        "pdf_reports": reports,
+    }
+    return {
+        "reports": reports,
+        "summary": summary,
+        "summary_path": "",
+        "output_root": str(output_root),
+    }
+
+
+def _retain_step8h_media_only(output_root):
+    """Keep Step 8H disk output restricted to MP4 videos and PDF reports."""
+    output_root = Path(output_root)
+    if not output_root.exists():
+        return []
+    removed = []
+    for artifact in sorted(output_root.rglob("*"), reverse=True):
+        if artifact.is_file() and artifact.suffix.lower() not in {".mp4", ".pdf"}:
+            artifact.unlink()
+            removed.append(str(artifact))
+    for directory in sorted(
+        (path for path in output_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
 def render_trajectory_pattern_visualizations(state, output_root):
-    """Write Step 8C HTML reports plus capped statistical-repair MP4s."""
+    """Write only capped statistical-repair MP4s and statistical PDFs."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    visualization_started = time.perf_counter()
+    removed_non_media = _retain_step8h_media_only(output_root)
+    started = time.perf_counter()
     records = list(state.get("trajectory_pattern_records", []))
     print(
-        f"[step 8c][visualization] START tracks={len(records)} "
+        f"[step 8h][visualization] START tracks={len(records)} "
         f"output_root={output_root}",
         flush=True,
     )
-
-    by_video = defaultdict(list)
-    for record in records:
-        by_video[str(record.get("video_id", ""))].append(record)
-
     track_video_manifest = render_step8bc_track_videos(
         state,
         output_root,
-        fps=max(
-            0.1,
-            _number(state.get("step8bc_visualization_fps", 10.0), 10.0),
-        ),
-        max_tracks_per_video=_MAX_TRACK_VIDEOS_PER_VIDEO,
+        fps=max(0.1, _number(state.get("step8bc_visualization_fps", 10.0), 10.0)),
+        max_tracks_per_video=_MAX_TRACK_VIDEOS_TOTAL,
     )
-    track_media = {}
-    for row in (
-        list(track_video_manifest.get("rendered", []))
-        + list(track_video_manifest.get("skipped", []))
-    ):
-        video_id = str(row.get("video_id", ""))
-        track_id = int(row.get("track_id", -1))
-        track_dir = f"track_{track_id:04d}"
-        media = {
-            "metrics_href": (
-                f"{track_dir}/track_{track_id:04d}_8b_8c_metrics.json"
-            ),
-            "status": str(row.get("status", "unknown")),
-        }
-        if row.get("visualization_path"):
-            media["video_href"] = (
-                f"{track_dir}/track_{track_id:04d}_8b_8c.mp4"
-            )
-        track_media[(video_id, track_id)] = media
-
-    rendered = []
-    skipped = []
-    report_started = time.perf_counter()
-    for record in tqdm(
+    statistical_pdfs = render_step8c_statistical_pdfs(
         records,
-        desc="[step 8c] HTML track reports",
-        unit="track",
-        dynamic_ncols=True,
-    ):
-        video_id = str(record.get("video_id", ""))
-        track_id = int(record.get("track_id", -1))
-        path = (
-            output_root
-            / video_id
-            / f"track_{track_id:04d}_pattern_process.html"
-        )
-        success, status = _render_track_html(
-            record,
-            path,
-            media=track_media.get((video_id, track_id)),
-        )
-        row = {
-            "video_id": video_id,
-            "track_id": track_id,
-            "status": status,
-            "media_type": "text/html",
-        }
-        if success:
-            row["visualization_path"] = str(path)
-            row["report_path"] = str(path)
-            rendered.append(row)
-        else:
-            skipped.append(row)
-    print(
-        f"[step 8c][visualization] HTML_REPORTS_DONE "
-        f"rendered={len(rendered)} skipped={len(skipped)} "
-        f"latency={time.perf_counter() - report_started:.2f}s",
-        flush=True,
+        dict(state.get("trajectory_pattern_statistics_promotion", {})),
+        output_root,
     )
-
-    summaries = []
-    summary_skipped = []
-    summary_started = time.perf_counter()
-    for video_id, video_records in tqdm(
-        sorted(by_video.items()),
-        desc="[step 8c] HTML video summaries",
-        unit="video",
-        dynamic_ncols=True,
-    ):
-        path = output_root / video_id / "video_pattern_summary.html"
-        success, status = _render_video_summary_html(
-            video_id,
-            video_records,
-            dict(state.get("trajectory_pattern_statistics_promotion", {})),
-            path,
-            track_media=track_media,
-        )
-        row = {
-            "video_id": video_id,
-            "status": status,
-            "media_type": "text/html",
-        }
-        if success:
-            row["visualization_path"] = str(path)
-            row["report_path"] = str(path)
-            summaries.append(row)
-        else:
-            summary_skipped.append(row)
+    removed_non_media.extend(_retain_step8h_media_only(output_root))
     print(
-        f"[step 8c][visualization] HTML_SUMMARIES_DONE "
-        f"rendered={len(summaries)} skipped={len(summary_skipped)} "
-        f"latency={time.perf_counter() - summary_started:.2f}s",
-        flush=True,
-    )
-
-    manifest = {
-        "version": 4,
-        "report_format": "html",
-        "self_contained_reports": True,
-        "num_track_reports": len(rendered),
-        "num_summary_reports": len(summaries),
-        "num_selected_track_videos": int(
-            track_video_manifest.get("num_selected_tracks", 0)
-        ),
-        "num_track_videos": int(
-            track_video_manifest.get("num_rendered_videos", 0)
-        ),
-        "num_skipped_track_videos": int(
-            track_video_manifest.get("num_skipped_videos", 0)
-        ),
-        "max_track_videos_per_video": _MAX_TRACK_VIDEOS_PER_VIDEO,
-        "track_video_layout": str(
-            track_video_manifest.get("layout", "")
-        ),
-        "track_video_canvas_resolution": list(
-            track_video_manifest.get("canvas_resolution", [])
-        ),
-        "num_skipped": len(skipped) + len(summary_skipped),
-        "track_reports": rendered,
-        "summary_reports": summaries,
-        "track_videos": list(track_video_manifest.get("rendered", [])),
-        "track_video_skipped": list(track_video_manifest.get("skipped", [])),
-        "track_video_selections": list(
-            track_video_manifest.get("selections", [])
-        ),
-        "skipped": skipped + summary_skipped,
-    }
-    (output_root / "trajectory_pattern_visualization_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
-    print(
-        f"[step 8c][visualization] DONE "
-        f"track_html_reports={len(rendered)} "
-        f"summary_html_reports={len(summaries)} "
+        f"[step 8h][visualization] DONE "
+        f"statistical_pdf_reports={len(statistical_pdfs.get('reports', []))} "
         f"track_videos={len(track_video_manifest.get('rendered', []))} "
         f"track_video_skipped={len(track_video_manifest.get('skipped', []))} "
-        f"latency={time.perf_counter() - visualization_started:.2f}s "
-        f"manifest={output_root / 'trajectory_pattern_visualization_manifest.json'}",
+        f"removed_non_media={len(removed_non_media)} "
+        f"latency={time.perf_counter() - started:.2f}s output_root={output_root}",
         flush=True,
     )
     return {
         **state,
-        "trajectory_pattern_visualizations": rendered,
-        "trajectory_pattern_video_summaries": summaries,
-        "trajectory_pattern_track_videos": list(
-            track_video_manifest.get("rendered", [])
-        ),
-        "trajectory_pattern_track_video_skipped": list(
-            track_video_manifest.get("skipped", [])
-        ),
-        "trajectory_pattern_track_video_selections": list(
-            track_video_manifest.get("selections", [])
-        ),
-        "trajectory_pattern_track_video_manifest_path": str(
-            track_video_manifest.get("manifest_path", "")
-        ),
-        "trajectory_pattern_visualization_skipped": skipped + summary_skipped,
+        "trajectory_pattern_visualizations": [],
+        "trajectory_pattern_video_summaries": [],
+        "trajectory_pattern_statistical_pdf_reports": list(statistical_pdfs.get("reports", [])),
+        "trajectory_pattern_statistical_summary": dict(statistical_pdfs.get("summary", {})),
+        "trajectory_pattern_statistical_summary_path": "",
+        "trajectory_pattern_statistical_pdf_output_root": str(statistical_pdfs.get("output_root", "")),
+        "trajectory_pattern_track_videos": list(track_video_manifest.get("rendered", [])),
+        "trajectory_pattern_track_video_skipped": list(track_video_manifest.get("skipped", [])),
+        "trajectory_pattern_track_video_selections": list(track_video_manifest.get("selections", [])),
+        "trajectory_pattern_track_video_manifest_path": "",
+        "trajectory_pattern_visualization_skipped": [],
         "trajectory_pattern_visualization_output_root": output_root,
     }

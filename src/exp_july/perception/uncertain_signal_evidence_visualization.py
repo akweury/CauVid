@@ -13,9 +13,9 @@ from pathlib import Path
 from tqdm import tqdm
 
 
-_VISUALIZATION_VERSION = 2
-_SELECTION_POLICY = "step8b-lowest-confidence-first-v1"
-_MAX_TRACK_VIDEOS_PER_SOURCE_VIDEO = 3
+_VISUALIZATION_VERSION = 4
+_SELECTION_POLICY = "step8b-global-lowest-confidence-five-v2"
+_MAX_VISUALIZATION_VIDEOS_TOTAL = 5
 _OUTPUT_WIDTH = 1920
 _OUTPUT_HEIGHT = 1440
 _LEFT_SCENE_WIDTH = 1100
@@ -26,6 +26,9 @@ _CUE_ORDER = (
     "recede",
     "acceleration",
     "deceleration",
+    "relative_static",
+    "relative_moving",
+    "relative_motion_uncertain",
 )
 
 
@@ -56,41 +59,32 @@ def _cue_strength(evidence):
 
 def select_step8b_visualization_tracks(
     evidence_videos,
-    max_tracks_per_video=3,
+    max_tracks_per_video=5,
 ):
-    """Select the same most-uncertain tracks independent of input ordering."""
-    limit = min(
-        _MAX_TRACK_VIDEOS_PER_SOURCE_VIDEO,
-        max(0, int(max_tracks_per_video)),
-    )
-    selected = []
-    for video in sorted(
-        evidence_videos,
-        key=lambda row: str(row.get("video_id", "")),
-    ):
+    """Select at most five most-uncertain tracks across the complete run."""
+    del max_tracks_per_video  # Retained for compatibility; the global cap is fixed.
+    candidates = []
+    for video in evidence_videos:
         video_id = str(video.get("video_id", ""))
         unique = {}
         for evidence in video.get("track_signal_evidence", []):
             track_id = _track_id(evidence.get("track_id"))
             if video_id and track_id >= 0:
                 unique.setdefault(track_id, evidence)
-        ranked = sorted(
-            unique.values(),
-            key=lambda row: (
-                _cue_strength(row),
-                _stable_tie_breaker(video_id, _track_id(row.get("track_id"))),
-                _track_id(row.get("track_id")),
-            ),
+        candidates.extend(
+            {"video_id": video_id, "track_id": track_id, "evidence": evidence}
+            for track_id, evidence in unique.items()
         )
-        selected.extend(
-            {
-                "video_id": video_id,
-                "track_id": _track_id(evidence.get("track_id")),
-                "evidence": evidence,
-            }
-            for evidence in ranked[:limit]
-        )
-    return selected
+    ranked = sorted(
+        candidates,
+        key=lambda row: (
+            _cue_strength(row["evidence"]),
+            _stable_tie_breaker(row["video_id"], row["track_id"]),
+            row["video_id"],
+            row["track_id"],
+        ),
+    )
+    return ranked[:_MAX_VISUALIZATION_VIDEOS_TOTAL]
 
 
 def _confidence_color(confidence):
@@ -179,25 +173,28 @@ def _build_evidence_panel(cv2, np, evidence, width, height):
     )
 
     cues = dict(evidence.get("observable_cues", {}))
-    y = 330
-    for name in _CUE_ORDER:
+    column_width = max(1, (width - 2 * margin) // 3)
+    for cue_index, name in enumerate(_CUE_ORDER):
+        row, column = divmod(cue_index, 3)
+        x = margin + column * column_width
+        y = 350 + row * 300
         value = max(0.0, min(1.0, _number(cues.get(name, 0.0))))
         color = _confidence_color(value)
         title = name.upper()
+        title_scale = 0.58 if len(title) > 18 else 0.82
         _put_text(
-            cv2, panel, title, margin, y, 1.55, (235, 238, 243), 4
+            cv2, panel, title, x, y, title_scale, (235, 238, 243), 2
         )
         _put_text(
             cv2,
             panel,
             f"{value:.3f}",
-            margin,
-            y + 67,
-            1.70,
+            x,
+            y + 58,
+            1.12,
             color,
-            4,
+            3,
         )
-        y += 170
 
     _put_text(
         cv2,
@@ -575,17 +572,12 @@ def render_step8b_signal_evidence_videos(
     fps=10.0,
     max_tracks_per_video=3,
 ):
-    """Render at most three deterministic, low-confidence tracks per video."""
+    """Render at most five deterministic track MP4s across the complete run."""
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    limit = min(
-        _MAX_TRACK_VIDEOS_PER_SOURCE_VIDEO,
-        max(0, int(max_tracks_per_video)),
-    )
-    selected = select_step8b_visualization_tracks(
-        evidence_videos,
-        max_tracks_per_video=limit,
-    )
+    del max_tracks_per_video  # The visualization budget is global and fixed.
+    limit = _MAX_VISUALIZATION_VIDEOS_TOTAL
+    selected = select_step8b_visualization_tracks(evidence_videos)
     relative_by_video = {
         str(video.get("video_id", "")): video for video in relative_motion
     }
@@ -601,24 +593,16 @@ def render_step8b_signal_evidence_videos(
         selected_by_video[row["video_id"]].append(row["track_id"])
 
     pruned_artifacts = []
-    for video_id in sorted(available_by_video):
-        selected_ids = set(selected_by_video.get(video_id, []))
-        video_root = output_root / video_id
-        if not video_root.exists():
-            continue
-        for track_root in video_root.glob("track_*"):
-            if not track_root.is_dir():
-                continue
-            track_id = _track_id(track_root.name.removeprefix("track_"))
-            if track_id in selected_ids:
-                continue
-            for artifact in (
-                track_root / f"track_{track_id:04d}_step8b_evidence.mp4",
-                track_root / f"track_{track_id:04d}_evidence.json",
-            ):
-                if artifact.is_file():
-                    artifact.unlink()
-                    pruned_artifacts.append(str(artifact))
+    selected_stems = {f"{row['video_id']}_track_{row['track_id']:04d}" for row in selected}
+    # Remove legacy nested track artifacts and stale flat artifacts from older selections.
+    for artifact in list(output_root.glob("*/track_*/*_step8b_evidence.mp4")) + list(output_root.glob("*/track_*/*_evidence.json")):
+        if artifact.is_file():
+            artifact.unlink();pruned_artifacts.append(str(artifact))
+    for artifact in list(output_root.glob("*_track_*_step8b_evidence.mp4")) + list(output_root.glob("*_track_*_evidence.json")):
+        name=artifact.name
+        stem=name.removesuffix("_step8b_evidence.mp4").removesuffix("_evidence.json")
+        if stem not in selected_stems and artifact.is_file():
+            artifact.unlink();pruned_artifacts.append(str(artifact))
 
     frame_counts = {
         video_id: len(_frame_map(video))
@@ -629,7 +613,7 @@ def render_step8b_signal_evidence_videos(
     )
     print(
         f"[step 8b][visualization] MP4_START tracks={len(selected)} "
-        f"frames={total_frames} max_tracks_per_video={limit} "
+        f"frames={total_frames} max_videos_total={limit} output_layout=flat "
         f"fps={float(fps):.2f} output_root={output_root}",
         flush=True,
     )
@@ -664,15 +648,15 @@ def render_step8b_signal_evidence_videos(
                 f"track_id={track_id} frames={expected_frames}",
                 flush=True,
             )
-            track_root = output_root / video_id / f"track_{track_id:04d}"
-            evidence_path = track_root / f"track_{track_id:04d}_evidence.json"
-            track_root.mkdir(parents=True, exist_ok=True)
+            artifact_stem = f"{video_id}_track_{track_id:04d}"
+            track_root = output_root
+            evidence_path = track_root / f"{artifact_stem}_evidence.json"
             evidence_path.write_text(
                 json.dumps(row["evidence"], indent=2, default=str),
                 encoding="utf-8",
             )
             output_path = (
-                track_root / f"track_{track_id:04d}_step8b_evidence.mp4"
+                track_root / f"{artifact_stem}_step8b_evidence.mp4"
             )
             try:
                 path, status = _render_step8b_track_video(
@@ -738,7 +722,9 @@ def render_step8b_signal_evidence_videos(
         "canvas_resolution": [_OUTPUT_WIDTH, _OUTPUT_HEIGHT],
         "canvas_aspect_ratio": "4:3",
         "selection_policy": _SELECTION_POLICY,
-        "max_tracks_per_video": limit,
+        "max_tracks_per_video": None,
+        "max_visualization_videos_total": limit,
+        "output_folder": str(output_root),
         "confidence_color_scale": {
             "low": "red",
             "medium": "yellow",
@@ -762,8 +748,5 @@ def render_step8b_signal_evidence_videos(
 
 
 def configured_step8b_visualization_limit():
-    try:
-        configured = int(os.environ.get("CAUVID_STEP8B_MAX_TRACK_VIDEOS", "3"))
-    except ValueError:
-        configured = 3
-    return min(_MAX_TRACK_VIDEOS_PER_SOURCE_VIDEO, max(0, configured))
+    """Return the fixed global Step 8B visualization budget."""
+    return _MAX_VISUALIZATION_VIDEOS_TOTAL

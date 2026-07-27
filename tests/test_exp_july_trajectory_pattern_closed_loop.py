@@ -3,9 +3,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.exp_july.perception.adaptive_motion_repair import _recompute_motion
-from src.exp_july.perception.pipeline import _uncertain_signal_evidence_video
+from src.exp_july.perception.pipeline import (
+    _uncertain_signal_evidence_video,
+    step8c_trajectory_clustering,
+    step8d_closed_loop_trajectory_repair,
+)
 from src.exp_july.perception.trajectory_pattern_closed_loop import (
     PATTERNS,
     RESIDUALS,
@@ -209,6 +214,51 @@ def llm(kind, _prompt):
 
 
 class TrajectoryPatternClosedLoopTests(unittest.TestCase):
+    def test_clustering_and_repair_are_separate_active_stages(self):
+        source = state()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "src.exp_july.perception.pipeline.get_pipeline_output_root",
+            return_value=Path(tmp),
+        ):
+            clustered = step8c_trajectory_clustering(source, llm_generate=llm)
+            self.assertEqual(
+                clustered["trajectory_clustering_manifest"]["repairs_performed"],
+                0,
+            )
+            self.assertNotIn("trajectory_pattern_records", clustered)
+            self.assertTrue(clustered["trajectory_clustered_tracks"])
+            self.assertTrue(
+                all(track.get("cohort_id") for track in clustered["trajectory_clustered_tracks"])
+            )
+
+            repaired = step8d_closed_loop_trajectory_repair(
+                clustered,
+                llm_generate=llm,
+            )
+            self.assertTrue(repaired["trajectory_pattern_records"])
+            self.assertNotIn("trajectory_pattern_visualizations", repaired)
+            self.assertEqual(
+                repaired["trajectory_pattern_records"][0]["trajectory_cohort_id"],
+                clustered["trajectory_clustered_tracks"][0]["cohort_id"],
+            )
+            self.assertEqual(
+                repaired["trajectory_pattern_manifest"]["repair_cache_hits"],
+                0,
+            )
+            cached = step8d_closed_loop_trajectory_repair(
+                clustered,
+                llm_generate=llm,
+            )
+            self.assertEqual(
+                cached["trajectory_pattern_manifest"]["repair_cache_hits"],
+                1,
+            )
+            self.assertTrue(
+                cached["trajectory_pattern_records"][0]["llm_processing"][
+                    "repair_cache_hit"
+                ]
+            )
+
     def test_pending_policy_activates_only_at_the_next_epoch_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -264,69 +314,20 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             self.assertTrue((root / "policies" / "active_policy.json").exists())
             self.assertTrue((root / "policies" / "epoch_0001.json").exists())
             self.assertTrue(list((root / "epoch_reviews").glob("*_package.json")))
-            track_report = (
-                root
-                / "visualizations"
-                / "demo"
-                / "track_0007_pattern_process.html"
-            )
-            summary_report = (
-                root
-                / "visualizations"
-                / "demo"
-                / "video_pattern_summary.html"
-            )
-            self.assertTrue(track_report.exists())
-            self.assertTrue(summary_report.exists())
-            self.assertFalse(
-                (
-                    root
-                    / "visualizations"
-                    / "demo"
-                    / "track_0007_pattern_process.png"
-                ).exists()
-            )
-            self.assertFalse(
-                (
-                    root
-                    / "visualizations"
-                    / "demo"
-                    / "video_pattern_summary.png"
-                ).exists()
-            )
-            track_html = track_report.read_text(encoding="utf-8")
-            for marker in (
-                'id="symbolic-track"',
-                'id="pattern-residuals"',
-                'id="llm-interpretation"',
-                'id="repair-candidates"',
-                'id="symbolic-validation"',
-                'id="final-result"',
-                'id="provenance"',
-            ):
-                self.assertIn(marker, track_html)
-            self.assertNotIn("https://", track_html)
-            summary_html = summary_report.read_text(encoding="utf-8")
-            self.assertIn("Step 8C video pattern summary", summary_html)
-            self.assertIn("track_0007_pattern_process.html", summary_html)
-            self.assertNotIn("https://", summary_html)
-            visualization_manifest_path = (
-                root
-                / "visualizations"
-                / "trajectory_pattern_visualization_manifest.json"
-            )
-            self.assertTrue(visualization_manifest_path.exists())
-            visualization_manifest = json.loads(
-                visualization_manifest_path.read_text(encoding="utf-8")
-            )
-            self.assertEqual(visualization_manifest["report_format"], "html")
-            self.assertEqual(visualization_manifest["num_track_reports"], 1)
-            self.assertEqual(visualization_manifest["num_summary_reports"], 1)
+            visualization_root = root / "visualizations"
+            visualization_files = [
+                path for path in visualization_root.rglob("*") if path.is_file()
+            ]
+            self.assertTrue(visualization_files)
             self.assertTrue(
-                visualization_manifest["track_reports"][0][
-                    "visualization_path"
-                ].endswith(".html")
+                all(path.suffix.lower() in {".mp4", ".pdf"} for path in visualization_files)
             )
+            self.assertEqual(
+                len(list((visualization_root / "statistics_pdfs").glob("*.pdf"))),
+                3,
+            )
+            self.assertFalse(list(visualization_root.rglob("*.html")))
+            self.assertFalse(list(visualization_root.rglob("*.json")))
             dashboard = root / "dashboard" / "index.html"
             self.assertTrue(dashboard.exists())
             html = dashboard.read_text(encoding="utf-8")
@@ -385,7 +386,14 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
         self.assertEqual(len(record["pattern_candidates"]), len(PATTERNS))
         for candidate in record["pattern_candidates"]:
             self.assertEqual(set(candidate["residual_vector"]), set(RESIDUALS))
-        self.assertTrue(record["candidate_repairs"])
+        if not record["candidate_repairs"]:
+            self.assertTrue(record["llm_processing"]["repair_fast_path"])
+            self.assertEqual(
+                record["final_selection_reason"],
+                "valid_no_repair_fast_path_original_preserved",
+            )
+        else:
+            self.assertTrue(record["candidate_repairs"])
         required_candidate_fields = {
             "pre_pattern_scores", "post_repair_pattern_scores", "LLM_prior",
             "repair_hypothesis", "pattern_hypothesis", "symbolic_verdict",
@@ -401,8 +409,9 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             for repair in record["candidate_repairs"]
             for source in repair["pattern_hypothesis"]["selection_sources"]
         }
-        self.assertIn("mandatory_unknown_baseline", sources)
-        self.assertIn("minimum_residual_baseline", sources)
+        if record["candidate_repairs"]:
+            self.assertIn("mandatory_unknown_baseline", sources)
+            self.assertIn("minimum_residual_baseline", sources)
         self.assertIn("LLM_preferred_pattern", record)
         self.assertEqual(record["provenance"]["frozen_policy_version"], 1)
         self.assertEqual(record["provenance"]["epoch_id"], 1)
@@ -419,6 +428,7 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
             "highest_ranked_after_hard_constraints",
             "no_candidate_passed_hard_constraints_original_preserved",
             "no_repair_required_original_preserved",
+            "valid_no_repair_fast_path_original_preserved",
         })
         self.assertEqual(
             result["pre_pattern_relative_object_motion"],
@@ -430,8 +440,11 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
         self.assertEqual(cohort_summary["track_count"], 1)
         self.assertIn("motion_statistics", cohort_summary)
         self.assertIn("systematic_anomalies", cohort_summary)
-        self.assertEqual(len(result["trajectory_pattern_visualizations"]), 1)
-        self.assertEqual(len(result["trajectory_pattern_video_summaries"]), 1)
+        self.assertEqual(result["trajectory_pattern_visualizations"], [])
+        self.assertEqual(result["trajectory_pattern_video_summaries"], [])
+        self.assertEqual(
+            len(result["trajectory_pattern_statistical_pdf_reports"]), 3
+        )
 
 
     def test_statistics_update_and_promotion_splits_are_video_disjoint(self):

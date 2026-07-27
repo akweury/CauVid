@@ -29,3 +29,12 @@ from src.exp_july.perception.pipeline import step8f_final_trajectory_validation
 from src.exp_july.perception.pipeline import step8g_prior_guided_ego_motion_refinement
 from src.exp_july.perception.pipeline import step8h_visual_relative_motion
 from src.exp_july.perception.pipeline import step8i_threshold_calibration
+from src.exp_july.perception.pipeline import step8c_trajectory_clustering
+from src.exp_july.perception.pipeline import step8d_closed_loop_trajectory_repair
+from src.exp_july.perception.pipeline import step8e_repaired_trajectory_validation
+from src.exp_july.perception.pipeline import step8f_trajectory_statistics
+from src.exp_july.perception.pipeline import step8g_repaired_track_materialization
+from src.exp_july.perception.pipeline import step8h_trajectory_repair_visualization
+from src.exp_july.perception.pipeline import step8i_trajectory_audit_dashboard
+from src.exp_july.perception.pipeline import step8j_trajectory_provenance_audit
+from src.exp_july.perception.pipeline import step8k_trajectory_handoff
