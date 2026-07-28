@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import html
 import json
 import math
 from pathlib import Path
 
 
-VERSION = 1
+VERSION = 4
+VISUALIZATION_VERSION = 8
 CUE_NAMES = (
     "ego_static", "ego_driving_forward", "ego_driving_backward",
     "ego_turning_left", "ego_turning_right", "ego_straight",
@@ -18,9 +21,12 @@ CUE_NAMES = (
 
 def _cues(action, signal, acceleration_threshold, validated):
     cues = {name: 0.0 for name in CUE_NAMES}
-    if not validated or action == "unknown":
+    if action == "unknown":
         cues["ego_motion_uncertain"] = 1.0
         return cues
+    if not validated:
+        # Preserve the best numerical state and expose uncertainty separately.
+        cues["ego_motion_uncertain"] = 1.0
     if action == "static":
         cues["ego_static"] = 1.0
     elif action == "backward":
@@ -43,6 +49,34 @@ def _cues(action, signal, acceleration_threshold, validated):
     return cues
 
 
+
+def _segment_signal_confidence(action, signals, static_threshold, lateral_threshold):
+    """Score support from continuous signals without turning uncertainty into unknown."""
+    finite = lambda key: [
+        float(row[key]) for row in signals
+        if row.get(key) is not None and math.isfinite(float(row[key]))
+    ]
+    speeds, vz_values, vx_values = finite("ego_speed"), finite("ego_vz"), finite("ego_vx")
+    if not signals or action == "unknown":
+        return 0.0
+    if action == "static":
+        if not speeds:
+            return 0.0
+        median_speed = sorted(speeds)[len(speeds) // 2]
+        return float(max(0.0, min(1.0, 1.0 - median_speed / max(1e-6, 2.0 * static_threshold))))
+    if action in {"forward", "backward"}:
+        if not vz_values:
+            return 0.0
+        signed = sorted(vz_values)[len(vz_values) // 2] * (1.0 if action == "forward" else -1.0)
+        return float(max(0.0, min(1.0, signed / max(1e-6, 3.0 * static_threshold))))
+    if action in {"left", "turning_left", "right", "turning_right"}:
+        if not vx_values:
+            return 0.0
+        magnitude = sorted(abs(value) for value in vx_values)[len(vx_values) // 2]
+        return float(max(0.0, min(1.0, magnitude / max(1e-6, 3.0 * lateral_threshold))))
+    return 0.0
+
+
 def finalize_video(refinement, provisional):
     signal_by_frame = {
         int(row.get("frame_index", offset)): row
@@ -56,7 +90,12 @@ def finalize_video(refinement, provisional):
         int(row.get("segment_id", -1)): row
         for row in refinement.get("selected_normalized_evidence", {}).get("normalized_segment_evidence", [])
     }
-    acceleration_threshold = float(provisional.get("configuration", {}).get("acceleration_threshold", 0.0))
+    acceleration_threshold = float(
+        refinement.get("selected_thresholds", {}).get(
+            "acceleration_threshold",
+            provisional.get("configuration", {}).get("acceleration_threshold", 0.0),
+        )
+    )
     frames = []
     final_segments = []
     corrections = {int(row.get("segment_id", -1)): row for row in refinement.get("corrections", [])}
@@ -68,7 +107,8 @@ def finalize_video(refinement, provisional):
         segment_id = int(segment.get("segment_id", len(final_segments)))
         validated = segment.get("validation_status") == "validated"
         action = str(segment.get("action", "unknown"))
-        published_action = action if validated else "unknown"
+        supported_actions = {"static", "forward", "backward", "left", "right", "turning_left", "turning_right"}
+        published_action = action if action in supported_actions else "unknown"
         rules = rule_by_segment.get(segment_id, {})
         evidence = evidence_by_segment.get(segment_id, {})
         hypotheses = dict(rules.get("hypothesis_scores", {}))
@@ -78,7 +118,26 @@ def finalize_video(refinement, provisional):
             else action
         )
         rule_confidence = float(hypotheses.get(target_family, max(hypotheses.values(), default=0.0)))
-        confidence = float(max(0.0, min(1.0, rule_confidence * (1.0 - float(evidence.get("uncertainty", 1.0))))))
+        segment_signals = [
+            signal_by_frame.get(frame_index, {})
+            for frame_index in range(int(segment.get("start_frame", 0)), int(segment.get("end_frame", 0)) + 1)
+        ]
+        selected_thresholds = dict(refinement.get("selected_thresholds", provisional.get("selected_thresholds", {})))
+        signal_confidence = _segment_signal_confidence(
+            published_action,
+            segment_signals,
+            float(selected_thresholds.get("static_speed_threshold", 0.2)),
+            float(selected_thresholds.get("lateral_threshold", 0.2)),
+        )
+        evidence_confidence = 1.0 - float(evidence.get("uncertainty", 1.0))
+        combined_confidence = 0.55 * signal_confidence + 0.25 * rule_confidence + 0.20 * evidence_confidence
+        if validated:
+            confidence = max(combined_confidence, 0.5 * rule_confidence + 0.5 * evidence_confidence)
+        else:
+            confidence = min(0.79, combined_confidence)
+        if published_action != "unknown":
+            confidence = max(0.05, confidence)
+        confidence = float(max(0.0, min(1.0, confidence)))
         correction = corrections.get(segment_id)
         explanation = (
             f"Corrected provisional {','.join(correction.get('provisional_actions', []))} to {action} because {correction.get('reason')}; best evidence hypothesis={correction.get('best_rule_hypothesis')}."
@@ -93,6 +152,9 @@ def finalize_video(refinement, provisional):
             "action": published_action,
             "validated_action": action if validated else None,
             "confidence": confidence,
+            "signal_confidence": signal_confidence,
+            "semantic_confidence": rule_confidence,
+            "prediction_status": "validated" if validated else "soft_uncertain",
             "correction": correction,
             "correction_reason": explanation,
             "fired_rule_ids": [row.get("rule_id") for row in rules.get("fired_rules", [])],
@@ -113,6 +175,9 @@ def finalize_video(refinement, provisional):
                 "segment_id": segment_id,
                 "validation_status": segment.get("validation_status"),
                 "confidence": confidence,
+                "signal_confidence": signal_confidence,
+                "semantic_confidence": rule_confidence,
+                "prediction_status": "validated" if validated else "soft_uncertain",
                 "correction_reason": explanation,
             })
     frames.sort(key=lambda row: row["frame_index"])
@@ -134,6 +199,7 @@ def finalize_video(refinement, provisional):
         "threshold_changes": dict(refinement.get("threshold_changes", {})),
         "threshold_status": "final_validated_and_frozen",
         "provisional_segments": list(refinement.get("provisional_segments", [])),
+        "provisional_frames": copy.deepcopy(provisional.get("frames", [])),
         "final_action_segments": final_segments,
         "frames": frames,
         "num_frames": len(frames),
@@ -173,7 +239,15 @@ def _draw_signal_chart(cv2, canvas, values, current, box, color, label):
     cv2.putText(canvas, label, (x1 + 5, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, .48, color, 1, cv2.LINE_AA)
     finite = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     bound = max(1e-9, max([abs(v) for v in finite] or [1.0])); mid=(y1+y2)//2
-    cv2.line(canvas,(x1,mid),(x2,mid),(80,190,240),1,cv2.LINE_AA)
+    # Bright dashed zero reference remains visible against all signal colors.
+    dash_length, dash_gap = 14, 8
+    dash_x = x1
+    while dash_x < x2:
+        cv2.line(
+            canvas, (dash_x, mid), (min(x2, dash_x + dash_length), mid),
+            (80, 245, 255), 2, cv2.LINE_AA,
+        )
+        dash_x += dash_length + dash_gap
     points=[]
     for i,value in enumerate(values):
         if value is None: continue
@@ -191,6 +265,112 @@ def _segment_for_frame(rows, frame_index):
         ),
         {},
     )
+
+
+_EGO_STATE_COLORS = {
+    "forward": (70, 220, 110),
+    "backward": (80, 120, 245),
+    "static": (180, 180, 180),
+    "left": (245, 175, 70),
+    "right": (220, 90, 225),
+    "straight": (90, 210, 230),
+    "accelerating": (70, 230, 150),
+    "decelerating": (70, 145, 245),
+    "steady": (190, 190, 105),
+    "uncertain": (80, 84, 94),
+    "unknown": (80, 84, 94),
+}
+
+
+def _ego_timeline_states(frame):
+    cues = dict(frame.get("observable_cues", {}))
+    action = str(frame.get("action", "")).lower()
+    if float(cues.get("ego_static", 0.0)) > 0.5:
+        longitudinal = "static"
+    elif float(cues.get("ego_driving_backward", 0.0)) > 0.5:
+        longitudinal = "backward"
+    elif float(cues.get("ego_driving_forward", 0.0)) > 0.5:
+        longitudinal = "forward"
+    elif action == "static":
+        longitudinal = "static"
+    elif action == "backward":
+        longitudinal = "backward"
+    elif action == "forward":
+        longitudinal = "forward"
+    else:
+        longitudinal = "uncertain"
+    if longitudinal == "static":
+        return "static", "static", "static"
+    if float(cues.get("ego_turning_left", 0.0)) > 0.5:
+        lateral = "left"
+    elif float(cues.get("ego_turning_right", 0.0)) > 0.5:
+        lateral = "right"
+    elif float(cues.get("ego_straight", 0.0)) > 0.5:
+        lateral = "straight"
+    else:
+        # A valid non-turning longitudinal state is laterally stable, not unknown.
+        lateral = "straight" if longitudinal != "uncertain" else "uncertain"
+    if float(cues.get("ego_accelerating", 0.0)) > 0.5:
+        speed_change = "accelerating"
+    elif float(cues.get("ego_decelerating", 0.0)) > 0.5:
+        speed_change = "decelerating"
+    else:
+        speed_change = "steady" if longitudinal != "uncertain" else "uncertain"
+    return longitudinal, lateral, speed_change
+
+
+def _draw_ego_state_timelines(cv2, canvas, frames, current_frame, box):
+    """Draw three synchronized final-decision bars under the source video."""
+    x1, y1, x2, y2 = box
+    rows = sorted(frames, key=lambda item: int(item.get("frame_index", 0)))
+    if not rows:
+        return
+    first = int(rows[0].get("frame_index", 0))
+    last = int(rows[-1].get("frame_index", first))
+    span = max(1, last - first)
+    label_width = 265
+    bar_left = x1 + label_width
+    lane_height = 32
+    lane_gap = 10
+    lane_names = ("LONGITUDINAL", "LATERAL", "SPEED CHANGE")
+    current_row = min(
+        rows,
+        key=lambda item: abs(int(item.get("frame_index", first)) - current_frame),
+    )
+    current_states = _ego_timeline_states(current_row)
+    cv2.putText(
+        canvas, "FINAL EGO STATE TIMELINE [7F]", (x1, y1 - 9),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (245, 247, 250), 2, cv2.LINE_AA,
+    )
+    for lane, (name, active_state) in enumerate(zip(lane_names, current_states)):
+        top = y1 + lane * (lane_height + lane_gap)
+        bottom = top + lane_height
+        cv2.rectangle(canvas, (x1, top), (x2, bottom), (25, 30, 38), -1)
+        cv2.putText(
+            canvas, f"{name}: {active_state}", (x1 + 8, top + 23),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            _EGO_STATE_COLORS.get(active_state, _EGO_STATE_COLORS["unknown"]),
+            2, cv2.LINE_AA,
+        )
+        for index, frame in enumerate(rows):
+            frame_id = int(frame.get("frame_index", first))
+            next_id = (
+                int(rows[index + 1].get("frame_index", frame_id + 1))
+                if index + 1 < len(rows) else last + 1
+            )
+            left = bar_left + int((frame_id - first) * (x2 - bar_left) / span)
+            right = bar_left + int((next_id - first) * (x2 - bar_left) / span)
+            right = max(bar_left, min(x2, right))
+            state = _ego_timeline_states(frame)[lane]
+            cv2.rectangle(
+                canvas, (left, top + 3), (max(left + 1, right), bottom - 3),
+                _EGO_STATE_COLORS.get(state, _EGO_STATE_COLORS["unknown"]), -1,
+            )
+        cv2.rectangle(canvas, (bar_left, top + 3), (x2, bottom - 3), (105, 112, 124), 1)
+        marker_x = bar_left + int((current_frame - first) * (x2 - bar_left) / span)
+        marker_x = max(bar_left, min(x2, marker_x))
+        cv2.line(canvas, (marker_x, top - 2), (marker_x, bottom + 2), (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.circle(canvas, (marker_x, top + 2), 5, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def _panel_text(cv2, canvas, text, x, y, color, scale=0.60, thickness=2, max_chars=54):
@@ -299,19 +479,219 @@ def _draw_complete_rule(cv2, canvas, rule, left, top, width, color):
     hypothesis = str(rule.get("hypothesis", "unknown"))
     cv2.putText(
         canvas, f"{hypothesis}(S) :-", (left, top + 20),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.47, color, 2, cv2.LINE_AA,
+        cv2.FONT_HERSHEY_SIMPLEX, 0.62, color, 2, cv2.LINE_AA,
     )
     atoms = list(rule.get("atoms", []))
     for atom_index, atom in enumerate(atoms[:4]):
         suffix = "," if atom_index < len(atoms) - 1 else "."
         text = _rule_atom_text(atom) + suffix
-        scale = 0.34
-        while cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] > width and scale > 0.25:
+        scale = 0.48
+        while cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0] > width and scale > 0.32:
             scale -= 0.02
         cv2.putText(
-            canvas, text, (left + 13, top + 40 + atom_index * 16),
-            cv2.FONT_HERSHEY_SIMPLEX, scale, (235, 240, 245), 1, cv2.LINE_AA,
+            canvas, text, (left + 13, top + 43 + atom_index * 22),
+            cv2.FONT_HERSHEY_SIMPLEX, scale, (235, 240, 245), 2, cv2.LINE_AA,
         )
+
+
+_EGO_LABEL_COLORS = {
+    "forward": (70, 220, 110),
+    "backward": (80, 120, 245),
+    "static": (180, 180, 180),
+    "left": (245, 175, 70),
+    "turning_left": (245, 175, 70),
+    "right": (220, 90, 225),
+    "turning_right": (220, 90, 225),
+    "unknown": (80, 84, 94),
+}
+
+
+def _label_segments_for_rule_stage(final_segments, rule_segments):
+    rules_by_id = {
+        int(row.get("segment_id", -1)): row for row in rule_segments
+    }
+    rows = []
+    for segment in final_segments:
+        candidate = dict(segment)
+        rule = rules_by_id.get(int(segment.get("segment_id", -1)), {})
+        scores = dict(rule.get("hypothesis_scores", {}))
+        candidate["action"] = (
+            max(scores.items(), key=lambda item: (float(item[1]), item[0]))[0]
+            if scores else segment.get("action_before_finalization", "unknown")
+        )
+        rows.append(candidate)
+    return rows
+
+
+def _label_segments_for_refined_stage(final_segments):
+    rows = []
+    for segment in final_segments:
+        candidate = dict(segment)
+        candidate["action"] = segment.get(
+            "action_before_finalization", segment.get("action", "unknown")
+        )
+        rows.append(candidate)
+    return rows
+
+
+def _segment_label_states(segment):
+    action = str(segment.get("action", "unknown"))
+    if action == "static":
+        return ("static", "static", "static")
+    if action == "backward":
+        return ("backward", "straight", "steady")
+    if action in {"left", "turning_left"}:
+        return ("forward", "left", "steady")
+    if action in {"right", "turning_right"}:
+        return ("forward", "right", "steady")
+    if action == "forward":
+        return ("forward", "straight", "steady")
+    return ("uncertain", "uncertain", "uncertain")
+
+
+
+def _compare_segment_label_sequences(reference, candidate, first, last):
+    changed_frames = []
+    for frame_index in range(first, last + 1):
+        reference_action = str(_segment_for_frame(reference, frame_index).get("action", "unknown"))
+        candidate_action = str(_segment_for_frame(candidate, frame_index).get("action", "unknown"))
+        if reference_action != candidate_action:
+            changed_frames.append(frame_index)
+    return {
+        "identical": not changed_frames,
+        "changed_frame_count": len(changed_frames),
+        "total_frame_count": max(0, last - first + 1),
+        "changed_frames": changed_frames,
+    }
+
+
+def _draw_label_version_panel(
+    cv2,
+    canvas,
+    provisional_segments,
+    provisional_frames,
+    final_segments,
+    rule_segments,
+    final_frames,
+    current_frame,
+):
+    """Show three synchronized ego-state lanes for every Step 7 version."""
+    left, right = 1140, 1900
+    cv2.rectangle(canvas, (1122, 0), (1919, 1079), (15, 19, 25), -1)
+    cv2.putText(
+        canvas, "EGO LABEL UPDATES: 3 STATE BARS", (left, 39),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.76, (248, 249, 252), 3, cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas, "longitudinal | lateral | speed change", (left, 65),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (165, 175, 188), 1, cv2.LINE_AA,
+    )
+    rule_labels = _label_segments_for_rule_stage(final_segments, rule_segments)
+    refined_labels = _label_segments_for_refined_stage(final_segments)
+    versions = (
+        ("7A", "ORIGINAL", provisional_frames, True, "original frame-level prediction"),
+        ("7D", "RULE UPDATE", rule_labels, False, "updated by 7D"),
+        ("7E", "REFINED", refined_labels, False, "compare with 7A"),
+        ("7F", "FINAL", final_frames, True, "validated by 7F"),
+    )
+    all_segments = list(provisional_segments) + list(final_segments)
+    first = min((int(row.get("start_frame", 0)) for row in all_segments), default=0)
+    last = max((int(row.get("end_frame", first)) for row in all_segments), default=first)
+    span = max(1, last - first)
+    refinement_comparison = _compare_segment_label_sequences(
+        provisional_segments, refined_labels, first, last
+    )
+    lane_names = ("LONG", "LAT", "SPEED")
+    row_top, row_height, row_gap = 82, 220, 20
+    for version_index, (step, title, records, frame_mode, provenance) in enumerate(versions):
+        top = row_top + version_index * (row_height + row_gap)
+        bottom = top + row_height
+        accent = (70, 180, 245) if version_index == 0 else (80, 225, 120)
+        if step == "7E":
+            current_7a = str(_segment_for_frame(provisional_segments, current_frame).get("action", "unknown"))
+            current_7e = str(_segment_for_frame(refined_labels, current_frame).get("action", "unknown"))
+            current_relation = "current changed" if current_7a != current_7e else "current identical"
+            if refinement_comparison["identical"]:
+                provenance = f"IDENTICAL TO 7A | {current_relation}"
+                accent = (80, 225, 120)
+            else:
+                provenance = (
+                    f"UPDATED FROM 7A | {current_relation} | "
+                    f"changed={refinement_comparison['changed_frame_count']}/"
+                    f"{refinement_comparison['total_frame_count']}"
+                )
+                accent = (70, 180, 245)
+        cv2.rectangle(canvas, (left, top), (right, bottom), (27, 33, 42), -1)
+        cv2.rectangle(canvas, (left, top), (left + 9, bottom), accent, -1)
+        cv2.putText(
+            canvas, f"{step} {title}", (left + 20, top + 28),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.61, accent, 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas, provenance, (left + 230, top + 27),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.46, (205, 212, 222), 1, cv2.LINE_AA,
+        )
+        if frame_mode:
+            current_record = min(
+                records or [{}],
+                key=lambda item: abs(int(item.get("frame_index", first)) - current_frame),
+            )
+            current_states = _ego_timeline_states(current_record)
+        else:
+            current_record = _segment_for_frame(records, current_frame)
+            current_states = _segment_label_states(current_record)
+        label_width = 215
+        bar_left, bar_right = left + label_width, right - 15
+        for lane, (lane_name, active_state) in enumerate(zip(lane_names, current_states)):
+            lane_top = top + 58 + lane * 49
+            lane_bottom = lane_top + 36
+            color = _EGO_LABEL_COLORS.get(
+                active_state, _EGO_STATE_COLORS.get(active_state, (80, 84, 94))
+            )
+            confidence_suffix = (
+                f" c={float(current_record.get('confidence', 0.0)):.2f}"
+                if frame_mode and lane == 0 else ""
+            )
+            cv2.putText(
+                canvas, f"{lane_name}: {active_state}{confidence_suffix}", (left + 18, lane_top + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.54, color, 2, cv2.LINE_AA,
+            )
+            cv2.rectangle(canvas, (bar_left, lane_top), (bar_right, lane_bottom), (58, 64, 75), -1)
+            if frame_mode:
+                ordered = sorted(records, key=lambda item: int(item.get("frame_index", first)))
+                for record_index, record in enumerate(ordered):
+                    frame_id = int(record.get("frame_index", first))
+                    next_id = (
+                        int(ordered[record_index + 1].get("frame_index", frame_id + 1))
+                        if record_index + 1 < len(ordered) else last + 1
+                    )
+                    state = _ego_timeline_states(record)[lane]
+                    x_start = bar_left + int((frame_id - first) * (bar_right - bar_left) / span)
+                    x_end = bar_left + int((next_id - first) * (bar_right - bar_left) / span)
+                    x_end = max(x_start + 1, min(bar_right, x_end))
+                    cv2.rectangle(
+                        canvas, (x_start, lane_top + 2), (x_end, lane_bottom - 2),
+                        _EGO_STATE_COLORS.get(state, _EGO_STATE_COLORS["unknown"]), -1,
+                    )
+            else:
+                for segment in records:
+                    segment_start = int(segment.get("start_frame", first))
+                    segment_end = int(segment.get("end_frame", segment_start))
+                    state = _segment_label_states(segment)[lane]
+                    x_start = bar_left + int((segment_start - first) * (bar_right - bar_left) / span)
+                    x_end = bar_left + int((segment_end + 1 - first) * (bar_right - bar_left) / span)
+                    x_start = max(bar_left, min(bar_right, x_start))
+                    x_end = max(x_start + 1, min(bar_right, x_end))
+                    cv2.rectangle(
+                        canvas, (x_start, lane_top + 2), (x_end, lane_bottom - 2),
+                        _EGO_STATE_COLORS.get(state, _EGO_STATE_COLORS["unknown"]), -1,
+                    )
+            marker = bar_left + int((current_frame - first) * (bar_right - bar_left) / span)
+            marker = max(bar_left, min(bar_right, marker))
+            cv2.line(
+                canvas, (marker, lane_top - 2), (marker, lane_bottom + 2),
+                (255, 255, 255), 2, cv2.LINE_AA,
+            )
 
 
 def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5):
@@ -351,8 +731,44 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
             skipped.append({"video_id": video_id, "reason": "missing_images"})
             continue
         path = output_root / f"{video_id}_ego_symbol_audit.mp4"
-        if path.exists() and path.stat().st_size > 0:
-            rendered.append({"video_id": video_id, "path": str(path), "cache_hit": True})
+        cache_metadata_path = path.with_suffix(".visual_cache.json")
+        source_metadata = []
+        for _, source_frame in available:
+            image_path = Path(str(source_frame.get("image_path", "")))
+            stat = image_path.stat()
+            source_metadata.append({
+                "frame_index": int(source_frame.get("frame_index", len(source_metadata))),
+                "image_path": str(image_path),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            })
+        visual_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "visualization_version": VISUALIZATION_VERSION,
+                    "final_video": final,
+                    "source_metadata": source_metadata,
+                    "fps": float(fps),
+                    "resolution": [1920, 1080],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()
+        ).hexdigest()
+        cached_visual = None
+        if path.exists() and path.stat().st_size > 0 and cache_metadata_path.exists():
+            try:
+                cached_visual = json.loads(cache_metadata_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached_visual = None
+        if cached_visual and cached_visual.get("visual_fingerprint") == visual_fingerprint:
+            rendered.append({
+                "video_id": video_id,
+                "path": str(path),
+                "cache_hit": True,
+                "visual_fingerprint": visual_fingerprint,
+            })
             continue
         writer = cv2.VideoWriter(
             str(path), cv2.VideoWriter_fourcc(*"mp4v"), max(0.1, float(fps)),
@@ -382,7 +798,7 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
                 continue
             canvas = np.full((1080, 1920, 3), (12, 15, 20), np.uint8)
             # Left column: intentionally clean source image, no boxes or flow overlays.
-            source_left, source_top, source_right, source_bottom = 0, 0, 1120, 665
+            source_left, source_top, source_right, source_bottom = 0, 0, 1120, 405
             scale = min(
                 (source_right - source_left) / image.shape[1],
                 (source_bottom - source_top) / image.shape[0],
@@ -398,6 +814,29 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
             cv2.putText(
                 canvas, f"ORIGINAL VIDEO   frame {frame_index}", (24, 48),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.92, (255, 255, 255), 2, cv2.LINE_AA,
+            )
+            current_signal_index = min(
+                range(len(frames)),
+                key=lambda index: abs(
+                    int(frames[index].get("frame_index", frame_index)) - frame_index
+                ),
+            )
+            ego_vx = [
+                item.get("signal_evidence", {}).get("ego_vx") for item in frames
+            ]
+            ego_vz = [
+                item.get("signal_evidence", {}).get("ego_vz") for item in frames
+            ]
+            _draw_signal_chart(
+                cv2, canvas, ego_vx, current_signal_index,
+                (24, 430, 550, 552), (90, 225, 255), "EGO vx [7F]",
+            )
+            _draw_signal_chart(
+                cv2, canvas, ego_vz, current_signal_index,
+                (569, 430, 1095, 552), (100, 245, 145), "EGO vz [7F]",
+            )
+            _draw_ego_state_timelines(
+                cv2, canvas, frames, frame_index, (24, 580, 1095, 716)
             )
 
             provisional = _segment_for_frame(provisional_segments, frame_index)
@@ -416,7 +855,7 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
             correction = final_segment.get("correction")
 
             if fired_rows:
-                rule_left, rule_top, rule_right, rule_bottom = 24, 690, 1095, 1058
+                rule_left, rule_top, rule_right, rule_bottom = 24, 735, 1095, 1058
                 cv2.rectangle(
                     canvas, (rule_left, rule_top), (rule_right, rule_bottom),
                     (24, 30, 38), -1,
@@ -427,11 +866,11 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
                 )
                 cv2.putText(
                     canvas, "FIRED RULES [7D]  HEAD + BODY", (rule_left + 25, rule_top + 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, colors["7D"], 2, cv2.LINE_AA,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.88, colors["7D"], 3, cv2.LINE_AA,
                 )
                 rule_cell_width = 510
-                rule_cell_height = 101
-                for rule_index, fired_rule in enumerate(fired_rows[:6]):
+                rule_cell_height = 128
+                for rule_index, fired_rule in enumerate(fired_rows[:4]):
                     column = rule_index % 2
                     row_index = rule_index // 2
                     cell_left = rule_left + 28 + column * 520
@@ -499,19 +938,39 @@ def render_mp4s(final_videos, position_by_video, output_root, fps=10.0, limit=5)
                 f"{final_action} | {final_status} | conf={float(row.get('confidence', 0)):.2f} "
                 f"| {correction_text}"
             )
-            row_tops = (32, 202, 372, 542, 712, 882)
-            _draw_step_block(cv2, canvas, row_tops[0], "7A", "INITIAL LABEL", summary_7a, colors["7A"])
-            _draw_step_block(cv2, canvas, row_tops[1], "7B", "PATCH EVIDENCE", summary_7b, colors["7B"])
-            _draw_step_block(cv2, canvas, row_tops[2], "7C", "NORMALIZATION", summary_7c, colors["7C"])
-            _draw_step_block(cv2, canvas, row_tops[3], "7D", "GLOBAL RULES", summary_7d, colors["7D"])
-            _draw_step_block(cv2, canvas, row_tops[4], "7E", "REFINEMENT", summary_7e, colors["7E"])
-            _draw_step_block(cv2, canvas, row_tops[5], "7F", "FINAL LABEL", summary_7f, colors["7F"])
+            _draw_label_version_panel(
+                cv2,
+                canvas,
+                provisional_segments,
+                list(final.get("provisional_frames", [])),
+                final_segments,
+                rule_segments,
+                frames,
+                frame_index,
+            )
             writer.write(canvas)
         writer.release()
-        rendered.append({"video_id": video_id, "path": str(path), "cache_hit": False})
+        cache_metadata_path.write_text(
+            json.dumps(
+                {
+                    "visualization_version": VISUALIZATION_VERSION,
+                    "visual_fingerprint": visual_fingerprint,
+                    "video_id": video_id,
+                    "path": str(path),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        rendered.append({
+            "video_id": video_id,
+            "path": str(path),
+            "cache_hit": False,
+            "visual_fingerprint": visual_fingerprint,
+        })
     return {
-        "version": 2,
-        "layout": "original_video_left_step7a_to_7f_key_value_table_right",
+        "version": VISUALIZATION_VERSION,
+        "layout": "original_video_signals_states_rules_left_three_lane_ego_state_versions_right",
         "resolution": [1920, 1080],
         "rendered": rendered,
         "skipped": skipped,

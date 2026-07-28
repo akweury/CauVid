@@ -134,7 +134,7 @@ def _estimator_agreement(segment, global_state):
     }
 
 
-def calibrate_video(raw_video):
+def calibrate_video(raw_video, preserve_raw_evidence=True):
     segments = list(raw_video.get("segments", []))
     vectors = [
         vector for segment in segments for vector in segment.get("patch_vectors", [])
@@ -252,6 +252,14 @@ def calibrate_video(raw_video):
             "method": "median_mad_with_iqr_and_degenerate_fallback",
             "motion_normalization": "segment_median_in_video_noise_scale_units",
             "uncertainty_aggregation": "unweighted_mean_of_bounded_measurement_components",
-            "raw_evidence_preserved": copy.deepcopy(raw_video),
+            "raw_evidence_preserved": (
+                copy.deepcopy(raw_video)
+                if preserve_raw_evidence
+                else {
+                    "video_id": str(raw_video.get("video_id", "")),
+                    "segments": [],
+                    "omitted_during_candidate_search": True,
+                }
+            ),
         },
     }

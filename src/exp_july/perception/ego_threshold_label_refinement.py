@@ -10,17 +10,20 @@ from src.exp_july.perception.global_ego_symbolic_rules import evaluate_video
 from src.exp_july.perception.video_local_evidence_calibration import calibrate_video
 
 
-VERSION = 1
+VERSION = 4
 MAX_ITERATIONS = 4
 
 
-def _candidate_segment_evidence(candidate_segments, raw_video):
-    pair_rows = []
+def _candidate_segment_evidence(candidate_segments, raw_video, pair_rows=None):
     cfg = dict(raw_video.get("configuration", {}))
     total_regions = max(1, int(cfg.get("region_rows", 3)) * int(cfg.get("region_cols", 3)))
-    for original in raw_video.get("segments", []):
-        pair_rows.extend(copy.deepcopy(original.get("frame_pair_evidence", [])))
-    pair_rows.sort(key=lambda row: (int(row.get("start_frame", 0)), int(row.get("end_frame", 0))))
+    if pair_rows is None:
+        pair_rows = [
+            pair
+            for original in raw_video.get("segments", [])
+            for pair in original.get("frame_pair_evidence", [])
+        ]
+        pair_rows.sort(key=lambda row: (int(row.get("start_frame", 0)), int(row.get("end_frame", 0))))
     results = []
     for candidate in candidate_segments:
         start = int(candidate.get("start_frame", 0))
@@ -36,7 +39,9 @@ def _candidate_segment_evidence(candidate_segments, raw_video):
         covered = sorted({str(vector.get("region_id", "unknown")) for vector in vectors})
         radial = Counter(str(vector.get("radial_state", "neutral")) for vector in vectors)
         denominator = max(1, len(vectors))
-        possible_pairs = max(1, end - start)
+        # Step 7B may sample frame pairs in eval-fast mode. Persistence must use
+        # attempted sampled pairs, not every theoretical consecutive frame pair.
+        possible_pairs = max(1, len(pairs))
         reliability = float(len(vectors) / max(1, raw_count))
         coverage = float(len(covered) / total_regions)
         persistence = float(len(reliable_pairs) / possible_pairs)
@@ -126,10 +131,12 @@ def _candidate_rule_metrics(rule_video):
     return hard_violations, float(soft_severity), unexplained, uncertain_segments
 
 
-def evaluate_candidate(video_id, candidate_score, raw_video):
+def evaluate_candidate(video_id, candidate_score, raw_video, pair_rows=None, preserve_raw_evidence=False):
     candidate_segments = list(candidate_score.get("segments", []))
-    resegmented = _candidate_segment_evidence(candidate_segments, raw_video)
-    calibrated = calibrate_video(resegmented)
+    resegmented = _candidate_segment_evidence(candidate_segments, raw_video, pair_rows=pair_rows)
+    calibrated = calibrate_video(
+        resegmented, preserve_raw_evidence=preserve_raw_evidence
+    )
     rule_video = evaluate_video(calibrated)
     hard, soft, unexplained, uncertain_segments = _candidate_rule_metrics(rule_video)
     components = dict(candidate_score.get("score_components", {}))
@@ -137,6 +144,10 @@ def evaluate_candidate(video_id, candidate_score, raw_video):
         int(hard),
         round(float(soft), 12),
         int(unexplained),
+        round(float(components.get("forward_backward_reversals", 0.0)), 12),
+        round(float(components.get("acceleration_deceleration_reversals", 0.0)), 12),
+        round(float(components.get("longitudinal_state_transitions", 0.0)), 12),
+        round(float(components.get("acceleration_state_transitions", 0.0)), 12),
         int(candidate_score.get("num_rapid_left_right_reversals", 0)),
         int(candidate_score.get("num_short_segments", 0)),
         round(float(components.get("action_complexity", 0.0)), 12),
@@ -152,6 +163,10 @@ def evaluate_candidate(video_id, candidate_score, raw_video):
         "soft_rule_violation_severity": float(soft),
         "unexplained_segments": int(unexplained),
         "rapid_state_reversals": int(candidate_score.get("num_rapid_left_right_reversals", 0)),
+        "longitudinal_state_transitions": int(candidate_score.get("num_longitudinal_state_transitions", 0)),
+        "forward_backward_reversals": int(candidate_score.get("num_forward_backward_reversals", 0)),
+        "acceleration_state_transitions": int(candidate_score.get("num_acceleration_state_transitions", 0)),
+        "acceleration_deceleration_reversals": int(candidate_score.get("num_acceleration_deceleration_reversals", 0)),
         "short_segments": int(candidate_score.get("num_short_segments", 0)),
         "action_complexity": float(components.get("action_complexity", 0.0)),
         "signal_fit_error": float(components.get("signal_fit_error", 0.0)),
@@ -162,17 +177,36 @@ def evaluate_candidate(video_id, candidate_score, raw_video):
         "source_candidate_score": {
             key: copy.deepcopy(value)
             for key, value in candidate_score.items()
-            if key not in {"actions", "segments"}
+            if key not in {"actions", "segments", "longitudinal_states", "speed_change_states"}
         },
     }
 
 
 def refine_video(video_id, candidate_scores, raw_video, provisional_video, max_iterations=MAX_ITERATIONS):
-    evaluated = [evaluate_candidate(video_id, row, raw_video) for row in candidate_scores]
+    pair_rows = [
+        pair
+        for original in raw_video.get("segments", [])
+        for pair in original.get("frame_pair_evidence", [])
+    ]
+    pair_rows.sort(key=lambda row: (int(row.get("start_frame", 0)), int(row.get("end_frame", 0))))
+    evaluated = [
+        evaluate_candidate(video_id, row, raw_video, pair_rows=pair_rows)
+        for row in candidate_scores
+    ]
     if not evaluated:
         raise RuntimeError(f"Step 7E generated no candidates for video {video_id}")
     evaluated.sort(key=lambda row: tuple(row["rank_key"]))
-    selected = evaluated[0]
+    selected_summary = evaluated[0]
+    selected = evaluate_candidate(
+        video_id,
+        next(
+            row for row in candidate_scores
+            if str(row.get("candidate_id")) == selected_summary["candidate_id"]
+        ),
+        raw_video,
+        pair_rows=pair_rows,
+        preserve_raw_evidence=True,
+    )
     history = []
     previous_signature = None
     stabilized = False
@@ -253,7 +287,7 @@ def refine_video(video_id, candidate_scores, raw_video, provisional_video, max_i
             }
             for candidate in evaluated
         ],
-        "selection_reason": "lexicographic_minimum: hard violations, soft severity, unexplained, reversals, short segments, complexity, signal fit",
+        "selection_reason": "lexicographic_minimum: hard violations, soft severity, unexplained, forward/backward reversals, acceleration/deceleration reversals, longitudinal transitions, acceleration transitions, left/right reversals, short segments, complexity, signal fit",
         "provenance": {
             "source_steps": ["7a", "7b", "7c", "7d"],
             "deterministic": True,

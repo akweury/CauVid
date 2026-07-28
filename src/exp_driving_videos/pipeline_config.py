@@ -65,6 +65,24 @@ def _load_output_root(*parts: str) -> Path:
     return out
 
 
+def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
+    cfg = _load_cfg_section(
+        {
+            "vx_seg_max_count": 8,
+            "vz_seg_max_count": 5,
+            "max_plateau_middle_th_vx": 250.0,
+            "max_plateau_middle_th_vz": 70.0,
+        },
+        path=("step7a_axis_threshold_segmentation",),
+        warn_label="Step 7A axis-threshold segmentation",
+    )
+    cfg["vx_seg_max_count"] = max(1, int(cfg.get("vx_seg_max_count", 8)))
+    cfg["vz_seg_max_count"] = max(1, int(cfg.get("vz_seg_max_count", 5)))
+    cfg["max_plateau_middle_th_vx"] = max(0.0, float(cfg.get("max_plateau_middle_th_vx", 250.0)))
+    cfg["max_plateau_middle_th_vz"] = max(0.0, float(cfg.get("max_plateau_middle_th_vz", 70.0)))
+    return cfg
+
+
 def get_ego_motion_smoothing_window(default: int = 5) -> int:
     try:
         cfg = _load_exp_driving_cfg()

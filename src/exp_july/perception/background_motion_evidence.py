@@ -24,12 +24,36 @@ DEFAULT_CONFIG = {
     "local_residual_mad_scale": 3.5,
     "radial_deadband_px": 0.05,
     "min_reliable_tracks_per_pair": 4,
+    "execution_profile": "train",
+    "frame_stride": 1,
+    "forward_backward_check": True,
+}
+
+PROFILE_CONFIGS = {
+    "train": {},
+    "eval-fast": {
+        "execution_profile": "eval-fast",
+        "frame_stride": 4,
+        "region_rows": 2,
+        "region_cols": 3,
+        "max_patches_per_region": 10,
+        "lk_max_level": 2,
+        "forward_backward_check": False,
+    },
 }
 
 
 def resolved_config(config=None):
+    supplied = dict(config or {})
+    profile = str(supplied.get("execution_profile", "train"))
+    if profile not in PROFILE_CONFIGS:
+        raise ValueError(
+            f"unknown Step 7 execution profile {profile!r}; "
+            f"expected one of {sorted(PROFILE_CONFIGS)}"
+        )
     result = dict(DEFAULT_CONFIG)
-    result.update(dict(config or {}))
+    result.update(PROFILE_CONFIGS[profile])
+    result.update(supplied)
     return result
 
 
@@ -162,12 +186,17 @@ def _track_pair(cv2, np, left_frame, right_frame, cfg):
     if forward is None:
         result["status"] = "forward_tracking_failed"
         return result
-    backward, status_backward, _ = cv2.calcOpticalFlowPyrLK(
-        right_gray, left_gray, forward, None, **lk
-    )
-    if backward is None:
-        result["status"] = "backward_tracking_failed"
-        return result
+    use_backward = bool(cfg.get("forward_backward_check", True))
+    if use_backward:
+        backward, status_backward, _ = cv2.calcOpticalFlowPyrLK(
+            right_gray, left_gray, forward, None, **lk
+        )
+        if backward is None:
+            result["status"] = "backward_tracking_failed"
+            return result
+    else:
+        backward = points
+        status_backward = np.ones_like(status_forward)
     height, width = left_gray.shape[:2]
     center_x, center_y = 0.5 * width, 0.5 * height
     candidates = []
@@ -178,8 +207,8 @@ def _track_pair(cv2, np, left_frame, right_frame, cfg):
         if not bool(status_forward[index]) or not bool(status_backward[index]):
             rejected["lk_status"] += 1
             continue
-        fb_error = float(np.linalg.norm(back - start))
-        if fb_error > float(cfg["forward_backward_error_px"]):
+        fb_error = float(np.linalg.norm(back - start)) if use_backward else 0.0
+        if use_backward and fb_error > float(cfg["forward_backward_error_px"]):
             rejected["forward_backward_error"] += 1
             continue
         x2, y2 = float(end[0]), float(end[1])
@@ -235,9 +264,12 @@ def _track_pair(cv2, np, left_frame, right_frame, cfg):
                 else "neutral"
             )
             row["provenance"] = {
-                "estimator": "sparse_lk_forward_backward",
+                "estimator": (
+                    "sparse_lk_forward_backward" if use_backward else "sparse_lk_forward"
+                ),
                 "independent_from_existing_ego_vz": True,
                 "object_bbox_excluded": True,
+                "forward_backward_check": use_backward,
             }
             accepted.append(row)
     result["patch_vectors"] = accepted
@@ -260,21 +292,23 @@ def extract_video_evidence(position_video, provisional_video, config=None):
     }
     segment_results = []
     total_regions = int(cfg["region_rows"]) * int(cfg["region_cols"])
+    stride = max(1, int(cfg.get("frame_stride", 1)))
     for segment in provisional_video.get("final_action_segments", []):
         start = int(segment.get("start_frame", 0))
         end = int(segment.get("end_frame", start))
         frame_ids = [index for index in sorted(frames) if start <= index <= end]
+        sampled_ids = frame_ids[::stride]
+        if len(frame_ids) > 1 and sampled_ids[-1] != frame_ids[-1]:
+            sampled_ids.append(frame_ids[-1])
         pairs = []
-        for left_id, right_id in zip(frame_ids, frame_ids[1:]):
-            if right_id != left_id + 1:
-                continue
+        for left_id, right_id in zip(sampled_ids, sampled_ids[1:]):
             pairs.append(_track_pair(cv2, np, frames[left_id], frames[right_id], cfg))
         vectors = [vector for pair in pairs for vector in pair["patch_vectors"]]
         reliable_pairs = [pair for pair in pairs if pair["status"] == "completed"]
         radial_counts = Counter(vector["radial_state"] for vector in vectors)
         vector_count = max(1, len(vectors))
         covered = sorted({region for pair in pairs for region in pair["covered_regions"]})
-        persistence = float(len(reliable_pairs) / max(1, len(frame_ids) - 1))
+        persistence = float(len(reliable_pairs) / max(1, len(pairs)))
         raw_count = sum(pair["raw_patch_count"] for pair in pairs)
         reliability = float(len(vectors) / max(1, raw_count))
         coverage = float(len(covered) / max(1, total_regions))
@@ -285,6 +319,8 @@ def extract_video_evidence(position_video, provisional_video, config=None):
             "start_frame": start,
             "end_frame": end,
             "duration_frames": int(segment.get("duration_frames", len(frame_ids))),
+            "sampled_frame_count": len(sampled_ids),
+            "sampled_pair_count": len(pairs),
             "status": "completed" if vectors else "insufficient_evidence",
             "patch_vectors": vectors,
             "frame_pair_evidence": pairs,
@@ -316,5 +352,6 @@ def extract_video_evidence(position_video, provisional_video, config=None):
         "segments": segment_results,
         "num_segments": len(segment_results),
         "num_patch_vectors": sum(row["num_accepted_vectors"] for row in segment_results),
+        "execution_profile": cfg["execution_profile"],
         "configuration": cfg,
     }

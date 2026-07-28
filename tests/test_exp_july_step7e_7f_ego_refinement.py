@@ -6,7 +6,12 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from src.exp_july.perception.ego_symbol_finalization import build_html, finalize_video, render_mp4s
+from src.exp_july.perception.ego_symbol_finalization import (
+    _compare_segment_label_sequences,
+    build_html,
+    finalize_video,
+    render_mp4s,
+)
 from src.exp_july.perception.ego_threshold_label_refinement import refine_video
 from src.exp_july.perception.pipeline import (
     step7e_threshold_label_refinement,
@@ -104,6 +109,26 @@ def _provisional():
 
 
 class Step7E7FEgoRefinementTests(unittest.TestCase):
+    def test_7e_visual_comparison_distinguishes_identical_and_updated_labels(self):
+        original = [
+            {"start_frame": 0, "end_frame": 4, "action": "forward"},
+            {"start_frame": 5, "end_frame": 9, "action": "left"},
+        ]
+        identical = _compare_segment_label_sequences(original, list(original), 0, 9)
+        self.assertTrue(identical["identical"])
+        self.assertEqual(identical["changed_frame_count"], 0)
+        updated = _compare_segment_label_sequences(
+            original,
+            [
+                {"start_frame": 0, "end_frame": 4, "action": "forward"},
+                {"start_frame": 5, "end_frame": 9, "action": "right"},
+            ],
+            0,
+            9,
+        )
+        self.assertFalse(updated["identical"])
+        self.assertEqual(updated["changed_frame_count"], 5)
+
     def test_backward_is_corrected_to_forward_by_rule_rank_and_stabilizes(self):
         result = refine_video(
             "demo",
@@ -133,6 +158,8 @@ class Step7E7FEgoRefinementTests(unittest.TestCase):
         self.assertEqual(final["frames"][0]["action"], "forward")
         self.assertGreater(final["frames"][0]["observable_cues"]["ego_driving_forward"], 0)
         self.assertEqual(final["provisional_segments"][0]["action"], "backward")
+        self.assertEqual(len(final["provisional_frames"]), 5)
+        self.assertEqual(final["provisional_frames"][0]["action"], "backward")
         self.assertTrue(final["final_action_segments"][0]["fired_rule_ids"])
         self.assertIn("Corrected provisional backward to forward", final["final_action_segments"][0]["correction_reason"])
         self.assertIn("candidate_rankings", final)
@@ -143,9 +170,11 @@ class Step7E7FEgoRefinementTests(unittest.TestCase):
         refinement = refine_video("demo", [_candidate("forward", "forward", 0.3)], raw, _provisional())
         self.assertEqual(refinement["refined_segments"][0]["validation_status"], "uncertain")
         final = finalize_video(refinement, _provisional())
-        self.assertEqual(final["frames"][0]["action"], "unknown")
+        self.assertEqual(final["frames"][0]["action"], "forward")
+        self.assertEqual(final["frames"][0]["prediction_status"], "soft_uncertain")
+        self.assertGreater(final["frames"][0]["confidence"], 0.0)
         self.assertEqual(final["frames"][0]["observable_cues"]["ego_motion_uncertain"], 1.0)
-        self.assertEqual(final["frames"][0]["observable_cues"]["ego_driving_forward"], 0.0)
+        self.assertEqual(final["frames"][0]["observable_cues"]["ego_driving_forward"], 1.0)
 
     def test_pipeline_stages_cache_and_replace_provisional_downstream_symbols(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,6 +234,22 @@ class Step7E7FEgoRefinementTests(unittest.TestCase):
             self.assertIn("threshold_changes", text)
             self.assertEqual(len(videos["rendered"]), 1)
             self.assertTrue(Path(videos["rendered"][0]["path"]).exists())
+            self.assertFalse(videos["rendered"][0]["cache_hit"])
+            cached = render_mp4s(
+                [final], {"demo": {"video_id": "demo", "frames": frames}},
+                root / "videos", fps=5,
+            )
+            self.assertTrue(cached["rendered"][0]["cache_hit"])
+            final["frames"][0]["confidence"] = 0.123
+            regenerated = render_mp4s(
+                [final], {"demo": {"video_id": "demo", "frames": frames}},
+                root / "videos", fps=5,
+            )
+            self.assertFalse(regenerated["rendered"][0]["cache_hit"])
+            self.assertNotEqual(
+                cached["rendered"][0]["visual_fingerprint"],
+                regenerated["rendered"][0]["visual_fingerprint"],
+            )
 
 
 if __name__ == "__main__":

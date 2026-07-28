@@ -17,6 +17,12 @@ merge_annotations:
   render_video: false
   use_dataset_annotations: false
 
+step7a_axis_threshold_segmentation:
+  vx_seg_max_count: 8
+  vz_seg_max_count: 5
+  max_plateau_middle_th_vx: 250
+  max_plateau_middle_th_vz: 70
+
 ego_motion:
   render_video: false
   smoothing_window: 5

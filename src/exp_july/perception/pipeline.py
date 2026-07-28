@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 
 _TRACKLET_REPAIR_VERSION = 1
-_EGO_SYMBOL_PRIOR_VERSION = 2
+_EGO_SYMBOL_PRIOR_VERSION = 7
 _EGO_CUE_NAMES = (
     "ego_static",
     "ego_driving_forward",
@@ -46,16 +46,26 @@ _EGO_SYMBOL_DEFAULT_CONFIG = {
     "candidate_static_speed_thresholds": [0.15, 0.25, 0.40],
     "candidate_lateral_thresholds": [0.08, 0.15, 0.30, 0.50],
     "candidate_yaw_thresholds": [0.015, 0.030, 0.060, 0.100],
+    "candidate_acceleration_thresholds": [0.06, 0.12, 0.20],
     "acceleration_threshold": 0.12,
     "min_short_segment_frames": 3,
     "rapid_reversal_window_frames": 6,
     "max_candidates": 64,
+    "threshold_search_rounds": 3,
+    "threshold_refinement_top_k": 3,
+    "threshold_refinement_factor": 0.5,
+    "step7e_expensive_candidate_limit": 8,
     "score_weights": {
         "signal_fit_error": 1.0,
         "state_transitions": 0.75,
         "short_segment_count": 1.25,
         "short_segment_duration": 0.75,
         "rapid_left_right_reversals": 1.50,
+        "longitudinal_state_transitions": 1.00,
+        "forward_backward_reversals": 2.00,
+        "acceleration_state_transitions": 0.75,
+        "acceleration_deceleration_reversals": 1.50,
+        "acceleration_signal_fit_error": 0.75,
         "action_complexity": 0.25,
     },
 }
@@ -3614,6 +3624,177 @@ def _reliable_reference_objects_video(evidence_video):
     }
 
 
+def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
+    """Create a deterministic video-level train/eval split before Step 7A."""
+    video_ids = sorted(
+        {str(video_id) for video_id in position_state.get("videos", []) if str(video_id)},
+        key=lambda video_id: (hashlib.sha256(video_id.encode("utf-8")).hexdigest(), video_id),
+    )
+    total_ratio = max(1, int(train_ratio) + int(eval_ratio))
+    if len(video_ids) <= 1:
+        eval_count = 0
+    else:
+        eval_count = max(1, int(round(len(video_ids) * int(eval_ratio) / total_ratio)))
+        eval_count = min(len(video_ids) - 1, eval_count)
+    eval_ids = sorted(video_ids[:eval_count])
+    train_ids = sorted(video_ids[eval_count:])
+    payload = {
+        "version": 1,
+        "stage": "07_train_eval_split",
+        "strategy": "deterministic_sha256_video_split",
+        "requested_ratio": "4:1",
+        "train_video_ids": train_ids,
+        "eval_video_ids": eval_ids,
+        "num_train_videos": len(train_ids),
+        "num_eval_videos": len(eval_ids),
+        "num_videos": len(video_ids),
+    }
+    output_root = get_pipeline_output_root() / "07_train_eval_split"
+    output_root.mkdir(parents=True, exist_ok=True)
+    split_path = output_root / "train_eval_split.json"
+    split_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(
+        f"[step 7 split] videos={len(video_ids)} train={len(train_ids)} "
+        f"eval={len(eval_ids)} ratio=4:1",
+        flush=True,
+    )
+    return {
+        **position_state,
+        "step7_train_eval_split": payload,
+        "step7_train_video_ids": train_ids,
+        "step7_eval_video_ids": eval_ids,
+        "step7_train_eval_split_path": str(split_path),
+    }
+
+
+def step7a_axis_threshold_segmentation(position_state):
+    """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
+    from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
+    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4
+
+    signal_state = step7_ego_motion(position_state)
+    ego_motion = list(signal_state.get("ego_motion", []))
+    step7a_config = driving_pipeline_config.get_step7a_axis_threshold_segmentation_cfg()
+    vx_seg_max_count = int(step7a_config["vx_seg_max_count"])
+    vz_seg_max_count = int(step7a_config["vz_seg_max_count"])
+    max_plateau_middle_th_vx = float(step7a_config["max_plateau_middle_th_vx"])
+    max_plateau_middle_th_vz = float(step7a_config["max_plateau_middle_th_vz"])
+    output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
+    output_root.mkdir(parents=True, exist_ok=True)
+    results = []
+    cached_videos = 0
+    for ego_video in tqdm(ego_motion, desc="[step 7a] axis_threshold_segmentation", unit="video"):
+        video_id = str(ego_video.get("video_id", ""))
+        source_fingerprint = hashlib.sha256(json.dumps(
+            ego_video.get("frames", []), sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
+        path = output_root / video_id / "axis_threshold_segmentation.json"
+        cached = None
+        if path.exists():
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+                if int(candidate.get("version", 0)) == VERSION and str(candidate.get("source_fingerprint", "")) == source_fingerprint:
+                    cached = candidate
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cached = None
+        recomputed = cached is None
+        if recomputed:
+            cached = segment_video(ego_video)
+            cached["source_fingerprint"] = source_fingerprint
+            path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            cached_videos += 1
+        chart_path = path.parent / "axis_threshold_segment_counts.png"
+        if recomputed or not chart_path.exists():
+            render_segment_count_chart(cached, chart_path)
+        cached["segment_count_chart"] = str(chart_path)
+        path.write_text(json.dumps(cached, indent=2), encoding="utf-8")
+        results.append(cached)
+    train_video_ids = set(position_state.get("step7_train_video_ids", []))
+    eval_video_ids = set(position_state.get("step7_eval_video_ids", []))
+    train_results = [row for row in results if str(row.get("video_id", "")) in train_video_ids]
+    eval_results = [row for row in results if str(row.get("video_id", "")) in eval_video_ids]
+    # Compatibility fallback for direct Step 7A calls without the pre-split stage.
+    if not train_results and not eval_results:
+        train_results = results
+    overall_scatter = render_all_video_plateau_scatter(
+        train_results,
+        output_root / "all_videos_plateau_scatter.png",
+        eval_results=eval_results,
+        vx_seg_max_count=vx_seg_max_count,
+        vz_seg_max_count=vz_seg_max_count,
+        max_plateau_middle_th_vx=max_plateau_middle_th_vx,
+        max_plateau_middle_th_vz=max_plateau_middle_th_vz,
+    )
+    ego_by_video = {str(row.get("video_id", "")): row for row in ego_motion}
+    visualization_mp4s = []
+    for result in tqdm(eval_results, desc="[step 7a] eval visualization MP4", unit="video"):
+        video_id = str(result.get("video_id", ""))
+        visualization_path = output_root / video_id / "axis_segmentation_visualization.mp4"
+        visualization_fingerprint = hashlib.sha256(json.dumps({
+            "version": VERSION,
+            "visualization_layout": "eval_only_all_video_scatter_v2",
+            "source_fingerprint": result.get("source_fingerprint"),
+            "confidence_points": [row for row in overall_scatter.get("points", []) if str(row.get("video_id", "")) == video_id],
+        }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+        cached_visual = result.get("visualization", {})
+        if (visualization_path.exists() and cached_visual.get("status") == "rendered"
+                and cached_visual.get("source_fingerprint") == visualization_fingerprint):
+            visual = cached_visual
+        else:
+            visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path)
+            visual["source_fingerprint"] = visualization_fingerprint
+        result["visualization"] = visual
+        visualization_mp4s.append(visual)
+        (output_root / video_id / "axis_threshold_segmentation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    manifest = {
+        "version": VERSION,
+        "stage": "7a_ego_axis_threshold_segmentation",
+        "method": "multi_plateau_segment_count_stability",
+        "num_videos": len(results),
+        "num_frames": sum(int(row.get("num_frames", 0)) for row in results),
+        "threshold_candidates_per_axis": 100,
+        "vx_seg_max_count": vx_seg_max_count,
+        "vz_seg_max_count": vz_seg_max_count,
+        "max_plateau_middle_th_vx": max_plateau_middle_th_vx,
+        "max_plateau_middle_th_vz": max_plateau_middle_th_vz,
+        "configuration": step7a_config,
+        "train_eval_split": copy.deepcopy(position_state.get("step7_train_eval_split", {})),
+        "cached_videos": cached_videos,
+        "segment_count_charts": [str(row.get("segment_count_chart", "")) for row in results],
+        "visualization_scope": "eval_videos_only",
+        "num_visualized_eval_videos": len(visualization_mp4s),
+        "visualization_mp4s": visualization_mp4s,
+        "num_qualifying_plateaus": sum(
+            len(row.get(axis, {}).get("qualifying_plateaus", []))
+            for row in results for axis in ("vx_segmentation", "vz_segmentation")
+        ),
+        "all_videos_plateau_scatter": overall_scatter,
+    }
+    manifest_path = output_root / "axis_threshold_segmentation_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        f"[step 7a] axis_threshold_segmentation videos={manifest['num_videos']} "
+        f"frames={manifest['num_frames']} candidates=100x2 "
+        f"plateaus={manifest['num_qualifying_plateaus']} cached={cached_videos} "
+        f"scatter={overall_scatter['path']}",
+        flush=True,
+    )
+    return {
+        **position_state,
+        **signal_state,
+        "step7_status": "7a_only",
+        "step7_substeps": ["7a_axis_threshold_segmentation"],
+        "ego_axis_threshold_segmentation": results,
+        "ego_axis_threshold_segmentation_manifest": manifest,
+        "ego_axis_threshold_segmentation_manifest_path": str(manifest_path),
+        "ego_axis_threshold_segmentation_output_root": output_root,
+        "ego_symbol_prior": [],
+        "final_ego_symbols": [],
+    }
+
+
+
 def _median(values):
     vals = sorted(_safe_float(value) for value in values if math.isfinite(_safe_float(value)))
     if not vals:
@@ -4449,6 +4630,7 @@ def _ego_symbol_config(config=None):
         "candidate_static_speed_thresholds",
         "candidate_lateral_thresholds",
         "candidate_yaw_thresholds",
+        "candidate_acceleration_thresholds",
     ):
         values = sorted(
             {
@@ -4461,6 +4643,14 @@ def _ego_symbol_config(config=None):
             raise ValueError(f"Step 7A requires at least one positive value for {key}")
         merged[key] = values
     merged["max_candidates"] = max(1, int(merged.get("max_candidates", 64)))
+    merged["threshold_search_rounds"] = max(1, int(merged.get("threshold_search_rounds", 3)))
+    merged["threshold_refinement_top_k"] = max(1, int(merged.get("threshold_refinement_top_k", 3)))
+    merged["step7e_expensive_candidate_limit"] = max(
+        1, int(merged.get("step7e_expensive_candidate_limit", 8))
+    )
+    merged["threshold_refinement_factor"] = float(merged.get("threshold_refinement_factor", 0.5))
+    if not 0.0 < merged["threshold_refinement_factor"] < 1.0:
+        raise ValueError("threshold_refinement_factor must be between 0 and 1")
     merged["min_short_segment_frames"] = max(
         1, int(merged.get("min_short_segment_frames", 3))
     )
@@ -4560,7 +4750,13 @@ def _ego_action(sample, thresholds):
         return "forward"
     if vz < -thresholds["static_speed_threshold"]:
         return "backward"
-    return "unknown"
+    # A valid low-margin signal should remain a soft numerical prediction.
+    # Symbolic evidence may lower confidence later, but must not erase its sign.
+    if vz > 1e-9:
+        return "forward"
+    if vz < -1e-9:
+        return "backward"
+    return "static"
 
 
 def _contiguous_action_segments(samples, actions):
@@ -4628,6 +4824,69 @@ def _within_action_signal_fit_error(samples, actions):
     return float(max(0.0, min(1.0, numerator / denominator)))
 
 
+
+def _transition_counts(states, reversal_pair):
+    valid = [state for state in states if state != "unknown"]
+    transitions = sum(left != right for left, right in zip(valid, valid[1:]))
+    reversals = sum(
+        {left, right} == set(reversal_pair)
+        for left, right in zip(valid, valid[1:])
+    )
+    return transitions, reversals
+
+
+def _longitudinal_states(samples, thresholds):
+    states = []
+    for sample in samples:
+        if not sample.get("available", False):
+            states.append("unknown")
+        elif float(sample.get("ego_speed", 0.0)) <= thresholds["static_speed_threshold"]:
+            states.append("static")
+        elif float(sample.get("ego_vz", 0.0)) > 1e-9:
+            states.append("forward")
+        elif float(sample.get("ego_vz", 0.0)) < -1e-9:
+            states.append("backward")
+        else:
+            states.append("static")
+    return states
+
+
+def _speed_change_states(samples, acceleration_threshold):
+    states = []
+    for sample in samples:
+        delta = sample.get("ego_speed_delta")
+        if not sample.get("available", False) or delta is None:
+            states.append("unknown")
+        elif float(delta) > acceleration_threshold:
+            states.append("accelerating")
+        elif float(delta) < -acceleration_threshold:
+            states.append("decelerating")
+        else:
+            states.append("steady")
+    return states
+
+
+def _speed_change_fit_error(samples, states):
+    valid = [
+        (float(sample["ego_speed_delta"]), state)
+        for sample, state in zip(samples, states)
+        if sample.get("ego_speed_delta") is not None and state != "unknown"
+    ]
+    if len(valid) <= 1:
+        return 0.0
+    values = [value for value, _ in valid]
+    mean = sum(values) / len(values)
+    total = sum((value - mean) ** 2 for value in values)
+    if total <= 1e-12:
+        return 0.0
+    residual = 0.0
+    for state in {state for _, state in valid}:
+        grouped = [value for value, current in valid if current == state]
+        group_mean = sum(grouped) / len(grouped)
+        residual += sum((value - group_mean) ** 2 for value in grouped)
+    return float(max(0.0, min(1.0, residual / total)))
+
+
 def _score_ego_threshold_candidate(samples, thresholds, config, candidate_id):
     actions = [_ego_action(sample, thresholds) for sample in samples]
     segments = _contiguous_action_segments(samples, actions)
@@ -4655,6 +4914,30 @@ def _score_ego_threshold_candidate(samples, thresholds, config, candidate_id):
             <= config["rapid_reversal_window_frames"]
         ):
             reversals += 1
+    longitudinal_states = _longitudinal_states(samples, thresholds)
+    longitudinal_transitions, forward_backward_reversals = _transition_counts(
+        longitudinal_states, ("forward", "backward")
+    )
+    acceleration_options = []
+    for acceleration_threshold in config["candidate_acceleration_thresholds"]:
+        speed_change_states = _speed_change_states(samples, acceleration_threshold)
+        acceleration_transitions, acceleration_reversals = _transition_counts(
+            speed_change_states, ("accelerating", "decelerating")
+        )
+        fit_error = _speed_change_fit_error(samples, speed_change_states)
+        normalized_transition = acceleration_transitions / max(1, frame_count - 1)
+        normalized_reversal = acceleration_reversals / max(1, frame_count - 1)
+        acceleration_options.append((
+            fit_error + 0.75 * normalized_transition + 1.5 * normalized_reversal,
+            float(acceleration_threshold),
+            speed_change_states,
+            acceleration_transitions,
+            acceleration_reversals,
+            fit_error,
+        ))
+    acceleration_options.sort(key=lambda row: (row[0], row[1]))
+    _, selected_acceleration_threshold, speed_change_states, acceleration_transitions, acceleration_reversals, acceleration_fit_error = acceleration_options[0]
+    thresholds = {**thresholds, "acceleration_threshold": selected_acceleration_threshold}
     unique_actions = {
         action for action in actions if action not in {"unknown"}
     }
@@ -4669,6 +4952,19 @@ def _score_ego_threshold_candidate(samples, thresholds, config, candidate_id):
         "rapid_left_right_reversals": float(
             reversals / max(1, len(directional_segments) - 1)
         ),
+        "longitudinal_state_transitions": float(
+            longitudinal_transitions / max(1, frame_count - 1)
+        ),
+        "forward_backward_reversals": float(
+            forward_backward_reversals / max(1, frame_count - 1)
+        ),
+        "acceleration_state_transitions": float(
+            acceleration_transitions / max(1, frame_count - 1)
+        ),
+        "acceleration_deceleration_reversals": float(
+            acceleration_reversals / max(1, frame_count - 1)
+        ),
+        "acceleration_signal_fit_error": float(acceleration_fit_error),
         "action_complexity": float(
             0.5 * len(unique_actions) / 7.0
             + 0.5 * len(segments) / frame_count
@@ -4694,23 +4990,98 @@ def _score_ego_threshold_candidate(samples, thresholds, config, candidate_id):
             int(segment["duration_frames"]) for segment in short_segments
         ),
         "num_rapid_left_right_reversals": reversals,
+        "num_longitudinal_state_transitions": longitudinal_transitions,
+        "num_forward_backward_reversals": forward_backward_reversals,
+        "num_acceleration_state_transitions": acceleration_transitions,
+        "num_acceleration_deceleration_reversals": acceleration_reversals,
+        "longitudinal_states": longitudinal_states,
+        "speed_change_states": speed_change_states,
         "action_counts": dict(sorted(counts.items())),
         "actions": actions,
         "segments": segments,
     }
 
 
-def _select_ego_thresholds(samples, config):
+def _threshold_axis_step(values):
+    ordered = sorted(set(float(value) for value in values))
+    gaps = [right - left for left, right in zip(ordered, ordered[1:]) if right > left]
+    return min(gaps) if gaps else max(1e-4, ordered[0] * 0.5)
+
+
+def _coarse_to_fine_ego_candidate_scores(samples, config):
+    """Generate deterministic, label-aware threshold candidates over several rounds."""
+    axes = {
+        "static_speed_threshold": config["candidate_static_speed_thresholds"],
+        "lateral_threshold": config["candidate_lateral_thresholds"],
+        "yaw_threshold": config["candidate_yaw_thresholds"],
+    }
+    base_steps = {key: _threshold_axis_step(values) for key, values in axes.items()}
     scores = []
-    for index, thresholds in enumerate(_ego_threshold_candidates(config)):
-        scores.append(
-            _score_ego_threshold_candidate(
+    seen_thresholds = set()
+    seen_label_sequences = set()
+
+    def add_round(threshold_rows, round_index, parents):
+        round_scores = []
+        for thresholds in sorted(
+            threshold_rows,
+            key=lambda row: tuple(float(row[key]) for key in sorted(axes)),
+        )[: config["max_candidates"]]:
+            signature = tuple(round(float(thresholds[key]), 12) for key in sorted(axes))
+            if signature in seen_thresholds:
+                continue
+            seen_thresholds.add(signature)
+            candidate = _score_ego_threshold_candidate(
                 samples,
                 thresholds,
                 config,
-                candidate_id=f"ego_threshold_{index:03d}",
+                candidate_id=f"ego_threshold_r{round_index}_{len(scores) + len(round_scores):04d}",
             )
-        )
+            label_signature = (
+                tuple(candidate["actions"]),
+                tuple(candidate["speed_change_states"]),
+            )
+            if label_signature in seen_label_sequences:
+                continue
+            seen_label_sequences.add(label_signature)
+            candidate["search_round"] = round_index
+            candidate["parent_candidate_ids"] = list(parents)
+            candidate["refinement_steps"] = {
+                key: float(base_steps[key] * config["threshold_refinement_factor"] ** round_index)
+                for key in axes
+            }
+            round_scores.append(candidate)
+        scores.extend(round_scores)
+        return round_scores
+
+    current = add_round(_ego_threshold_candidates(config), 0, [])
+    for round_index in range(1, config["threshold_search_rounds"]):
+        parents = sorted(
+            current or scores,
+            key=lambda row: (float(row["score"]), row["candidate_id"]),
+        )[: config["threshold_refinement_top_k"]]
+        proposals = []
+        for parent in parents:
+            center = parent["thresholds"]
+            axis_values = []
+            for key in sorted(axes):
+                step = base_steps[key] * config["threshold_refinement_factor"] ** round_index
+                axis_values.append((key, [max(1e-9, float(center[key]) + delta * step) for delta in (-1, 0, 1)]))
+            for static_value in axis_values[1][1]:
+                for lateral_value in axis_values[0][1]:
+                    for yaw_value in axis_values[2][1]:
+                        proposals.append({
+                            "static_speed_threshold": static_value,
+                            "lateral_threshold": lateral_value,
+                            "yaw_threshold": yaw_value,
+                        })
+        current = add_round(proposals, round_index, [row["candidate_id"] for row in parents])
+        if not current:
+            break
+    return scores
+
+
+def _select_ego_thresholds(samples, config):
+    scores = _coarse_to_fine_ego_candidate_scores(samples, config)
     if not scores:
         raise RuntimeError("Step 7A generated no threshold candidates")
     selected = min(scores, key=lambda row: (float(row["score"]), row["candidate_id"]))
@@ -4718,75 +5089,104 @@ def _select_ego_thresholds(samples, config):
 
 
 def _ego_symbol_prior_video(ego_video, config=None):
-    """Select and freeze per-video thresholds before producing ego cues."""
+    """Segment ego-vz with constrained change-point dynamic programming."""
+    from src.exp_july.perception.ego_vz_change_point_segmentation import segment_ego_vz
+
     resolved_config = _ego_symbol_config(config)
     samples = _ego_continuous_samples(ego_video)
-    selected, candidate_scores = _select_ego_thresholds(samples, resolved_config)
-    selected_thresholds = dict(selected["thresholds"])
-    acceleration_threshold = float(resolved_config["acceleration_threshold"])
+    segmentation = segment_ego_vz(samples, resolved_config)
+    segments = list(segmentation["segments"])
+    action_by_sample = {}
+    segment_by_sample = {}
+    for segment in segments:
+        for sample_index in segment.get("sample_indices", []):
+            action_by_sample[int(sample_index)] = str(segment["state"])
+            segment_by_sample[int(sample_index)] = segment
+    static_bands = [
+        float(segment["adaptive_static_band"])
+        for segment in segments
+        if segment.get("adaptive_static_band") is not None
+    ]
+    static_band = _median(static_bands) if static_bands else float(
+        resolved_config.get("static_band_floor", 0.05)
+    )
+    selected_thresholds = {
+        "static_speed_threshold": float(static_band),
+        # Compatibility-only fields for the existing 7E/7F interface. They do
+        # not participate in Step 7A longitudinal state assignment.
+        "lateral_threshold": float(resolved_config["candidate_lateral_thresholds"][0]),
+        "yaw_threshold": float(resolved_config["candidate_yaw_thresholds"][0]),
+        "acceleration_threshold": float(resolved_config["acceleration_threshold"]),
+    }
+    acceleration_threshold = selected_thresholds["acceleration_threshold"]
     output_frames = []
-    for sample, action in zip(samples, selected["actions"]):
+    for sample_index, sample in enumerate(samples):
+        action = action_by_sample.get(sample_index, "unknown")
+        segment = segment_by_sample.get(sample_index, {})
         cues = {name: 0.0 for name in _EGO_CUE_NAMES}
-        if action == "unknown":
-            cues["ego_motion_uncertain"] = 1.0
-        elif action == "static":
+        cues["ego_motion_uncertain"] = (
+            1.0 if action == "unknown"
+            else float(max(0.0, min(1.0, 1.0 - float(segment.get("confidence", 0.0)))))
+        )
+        if action == "static":
             cues["ego_static"] = 1.0
-        else:
-            vz = float(sample.get("ego_vz", 0.0))
-            if vz > selected_thresholds["static_speed_threshold"]:
-                cues["ego_driving_forward"] = 1.0
-            elif vz < -selected_thresholds["static_speed_threshold"]:
-                cues["ego_driving_backward"] = 1.0
-            if action in {"left", "turning_left"}:
-                cues["ego_turning_left"] = 1.0
-            elif action in {"right", "turning_right"}:
-                cues["ego_turning_right"] = 1.0
-            else:
-                cues["ego_straight"] = 1.0
+        elif action == "forward":
+            cues["ego_driving_forward"] = 1.0
+            cues["ego_straight"] = 1.0
+        elif action == "backward":
+            cues["ego_driving_backward"] = 1.0
+            cues["ego_straight"] = 1.0
+        if action not in {"unknown", "static"}:
             delta = sample.get("ego_speed_delta")
             if delta is not None and float(delta) > acceleration_threshold:
                 cues["ego_accelerating"] = 1.0
             elif delta is not None and float(delta) < -acceleration_threshold:
                 cues["ego_decelerating"] = 1.0
-        output_frames.append(
-            {
-                "frame_index": int(sample["frame_index"]),
-                "action": action,
-                "observable_cues": cues,
-                "signal_evidence": {
-                    key: sample.get(key)
-                    for key in (
-                        "ego_vx",
-                        "ego_vz",
-                        "ego_yaw_rate",
-                        "ego_speed",
-                        "ego_speed_delta",
-                    )
-                },
-            }
-        )
+        output_frames.append({
+            "frame_index": int(sample["frame_index"]),
+            "action": action,
+            "confidence": float(segment.get("confidence", 0.0)),
+            "segment_id": segment.get("segment_id"),
+            "observable_cues": cues,
+            "signal_evidence": {
+                key: sample.get(key)
+                for key in ("ego_vx", "ego_vz", "ego_yaw_rate", "ego_speed", "ego_speed_delta")
+            },
+        })
     aggregate = {
-        name: float(
-            sum(frame["observable_cues"][name] for frame in output_frames)
-            / max(1, len(output_frames))
-        )
+        name: float(sum(frame["observable_cues"][name] for frame in output_frames) / max(1, len(output_frames)))
         for name in _EGO_CUE_NAMES
     }
-    audit = (
-        f"Selected {selected['candidate_id']} with minimum global score "
-        f"{selected['score']:.6f} from {len(candidate_scores)} deterministic "
-        "threshold candidates. The score combines within-segment signal fit, "
-        "state transitions, short-segment count and duration, rapid left-right "
-        "reversals, and overall action complexity. Thresholds are frozen for "
-        "this run and use no Step 8 object evidence."
+    run_audits = []
+    seen_run_audits = set()
+    for segment in segments:
+        run_audit = segment.get("run_audit", {})
+        identity = id(run_audit)
+        if not run_audit or identity in seen_run_audits:
+            continue
+        seen_run_audits.add(identity)
+        members = [row for row in segments if row.get("run_audit") is run_audit]
+        run_audits.append({
+            **copy.deepcopy(run_audit),
+            "start_frame": min(int(row["start_frame"]) for row in members),
+            "end_frame": max(int(row["end_frame"]) for row in members),
+        })
+    objective = float(sum(float(row.get("objective", 0.0)) for row in run_audits))
+    audit_explanation = (
+        f"Constrained change-point dynamic programming segmented ego_vz into {len(segments)} "
+        f"segments using robust prefix-statistic fitting, an additional-segment penalty, "
+        f"minimum length {segmentation['configuration']['min_segment_length']}, and pruned "
+        "candidate boundaries. States use an adaptive video-local static band; direct "
+        "forward/backward transitions are forbidden, adjacent identical states are merged, "
+        "and high residual variance is represented by lower confidence."
     )
-    speed_values = [
-        float(sample["ego_speed"])
-        for sample in samples
-        if sample.get("ego_speed") is not None
-    ]
+    speed_values = [float(sample["ego_speed"]) for sample in samples if sample.get("ego_speed") is not None]
     speed_median = _median(speed_values)
     speed_mad = _median([abs(value - speed_median) for value in speed_values])
+    public_segments = [
+        {key: copy.deepcopy(value) for key, value in segment.items() if key not in {"sample_indices", "run_audit"}}
+        for segment in segments
+    ]
     return {
         "version": _EGO_SYMBOL_PRIOR_VERSION,
         "video_id": str(ego_video.get("video_id", "")),
@@ -4802,26 +5202,45 @@ def _ego_symbol_prior_video(ego_video, config=None):
         "aggregate_cues": aggregate,
         "selected_threshold": copy.deepcopy(selected_thresholds),
         "selected_thresholds": copy.deepcopy(selected_thresholds),
-        "selected_candidate_id": selected["candidate_id"],
-        "selected_candidate_score": float(selected["score"]),
-        "candidate_scores": [
-            {key: copy.deepcopy(value) for key, value in row.items() if key not in {"actions", "segments"}}
-            for row in candidate_scores
-        ],
-        "final_action_segments": [
-            {key: copy.deepcopy(value) for key, value in segment.items() if key != "sample_indices"}
-            for segment in selected["segments"]
-        ],
-        "audit_explanation": audit,
-        "configuration": copy.deepcopy(resolved_config),
+        "selected_candidate_id": "ego_vz_constrained_dp",
+        "selected_candidate_score": objective,
+        "candidate_scores": [{
+            "candidate_id": "ego_vz_constrained_dp",
+            "thresholds": copy.deepcopy(selected_thresholds),
+            "score": objective,
+            "search_round": 0,
+            "num_segments": len(public_segments),
+            "num_transitions": max(0, len(public_segments) - 1),
+            "method": segmentation["method"],
+        }],
+        "final_action_segments": public_segments,
+        "change_point_segmentation": {
+            "method": segmentation["method"],
+            "global_noise_scale": segmentation["global_noise_scale"],
+            "boundaries": [
+                {"segment_id": segment["segment_id"], "start_frame": segment["start_frame"], "end_frame": segment["end_frame"]}
+                for segment in public_segments
+            ],
+            "segments": copy.deepcopy(public_segments),
+            "runs": run_audits,
+            "provenance": {
+                "source_step": "07_ego_motion",
+                "source_signal": "ego_vz",
+                "implementation_version": 1,
+                "deterministic": True,
+            },
+        },
+        "audit_explanation": audit_explanation,
+        "configuration": copy.deepcopy(segmentation["configuration"]),
         "calibration": {
-            "static_speed_band": float(selected_thresholds["static_speed_threshold"]),
-            "lateral_turn_band": float(selected_thresholds["lateral_threshold"]),
-            "yaw_turn_band": float(selected_thresholds["yaw_threshold"]),
+            "static_speed_band": float(static_band),
+            "lateral_turn_band": selected_thresholds["lateral_threshold"],
+            "yaw_turn_band": selected_thresholds["yaw_threshold"],
             "acceleration_band": acceleration_threshold,
             "speed_median": float(speed_median),
             "speed_mad": float(speed_mad),
-            "selection_method": "minimum_global_temporal_segmentation_score",
+            "ego_vz_noise_scale": float(segmentation["global_noise_scale"]),
+            "selection_method": "constrained_change_point_dynamic_programming",
         },
     }
 
@@ -4891,7 +5310,7 @@ def step7a_ego_symbol_prior(ego_state, config=None):
         "role": "provisional_ego_symbol_hypothesis",
         "label_status": "provisional",
         "downstream_usable_as_final": False,
-        "threshold_selection": "per_video_minimum_global_score",
+        "threshold_selection": "adaptive_static_band_from_constrained_change_points",
         "config_fingerprint": config_fingerprint,
         "selected_thresholds_by_video": {
             str(row.get("video_id", "")): copy.deepcopy(
@@ -4906,7 +5325,7 @@ def step7a_ego_symbol_prior(ego_state, config=None):
     print(
         f"[step 7a] ego_symbol_prior videos={manifest['num_videos']} "
         f"frames={manifest['num_frames']} cached={cached_videos} "
-        f"thresholds=per_video_auto"
+        f"segmentation=constrained_dp"
     )
     return {
         **ego_state,
@@ -4997,6 +5416,7 @@ def step7b_background_motion_evidence(position_state, ego_symbol_state, config=N
         "num_segments": sum(int(row.get("num_segments", 0)) for row in results),
         "num_patch_vectors": sum(int(row.get("num_patch_vectors", 0)) for row in results),
         "cached_videos": cached_videos,
+        "execution_profile": cfg["execution_profile"],
         "configuration": cfg,
     }
     manifest_path = output_root / "background_motion_evidence_manifest.json"
@@ -5004,7 +5424,8 @@ def step7b_background_motion_evidence(position_state, ego_symbol_state, config=N
     print(
         f"[step 7b] background_motion_evidence videos={manifest['num_videos']} "
         f"segments={manifest['num_segments']} patches={manifest['num_patch_vectors']} "
-        f"cached={cached_videos}",
+        f"cached={cached_videos} profile={cfg['execution_profile']} "
+        f"stride={cfg['frame_stride']}",
         flush=True,
     )
     return {
@@ -5164,6 +5585,40 @@ def step7d_global_symbolic_rule_evaluation(calibrated_state):
     }
 
 
+
+def _shortlist_step7e_candidates(candidates, selected_candidate_id, limit):
+    """Keep a deterministic, round-diverse shortlist for expensive evidence evaluation."""
+    ordered = sorted(
+        candidates,
+        key=lambda row: (
+            float(row.get("score", float("inf"))),
+            int(row.get("num_forward_backward_reversals", 0)),
+            int(row.get("num_acceleration_deceleration_reversals", 0)),
+            str(row.get("candidate_id", "")),
+        ),
+    )
+    by_id = {str(row.get("candidate_id", "")): row for row in ordered}
+    selected = []
+    seen = set()
+
+    def add(row):
+        if row is None:
+            return
+        candidate_id = str(row.get("candidate_id", ""))
+        if candidate_id and candidate_id not in seen:
+            seen.add(candidate_id)
+            selected.append(row)
+
+    add(by_id.get(str(selected_candidate_id)))
+    for round_index in sorted({int(row.get("search_round", 0)) for row in ordered}):
+        add(next((row for row in ordered if int(row.get("search_round", 0)) == round_index), None))
+    for row in ordered:
+        if len(selected) >= max(1, int(limit)):
+            break
+        add(row)
+    return selected[: max(1, int(limit))]
+
+
 def step7e_threshold_label_refinement(rule_state):
     """Search bounded thresholds until labels and thresholds stabilize."""
     from src.exp_july.perception.ego_threshold_label_refinement import VERSION, refine_video
@@ -5181,15 +5636,19 @@ def step7e_threshold_label_refinement(rule_state):
         raw_video = raw_by_video.get(video_id, {"video_id": video_id, "segments": []})
         config = _ego_symbol_config(provisional.get("configuration", {}))
         samples = list(provisional.get("continuous_signals", []))
-        candidates = [
-            _score_ego_threshold_candidate(samples, thresholds, config, f"ego_threshold_{index:03d}")
-            for index, thresholds in enumerate(_ego_threshold_candidates(config))
-        ]
+        generated_candidates = _coarse_to_fine_ego_candidate_scores(samples, config)
+        candidates = _shortlist_step7e_candidates(
+            generated_candidates,
+            provisional.get("selected_candidate_id"),
+            config["step7e_expensive_candidate_limit"],
+        )
         source_fingerprint = _step8_cache_fingerprint({
-            "schema": "step7e-threshold-label-refinement-v1",
+            "schema": "step7e-threshold-label-refinement-v2",
             "provisional": provisional,
             "raw_evidence": raw_video,
-            "candidate_thresholds": [row["thresholds"] for row in candidates],
+            "generated_candidate_thresholds": [row["thresholds"] for row in generated_candidates],
+            "evaluated_candidate_ids": [row["candidate_id"] for row in candidates],
+            "expensive_candidate_limit": config["step7e_expensive_candidate_limit"],
             "max_iterations": max_iterations,
         })
         path = output_root / video_id / "threshold_label_refinement.json"
@@ -5204,19 +5663,31 @@ def step7e_threshold_label_refinement(rule_state):
         if cached is not None:
             cached_videos += 1; results.append(cached); continue
         result = refine_video(video_id, candidates, raw_video, provisional, max_iterations=max_iterations)
+        result["generated_candidate_count"] = len(generated_candidates)
+        result["evaluated_candidate_count"] = len(candidates)
+        result["expensive_candidate_limit"] = config["step7e_expensive_candidate_limit"]
         result["source_fingerprint"] = source_fingerprint
         path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(result, indent=2), encoding="utf-8"); results.append(result)
     manifest = {
         "version": VERSION, "stage": "7e_threshold_label_refinement", "deterministic": True,
         "num_videos": len(results), "cached_videos": cached_videos,
+        "num_generated_candidates": sum(int(row.get("generated_candidate_count", len(row.get("candidate_rankings", [])))) for row in results),
         "num_candidates": sum(len(row.get("candidate_rankings", [])) for row in results),
+        "expensive_candidate_limit": max((int(row.get("expensive_candidate_limit", 0)) for row in results), default=0),
         "num_corrections": sum(len(row.get("corrections", [])) for row in results),
         "num_uncertain_segments": sum(len(row.get("uncertain_segments", [])) for row in results),
         "num_stabilized": sum(bool(row.get("stabilized")) for row in results),
         "max_iterations": max_iterations,
     }
     manifest_path = output_root / "threshold_label_refinement_manifest.json"; manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"[step 7e] threshold_label_refinement videos={manifest['num_videos']} candidates={manifest['num_candidates']} corrections={manifest['num_corrections']} uncertain={manifest['num_uncertain_segments']} stabilized={manifest['num_stabilized']} cached={cached_videos}", flush=True)
+    print(
+        f"[step 7e] threshold_label_refinement videos={manifest['num_videos']} "
+        f"generated={manifest['num_generated_candidates']} evaluated={manifest['num_candidates']} "
+        f"limit={manifest['expensive_candidate_limit']} corrections={manifest['num_corrections']} "
+        f"uncertain={manifest['num_uncertain_segments']} stabilized={manifest['num_stabilized']} "
+        f"cached={cached_videos}",
+        flush=True,
+    )
     return {**rule_state, "ego_threshold_label_refinement": results, "ego_threshold_label_refinement_manifest": manifest, "ego_threshold_label_refinement_manifest_path": str(manifest_path), "ego_threshold_label_refinement_output_root": output_root}
 
 

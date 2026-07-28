@@ -10,8 +10,9 @@ media, and audit artifacts.
 
 ```text
 1 Init → 2 Detection → 3 Tracking → 6 3D Positions → 7 Ego Motion
-→ 7A Ego Symbol Prior → 8 Trajectory Repair → 8A Relative Motion → Threshold Epoch
-→ 8B Signal Evidence → 8C Pattern/Cohort Repair → 8D Validation
+→ 7 Empty → 7 Train/Eval Split → 7A Axis Threshold Segmentation
+→ 8 Trajectory Repair → 8A Relative Motion → 8B Signal Evidence
+→ 8C Pattern/Cohort Repair → 8D Validation
 → 8E Semantic Protection → 8F Final Validation → 8G Ego Refinement
 → 8H Visualization → 8I Threshold Calibration
 → 9 Segmentation → 10 Segment Motion → 11–18 Rule Learning/Refinement
@@ -59,33 +60,77 @@ recomputation.
 
 **Output directory:** `06_driving_mini_3d_positions/`
 
-### Step 7 — Ego-motion estimation
-
-Estimates camera/ego motion over time from the Step 6 geometry and stores
-frame-level ego-motion signals and uncertainty. Valid per-video caches are
-reused.
-
-**Output directory:** `07_driving_mini_ego_motion/`
-
-### Step 7A — Ego-symbol prior
+### Step 7 — Empty
 
 ```text
-Step 7 vx/vz/yaw → bounded threshold search → temporal action segments
-→ minimum global score → frozen frame-aligned ego-cue prior
+Step 6 geometry → empty Step 7 → 4:1 video split → Step 7A → Step 8
 ```
 
-Threshold candidates and scoring weights are configuration-driven. Each video
-stores its continuous signals, selected threshold bundle, per-candidate score
-components, final contiguous action segments, and deterministic audit explanation.
+Step 7 itself is empty. The former 7B–7F pipeline remains disabled. Step 7A is
+the only active Step 7 substep and obtains the continuous ego signals internally.
 
-| Output group | Symbols |
+### Pre-7A — Train/evaluation split
+
+```text
+videos → deterministic SHA-256 ordering → train/eval split (4:1)
+```
+
+The split is performed at video level and saved to
+`07_train_eval_split/train_eval_split.json`. Training videos fit the dense
+plateau region; evaluation videos are used only for held-out scoring.
+
+### Step 7A — Axis threshold segmentation
+
+```text
+ego vx/vz → 100 N values → temporal-segment counts → stable plateaus
+→ candidate middle N → train confidence heat map → eval confidence
+```
+
+| Axis | Below `-N` | `[-N, N]` | Above `N` |
+|---|---|---|---|
+| `vz` | `backward` | `static` | `forward` |
+| `vx` | `right` | `straight` | `left` |
+
+Plateaus must span more than five sampled `N` values and produce more than one
+temporal segment. Every retained plateau contributes its middle `N`; Step 7A
+does not select one final threshold.
+
+| Configuration | Default |
+|---|---:|
+| `vx_seg_max_count` | 8 |
+| `vz_seg_max_count` | 5 |
+| `max_plateau_middle_th_vx` | 250 |
+| `max_plateau_middle_th_vz` | 70 |
+
+Points exceeding either axis-specific limit remain visible but are disabled
+and colored gray. Enabled training points fit the normalized Gaussian confidence
+function `c(middle N, temporal segments)`. Evaluation points do not affect the
+fit and are scored using `mean_eval_confidence`.
+
+| Output | Content |
 |---|---|
-| Motion state | `ego_static`, `ego_driving_forward`, `ego_driving_backward` |
-| Direction | `ego_turning_left`, `ego_turning_right`, `ego_straight` |
-| Speed change | `ego_accelerating`, `ego_decelerating` |
-| Uncertainty | `ego_motion_uncertain` |
+| Per-video JSON | thresholds, segment counts, plateaus, middle `N`, candidate segments |
+| Per-video PNG | 1×2 `vx`/`vz` plateau charts |
+| Overall PNG | 1×2 confidence heat maps with train, eval, and disabled points |
+| Scatter audit | confidence surfaces, point confidence, limits, split, eval metric |
 
-**Output directory:** `07a_ego_symbol_prior/`
+**MP4 audit visualization:** `<video_id>/axis_segmentation_visualization.mp4`
+
+The MP4 is generated only for evaluation-split videos. It uses a two-panel
+layout: original frames on the left, synchronized ego `vx` and `vz` plots below
+them (with bright dashed zero references), and `vx` / `vz` segment-label
+timelines on the right. The right panel also embeds the all-video `vx` and `vz`
+plateau scatter charts; the current evaluation video's points are emphasized
+with cyan stars. A white marker follows the current frame. State colors
+distinguish right, straight, left, backward, static, and forward. Because Step
+7A retains multiple threshold plateaus, the timeline uses
+the highest-confidence enabled plateau for display only; the selected display
+threshold and confidence are recorded without changing pipeline decisions.
+
+**Output directory:** `07a_ego_axis_threshold_segmentation/`
+
+Artifacts: `<video_id>/axis_threshold_segment_counts.png` and
+`all_videos_plateau_scatter.png`.
 
 ## Step 8 — High-level flow
 

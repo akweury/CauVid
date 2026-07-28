@@ -11,13 +11,8 @@ from src.exp_july.perception import step1_init
 from src.exp_july.perception import step2_detection
 from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
-from src.exp_july.perception import step7_ego_motion
-from src.exp_july.perception import step7a_ego_symbol_prior
-from src.exp_july.perception import step7b_background_motion_evidence
-from src.exp_july.perception import step7c_video_local_evidence_calibration
-from src.exp_july.perception import step7d_global_symbolic_rule_evaluation
-from src.exp_july.perception import step7e_threshold_label_refinement
-from src.exp_july.perception import step7f_ego_symbol_finalization
+from src.exp_july.perception import step7_train_eval_split
+from src.exp_july.perception import step7a_axis_threshold_segmentation
 from src.exp_july.perception import step8_trajectory_repair
 from src.exp_july.perception import step8a_relative_object_motion
 from src.exp_july.perception import step8b_signal_evidence
@@ -171,6 +166,13 @@ def _step_data_error(step_name, state):
         if int(manifest.get("num_frames", 0) or 0) <= 0:
             return "produced zero ego-symbol-prior frames"
 
+    if step_name == "07a_axis_threshold_segmentation":
+        manifest = state.get("ego_axis_threshold_segmentation_manifest", {})
+        if int(manifest.get("num_videos", 0) or 0) <= 0:
+            return "produced no axis-threshold-segmentation videos"
+        if int(manifest.get("num_frames", 0) or 0) <= 0:
+            return "produced zero axis-threshold-segmentation frames"
+
     if step_name == "08_trajectory_repair":
         repaired = state.get("positions_3d", state.get("tracklet_repair", []))
         if not repaired:
@@ -289,7 +291,16 @@ def _tracked_step(tracker, step_name, operation):
     )
 
 
-def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
+def _run_pipeline(
+    video_ids,
+    video_count,
+    rounds,
+    max_step,
+    tracker,
+    step7_profile="eval-fast",
+    step7_threshold_search_rounds=3,
+    step7e_expensive_candidate_limit=8,
+):
     # Step 1: initialize dataset scope and selected videos.
     env = _tracked_step(
         tracker,
@@ -321,47 +332,32 @@ def _run_pipeline(video_ids, video_count, rounds, max_step, tracker):
     )
     if max_step <= 6:
         return position_state
-    # Step 7: estimate ego motion signals.
-    ego_state = _tracked_step(
-        tracker, "07_ego_motion", lambda: step7_ego_motion(position_state)
-    )
+    # Step 7: intentionally empty. The former 7/7A-7F ego-motion pipeline is
+    # archived but not executed. Preserve the Step 6 payload for Step 8 and
+    # expose explicit empty fields so downstream consumers never reuse stale
+    # ego-motion or ego-symbol results.
+    ego_final_state = {
+        **position_state,
+        "step7_status": "empty",
+        "step7_substeps": [],
+        "ego_motion": [],
+        "ego_symbol_prior": [],
+        "final_ego_symbols": [],
+    }
     if max_step <= 7:
-        return ego_state
-    # Step 7A: freeze an initial ego-symbol prior before object processing.
-    ego_symbol_state = _tracked_step(
+        return ego_final_state
+    # Split videos before Step 7A. Density is fitted on train videos and
+    # evaluated only on held-out evaluation videos.
+    step7_split_state = _tracked_step(
         tracker,
-        "07a_ego_symbol_prior",
-        lambda: step7a_ego_symbol_prior(ego_state),
+        "07_train_eval_split",
+        lambda: step7_train_eval_split(position_state),
     )
-    # Step 7B: extract independent background motion evidence for provisional labels.
-    ego_evidence_state = _tracked_step(
-        tracker,
-        "07b_background_motion_evidence",
-        lambda: step7b_background_motion_evidence(position_state, ego_symbol_state),
-    )
-    # Step 7C: calibrate raw background evidence within each video.
-    ego_calibrated_state = _tracked_step(
-        tracker,
-        "07c_video_local_evidence_calibration",
-        lambda: step7c_video_local_evidence_calibration(ego_evidence_state),
-    )
-    # Step 7D: evaluate shared symbolic rules over normalized evidence.
-    ego_rule_state = _tracked_step(
-        tracker,
-        "07d_global_symbolic_rule_evaluation",
-        lambda: step7d_global_symbolic_rule_evaluation(ego_calibrated_state),
-    )
-    # Step 7E: refine thresholds and labels in a deterministic rule loop.
-    ego_refined_state = _tracked_step(
-        tracker,
-        "07e_threshold_label_refinement",
-        lambda: step7e_threshold_label_refinement(ego_rule_state),
-    )
-    # Step 7F: publish only validated final ego symbols and audit artifacts.
+    # Step 7A: the only active Step 7 analysis substep.
     ego_final_state = _tracked_step(
         tracker,
-        "07f_ego_symbol_finalization",
-        lambda: step7f_ego_symbol_finalization(position_state, ego_refined_state),
+        "07a_axis_threshold_segmentation",
+        lambda: step7a_axis_threshold_segmentation(step7_split_state),
     )
     # Step 8: repair trajectories first; split events receive new track IDs.
     repaired_state = _tracked_step(
@@ -523,6 +519,9 @@ def main(
     video_count=None,
     rounds=3,
     max_step=18,
+    step7_profile="eval-fast",
+    step7_threshold_search_rounds=3,
+    step7e_expensive_candidate_limit=8,
     *,
     wandb_enabled=None,
     wandb_project=None,
@@ -547,7 +546,10 @@ def main(
     )
     try:
         result = _run_pipeline(
-            video_ids, video_count, rounds, max_step, tracker
+            video_ids, video_count, rounds, max_step, tracker,
+            step7_profile=step7_profile,
+            step7_threshold_search_rounds=step7_threshold_search_rounds,
+            step7e_expensive_candidate_limit=step7e_expensive_candidate_limit,
         )
     except BaseException as exc:
         tracker.finish(status="failed", error=exc)
@@ -562,6 +564,24 @@ def _parse_args():
     parser.add_argument("--video-count", type=int, default=None, help="Limit the run to this many videos")
     parser.add_argument("--rounds", type=int, default=3, help="Number of causal refinement rounds")
     parser.add_argument("--max-step", type=int, default=18, help="Highest pipeline step to execute")
+    parser.add_argument(
+        "--step7-profile",
+        choices=("eval-fast", "train"),
+        default="eval-fast",
+        help="Deprecated compatibility option; Step 7 is currently empty",
+    )
+    parser.add_argument(
+        "--step7-threshold-search-rounds",
+        type=int,
+        default=3,
+        help="Deprecated compatibility option; Step 7 is currently empty",
+    )
+    parser.add_argument(
+        "--step7e-expensive-candidate-limit",
+        type=int,
+        default=8,
+        help="Deprecated compatibility option; Step 7 is currently empty",
+    )
     wandb_group = parser.add_mutually_exclusive_group()
     wandb_group.add_argument("--wandb", dest="wandb_enabled", action="store_true", help="Enable W&B tracking")
     wandb_group.add_argument("--no-wandb", dest="wandb_enabled", action="store_false", help="Disable W&B tracking")
@@ -579,6 +599,9 @@ if __name__ == "__main__":
         video_count=args.video_count,
         rounds=args.rounds,
         max_step=args.max_step,
+        step7_profile=args.step7_profile,
+        step7_threshold_search_rounds=max(1, args.step7_threshold_search_rounds),
+        step7e_expensive_candidate_limit=max(1, args.step7e_expensive_candidate_limit),
         wandb_enabled=args.wandb_enabled,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
