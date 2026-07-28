@@ -3670,7 +3670,7 @@ def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
 def step7a_axis_threshold_segmentation(position_state):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
-    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4
+    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4, render_eval_signal_segmentation_chart
 
     signal_state = step7_ego_motion(position_state)
     ego_motion = list(signal_state.get("ego_motion", []))
@@ -3736,15 +3736,21 @@ def step7a_axis_threshold_segmentation(position_state):
     )
     ego_by_video = {str(row.get("video_id", "")): row for row in ego_motion}
     visualization_mp4s = []
-    for result in tqdm(eval_results, desc="[step 7a] eval visualization MP4", unit="video"):
+    signal_segmentation_charts = []
+    for result in tqdm(eval_results, desc="[step 7a] eval visualizations", unit="video"):
         video_id = str(result.get("video_id", ""))
         visualization_path = output_root / video_id / "axis_segmentation_visualization.mp4"
+        signal_chart_path = output_root / video_id / "axis_signal_segmentation.png"
         visualization_fingerprint = hashlib.sha256(json.dumps({
             "version": VERSION,
-            "visualization_layout": "eval_only_all_video_scatter_v2",
+            "visualization_layout": "eval_only_three_column_all_enabled_segmentations_v4",
             "source_fingerprint": result.get("source_fingerprint"),
             "confidence_points": [row for row in overall_scatter.get("points", []) if str(row.get("video_id", "")) == video_id],
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
+        signal_chart_fingerprint = hashlib.sha256(json.dumps({
+            "visualization_fingerprint": visualization_fingerprint,
+            "signal_chart_layout": "k_by_2_all_enabled_threshold_segmentations_v2",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         cached_visual = result.get("visualization", {})
         if (visualization_path.exists() and cached_visual.get("status") == "rendered"
                 and cached_visual.get("source_fingerprint") == visualization_fingerprint):
@@ -3752,8 +3758,17 @@ def step7a_axis_threshold_segmentation(position_state):
         else:
             visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path)
             visual["source_fingerprint"] = visualization_fingerprint
+        cached_signal_chart = result.get("signal_segmentation_chart", {})
+        if (signal_chart_path.exists() and cached_signal_chart.get("status") == "rendered"
+                and cached_signal_chart.get("source_fingerprint") == signal_chart_fingerprint):
+            signal_chart = cached_signal_chart
+        else:
+            signal_chart = render_eval_signal_segmentation_chart(result, overall_scatter, signal_chart_path)
+            signal_chart["source_fingerprint"] = signal_chart_fingerprint
         result["visualization"] = visual
+        result["signal_segmentation_chart"] = signal_chart
         visualization_mp4s.append(visual)
+        signal_segmentation_charts.append(signal_chart)
         (output_root / video_id / "axis_threshold_segmentation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     manifest = {
         "version": VERSION,
@@ -3775,6 +3790,8 @@ def step7a_axis_threshold_segmentation(position_state):
         "visualization_scope": "eval_videos_only",
         "num_visualized_eval_videos": len(visualization_mp4s),
         "visualization_mp4s": visualization_mp4s,
+        "num_signal_segmentation_charts": len(signal_segmentation_charts),
+        "signal_segmentation_charts": signal_segmentation_charts,
         "num_qualifying_plateaus": sum(
             len(row.get(axis, {}).get("qualifying_plateaus", []))
             for row in results for axis in ("vx_segmentation", "vz_segmentation")

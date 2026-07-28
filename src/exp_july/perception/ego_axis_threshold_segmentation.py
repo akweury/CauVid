@@ -291,7 +291,7 @@ def render_segment_count_chart(result, output_path):
     return str(output_path)
 
 
-def _confidence_surface(rows, grid_size=90):
+def _confidence_surface(rows, grid_size=90, bounds=None):
     """Fit normalized Gaussian confidence c(middle_N, segment_count)."""
     if not rows:
         return None
@@ -310,10 +310,13 @@ def _confidence_surface(rows, grid_size=90):
     factor = count ** (-1.0 / 6.0)
     bandwidth_x = max(float(np.std(x_values)) * factor, x_reference / 25.0, 1e-6)
     bandwidth_y = max(float(np.std(y_values)) * factor, y_reference / 25.0, 0.15)
-    x_min = float(np.min(x_values) - 2.5 * bandwidth_x)
-    x_max = float(np.max(x_values) + 2.5 * bandwidth_x)
-    y_min = float(np.min(y_values) - 2.5 * bandwidth_y)
-    y_max = float(np.max(y_values) + 2.5 * bandwidth_y)
+    if bounds is None:
+        x_min = float(np.min(x_values) - 2.5 * bandwidth_x)
+        x_max = float(np.max(x_values) + 2.5 * bandwidth_x)
+        y_min = float(np.min(y_values) - 2.5 * bandwidth_y)
+        y_max = float(np.max(y_values) + 2.5 * bandwidth_y)
+    else:
+        x_min, x_max, y_min, y_max = (float(value) for value in bounds)
     x_grid = np.linspace(x_min, x_max, max(30, int(grid_size)))
     y_grid = np.linspace(y_min, y_max, max(30, int(grid_size)))
     grid_x, grid_y = np.meshgrid(x_grid, y_grid)
@@ -388,6 +391,15 @@ def render_all_video_plateau_scatter(
         "vx": max(0.0, float(max_plateau_middle_th_vx)),
         "vz": max(0.0, float(max_plateau_middle_th_vz)),
     }
+    plot_limits = {
+        signal_axis: {
+            "x_min": 0.0,
+            "x_max": 1.2 * midpoint_limits[signal_axis],
+            "y_min": 0.0,
+            "y_max": 1.2 * axis_limits[signal_axis],
+        }
+        for signal_axis in ("vx", "vz")
+    }
 
     def collect(source_results, split):
         rows = []
@@ -422,7 +434,11 @@ def render_all_video_plateau_scatter(
         train_enabled = [row for row in rows if row["split"] == "train" and row["enabled"]]
         eval_enabled = [row for row in rows if row["split"] == "eval" and row["enabled"]]
         disabled_rows = [row for row in rows if not row["enabled"]]
-        model = _confidence_surface(train_enabled)
+        limits = plot_limits[signal_axis]
+        model = _confidence_surface(
+            train_enabled,
+            bounds=(limits["x_min"], limits["x_max"], limits["y_min"], limits["y_max"]),
+        )
         confidence_regions[signal_axis] = None if model is None else model["audit"]
         if model is not None:
             heatmap = plot_axis.contourf(
@@ -470,6 +486,8 @@ def render_all_video_plateau_scatter(
         )
         plot_axis.axhline(axis_limits[signal_axis], color="#666666", linestyle="--", linewidth=1.3)
         plot_axis.axvline(midpoint_limits[signal_axis], color="#999999", linestyle=":", linewidth=1.5)
+        plot_axis.set_xlim(limits["x_min"], limits["x_max"])
+        plot_axis.set_ylim(limits["y_min"], limits["y_max"])
         plot_axis.set_title(f"{signal_axis.upper()} confidence | train={len(train_enabled)} | eval={len(eval_enabled)}", fontsize=14, fontweight="bold")
         plot_axis.set_xlabel("Plateau middle threshold N", fontsize=12)
         plot_axis.set_ylabel("Number of temporal segments at N", fontsize=12)
@@ -486,6 +504,7 @@ def render_all_video_plateau_scatter(
         "max_plateau_middle_th_vx": midpoint_limits["vx"],
         "max_plateau_middle_th_vz": midpoint_limits["vz"],
         "max_plateau_middle_threshold_by_axis": dict(midpoint_limits),
+        "plot_limits_by_axis": plot_limits,
         "confidence_regions": confidence_regions,
         "evaluation_metrics": evaluation_metrics,
         "num_points": len(points),

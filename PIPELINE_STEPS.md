@@ -116,23 +116,34 @@ segments must be longer than the configured tolerance.
 Points exceeding either axis-specific limit remain visible but are disabled
 and colored gray. Enabled training points fit the normalized Gaussian confidence
 function `c(middle N, temporal segments)`. Evaluation points do not affect the
-fit and are scored using `mean_eval_confidence`.
+fit and are scored using `mean_eval_confidence`. Each confidence heat map uses
+fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
+`max_plateau_middle_th_v*` on x and `v*_seg_max_count` on y.
 
 | Output | Content |
 |---|---|
 | Per-video JSON | thresholds, segment counts, plateaus, middle `N`, candidate segments |
 | Per-video PNG | 1×2 `vx`/`vz` plateau charts |
+| Per-eval-video signal PNG | k×2 matrix of all enabled `vx`/`vz` thresholds, with one candidate per row, state-colored segment backgrounds, and dashed `±N` label thresholds |
 | Overall PNG | 1×2 confidence heat maps with train, eval, and disabled points |
 | Scatter audit | confidence surfaces, point confidence, limits, split, eval metric |
 
 **MP4 audit visualization:** `<video_id>/axis_segmentation_visualization.mp4`
 
-The MP4 is generated only for evaluation-split videos. It uses a two-panel
-layout: original frames on the left, synchronized ego `vx` and `vz` plots below
-them (with bright dashed zero references), and `vx` / `vz` segment-label
-timelines on the right. The right panel also embeds the all-video `vx` and `vz`
-plateau scatter charts; the current evaluation video's points are emphasized
-with cyan stars. A white marker follows the current frame. State colors
+**Evaluation signal chart:** `<video_id>/axis_signal_segmentation.png`
+
+The signal chart uses `vx` and `vz` as its two columns. Its row count `k` is
+the larger enabled-candidate count across the two axes; if the counts differ,
+unused cells are explicitly marked. Candidates are ordered by increasing `N`.
+
+The MP4 is generated only for evaluation-split videos. It uses a three-column
+layout: original frames with synchronized ego `vx` and `vz` plots in the left
+column (with bright dashed zero references), all enabled `vx` / `vz` threshold
+candidates and their colored segmentation timelines stacked by increasing `N`
+in the middle column, and vertically stacked all-video `vx` / `vz` plateau
+scatter charts in the right column. The current evaluation video's scatter
+points are emphasized with cyan stars. Every middle-column row identifies its
+threshold and confidence, and a white marker follows the current frame. State colors
 distinguish right, straight, left, backward, static, and forward. Because Step
 7A retains multiple threshold plateaus, the timeline uses
 the highest-confidence enabled plateau for display only; the selected display

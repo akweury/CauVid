@@ -202,6 +202,13 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             self.assertEqual(audit["max_plateau_middle_th_vx"], 0.5)
             self.assertEqual(audit["max_plateau_middle_th_vz"], 100.0)
             self.assertEqual(
+                audit["plot_limits_by_axis"],
+                {
+                    "vx": {"x_min": 0.0, "x_max": 0.6, "y_min": 0.0, "y_max": 118.8},
+                    "vz": {"x_min": 0.0, "x_max": 120.0, "y_min": 0.0, "y_max": 118.8},
+                },
+            )
+            self.assertEqual(
                 audit["num_disabled_points"],
                 sum(
                     row["midpoint_n"] > (0.5 if row["axis"] == "vx" else 100.0)
@@ -235,6 +242,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
                     self.assertIsNotNone(region)
                     self.assertEqual(region["training_point_count"], enabled_count)
                     self.assertEqual(region["peak_confidence"], 1.0)
+                    self.assertEqual(region["bounds"], audit["plot_limits_by_axis"][axis])
                 else:
                     self.assertIsNone(region)
                 metric = audit["evaluation_metrics"][axis]
