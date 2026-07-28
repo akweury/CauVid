@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 9
+VERSION = 10
 NUM_THRESHOLDS = 100
 
 
@@ -70,6 +70,47 @@ def _segments(frames, axis, threshold, labels):
     return rows
 
 
+def filter_short_state_interruptions(segments, tolerance_frames):
+    """Bridge short state interruptions between two persistent equal-state segments."""
+    tolerance = max(0, int(tolerance_frames))
+    rows = [dict(row) for row in segments]
+    if tolerance <= 0 or len(rows) < 3:
+        return rows
+    changed = True
+    while changed:
+        changed = False
+        for left_index, left in enumerate(rows[:-2]):
+            if int(left.get("duration_frames", 0)) <= tolerance:
+                continue
+            for right_index in range(left_index + 2, len(rows)):
+                right = rows[right_index]
+                interruption_frames = int(right["start_frame"]) - int(left["end_frame"]) - 1
+                if interruption_frames > tolerance:
+                    break
+                if (right.get("state") == left.get("state")
+                        and int(right.get("duration_frames", 0)) > tolerance):
+                    merged = dict(left)
+                    merged["end_frame"] = int(right["end_frame"])
+                    merged["duration_frames"] = merged["end_frame"] - int(merged["start_frame"]) + 1
+                    merged["noise_filter_merged"] = True
+                    merged["absorbed_interruption_frames"] = interruption_frames
+                    merged["absorbed_states"] = [str(row.get("state", "")) for row in rows[left_index + 1:right_index]]
+                    rows[left_index:right_index + 1] = [merged]
+                    changed = True
+                    break
+            if changed:
+                break
+    for segment_id, row in enumerate(rows):
+        row["segment_id"] = segment_id
+    return rows
+
+
+def _filtered_segments(frames, axis, threshold, labels, tolerance_frames):
+    return filter_short_state_interruptions(
+        _segments(frames, axis, threshold, labels), tolerance_frames,
+    )
+
+
 def _plateaus(candidate_rows):
     plateaus = []
     start = 0
@@ -101,7 +142,7 @@ def _plateaus(candidate_rows):
     return plateaus
 
 
-def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS):
+def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tolerance_frames=5):
     values = [
         value
         for frame in frames
@@ -121,7 +162,8 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS):
         candidates.append({
             "candidate_index": index,
             "threshold": float(threshold),
-            "segment_count": len(_segments(frames, axis, threshold, labels)),
+            "segment_count": len(_filtered_segments(frames, axis, threshold, labels, noise_tolerance_frames)),
+            "raw_segment_count": len(_segments(frames, axis, threshold, labels)),
         })
     all_plateaus = _plateaus(candidates)
     qualifying = []
@@ -131,7 +173,9 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS):
             continue
         row = dict(plateau)
         row["candidate_optimal_n"] = float(row["midpoint_n"])
-        row["segments"] = _segments(frames, axis, row["midpoint_n"], labels)
+        row["segments"] = _filtered_segments(
+            frames, axis, row["midpoint_n"], labels, noise_tolerance_frames,
+        )
         qualifying.append(row)
     return {
         "axis": axis,
@@ -145,6 +189,12 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS):
         "threshold_candidates": candidates,
         "all_plateaus": all_plateaus,
         "qualifying_plateaus": qualifying,
+        "noise_filter": {
+            "method": "bridge_short_interruptions_between_persistent_equal_states",
+            "tolerance_frames": max(0, int(noise_tolerance_frames)),
+            "persistent_anchor_minimum_frames_exclusive": max(0, int(noise_tolerance_frames)),
+            "interruption_measure": "total_frame_span_between_anchor_segments",
+        },
         "plateau_filter": {
             "minimum_n_values_exclusive": 5,
             "exclude_single_segment_plateaus": True,
@@ -152,10 +202,16 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS):
     }
 
 
-def segment_video(ego_video):
+def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_frames=5):
     frames = list(ego_video.get("frames", []))
-    vz = segment_axis(frames, "vz", ("backward", "static", "forward"))
-    vx = segment_axis(frames, "vx", ("right", "straight", "left"))
+    vz = segment_axis(
+        frames, "vz", ("backward", "static", "forward"),
+        noise_tolerance_frames=vz_noise_tolerance_frames,
+    )
+    vx = segment_axis(
+        frames, "vx", ("right", "straight", "left"),
+        noise_tolerance_frames=vx_noise_tolerance_frames,
+    )
     frame_rows = []
     for offset, frame in enumerate(frames):
         frame_rows.append({
@@ -177,6 +233,10 @@ def segment_video(ego_video):
             "threshold_candidates_per_axis": NUM_THRESHOLDS,
             "selection": "all_plateaus_over_five_n_values_excluding_single_segment",
             "single_final_n_selected": False,
+            "noise_tolerance_frames": {
+                "vx": max(0, int(vx_noise_tolerance_frames)),
+                "vz": max(0, int(vz_noise_tolerance_frames)),
+            },
             "deterministic": True,
         },
     }

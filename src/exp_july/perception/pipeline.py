@@ -3679,15 +3679,19 @@ def step7a_axis_threshold_segmentation(position_state):
     vz_seg_max_count = int(step7a_config["vz_seg_max_count"])
     max_plateau_middle_th_vx = float(step7a_config["max_plateau_middle_th_vx"])
     max_plateau_middle_th_vz = float(step7a_config["max_plateau_middle_th_vz"])
+    noise_tolerance_frames_vx = int(step7a_config["noise_tolerance_frames_vx"])
+    noise_tolerance_frames_vz = int(step7a_config["noise_tolerance_frames_vz"])
     output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
     output_root.mkdir(parents=True, exist_ok=True)
     results = []
     cached_videos = 0
     for ego_video in tqdm(ego_motion, desc="[step 7a] axis_threshold_segmentation", unit="video"):
         video_id = str(ego_video.get("video_id", ""))
-        source_fingerprint = hashlib.sha256(json.dumps(
-            ego_video.get("frames", []), sort_keys=True, separators=(",", ":"), default=str,
-        ).encode("utf-8")).hexdigest()
+        source_fingerprint = hashlib.sha256(json.dumps({
+            "frames": ego_video.get("frames", []),
+            "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
+            "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
+        }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         path = output_root / video_id / "axis_threshold_segmentation.json"
         cached = None
         if path.exists():
@@ -3699,7 +3703,11 @@ def step7a_axis_threshold_segmentation(position_state):
                 cached = None
         recomputed = cached is None
         if recomputed:
-            cached = segment_video(ego_video)
+            cached = segment_video(
+                ego_video,
+                vx_noise_tolerance_frames=noise_tolerance_frames_vx,
+                vz_noise_tolerance_frames=noise_tolerance_frames_vz,
+            )
             cached["source_fingerprint"] = source_fingerprint
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
@@ -3758,6 +3766,8 @@ def step7a_axis_threshold_segmentation(position_state):
         "vz_seg_max_count": vz_seg_max_count,
         "max_plateau_middle_th_vx": max_plateau_middle_th_vx,
         "max_plateau_middle_th_vz": max_plateau_middle_th_vz,
+        "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
+        "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
         "configuration": step7a_config,
         "train_eval_split": copy.deepcopy(position_state.get("step7_train_eval_split", {})),
         "cached_videos": cached_videos,

@@ -72,6 +72,8 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
             "vz_seg_max_count": 5,
             "max_plateau_middle_th_vx": 250.0,
             "max_plateau_middle_th_vz": 70.0,
+            "noise_tolerance_frames_vx": 5,
+            "noise_tolerance_frames_vz": 5,
         },
         path=("step7a_axis_threshold_segmentation",),
         warn_label="Step 7A axis-threshold segmentation",
@@ -80,6 +82,8 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
     cfg["vz_seg_max_count"] = max(1, int(cfg.get("vz_seg_max_count", 5)))
     cfg["max_plateau_middle_th_vx"] = max(0.0, float(cfg.get("max_plateau_middle_th_vx", 250.0)))
     cfg["max_plateau_middle_th_vz"] = max(0.0, float(cfg.get("max_plateau_middle_th_vz", 70.0)))
+    cfg["noise_tolerance_frames_vx"] = max(0, int(cfg.get("noise_tolerance_frames_vx", 5)))
+    cfg["noise_tolerance_frames_vz"] = max(0, int(cfg.get("noise_tolerance_frames_vz", 5)))
     return cfg
 
 

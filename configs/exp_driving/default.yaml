@@ -22,6 +22,8 @@ step7a_axis_threshold_segmentation:
   vz_seg_max_count: 5
   max_plateau_middle_th_vx: 250
   max_plateau_middle_th_vz: 70
+  noise_tolerance_frames_vx: 5
+  noise_tolerance_frames_vz: 5
 
 ego_motion:
   render_video: false

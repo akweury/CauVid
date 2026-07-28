@@ -28,7 +28,10 @@ def _candidate(result,a,audit):
  elif ps:p=max(ps,key=lambda q:(int(q["num_n_values"]),-float(q["midpoint_n"])));conf=None;sel="widest_qualifying_plateau_fallback"
  else:
   ls=result.get(key,{}).get("labels",{}); labels=(ls.get("negative","negative"),ls.get("center","static"),ls.get("positive","positive"))
-  return {"threshold_n":0.,"confidence":None,"selection":"zero_threshold_fallback","display_only":True,"segments":_segments(result.get("frames",[]),a,0.,labels)}
+  from src.exp_july.perception.ego_axis_threshold_segmentation import filter_short_state_interruptions
+  tolerance=int(result.get(key,{}).get("noise_filter",{}).get("tolerance_frames",5))
+  segments=filter_short_state_interruptions(_segments(result.get("frames",[]),a,0.,labels),tolerance)
+  return {"threshold_n":0.,"confidence":None,"selection":"zero_threshold_fallback","display_only":True,"segments":segments}
  return {"threshold_n":float(p["midpoint_n"]),"confidence":conf,"plateau_id":int(p["plateau_id"]),"selection":sel,"display_only":True,"segments":p.get("segments",[])}
 def _state(c,fi):
  for s in c["segments"]:

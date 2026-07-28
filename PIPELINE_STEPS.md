@@ -82,8 +82,9 @@ plateau region; evaluation videos are used only for held-out scoring.
 ### Step 7A — Axis threshold segmentation
 
 ```text
-ego vx/vz → 100 N values → temporal-segment counts → stable plateaus
-→ candidate middle N → train confidence heat map → eval confidence
+ego vx/vz → 100 N values → threshold labels → short-interruption filtering
+→ temporal-segment counts → stable plateaus → candidate middle N
+→ train confidence heat map → eval confidence
 ```
 
 | Axis | Below `-N` | `[-N, N]` | Above `N` |
@@ -95,12 +96,22 @@ Plateaus must span more than five sampled `N` values and produce more than one
 temporal segment. Every retained plateau contributes its middle `N`; Step 7A
 does not select one final threshold.
 
+Before segment counting, a deterministic noise filter bridges two persistent
+segments with the same state when the entire intervening frame span is within
+the axis tolerance. It handles both single-state interruptions such as
+`forward → static → forward` and mixed interruptions such as
+`forward → static → backward → static → forward`. The same operation is used
+for the `right`, `straight`, and `left` states on `vx`. Both surrounding anchor
+segments must be longer than the configured tolerance.
+
 | Configuration | Default |
 |---|---:|
 | `vx_seg_max_count` | 8 |
 | `vz_seg_max_count` | 5 |
 | `max_plateau_middle_th_vx` | 250 |
 | `max_plateau_middle_th_vz` | 70 |
+| `noise_tolerance_frames_vx` | 5 |
+| `noise_tolerance_frames_vz` | 5 |
 
 Points exceeding either axis-specific limit remain visible but are disabled
 and colored gray. Enabled training points fit the normalized Gaussian confidence

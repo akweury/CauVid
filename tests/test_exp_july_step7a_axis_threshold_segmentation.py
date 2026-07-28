@@ -8,6 +8,7 @@ from src.exp_july.perception.pipeline import step7_train_eval_split
 from src.exp_july.perception.ego_axis_threshold_segmentation import (
     _confidence_at,
     _confidence_surface,
+    filter_short_state_interruptions,
     render_all_video_plateau_scatter,
     render_segment_count_chart,
     segment_axis,
@@ -30,6 +31,39 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             self.assertEqual(len(first["step7_eval_video_ids"]), 2)
             self.assertFalse(set(first["step7_train_video_ids"]) & set(first["step7_eval_video_ids"]))
             self.assertTrue(Path(first["step7_train_eval_split_path"]).exists())
+
+    def test_noise_filter_merges_single_short_state_between_long_matching_states(self):
+        segments = [
+            {"state": "forward", "start_frame": 0, "end_frame": 9, "duration_frames": 10},
+            {"state": "static", "start_frame": 10, "end_frame": 13, "duration_frames": 4},
+            {"state": "forward", "start_frame": 14, "end_frame": 23, "duration_frames": 10},
+        ]
+        filtered = filter_short_state_interruptions(segments, tolerance_frames=5)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["state"], "forward")
+        self.assertEqual(filtered[0]["duration_frames"], 24)
+        self.assertEqual(filtered[0]["absorbed_states"], ["static"])
+
+    def test_noise_filter_merges_multi_state_interruption_for_either_axis(self):
+        segments = [
+            {"state": "left", "start_frame": 0, "end_frame": 7, "duration_frames": 8},
+            {"state": "straight", "start_frame": 8, "end_frame": 8, "duration_frames": 1},
+            {"state": "right", "start_frame": 9, "end_frame": 9, "duration_frames": 1},
+            {"state": "straight", "start_frame": 10, "end_frame": 10, "duration_frames": 1},
+            {"state": "left", "start_frame": 11, "end_frame": 18, "duration_frames": 8},
+        ]
+        filtered = filter_short_state_interruptions(segments, tolerance_frames=5)
+        self.assertEqual([row["state"] for row in filtered], ["left"])
+        self.assertEqual(filtered[0]["absorbed_interruption_frames"], 3)
+        self.assertEqual(filtered[0]["absorbed_states"], ["straight", "right", "straight"])
+
+    def test_noise_filter_preserves_interruptions_above_tolerance(self):
+        segments = [
+            {"state": "backward", "start_frame": 0, "end_frame": 7, "duration_frames": 8},
+            {"state": "static", "start_frame": 8, "end_frame": 13, "duration_frames": 6},
+            {"state": "backward", "start_frame": 14, "end_frame": 21, "duration_frames": 8},
+        ]
+        self.assertEqual(len(filter_short_state_interruptions(segments, tolerance_frames=5)), 3)
 
     def test_uses_exactly_100_interior_threshold_candidates(self):
         frames = [
