@@ -3670,7 +3670,7 @@ def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
 def step7a_axis_threshold_segmentation(position_state):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
-    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4, render_eval_signal_segmentation_chart
+    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4, render_eval_candidate_filter_comparisons, render_eval_signal_segmentation_chart
 
     signal_state = step7_ego_motion(position_state)
     ego_motion = list(signal_state.get("ego_motion", []))
@@ -3679,8 +3679,19 @@ def step7a_axis_threshold_segmentation(position_state):
     vz_seg_max_count = int(step7a_config["vz_seg_max_count"])
     max_plateau_middle_th_vx = float(step7a_config["max_plateau_middle_th_vx"])
     max_plateau_middle_th_vz = float(step7a_config["max_plateau_middle_th_vz"])
+    plateau_min_n_values = int(step7a_config["plateau_min_n_values"])
     noise_tolerance_frames_vx = int(step7a_config["noise_tolerance_frames_vx"])
     noise_tolerance_frames_vz = int(step7a_config["noise_tolerance_frames_vz"])
+    bridge_config_by_axis = {
+        axis: {
+            "bridge_total_max_frames": int(step7a_config[f"bridge_total_max_frames_{axis}"]),
+            "anchor_min_frames": int(step7a_config[f"anchor_min_frames_{axis}"]),
+            "bridge_max_segments": int(step7a_config[f"bridge_max_segments_{axis}"]),
+            "bridge_max_anchor_ratio": float(step7a_config[f"bridge_max_anchor_ratio_{axis}"]),
+        }
+        for axis in ("vx", "vz")
+    }
+    filter_comparison_max_candidates = int(step7a_config["filter_comparison_max_candidates"])
     output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "train").mkdir(parents=True, exist_ok=True)
@@ -3693,8 +3704,10 @@ def step7a_axis_threshold_segmentation(position_state):
         video_id = str(ego_video.get("video_id", ""))
         source_fingerprint = hashlib.sha256(json.dumps({
             "frames": ego_video.get("frames", []),
+            "plateau_min_n_values": plateau_min_n_values,
             "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
             "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
+            "bridge_config_by_axis": bridge_config_by_axis,
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         data_split = "eval" if video_id in eval_video_ids else "train"
         video_output_root = output_root / data_split / video_id
@@ -3713,6 +3726,9 @@ def step7a_axis_threshold_segmentation(position_state):
                 ego_video,
                 vx_noise_tolerance_frames=noise_tolerance_frames_vx,
                 vz_noise_tolerance_frames=noise_tolerance_frames_vz,
+                vx_bridge_config=bridge_config_by_axis["vx"],
+                vz_bridge_config=bridge_config_by_axis["vz"],
+                plateau_min_n_values=plateau_min_n_values,
             )
             cached["source_fingerprint"] = source_fingerprint
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3743,11 +3759,13 @@ def step7a_axis_threshold_segmentation(position_state):
     ego_by_video = {str(row.get("video_id", "")): row for row in ego_motion}
     visualization_mp4s = []
     signal_segmentation_charts = []
+    filter_comparison_visualizations = []
     for result in tqdm(eval_results, desc="[step 7a] eval visualizations", unit="video"):
         video_id = str(result.get("video_id", ""))
         video_output_root = output_root / "eval" / video_id
         visualization_path = video_output_root / "axis_segmentation_visualization.mp4"
         signal_chart_path = video_output_root / "axis_signal_segmentation.png"
+        filter_comparison_root = video_output_root / "candidate_filter_comparisons"
         visualization_fingerprint = hashlib.sha256(json.dumps({
             "version": VERSION,
             "visualization_layout": "eval_only_three_column_threshold_summary_v6",
@@ -3756,7 +3774,12 @@ def step7a_axis_threshold_segmentation(position_state):
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         signal_chart_fingerprint = hashlib.sha256(json.dumps({
             "visualization_fingerprint": visualization_fingerprint,
-            "signal_chart_layout": "k_by_2_enabled_and_disabled_threshold_segmentations_v3",
+            "signal_chart_layout": "k_by_2_compact_titles_enabled_disabled_v4",
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        filter_comparison_fingerprint = hashlib.sha256(json.dumps({
+            "source_fingerprint": result.get("source_fingerprint"),
+            "layout": "2x1_before_after_guaranteed_long_segments_v3",
+            "max_candidates_per_axis": filter_comparison_max_candidates,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         cached_visual = result.get("visualization", {})
         if (visualization_path.exists() and cached_visual.get("status") == "rendered"
@@ -3772,10 +3795,29 @@ def step7a_axis_threshold_segmentation(position_state):
         else:
             signal_chart = render_eval_signal_segmentation_chart(result, overall_scatter, signal_chart_path)
             signal_chart["source_fingerprint"] = signal_chart_fingerprint
+        cached_filter_comparison = result.get("candidate_filter_comparisons", {})
+        cached_filter_paths = [Path(row.get("path", "")) for row in cached_filter_comparison.get("charts", [])]
+        expected_filter_charts = sum(min(
+            filter_comparison_max_candidates,
+            len(result.get(f"{axis}_segmentation", {}).get("threshold_candidates", [])),
+        ) for axis in ("vx", "vz"))
+        if (cached_filter_comparison.get("status") == "rendered"
+                and cached_filter_comparison.get("source_fingerprint") == filter_comparison_fingerprint
+                and len(cached_filter_paths) == expected_filter_charts
+                and all(path.is_file() for path in cached_filter_paths)):
+            filter_comparison = cached_filter_comparison
+        else:
+            filter_comparison = render_eval_candidate_filter_comparisons(
+                result, filter_comparison_root,
+                max_candidates=filter_comparison_max_candidates,
+            )
+            filter_comparison["source_fingerprint"] = filter_comparison_fingerprint
         result["visualization"] = visual
         result["signal_segmentation_chart"] = signal_chart
+        result["candidate_filter_comparisons"] = filter_comparison
         visualization_mp4s.append(visual)
         signal_segmentation_charts.append(signal_chart)
+        filter_comparison_visualizations.append(filter_comparison)
         (video_output_root / "axis_threshold_segmentation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     manifest = {
         "version": VERSION,
@@ -3788,8 +3830,11 @@ def step7a_axis_threshold_segmentation(position_state):
         "vz_seg_max_count": vz_seg_max_count,
         "max_plateau_middle_th_vx": max_plateau_middle_th_vx,
         "max_plateau_middle_th_vz": max_plateau_middle_th_vz,
+        "plateau_min_n_values": plateau_min_n_values,
         "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
         "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
+        "bridge_config_by_axis": bridge_config_by_axis,
+        "filter_comparison_max_candidates": filter_comparison_max_candidates,
         "configuration": step7a_config,
         "train_eval_split": copy.deepcopy(position_state.get("step7_train_eval_split", {})),
         "train_output_root": str(output_root / "train"),
@@ -3803,6 +3848,8 @@ def step7a_axis_threshold_segmentation(position_state):
         "visualization_mp4s": visualization_mp4s,
         "num_signal_segmentation_charts": len(signal_segmentation_charts),
         "signal_segmentation_charts": signal_segmentation_charts,
+        "num_filter_comparison_visualizations": sum(int(row.get("num_charts", 0)) for row in filter_comparison_visualizations),
+        "candidate_filter_comparisons": filter_comparison_visualizations,
         "num_qualifying_plateaus": sum(
             len(row.get(axis, {}).get("qualifying_plateaus", []))
             for row in results for axis in ("vx_segmentation", "vz_segmentation")

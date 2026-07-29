@@ -66,8 +66,10 @@ recomputation.
 Step 6 geometry → empty Step 7 → 4:1 video split → Step 7A → Step 8
 ```
 
-Step 7 itself is empty. The former 7B–7F pipeline remains disabled. Step 7A is
-the only active Step 7 substep and obtains the continuous ego signals internally.
+Step 7 itself is empty. Step 7A is the only active Step 7 substep and obtains
+the continuous ego signals internally. Step 7B is retained only as a documented
+future transition-validation placeholder; the former executable 7B–7F pipeline
+remains disabled.
 
 ### Pre-7A — Train/evaluation split
 
@@ -92,17 +94,31 @@ ego vx/vz → 100 N values → threshold labels → short-interruption filtering
 | `vz` | `backward` | `static` | `forward` |
 | `vx` | `right` | `straight` | `left` |
 
-Plateaus must span more than five sampled `N` values and produce more than one
+Plateaus must span at least three sampled `N` values and produce more than one
 temporal segment. Every retained plateau contributes its middle `N`; Step 7A
 does not select one final threshold.
 
-Before segment counting, a deterministic noise filter bridges two persistent
-segments with the same state when the entire intervening frame span is within
-the axis tolerance. It handles both single-state interruptions such as
-`forward → static → forward` and mixed interruptions such as
-`forward → static → backward → static → forward`. The same operation is used
-for the `right`, `straight`, and `left` states on `vx`. Both surrounding anchor
-segments must be longer than the configured tolerance. The segment-count PNG
+Before segment counting, a deterministic robust bridge filter joins equal-state
+outer anchors across one or more noisy interior states. It handles simple
+interruptions such as `forward → static → forward` and complex interruptions
+such as `forward → backward → static → forward → backward → forward`. A bridge
+is accepted only when both outer anchors meet `anchor_min_frames`, every inner
+segment is within `noise_tolerance_frames`, the total interruption span is
+within `bridge_total_max_frames`, the number of inner segments is within
+`bridge_max_segments`, and the interruption-to-shorter-anchor ratio is within
+`bridge_max_anchor_ratio`. The same operation is applied independently to
+`right`, `straight`, and `left` on `vx`.
+
+A second cleanup pass guarantees that no removable short segments remain. It
+groups residual short segments into islands. Edge islands attach to their only
+long neighbor. For an island between two long anchors, all possible monotonic
+left/right split points are scored using duration-weighted distance between the
+short-segment mean signals and the two anchor mean signals. The minimum-cost
+split attaches the prefix to the left anchor and suffix to the right anchor.
+When no long anchor exists, the entire sequence collapses to its dominant state;
+a sequence whose total observed span is itself no more than the tolerance is
+marked as unavoidably short. Assignment states, anchor means, signal distances,
+selected sides, and methods are retained in the segment audit. The segment-count PNG
 plots the original raw count as a dashed gray curve and the filtered count as a
 solid axis-colored curve. Plateau annotations report the filtered count and the
 raw count range; plateau detection uses only the filtered count.
@@ -113,8 +129,14 @@ raw count range; plateau detection uses only the filtered count.
 | `vz_seg_max_count` | 5 |
 | `max_plateau_middle_th_vx` | 250 |
 | `max_plateau_middle_th_vz` | 70 |
+| `plateau_min_n_values` | 3 |
 | `noise_tolerance_frames_vx` | 5 |
 | `noise_tolerance_frames_vz` | 5 |
+| `bridge_total_max_frames_vx` / `vz` | 15 |
+| `anchor_min_frames_vx` / `vz` | 8 |
+| `bridge_max_segments_vx` / `vz` | 5 |
+| `bridge_max_anchor_ratio_vx` / `vz` | 0.75 |
+| `filter_comparison_max_candidates` | 20 |
 
 Points exceeding either axis-specific limit remain visible but are disabled
 and colored gray. Enabled training points fit the normalized Gaussian confidence
@@ -128,6 +150,7 @@ fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
 | Per-video JSON | `train/<video_id>/` or `eval/<video_id>/`; thresholds, segment counts, plateaus, middle `N`, candidate segments |
 | Per-video PNG | `train/<video_id>/` or `eval/<video_id>/`; 1×2 `vx`/`vz` charts showing raw pre-merge and filtered post-merge segment counts at every `N` |
 | Per-eval-video signal PNG | k×2 matrix of all qualifying `vx`/`vz` thresholds, including enabled and disabled candidates, with status/reason, state-colored backgrounds, and dashed `±N` thresholds |
+| Per-eval candidate filter PNGs | For each axis and its 20 smallest sampled candidate `N` values, a separate 2×1 before/after short-merge comparison with state-colored backgrounds and per-segment `SHORT`/`LONG` labels |
 | Overall PNG | 1×2 confidence heat maps with train, eval, and disabled points |
 | Scatter audit | confidence surfaces, point confidence, limits, split, eval metric |
 
@@ -135,12 +158,22 @@ fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
 
 **Evaluation signal chart:** `eval/<video_id>/axis_signal_segmentation.png`
 
+**Candidate filter comparisons:**
+`eval/<video_id>/candidate_filter_comparisons/{vx,vz}/candidate_*.png`
+
+Every segment in both rows is annotated with its state, duration, and length
+class. `SHORT` means `duration_frames <= noise_tolerance_frames_v*`; `LONG`
+means `duration_frames > noise_tolerance_frames_v*`. Short labels use a red
+badge and long labels use a green badge. The same classifications are stored in
+the per-chart JSON metadata as `raw_segments` and `filtered_segments`.
+
 The signal chart uses `vx` and `vz` as its two columns. Its row count `k` is
 the larger qualifying-candidate count across the two axes; if the counts differ,
 unused cells are explicitly marked. Candidates are ordered by increasing `N`.
-Enabled candidates have green status titles. Disabled candidates remain visible
-with pale-red panels, red status titles, a `DISABLED` watermark, and the exact
-disabling reason.
+Enabled candidates have compact green status titles. Disabled candidates remain
+visible with pale-red panels, compact red status titles, and a `DISABLED`
+watermark. Full disabling reasons are wrapped inside the subplot instead of
+being appended to its title.
 
 The MP4 is generated only for evaluation-split videos. It uses a three-column
 layout: original frames with synchronized ego `vx` and `vz` plots in the left
@@ -163,13 +196,32 @@ threshold and confidence are recorded without changing pipeline decisions.
 ```text
 07a_ego_axis_threshold_segmentation/
 ├── train/<video_id>/   # train JSON and plateau PNG
-├── eval/<video_id>/    # eval JSON, plateau PNG, signal PNG, and MP4
+├── eval/<video_id>/    # eval JSON, plateau PNG, signal PNG, MP4
+│   └── candidate_filter_comparisons/{vx,vz}/  # 2×1 raw/filtered PNGs
 ├── all_videos_plateau_scatter.png
 └── axis_threshold_segmentation_manifest.json
 ```
 
 Artifacts: `<video_id>/axis_threshold_segment_counts.png` and
 `all_videos_plateau_scatter.png`.
+
+### Step 7B — Reserved transition-logic validation (empty)
+
+```text
+Step 7A filtered segments → transition validation (planned only)
+```
+
+Step 7B remains empty and is not called by the pipeline. It is reserved for a
+future deterministic real-world transition validator that runs after the Step
+7A short-segment filter. The planned legal transitions are:
+
+| Axis | Legal adjacent-state transitions | Forbidden direct transition |
+|---|---|---|
+| `vz` | `forward ↔ static`, `static ↔ backward` | `forward ↔ backward` |
+| `vx` | `left ↔ straight`, `straight ↔ right` | `left ↔ right` |
+
+This is currently a design comment only: it does not modify segments, insert
+neutral states, reject candidates, or change downstream results.
 
 ## Step 8 — High-level flow
 

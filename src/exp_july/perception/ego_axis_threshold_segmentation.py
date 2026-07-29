@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 11
+VERSION = 15
 NUM_THRESHOLDS = 100
 
 
@@ -58,46 +58,172 @@ def _segments(frames, axis, threshold, labels):
                 "start_frame": frame_index,
                 "end_frame": frame_index,
                 "duration_frames": 1,
+                "signal_sum": float(value),
             }
         else:
             active["end_frame"] = frame_index
             active["duration_frames"] += 1
+            active["signal_sum"] += float(value)
         previous_frame = frame_index
     if active is not None:
         rows.append(active)
     for segment_id, row in enumerate(rows):
         row["segment_id"] = segment_id
+        row["mean_signal"] = float(row.pop("signal_sum") / max(1, int(row["duration_frames"])))
     return rows
 
 
-def filter_short_state_interruptions(segments, tolerance_frames):
-    """Bridge short state interruptions between two persistent equal-state segments."""
+def _weighted_mean_signal(rows):
+    weighted = [(float(row["mean_signal"]), int(row.get("duration_frames", 0))) for row in rows if row.get("mean_signal") is not None]
+    total = sum(weight for _, weight in weighted)
+    return None if total <= 0 else float(sum(value * weight for value, weight in weighted) / total)
+
+
+def _coalesce_assigned_segments(rows):
+    output = []
+    for source in rows:
+        row = dict(source)
+        if output and output[-1].get("state") == row.get("state"):
+            previous = output[-1]
+            combined_mean = _weighted_mean_signal([previous, row])
+            previous["end_frame"] = int(row["end_frame"])
+            previous["duration_frames"] = previous["end_frame"] - int(previous["start_frame"]) + 1
+            previous["mean_signal"] = combined_mean
+            assignments = list(previous.get("residual_short_assignments", []))
+            assignments.extend(row.get("residual_short_assignments", []))
+            if assignments:
+                previous["residual_short_assignments"] = assignments
+        else:
+            output.append(row)
+    for segment_id, row in enumerate(output):
+        row["segment_id"] = segment_id
+    return output
+
+
+def merge_remaining_short_segments(segments, tolerance_frames):
+    """Assign every residual short island to neighboring long segments."""
     tolerance = max(0, int(tolerance_frames))
     rows = [dict(row) for row in segments]
-    if tolerance <= 0 or len(rows) < 3:
+    if tolerance <= 0 or not rows:
+        return rows
+    long_indices = [index for index, row in enumerate(rows) if int(row.get("duration_frames", 0)) > tolerance]
+    if not long_indices:
+        dominant = max(rows, key=lambda row: (int(row.get("duration_frames", 0)), -int(row.get("segment_id", 0))))
+        assignment_rows = []
+        for row in rows:
+            assigned = dict(row)
+            assigned["residual_short_assignments"] = [{
+                "original_state": str(row.get("state", "")), "assigned_state": str(dominant.get("state", "")),
+                "duration_frames": int(row.get("duration_frames", 0)), "assignment_method": "global_dominant_state_no_long_anchor",
+                "mean_signal": row.get("mean_signal"),
+            }]
+            assigned["state"] = dominant.get("state")
+            assignment_rows.append(assigned)
+        output = _coalesce_assigned_segments(assignment_rows)
+        if output and int(output[0].get("duration_frames", 0)) <= tolerance:
+            output[0]["short_segment_unavoidable_entire_sequence"] = True
+        return output
+    index = 0
+    while index < len(rows):
+        if int(rows[index].get("duration_frames", 0)) > tolerance:
+            index += 1
+            continue
+        start = index
+        while index < len(rows) and int(rows[index].get("duration_frames", 0)) <= tolerance:
+            index += 1
+        end = index
+        island = rows[start:end]
+        left = rows[start - 1] if start > 0 and int(rows[start - 1].get("duration_frames", 0)) > tolerance else None
+        right = rows[end] if end < len(rows) and int(rows[end].get("duration_frames", 0)) > tolerance else None
+        if left is not None and right is not None:
+            left_mean, right_mean = left.get("mean_signal"), right.get("mean_signal")
+            def distance(row, anchor_mean):
+                if row.get("mean_signal") is None or anchor_mean is None:
+                    return 0.0
+                return abs(float(row["mean_signal"]) - float(anchor_mean)) * max(1, int(row.get("duration_frames", 0)))
+            split_candidates = []
+            for split in range(len(island) + 1):
+                cost = sum(distance(row, left_mean) for row in island[:split]) + sum(distance(row, right_mean) for row in island[split:])
+                split_candidates.append((cost, abs(split - len(island) / 2.0), split))
+            _, _, split = min(split_candidates)
+        elif left is not None:
+            split = len(island)
+        else:
+            split = 0
+        for offset, row in enumerate(island):
+            target = left if offset < split else right
+            if target is None:
+                target = left or right
+            assigned_state = str(target.get("state", row.get("state", ""))) if target is not None else str(row.get("state", ""))
+            row_mean = row.get("mean_signal")
+            left_distance = None if left is None or row_mean is None or left.get("mean_signal") is None else abs(float(row_mean) - float(left["mean_signal"]))
+            right_distance = None if right is None or row_mean is None or right.get("mean_signal") is None else abs(float(row_mean) - float(right["mean_signal"]))
+            row["residual_short_assignments"] = [{
+                "original_state": str(row.get("state", "")), "assigned_state": assigned_state,
+                "duration_frames": int(row.get("duration_frames", 0)), "mean_signal": row_mean,
+                "left_anchor_state": None if left is None else str(left.get("state", "")),
+                "right_anchor_state": None if right is None else str(right.get("state", "")),
+                "left_anchor_mean_signal": None if left is None else left.get("mean_signal"),
+                "right_anchor_mean_signal": None if right is None else right.get("mean_signal"),
+                "left_signal_distance": left_distance, "right_signal_distance": right_distance,
+                "selected_side": "left" if target is left else "right",
+                "assignment_method": "nearest_neighbor_mean_signal_monotonic_split" if left is not None and right is not None else "single_available_long_neighbor",
+            }]
+            row["state"] = assigned_state
+    return _coalesce_assigned_segments(rows)
+
+
+def filter_short_state_interruptions(
+    segments, tolerance_frames, bridge_total_max_frames=15,
+    anchor_min_frames=8, bridge_max_segments=5,
+    bridge_max_anchor_ratio=0.75,
+):
+    """Bridge a bounded sequence of individually short states between equal anchors."""
+    tolerance = max(0, int(tolerance_frames))
+    total_limit = max(0, int(bridge_total_max_frames))
+    anchor_minimum = max(1, int(anchor_min_frames))
+    maximum_segments = max(1, int(bridge_max_segments))
+    maximum_ratio = max(0.0, float(bridge_max_anchor_ratio))
+    rows = [dict(row) for row in segments]
+    if tolerance <= 0 or total_limit <= 0 or maximum_ratio <= 0.0 or len(rows) < 3:
         return rows
     changed = True
     while changed:
         changed = False
         for left_index, left in enumerate(rows[:-2]):
-            if int(left.get("duration_frames", 0)) <= tolerance:
+            left_duration = int(left.get("duration_frames", 0))
+            if left_duration < anchor_minimum:
                 continue
-            for right_index in range(left_index + 2, len(rows)):
+            last_right_index = min(len(rows), left_index + maximum_segments + 2)
+            for right_index in range(left_index + 2, last_right_index):
                 right = rows[right_index]
                 interruption_frames = int(right["start_frame"]) - int(left["end_frame"]) - 1
-                if interruption_frames > tolerance:
+                if interruption_frames > total_limit:
                     break
-                if (right.get("state") == left.get("state")
-                        and int(right.get("duration_frames", 0)) > tolerance):
-                    merged = dict(left)
-                    merged["end_frame"] = int(right["end_frame"])
-                    merged["duration_frames"] = merged["end_frame"] - int(merged["start_frame"]) + 1
-                    merged["noise_filter_merged"] = True
-                    merged["absorbed_interruption_frames"] = interruption_frames
-                    merged["absorbed_states"] = [str(row.get("state", "")) for row in rows[left_index + 1:right_index]]
-                    rows[left_index:right_index + 1] = [merged]
-                    changed = True
-                    break
+                right_duration = int(right.get("duration_frames", 0))
+                if right.get("state") != left.get("state") or right_duration < anchor_minimum:
+                    continue
+                interruptions = rows[left_index + 1:right_index]
+                if not interruptions or any(
+                    int(row.get("duration_frames", 0)) > tolerance
+                    for row in interruptions
+                ):
+                    continue
+                anchor_ratio = interruption_frames / max(1, min(left_duration, right_duration))
+                if anchor_ratio > maximum_ratio:
+                    continue
+                merged = dict(left)
+                merged["end_frame"] = int(right["end_frame"])
+                merged["duration_frames"] = merged["end_frame"] - int(merged["start_frame"]) + 1
+                merged["mean_signal"] = _weighted_mean_signal(rows[left_index:right_index + 1])
+                merged["noise_filter_merged"] = True
+                merged["absorbed_interruption_frames"] = interruption_frames
+                merged["absorbed_segment_count"] = len(interruptions)
+                merged["absorbed_states"] = [str(row.get("state", "")) for row in interruptions]
+                merged["bridge_anchor_ratio"] = float(anchor_ratio)
+                rows[left_index:right_index + 1] = [merged]
+                changed = True
+                break
             if changed:
                 break
     for segment_id, row in enumerate(rows):
@@ -105,11 +231,16 @@ def filter_short_state_interruptions(segments, tolerance_frames):
     return rows
 
 
-def _filtered_segments(frames, axis, threshold, labels, tolerance_frames):
-    return filter_short_state_interruptions(
+def _filtered_segments(frames, axis, threshold, labels, tolerance_frames, bridge_config=None):
+    config = dict(bridge_config or {})
+    bridged = filter_short_state_interruptions(
         _segments(frames, axis, threshold, labels), tolerance_frames,
+        bridge_total_max_frames=config.get("bridge_total_max_frames", 15),
+        anchor_min_frames=config.get("anchor_min_frames", 8),
+        bridge_max_segments=config.get("bridge_max_segments", 5),
+        bridge_max_anchor_ratio=config.get("bridge_max_anchor_ratio", 0.75),
     )
-
+    return merge_remaining_short_segments(bridged, tolerance_frames)
 
 def _plateaus(candidate_rows):
     plateaus = []
@@ -144,7 +275,7 @@ def _plateaus(candidate_rows):
     return plateaus
 
 
-def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tolerance_frames=5):
+def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tolerance_frames=5, bridge_config=None, plateau_min_n_values=3):
     values = [
         value
         for frame in frames
@@ -164,19 +295,19 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
         candidates.append({
             "candidate_index": index,
             "threshold": float(threshold),
-            "segment_count": len(_filtered_segments(frames, axis, threshold, labels, noise_tolerance_frames)),
+            "segment_count": len(_filtered_segments(frames, axis, threshold, labels, noise_tolerance_frames, bridge_config)),
             "raw_segment_count": len(_segments(frames, axis, threshold, labels)),
         })
     all_plateaus = _plateaus(candidates)
     qualifying = []
     for plateau in all_plateaus:
-        # More than five sampled N values and more than one temporal segment.
-        if plateau["num_n_values"] <= 5 or plateau["segment_count"] <= 1:
+        # Retain plateaus spanning the configured minimum N samples and >1 segment.
+        if plateau["num_n_values"] < max(1, int(plateau_min_n_values)) or plateau["segment_count"] <= 1:
             continue
         row = dict(plateau)
         row["candidate_optimal_n"] = float(row["midpoint_n"])
         row["segments"] = _filtered_segments(
-            frames, axis, row["midpoint_n"], labels, noise_tolerance_frames,
+            frames, axis, row["midpoint_n"], labels, noise_tolerance_frames, bridge_config,
         )
         qualifying.append(row)
     return {
@@ -192,27 +323,37 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
         "all_plateaus": all_plateaus,
         "qualifying_plateaus": qualifying,
         "noise_filter": {
-            "method": "bridge_short_interruptions_between_persistent_equal_states",
+            "method": "robust_multi_segment_bridge_between_equal_state_anchors",
             "tolerance_frames": max(0, int(noise_tolerance_frames)),
-            "persistent_anchor_minimum_frames_exclusive": max(0, int(noise_tolerance_frames)),
+            "bridge_total_max_frames": max(0, int((bridge_config or {}).get("bridge_total_max_frames", 15))),
+            "anchor_min_frames": max(1, int((bridge_config or {}).get("anchor_min_frames", 8))),
+            "bridge_max_segments": max(1, int((bridge_config or {}).get("bridge_max_segments", 5))),
+            "bridge_max_anchor_ratio": max(0.0, float((bridge_config or {}).get("bridge_max_anchor_ratio", 0.75))),
             "interruption_measure": "total_frame_span_between_anchor_segments",
+            "requirements": ["equal_outer_states", "every_inner_segment_is_short", "bounded_total_span", "bounded_inner_segment_count", "bounded_anchor_ratio"],
+            "residual_short_cleanup": "monotonic_mean_signal_assignment_to_neighboring_long_segments",
+            "output_invariant": "no_short_segments_when_total_observed_span_exceeds_tolerance",
         },
         "plateau_filter": {
-            "minimum_n_values_exclusive": 5,
+            "minimum_n_values_inclusive": max(1, int(plateau_min_n_values)),
             "exclude_single_segment_plateaus": True,
         },
     }
 
 
-def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_frames=5):
+def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_frames=5, vx_bridge_config=None, vz_bridge_config=None, plateau_min_n_values=3):
     frames = list(ego_video.get("frames", []))
     vz = segment_axis(
         frames, "vz", ("backward", "static", "forward"),
         noise_tolerance_frames=vz_noise_tolerance_frames,
+        bridge_config=vz_bridge_config,
+        plateau_min_n_values=plateau_min_n_values,
     )
     vx = segment_axis(
         frames, "vx", ("right", "straight", "left"),
         noise_tolerance_frames=vx_noise_tolerance_frames,
+        bridge_config=vx_bridge_config,
+        plateau_min_n_values=plateau_min_n_values,
     )
     frame_rows = []
     for offset, frame in enumerate(frames):
@@ -233,11 +374,16 @@ def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_fra
         "provenance": {
             "source": "continuous_ego_motion",
             "threshold_candidates_per_axis": NUM_THRESHOLDS,
-            "selection": "all_plateaus_over_five_n_values_excluding_single_segment",
+            "plateau_min_n_values": max(1, int(plateau_min_n_values)),
+            "selection": "plateaus_meeting_minimum_n_values_excluding_single_segment",
             "single_final_n_selected": False,
             "noise_tolerance_frames": {
                 "vx": max(0, int(vx_noise_tolerance_frames)),
                 "vz": max(0, int(vz_noise_tolerance_frames)),
+            },
+            "bridge_config": {
+                "vx": dict(vx_bridge_config or {}),
+                "vz": dict(vz_bridge_config or {}),
             },
             "deterministic": True,
         },

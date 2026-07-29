@@ -17,11 +17,20 @@ def _segments(frames,a,n,labels):
   state=labels[0] if v < -n else labels[2] if v > n else labels[1]
   if not active or active["state"]!=state or prev is None or fi!=prev+1:
    if active:out.append(active)
-   active={"state":state,"start_frame":fi,"end_frame":fi}
-  else:active["end_frame"]=fi
+   active={"state":state,"start_frame":fi,"end_frame":fi,"duration_frames":1}
+  else:active["end_frame"]=fi;active["duration_frames"]+=1
   prev=fi
  if active:out.append(active)
  return out
+def _bridge_kwargs(data):
+ config=data.get("noise_filter",{})
+ return {
+  "bridge_total_max_frames":int(config.get("bridge_total_max_frames",15)),
+  "anchor_min_frames":int(config.get("anchor_min_frames",8)),
+  "bridge_max_segments":int(config.get("bridge_max_segments",5)),
+  "bridge_max_anchor_ratio":float(config.get("bridge_max_anchor_ratio",.75)),
+ }
+
 def _all_candidates(result,a,audit):
  key=f"{a}_segmentation";plateaus={int(p["plateau_id"]):p for p in result.get(key,{}).get("qualifying_plateaus",[])}
  points={int(p["plateau_id"]):p for p in audit.get("points",[]) if p.get("axis")==a and str(p.get("video_id",""))==str(result.get("video_id","")) and int(p.get("plateau_id",-1)) in plateaus}
@@ -41,9 +50,10 @@ def _candidate(result,a,audit):
  elif ps:p=max(ps,key=lambda q:(int(q["num_n_values"]),-float(q["midpoint_n"])));conf=None;sel="widest_qualifying_plateau_fallback"
  else:
   ls=result.get(key,{}).get("labels",{}); labels=(ls.get("negative","negative"),ls.get("center","static"),ls.get("positive","positive"))
-  from src.exp_july.perception.ego_axis_threshold_segmentation import filter_short_state_interruptions
+  from src.exp_july.perception.ego_axis_threshold_segmentation import filter_short_state_interruptions, merge_remaining_short_segments
   tolerance=int(result.get(key,{}).get("noise_filter",{}).get("tolerance_frames",5))
-  segments=filter_short_state_interruptions(_segments(result.get("frames",[]),a,0.,labels),tolerance)
+  bridged=filter_short_state_interruptions(_segments(result.get("frames",[]),a,0.,labels),tolerance,**_bridge_kwargs(result.get(key,{})))
+  segments=merge_remaining_short_segments(bridged,tolerance)
   return {"threshold_n":0.,"confidence":None,"selection":"zero_threshold_fallback","display_only":True,"segments":segments}
  return {"threshold_n":float(p["midpoint_n"]),"confidence":conf,"plateau_id":int(p["plateau_id"]),"selection":sel,"display_only":True,"segments":p.get("segments",[])}
 def _state(c,fi):
@@ -154,15 +164,48 @@ def render_eval_signal_segmentation_chart(result,audit,output_path):
    ax.axhline(-threshold,color=PLOT_COLORS[labels[0]],linestyle="--",linewidth=1.8,label=f"{labels[0]} / {labels[1]}: −N",zorder=2)
    ax.axhline(threshold,color=PLOT_COLORS[labels[2]],linestyle="--",linewidth=1.8,label=f"{labels[1]} / {labels[2]}: +N",zorder=2)
    confidence="n/a" if candidate.get("confidence") is None else f"{candidate['confidence']:.3f}"
-   reason="" if enabled else " | reason="+",".join(candidate.get("disabled_reasons",[]))
    status="ENABLED" if enabled else "DISABLED"
-   ax.set_title(f"[{status}] {axis.upper()} candidate {row+1}/{len(candidates[axis])} | threshold N={threshold:.5g} | confidence={confidence}{reason}",fontweight="bold",color="#16803a" if enabled else "#b42318")
-   if not enabled:ax.text(.98,.88,"DISABLED",transform=ax.transAxes,ha="right",va="top",fontsize=16,fontweight="bold",color="#d65a50",alpha=.38)
+   ax.set_title(f"[{status}] {axis.upper()} {row+1}/{len(candidates[axis])} | N={threshold:.5g} | conf={confidence}",fontweight="bold",fontsize=10.5,color="#16803a" if enabled else "#b42318",pad=7)
+   if not enabled:
+    reasons=candidate.get("disabled_reasons",[]) or ["unspecified"]
+    reason_text="Disabled because:\n"+"\n".join(f"• {reason}" for reason in reasons)
+    ax.text(.02,.96,reason_text,transform=ax.transAxes,ha="left",va="top",fontsize=8.5,color="#8f1d16",bbox={"boxstyle":"round,pad=0.3","fc":"#fff7f6","ec":"#d65a50","alpha":.92},zorder=8)
+    ax.text(.98,.88,"DISABLED",transform=ax.transAxes,ha="right",va="top",fontsize=16,fontweight="bold",color="#d65a50",alpha=.30)
    ax.set_xlabel("Frame index");ax.set_ylabel(f"Ego {axis}");ax.grid(True,alpha=.22);ax.legend(loc="best",fontsize=8,ncol=2)
    if indices:ax.set_xlim(min(indices)-.5,max(indices)+.5)
  fig.suptitle(f"Step 7A qualifying threshold segmentations (enabled + disabled) | video={result.get('video_id','')} | rows={k}",fontsize=16,fontweight="bold")
  fig.savefig(path,dpi=170);plt.close(fig)
  return {"status":"rendered","path":str(path),"layout":"k_by_2_all_qualifying_threshold_segmentations","num_rows":k,"vx_candidates":candidates["vx"],"vz_candidates":candidates["vz"],"vx_enabled_candidates":[row for row in candidates["vx"] if row["enabled"]],"vz_enabled_candidates":[row for row in candidates["vz"] if row["enabled"]],"vx_disabled_candidates":[row for row in candidates["vx"] if not row["enabled"]],"vz_disabled_candidates":[row for row in candidates["vz"] if not row["enabled"]]}
+
+def _segment_length_rows(segments,tolerance):
+ rows=[]
+ for segment in segments:
+  row=dict(segment);duration=int(row.get("duration_frames",int(row["end_frame"])-int(row["start_frame"])+1));row["duration_frames"]=duration;row["length_class"]="short" if duration<=tolerance else "long";rows.append(row)
+ return rows
+
+def render_eval_candidate_filter_comparisons(result,output_root,max_candidates=20):
+ """Render raw-vs-filtered 2x1 charts for the smallest candidate Ns per axis."""
+ import matplotlib
+ matplotlib.use("Agg")
+ import matplotlib.pyplot as plt
+ import numpy as np
+ from matplotlib.patches import Patch
+ from src.exp_july.perception.ego_axis_threshold_segmentation import filter_short_state_interruptions, merge_remaining_short_segments
+ output_root=Path(output_root);frames=list(result.get("frames",[]));outputs=[];limit=max(0,int(max_candidates))
+ for axis in ("vx","vz"):
+  data=result.get(f"{axis}_segmentation",{});label_map=data.get("labels",{});labels=(str(label_map.get("negative","negative")),str(label_map.get("center","static")),str(label_map.get("positive","positive")));tolerance=int(data.get("noise_filter",{}).get("tolerance_frames",5));candidates=sorted(data.get("threshold_candidates",[]),key=lambda row:(float(row["threshold"]),int(row.get("candidate_index",0))))[:limit];axis_root=output_root/axis;axis_root.mkdir(parents=True,exist_ok=True)
+  indices=[int(frame.get("frame_index",i)) for i,frame in enumerate(frames)];values=[_signal(frame,axis) for frame in frames]
+  for rank,candidate in enumerate(candidates,1):
+   threshold=float(candidate["threshold"]);raw=_segment_length_rows(_segments(frames,axis,threshold,labels),tolerance);bridged=filter_short_state_interruptions(raw,tolerance,**_bridge_kwargs(data));filtered=_segment_length_rows(merge_remaining_short_segments(bridged,tolerance),tolerance);path=axis_root/f"candidate_{rank:02d}_index_{int(candidate.get('candidate_index',rank-1)):03d}.png"
+   fig,axes=plt.subplots(2,1,figsize=(16,8),sharex=True,constrained_layout=True)
+   for ax,title,segments in ((axes[0],"BEFORE short-segment merge",raw),(axes[1],"AFTER short-segment merge",filtered)):
+    observed=set()
+    for segment_index,segment in enumerate(segments):
+     state=str(segment.get("state","unavailable"));start=float(segment["start_frame"]);end=float(segment["end_frame"]);duration=int(segment["duration_frames"]);length_class=str(segment["length_class"]);ax.axvspan(start-.5,end+.5,color=PLOT_COLORS.get(state,PLOT_COLORS["unavailable"]),alpha=.28,zorder=0);observed.add(state);midpoint=.5*(start+end);ax.text(midpoint,.88-.17*(segment_index%2),f"{state.upper()}\n{length_class.upper()} {duration}f",transform=ax.get_xaxis_transform(),ha="center",va="top",rotation=90 if length_class=="short" else 0,fontsize=7,fontweight="bold",color="#8f1d16" if length_class=="short" else "#176b35",bbox={"boxstyle":"round,pad=0.2","fc":"#fff0ee" if length_class=="short" else "#edf9f0","ec":"#d65a50" if length_class=="short" else "#4aa564","alpha":.88},zorder=7,clip_on=True)
+    ax.plot(indices,[np.nan if value is None else value for value in values],color="#17202a",linewidth=2.0,label=f"ego {axis}",zorder=3);ax.axhline(-threshold,color=PLOT_COLORS[labels[0]],linestyle="--",linewidth=1.7,label="−N");ax.axhline(threshold,color=PLOT_COLORS[labels[2]],linestyle="--",linewidth=1.7,label="+N");ax.axhline(0.,color="#f4c542",linestyle=":",linewidth=1.2,label="zero");handles=[Patch(facecolor=PLOT_COLORS[state],alpha=.35,label=state) for state in labels if state in observed];handles.extend([Patch(facecolor="#fff0ee",edgecolor="#d65a50",label=f"SHORT ≤ {tolerance}f"),Patch(facecolor="#edf9f0",edgecolor="#4aa564",label=f"LONG > {tolerance}f")]);line_handles,line_labels=ax.get_legend_handles_labels();ax.legend(handles+line_handles,[handle.get_label() for handle in handles]+line_labels,loc="best",fontsize=8,ncol=4);ax.set_title(f"{title} | segments={len(segments)}",fontsize=12,fontweight="bold");ax.set_ylabel(f"Ego {axis}");ax.grid(True,alpha=.2)
+    if indices:ax.set_xlim(min(indices)-.5,max(indices)+.5)
+   axes[1].set_xlabel("Frame index");fig.suptitle(f"Step 7A {axis.upper()} candidate {rank}/{len(candidates)} | N={threshold:.6g} | tolerance={tolerance} frames | video={result.get('video_id','')}",fontsize=15,fontweight="bold");fig.savefig(path,dpi=150);plt.close(fig);outputs.append({"status":"rendered","axis":axis,"candidate_rank":rank,"candidate_index":int(candidate.get("candidate_index",rank-1)),"threshold_n":threshold,"raw_segment_count":len(raw),"filtered_segment_count":len(filtered),"raw_segments":raw,"filtered_segments":filtered,"noise_tolerance_frames":tolerance,"bridge_config":_bridge_kwargs(data),"short_segment_definition":f"duration_frames <= {tolerance}","long_segment_definition":f"duration_frames > {tolerance}","path":str(path)})
+ return {"status":"rendered","layout":"2x1_before_after_guaranteed_long_segments","max_candidates_per_axis":limit,"num_charts":len(outputs),"charts":outputs}
 
 def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.):
  import cv2,numpy as np

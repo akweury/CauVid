@@ -5,12 +5,13 @@ from unittest.mock import patch
 
 from src.exp_july.perception.pipeline import step7_train_eval_split, step7a_axis_threshold_segmentation
 
-from src.exp_july.perception.ego_axis_threshold_visualization import render_eval_signal_segmentation_chart
+from src.exp_july.perception.ego_axis_threshold_visualization import render_eval_candidate_filter_comparisons, render_eval_signal_segmentation_chart
 
 from src.exp_july.perception.ego_axis_threshold_segmentation import (
     _confidence_at,
     _confidence_surface,
     filter_short_state_interruptions,
+    merge_remaining_short_segments,
     render_all_video_plateau_scatter,
     render_segment_count_chart,
     segment_axis,
@@ -59,6 +60,68 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         self.assertEqual(filtered[0]["absorbed_interruption_frames"], 3)
         self.assertEqual(filtered[0]["absorbed_states"], ["straight", "right", "straight"])
 
+    def test_noise_filter_merges_complex_sequence_of_individually_short_states(self):
+        states = [
+            ("forward", 20),
+            ("backward", 2),
+            ("static", 2),
+            ("forward", 1),
+            ("backward", 2),
+            ("forward", 25),
+        ]
+        segments = []
+        start = 0
+        for state, duration in states:
+            segments.append({"state": state, "start_frame": start, "end_frame": start + duration - 1, "duration_frames": duration})
+            start += duration
+        filtered = filter_short_state_interruptions(
+            segments, tolerance_frames=5,
+            bridge_total_max_frames=15, anchor_min_frames=8,
+            bridge_max_segments=5, bridge_max_anchor_ratio=0.75,
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["state"], "forward")
+        self.assertEqual(filtered[0]["duration_frames"], 52)
+        self.assertEqual(filtered[0]["absorbed_segment_count"], 4)
+        self.assertEqual(filtered[0]["absorbed_states"], ["backward", "static", "forward", "backward"])
+
+    def test_noise_filter_rejects_bridge_with_excessive_anchor_ratio(self):
+        segments = [
+            {"state": "forward", "start_frame": 0, "end_frame": 7, "duration_frames": 8},
+            {"state": "static", "start_frame": 8, "end_frame": 13, "duration_frames": 6},
+            {"state": "forward", "start_frame": 14, "end_frame": 21, "duration_frames": 8},
+        ]
+        filtered = filter_short_state_interruptions(
+            segments, tolerance_frames=6,
+            bridge_total_max_frames=15, anchor_min_frames=8,
+            bridge_max_segments=5, bridge_max_anchor_ratio=0.5,
+        )
+        self.assertEqual(len(filtered), 3)
+
+    def test_residual_short_island_uses_mean_signal_to_split_between_long_neighbors(self):
+        segments = [
+            {"state": "forward", "start_frame": 0, "end_frame": 9, "duration_frames": 10, "mean_signal": 10.0},
+            {"state": "static", "start_frame": 10, "end_frame": 11, "duration_frames": 2, "mean_signal": 8.0},
+            {"state": "static", "start_frame": 12, "end_frame": 13, "duration_frames": 2, "mean_signal": -9.0},
+            {"state": "backward", "start_frame": 14, "end_frame": 23, "duration_frames": 10, "mean_signal": -10.0},
+        ]
+        filtered = merge_remaining_short_segments(segments, tolerance_frames=5)
+        self.assertEqual([row["state"] for row in filtered], ["forward", "backward"])
+        self.assertEqual([row["duration_frames"] for row in filtered], [12, 12])
+        self.assertTrue(all(row["duration_frames"] > 5 for row in filtered))
+        self.assertEqual(filtered[0]["residual_short_assignments"][0]["assigned_state"], "forward")
+        self.assertEqual(filtered[1]["residual_short_assignments"][0]["assigned_state"], "backward")
+
+    def test_residual_edge_short_island_attaches_to_only_long_neighbor(self):
+        segments = [
+            {"state": "static", "start_frame": 0, "end_frame": 2, "duration_frames": 3, "mean_signal": 0.0},
+            {"state": "forward", "start_frame": 3, "end_frame": 12, "duration_frames": 10, "mean_signal": 8.0},
+        ]
+        filtered = merge_remaining_short_segments(segments, tolerance_frames=5)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["state"], "forward")
+        self.assertEqual(filtered[0]["duration_frames"], 13)
+
     def test_noise_filter_preserves_interruptions_above_tolerance(self):
         segments = [
             {"state": "backward", "start_frame": 0, "end_frame": 7, "duration_frames": 8},
@@ -77,7 +140,13 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         config = {
             "vx_seg_max_count": 8, "vz_seg_max_count": 5,
             "max_plateau_middle_th_vx": 250.0, "max_plateau_middle_th_vz": 70.0,
+            "plateau_min_n_values": 3,
             "noise_tolerance_frames_vx": 5, "noise_tolerance_frames_vz": 5,
+            "bridge_total_max_frames_vx": 15, "bridge_total_max_frames_vz": 15,
+            "anchor_min_frames_vx": 8, "anchor_min_frames_vz": 8,
+            "bridge_max_segments_vx": 5, "bridge_max_segments_vz": 5,
+            "bridge_max_anchor_ratio_vx": 0.75, "bridge_max_anchor_ratio_vz": 0.75,
+            "filter_comparison_max_candidates": 2,
         }
 
         def touch_chart(_result, path):
@@ -92,6 +161,15 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         def signal_chart(_result, _audit, path):
             path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"png"); return {"status": "rendered", "path": str(path)}
 
+        def filter_comparisons(_result, output_root, max_candidates=20):
+            charts = []
+            for axis in ("vx", "vz"):
+                for index in range(max_candidates):
+                    path = Path(output_root) / axis / f"candidate_{index:02d}.png"
+                    path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"png")
+                    charts.append({"status": "rendered", "axis": axis, "path": str(path)})
+            return {"status": "rendered", "num_charts": len(charts), "charts": charts}
+
         with tempfile.TemporaryDirectory() as directory, \
                 patch("src.exp_july.perception.pipeline.get_pipeline_output_root", return_value=Path(directory)), \
                 patch("src.exp_july.perception.pipeline.step7_ego_motion", return_value={"ego_motion": ego_motion}), \
@@ -99,7 +177,8 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
                 patch("src.exp_july.perception.ego_axis_threshold_segmentation.render_segment_count_chart", side_effect=touch_chart), \
                 patch("src.exp_july.perception.ego_axis_threshold_segmentation.render_all_video_plateau_scatter", side_effect=scatter), \
                 patch("src.exp_july.perception.ego_axis_threshold_visualization.render_axis_segmentation_mp4", side_effect=visual), \
-                patch("src.exp_july.perception.ego_axis_threshold_visualization.render_eval_signal_segmentation_chart", side_effect=signal_chart):
+                patch("src.exp_july.perception.ego_axis_threshold_visualization.render_eval_signal_segmentation_chart", side_effect=signal_chart), \
+                patch("src.exp_july.perception.ego_axis_threshold_visualization.render_eval_candidate_filter_comparisons", side_effect=filter_comparisons):
             output = step7a_axis_threshold_segmentation({
                 "step7_train_video_ids": ["train-video"],
                 "step7_eval_video_ids": ["eval-video"],
@@ -110,6 +189,8 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             self.assertTrue((root / "eval" / "eval-video" / "axis_threshold_segmentation.json").exists())
             self.assertTrue((root / "eval" / "eval-video" / "axis_segmentation_visualization.mp4").exists())
             self.assertTrue((root / "eval" / "eval-video" / "axis_signal_segmentation.png").exists())
+            self.assertTrue((root / "eval" / "eval-video" / "candidate_filter_comparisons" / "vx" / "candidate_00.png").exists())
+            self.assertTrue((root / "eval" / "eval-video" / "candidate_filter_comparisons" / "vz" / "candidate_00.png").exists())
             self.assertFalse((root / "eval" / "train-video").exists())
             self.assertEqual(output["ego_axis_threshold_segmentation_manifest"]["num_train_videos"], 1)
             self.assertEqual(output["ego_axis_threshold_segmentation_manifest"]["num_eval_videos"], 1)
@@ -149,14 +230,14 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
     def test_keeps_every_long_plateau_and_uses_its_middle_n(self):
         frames = [
             {"frame_index": index, "ego_vz_smoothed": value}
-            for index, value in enumerate([-3.0] * 4 + [0.0] * 4 + [3.0] * 4)
+            for index, value in enumerate([-3.0] * 8 + [0.0] * 8 + [3.0] * 8)
         ]
         result = segment_axis(frames, "vz", ("backward", "static", "forward"))
         self.assertTrue(result["qualifying_plateaus"])
         self.assertNotIn("optimal_threshold", result)
         self.assertNotIn("selected_plateau", result)
         for plateau in result["qualifying_plateaus"]:
-            self.assertGreater(plateau["num_n_values"], 5)
+            self.assertGreaterEqual(plateau["num_n_values"], 3)
             self.assertGreater(plateau["segment_count"], 1)
             self.assertAlmostEqual(
                 plateau["midpoint_n"],
@@ -179,9 +260,9 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
     def test_vz_and_vx_use_requested_state_vocabulary(self):
         frames = []
         for index, (vx, vz) in enumerate(
-            [(-2.0, -3.0)] * 4
-            + [(0.0, 0.0)] * 4
-            + [(2.0, 3.0)] * 4
+            [(-2.0, -3.0)] * 8
+            + [(0.0, 0.0)] * 8
+            + [(2.0, 3.0)] * 8
         ):
             frames.append(
                 {
@@ -200,6 +281,38 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             {"right", "straight", "left"},
         )
 
+
+    def test_renders_smallest_candidate_filter_comparisons_for_both_axes(self):
+        frames = [
+            {"frame_index": index, "ego_vx": vx, "ego_vz": vz}
+            for index, (vx, vz) in enumerate(
+                [(-3.0, 3.0)] * 8 + [(0.0, 0.0)] * 3 + [(-3.0, 3.0)] * 8
+            )
+        ]
+        result = segment_video({"video_id": "filter-demo", "frames": frames})
+        with tempfile.TemporaryDirectory() as directory:
+            output = render_eval_candidate_filter_comparisons(
+                result, Path(directory), max_candidates=2,
+            )
+            self.assertEqual(output["num_charts"], 4)
+            self.assertEqual(output["max_candidates_per_axis"], 2)
+            self.assertEqual([row["axis"] for row in output["charts"]], ["vx", "vx", "vz", "vz"])
+            for row in output["charts"]:
+                path = Path(row["path"])
+                self.assertTrue(path.exists())
+                self.assertGreater(path.stat().st_size, 1000)
+                self.assertGreaterEqual(row["raw_segment_count"], row["filtered_segment_count"])
+                self.assertTrue(all(segment["length_class"] in {"short", "long"} for segment in row["raw_segments"]))
+                self.assertTrue(all(segment["length_class"] in {"short", "long"} for segment in row["filtered_segments"]))
+                self.assertEqual(row["short_segment_definition"], "duration_frames <= 5")
+                self.assertEqual(row["long_segment_definition"], "duration_frames > 5")
+            self.assertIn("short", {segment["length_class"] for segment in output["charts"][0]["raw_segments"]})
+            self.assertIn("long", {segment["length_class"] for segment in output["charts"][0]["raw_segments"]})
+            self.assertEqual(output["layout"], "2x1_before_after_guaranteed_long_segments")
+            for axis in ("vx", "vz"):
+                thresholds = [row["threshold_n"] for row in output["charts"] if row["axis"] == axis]
+                expected = [row["threshold"] for row in result[f"{axis}_segmentation"]["threshold_candidates"][:2]]
+                self.assertEqual(thresholds, expected)
 
     def test_signal_chart_renders_enabled_and_disabled_candidates(self):
         frames = [
@@ -276,7 +389,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
                     "ego_vx_smoothed": value * (video_index + 1),
                     "ego_vz_smoothed": value * (video_index + 2),
                 }
-                for index, value in enumerate([-2.0] * 5 + [0.0] * 5 + [2.0] * 5)
+                for index, value in enumerate([-2.0] * 8 + [0.0] * 8 + [2.0] * 8)
             ]
             videos.append(segment_video({"video_id": f"video-{video_index}", "frames": frames}))
         with tempfile.TemporaryDirectory() as directory:

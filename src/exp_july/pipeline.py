@@ -359,6 +359,13 @@ def _run_pipeline(
         "07a_axis_threshold_segmentation",
         lambda: step7a_axis_threshold_segmentation(step7_split_state),
     )
+    # Step 7B: intentionally empty; reserved for post-filter transition-logic
+    # validation. Planned VZ transitions must pass through the neutral state:
+    # forward <-> static <-> backward, so direct forward <-> backward is
+    # forbidden. Planned VX transitions follow the same rule:
+    # left <-> straight <-> right, so direct left <-> right is forbidden.
+    # This future validation must run after Step 7A short-segment filtering.
+    # No Step 7B function is called and no pipeline state is changed here.
     # Step 8: repair trajectories first; split events receive new track IDs.
     repaired_state = _tracked_step(
         tracker,

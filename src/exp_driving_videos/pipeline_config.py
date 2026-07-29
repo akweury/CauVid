@@ -72,8 +72,18 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
             "vz_seg_max_count": 5,
             "max_plateau_middle_th_vx": 250.0,
             "max_plateau_middle_th_vz": 70.0,
+            "plateau_min_n_values": 3,
             "noise_tolerance_frames_vx": 5,
             "noise_tolerance_frames_vz": 5,
+            "bridge_total_max_frames_vx": 15,
+            "bridge_total_max_frames_vz": 15,
+            "anchor_min_frames_vx": 8,
+            "anchor_min_frames_vz": 8,
+            "bridge_max_segments_vx": 5,
+            "bridge_max_segments_vz": 5,
+            "bridge_max_anchor_ratio_vx": 0.75,
+            "bridge_max_anchor_ratio_vz": 0.75,
+            "filter_comparison_max_candidates": 20,
         },
         path=("step7a_axis_threshold_segmentation",),
         warn_label="Step 7A axis-threshold segmentation",
@@ -82,8 +92,15 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
     cfg["vz_seg_max_count"] = max(1, int(cfg.get("vz_seg_max_count", 5)))
     cfg["max_plateau_middle_th_vx"] = max(0.0, float(cfg.get("max_plateau_middle_th_vx", 250.0)))
     cfg["max_plateau_middle_th_vz"] = max(0.0, float(cfg.get("max_plateau_middle_th_vz", 70.0)))
+    cfg["plateau_min_n_values"] = max(1, int(cfg.get("plateau_min_n_values", 3)))
     cfg["noise_tolerance_frames_vx"] = max(0, int(cfg.get("noise_tolerance_frames_vx", 5)))
     cfg["noise_tolerance_frames_vz"] = max(0, int(cfg.get("noise_tolerance_frames_vz", 5)))
+    for axis in ("vx", "vz"):
+        cfg[f"bridge_total_max_frames_{axis}"] = max(0, int(cfg.get(f"bridge_total_max_frames_{axis}", 15)))
+        cfg[f"anchor_min_frames_{axis}"] = max(1, int(cfg.get(f"anchor_min_frames_{axis}", 8)))
+        cfg[f"bridge_max_segments_{axis}"] = max(1, int(cfg.get(f"bridge_max_segments_{axis}", 5)))
+        cfg[f"bridge_max_anchor_ratio_{axis}"] = max(0.0, float(cfg.get(f"bridge_max_anchor_ratio_{axis}", 0.75)))
+    cfg["filter_comparison_max_candidates"] = max(0, int(cfg.get("filter_comparison_max_candidates", 20)))
     return cfg
 
 

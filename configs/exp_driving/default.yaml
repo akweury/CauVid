@@ -22,8 +22,18 @@ step7a_axis_threshold_segmentation:
   vz_seg_max_count: 5
   max_plateau_middle_th_vx: 250
   max_plateau_middle_th_vz: 70
+  plateau_min_n_values: 3
   noise_tolerance_frames_vx: 5
   noise_tolerance_frames_vz: 5
+  bridge_total_max_frames_vx: 15
+  bridge_total_max_frames_vz: 15
+  anchor_min_frames_vx: 8
+  anchor_min_frames_vz: 8
+  bridge_max_segments_vx: 5
+  bridge_max_segments_vz: 5
+  bridge_max_anchor_ratio_vx: 0.75
+  bridge_max_anchor_ratio_vz: 0.75
+  filter_comparison_max_candidates: 20
 
 ego_motion:
   render_video: false
