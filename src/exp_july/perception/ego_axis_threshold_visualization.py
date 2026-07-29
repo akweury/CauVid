@@ -124,16 +124,17 @@ def _candidate_stack(im,box,result,audit,indices,now,show_final=True,highlights=
    is_best=best is not None and candidate_id==int(best.get("plateau_id",-2))
    confidence="n/a" if candidate.get("confidence") is None else f"{candidate['confidence']:.3f}"
    text_scale=.48 if pitch>=36 else .38
-   badges=(" | FINAL-MATCH" if is_optimal else "")+(" | HEATMAP-BEST" if is_best else "")
-   text_color=(0,245,255) if is_optimal else (255,245,0) if is_best else (235,235,235)
-   cv2.putText(im,f"N={candidate['threshold_n']:.5g} | conf={confidence}{badges}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,text_scale,text_color,1,cv2.LINE_AA)
+   badges=(" | FINAL BEST" if is_optimal else "")+(" | HEATMAP BEST" if is_best else "")
+   highlight_scale=.54 if pitch>=36 else .44
+   text_color=(70,255,90) if is_optimal else (0,145,255) if is_best else (235,235,235)
+   cv2.putText(im,f"N={candidate['threshold_n']:.5g} | conf={confidence}{badges}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,highlight_scale if (is_optimal or is_best) else text_scale,text_color,2 if (is_optimal or is_best) else 1,cv2.LINE_AA)
    bar_y=cursor+min(21,pitch-5)
    bar_h=max(3,min(34,pitch-(bar_y-cursor)-2))
    for i,frame_index in enumerate(indices):
     x0=x+int(i*w/total_frames);x1=x+int((i+1)*w/total_frames)
     cv2.rectangle(im,(x0,bar_y),(max(x0+1,x1),bar_y+bar_h),COLORS[_state(candidate,frame_index)],-1)
-   if is_optimal:cv2.rectangle(im,(x-2,bar_y-2),(x+w+2,bar_y+bar_h+2),(0,245,255),2)
-   if is_best:cv2.rectangle(im,(x+1,bar_y+1),(x+w-1,bar_y+bar_h-1),(255,245,0),2)
+   if is_optimal:cv2.rectangle(im,(x-4,bar_y-4),(x+w+4,bar_y+bar_h+4),(70,255,90),4)
+   if is_best:cv2.rectangle(im,(x-1,bar_y-1),(x+w+1,bar_y+bar_h+1),(0,145,255),3)
    marker_x=x+int((now+.5)*w/total_frames)
    cv2.line(im,(marker_x,bar_y-2),(marker_x,bar_y+bar_h+2),(255,255,255),2,cv2.LINE_AA)
    cursor+=pitch
@@ -206,7 +207,7 @@ def _scatter_panel(audit,video_id,size,result=None,show_heatmap=False):
  from matplotlib.backends.backend_agg import FigureCanvasAgg
  from matplotlib.figure import Figure
  from src.exp_july.perception.ego_axis_threshold_segmentation import _confidence_surface
- points=list(audit.get("points",[])); fig=Figure(figsize=(4.8,10.4),dpi=100,facecolor="#181b20"); canvas=FigureCanvasAgg(fig); axes=fig.subplots(2,1)
+ points=list(audit.get("points",[])); fig=Figure(figsize=(6.2 if show_heatmap else 4.8,10.4),dpi=100,facecolor="#181b20"); canvas=FigureCanvasAgg(fig); axes=fig.subplots(2,1)
  highlights=_step7b_scatter_highlights(result or {},audit) if show_heatmap else {}
  for ax,axis in zip(axes,("vx","vz")):
   rows=[p for p in points if p.get("axis")==axis]; current=[p for p in rows if str(p.get("video_id",""))==str(video_id)]; others=[p for p in rows if str(p.get("video_id",""))!=str(video_id)]
@@ -234,9 +235,9 @@ def _scatter_panel(audit,video_id,size,result=None,show_heatmap=False):
    if current:ax.scatter([p["midpoint_n"] for p in current],[p["segment_count"] for p in current],s=150,c="#00f5ff",marker="*",edgecolors="white",linewidths=1.1,zorder=8,label="CURRENT VIDEO")
   if limits:
    ax.set_xlim(float(limits.get("x_min",0.)),float(limits["x_max"]));ax.set_ylim(float(limits.get("y_min",0.)),float(limits["y_max"]))
-  ax.set_title(f"{axis.upper()} eval thresholds + train heat map" if show_heatmap else f"{axis.upper()} plateaus",color="white",fontsize=13,fontweight="bold");ax.set_xlabel("middle N",color="#e5e5e5",fontsize=10);ax.set_ylabel("segments",color="#e5e5e5",fontsize=10);ax.tick_params(colors="#dddddd",labelsize=8);ax.grid(True,alpha=.2,color="white")
+  ax.set_title(f"{axis.upper()} eval thresholds + train heat map" if show_heatmap else f"{axis.upper()} plateaus",color="white",fontsize=15 if show_heatmap else 13,fontweight="bold");ax.set_xlabel("middle N",color="#e5e5e5",fontsize=12 if show_heatmap else 10);ax.set_ylabel("segments",color="#e5e5e5",fontsize=12 if show_heatmap else 10);ax.tick_params(colors="#dddddd",labelsize=10 if show_heatmap else 8);ax.grid(True,alpha=.2,color="white")
   for spine in ax.spines.values():spine.set_color("#888888")
-  ax.legend(fontsize=7,loc="best",facecolor="#30343b",labelcolor="white",framealpha=.9)
+  ax.legend(fontsize=10 if show_heatmap else 7,loc="best",facecolor="#30343b",labelcolor="white",framealpha=.94,borderpad=.7,labelspacing=.55,handlelength=1.8)
  fig.suptitle(("TRAIN HEAT MAP + EVAL VIDEO\n" if show_heatmap else "ALL-VIDEO PLATEAUS\n")+f"current={video_id}",color="white",fontsize=14,fontweight="bold");fig.tight_layout(rect=(0,.01,1,.94));canvas.draw();rgba=np.asarray(canvas.buffer_rgba());bgr=cv2.cvtColor(rgba,cv2.COLOR_RGBA2BGR)
  return cv2.resize(bgr,size,interpolation=cv2.INTER_AREA)
 
@@ -501,7 +502,7 @@ def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.,show
  import cv2,numpy as np
  frames=list(ego_video.get("frames",[]))
  if not frames:return {"status":"skipped","reason":"no_frames","path":None}
- path=Path(output_path);path.parent.mkdir(parents=True,exist_ok=True);vx=_candidate(result,"vx",audit);vz=_candidate(result,"vz",audit);W,H,C1,C2=1920,1080,1000,1440;right_panel_highlights=_step7b_scatter_highlights(result,audit) if show_final else {};scatter_panel=_scatter_panel(audit,result.get("video_id",""),(W-C2-40,H-164),result=result,show_heatmap=show_final);wr=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"mp4v"),max(1.,float(fps)),(W,H))
+ path=Path(output_path);path.parent.mkdir(parents=True,exist_ok=True);vx=_candidate(result,"vx",audit);vz=_candidate(result,"vz",audit);W,H=1920,1080;C1,C2=(900,1370) if show_final else (1000,1440);right_panel_highlights=_step7b_scatter_highlights(result,audit) if show_final else {};scatter_panel=_scatter_panel(audit,result.get("video_id",""),(W-C2-40,H-164),result=result,show_heatmap=show_final);wr=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"mp4v"),max(1.,float(fps)),(W,H))
  if not wr.isOpened():raise RuntimeError(f"Could not open Step 7A MP4 writer: {path}")
  ids=[int(f.get("frame_index",i)) for i,f in enumerate(frames)]
  for i,f in enumerate(frames):
