@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 10
+VERSION = 11
 NUM_THRESHOLDS = 100
 
 
@@ -134,6 +134,8 @@ def _plateaus(candidate_rows):
             "end_index": index - 1,
             "num_n_values": len(chunk),
             "segment_count": int(chunk[0]["segment_count"]),
+            "raw_segment_count_min": min(int(row.get("raw_segment_count", row["segment_count"])) for row in chunk),
+            "raw_segment_count_max": max(int(row.get("raw_segment_count", row["segment_count"])) for row in chunk),
             "threshold_start": float(chunk[0]["threshold"]),
             "threshold_end": float(chunk[-1]["threshold"]),
             "midpoint_n": float(midpoint),
@@ -259,7 +261,17 @@ def render_segment_count_chart(result, output_path):
         candidates = data["threshold_candidates"]
         thresholds = [row["threshold"] for row in candidates]
         counts = [row["segment_count"] for row in candidates]
-        axis.plot(thresholds, counts, color=color, linewidth=2.3, marker=".", markersize=4)
+        raw_counts = [row.get("raw_segment_count", row["segment_count"]) for row in candidates]
+        axis.plot(
+            thresholds, raw_counts, color="#6C757D", linewidth=1.9,
+            linestyle="--", marker="x", markersize=3.5,
+            label="raw segments before short-merge filter", zorder=2,
+        )
+        axis.plot(
+            thresholds, counts, color=color, linewidth=2.5,
+            marker=".", markersize=4,
+            label="filtered segments after short-merge filter", zorder=3,
+        )
         for plateau_index, plateau in enumerate(data["qualifying_plateaus"]):
             midpoint = plateau["midpoint_n"]
             count = plateau["segment_count"]
@@ -270,8 +282,11 @@ def render_segment_count_chart(result, output_path):
             )
             axis.axvline(midpoint, color="#7A1FA2", linestyle="--", linewidth=1.8)
             axis.scatter([midpoint], [count], s=75, color="#7A1FA2", edgecolors="white", linewidths=1.2, zorder=5)
+            raw_min = int(plateau.get("raw_segment_count_min", count))
+            raw_max = int(plateau.get("raw_segment_count_max", count))
+            raw_text = str(raw_min) if raw_min == raw_max else f"{raw_min}-{raw_max}"
             axis.annotate(
-                f"middle N={midpoint:.5g}\nsegments={count}",
+                f"middle N={midpoint:.5g}\nfiltered={count} | raw={raw_text}",
                 xy=(midpoint, count), xytext=(7, 13), textcoords="offset points",
                 fontsize=8.5, fontweight="bold", color="#4A1268",
                 bbox={"boxstyle": "round,pad=0.25", "fc": "white", "ec": "#7A1FA2", "alpha": 0.9},
@@ -280,10 +295,9 @@ def render_segment_count_chart(result, output_path):
         axis.set_xlabel("Threshold N", fontsize=11)
         axis.set_ylabel("Number of temporal segments", fontsize=11)
         axis.grid(True, alpha=0.25)
-        if data["qualifying_plateaus"]:
-            axis.legend(fontsize=9)
+        axis.legend(fontsize=8.5, loc="best")
     figure.suptitle(
-        f"Step 7A multi-plateau threshold stability | video={result.get('video_id', '')}",
+        f"Step 7A raw vs filtered segment counts | video={result.get('video_id', '')}",
         fontsize=15, fontweight="bold",
     )
     figure.savefig(output_path, dpi=160)

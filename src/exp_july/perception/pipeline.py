@@ -3683,6 +3683,10 @@ def step7a_axis_threshold_segmentation(position_state):
     noise_tolerance_frames_vz = int(step7a_config["noise_tolerance_frames_vz"])
     output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
     output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "train").mkdir(parents=True, exist_ok=True)
+    (output_root / "eval").mkdir(parents=True, exist_ok=True)
+    train_video_ids = set(str(value) for value in position_state.get("step7_train_video_ids", []))
+    eval_video_ids = set(str(value) for value in position_state.get("step7_eval_video_ids", []))
     results = []
     cached_videos = 0
     for ego_video in tqdm(ego_motion, desc="[step 7a] axis_threshold_segmentation", unit="video"):
@@ -3692,7 +3696,9 @@ def step7a_axis_threshold_segmentation(position_state):
             "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
             "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
-        path = output_root / video_id / "axis_threshold_segmentation.json"
+        data_split = "eval" if video_id in eval_video_ids else "train"
+        video_output_root = output_root / data_split / video_id
+        path = video_output_root / "axis_threshold_segmentation.json"
         cached = None
         if path.exists():
             try:
@@ -3715,11 +3721,11 @@ def step7a_axis_threshold_segmentation(position_state):
         chart_path = path.parent / "axis_threshold_segment_counts.png"
         if recomputed or not chart_path.exists():
             render_segment_count_chart(cached, chart_path)
+        cached["data_split"] = data_split
+        cached["output_directory"] = str(video_output_root)
         cached["segment_count_chart"] = str(chart_path)
         path.write_text(json.dumps(cached, indent=2), encoding="utf-8")
         results.append(cached)
-    train_video_ids = set(position_state.get("step7_train_video_ids", []))
-    eval_video_ids = set(position_state.get("step7_eval_video_ids", []))
     train_results = [row for row in results if str(row.get("video_id", "")) in train_video_ids]
     eval_results = [row for row in results if str(row.get("video_id", "")) in eval_video_ids]
     # Compatibility fallback for direct Step 7A calls without the pre-split stage.
@@ -3739,17 +3745,18 @@ def step7a_axis_threshold_segmentation(position_state):
     signal_segmentation_charts = []
     for result in tqdm(eval_results, desc="[step 7a] eval visualizations", unit="video"):
         video_id = str(result.get("video_id", ""))
-        visualization_path = output_root / video_id / "axis_segmentation_visualization.mp4"
-        signal_chart_path = output_root / video_id / "axis_signal_segmentation.png"
+        video_output_root = output_root / "eval" / video_id
+        visualization_path = video_output_root / "axis_segmentation_visualization.mp4"
+        signal_chart_path = video_output_root / "axis_signal_segmentation.png"
         visualization_fingerprint = hashlib.sha256(json.dumps({
             "version": VERSION,
-            "visualization_layout": "eval_only_three_column_all_enabled_segmentations_v4",
+            "visualization_layout": "eval_only_three_column_threshold_summary_v6",
             "source_fingerprint": result.get("source_fingerprint"),
             "confidence_points": [row for row in overall_scatter.get("points", []) if str(row.get("video_id", "")) == video_id],
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         signal_chart_fingerprint = hashlib.sha256(json.dumps({
             "visualization_fingerprint": visualization_fingerprint,
-            "signal_chart_layout": "k_by_2_all_enabled_threshold_segmentations_v2",
+            "signal_chart_layout": "k_by_2_enabled_and_disabled_threshold_segmentations_v3",
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         cached_visual = result.get("visualization", {})
         if (visualization_path.exists() and cached_visual.get("status") == "rendered"
@@ -3769,7 +3776,7 @@ def step7a_axis_threshold_segmentation(position_state):
         result["signal_segmentation_chart"] = signal_chart
         visualization_mp4s.append(visual)
         signal_segmentation_charts.append(signal_chart)
-        (output_root / video_id / "axis_threshold_segmentation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        (video_output_root / "axis_threshold_segmentation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     manifest = {
         "version": VERSION,
         "stage": "7a_ego_axis_threshold_segmentation",
@@ -3785,6 +3792,10 @@ def step7a_axis_threshold_segmentation(position_state):
         "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
         "configuration": step7a_config,
         "train_eval_split": copy.deepcopy(position_state.get("step7_train_eval_split", {})),
+        "train_output_root": str(output_root / "train"),
+        "eval_output_root": str(output_root / "eval"),
+        "num_train_videos": len(train_results),
+        "num_eval_videos": len(eval_results),
         "cached_videos": cached_videos,
         "segment_count_charts": [str(row.get("segment_count_chart", "")) for row in results],
         "visualization_scope": "eval_videos_only",

@@ -102,7 +102,10 @@ the axis tolerance. It handles both single-state interruptions such as
 `forward → static → forward` and mixed interruptions such as
 `forward → static → backward → static → forward`. The same operation is used
 for the `right`, `straight`, and `left` states on `vx`. Both surrounding anchor
-segments must be longer than the configured tolerance.
+segments must be longer than the configured tolerance. The segment-count PNG
+plots the original raw count as a dashed gray curve and the filtered count as a
+solid axis-colored curve. Plateau annotations report the filtered count and the
+raw count range; plateau detection uses only the filtered count.
 
 | Configuration | Default |
 |---|---:|
@@ -122,34 +125,48 @@ fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
 
 | Output | Content |
 |---|---|
-| Per-video JSON | thresholds, segment counts, plateaus, middle `N`, candidate segments |
-| Per-video PNG | 1×2 `vx`/`vz` plateau charts |
-| Per-eval-video signal PNG | k×2 matrix of all enabled `vx`/`vz` thresholds, with one candidate per row, state-colored segment backgrounds, and dashed `±N` label thresholds |
+| Per-video JSON | `train/<video_id>/` or `eval/<video_id>/`; thresholds, segment counts, plateaus, middle `N`, candidate segments |
+| Per-video PNG | `train/<video_id>/` or `eval/<video_id>/`; 1×2 `vx`/`vz` charts showing raw pre-merge and filtered post-merge segment counts at every `N` |
+| Per-eval-video signal PNG | k×2 matrix of all qualifying `vx`/`vz` thresholds, including enabled and disabled candidates, with status/reason, state-colored backgrounds, and dashed `±N` thresholds |
 | Overall PNG | 1×2 confidence heat maps with train, eval, and disabled points |
 | Scatter audit | confidence surfaces, point confidence, limits, split, eval metric |
 
-**MP4 audit visualization:** `<video_id>/axis_segmentation_visualization.mp4`
+**MP4 audit visualization:** `eval/<video_id>/axis_segmentation_visualization.mp4`
 
-**Evaluation signal chart:** `<video_id>/axis_signal_segmentation.png`
+**Evaluation signal chart:** `eval/<video_id>/axis_signal_segmentation.png`
 
 The signal chart uses `vx` and `vz` as its two columns. Its row count `k` is
-the larger enabled-candidate count across the two axes; if the counts differ,
+the larger qualifying-candidate count across the two axes; if the counts differ,
 unused cells are explicitly marked. Candidates are ordered by increasing `N`.
+Enabled candidates have green status titles. Disabled candidates remain visible
+with pale-red panels, red status titles, a `DISABLED` watermark, and the exact
+disabling reason.
 
 The MP4 is generated only for evaluation-split videos. It uses a three-column
 layout: original frames with synchronized ego `vx` and `vz` plots in the left
 column (with bright dashed zero references), all enabled `vx` / `vz` threshold
 candidates and their colored segmentation timelines stacked by increasing `N`
 in the middle column, and vertically stacked all-video `vx` / `vz` plateau
-scatter charts in the right column. The current evaluation video's scatter
-points are emphasized with cyan stars. Every middle-column row identifies its
-threshold and confidence, and a white marker follows the current frame. State colors
-distinguish right, straight, left, backward, static, and forward. Because Step
+scatter charts in the right column. The top of the right column lists the
+current evaluation video's enabled `vx` and `vz` plateau-middle candidate
+thresholds; it explicitly notes that Step 7A has not selected a final `N`.
+The current evaluation video's scatter points are emphasized with cyan stars. Fixed legends above each middle-panel
+axis group explain the `vx` colors (`right`, `straight`, `left`) and `vz` colors
+(`backward`, `static`, `forward`). Every middle-column row identifies its
+threshold and confidence, and a white marker follows the current frame. Because Step
 7A retains multiple threshold plateaus, the timeline uses
 the highest-confidence enabled plateau for display only; the selected display
 threshold and confidence are recorded without changing pipeline decisions.
 
 **Output directory:** `07a_ego_axis_threshold_segmentation/`
+
+```text
+07a_ego_axis_threshold_segmentation/
+├── train/<video_id>/   # train JSON and plateau PNG
+├── eval/<video_id>/    # eval JSON, plateau PNG, signal PNG, and MP4
+├── all_videos_plateau_scatter.png
+└── axis_threshold_segmentation_manifest.json
+```
 
 Artifacts: `<video_id>/axis_threshold_segment_counts.png` and
 `all_videos_plateau_scatter.png`.

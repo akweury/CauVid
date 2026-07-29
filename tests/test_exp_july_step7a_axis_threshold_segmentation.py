@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.exp_july.perception.pipeline import step7_train_eval_split
+from src.exp_july.perception.pipeline import step7_train_eval_split, step7a_axis_threshold_segmentation
+
+from src.exp_july.perception.ego_axis_threshold_visualization import render_eval_signal_segmentation_chart
 
 from src.exp_july.perception.ego_axis_threshold_segmentation import (
     _confidence_at,
@@ -65,6 +67,53 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         ]
         self.assertEqual(len(filter_short_state_interruptions(segments, tolerance_frames=5)), 3)
 
+    def test_pipeline_writes_per_video_outputs_under_train_and_eval_folders(self):
+        train_frames = [{"frame_index": index, "ego_vx": float(index % 3 - 1), "ego_vz": float(index % 3 - 1)} for index in range(6)]
+        eval_frames = [{"frame_index": index, "ego_vx": float(1 - index % 3), "ego_vz": float(1 - index % 3)} for index in range(6)]
+        ego_motion = [
+            {"video_id": "train-video", "frames": train_frames},
+            {"video_id": "eval-video", "frames": eval_frames},
+        ]
+        config = {
+            "vx_seg_max_count": 8, "vz_seg_max_count": 5,
+            "max_plateau_middle_th_vx": 250.0, "max_plateau_middle_th_vz": 70.0,
+            "noise_tolerance_frames_vx": 5, "noise_tolerance_frames_vz": 5,
+        }
+
+        def touch_chart(_result, path):
+            path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"chart"); return str(path)
+
+        def scatter(_train, path, **_kwargs):
+            path = Path(path); path.write_bytes(b"scatter"); return {"path": str(path), "points": []}
+
+        def visual(_result, _ego, _audit, path):
+            path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"mp4"); return {"status": "rendered", "path": str(path)}
+
+        def signal_chart(_result, _audit, path):
+            path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"png"); return {"status": "rendered", "path": str(path)}
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("src.exp_july.perception.pipeline.get_pipeline_output_root", return_value=Path(directory)), \
+                patch("src.exp_july.perception.pipeline.step7_ego_motion", return_value={"ego_motion": ego_motion}), \
+                patch("src.exp_july.perception.pipeline.driving_pipeline_config.get_step7a_axis_threshold_segmentation_cfg", return_value=config), \
+                patch("src.exp_july.perception.ego_axis_threshold_segmentation.render_segment_count_chart", side_effect=touch_chart), \
+                patch("src.exp_july.perception.ego_axis_threshold_segmentation.render_all_video_plateau_scatter", side_effect=scatter), \
+                patch("src.exp_july.perception.ego_axis_threshold_visualization.render_axis_segmentation_mp4", side_effect=visual), \
+                patch("src.exp_july.perception.ego_axis_threshold_visualization.render_eval_signal_segmentation_chart", side_effect=signal_chart):
+            output = step7a_axis_threshold_segmentation({
+                "step7_train_video_ids": ["train-video"],
+                "step7_eval_video_ids": ["eval-video"],
+            })
+            root = Path(output["ego_axis_threshold_segmentation_output_root"])
+            self.assertTrue((root / "train" / "train-video" / "axis_threshold_segmentation.json").exists())
+            self.assertTrue((root / "train" / "train-video" / "axis_threshold_segment_counts.png").exists())
+            self.assertTrue((root / "eval" / "eval-video" / "axis_threshold_segmentation.json").exists())
+            self.assertTrue((root / "eval" / "eval-video" / "axis_segmentation_visualization.mp4").exists())
+            self.assertTrue((root / "eval" / "eval-video" / "axis_signal_segmentation.png").exists())
+            self.assertFalse((root / "eval" / "train-video").exists())
+            self.assertEqual(output["ego_axis_threshold_segmentation_manifest"]["num_train_videos"], 1)
+            self.assertEqual(output["ego_axis_threshold_segmentation_manifest"]["num_eval_videos"], 1)
+
     def test_uses_exactly_100_interior_threshold_candidates(self):
         frames = [
             {"frame_index": index, "ego_vz_smoothed": value}
@@ -77,6 +126,25 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         self.assertEqual(len(thresholds), 100)
         self.assertGreater(min(thresholds), 0.0)
         self.assertLess(max(thresholds), 4.0)
+
+    def test_threshold_candidates_preserve_raw_and_filtered_segment_counts(self):
+        frames = [
+            {"frame_index": index, "ego_vz_smoothed": value}
+            for index, value in enumerate([-3.0] * 10 + [0.0] * 3 + [-3.0] * 10)
+        ]
+        result = segment_axis(
+            frames, "vz", ("backward", "static", "forward"),
+            noise_tolerance_frames=5,
+        )
+        affected = [
+            row for row in result["threshold_candidates"]
+            if row["raw_segment_count"] > row["segment_count"]
+        ]
+        self.assertTrue(affected)
+        self.assertTrue(all(row["raw_segment_count"] == 3 for row in affected))
+        self.assertTrue(all(row["segment_count"] == 1 for row in affected))
+        self.assertTrue(all("raw_segment_count_min" in row for row in result["all_plateaus"]))
+        self.assertTrue(all("raw_segment_count_max" in row for row in result["all_plateaus"]))
 
     def test_keeps_every_long_plateau_and_uses_its_middle_n(self):
         frames = [
@@ -132,6 +200,37 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             {"right", "straight", "left"},
         )
 
+
+    def test_signal_chart_renders_enabled_and_disabled_candidates(self):
+        frames = [
+            {"frame_index": index, "ego_vx": float(index % 3 - 1), "ego_vz": float(index % 3 - 1)}
+            for index in range(12)
+        ]
+        result = {
+            "video_id": "status-demo", "frames": frames,
+            "vx_segmentation": {"qualifying_plateaus": [
+                {"plateau_id": 1, "midpoint_n": 1.0, "segments": []},
+                {"plateau_id": 2, "midpoint_n": 2.0, "segments": []},
+            ]},
+            "vz_segmentation": {"qualifying_plateaus": [
+                {"plateau_id": 3, "midpoint_n": 3.0, "segments": []},
+            ]},
+        }
+        audit = {"points": [
+            {"video_id": "status-demo", "axis": "vx", "plateau_id": 1, "enabled": True, "confidence": 0.8, "disabled_reasons": []},
+            {"video_id": "status-demo", "axis": "vx", "plateau_id": 2, "enabled": False, "confidence": None, "disabled_reasons": ["segment_count_above_seg_max_count"]},
+            {"video_id": "status-demo", "axis": "vz", "plateau_id": 3, "enabled": False, "confidence": None, "disabled_reasons": ["plateau_middle_n_above_maximum"]},
+        ]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "axis_signal_segmentation.png"
+            output = render_eval_signal_segmentation_chart(result, audit, path)
+            self.assertTrue(path.exists())
+            self.assertGreater(path.stat().st_size, 1000)
+            self.assertEqual(len(output["vx_enabled_candidates"]), 1)
+            self.assertEqual(len(output["vx_disabled_candidates"]), 1)
+            self.assertEqual(len(output["vz_disabled_candidates"]), 1)
+            self.assertEqual(output["vx_disabled_candidates"][0]["activation_status"], "DISABLED")
+            self.assertEqual(output["layout"], "k_by_2_all_qualifying_threshold_segmentations")
 
     def test_renders_individual_one_by_two_segment_count_chart(self):
         frames = [
