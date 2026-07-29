@@ -1,7 +1,7 @@
 """Step 7A MP4 audit renderer (display-only hypothesis selection)."""
 from pathlib import Path
 import math
-COLORS={"forward":(70,205,80),"backward":(65,80,235),"static":(145,145,145),"left":(235,190,55),"right":(205,75,205),"straight":(235,165,65),"unavailable":(60,60,60)}
+COLORS={"forward":(70,205,80),"backward":(65,80,235),"static":(145,145,145),"left":(235,190,55),"right":(205,75,205),"straight":(40,210,250),"unavailable":(60,60,60)}
 PLOT_COLORS={"forward":"#46cd50","backward":"#eb5041","static":"#919191","left":"#37beeb","right":"#cd4bcd","straight":"#41a5eb","unavailable":"#3c3c3c"}
 def _signal(f,a):
  for k in (f"refined_ego_{a}",f"ego_{a}_smoothed",f"ego_{a}"):
@@ -17,10 +17,11 @@ def _segments(frames,a,n,labels):
   state=labels[0] if v < -n else labels[2] if v > n else labels[1]
   if not active or active["state"]!=state or prev is None or fi!=prev+1:
    if active:out.append(active)
-   active={"state":state,"start_frame":fi,"end_frame":fi,"duration_frames":1}
-  else:active["end_frame"]=fi;active["duration_frames"]+=1
+   active={"state":state,"start_frame":fi,"end_frame":fi,"duration_frames":1,"signal_sum":float(v)}
+  else:active["end_frame"]=fi;active["duration_frames"]+=1;active["signal_sum"]+=float(v)
   prev=fi
  if active:out.append(active)
+ for segment in out:segment["mean_signal"]=float(segment.pop("signal_sum")/max(1,int(segment["duration_frames"])))
  return out
 def _bridge_kwargs(data):
  config=data.get("noise_filter",{})
@@ -83,22 +84,75 @@ def _state_legend(im,x,y,w,states):
   cv2.rectangle(im,(cell_x,y),(cell_x+swatch,y+swatch),(225,225,225),1)
   cv2.putText(im,state.upper(),(cell_x+swatch+5,y+12),cv2.FONT_HERSHEY_DUPLEX,.34,(225,228,235),1,cv2.LINE_AA)
 
-def _candidate_stack(im,box,result,audit,indices,now):
+def _final_prediction(result, axis):
+ final=result.get(f"{axis}_segmentation",{}).get("final_segmentation",{})
+ frames=list(final.get("frames",[]))
+ return {
+  "selection":"final_confidence_weighted_dp",
+  "status":str(final.get("status","unavailable_no_enabled_candidates")),
+  "final_prediction":True,
+  "segments":list(final.get("segments",[])),
+  "frames":frames,
+  "frames_by_index":{int(row["frame_index"]):row for row in frames},
+ }
+
+def _candidate_stack(im,box,result,audit,indices,now,show_final=True):
  import cv2
- x,y,w,h=box;groups=[("VX SEGMENTS","vx",("right","straight","left"),_enabled_candidates(result,"vx",audit)),("VZ SEGMENTS","vz",("backward","static","forward"),_enabled_candidates(result,"vz",audit))];total=sum(max(1,len(rows)) for _,_,_,rows in groups);header_h=54;pitch=min(92,max(18,int((h-header_h*len(groups))/max(1,total))))
+ groups=[
+  ("VX SEGMENTS","vx",("right","straight","left"),_enabled_candidates(result,"vx",audit),_final_prediction(result,"vx")),
+  ("VZ SEGMENTS","vz",("backward","static","forward"),_enabled_candidates(result,"vz",audit),_final_prediction(result,"vz")),
+ ]
+ x,y,w,h=box
+ total=sum(max(1,len(rows))+(1 if show_final else 0) for _,_,_,rows,_ in groups)
+ header_h=54
+ pitch=min(92,max(18,int((h-header_h*len(groups))/max(1,total))))
  cursor=y
- for title,axis,states,rows in groups:
-  cv2.putText(im,f"{title} | enabled={len(rows)}",(x,cursor+18),cv2.FONT_HERSHEY_DUPLEX,.53,(255,255,255),1,cv2.LINE_AA)
+ total_frames=max(1,len(indices))
+ for title,axis,states,rows,final_prediction in groups:
+  cv2.putText(im,f"{title} | candidates={len(rows)}"+(" + FINAL" if show_final else ""),(x,cursor+18),cv2.FONT_HERSHEY_DUPLEX,.53,(255,255,255),1,cv2.LINE_AA)
   _state_legend(im,x,cursor+27,w,states)
   cursor+=header_h
   if not rows:
-   cv2.putText(im,"No enabled threshold candidates",(x+8,cursor+18),cv2.FONT_HERSHEY_SIMPLEX,.48,(150,155,165),1,cv2.LINE_AA);cursor+=pitch
-   continue
+   cv2.putText(im,"No enabled threshold candidates",(x+8,cursor+min(16,pitch-5)),cv2.FONT_HERSHEY_SIMPLEX,.43,(150,155,165),1,cv2.LINE_AA)
+   cursor+=pitch
   for candidate in rows:
-   confidence="n/a" if candidate.get("confidence") is None else f"{candidate['confidence']:.3f}";text_scale=.48 if pitch>=36 else .38;cv2.putText(im,f"N={candidate['threshold_n']:.5g} | confidence={confidence}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,text_scale,(235,235,235),1,cv2.LINE_AA);bar_y=cursor+min(21,pitch-5);bar_h=max(3,min(34,pitch-(bar_y-cursor)-2));total_frames=max(1,len(indices))
+   confidence="n/a" if candidate.get("confidence") is None else f"{candidate['confidence']:.3f}"
+   text_scale=.48 if pitch>=36 else .38
+   cv2.putText(im,f"N={candidate['threshold_n']:.5g} | confidence={confidence}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,text_scale,(235,235,235),1,cv2.LINE_AA)
+   bar_y=cursor+min(21,pitch-5)
+   bar_h=max(3,min(34,pitch-(bar_y-cursor)-2))
    for i,frame_index in enumerate(indices):
-    x0=x+int(i*w/total_frames);x1=x+int((i+1)*w/total_frames);cv2.rectangle(im,(x0,bar_y),(max(x0+1,x1),bar_y+bar_h),COLORS[_state(candidate,frame_index)],-1)
-   marker_x=x+int((now+.5)*w/total_frames);cv2.line(im,(marker_x,bar_y-2),(marker_x,bar_y+bar_h+2),(255,255,255),2,cv2.LINE_AA);cursor+=pitch
+    x0=x+int(i*w/total_frames);x1=x+int((i+1)*w/total_frames)
+    cv2.rectangle(im,(x0,bar_y),(max(x0+1,x1),bar_y+bar_h),COLORS[_state(candidate,frame_index)],-1)
+   marker_x=x+int((now+.5)*w/total_frames)
+   cv2.line(im,(marker_x,bar_y-2),(marker_x,bar_y+bar_h+2),(255,255,255),2,cv2.LINE_AA)
+   cursor+=pitch
+  if not show_final:
+   continue
+  current_frame_index=indices[now]
+  metrics=final_prediction["frames_by_index"].get(current_frame_index,{})
+  confidence=float(metrics.get("confidence",0.0))
+  consensus=float(metrics.get("consensus",0.0))
+  margin=float(metrics.get("margin",0.0))
+  disagreement=float(metrics.get("candidate_disagreement",0.0))
+  text_scale=.46 if pitch>=36 else .34
+  final_text=(
+   f"FINAL PREDICTION | C={confidence:.2f} S={consensus:.2f} M={margin:+.2f} D={disagreement:.2f}"
+   if final_prediction.get("status") == "completed"
+   else "FINAL UNAVAILABLE | NO ENABLED N"
+  )
+  final_color=(0,245,255) if final_prediction.get("status") == "completed" else (90,90,245)
+  cv2.putText(im,final_text,(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_DUPLEX,text_scale,final_color,2,cv2.LINE_AA)
+  bar_y=cursor+min(21,pitch-5)
+  bar_h=max(3,min(34,pitch-(bar_y-cursor)-2))
+  for i,frame_index in enumerate(indices):
+   x0=x+int(i*w/total_frames);x1=x+int((i+1)*w/total_frames)
+   cv2.rectangle(im,(x0,bar_y),(max(x0+1,x1),bar_y+bar_h),COLORS[_state(final_prediction,frame_index)],-1)
+  cv2.rectangle(im,(x,bar_y),(x+w,bar_y+bar_h),final_color,2)
+  marker_x=x+int((now+.5)*w/total_frames)
+  cv2.line(im,(marker_x,bar_y-3),(marker_x,bar_y+bar_h+3),(255,255,255),3,cv2.LINE_AA)
+  cursor+=pitch
+
 def _threshold_summary(im,x,y,w,result,audit):
  import cv2
  cv2.rectangle(im,(x,y),(x+w,y+112),(36,40,47),-1)
@@ -183,31 +237,219 @@ def _segment_length_rows(segments,tolerance):
   row=dict(segment);duration=int(row.get("duration_frames",int(row["end_frame"])-int(row["start_frame"])+1));row["duration_frames"]=duration;row["length_class"]="short" if duration<=tolerance else "long";rows.append(row)
  return rows
 
-def render_eval_candidate_filter_comparisons(result,output_root,max_candidates=20):
- """Render raw-vs-filtered 2x1 charts for the smallest candidate Ns per axis."""
- import matplotlib
- matplotlib.use("Agg")
- import matplotlib.pyplot as plt
- import numpy as np
- from matplotlib.patches import Patch
- from src.exp_july.perception.ego_axis_threshold_segmentation import filter_short_state_interruptions, merge_remaining_short_segments
- output_root=Path(output_root);frames=list(result.get("frames",[]));outputs=[];limit=max(0,int(max_candidates))
- for axis in ("vx","vz"):
-  data=result.get(f"{axis}_segmentation",{});label_map=data.get("labels",{});labels=(str(label_map.get("negative","negative")),str(label_map.get("center","static")),str(label_map.get("positive","positive")));tolerance=int(data.get("noise_filter",{}).get("tolerance_frames",5));candidates=sorted(data.get("threshold_candidates",[]),key=lambda row:(float(row["threshold"]),int(row.get("candidate_index",0))))[:limit];axis_root=output_root/axis;axis_root.mkdir(parents=True,exist_ok=True)
-  indices=[int(frame.get("frame_index",i)) for i,frame in enumerate(frames)];values=[_signal(frame,axis) for frame in frames]
-  for rank,candidate in enumerate(candidates,1):
-   threshold=float(candidate["threshold"]);raw=_segment_length_rows(_segments(frames,axis,threshold,labels),tolerance);bridged=filter_short_state_interruptions(raw,tolerance,**_bridge_kwargs(data));filtered=_segment_length_rows(merge_remaining_short_segments(bridged,tolerance),tolerance);path=axis_root/f"candidate_{rank:02d}_index_{int(candidate.get('candidate_index',rank-1)):03d}.png"
-   fig,axes=plt.subplots(2,1,figsize=(16,8),sharex=True,constrained_layout=True)
-   for ax,title,segments in ((axes[0],"BEFORE short-segment merge",raw),(axes[1],"AFTER short-segment merge",filtered)):
-    observed=set()
-    for segment_index,segment in enumerate(segments):
-     state=str(segment.get("state","unavailable"));start=float(segment["start_frame"]);end=float(segment["end_frame"]);duration=int(segment["duration_frames"]);length_class=str(segment["length_class"]);ax.axvspan(start-.5,end+.5,color=PLOT_COLORS.get(state,PLOT_COLORS["unavailable"]),alpha=.28,zorder=0);observed.add(state);midpoint=.5*(start+end);ax.text(midpoint,.88-.17*(segment_index%2),f"{state.upper()}\n{length_class.upper()} {duration}f",transform=ax.get_xaxis_transform(),ha="center",va="top",rotation=90 if length_class=="short" else 0,fontsize=7,fontweight="bold",color="#8f1d16" if length_class=="short" else "#176b35",bbox={"boxstyle":"round,pad=0.2","fc":"#fff0ee" if length_class=="short" else "#edf9f0","ec":"#d65a50" if length_class=="short" else "#4aa564","alpha":.88},zorder=7,clip_on=True)
-    ax.plot(indices,[np.nan if value is None else value for value in values],color="#17202a",linewidth=2.0,label=f"ego {axis}",zorder=3);ax.axhline(-threshold,color=PLOT_COLORS[labels[0]],linestyle="--",linewidth=1.7,label="−N");ax.axhline(threshold,color=PLOT_COLORS[labels[2]],linestyle="--",linewidth=1.7,label="+N");ax.axhline(0.,color="#f4c542",linestyle=":",linewidth=1.2,label="zero");handles=[Patch(facecolor=PLOT_COLORS[state],alpha=.35,label=state) for state in labels if state in observed];handles.extend([Patch(facecolor="#fff0ee",edgecolor="#d65a50",label=f"SHORT ≤ {tolerance}f"),Patch(facecolor="#edf9f0",edgecolor="#4aa564",label=f"LONG > {tolerance}f")]);line_handles,line_labels=ax.get_legend_handles_labels();ax.legend(handles+line_handles,[handle.get_label() for handle in handles]+line_labels,loc="best",fontsize=8,ncol=4);ax.set_title(f"{title} | segments={len(segments)}",fontsize=12,fontweight="bold");ax.set_ylabel(f"Ego {axis}");ax.grid(True,alpha=.2)
-    if indices:ax.set_xlim(min(indices)-.5,max(indices)+.5)
-   axes[1].set_xlabel("Frame index");fig.suptitle(f"Step 7A {axis.upper()} candidate {rank}/{len(candidates)} | N={threshold:.6g} | tolerance={tolerance} frames | video={result.get('video_id','')}",fontsize=15,fontweight="bold");fig.savefig(path,dpi=150);plt.close(fig);outputs.append({"status":"rendered","axis":axis,"candidate_rank":rank,"candidate_index":int(candidate.get("candidate_index",rank-1)),"threshold_n":threshold,"raw_segment_count":len(raw),"filtered_segment_count":len(filtered),"raw_segments":raw,"filtered_segments":filtered,"noise_tolerance_frames":tolerance,"bridge_config":_bridge_kwargs(data),"short_segment_definition":f"duration_frames <= {tolerance}","long_segment_definition":f"duration_frames > {tolerance}","path":str(path)})
- return {"status":"rendered","layout":"2x1_before_after_guaranteed_long_segments","max_candidates_per_axis":limit,"num_charts":len(outputs),"charts":outputs}
+def render_eval_candidate_filter_comparisons(result, output_root, max_candidates=20):
+    """Render 4x1 raw/filtered segmentation and confidence charts."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.patches import Patch
+    from src.exp_july.perception.ego_axis_threshold_segmentation import (
+        filter_short_state_interruptions, frame_label_confidences,
+        merge_remaining_short_segments,
+    )
+    output_root = Path(output_root)
+    frames = list(result.get("frames", []))
+    outputs = []
+    limit = max(0, int(max_candidates))
+    for axis in ("vx", "vz"):
+        data = result.get(f"{axis}_segmentation", {})
+        label_map = data.get("labels", {})
+        labels = (
+            str(label_map.get("negative", "negative")),
+            str(label_map.get("center", "static")),
+            str(label_map.get("positive", "positive")),
+        )
+        tolerance = int(data.get("noise_filter", {}).get("tolerance_frames", 5))
+        candidates = sorted(
+            data.get("threshold_candidates", []),
+            key=lambda row: (float(row["threshold"]), int(row.get("candidate_index", 0))),
+        )[:limit]
+        axis_root = output_root / axis
+        axis_root.mkdir(parents=True, exist_ok=True)
+        indices = [int(frame.get("frame_index", index)) for index, frame in enumerate(frames)]
+        values = [_signal(frame, axis) for frame in frames]
+        for rank, candidate in enumerate(candidates, 1):
+            threshold = float(candidate["threshold"])
+            raw = _segment_length_rows(_segments(frames, axis, threshold, labels), tolerance)
+            bridged = filter_short_state_interruptions(raw, tolerance, **_bridge_kwargs(data))
+            filtered = _segment_length_rows(
+                merge_remaining_short_segments(bridged, tolerance), tolerance,
+            )
+            minimum_long_length = tolerance + 1
+            raw_frame_labels = frame_label_confidences(
+                frames, raw, raw, minimum_long_length,
+            )
+            filtered_frame_labels = frame_label_confidences(
+                frames, raw, filtered, minimum_long_length,
+            )
+            path = axis_root / (
+                f"candidate_{rank:02d}_index_"
+                f"{int(candidate.get('candidate_index', rank - 1)):03d}.png"
+            )
+            figure, axes = plt.subplots(
+                4, 1, figsize=(16, 11), sharex=True,
+                gridspec_kw={"height_ratios": [3.0, 1.0, 3.0, 1.0]},
+                constrained_layout=True,
+            )
 
-def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.):
+            def draw_segmentation(ax, title, segments):
+                observed = set()
+                for segment_index, segment in enumerate(segments):
+                    state = str(segment.get("state", "unavailable"))
+                    start_frame = float(segment["start_frame"])
+                    end_frame = float(segment["end_frame"])
+                    duration = int(segment["duration_frames"])
+                    length_class = str(segment["length_class"])
+                    ax.axvspan(
+                        start_frame - 0.5, end_frame + 0.5,
+                        color=PLOT_COLORS.get(state, PLOT_COLORS["unavailable"]),
+                        alpha=0.28, zorder=0,
+                    )
+                    observed.add(state)
+                    midpoint = 0.5 * (start_frame + end_frame)
+                    ax.text(
+                        midpoint, 0.88 - 0.17 * (segment_index % 2),
+                        f"{state.upper()}\n{length_class.upper()} {duration}f",
+                        transform=ax.get_xaxis_transform(), ha="center", va="top",
+                        rotation=90 if length_class == "short" else 0,
+                        fontsize=7, fontweight="bold",
+                        color="#8f1d16" if length_class == "short" else "#176b35",
+                        bbox={
+                            "boxstyle": "round,pad=0.2",
+                            "fc": "#fff0ee" if length_class == "short" else "#edf9f0",
+                            "ec": "#d65a50" if length_class == "short" else "#4aa564",
+                            "alpha": 0.88,
+                        },
+                        zorder=7, clip_on=True,
+                    )
+                ax.plot(
+                    indices, [np.nan if value is None else value for value in values],
+                    color="#17202a", linewidth=2.0, label=f"ego {axis}", zorder=3,
+                )
+                ax.axhline(
+                    -threshold, color=PLOT_COLORS[labels[0]], linestyle="--",
+                    linewidth=1.7, label="−N",
+                )
+                ax.axhline(
+                    threshold, color=PLOT_COLORS[labels[2]], linestyle="--",
+                    linewidth=1.7, label="+N",
+                )
+                ax.axhline(
+                    0.0, color="#f4c542", linestyle=":", linewidth=1.2,
+                    label="zero",
+                )
+                handles = [
+                    Patch(facecolor=PLOT_COLORS[state], alpha=0.35, label=state)
+                    for state in labels if state in observed
+                ]
+                handles.extend([
+                    Patch(
+                        facecolor="#fff0ee", edgecolor="#d65a50",
+                        label=f"SHORT ≤ {tolerance}f",
+                    ),
+                    Patch(
+                        facecolor="#edf9f0", edgecolor="#4aa564",
+                        label=f"LONG > {tolerance}f",
+                    ),
+                ])
+                line_handles, line_labels = ax.get_legend_handles_labels()
+                ax.legend(
+                    handles + line_handles,
+                    [handle.get_label() for handle in handles] + line_labels,
+                    loc="best", fontsize=8, ncol=4,
+                )
+                ax.set_title(
+                    f"{title} | segments={len(segments)}",
+                    fontsize=12, fontweight="bold",
+                )
+                ax.set_ylabel(f"Ego {axis}")
+                ax.grid(True, alpha=0.2)
+                if indices:
+                    ax.set_xlim(min(indices) - 0.5, max(indices) + 0.5)
+
+            def draw_confidence(ax, title, frame_labels):
+                confidence_by_frame = {
+                    int(row["frame_index"]): float(row["confidence"])
+                    for row in frame_labels
+                }
+                confidence_values = np.asarray([
+                    confidence_by_frame.get(frame_index, np.nan)
+                    for frame_index in indices
+                ], dtype=float)
+                confidence_values = np.clip(confidence_values, 0.0, 1.0)
+                if indices:
+                    ax.imshow(
+                        confidence_values.reshape(1, -1),
+                        extent=(min(indices) - 0.5, max(indices) + 0.5, 0.0, 1.0),
+                        origin="lower", aspect="auto", interpolation="bilinear",
+                        cmap="viridis", vmin=0.0, vmax=1.0, zorder=0,
+                    )
+                    ax.plot(
+                        indices, confidence_values, color="#17202a",
+                        linewidth=1.8, marker=".", markersize=3.5, zorder=3,
+                    )
+                    ax.set_xlim(min(indices) - 0.5, max(indices) + 0.5)
+                ax.axhline(0.5, color="white", linestyle="--", linewidth=1.0, alpha=0.9)
+                ax.set_ylim(0.0, 1.0)
+                ax.set_yticks([0.0, 0.5, 1.0])
+                ax.set_ylabel("Confidence")
+                ax.set_title(
+                    f"{title} | Viridis: purple=0 · green=0.5 · yellow=1",
+                    fontsize=10.5, fontweight="bold",
+                )
+                ax.grid(True, axis="x", alpha=0.18)
+
+            draw_segmentation(axes[0], "BEFORE short-segment merge", raw)
+            draw_confidence(axes[1], "BEFORE frame-label confidence", raw_frame_labels)
+            draw_segmentation(axes[2], "AFTER short-segment merge", filtered)
+            draw_confidence(axes[3], "AFTER frame-label confidence", filtered_frame_labels)
+            axes[3].set_xlabel("Frame index")
+            figure.suptitle(
+                f"Step 7A {axis.upper()} candidate {rank}/{len(candidates)} | "
+                f"N={threshold:.6g} | tolerance={tolerance} frames | "
+                f"video={result.get('video_id', '')}",
+                fontsize=15, fontweight="bold",
+            )
+            figure.savefig(path, dpi=150)
+            plt.close(figure)
+            outputs.append({
+                "status": "rendered",
+                "axis": axis,
+                "candidate_rank": rank,
+                "candidate_index": int(candidate.get("candidate_index", rank - 1)),
+                "threshold_n": threshold,
+                "raw_segment_count": len(raw),
+                "filtered_segment_count": len(filtered),
+                "raw_segments": raw,
+                "filtered_segments": filtered,
+                "raw_frame_confidence_min": min(
+                    (row["confidence"] for row in raw_frame_labels), default=None,
+                ),
+                "raw_frame_confidence_max": max(
+                    (row["confidence"] for row in raw_frame_labels), default=None,
+                ),
+                "filtered_frame_confidence_min": min(
+                    (row["confidence"] for row in filtered_frame_labels), default=None,
+                ),
+                "filtered_frame_confidence_max": max(
+                    (row["confidence"] for row in filtered_frame_labels), default=None,
+                ),
+                "noise_tolerance_frames": tolerance,
+                "bridge_config": _bridge_kwargs(data),
+                "short_segment_definition": f"duration_frames <= {tolerance}",
+                "long_segment_definition": f"duration_frames > {tolerance}",
+                "path": str(path),
+            })
+    return {
+        "status": "rendered",
+        "layout": "4x1_before_after_segmentation_and_confidence",
+        "max_candidates_per_axis": limit,
+        "num_charts": len(outputs),
+        "charts": outputs,
+    }
+
+def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.,show_final=True,step_label="7B"):
  import cv2,numpy as np
  frames=list(ego_video.get("frames",[]))
  if not frames:return {"status":"skipped","reason":"no_frames","path":None}
@@ -218,9 +460,9 @@ def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.):
   im=np.full((H,W,3),(24,27,32),np.uint8);p=Path(str(f.get("image_path","")));src=cv2.imread(str(p)) if p.is_file() else None
   if src is not None:s=min((C1-44)/src.shape[1],650/src.shape[0]);src=cv2.resize(src,(int(src.shape[1]*s),int(src.shape[0]*s)));x=22+(C1-44-src.shape[1])//2;y=48+(650-src.shape[0])//2;im[y:y+src.shape[0],x:x+src.shape[1]]=src
   else:cv2.putText(im,"SOURCE FRAME UNAVAILABLE",(190,370),cv2.FONT_HERSHEY_DUPLEX,1.2,(80,100,235),2,cv2.LINE_AA)
-  cv2.putText(im,f"STEP 7A EGO SEGMENTATION | FRAME {ids[i]}",(22,32),cv2.FONT_HERSHEY_DUPLEX,.78,(245,245,245),2,cv2.LINE_AA);cw=(C1-66)//2;_chart(im,(22,730,cw,320),frames,"vx",i);_chart(im,(44+cw,730,cw,320),frames,"vz",i)
-  cv2.line(im,(C1,0),(C1,H),(95,100,110),2);cv2.line(im,(C2,0),(C2,H),(95,100,110),2);x=C1+24;w=C2-C1-48;cv2.putText(im,"ALL ENABLED SEGMENTATIONS",(x,44),cv2.FONT_HERSHEY_DUPLEX,.72,(255,255,255),2,cv2.LINE_AA);_candidate_stack(im,(x,62,w,H-88),result,audit,ids,i)
+  cv2.putText(im,f"STEP {step_label} EGO SEGMENTATION | FRAME {ids[i]}",(22,32),cv2.FONT_HERSHEY_DUPLEX,.78,(245,245,245),2,cv2.LINE_AA);cw=(C1-66)//2;_chart(im,(22,730,cw,320),frames,"vx",i);_chart(im,(44+cw,730,cw,320),frames,"vz",i)
+  cv2.line(im,(C1,0),(C1,H),(95,100,110),2);cv2.line(im,(C2,0),(C2,H),(95,100,110),2);x=C1+24;w=C2-C1-48;cv2.putText(im,"CANDIDATES + FINAL PREDICTIONS" if show_final else "ENABLED SEGMENTATION CANDIDATES",(x,44),cv2.FONT_HERSHEY_DUPLEX,.72,(255,255,255),2,cv2.LINE_AA);_candidate_stack(im,(x,62,w,H-88),result,audit,ids,i,show_final=show_final)
   _threshold_summary(im,C2+20,18,W-C2-40,result,audit)
   scatter_y=142;im[scatter_y:scatter_y+scatter_panel.shape[0],C2+20:C2+20+scatter_panel.shape[1]]=scatter_panel
   wr.write(im)
- wr.release();return {"status":"rendered","path":str(path),"fps":float(fps),"num_frames":len(frames),"layout":"source_signals_left_all_enabled_segmentations_middle_scatters_right","vx_candidate":vx,"vz_candidate":vz,"vx_enabled_candidates":_enabled_candidates(result,"vx",audit),"vz_enabled_candidates":_enabled_candidates(result,"vz",audit)}
+ wr.release();return {"status":"rendered","path":str(path),"fps":float(fps),"num_frames":len(frames),"layout":"source_signals_left_"+("candidates_plus_final_predictions" if show_final else "enabled_candidates_only")+"_middle_scatters_right","step_label":str(step_label),"show_final":bool(show_final),"vx_candidate":vx,"vz_candidate":vz,"vx_enabled_candidates":_enabled_candidates(result,"vx",audit),"vz_enabled_candidates":_enabled_candidates(result,"vz",audit)}

@@ -6,6 +6,7 @@ from src.exp_july.perception.pipeline import step7_ego_motion
 from src.exp_july.perception.pipeline import step7a_ego_symbol_prior
 from src.exp_july.perception.pipeline import step7_train_eval_split
 from src.exp_july.perception.pipeline import step7a_axis_threshold_segmentation
+from src.exp_july.perception.pipeline import step7b_optimal_segmentation_selection
 from src.exp_july.perception.pipeline import step7b_background_motion_evidence
 from src.exp_july.perception.pipeline import step7c_video_local_evidence_calibration
 from src.exp_july.perception.pipeline import step7d_global_symbolic_rule_evaluation

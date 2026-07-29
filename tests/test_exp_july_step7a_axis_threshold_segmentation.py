@@ -3,23 +3,82 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.exp_july.perception.pipeline import step7_train_eval_split, step7a_axis_threshold_segmentation
+from src.exp_july.perception.pipeline import step7_train_eval_split, step7a_axis_threshold_segmentation, step7b_optimal_segmentation_selection
 
 from src.exp_july.perception.ego_axis_threshold_visualization import render_eval_candidate_filter_comparisons, render_eval_signal_segmentation_chart
 
 from src.exp_july.perception.ego_axis_threshold_segmentation import (
     _confidence_at,
     _confidence_surface,
+    apply_semantic_candidate_confidence_correction,
+    changed_label_confidence,
+    confidence_weighted_consensus,
     filter_short_state_interruptions,
+    finalize_enabled_consensus,
+    materialize_enabled_candidates,
     merge_remaining_short_segments,
     render_all_video_plateau_scatter,
     render_segment_count_chart,
+    render_train_optimal_n_scatter,
     segment_axis,
     segment_video,
 )
 
 
 class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
+    def test_step7b_merges_step7a_enabled_candidates_without_mutating_candidates(self):
+        frames = [
+            {"frame_index": index, "ego_vx": value, "ego_vz": value}
+            for index, value in enumerate([-5.0] * 6 + [0.0] * 6 + [5.0] * 6)
+        ]
+        candidate_result = segment_video({"video_id": "demo", "frames": frames})
+        candidate_result["data_split"] = "train"
+        points = []
+        for axis in ("vx", "vz"):
+            for plateau in candidate_result[f"{axis}_segmentation"]["qualifying_plateaus"]:
+                points.append({
+                    "video_id": "demo", "axis": axis,
+                    "plateau_id": int(plateau["plateau_id"]),
+                    "midpoint_n": float(plateau["midpoint_n"]),
+                    "enabled": True, "confidence": 0.9,
+                    "disabled_reasons": [],
+                })
+        audit = {"points": points}
+        materialize_enabled_candidates(candidate_result, audit)
+        state = {
+            "ego_axis_threshold_segmentation": [candidate_result],
+            "ego_axis_threshold_segmentation_manifest": {"all_videos_plateau_scatter": audit},
+            "ego_motion": [{"video_id": "demo", "frames": frames}],
+            "step7_eval_video_ids": [],
+            "step7_substeps": ["7a_axis_threshold_segmentation"],
+        }
+        config = {
+            "consensus_min_segment_length_vx": 3,
+            "consensus_min_segment_length_vz": 3,
+            "visualization_max_eval_videos": 3,
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("src.exp_july.perception.pipeline.get_pipeline_output_root", return_value=Path(directory)), \
+                patch("src.exp_july.perception.pipeline.driving_pipeline_config.get_step7a_axis_threshold_segmentation_cfg", return_value=config):
+            output = step7b_optimal_segmentation_selection(state)
+            manifest_exists = Path(output["ego_axis_consensus_segmentation_manifest_path"]).exists()
+            final_path_exists = Path(output["ego_axis_final_segmentation"][0]["step7b_final_segmentation_path"]).exists()
+            optimal_chart_exists = Path(output["ego_axis_consensus_segmentation_manifest"]["optimal_n_scatter"]["path"]).exists()
+        self.assertEqual(
+            state["ego_axis_threshold_segmentation"][0]["final_segmentation"]["status"],
+            "pending_step7b_consensus_merge",
+        )
+        final_result = output["ego_axis_final_segmentation"][0]
+        self.assertEqual(final_result["final_segmentation"]["status"], "completed")
+        self.assertEqual(final_result["final_segmentation"]["merge_step"], "7b")
+        self.assertEqual(output["final_ego_symbols"][0]["source_step"], "7b_consensus_merge")
+        self.assertEqual(final_result["vx_segmentation"]["optimal_n_selection"]["status"], "selected")
+        self.assertEqual(final_result["vz_segmentation"]["optimal_n_selection"]["status"], "selected")
+        self.assertTrue(optimal_chart_exists)
+        self.assertTrue(manifest_exists)
+        self.assertTrue(final_path_exists)
+
+
     def test_pre_step_uses_deterministic_four_to_one_video_split(self):
         state = {"videos": [f"video-{index:02d}" for index in range(10)]}
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -34,6 +93,230 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             self.assertEqual(len(first["step7_eval_video_ids"]), 2)
             self.assertFalse(set(first["step7_train_video_ids"]) & set(first["step7_eval_video_ids"]))
             self.assertTrue(Path(first["step7_train_eval_split_path"]).exists())
+
+    def test_changed_label_confidence_is_symmetric_and_reaches_zero_at_minimum_long_length(self):
+        values = [changed_label_confidence(6, offset, 6) for offset in range(6)]
+        self.assertEqual(values, [1.0, 0.5, 0.0, 0.0, 0.5, 1.0])
+        self.assertEqual(values, list(reversed(values)))
+
+    def test_optimal_n_heatmap_fits_train_and_overlays_eval(self):
+        def result(video_id, split, vx_n, vz_n):
+            def axis_selection(value, segments):
+                return {
+                    "optimal_n_selection": {
+                        "status": "selected", "optimal_n": value,
+                        "selected_segment_count": segments,
+                        "selected_similarity": 0.9, "selected_candidate_id": 0,
+                    }
+                }
+            return {
+                "video_id": video_id, "data_split": split,
+                "vx_segmentation": axis_selection(vx_n, 3),
+                "vz_segmentation": axis_selection(vz_n, 2),
+            }
+        train = [result("train-a", "train", 10.0, 4.0), result("train-b", "train", 14.0, 6.0)]
+        evaluation = [result("eval-a", "eval", 12.0, 5.0)]
+        with tempfile.TemporaryDirectory() as directory:
+            audit = render_train_optimal_n_scatter(
+                train, evaluation, Path(directory) / "optimal.png",
+                vx_seg_max_count=8, vz_seg_max_count=5,
+                max_plateau_middle_th_vx=250.0, max_plateau_middle_th_vz=70.0,
+            )
+            self.assertTrue(Path(audit["path"]).exists())
+        self.assertEqual(audit["num_train_optimal_points"], 4)
+        self.assertEqual(audit["num_eval_optimal_points"], 2)
+        self.assertEqual(
+            {row["split"] for row in audit["points"]}, {"train", "eval"},
+        )
+        eval_points = [row for row in audit["points"] if row["split"] == "eval"]
+        self.assertTrue(all(row["train_density_confidence"] is not None for row in eval_points))
+
+    def test_step7b_semantic_correction_penalizes_both_opposite_segments(self):
+        def candidate(candidate_index, states):
+            segments = []
+            frame_labels = []
+            start = 0
+            for segment_id, (state, duration) in enumerate(states):
+                end = start + duration - 1
+                segments.append({
+                    "segment_id": segment_id, "state": state,
+                    "start_frame": start, "end_frame": end,
+                    "duration_frames": duration,
+                })
+                frame_labels.extend({
+                    "frame_index": frame_index, "label": state, "confidence": 1.0,
+                } for frame_index in range(start, end + 1))
+                start = end + 1
+            return {
+                "candidate_index": candidate_index, "threshold": float(candidate_index + 1),
+                "candidate_confidence": 1.0, "segments": segments,
+                "frame_labels": frame_labels,
+            }
+
+        violating = candidate(0, [("forward", 4), ("backward", 4)])
+        compliant = candidate(1, [("static", 8)])
+        result = {
+            "vx_segmentation": {
+                "labels": {"negative": "right", "center": "straight", "positive": "left"},
+                "enabled_segmentation_candidates": [],
+                "candidate_selection_summary": {},
+            },
+            "vz_segmentation": {
+                "labels": {"negative": "backward", "center": "static", "positive": "forward"},
+                "enabled_segmentation_candidates": [violating, compliant],
+                "candidate_selection_summary": {
+                    "num_qualifying_candidates": 2, "num_disabled_candidates": 0,
+                },
+            },
+        }
+        summary = apply_semantic_candidate_confidence_correction(
+            result, opposite_transition_penalty=0.75,
+        )
+        self.assertEqual(summary["num_violations"], 1)
+        self.assertEqual(summary["num_penalized_candidates"], 1)
+        self.assertTrue(all(
+            row["semantic_corrected_confidence"] == 0.25
+            for row in violating["frame_labels"]
+        ))
+        self.assertTrue(all(
+            row["semantic_confidence_multiplier"] == 0.25
+            for row in violating["segments"]
+        ))
+        self.assertTrue(all(
+            row["semantic_corrected_confidence"] == 1.0
+            for row in compliant["frame_labels"]
+        ))
+        finalize_enabled_consensus(
+            result, None, vx_minimum_segment_length=2, vz_minimum_segment_length=2,
+        )
+        final_states = [
+            row["state"]
+            for row in result["vz_segmentation"]["final_segmentation"]["frames"]
+        ]
+        self.assertEqual(final_states, ["static"] * 8)
+
+    def test_consensus_dp_returns_one_sequence_with_frame_diagnostics(self):
+        candidates = []
+        for candidate_index in range(3):
+            frame_labels = []
+            for frame_index in range(7):
+                label = "forward"
+                if frame_index == 3 and candidate_index in (1, 2):
+                    label = "backward"
+                frame_labels.append({
+                    "frame_index": frame_index,
+                    "label": label,
+                    "confidence": 1.0,
+                })
+            candidates.append({
+                "candidate_index": candidate_index,
+                "threshold": float(candidate_index + 1),
+                "frame_labels": frame_labels,
+            })
+        final = confidence_weighted_consensus(
+            candidates, ("backward", "static", "forward"), 3,
+        )
+        self.assertTrue(final["authoritative"])
+        self.assertEqual(final["num_candidates"], 3)
+        self.assertEqual(len(final["frames"]), 7)
+        self.assertEqual([row["state"] for row in final["frames"]], ["forward"] * 7)
+        contested = final["frames"][3]
+        self.assertEqual(contested["local_evidence_winner"], "backward")
+        self.assertTrue(contested["dp_overrode_local_winner"])
+        self.assertAlmostEqual(contested["confidence"], 1.0 / 3.0)
+        self.assertAlmostEqual(contested["consensus"], 1.0 / 3.0)
+        self.assertLess(contested["margin"], 0.0)
+        self.assertAlmostEqual(contested["candidate_disagreement"], 1.0 / 3.0)
+        self.assertTrue(all(
+            row["duration_frames"] >= 3 for row in final["segments"]
+        ))
+
+    def test_enabled_plateau_candidates_only_feed_final_consensus(self):
+        frames = [
+            {"frame_index": index, "ego_vx": value, "ego_vz": value}
+            for index, value in enumerate([-5.0] * 6 + [0.0] * 6 + [5.0] * 6)
+        ]
+        result = segment_video(
+            {"video_id": "enabled-only", "frames": frames},
+            vx_noise_tolerance_frames=2, vz_noise_tolerance_frames=2,
+            plateau_min_n_values=3,
+            vx_consensus_min_segment_length=3,
+            vz_consensus_min_segment_length=3,
+        )
+        self.assertEqual(
+            result["final_segmentation"]["vx"]["status"],
+            "pending_enabled_candidate_audit",
+        )
+        points = []
+        enabled_ids = {}
+        for axis in ("vx", "vz"):
+            plateaus = result[f"{axis}_segmentation"]["qualifying_plateaus"]
+            self.assertTrue(plateaus)
+            enabled = plateaus[:1]
+            enabled_ids[axis] = [int(row["plateau_id"]) for row in enabled]
+            for plateau in plateaus:
+                points.append({
+                    "video_id": "enabled-only",
+                    "axis": axis,
+                    "plateau_id": int(plateau["plateau_id"]),
+                    "midpoint_n": float(plateau["midpoint_n"]),
+                    "enabled": plateau in enabled,
+                    "confidence": 0.8 if plateau in enabled else None,
+                })
+        finalize_enabled_consensus(
+            result, {"points": points},
+            vx_minimum_segment_length=3,
+            vz_minimum_segment_length=3,
+        )
+        for axis in ("vx", "vz"):
+            final = result["final_segmentation"][axis]
+            self.assertEqual(final["status"], "completed")
+            self.assertEqual(final["candidate_scope"], "enabled_qualifying_plateau_middle_candidates")
+            self.assertEqual(final["enabled_candidate_ids"], enabled_ids[axis])
+            self.assertEqual(final["num_candidates"], 1)
+            self.assertTrue(final["disabled_candidates_excluded"])
+            self.assertEqual(len(final["frames"]), len(frames))
+            self.assertTrue(all(0.0 <= row["confidence"] <= 1.0 for row in final["frames"]))
+
+    def test_no_enabled_plateau_produces_explicit_unavailable_result(self):
+        frames = [
+            {"frame_index": index, "ego_vx": value, "ego_vz": value}
+            for index, value in enumerate([-5.0] * 6 + [0.0] * 6 + [5.0] * 6)
+        ]
+        result = segment_video({"video_id": "none-enabled", "frames": frames})
+        finalize_enabled_consensus(result, {"points": []})
+        for axis in ("vx", "vz"):
+            final = result["final_segmentation"][axis]
+            self.assertEqual(final["status"], "unavailable_no_enabled_candidates")
+            self.assertFalse(final["authoritative"])
+            self.assertEqual(final["frames"], [])
+            self.assertEqual(final["segments"], [])
+
+
+    def test_candidate_frame_labels_receive_confidence_after_short_merge(self):
+        frames = [
+            {"frame_index": index, "ego_vz_smoothed": value}
+            for index, value in enumerate([10.0] * 8 + [-10.0] * 5 + [10.0] * 8)
+        ]
+        result = segment_axis(
+            frames, "vz", ("backward", "static", "forward"),
+            noise_tolerance_frames=5,
+        )
+        candidate = result["threshold_candidates"][0]
+        labels = candidate["frame_labels"]
+        self.assertEqual(len(labels), len(frames))
+        self.assertTrue(all(row["confidence"] == 1.0 for row in labels[:8] + labels[13:]))
+        changed = labels[8:13]
+        self.assertTrue(all(row["label_changed"] for row in changed))
+        self.assertTrue(all(row["original_label_confidence"] == 1.0 for row in labels))
+        self.assertTrue(all(row["filtered_label_confidence"] == row["confidence"] for row in labels))
+        self.assertEqual([row["original_label"] for row in changed], ["backward"] * 5)
+        self.assertEqual([row["label"] for row in changed], ["forward"] * 5)
+        confidence = [row["confidence"] for row in changed]
+        self.assertEqual(confidence, list(reversed(confidence)))
+        self.assertAlmostEqual(confidence[0], 1.0)
+        self.assertAlmostEqual(confidence[2], 1.0 - 5.0 / 6.0)
+        self.assertEqual(result["frame_label_confidence"]["minimum_long_segment_length"], 6)
 
     def test_noise_filter_merges_single_short_state_between_long_matching_states(self):
         segments = [
@@ -155,7 +438,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         def scatter(_train, path, **_kwargs):
             path = Path(path); path.write_bytes(b"scatter"); return {"path": str(path), "points": []}
 
-        def visual(_result, _ego, _audit, path):
+        def visual(_result, _ego, _audit, path, **_kwargs):
             path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"mp4"); return {"status": "rendered", "path": str(path)}
 
         def signal_chart(_result, _audit, path):
@@ -185,7 +468,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             })
             root = Path(output["ego_axis_threshold_segmentation_output_root"])
             self.assertTrue((root / "train" / "train-video" / "axis_threshold_segmentation.json").exists())
-            self.assertTrue((root / "train" / "train-video" / "axis_threshold_segment_counts.png").exists())
+            self.assertFalse((root / "train" / "train-video" / "axis_threshold_segment_counts.png").exists())
             self.assertTrue((root / "eval" / "eval-video" / "axis_threshold_segmentation.json").exists())
             self.assertTrue((root / "eval" / "eval-video" / "axis_segmentation_visualization.mp4").exists())
             self.assertTrue((root / "eval" / "eval-video" / "axis_signal_segmentation.png").exists())
@@ -306,9 +589,14 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
                 self.assertTrue(all(segment["length_class"] in {"short", "long"} for segment in row["filtered_segments"]))
                 self.assertEqual(row["short_segment_definition"], "duration_frames <= 5")
                 self.assertEqual(row["long_segment_definition"], "duration_frames > 5")
+                self.assertEqual(row["raw_frame_confidence_min"], 1.0)
+                self.assertEqual(row["raw_frame_confidence_max"], 1.0)
+                self.assertGreaterEqual(row["filtered_frame_confidence_max"], row["filtered_frame_confidence_min"])
+                self.assertGreaterEqual(row["filtered_frame_confidence_min"], 0.0)
+                self.assertLessEqual(row["filtered_frame_confidence_max"], 1.0)
             self.assertIn("short", {segment["length_class"] for segment in output["charts"][0]["raw_segments"]})
             self.assertIn("long", {segment["length_class"] for segment in output["charts"][0]["raw_segments"]})
-            self.assertEqual(output["layout"], "2x1_before_after_guaranteed_long_segments")
+            self.assertEqual(output["layout"], "4x1_before_after_segmentation_and_confidence")
             for axis in ("vx", "vz"):
                 thresholds = [row["threshold_n"] for row in output["charts"] if row["axis"] == axis]
                 expected = [row["threshold"] for row in result[f"{axis}_segmentation"]["threshold_candidates"][:2]]

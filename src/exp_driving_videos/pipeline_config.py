@@ -84,6 +84,10 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
             "bridge_max_anchor_ratio_vx": 0.75,
             "bridge_max_anchor_ratio_vz": 0.75,
             "filter_comparison_max_candidates": 20,
+            "visualization_max_eval_videos": 3,
+            "consensus_min_segment_length_vx": 6,
+            "consensus_min_segment_length_vz": 6,
+            "semantic_opposite_transition_penalty": 0.5,
         },
         path=("step7a_axis_threshold_segmentation",),
         warn_label="Step 7A axis-threshold segmentation",
@@ -101,6 +105,10 @@ def get_step7a_axis_threshold_segmentation_cfg() -> Dict[str, Any]:
         cfg[f"bridge_max_segments_{axis}"] = max(1, int(cfg.get(f"bridge_max_segments_{axis}", 5)))
         cfg[f"bridge_max_anchor_ratio_{axis}"] = max(0.0, float(cfg.get(f"bridge_max_anchor_ratio_{axis}", 0.75)))
     cfg["filter_comparison_max_candidates"] = max(0, int(cfg.get("filter_comparison_max_candidates", 20)))
+    cfg["visualization_max_eval_videos"] = max(0, int(cfg.get("visualization_max_eval_videos", 3)))
+    cfg["consensus_min_segment_length_vx"] = max(1, int(cfg.get("consensus_min_segment_length_vx", 6)))
+    cfg["consensus_min_segment_length_vz"] = max(1, int(cfg.get("consensus_min_segment_length_vz", 6)))
+    cfg["semantic_opposite_transition_penalty"] = min(1.0, max(0.0, float(cfg.get("semantic_opposite_transition_penalty", 0.5))))
     return cfg
 
 

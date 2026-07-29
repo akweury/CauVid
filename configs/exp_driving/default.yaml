@@ -34,6 +34,10 @@ step7a_axis_threshold_segmentation:
   bridge_max_anchor_ratio_vx: 0.75
   bridge_max_anchor_ratio_vz: 0.75
   filter_comparison_max_candidates: 20
+  visualization_max_eval_videos: 3
+  consensus_min_segment_length_vx: 6
+  consensus_min_segment_length_vz: 6
+  semantic_opposite_transition_penalty: 0.5
 
 ego_motion:
   render_video: false

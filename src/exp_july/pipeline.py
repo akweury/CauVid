@@ -13,6 +13,7 @@ from src.exp_july.perception import step3_tracking
 from src.exp_july.perception import step6_positions_3d
 from src.exp_july.perception import step7_train_eval_split
 from src.exp_july.perception import step7a_axis_threshold_segmentation
+from src.exp_july.perception import step7b_optimal_segmentation_selection
 from src.exp_july.perception import step8_trajectory_repair
 from src.exp_july.perception import step8a_relative_object_motion
 from src.exp_july.perception import step8b_signal_evidence
@@ -359,13 +360,13 @@ def _run_pipeline(
         "07a_axis_threshold_segmentation",
         lambda: step7a_axis_threshold_segmentation(step7_split_state),
     )
-    # Step 7B: intentionally empty; reserved for post-filter transition-logic
-    # validation. Planned VZ transitions must pass through the neutral state:
-    # forward <-> static <-> backward, so direct forward <-> backward is
-    # forbidden. Planned VX transitions follow the same rule:
-    # left <-> straight <-> right, so direct left <-> right is forbidden.
-    # This future validation must run after Step 7A short-segment filtering.
-    # No Step 7B function is called and no pipeline state is changed here.
+    # Step 7B: merge only the enabled Step 7A candidates into one confidence-
+    # weighted, minimum-length-constrained final sequence for each axis.
+    ego_final_state = _tracked_step(
+        tracker,
+        "07b_semantic_consensus_optimal_n",
+        lambda: step7b_optimal_segmentation_selection(ego_final_state),
+    )
     # Step 8: repair trajectories first; split events receive new track IDs.
     repaired_state = _tracked_step(
         tracker,

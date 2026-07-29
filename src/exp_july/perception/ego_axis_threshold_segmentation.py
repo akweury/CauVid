@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 
-VERSION = 15
+VERSION = 18
 NUM_THRESHOLDS = 100
 
 
@@ -242,6 +242,270 @@ def _filtered_segments(frames, axis, threshold, labels, tolerance_frames, bridge
     )
     return merge_remaining_short_segments(bridged, tolerance_frames)
 
+def changed_label_confidence(segment_length, frame_offset, minimum_long_length):
+    """Symmetric confidence valley for a relabeled source segment."""
+    length = max(1, int(segment_length))
+    offset = min(max(0, int(frame_offset)), length - 1)
+    minimum_long = max(1, int(minimum_long_length))
+    depth = min(1.0, length / minimum_long)
+    if length <= 2:
+        shape = 1.0
+    else:
+        distance_to_edge = min(offset, length - 1 - offset)
+        middle_distance = max(1, (length - 1) // 2)
+        shape = min(1.0, distance_to_edge / middle_distance)
+    return float(max(0.0, min(1.0, 1.0 - depth * shape)))
+
+
+def frame_label_confidences(frames, raw_segments, filtered_segments, minimum_long_length):
+    """Return original/final labels and confidence for every observed frame."""
+    raw_by_frame = {}
+    final_by_frame = {}
+    for segment in raw_segments:
+        for frame_index in range(int(segment["start_frame"]), int(segment["end_frame"]) + 1):
+            raw_by_frame[frame_index] = segment
+    for segment in filtered_segments:
+        for frame_index in range(int(segment["start_frame"]), int(segment["end_frame"]) + 1):
+            final_by_frame[frame_index] = segment
+    output = []
+    for offset, frame in enumerate(frames):
+        frame_index = int(frame.get("frame_index", offset))
+        raw = raw_by_frame.get(frame_index)
+        final = final_by_frame.get(frame_index)
+        if raw is None or final is None:
+            continue
+        original_label = str(raw.get("state", ""))
+        final_label = str(final.get("state", ""))
+        changed = original_label != final_label
+        source_length = int(raw.get("duration_frames", 1))
+        source_offset = frame_index - int(raw["start_frame"])
+        confidence = changed_label_confidence(
+            source_length, source_offset, minimum_long_length,
+        ) if changed else 1.0
+        output.append({
+            "frame_index": frame_index,
+            "original_label": original_label,
+            "label": final_label,
+            "label_changed": changed,
+            "original_label_confidence": 1.0,
+            "filtered_label_confidence": float(confidence),
+            "confidence": float(confidence),
+            "source_segment_start_frame": int(raw["start_frame"]),
+            "source_segment_end_frame": int(raw["end_frame"]),
+            "source_segment_duration_frames": source_length,
+            "minimum_long_segment_length": max(1, int(minimum_long_length)),
+            "confidence_method": "symmetric_triangular_valley_by_source_segment_length" if changed else "unchanged_label_identity",
+        })
+    return output
+
+
+def _candidate_frame_evidence(candidates, labels):
+    """Aggregate confidence-weighted candidate votes for each observed frame."""
+    state_order = list(labels)
+    by_frame = {}
+    for candidate in candidates:
+        candidate_confidence = candidate.get("candidate_confidence")
+        candidate_weight = (
+            1.0 if candidate_confidence is None
+            else max(0.0, min(1.0, float(candidate_confidence)))
+        )
+        for row in candidate.get("frame_labels", []):
+            frame_index = int(row["frame_index"])
+            state = str(row.get("label", ""))
+            if state not in state_order:
+                continue
+            frame_confidence = max(0.0, min(1.0, float(
+                row.get("semantic_corrected_confidence", row.get("confidence", 0.0))
+            )))
+            confidence = frame_confidence * candidate_weight
+            frame = by_frame.setdefault(frame_index, {
+                "weighted": {name: 0.0 for name in state_order},
+                "votes": {name: 0 for name in state_order},
+                "candidate_count": 0,
+                "weight_sum": 0.0,
+            })
+            frame["weighted"][state] += confidence
+            frame["votes"][state] += 1
+            frame["candidate_count"] += 1
+            frame["weight_sum"] += confidence
+    return by_frame
+
+
+def _decode_contiguous_evidence_block(rows, state_order, minimum_segment_length):
+    """Maximum-emission semi-Markov decoding with a hard minimum run length."""
+    length = len(rows)
+    minimum = max(1, int(minimum_segment_length))
+    if not rows:
+        return []
+    emission = [
+        [math.log(max(1e-12, float(row["normalized_evidence"][state]))) for state in state_order]
+        for row in rows
+    ]
+    prefix = [[0.0] * (length + 1) for _ in state_order]
+    for state_index in range(len(state_order)):
+        for frame_offset in range(length):
+            prefix[state_index][frame_offset + 1] = (
+                prefix[state_index][frame_offset] + emission[frame_offset][state_index]
+            )
+    if length < minimum:
+        scores = [prefix[index][length] for index in range(len(state_order))]
+        selected = max(range(len(state_order)), key=lambda index: (scores[index], -index))
+        return [state_order[selected]] * length
+
+    negative_infinity = float("-inf")
+    dp = [[negative_infinity] * len(state_order) for _ in range(length)]
+    back = [[None] * len(state_order) for _ in range(length)]
+    for end in range(minimum - 1, length):
+        for state_index in range(len(state_order)):
+            for start in range(0, end - minimum + 2):
+                segment_score = prefix[state_index][end + 1] - prefix[state_index][start]
+                if start == 0:
+                    score, pointer = segment_score, None
+                else:
+                    previous_end = start - 1
+                    previous = [
+                        (dp[previous_end][other], other)
+                        for other in range(len(state_order))
+                        if other != state_index and dp[previous_end][other] != negative_infinity
+                    ]
+                    if not previous:
+                        continue
+                    previous_score, previous_state = max(previous, key=lambda item: (item[0], -item[1]))
+                    score = previous_score + segment_score
+                    pointer = (previous_end, previous_state, start)
+                if score > dp[end][state_index]:
+                    dp[end][state_index] = score
+                    back[end][state_index] = pointer
+
+    final_state = max(
+        range(len(state_order)), key=lambda index: (dp[length - 1][index], -index)
+    )
+    decoded = [None] * length
+    end, state_index = length - 1, final_state
+    while end >= 0:
+        pointer = back[end][state_index]
+        start = 0 if pointer is None else int(pointer[2])
+        decoded[start:end + 1] = [state_order[state_index]] * (end - start + 1)
+        if pointer is None:
+            break
+        end, state_index, _ = pointer
+    return decoded
+
+
+def _final_segments(frame_rows, minimum_segment_length):
+    segments = []
+    for row in frame_rows:
+        frame_index = int(row["frame_index"])
+        state = str(row["state"])
+        contiguous = segments and frame_index == int(segments[-1]["end_frame"]) + 1
+        if not segments or segments[-1]["state"] != state or not contiguous:
+            segments.append({
+                "state": state, "start_frame": frame_index, "end_frame": frame_index,
+                "duration_frames": 1, "_rows": [row],
+            })
+        else:
+            segments[-1]["end_frame"] = frame_index
+            segments[-1]["duration_frames"] += 1
+            segments[-1]["_rows"].append(row)
+    for segment_id, segment in enumerate(segments):
+        rows = segment.pop("_rows")
+        segment["segment_id"] = segment_id
+        for field, output in (
+            ("confidence", "mean_confidence"),
+            ("consensus", "mean_consensus"),
+            ("margin", "mean_margin"),
+            ("candidate_disagreement", "mean_candidate_disagreement"),
+        ):
+            segment[output] = float(sum(float(row[field]) for row in rows) / len(rows))
+        segment["confidence"] = segment["mean_confidence"]
+        segment["consensus"] = segment["mean_consensus"]
+        segment["margin"] = segment["mean_margin"]
+        segment["candidate_disagreement"] = segment["mean_candidate_disagreement"]
+        segment["minimum_length_constraint_satisfied"] = (
+            int(segment["duration_frames"]) >= max(1, int(minimum_segment_length))
+        )
+    return segments
+
+
+def confidence_weighted_consensus(candidates, labels, minimum_segment_length):
+    """Return one authoritative state sequence from all threshold candidates."""
+    state_order = list(labels)
+    evidence_by_frame = _candidate_frame_evidence(candidates, state_order)
+    evidence_rows = []
+    for frame_index in sorted(evidence_by_frame):
+        evidence = evidence_by_frame[frame_index]
+        total_weight = float(evidence["weight_sum"])
+        normalized = (
+            {state: float(evidence["weighted"][state] / total_weight) for state in state_order}
+            if total_weight > 0.0
+            else {state: 1.0 / len(state_order) for state in state_order}
+        )
+        evidence_rows.append({
+            "frame_index": frame_index,
+            "normalized_evidence": normalized,
+            "weighted_evidence": {
+                state: float(evidence["weighted"][state]) for state in state_order
+            },
+            "vote_counts": {state: int(evidence["votes"][state]) for state in state_order},
+            "candidate_count": int(evidence["candidate_count"]),
+            "candidate_weight_sum": total_weight,
+        })
+
+    decoded_by_frame = {}
+    block_start = 0
+    while block_start < len(evidence_rows):
+        block_end = block_start + 1
+        while (
+            block_end < len(evidence_rows)
+            and int(evidence_rows[block_end]["frame_index"])
+            == int(evidence_rows[block_end - 1]["frame_index"]) + 1
+        ):
+            block_end += 1
+        block = evidence_rows[block_start:block_end]
+        states = _decode_contiguous_evidence_block(block, state_order, minimum_segment_length)
+        decoded_by_frame.update({
+            int(row["frame_index"]): state for row, state in zip(block, states)
+        })
+        block_start = block_end
+
+    final_frames = []
+    for row in evidence_rows:
+        decoded_state = decoded_by_frame[int(row["frame_index"])]
+        normalized = row["normalized_evidence"]
+        alternatives = [normalized[state] for state in state_order if state != decoded_state]
+        candidate_count = max(1, int(row["candidate_count"]))
+        local_top = max(normalized, key=lambda state: (normalized[state], -state_order.index(state)))
+        final_frames.append({
+            **row,
+            "state": decoded_state,
+            "label": decoded_state,
+            "confidence": float(normalized[decoded_state]),
+            "consensus": float(row["vote_counts"][decoded_state] / candidate_count),
+            "margin": float(normalized[decoded_state] - max(alternatives, default=0.0)),
+            "candidate_disagreement": float(1.0 - max(row["vote_counts"].values()) / candidate_count),
+            "local_evidence_winner": local_top,
+            "dp_overrode_local_winner": decoded_state != local_top,
+        })
+    return {
+        "status": "completed" if candidates else "unavailable_no_enabled_candidates",
+        "method": "confidence_weighted_candidate_evidence_plus_min_length_dp",
+        "authoritative": bool(candidates),
+        "candidate_scope": "enabled_qualifying_plateau_middle_candidates",
+        "num_candidates": len(candidates),
+        "enabled_candidate_ids": [int(row.get("candidate_index", -1)) for row in candidates],
+        "enabled_candidate_thresholds": [float(row.get("threshold", 0.0)) for row in candidates],
+        "enabled_candidate_confidences": [
+            None if row.get("candidate_confidence") is None
+            else float(row["candidate_confidence"])
+            for row in candidates
+        ],
+        "state_order": state_order,
+        "minimum_segment_length": max(1, int(minimum_segment_length)),
+        "frames": final_frames,
+        "segments": _final_segments(final_frames, minimum_segment_length),
+    }
+
+
 def _plateaus(candidate_rows):
     plateaus = []
     start = 0
@@ -275,7 +539,7 @@ def _plateaus(candidate_rows):
     return plateaus
 
 
-def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tolerance_frames=5, bridge_config=None, plateau_min_n_values=3):
+def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tolerance_frames=5, bridge_config=None, plateau_min_n_values=3, consensus_min_segment_length=None):
     values = [
         value
         for frame in frames
@@ -291,13 +555,26 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
             for index in range(1, num_thresholds + 1)
         ]
     candidates = []
+    minimum_long_length = max(1, int(noise_tolerance_frames) + 1)
     for index, threshold in enumerate(thresholds):
+        raw_segments = _segments(frames, axis, threshold, labels)
+        filtered_segments = _filtered_segments(
+            frames, axis, threshold, labels, noise_tolerance_frames, bridge_config,
+        )
         candidates.append({
             "candidate_index": index,
             "threshold": float(threshold),
-            "segment_count": len(_filtered_segments(frames, axis, threshold, labels, noise_tolerance_frames, bridge_config)),
-            "raw_segment_count": len(_segments(frames, axis, threshold, labels)),
+            "segment_count": len(filtered_segments),
+            "raw_segment_count": len(raw_segments),
+            "frame_labels": frame_label_confidences(
+                frames, raw_segments, filtered_segments, minimum_long_length,
+            ),
         })
+    consensus_minimum = (
+        minimum_long_length
+        if consensus_min_segment_length is None
+        else max(1, int(consensus_min_segment_length))
+    )
     all_plateaus = _plateaus(candidates)
     qualifying = []
     for plateau in all_plateaus:
@@ -306,10 +583,24 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
             continue
         row = dict(plateau)
         row["candidate_optimal_n"] = float(row["midpoint_n"])
+        raw_segments = _segments(frames, axis, row["midpoint_n"], labels)
         row["segments"] = _filtered_segments(
             frames, axis, row["midpoint_n"], labels, noise_tolerance_frames, bridge_config,
         )
+        row["frame_labels"] = frame_label_confidences(
+            frames, raw_segments, row["segments"], minimum_long_length,
+        )
         qualifying.append(row)
+    final_segmentation = {
+        "status": "pending_enabled_candidate_audit",
+        "authoritative": False,
+        "candidate_scope": "enabled_qualifying_plateau_middle_candidates",
+        "num_candidates": 0,
+        "state_order": list(labels),
+        "minimum_segment_length": consensus_minimum,
+        "frames": [],
+        "segments": [],
+    }
     return {
         "axis": axis,
         "labels": {
@@ -322,6 +613,14 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
         "threshold_candidates": candidates,
         "all_plateaus": all_plateaus,
         "qualifying_plateaus": qualifying,
+        "final_segmentation": final_segmentation,
+        "frame_label_confidence": {
+            "raw_confidence": 1.0,
+            "unchanged_filtered_confidence": 1.0,
+            "minimum_long_segment_length": minimum_long_length,
+            "changed_label_profile": "symmetric_triangular_valley",
+            "maximum_valley_depth": "min(1, source_segment_length / minimum_long_segment_length)",
+        },
         "noise_filter": {
             "method": "robust_multi_segment_bridge_between_equal_state_anchors",
             "tolerance_frames": max(0, int(noise_tolerance_frames)),
@@ -341,19 +640,21 @@ def segment_axis(frames, axis, labels, num_thresholds=NUM_THRESHOLDS, noise_tole
     }
 
 
-def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_frames=5, vx_bridge_config=None, vz_bridge_config=None, plateau_min_n_values=3):
+def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_frames=5, vx_bridge_config=None, vz_bridge_config=None, plateau_min_n_values=3, vx_consensus_min_segment_length=None, vz_consensus_min_segment_length=None):
     frames = list(ego_video.get("frames", []))
     vz = segment_axis(
         frames, "vz", ("backward", "static", "forward"),
         noise_tolerance_frames=vz_noise_tolerance_frames,
         bridge_config=vz_bridge_config,
         plateau_min_n_values=plateau_min_n_values,
+        consensus_min_segment_length=vz_consensus_min_segment_length,
     )
     vx = segment_axis(
         frames, "vx", ("right", "straight", "left"),
         noise_tolerance_frames=vx_noise_tolerance_frames,
         bridge_config=vx_bridge_config,
         plateau_min_n_values=plateau_min_n_values,
+        consensus_min_segment_length=vx_consensus_min_segment_length,
     )
     frame_rows = []
     for offset, frame in enumerate(frames):
@@ -362,14 +663,35 @@ def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_fra
             "ego_vx": _signal(frame, "vx"),
             "ego_vz": _signal(frame, "vz"),
         })
+    vx_final_by_frame = {
+        int(row["frame_index"]): row for row in vx["final_segmentation"]["frames"]
+    }
+    vz_final_by_frame = {
+        int(row["frame_index"]): row for row in vz["final_segmentation"]["frames"]
+    }
+    final_frame_labels = []
+    for frame_index in sorted(set(vx_final_by_frame) | set(vz_final_by_frame)):
+        vx_row = vx_final_by_frame.get(frame_index)
+        vz_row = vz_final_by_frame.get(frame_index)
+        final_frame_labels.append({
+            "frame_index": frame_index,
+            "vx": vx_row,
+            "vz": vz_row,
+        })
     return {
         "version": VERSION,
         "video_id": str(ego_video.get("video_id", "")),
         "status": "completed",
-        "method": "multi_plateau_segment_count_stability",
+        "method": "confidence_weighted_candidate_consensus_dp",
         "num_frames": len(frames),
         "vz_segmentation": vz,
         "vx_segmentation": vx,
+        "final_segmentation": {
+            "authoritative": True,
+            "vx": vx["final_segmentation"],
+            "vz": vz["final_segmentation"],
+            "frames": final_frame_labels,
+        },
         "frames": frame_rows,
         "provenance": {
             "source": "continuous_ego_motion",
@@ -377,6 +699,8 @@ def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_fra
             "plateau_min_n_values": max(1, int(plateau_min_n_values)),
             "selection": "plateaus_meeting_minimum_n_values_excluding_single_segment",
             "single_final_n_selected": False,
+            "single_final_segmentation_returned": False,
+            "final_decoding": "deferred_to_step7b_enabled_candidate_consensus",
             "noise_tolerance_frames": {
                 "vx": max(0, int(vx_noise_tolerance_frames)),
                 "vz": max(0, int(vz_noise_tolerance_frames)),
@@ -388,6 +712,252 @@ def segment_video(ego_video, vx_noise_tolerance_frames=5, vz_noise_tolerance_fra
             "deterministic": True,
         },
     }
+
+
+def materialize_enabled_candidates(result, plateau_audit):
+    """Attach enabled plateau-middle candidates without merging their labels."""
+    video_id = str(result.get("video_id", ""))
+    for axis in ("vx", "vz"):
+        axis_result = result.get(f"{axis}_segmentation", {})
+        plateaus = {
+            int(row["plateau_id"]): row
+            for row in axis_result.get("qualifying_plateaus", [])
+        }
+        axis_points = sorted(
+            (
+                row for row in plateau_audit.get("points", [])
+                if str(row.get("video_id", "")) == video_id
+                and str(row.get("axis", "")) == axis
+                and int(row.get("plateau_id", -1)) in plateaus
+            ),
+            key=lambda row: (float(row.get("midpoint_n", 0.0)), int(row.get("plateau_id", -1))),
+        )
+        enabled_candidates = []
+        disabled_candidates = []
+        for point in axis_points:
+            plateau = plateaus[int(point["plateau_id"])]
+            candidate = {
+                "candidate_index": int(plateau["plateau_id"]),
+                "plateau_id": int(plateau["plateau_id"]),
+                "threshold": float(plateau["midpoint_n"]),
+                "candidate_confidence": (
+                    None if point.get("confidence") is None
+                    else float(point["confidence"])
+                ),
+                "segment_count": int(plateau["segment_count"]),
+                "segments": [dict(row) for row in plateau.get("segments", [])],
+                "frame_labels": [dict(row) for row in plateau.get("frame_labels", [])],
+                "enabled": bool(point.get("enabled", False)),
+                "disabled_reasons": list(point.get("disabled_reasons", [])),
+                "enablement_source": "all_video_plateau_scatter_audit",
+            }
+            (enabled_candidates if candidate["enabled"] else disabled_candidates).append(candidate)
+        axis_result["enabled_segmentation_candidates"] = enabled_candidates
+        axis_result["disabled_segmentation_candidates"] = disabled_candidates
+        axis_result["candidate_selection_summary"] = {
+            "status": "completed",
+            "num_qualifying_candidates": len(plateaus),
+            "num_enabled_candidates": len(enabled_candidates),
+            "num_disabled_candidates": len(disabled_candidates),
+            "enabled_candidate_ids": [row["candidate_index"] for row in enabled_candidates],
+            "enabled_candidate_thresholds": [row["threshold"] for row in enabled_candidates],
+            "final_merge_performed": False,
+            "final_merge_step": "7b",
+        }
+        axis_result["final_segmentation"] = {
+            "status": "pending_step7b_consensus_merge",
+            "authoritative": False,
+            "candidate_scope": "enabled_qualifying_plateau_middle_candidates",
+            "num_candidates": len(enabled_candidates),
+            "frames": [],
+            "segments": [],
+        }
+    result["final_segmentation"] = {
+        "status": "pending_step7b_consensus_merge",
+        "authoritative": False,
+        "candidate_scope": "enabled_qualifying_plateau_middle_candidates_only",
+        "frames": [],
+    }
+    result.setdefault("provenance", {})["final_decoding"] = "deferred_to_step7b"
+    result["provenance"]["disabled_candidates_excluded"] = True
+    return result
+
+
+def apply_semantic_candidate_confidence_correction(result, opposite_transition_penalty=0.5):
+    """Penalize both segments at direct forward/backward candidate transitions."""
+    penalty = max(0.0, min(1.0, float(opposite_transition_penalty)))
+    total_violations = 0
+    corrected_candidates = 0
+    axis_summaries = {}
+    for axis in ("vx", "vz"):
+        candidates = result.get(f"{axis}_segmentation", {}).get(
+            "enabled_segmentation_candidates", []
+        )
+        axis_violations = 0
+        axis_corrected = 0
+        for candidate in candidates:
+            segments = sorted(
+                candidate.get("segments", []),
+                key=lambda row: (int(row.get("start_frame", 0)), int(row.get("end_frame", 0))),
+            )
+            violation_counts = [0] * len(segments)
+            violations = []
+            if axis == "vz":
+                forbidden = {("forward", "backward"), ("backward", "forward")}
+                for left_index, (left, right) in enumerate(zip(segments, segments[1:])):
+                    transition = (str(left.get("state", "")), str(right.get("state", "")))
+                    if transition not in forbidden:
+                        continue
+                    right_index = left_index + 1
+                    violation_counts[left_index] += 1
+                    violation_counts[right_index] += 1
+                    violations.append({
+                        "rule_id": "no_direct_forward_backward_transition",
+                        "transition": f"{transition[0]}->{transition[1]}",
+                        "left_segment_id": int(left.get("segment_id", left_index)),
+                        "right_segment_id": int(right.get("segment_id", right_index)),
+                        "left_frame_range": [int(left["start_frame"]), int(left["end_frame"])],
+                        "right_frame_range": [int(right["start_frame"]), int(right["end_frame"])],
+                        "penalty_per_incident": penalty,
+                        "affected_segments": "both",
+                    })
+            frame_labels = candidate.get("frame_labels", [])
+            original_values = []
+            corrected_values = []
+            for frame in frame_labels:
+                frame_index = int(frame["frame_index"])
+                incidents = sum(
+                    count
+                    for segment, count in zip(segments, violation_counts)
+                    if count > 0 and int(segment["start_frame"]) <= frame_index <= int(segment["end_frame"])
+                )
+                multiplier = float((1.0 - penalty) ** incidents)
+                original = max(0.0, min(1.0, float(frame.get("confidence", 0.0))))
+                corrected = float(original * multiplier)
+                frame["semantic_confidence_before"] = original
+                frame["semantic_confidence_multiplier"] = multiplier
+                frame["semantic_corrected_confidence"] = corrected
+                frame["semantic_violation_count"] = incidents
+                frame["semantic_correction_applied"] = incidents > 0
+                original_values.append(original)
+                corrected_values.append(corrected)
+            for index, segment in enumerate(segments):
+                incidents = violation_counts[index]
+                multiplier = float((1.0 - penalty) ** incidents)
+                segment_frames = [
+                    row for row in frame_labels
+                    if int(segment["start_frame"]) <= int(row["frame_index"]) <= int(segment["end_frame"])
+                ]
+                segment_before = (
+                    sum(float(row["semantic_confidence_before"]) for row in segment_frames) / len(segment_frames)
+                    if segment_frames else 0.0
+                )
+                segment_after = (
+                    sum(float(row["semantic_corrected_confidence"]) for row in segment_frames) / len(segment_frames)
+                    if segment_frames else 0.0
+                )
+                segment["semantic_violation_count"] = incidents
+                segment["semantic_confidence_before"] = float(segment_before)
+                segment["semantic_confidence_after"] = float(segment_after)
+                segment["semantic_confidence_multiplier"] = multiplier
+                segment["semantic_correction_applied"] = incidents > 0
+                segment["semantic_rule_status"] = "violated" if incidents else "satisfied"
+            original_mean = (
+                float(sum(original_values) / len(original_values)) if original_values else 0.0
+            )
+            corrected_mean = (
+                float(sum(corrected_values) / len(corrected_values)) if corrected_values else 0.0
+            )
+            candidate["semantic_correction"] = {
+                "status": "penalized" if violations else "unchanged",
+                "rules_evaluated": ["no_direct_forward_backward_transition"] if axis == "vz" else [],
+                "violations": violations,
+                "num_violations": len(violations),
+                "penalty_per_incident": penalty,
+                "original_mean_frame_confidence": original_mean,
+                "corrected_mean_frame_confidence": corrected_mean,
+                "candidate_confidence_multiplier": (
+                    corrected_mean / original_mean if original_mean > 0.0 else 1.0
+                ),
+                "correction_step": "7b_pre_merge_semantic_correction",
+            }
+            axis_violations += len(violations)
+            if violations:
+                axis_corrected += 1
+        total_violations += axis_violations
+        corrected_candidates += axis_corrected
+        axis_summaries[axis] = {
+            "num_candidates": len(candidates),
+            "num_penalized_candidates": axis_corrected,
+            "num_violations": axis_violations,
+        }
+    summary = {
+        "status": "completed",
+        "step": "7b_pre_merge_semantic_correction",
+        "rule_ids": ["no_direct_forward_backward_transition"],
+        "opposite_transition_penalty": penalty,
+        "num_penalized_candidates": corrected_candidates,
+        "num_violations": total_violations,
+        "axis_summaries": axis_summaries,
+        "final_merge_uses": "semantic_corrected_confidence",
+    }
+    result["step7b_semantic_confidence_correction"] = summary
+    return summary
+
+
+def finalize_enabled_consensus(result, plateau_audit=None, vx_minimum_segment_length=6, vz_minimum_segment_length=6):
+    """Step 7B merge of the enabled candidates materialized by Step 7A."""
+    if plateau_audit is not None:
+        materialize_enabled_candidates(result, plateau_audit)
+    minimum_by_axis = {
+        "vx": max(1, int(vx_minimum_segment_length)),
+        "vz": max(1, int(vz_minimum_segment_length)),
+    }
+    for axis in ("vx", "vz"):
+        axis_result = result.get(f"{axis}_segmentation", {})
+        labels = axis_result.get("labels", {})
+        state_order = (
+            str(labels.get("negative", "negative")),
+            str(labels.get("center", "center")),
+            str(labels.get("positive", "positive")),
+        )
+        enabled_candidates = list(axis_result.get("enabled_segmentation_candidates", []))
+        final = confidence_weighted_consensus(
+            enabled_candidates, state_order, minimum_by_axis[axis],
+        )
+        summary = axis_result.get("candidate_selection_summary", {})
+        final["enablement_source"] = "step7a_enabled_segmentation_candidates"
+        final["disabled_candidates_excluded"] = True
+        final["num_qualifying_candidates"] = int(summary.get("num_qualifying_candidates", len(enabled_candidates)))
+        final["num_disabled_candidates"] = int(summary.get("num_disabled_candidates", 0))
+        final["merge_step"] = "7b"
+        axis_result["final_segmentation"] = final
+
+    vx_final = result.get("vx_segmentation", {}).get("final_segmentation", {})
+    vz_final = result.get("vz_segmentation", {}).get("final_segmentation", {})
+    vx_by_frame = {int(row["frame_index"]): row for row in vx_final.get("frames", [])}
+    vz_by_frame = {int(row["frame_index"]): row for row in vz_final.get("frames", [])}
+    final_frames = [
+        {"frame_index": frame_index, "vx": vx_by_frame.get(frame_index), "vz": vz_by_frame.get(frame_index)}
+        for frame_index in sorted(set(vx_by_frame) | set(vz_by_frame))
+    ]
+    result["final_segmentation"] = {
+        "authoritative": bool(vx_final.get("authoritative")) and bool(vz_final.get("authoritative")),
+        "status": (
+            "completed" if vx_final.get("status") == "completed" and vz_final.get("status") == "completed"
+            else "partial_or_unavailable_no_enabled_candidates"
+        ),
+        "candidate_scope": "step7a_enabled_segmentation_candidates_only",
+        "merge_step": "7b",
+        "vx": vx_final,
+        "vz": vz_final,
+        "frames": final_frames,
+    }
+    result.setdefault("provenance", {})["final_decoding"] = (
+        "step7b_enabled_candidates_confidence_weighting_and_min_length_dp"
+    )
+    result["provenance"]["disabled_candidates_excluded"] = True
+    return result
 
 
 def render_segment_count_chart(result, output_path):
@@ -671,4 +1241,212 @@ def render_all_video_plateau_scatter(
         "num_enabled_points": sum(row["enabled"] for row in points),
         "num_disabled_points": sum(not row["enabled"] for row in points),
         "points": points,
+    }
+
+
+
+def select_optimal_n_by_final_similarity(result):
+    """Select the enabled candidate most similar to the final merged sequence."""
+    video_id = str(result.get("video_id", ""))
+    selections = {}
+    for axis in ("vx", "vz"):
+        axis_result = result.get(f"{axis}_segmentation", {})
+        final_frames = {
+            int(row["frame_index"]): row
+            for row in axis_result.get("final_segmentation", {}).get("frames", [])
+        }
+        comparisons = []
+        for candidate in axis_result.get("enabled_segmentation_candidates", []):
+            candidate_frames = {
+                int(row["frame_index"]): row
+                for row in candidate.get("frame_labels", [])
+            }
+            common = sorted(set(final_frames) & set(candidate_frames))
+            final_count = len(final_frames)
+            matched = [
+                frame_index for frame_index in common
+                if str(final_frames[frame_index].get("state", ""))
+                == str(candidate_frames[frame_index].get("label", ""))
+            ]
+            weights = {
+                frame_index: max(0.0, float(final_frames[frame_index].get("confidence", 0.0)))
+                for frame_index in common
+            }
+            total_weight = sum(weights.values())
+            weighted_similarity = (
+                sum(weights[frame_index] for frame_index in matched) / total_weight
+                if total_weight > 0.0 else 0.0
+            )
+            raw_similarity = len(matched) / len(common) if common else 0.0
+            coverage = len(common) / final_count if final_count else 0.0
+            comparison = {
+                "candidate_id": int(candidate.get("candidate_index", -1)),
+                "plateau_id": int(candidate.get("plateau_id", candidate.get("candidate_index", -1))),
+                "threshold_n": float(candidate.get("threshold", 0.0)),
+                "segment_count": int(candidate.get("segment_count", 0)),
+                "candidate_confidence": (
+                    None if candidate.get("candidate_confidence") is None
+                    else float(candidate["candidate_confidence"])
+                ),
+                "weighted_state_similarity": float(weighted_similarity),
+                "raw_state_similarity": float(raw_similarity),
+                "frame_coverage": float(coverage),
+                "num_common_frames": len(common),
+                "num_matching_frames": len(matched),
+                "num_disagreeing_frames": len(common) - len(matched),
+                "semantic_correction_status": str(candidate.get("semantic_correction", {}).get("status", "not_applied")),
+            }
+            comparisons.append(comparison)
+        comparisons.sort(key=lambda row: (row["threshold_n"], row["candidate_id"]))
+        if comparisons:
+            selected = max(comparisons, key=lambda row: (
+                row["weighted_state_similarity"],
+                row["raw_state_similarity"],
+                row["frame_coverage"],
+                -1.0 if row["candidate_confidence"] is None else row["candidate_confidence"],
+                -row["threshold_n"],
+                -row["candidate_id"],
+            ))
+            status = "selected"
+        else:
+            selected = None
+            status = "unavailable_no_enabled_candidates"
+        selection = {
+            "status": status,
+            "video_id": video_id,
+            "axis": axis,
+            "method": "final_confidence_weighted_frame_state_agreement",
+            "tie_break_order": [
+                "weighted_state_similarity", "raw_state_similarity", "frame_coverage",
+                "candidate_confidence", "lower_threshold_n", "lower_candidate_id",
+            ],
+            "num_compared_candidates": len(comparisons),
+            "optimal_n": None if selected is None else float(selected["threshold_n"]),
+            "selected_candidate_id": None if selected is None else int(selected["candidate_id"]),
+            "selected_segment_count": None if selected is None else int(selected["segment_count"]),
+            "selected_similarity": None if selected is None else float(selected["weighted_state_similarity"]),
+            "selected_candidate": selected,
+            "candidate_similarities": comparisons,
+        }
+        axis_result["optimal_n_selection"] = selection
+        selections[axis] = selection
+    result["optimal_n_selection"] = selections
+    return selections
+
+
+def render_train_optimal_n_scatter(
+    train_results, eval_results, output_path,
+    vx_seg_max_count=8, vz_seg_max_count=5,
+    max_plateau_middle_th_vx=250.0, max_plateau_middle_th_vz=70.0,
+):
+    """Render one optimal-N point/video, fitting heat maps from train only."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    limits = {
+        "vx": {"x": max(0.0, float(max_plateau_middle_th_vx)), "y": max(1, int(vx_seg_max_count))},
+        "vz": {"x": max(0.0, float(max_plateau_middle_th_vz)), "y": max(1, int(vz_seg_max_count))},
+    }
+
+    def collect(results, axis, split):
+        rows = []
+        for result in results:
+            selection = result.get(f"{axis}_segmentation", {}).get("optimal_n_selection", {})
+            if selection.get("status") != "selected":
+                continue
+            rows.append({
+                "video_id": str(result.get("video_id", "")),
+                "split": split,
+                "axis": axis,
+                "midpoint_n": float(selection["optimal_n"]),
+                "segment_count": int(selection["selected_segment_count"]),
+                "similarity": float(selection["selected_similarity"]),
+                "candidate_id": int(selection["selected_candidate_id"]),
+            })
+        return rows
+
+    figure, axes = plt.subplots(1, 2, figsize=(17, 7.5), constrained_layout=True)
+    all_points = []
+    confidence_regions = {}
+    evaluation_metrics = {}
+    for plot_axis, axis in zip(axes, ("vx", "vz")):
+        train_rows = collect(train_results, axis, "train")
+        eval_rows = collect(eval_results, axis, "eval")
+        all_points.extend(train_rows + eval_rows)
+        bounds = (0.0, 1.2 * limits[axis]["x"], 0.0, 1.2 * limits[axis]["y"])
+        model = _confidence_surface(train_rows, bounds=bounds)
+        confidence_regions[axis] = None if model is None else model["audit"]
+        if model is not None:
+            heatmap = plot_axis.contourf(
+                model["x"], model["y"], model["confidence"],
+                levels=np.linspace(0.0, 1.0, 13), cmap="viridis", alpha=0.52, zorder=0,
+            )
+            figure.colorbar(
+                heatmap, ax=plot_axis, fraction=0.046, pad=0.03,
+                label="Train optimal-N confidence",
+            )
+            for row in eval_rows:
+                row["train_density_confidence"] = _confidence_at(model, row)
+        else:
+            for row in eval_rows:
+                row["train_density_confidence"] = None
+        if train_rows:
+            plot_axis.scatter(
+                [row["midpoint_n"] for row in train_rows],
+                [row["segment_count"] for row in train_rows],
+                s=82, color="#2878B5", marker="o", edgecolors="white",
+                linewidths=0.9, alpha=0.88, label="train optimal N", zorder=5,
+            )
+        if eval_rows:
+            plot_axis.scatter(
+                [row["midpoint_n"] for row in eval_rows],
+                [row["segment_count"] for row in eval_rows],
+                s=115, color="#D24FA4", marker="D", edgecolors="white",
+                linewidths=1.1, alpha=0.96, label="eval optimal N", zorder=7,
+            )
+        eval_confidences = [
+            row["train_density_confidence"] for row in eval_rows
+            if row["train_density_confidence"] is not None
+        ]
+        evaluation_metrics[axis] = {
+            "metric": "mean_eval_optimal_n_train_density_confidence",
+            "value": None if not eval_confidences else float(sum(eval_confidences) / len(eval_confidences)),
+            "num_train_optimal_points": len(train_rows),
+            "num_eval_optimal_points": len(eval_rows),
+        }
+        plot_axis.axhline(limits[axis]["y"], color="#666666", linestyle="--", linewidth=1.2)
+        plot_axis.axvline(limits[axis]["x"], color="#999999", linestyle=":", linewidth=1.4)
+        plot_axis.set_xlim(bounds[0], bounds[1])
+        plot_axis.set_ylim(bounds[2], bounds[3])
+        plot_axis.set_title(
+            f"{axis.upper()} optimal N | train={len(train_rows)} | eval={len(eval_rows)}",
+            fontsize=14, fontweight="bold",
+        )
+        plot_axis.set_xlabel("Optimal threshold N", fontsize=12)
+        plot_axis.set_ylabel("Segments in most-similar candidate", fontsize=12)
+        plot_axis.grid(True, alpha=0.2)
+        plot_axis.legend(fontsize=9, loc="best")
+    figure.suptitle(
+        "Step 7B optimal N per video | train-fitted heat map + eval overlay",
+        fontsize=17, fontweight="bold",
+    )
+    figure.savefig(output_path, dpi=170)
+    plt.close(figure)
+    return {
+        "status": "rendered",
+        "path": str(output_path),
+        "method": "one_most_similar_candidate_optimal_n_per_video",
+        "heatmap_fit_split": "train_only",
+        "eval_usage": "overlay_and_held_out_density_evaluation_only",
+        "num_train_videos": len(train_results),
+        "num_eval_videos": len(eval_results),
+        "num_train_optimal_points": sum(row["split"] == "train" for row in all_points),
+        "num_eval_optimal_points": sum(row["split"] == "eval" for row in all_points),
+        "confidence_regions": confidence_regions,
+        "evaluation_metrics": evaluation_metrics,
+        "points": all_points,
     }

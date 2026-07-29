@@ -63,13 +63,14 @@ recomputation.
 ### Step 7 — Empty
 
 ```text
-Step 6 geometry → empty Step 7 → 4:1 video split → Step 7A → Step 8
+Step 6 geometry → empty Step 7 → 4:1 video split → Step 7A
+→ empty Step 7B selection interface → Step 8
 ```
 
-Step 7 itself is empty. Step 7A is the only active Step 7 substep and obtains
-the continuous ego signals internally. Step 7B is retained only as a documented
-future transition-validation placeholder; the former executable 7B–7F pipeline
-remains disabled.
+Step 7 itself is empty. Step 7A is the only Step 7 substep that performs
+analysis and obtains the continuous ego signals internally. Step 7B is a
+callable identity interface reserved for future optimal-candidate selection;
+the former executable 7B–7F pipeline remains disabled.
 
 ### Pre-7A — Train/evaluation split
 
@@ -83,10 +84,12 @@ plateau region; evaluation videos are used only for held-out scoring.
 
 ### Step 7A — Axis threshold segmentation
 
+**High level:** Convert continuous ego `vx`/`vz` signals into cleaned motion-state candidates, evaluate plateau-middle thresholds, and return every enabled candidate with its confidence and audit evidence. Step 7A does not merge candidates.
+
 ```text
 ego vx/vz → 100 N values → threshold labels → short-interruption filtering
 → temporal-segment counts → stable plateaus → candidate middle N
-→ train confidence heat map → eval confidence
+→ train confidence heat map → eval confidence → enabled candidate set
 ```
 
 | Axis | Below `-N` | `[-N, N]` | Above `N` |
@@ -95,8 +98,12 @@ ego vx/vz → 100 N values → threshold labels → short-interruption filtering
 | `vx` | `right` | `straight` | `left` |
 
 Plateaus must span at least three sampled `N` values and produce more than one
-temporal segment. Every retained plateau contributes its middle `N`; Step 7A
-does not select one final threshold.
+temporal segment. Every retained plateau contributes its middle `N`. The 100
+sampled thresholds remain audit evidence. Step 7A applies the configured
+segment-count and maximum-`N` limits, then stores all enabled plateau-middle
+candidates under `enabled_segmentation_candidates`; disabled candidates and
+their reasons remain under `disabled_segmentation_candidates`. It marks the
+final merge as `pending_step7b_consensus_merge` and emits no final ego symbols.
 
 Before segment counting, a deterministic robust bridge filter joins equal-state
 outer anchors across one or more noisy interior states. It handles simple
@@ -108,6 +115,16 @@ within `bridge_total_max_frames`, the number of inner segments is within
 `bridge_max_segments`, and the interruption-to-shorter-anchor ratio is within
 `bridge_max_anchor_ratio`. The same operation is applied independently to
 `right`, `straight`, and `left` on `vx`.
+
+Every sampled threshold candidate and retained plateau-middle candidate stores a
+frame-level label audit. Before filtering, every observed frame label has
+confidence `1.0`. Unchanged post-filter labels remain at `1.0`. A relabeled
+source segment receives a symmetric triangular confidence valley: confidence
+decreases toward its middle and rises symmetrically toward its end. Valley
+depth is `min(1, source_segment_length / minimum_long_segment_length)`, so a
+segment whose length equals the minimum long length reaches zero at its middle.
+Each row records original label, final label, confidence, source-segment bounds,
+duration, and confidence method.
 
 A second cleanup pass guarantees that no removable short segments remain. It
 groups residual short segments into islands. Edge islands attach to their only
@@ -137,6 +154,7 @@ raw count range; plateau detection uses only the filtered count.
 | `bridge_max_segments_vx` / `vz` | 5 |
 | `bridge_max_anchor_ratio_vx` / `vz` | 0.75 |
 | `filter_comparison_max_candidates` | 20 |
+| `semantic_opposite_transition_penalty` | 0.5 |
 
 Points exceeding either axis-specific limit remain visible but are disabled
 and colored gray. Enabled training points fit the normalized Gaussian confidence
@@ -147,10 +165,10 @@ fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
 
 | Output | Content |
 |---|---|
-| Per-video JSON | `train/<video_id>/` or `eval/<video_id>/`; thresholds, segment counts, plateaus, middle `N`, candidate segments |
-| Per-video PNG | `train/<video_id>/` or `eval/<video_id>/`; 1×2 `vx`/`vz` charts showing raw pre-merge and filtered post-merge segment counts at every `N` |
+| Per-video JSON | `train/<video_id>/` or `eval/<video_id>/`; all enabled and disabled `vx`/`vz` candidates, confidence, reasons, and a merge-pending marker |
+| Per-eval-video PNG | `eval/<video_id>/`; 1×2 `vx`/`vz` charts showing raw pre-merge and filtered post-merge segment counts at every `N` |
 | Per-eval-video signal PNG | k×2 matrix of all qualifying `vx`/`vz` thresholds, including enabled and disabled candidates, with status/reason, state-colored backgrounds, and dashed `±N` thresholds |
-| Per-eval candidate filter PNGs | For each axis and its 20 smallest sampled candidate `N` values, a separate 2×1 before/after short-merge comparison with state-colored backgrounds and per-segment `SHORT`/`LONG` labels |
+| Per-eval candidate filter PNGs | For each axis and its 20 smallest sampled candidate `N` values, a separate 4×1 chart: before segmentation, before confidence, after segmentation, after confidence |
 | Overall PNG | 1×2 confidence heat maps with train, eval, and disabled points |
 | Scatter audit | confidence surfaces, point confidence, limits, split, eval metric |
 
@@ -161,8 +179,15 @@ fixed axis ranges from zero to 1.2 times its axis-specific hyperparameter:
 **Candidate filter comparisons:**
 `eval/<video_id>/candidate_filter_comparisons/{vx,vz}/candidate_*.png`
 
-Every segment in both rows is annotated with its state, duration, and length
-class. `SHORT` means `duration_frames <= noise_tolerance_frames_v*`; `LONG`
+Each PNG uses four rows: before-filter segmentation, before-filter confidence,
+after-filter segmentation, and after-filter confidence. Every segment in the
+two segmentation rows is annotated with its state, duration, and length class.
+Each confidence row contains a frame-aligned continuous Viridis field
+for arbitrary decimal confidence values in `[0,1]` (`0 → 0.5 → 1`) plus the
+numerical confidence curve. Bilinear color interpolation provides smooth
+transitions between adjacent frames. The before-filter
+confidence is uniformly `1`; the after-filter row visualizes symmetric
+confidence valleys caused by label changes. `SHORT` means `duration_frames <= noise_tolerance_frames_v*`; `LONG`
 means `duration_frames > noise_tolerance_frames_v*`. Short labels use a red
 badge and long labels use a green badge. The same classifications are stored in
 the per-chart JSON metadata as `raw_segments` and `filtered_segments`.
@@ -175,7 +200,7 @@ visible with pale-red panels, compact red status titles, and a `DISABLED`
 watermark. Full disabling reasons are wrapped inside the subplot instead of
 being appended to its title.
 
-The MP4 is generated only for evaluation-split videos. It uses a three-column
+The Step 7A MP4 is generated for at most the first three deterministic evaluation-split videos. The cap is configured by `step7a_axis_threshold_segmentation.visualization_max_eval_videos`. Its middle panel lists enabled candidate bars only; it does not show a final prediction. It uses a three-column
 layout: original frames with synchronized ego `vx` and `vz` plots in the left
 column (with bright dashed zero references), all enabled `vx` / `vz` threshold
 candidates and their colored segmentation timelines stacked by increasing `N`
@@ -195,9 +220,9 @@ threshold and confidence are recorded without changing pipeline decisions.
 
 ```text
 07a_ego_axis_threshold_segmentation/
-├── train/<video_id>/   # train JSON and plateau PNG
-├── eval/<video_id>/    # eval JSON, plateau PNG, signal PNG, MP4
-│   └── candidate_filter_comparisons/{vx,vz}/  # 2×1 raw/filtered PNGs
+├── train/<video_id>/   # train JSON only
+├── eval/<video_id>/    # eval JSON; visual files for at most 3 eval videos
+│   └── candidate_filter_comparisons/{vx,vz}/  # 4×1 segmentation/confidence PNGs
 ├── all_videos_plateau_scatter.png
 └── axis_threshold_segmentation_manifest.json
 ```
@@ -205,25 +230,48 @@ threshold and confidence are recorded without changing pipeline decisions.
 Artifacts: `<video_id>/axis_threshold_segment_counts.png` and
 `all_videos_plateau_scatter.png`.
 
-### Step 7B — Reserved transition-logic validation (empty)
+### Step 7B — Enabled-candidate consensus merge
 
 ```text
-Step 7A filtered segments → transition validation (planned only)
+Step 7A enabled candidates → confidence-weighted frame/state evidence
+→ minimum-length dynamic programming → one final vx/vz sequence
 ```
 
-Step 7B remains empty and is not called by the pipeline. It is reserved for a
-future deterministic real-world transition validator that runs after the Step
-7A short-segment filter. The planned legal transitions are:
+Step 7B is the only stage that merges candidates. Before aggregation, it applies
+a deterministic semantic-confidence correction. The current rule forbids direct
+`forward → backward` and `backward → forward` transitions in a `vz` candidate.
+When violated, both adjacent segments receive the configured penalty; a segment
+involved in multiple violations receives the compounded multiplier
+`(1 - penalty)^incident_count`. Candidates satisfying every semantic rule keep
+their original confidence. Original, multiplier, corrected confidence, affected
+frames/segments, and rule violations are preserved for audit.
 
-| Axis | Legal adjacent-state transitions | Forbidden direct transition |
-|---|---|---|
-| `vz` | `forward ↔ static`, `static ↔ backward` | `forward ↔ backward` |
-| `vx` | `left ↔ straight`, `straight ↔ right` | `left ↔ right` |
+The merge multiplies each enabled candidate's train-fitted plateau confidence
+by its semantic-corrected frame confidence, aggregates state evidence, and
+applies deterministic minimum-segment-length dynamic programming. It outputs
+final frame and segment `state`, `confidence`, `consensus`, `margin`, and
+`candidate_disagreement`. If an axis has no enabled candidate, it returns
+`unavailable_no_enabled_candidates` without using a disabled threshold.
 
-This is currently a design comment only: it does not modify segments, insert
-neutral states, reject candidates, or change downstream results.
+After merging, Step 7B compares the final sequence with every enabled candidate.
+The primary similarity is final-confidence-weighted frame-state agreement; raw
+agreement, coverage, candidate confidence, lower `N`, and lower candidate ID are
+deterministic tie breakers. The most similar candidate's midpoint threshold is
+stored as that video's axis-specific `optimal_n`, together with every candidate
+similarity and the selected candidate provenance.
 
-## Step 8 — High-level flow
+Outputs are written to
+`07b_ego_axis_consensus_segmentation/{train,eval}/<video_id>/final_axis_segmentation.json`.
+For at most three eval videos, Step 7B also writes
+`final_consensus_visualization.mp4`; its middle panel appends a yellow-bordered
+`FINAL PREDICTION` bar below each axis's enabled candidates.
+
+The dataset-level chart
+`07b_ego_axis_consensus_segmentation/train_optimal_n_with_eval_scatter.png` uses
+a 1×2 `vx`/`vz` layout. Each video contributes at most one point per axis at
+`(optimal N, selected candidate segment count)`. The confidence heat-map
+background is fitted exclusively from train-video optimal points; held-out eval
+optimal points are then overlaid as magenta diamonds and do not affect the fit. The matching points, train-fitted confidence model, and held-out metrics are also saved to `train_optimal_n_with_eval_scatter.json`.
 
 ### Step 8 — Track repair
 

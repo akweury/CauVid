@@ -3669,7 +3669,7 @@ def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
 
 def step7a_axis_threshold_segmentation(position_state):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
-    from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
+    from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, materialize_enabled_candidates, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
     from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4, render_eval_candidate_filter_comparisons, render_eval_signal_segmentation_chart
 
     signal_state = step7_ego_motion(position_state)
@@ -3692,12 +3692,24 @@ def step7a_axis_threshold_segmentation(position_state):
         for axis in ("vx", "vz")
     }
     filter_comparison_max_candidates = int(step7a_config["filter_comparison_max_candidates"])
+    visualization_max_eval_videos = int(
+        step7a_config.get("visualization_max_eval_videos", 3)
+    )
+    consensus_min_segment_length_vx = int(
+        step7a_config.get("consensus_min_segment_length_vx", 6)
+    )
+    consensus_min_segment_length_vz = int(
+        step7a_config.get("consensus_min_segment_length_vz", 6)
+    )
     output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "train").mkdir(parents=True, exist_ok=True)
     (output_root / "eval").mkdir(parents=True, exist_ok=True)
     train_video_ids = set(str(value) for value in position_state.get("step7_train_video_ids", []))
     eval_video_ids = set(str(value) for value in position_state.get("step7_eval_video_ids", []))
+    visualized_eval_video_ids = set(
+        sorted(eval_video_ids)[:visualization_max_eval_videos]
+    )
     results = []
     cached_videos = 0
     for ego_video in tqdm(ego_motion, desc="[step 7a] axis_threshold_segmentation", unit="video"):
@@ -3708,6 +3720,8 @@ def step7a_axis_threshold_segmentation(position_state):
             "noise_tolerance_frames_vx": noise_tolerance_frames_vx,
             "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
             "bridge_config_by_axis": bridge_config_by_axis,
+            "consensus_min_segment_length_vx": consensus_min_segment_length_vx,
+            "consensus_min_segment_length_vz": consensus_min_segment_length_vz,
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         data_split = "eval" if video_id in eval_video_ids else "train"
         video_output_root = output_root / data_split / video_id
@@ -3729,21 +3743,29 @@ def step7a_axis_threshold_segmentation(position_state):
                 vx_bridge_config=bridge_config_by_axis["vx"],
                 vz_bridge_config=bridge_config_by_axis["vz"],
                 plateau_min_n_values=plateau_min_n_values,
+                vx_consensus_min_segment_length=consensus_min_segment_length_vx,
+                vz_consensus_min_segment_length=consensus_min_segment_length_vz,
             )
             cached["source_fingerprint"] = source_fingerprint
             path.parent.mkdir(parents=True, exist_ok=True)
         else:
             cached_videos += 1
         chart_path = path.parent / "axis_threshold_segment_counts.png"
-        if recomputed or not chart_path.exists():
+        if video_id in visualized_eval_video_ids and (recomputed or not chart_path.exists()):
             render_segment_count_chart(cached, chart_path)
         cached["data_split"] = data_split
         cached["output_directory"] = str(video_output_root)
-        cached["segment_count_chart"] = str(chart_path)
+        cached["segment_count_chart"] = (
+            str(chart_path) if video_id in visualized_eval_video_ids else None
+        )
         path.write_text(json.dumps(cached, indent=2), encoding="utf-8")
         results.append(cached)
     train_results = [row for row in results if str(row.get("video_id", "")) in train_video_ids]
     eval_results = [row for row in results if str(row.get("video_id", "")) in eval_video_ids]
+    visual_eval_results = [
+        row for row in eval_results
+        if str(row.get("video_id", "")) in visualized_eval_video_ids
+    ]
     # Compatibility fallback for direct Step 7A calls without the pre-split stage.
     if not train_results and not eval_results:
         train_results = results
@@ -3756,11 +3778,17 @@ def step7a_axis_threshold_segmentation(position_state):
         max_plateau_middle_th_vx=max_plateau_middle_th_vx,
         max_plateau_middle_th_vz=max_plateau_middle_th_vz,
     )
+    for result in results:
+        materialize_enabled_candidates(result, overall_scatter)
+        result_path = (
+            Path(result["output_directory"]) / "axis_threshold_segmentation.json"
+        )
+        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     ego_by_video = {str(row.get("video_id", "")): row for row in ego_motion}
     visualization_mp4s = []
     signal_segmentation_charts = []
     filter_comparison_visualizations = []
-    for result in tqdm(eval_results, desc="[step 7a] eval visualizations", unit="video"):
+    for result in tqdm(visual_eval_results, desc="[step 7a] eval visualizations", unit="video"):
         video_id = str(result.get("video_id", ""))
         video_output_root = output_root / "eval" / video_id
         visualization_path = video_output_root / "axis_segmentation_visualization.mp4"
@@ -3768,7 +3796,7 @@ def step7a_axis_threshold_segmentation(position_state):
         filter_comparison_root = video_output_root / "candidate_filter_comparisons"
         visualization_fingerprint = hashlib.sha256(json.dumps({
             "version": VERSION,
-            "visualization_layout": "eval_only_three_column_threshold_summary_v6",
+            "visualization_layout": "eval_only_enabled_candidates_no_final_v10",
             "source_fingerprint": result.get("source_fingerprint"),
             "confidence_points": [row for row in overall_scatter.get("points", []) if str(row.get("video_id", "")) == video_id],
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
@@ -3778,7 +3806,7 @@ def step7a_axis_threshold_segmentation(position_state):
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         filter_comparison_fingerprint = hashlib.sha256(json.dumps({
             "source_fingerprint": result.get("source_fingerprint"),
-            "layout": "2x1_before_after_guaranteed_long_segments_v3",
+            "layout": "4x1_viridis_gradient_confidence_v8",
             "max_candidates_per_axis": filter_comparison_max_candidates,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         cached_visual = result.get("visualization", {})
@@ -3786,7 +3814,7 @@ def step7a_axis_threshold_segmentation(position_state):
                 and cached_visual.get("source_fingerprint") == visualization_fingerprint):
             visual = cached_visual
         else:
-            visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path)
+            visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path, show_final=False, step_label="7A")
             visual["source_fingerprint"] = visualization_fingerprint
         cached_signal_chart = result.get("signal_segmentation_chart", {})
         if (signal_chart_path.exists() and cached_signal_chart.get("status") == "rendered"
@@ -3822,7 +3850,7 @@ def step7a_axis_threshold_segmentation(position_state):
     manifest = {
         "version": VERSION,
         "stage": "7a_ego_axis_threshold_segmentation",
-        "method": "multi_plateau_segment_count_stability",
+        "method": "confidence_weighted_candidate_consensus_dp",
         "num_videos": len(results),
         "num_frames": sum(int(row.get("num_frames", 0)) for row in results),
         "threshold_candidates_per_axis": 100,
@@ -3835,6 +3863,10 @@ def step7a_axis_threshold_segmentation(position_state):
         "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
         "bridge_config_by_axis": bridge_config_by_axis,
         "filter_comparison_max_candidates": filter_comparison_max_candidates,
+        "visualization_max_eval_videos": visualization_max_eval_videos,
+        "consensus_min_segment_length_vx": consensus_min_segment_length_vx,
+        "consensus_min_segment_length_vz": consensus_min_segment_length_vz,
+        "visualized_eval_video_ids": sorted(visualized_eval_video_ids),
         "configuration": step7a_config,
         "train_eval_split": copy.deepcopy(position_state.get("step7_train_eval_split", {})),
         "train_output_root": str(output_root / "train"),
@@ -3842,7 +3874,11 @@ def step7a_axis_threshold_segmentation(position_state):
         "num_train_videos": len(train_results),
         "num_eval_videos": len(eval_results),
         "cached_videos": cached_videos,
-        "segment_count_charts": [str(row.get("segment_count_chart", "")) for row in results],
+        "segment_count_charts": [
+            str(row["segment_count_chart"])
+            for row in visual_eval_results
+            if row.get("segment_count_chart")
+        ],
         "visualization_scope": "eval_videos_only",
         "num_visualized_eval_videos": len(visualization_mp4s),
         "visualization_mp4s": visualization_mp4s,
@@ -3850,6 +3886,12 @@ def step7a_axis_threshold_segmentation(position_state):
         "signal_segmentation_charts": signal_segmentation_charts,
         "num_filter_comparison_visualizations": sum(int(row.get("num_charts", 0)) for row in filter_comparison_visualizations),
         "candidate_filter_comparisons": filter_comparison_visualizations,
+        "num_enabled_segmentation_candidates": sum(
+            len(result.get(f"{axis}_segmentation", {}).get("enabled_segmentation_candidates", []))
+            for result in results for axis in ("vx", "vz")
+        ),
+        "final_merge_performed": False,
+        "final_merge_step": "7b",
         "num_qualifying_plateaus": sum(
             len(row.get(axis, {}).get("qualifying_plateaus", []))
             for row in results for axis in ("vx_segmentation", "vz_segmentation")
@@ -3861,14 +3903,16 @@ def step7a_axis_threshold_segmentation(position_state):
     print(
         f"[step 7a] axis_threshold_segmentation videos={manifest['num_videos']} "
         f"frames={manifest['num_frames']} candidates=100x2 "
-        f"plateaus={manifest['num_qualifying_plateaus']} cached={cached_videos} "
-        f"scatter={overall_scatter['path']}",
+        f"plateaus={manifest['num_qualifying_plateaus']} "
+        f"enabled_candidates={manifest['num_enabled_segmentation_candidates']} "
+        f"final_merge=deferred_to_7b "
+        f"cached={cached_videos} scatter={overall_scatter['path']}",
         flush=True,
     )
     return {
         **position_state,
         **signal_state,
-        "step7_status": "7a_only",
+        "step7_status": "7a_enabled_candidates",
         "step7_substeps": ["7a_axis_threshold_segmentation"],
         "ego_axis_threshold_segmentation": results,
         "ego_axis_threshold_segmentation_manifest": manifest,
@@ -3878,6 +3922,170 @@ def step7a_axis_threshold_segmentation(position_state):
         "final_ego_symbols": [],
     }
 
+
+
+def step7b_optimal_segmentation_selection(step7a_state):
+    """Merge Step 7A enabled candidates into one final sequence per axis."""
+    from src.exp_july.perception.ego_axis_threshold_segmentation import apply_semantic_candidate_confidence_correction, finalize_enabled_consensus, materialize_enabled_candidates, render_train_optimal_n_scatter, select_optimal_n_by_final_similarity
+    from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4
+
+    config = driving_pipeline_config.get_step7a_axis_threshold_segmentation_cfg()
+    vx_minimum = int(config.get("consensus_min_segment_length_vx", 6))
+    vz_minimum = int(config.get("consensus_min_segment_length_vz", 6))
+    semantic_penalty = float(config.get("semantic_opposite_transition_penalty", 0.5))
+    candidate_results = list(step7a_state.get("ego_axis_threshold_segmentation", []))
+    final_results = copy.deepcopy(candidate_results)
+    output_root = get_pipeline_output_root() / "07b_ego_axis_consensus_segmentation"
+    output_root.mkdir(parents=True, exist_ok=True)
+    visualization_max_eval_videos = int(config.get("visualization_max_eval_videos", 3))
+    visualized_eval_ids = set(
+        sorted(str(value) for value in step7a_state.get("step7_eval_video_ids", []))[:visualization_max_eval_videos]
+    )
+    ego_by_video = {
+        str(row.get("video_id", "")): row
+        for row in step7a_state.get("ego_motion", [])
+    }
+    visualization_mp4s = []
+    plateau_audit = step7a_state.get(
+        "ego_axis_threshold_segmentation_manifest", {}
+    ).get("all_videos_plateau_scatter", {})
+    final_ego_symbols = []
+    for result in tqdm(final_results, desc="[step 7b] consensus_merge", unit="video"):
+        has_materialized_candidates = all(
+            "enabled_segmentation_candidates" in result.get(f"{axis}_segmentation", {})
+            for axis in ("vx", "vz")
+        )
+        if not has_materialized_candidates:
+            materialize_enabled_candidates(result, plateau_audit)
+        apply_semantic_candidate_confidence_correction(
+            result, opposite_transition_penalty=semantic_penalty,
+        )
+        finalize_enabled_consensus(
+            result,
+            None,
+            vx_minimum_segment_length=vx_minimum,
+            vz_minimum_segment_length=vz_minimum,
+        )
+        select_optimal_n_by_final_similarity(result)
+        video_id = str(result.get("video_id", ""))
+        data_split = str(result.get("data_split", "train"))
+        video_output_root = output_root / data_split / video_id
+        video_output_root.mkdir(parents=True, exist_ok=True)
+        final_path = video_output_root / "final_axis_segmentation.json"
+        result["step7b_output_directory"] = str(video_output_root)
+        result["step7b_final_segmentation_path"] = str(final_path)
+        final_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        if data_split == "eval" and video_id in visualized_eval_ids:
+            visualization_path = video_output_root / "final_consensus_visualization.mp4"
+            visual = render_axis_segmentation_mp4(
+                result, ego_by_video.get(video_id, {}), plateau_audit,
+                visualization_path, show_final=True, step_label="7B",
+            )
+            result["step7b_visualization"] = visual
+            visualization_mp4s.append(visual)
+            final_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        final = copy.deepcopy(result.get("final_segmentation", {}))
+        final_ego_symbols.append({
+            "video_id": video_id,
+            "status": str(final.get("status", "")),
+            "source_step": "7b_consensus_merge",
+            "method": "semantic_corrected_enabled_candidate_confidence_weighted_min_length_dp",
+            "final_segmentation": final,
+            "optimal_n_selection": copy.deepcopy(result.get("optimal_n_selection", {})),
+            "provenance": {
+                "step7a_candidate_source": str(result.get("output_directory", "")),
+                "step7b_output": str(final_path),
+            },
+        })
+    train_final_results = [
+        result for result in final_results if str(result.get("data_split", "train")) == "train"
+    ]
+    eval_final_results = [
+        result for result in final_results if str(result.get("data_split", "train")) == "eval"
+    ]
+    optimal_n_scatter = render_train_optimal_n_scatter(
+        train_final_results, eval_final_results,
+        output_root / "train_optimal_n_with_eval_scatter.png",
+        vx_seg_max_count=int(config.get("vx_seg_max_count", 8)),
+        vz_seg_max_count=int(config.get("vz_seg_max_count", 5)),
+        max_plateau_middle_th_vx=float(config.get("max_plateau_middle_th_vx", 250.0)),
+        max_plateau_middle_th_vz=float(config.get("max_plateau_middle_th_vz", 70.0)),
+    )
+    optimal_n_scatter_audit_path = output_root / "train_optimal_n_with_eval_scatter.json"
+    optimal_n_scatter["audit_path"] = str(optimal_n_scatter_audit_path)
+    optimal_n_scatter_audit_path.write_text(
+        json.dumps(optimal_n_scatter, indent=2), encoding="utf-8",
+    )
+    manifest = {
+        "version": 3,
+        "stage": "7b_ego_axis_consensus_segmentation",
+        "method": "semantic_corrected_enabled_candidate_confidence_weighted_min_length_dp",
+        "num_videos": len(final_results),
+        "vx_minimum_segment_length": vx_minimum,
+        "vz_minimum_segment_length": vz_minimum,
+        "semantic_opposite_transition_penalty": semantic_penalty,
+        "semantic_rule_ids": ["no_direct_forward_backward_transition"],
+        "num_semantically_penalized_candidates": sum(
+            int(result.get("step7b_semantic_confidence_correction", {}).get("num_penalized_candidates", 0))
+            for result in final_results
+        ),
+        "num_semantic_violations": sum(
+            int(result.get("step7b_semantic_confidence_correction", {}).get("num_violations", 0))
+            for result in final_results
+        ),
+        "num_input_enabled_candidates": sum(
+            len(result.get(f"{axis}_segmentation", {}).get("enabled_segmentation_candidates", []))
+            for result in candidate_results for axis in ("vx", "vz")
+        ),
+        "num_completed_axes": sum(
+            result.get(f"{axis}_segmentation", {}).get("final_segmentation", {}).get("status") == "completed"
+            for result in final_results for axis in ("vx", "vz")
+        ),
+        "num_unavailable_axes": sum(
+            result.get(f"{axis}_segmentation", {}).get("final_segmentation", {}).get("status") != "completed"
+            for result in final_results for axis in ("vx", "vz")
+        ),
+        "output_root": str(output_root),
+        "optimal_n_scatter": optimal_n_scatter,
+        "num_selected_train_optimal_n": int(optimal_n_scatter.get("num_train_optimal_points", 0)),
+        "num_selected_eval_optimal_n": int(optimal_n_scatter.get("num_eval_optimal_points", 0)),
+        "visualization_scope": "at_most_configured_eval_videos",
+        "visualized_eval_video_ids": sorted(visualized_eval_ids),
+        "num_visualized_eval_videos": len(visualization_mp4s),
+        "visualization_mp4s": visualization_mp4s,
+        "videos": [
+            {
+                "video_id": str(result.get("video_id", "")),
+                "data_split": str(result.get("data_split", "train")),
+                "path": str(result.get("step7b_final_segmentation_path", "")),
+                "status": str(result.get("final_segmentation", {}).get("status", "")),
+            }
+            for result in final_results
+        ],
+    }
+    manifest_path = output_root / "consensus_segmentation_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        f"[step 7b] consensus_merge videos={manifest['num_videos']} "
+        f"enabled_candidates={manifest['num_input_enabled_candidates']} "
+        f"semantic_penalized={manifest['num_semantically_penalized_candidates']} "
+        f"semantic_violations={manifest['num_semantic_violations']} "
+        f"optimal_n_train={manifest['num_selected_train_optimal_n']} "
+        f"optimal_n_eval={manifest['num_selected_eval_optimal_n']} "
+        f"completed_axes={manifest['num_completed_axes']} "
+        f"unavailable_axes={manifest['num_unavailable_axes']}",
+        flush=True,
+    )
+    return {
+        **step7a_state,
+        "step7_status": "7b_final_consensus",
+        "step7_substeps": list(step7a_state.get("step7_substeps", [])) + ["7b_consensus_merge"],
+        "ego_axis_final_segmentation": final_results,
+        "ego_axis_consensus_segmentation_manifest": manifest,
+        "ego_axis_consensus_segmentation_manifest_path": str(manifest_path),
+        "ego_axis_consensus_segmentation_output_root": output_root,
+        "final_ego_symbols": final_ego_symbols,
+    }
 
 
 def _median(values):
@@ -4620,6 +4828,20 @@ def step7_ego_motion(position_state):
     output_root.mkdir(parents=True, exist_ok=True)
     ego_motion = []
     cached_videos = 0
+    requested_eval_video_ids = sorted({
+        str(value)
+        for value in position_state.get("step7_eval_video_ids", [])
+        if str(value)
+    })
+    restrict_visuals_to_eval = "step7_eval_video_ids" in position_state
+    visualization_max_eval_videos = int(
+        driving_pipeline_config.get_step7a_axis_threshold_segmentation_cfg().get(
+            "visualization_max_eval_videos", 3
+        )
+    )
+    eval_video_ids = set(
+        requested_eval_video_ids[:visualization_max_eval_videos]
+    )
     progress = tqdm(positions_3d, desc="[step 7] ego_motion", unit="video")
     for video_result in progress:
         video_id = str(video_result.get("video_id", ""))
@@ -4652,7 +4874,13 @@ def step7_ego_motion(position_state):
                     force_recompute=bool(run_args.get("force_recompute", False)),
                     smoothing_window=int(run_args.get("smoothing_window", 5)),
                     static_adjust_cfg=run_args.get("static_adjust_cfg"),
-                    render_video=bool(run_args.get("render_video", True)),
+                    render_video=(
+                        bool(run_args.get("render_video", True))
+                        and (
+                            not restrict_visuals_to_eval
+                            or video_id in eval_video_ids
+                        )
+                    ),
                     flow_device=run_args.get("flow_device"),
                 )
             )
