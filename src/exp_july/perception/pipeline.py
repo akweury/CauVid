@@ -6891,7 +6891,12 @@ def step8b_uncertain_signal_evidence(
 
 
 def step9_temporal_segmentation(ego_state, relative_motion_state):
-    return {"videos": ego_state["videos"], "temporal_segments": []}
+    return {
+        **relative_motion_state,
+        "videos": ego_state["videos"],
+        "final_ego_symbols": copy.deepcopy(ego_state.get("final_ego_symbols", [])),
+        "temporal_segments": [],
+    }
 
 
 def step8_trajectory_validation(
@@ -8105,4 +8110,4 @@ def step8i_threshold_calibration(state):
 
 
 def step10_segment_object_motion(segment_state):
-    return {"videos": segment_state["videos"], "segment_object_motion": []}
+    return {**segment_state, "segment_object_motion": []}

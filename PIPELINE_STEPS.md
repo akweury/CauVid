@@ -427,10 +427,15 @@ Currently returns an empty `temporal_segments` collection.
 Intended to summarize object motion within each temporal segment. Currently
 returns an empty `segment_object_motion` collection.
 
-### Step 11 — Important-object selection
+### Step 11 — Important-object audit visualization
 
-Intended to select the objects required for higher-level scene reasoning.
-Currently returns an empty `important_objects` collection.
+Important-object selection remains an empty scaffold. The active read-only audit
+renders up to five MP4s from the Step 8K handoff: the left panel shows the scene,
+object boxes, Step 7B ego labels, and synchronized `vx`/`vz` segmentation bars;
+the right panel shows up to four current-frame objects with class, track ID,
+relative-motion labels, positions, confidence, and numerical motion signals.
+
+**Output directory:** `11_important_objects_visualization/`
 
 ### Step 12 — Logic-atom construction
 

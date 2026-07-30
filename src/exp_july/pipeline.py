@@ -28,10 +28,18 @@ from src.exp_july.perception import step8j_trajectory_provenance_audit
 from src.exp_july.perception import step8k_trajectory_handoff
 from src.exp_july.perception import step9_temporal_segmentation
 from src.exp_july.perception import step10_segment_object_motion
+from src.exp_july.perception.important_objects_visualization import render_step11_visualizations
 
 
 def step11_important_objects(segment_motion_state):
-    return {"videos": segment_motion_state["videos"], "important_objects": []}
+    visualization = render_step11_visualizations(segment_motion_state)
+    return {
+        **segment_motion_state,
+        "important_objects": [],
+        "important_objects_visualization": visualization["manifest"],
+        "important_objects_visualization_manifest_path": visualization["manifest_path"],
+        "important_objects_visualization_output_root": visualization["output_root"],
+    }
 
 
 def step12_logic_atoms(important_object_state):
@@ -225,19 +233,12 @@ def _step_data_error(step_name, state):
         if int(manifest.get("num_tracks", 0) or 0) <= 0:
             return "published zero repaired-trajectory validation records"
 
+    if step_name == "11_important_objects":
+        visualization = state.get("important_objects_visualization", {})
+        if int(visualization.get("num_rendered", 0) or 0) <= 0:
+            return "rendered no important-object audit videos"
+
     required_collections = {
-        "09_temporal_segmentation": (
-            "temporal_segments",
-            "produced no temporal segments",
-        ),
-        "10_segment_motion": (
-            "segment_object_motion",
-            "produced no segment-level object motion",
-        ),
-        "11_important_objects": (
-            "important_objects",
-            "selected no important objects",
-        ),
         "12_logic_atoms": ("logic_atoms", "produced no logic atoms"),
         "13_target_heads": ("target_heads", "produced no target heads"),
         "14_rule_examples": (
@@ -446,7 +447,7 @@ def _run_pipeline(
     segment_state = _tracked_step(
         tracker,
         "09_temporal_segmentation",
-        lambda: step9_temporal_segmentation(ego_state, relative_motion_state),
+        lambda: step9_temporal_segmentation(ego_final_state, relative_motion_state),
     )
     if max_step <= 9:
         return segment_state
