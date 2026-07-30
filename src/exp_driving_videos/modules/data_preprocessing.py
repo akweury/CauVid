@@ -16,6 +16,8 @@ import logging
 
 import numpy as np
 
+from src.external_depth_anything.depth_cache import is_valid_depth_npz
+
 # Add project root to Python path for imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -536,9 +538,18 @@ def ensure_video_depth_maps(
         raise FileNotFoundError(f"No extracted frames found for {video_id}: {frame_dir}")
 
     expected_depths = [_depth_map_path_for_frame(depth_dir, frame.name) for frame in frame_files]
-    missing_depths = force_recompute or any(not path.exists() for path in expected_depths)
+    invalid_depths = [
+        path for path in expected_depths if not is_valid_depth_npz(path)
+    ]
+    missing_depths = force_recompute or bool(invalid_depths)
     if missing_depths:
         if not quiet:
+            if invalid_depths:
+                logger.info(
+                    "Regenerating %d missing or invalid depth maps for %s",
+                    len(invalid_depths),
+                    video_id,
+                )
             logger.info(f"Generating depth maps for {video_id} -> {depth_dir}")
         ok = generate_frame_depth_maps(
             frame_folder=frame_dir,

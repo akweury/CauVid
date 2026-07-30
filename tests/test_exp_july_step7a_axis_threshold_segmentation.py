@@ -479,7 +479,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             output = step7a_axis_threshold_segmentation({
                 "step7_train_video_ids": ["train-video"],
                 "step7_eval_video_ids": ["eval-video"],
-            })
+            }, render_candidate_filter_comparisons=True)
             root = Path(output["ego_axis_threshold_segmentation_output_root"])
             self.assertTrue((root / "train" / "train-video" / "axis_threshold_segmentation.json").exists())
             self.assertFalse((root / "train" / "train-video" / "axis_threshold_segment_counts.png").exists())

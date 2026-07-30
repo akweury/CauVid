@@ -47,6 +47,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.external_depth_anything.depth_cache import (
+    atomic_save_depth_npz,
+    is_valid_depth_npz,
+)
+
 # Add Depth-Anything-3 source to Python path
 DEPTH_ANYTHING_SRC = PROJECT_ROOT / "external" / "Depth-Anything-3" / "src"
 if str(DEPTH_ANYTHING_SRC) not in sys.path:
@@ -143,7 +148,9 @@ def generate_depth_maps(
     if skip_existing:
         image_files = [
             path for path in image_files
-            if not (output_dir / f"{Path(path).stem}_depth.npz").is_file()
+            if not is_valid_depth_npz(
+                output_dir / f"{Path(path).stem}_depth.npz"
+            )
         ]
     if not image_files:
         return {"processed": 0, "model_cache_hit": None}
@@ -213,7 +220,7 @@ def generate_depth_maps(
                     
                     # Save depth map as numpy array
                     depth_npz_path = output_dir / f"{img_name}_depth.npz"
-                    np.savez_compressed(depth_npz_path, depth=depth)
+                    atomic_save_depth_npz(depth_npz_path, depth)
                     print(f"  ✓ Saved: {depth_npz_path.name} (size: {depth.shape})")
                     
                     # Save depth map as normalized image for visualization

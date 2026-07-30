@@ -302,6 +302,7 @@ def _run_pipeline(
     step7_profile="eval-fast",
     step7_threshold_search_rounds=3,
     step7e_expensive_candidate_limit=8,
+    step7_candidate_filter_comparisons=False,
 ):
     # Step 1: initialize dataset scope and selected videos.
     env = _tracked_step(
@@ -359,7 +360,10 @@ def _run_pipeline(
     ego_final_state = _tracked_step(
         tracker,
         "07a_axis_threshold_segmentation",
-        lambda: step7a_axis_threshold_segmentation(step7_split_state),
+        lambda: step7a_axis_threshold_segmentation(
+            step7_split_state,
+            render_candidate_filter_comparisons=step7_candidate_filter_comparisons,
+        ),
     )
     # Step 7B: merge only the enabled Step 7A candidates into one confidence-
     # weighted, minimum-length-constrained final sequence for each axis.
@@ -531,6 +535,7 @@ def main(
     step7_profile="eval-fast",
     step7_threshold_search_rounds=3,
     step7e_expensive_candidate_limit=8,
+    step7_candidate_filter_comparisons=False,
     *,
     wandb_enabled=None,
     wandb_project=None,
@@ -559,6 +564,7 @@ def main(
             step7_profile=step7_profile,
             step7_threshold_search_rounds=step7_threshold_search_rounds,
             step7e_expensive_candidate_limit=step7e_expensive_candidate_limit,
+            step7_candidate_filter_comparisons=step7_candidate_filter_comparisons,
         )
     except BaseException as exc:
         tracker.finish(status="failed", error=exc)
@@ -591,6 +597,14 @@ def _parse_args():
         default=8,
         help="Deprecated compatibility option; Step 7 is currently empty",
     )
+    parser.add_argument(
+        "--step7-candidate-filter-comparisons",
+        action="store_true",
+        help=(
+            "Render Step 7A candidate-filter comparison charts. "
+            "Disabled by default because these charts are expensive."
+        ),
+    )
     wandb_group = parser.add_mutually_exclusive_group()
     wandb_group.add_argument("--wandb", dest="wandb_enabled", action="store_true", help="Enable W&B tracking")
     wandb_group.add_argument("--no-wandb", dest="wandb_enabled", action="store_false", help="Disable W&B tracking")
@@ -611,6 +625,7 @@ if __name__ == "__main__":
         step7_profile=args.step7_profile,
         step7_threshold_search_rounds=max(1, args.step7_threshold_search_rounds),
         step7e_expensive_candidate_limit=max(1, args.step7e_expensive_candidate_limit),
+        step7_candidate_filter_comparisons=args.step7_candidate_filter_comparisons,
         wandb_enabled=args.wandb_enabled,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

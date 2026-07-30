@@ -550,6 +550,19 @@ class ExpJulyWandbTests(unittest.TestCase):
             args = pipeline._parse_args()
         self.assertFalse(args.wandb_enabled)
 
+    def test_candidate_filter_comparison_visuals_are_opt_in(self):
+        with patch.object(sys, "argv", ["pipeline.py"]):
+            args = pipeline._parse_args()
+        self.assertFalse(args.step7_candidate_filter_comparisons)
+
+        with patch.object(
+            sys,
+            "argv",
+            ["pipeline.py", "--step7-candidate-filter-comparisons"],
+        ):
+            args = pipeline._parse_args()
+        self.assertTrue(args.step7_candidate_filter_comparisons)
+
 
 if __name__ == "__main__":
     unittest.main()

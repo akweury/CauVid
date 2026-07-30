@@ -68,3 +68,60 @@ def test_existing_depth_maps_are_filtered_before_model_load(tmp_path):
 
     assert result == {"processed": 0, "model_cache_hit": None}
     load.assert_not_called()
+
+
+def test_empty_depth_map_is_regenerated(tmp_path):
+    input_dir = tmp_path / "frames"
+    output_dir = tmp_path / "depth"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    Image.new("RGB", (2, 2)).save(input_dir / "frame_00001.jpg")
+    depth_path = output_dir / "frame_00001_depth.npz"
+    depth_path.touch()
+
+    fake = _FakeModel()
+    with mock.patch.object(
+        depth_map_generator,
+        "_get_cached_depth_model",
+        return_value=(fake, False),
+    ) as load:
+        result = depth_map_generator.generate_depth_maps(
+            input_dir,
+            output_dir,
+            device="cpu",
+            quiet=True,
+            skip_existing=True,
+        )
+
+    assert result["processed"] == 1
+    load.assert_called_once()
+    with np.load(depth_path) as data:
+        np.testing.assert_array_equal(
+            data["depth"], np.ones((2, 2), dtype=np.float32)
+        )
+
+
+def test_truncated_depth_map_is_regenerated(tmp_path):
+    input_dir = tmp_path / "frames"
+    output_dir = tmp_path / "depth"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    Image.new("RGB", (2, 2)).save(input_dir / "frame_00001.jpg")
+    depth_path = output_dir / "frame_00001_depth.npz"
+    depth_path.write_bytes(b"not a valid npz")
+
+    with mock.patch.object(
+        depth_map_generator,
+        "_get_cached_depth_model",
+        return_value=(_FakeModel(), False),
+    ):
+        depth_map_generator.generate_depth_maps(
+            input_dir,
+            output_dir,
+            device="cpu",
+            quiet=True,
+            skip_existing=True,
+        )
+
+    with np.load(depth_path) as data:
+        assert data["depth"].shape == (2, 2)

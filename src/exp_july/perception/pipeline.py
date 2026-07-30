@@ -3667,7 +3667,10 @@ def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
     }
 
 
-def step7a_axis_threshold_segmentation(position_state):
+def step7a_axis_threshold_segmentation(
+    position_state,
+    render_candidate_filter_comparisons=False,
+):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, materialize_enabled_candidates, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
     from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4, render_eval_candidate_filter_comparisons, render_eval_signal_segmentation_chart
@@ -3823,23 +3826,31 @@ def step7a_axis_threshold_segmentation(position_state):
         else:
             signal_chart = render_eval_signal_segmentation_chart(result, overall_scatter, signal_chart_path)
             signal_chart["source_fingerprint"] = signal_chart_fingerprint
-        cached_filter_comparison = result.get("candidate_filter_comparisons", {})
-        cached_filter_paths = [Path(row.get("path", "")) for row in cached_filter_comparison.get("charts", [])]
-        expected_filter_charts = sum(min(
-            filter_comparison_max_candidates,
-            len(result.get(f"{axis}_segmentation", {}).get("threshold_candidates", [])),
-        ) for axis in ("vx", "vz"))
-        if (cached_filter_comparison.get("status") == "rendered"
-                and cached_filter_comparison.get("source_fingerprint") == filter_comparison_fingerprint
-                and len(cached_filter_paths) == expected_filter_charts
-                and all(path.is_file() for path in cached_filter_paths)):
-            filter_comparison = cached_filter_comparison
+        if render_candidate_filter_comparisons:
+            cached_filter_comparison = result.get("candidate_filter_comparisons", {})
+            cached_filter_paths = [Path(row.get("path", "")) for row in cached_filter_comparison.get("charts", [])]
+            expected_filter_charts = sum(min(
+                filter_comparison_max_candidates,
+                len(result.get(f"{axis}_segmentation", {}).get("threshold_candidates", [])),
+            ) for axis in ("vx", "vz"))
+            if (cached_filter_comparison.get("status") == "rendered"
+                    and cached_filter_comparison.get("source_fingerprint") == filter_comparison_fingerprint
+                    and len(cached_filter_paths) == expected_filter_charts
+                    and all(path.is_file() for path in cached_filter_paths)):
+                filter_comparison = cached_filter_comparison
+            else:
+                filter_comparison = render_eval_candidate_filter_comparisons(
+                    result, filter_comparison_root,
+                    max_candidates=filter_comparison_max_candidates,
+                )
+                filter_comparison["source_fingerprint"] = filter_comparison_fingerprint
         else:
-            filter_comparison = render_eval_candidate_filter_comparisons(
-                result, filter_comparison_root,
-                max_candidates=filter_comparison_max_candidates,
-            )
-            filter_comparison["source_fingerprint"] = filter_comparison_fingerprint
+            filter_comparison = {
+                "status": "disabled",
+                "reason": "enable_with_step7_candidate_filter_comparisons_arg",
+                "num_charts": 0,
+                "charts": [],
+            }
         result["visualization"] = visual
         result["signal_segmentation_chart"] = signal_chart
         result["candidate_filter_comparisons"] = filter_comparison
@@ -3863,6 +3874,9 @@ def step7a_axis_threshold_segmentation(position_state):
         "noise_tolerance_frames_vz": noise_tolerance_frames_vz,
         "bridge_config_by_axis": bridge_config_by_axis,
         "filter_comparison_max_candidates": filter_comparison_max_candidates,
+        "candidate_filter_comparison_visualization_enabled": bool(
+            render_candidate_filter_comparisons
+        ),
         "visualization_max_eval_videos": visualization_max_eval_videos,
         "consensus_min_segment_length_vx": consensus_min_segment_length_vx,
         "consensus_min_segment_length_vz": consensus_min_segment_length_vz,
