@@ -4829,6 +4829,7 @@ def step6_positions_3d(tracking_state):
                     device=str(run_args.get("device", "auto")),
                     force_recompute=bool(run_args.get("force_recompute", False)),
                     force_recompute_depth=bool(run_args.get("force_recompute_depth", False)),
+                    quiet=True,
                 )
             )
     manifest = {

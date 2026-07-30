@@ -62,7 +62,10 @@ Step 3 tracking results.
 
 Combines tracked objects with geometry/depth information to estimate per-frame
 3D object positions. Valid per-video caches are relocated and loaded without
-recomputation.
+recomputation. When depth generation is required, Depth Anything is loaded once
+per process/device and reused across videos; only missing frame depth maps are
+inferred. Step 6 suppresses internal model/download progress while retaining its
+video-level progress bar and actionable warnings.
 
 **Output directory:** `06_driving_mini_3d_positions/`
 

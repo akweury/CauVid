@@ -12,6 +12,32 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import argparse
+import logging
+
+_DEPTH_MODEL_CACHE = {}
+
+def clear_depth_model_cache():
+    _DEPTH_MODEL_CACHE.clear()
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+def _get_cached_depth_model(model_name, device, use_fp16=False):
+    if DepthAnything3 is None:
+        raise RuntimeError(
+            "Depth Anything 3 is unavailable; install the external package before generating depth maps"
+        ) from _DEPTH_ANYTHING_IMPORT_ERROR
+    key = (str(model_name), str(device), bool(use_fp16))
+    if key in _DEPTH_MODEL_CACHE:
+        return _DEPTH_MODEL_CACHE[key], True
+    for logger_name in ("httpx", "httpcore", "huggingface_hub", "transformers"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    model = DepthAnything3.from_pretrained(model_name)
+    model = model.to(device=device)
+    model.eval()
+    if use_fp16 and device.type == "cuda":
+        model = model.half()
+    _DEPTH_MODEL_CACHE[key] = model
+    return model, False
 
 # Fix OpenMP library conflict on macOS
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -32,11 +58,8 @@ import config
 try:
     from depth_anything_3.api import DepthAnything3
 except ImportError as e:
-    print("❌ Error: Failed to import Depth Anything 3")
-    print(f"Import error: {e}")
-    print("\nPlease ensure all dependencies are installed:")
-    print("  pip install moviepy==1.0.3 omegaconf addict einops plyfile pycolmap evo")
-    sys.exit(1)
+    DepthAnything3 = None
+    _DEPTH_ANYTHING_IMPORT_ERROR = e
 
 
 def generate_depth_maps(
@@ -47,7 +70,9 @@ def generate_depth_maps(
     batch_size=8,
     device="cuda",
     use_fp16=False,
-    image_extensions=("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
+    image_extensions=("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG"),
+    skip_existing=True,
+    quiet=False,
 ):
     """
     Generate depth maps for images in a directory using Depth Anything V3
@@ -115,6 +140,13 @@ def generate_depth_maps(
     
     if max_images:
         image_files = image_files[:max_images]
+    if skip_existing:
+        image_files = [
+            path for path in image_files
+            if not (output_dir / f"{Path(path).stem}_depth.npz").is_file()
+        ]
+    if not image_files:
+        return {"processed": 0, "model_cache_hit": None}
     
     print(f"Found {len(image_files)} images to process")
     print(f"Processing in {(len(image_files) + batch_size - 1) // batch_size} batches")
@@ -125,28 +157,20 @@ def generate_depth_maps(
     print("="*60)
     
     try:
-        model = DepthAnything3.from_pretrained(model_name)
-        model = model.to(device=device)
-        model.eval()  # Set to evaluation mode
-        
-        # Depth Anything V3 currently runs more reliably in FP32 here.
-        if use_fp16 and device.type == "cuda":
-            model = model.half()
-            print(f"✓ Model loaded successfully (FP16 mode)")
-            print(f"GPU Memory after model load: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+        model, model_cache_hit = _get_cached_depth_model(
+            model_name, device, use_fp16=use_fp16,
+        )
+        if model_cache_hit:
+            print("✓ Reusing process-cached Depth Anything model")
+        elif use_fp16 and device.type == "cuda":
+            print("✓ Model loaded successfully (FP16 mode)")
         else:
-            print(f"✓ Model loaded successfully")
-            if device.type == "cuda":
-                print(f"GPU Memory after model load: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+            print("✓ Model loaded successfully")
             
     except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        print("\nAvailable models:")
-        print("  - depth-anything/DA3-Giant")
-        print("  - depth-anything/DA3-Large")
-        print("  - depth-anything/DA3-Base")
-        print("  - depth-anything/DA3-Small")
-        return
+        raise RuntimeError(
+            f"Failed to load Depth Anything model {model_name}: {e}"
+        ) from e
     
     # Process images in batches
     print("\n" + "="*60)
@@ -156,7 +180,7 @@ def generate_depth_maps(
     # Disable gradient computation for inference
     with torch.no_grad():
         # Process in batches
-        for batch_start in tqdm(range(0, len(image_files), batch_size), desc="Batch progress"):
+        for batch_start in tqdm(range(0, len(image_files), batch_size), desc="Batch progress", disable=quiet):
             batch_end = min(batch_start + batch_size, len(image_files))
             batch_paths = image_files[batch_start:batch_end]
             
@@ -209,13 +233,12 @@ def generate_depth_maps(
                         conf_img.save(conf_img_path)
                         print(f"  ✓ Saved: {conf_img_path.name}")
                 
-                # Clear GPU cache after each batch
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                # Keep the process-cached model resident between videos.
                     
             except Exception as e:
-                print(f"\n❌ Error processing batch {batch_start}-{batch_end}: {e}")
-                continue
+                raise RuntimeError(
+                    f"Depth inference failed for batch {batch_start}-{batch_end}: {e}"
+                ) from e
     
     print("\n" + "="*60)
     print("✅ Depth map generation complete!")
@@ -228,6 +251,7 @@ def generate_depth_maps(
     print(f"\nTotal files in output directory: {len(saved_files)}")
     print(f"  - .npz files: {len(list(output_dir.glob('*.npz')))} (raw depth values)")
     print(f"  - .png files: {len(list(output_dir.glob('*.png')))} (visualizations)")
+    return {"processed": len(image_files), "model_cache_hit": model_cache_hit}
 
 
 def main():

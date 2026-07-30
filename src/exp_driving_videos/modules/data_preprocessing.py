@@ -353,7 +353,9 @@ def generate_frame_depth_maps(
     batch_size: int = 4,
     device: str = "auto",
     image_extensions: List[str] = ['.jpg', '.jpeg', '.png'],
-    max_frames: Optional[int] = None
+    max_frames: Optional[int] = None,
+    skip_existing: bool = True,
+    quiet: bool = False,
 ) -> bool:
     """
     Generate depth maps for frames using Depth Anything V3
@@ -395,7 +397,8 @@ def generate_frame_depth_maps(
         
         # Create output folder
         depth_output_folder.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Depth maps will be saved to: {depth_output_folder}")
+        if not quiet:
+            logger.info(f"Depth maps will be saved to: {depth_output_folder}")
         
         # Auto-detect device
         if device == "auto":
@@ -406,19 +409,22 @@ def generate_frame_depth_maps(
                 device = "mps"
             else:
                 device = "cpu"
-            logger.info(f"Auto-detected device: {device}")
+            if not quiet:
+                logger.info(f"Auto-detected device: {device}")
         
         # Check if frame_folder contains subdirectories (organized by video) or just frames
         subdirs = [d for d in frame_folder.iterdir() if d.is_dir()]
         
         if subdirs:
             # Process each video subdirectory separately
-            logger.info(f"Found {len(subdirs)} video subdirectories to process")
+            if not quiet:
+                logger.info(f"Found {len(subdirs)} video subdirectories to process")
             success_count = 0
             
             for subdir in subdirs:
                 video_name = subdir.name
-                logger.info(f"Processing frames for video: {video_name}")
+                if not quiet:
+                    logger.info(f"Processing frames for video: {video_name}")
                 
                 # Create corresponding output subdirectory
                 video_depth_folder = depth_output_folder / video_name
@@ -434,22 +440,26 @@ def generate_frame_depth_maps(
                         batch_size=batch_size,
                         device=device,
                         use_fp16=False,
-                        image_extensions=tuple(f"*{ext}" for ext in image_extensions)
+                        image_extensions=tuple(f"*{ext}" for ext in image_extensions),
+                        skip_existing=skip_existing, quiet=quiet,
                     )
                     
-                    logger.info(f"✅ Completed depth maps for {video_name}")
+                    if not quiet:
+                        logger.info(f"✅ Completed depth maps for {video_name}")
                     success_count += 1
                     
                 except Exception as e:
                     logger.error(f"❌ Failed to process {video_name}: {str(e)}")
                     continue
             
-            logger.info(f"Depth map generation complete: {success_count}/{len(subdirs)} videos processed")
+            if not quiet:
+                logger.info(f"Depth map generation complete: {success_count}/{len(subdirs)} videos processed")
             return success_count == len(subdirs)
             
         else:
             # Process all frames in the folder directly
-            logger.info("Processing all frames in the folder directly")
+            if not quiet:
+                logger.info("Processing all frames in the folder directly")
             
             try:
                 generate_depth_maps(
@@ -460,10 +470,12 @@ def generate_frame_depth_maps(
                     batch_size=batch_size,
                     device=device,
                     use_fp16=False,
-                    image_extensions=tuple(f"*{ext}" for ext in image_extensions)
+                    image_extensions=tuple(f"*{ext}" for ext in image_extensions),
+                    skip_existing=skip_existing, quiet=quiet,
                 )
                 
-                logger.info("✅ Depth map generation completed successfully")
+                if not quiet:
+                    logger.info("✅ Depth map generation completed successfully")
                 return True
                 
             except Exception as e:
@@ -505,6 +517,7 @@ def ensure_video_depth_maps(
     batch_size: int = 4,
     device: str = "auto",
     force_recompute: bool = False,
+    quiet: bool = False,
 ) -> Path:
     """Ensure depth maps exist for one video's extracted frames.
 
@@ -525,13 +538,15 @@ def ensure_video_depth_maps(
     expected_depths = [_depth_map_path_for_frame(depth_dir, frame.name) for frame in frame_files]
     missing_depths = force_recompute or any(not path.exists() for path in expected_depths)
     if missing_depths:
-        logger.info(f"Generating depth maps for {video_id} -> {depth_dir}")
+        if not quiet:
+            logger.info(f"Generating depth maps for {video_id} -> {depth_dir}")
         ok = generate_frame_depth_maps(
             frame_folder=frame_dir,
             depth_output_folder=depth_dir,
             model_name=model_name,
             batch_size=batch_size,
             device=device,
+            skip_existing=not force_recompute, quiet=quiet,
         )
         if not ok:
             raise RuntimeError(f"Depth map generation failed for video {video_id}")
@@ -602,6 +617,7 @@ def prepare_video_3d_positions(
     batch_size: int = 4,
     device: str = "auto",
     force_recompute_depth: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Attach per-object 3D positions to a merged/tracked per-video result."""
     video_id = video_result["video_id"]
@@ -614,6 +630,7 @@ def prepare_video_3d_positions(
         batch_size=batch_size,
         device=device,
         force_recompute=force_recompute_depth,
+        quiet=quiet,
     )
 
     frames_with_3d = []

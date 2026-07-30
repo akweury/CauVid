@@ -41,6 +41,7 @@ def process_video(
     device: str = "auto",
     force_recompute: bool = False,
     force_recompute_depth: bool = False,
+    quiet: bool = False,
 ) -> Dict[str, Any]:
     video_id = video_result["video_id"]
     out_dir = (output_root or get_output_root()) / video_id
@@ -60,6 +61,7 @@ def process_video(
         batch_size=batch_size,
         device=device,
         force_recompute_depth=force_recompute_depth,
+        quiet=quiet,
     )
 
     num_objects = sum(len(frame.get("positions_3d", [])) for frame in enriched.get("frames", []))
