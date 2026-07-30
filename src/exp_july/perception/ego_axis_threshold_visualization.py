@@ -96,7 +96,7 @@ def _final_prediction(result, axis):
   "frames_by_index":{int(row["frame_index"]):row for row in frames},
  }
 
-def _candidate_stack(im,box,result,audit,indices,now,show_final=True):
+def _candidate_stack(im,box,result,audit,indices,now,show_final=True,highlights=None):
  import cv2
  groups=[
   ("VX SEGMENTS","vx",("right","straight","left"),_enabled_candidates(result,"vx",audit),_final_prediction(result,"vx")),
@@ -116,14 +116,25 @@ def _candidate_stack(im,box,result,audit,indices,now,show_final=True):
    cv2.putText(im,"No enabled threshold candidates",(x+8,cursor+min(16,pitch-5)),cv2.FONT_HERSHEY_SIMPLEX,.43,(150,155,165),1,cv2.LINE_AA)
    cursor+=pitch
   for candidate in rows:
+   axis_highlights=(highlights or {}).get(axis,{})
+   optimal=axis_highlights.get("optimal_final_similarity")
+   best=axis_highlights.get("best_heatmap_confidence")
+   candidate_id=int(candidate.get("plateau_id",-1))
+   is_optimal=optimal is not None and candidate_id==int(optimal.get("plateau_id",-2))
+   is_best=best is not None and candidate_id==int(best.get("plateau_id",-2))
    confidence="n/a" if candidate.get("confidence") is None else f"{candidate['confidence']:.3f}"
    text_scale=.48 if pitch>=36 else .38
-   cv2.putText(im,f"N={candidate['threshold_n']:.5g} | confidence={confidence}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,text_scale,(235,235,235),1,cv2.LINE_AA)
+   badges=(" | FINAL BEST" if is_optimal else "")+(" | HEATMAP BEST" if is_best else "")
+   highlight_scale=.54 if pitch>=36 else .44
+   text_color=(70,255,90) if is_optimal else (0,145,255) if is_best else (235,235,235)
+   cv2.putText(im,f"N={candidate['threshold_n']:.5g} | conf={confidence}{badges}",(x,cursor+min(15,pitch-7)),cv2.FONT_HERSHEY_SIMPLEX,highlight_scale if (is_optimal or is_best) else text_scale,text_color,2 if (is_optimal or is_best) else 1,cv2.LINE_AA)
    bar_y=cursor+min(21,pitch-5)
    bar_h=max(3,min(34,pitch-(bar_y-cursor)-2))
    for i,frame_index in enumerate(indices):
     x0=x+int(i*w/total_frames);x1=x+int((i+1)*w/total_frames)
     cv2.rectangle(im,(x0,bar_y),(max(x0+1,x1),bar_y+bar_h),COLORS[_state(candidate,frame_index)],-1)
+   if is_optimal:cv2.rectangle(im,(x-4,bar_y-4),(x+w+4,bar_y+bar_h+4),(70,255,90),4)
+   if is_best:cv2.rectangle(im,(x-1,bar_y-1),(x+w+1,bar_y+bar_h+1),(0,145,255),3)
    marker_x=x+int((now+.5)*w/total_frames)
    cv2.line(im,(marker_x,bar_y-2),(marker_x,bar_y+bar_h+2),(255,255,255),2,cv2.LINE_AA)
    cursor+=pitch
@@ -153,43 +164,81 @@ def _candidate_stack(im,box,result,audit,indices,now,show_final=True):
   cv2.line(im,(marker_x,bar_y-3),(marker_x,bar_y+bar_h+3),(255,255,255),3,cv2.LINE_AA)
   cursor+=pitch
 
-def _threshold_summary(im,x,y,w,result,audit):
+def _step7b_scatter_highlights(result,audit):
+ video_id=str(result.get("video_id",""));highlights={}
+ for axis in ("vx","vz"):
+  current=[row for row in audit.get("points",[]) if str(row.get("video_id",""))==video_id and str(row.get("axis",""))==axis and row.get("enabled")]
+  scored=[row for row in current if row.get("confidence") is not None]
+  best_confidence=max(scored,key=lambda row:(float(row["confidence"]),-float(row["midpoint_n"]),-int(row.get("plateau_id",-1)))) if scored else None
+  selection=result.get(f"{axis}_segmentation",{}).get("optimal_n_selection",{})
+  selected_id=selection.get("selected_candidate_id")
+  optimal=next((row for row in current if int(row.get("plateau_id",-1))==int(selected_id)),None) if selected_id is not None else None
+  highlights[axis]={
+   "optimal_final_similarity":None if optimal is None else dict(optimal),
+   "optimal_final_similarity_score":selection.get("selected_similarity"),
+   "best_heatmap_confidence":None if best_confidence is None else dict(best_confidence),
+  }
+ return highlights
+
+def _threshold_summary(im,x,y,w,result,audit,show_final=False,highlights=None):
  import cv2
  cv2.rectangle(im,(x,y),(x+w,y+112),(36,40,47),-1)
  cv2.rectangle(im,(x,y),(x+w,y+112),(105,112,124),1)
- cv2.putText(im,"EVAL VIDEO CANDIDATE THRESHOLDS",(x+10,y+23),cv2.FONT_HERSHEY_DUPLEX,.47,(255,255,255),1,cv2.LINE_AA)
+ cv2.putText(im,"EVAL VIDEO THRESHOLD HIGHLIGHTS" if show_final else "EVAL VIDEO CANDIDATE THRESHOLDS",(x+10,y+23),cv2.FONT_HERSHEY_DUPLEX,.47,(255,255,255),1,cv2.LINE_AA)
  for row,(axis,color) in enumerate((("vx",(95,205,255)),("vz",(90,220,130)))):
-  values=[candidate["threshold_n"] for candidate in _enabled_candidates(result,axis,audit)]
-  shown=values[:5]
-  text=", ".join(f"{value:.4g}" for value in shown) if shown else "none"
-  if len(values)>len(shown):text+=f"  (+{len(values)-len(shown)} more)"
-  cv2.putText(im,f"{axis.upper()} enabled N: {text}",(x+10,y+52+row*25),cv2.FONT_HERSHEY_SIMPLEX,.43,color,1,cv2.LINE_AA)
- cv2.putText(im,"Plateau-middle candidates; no final N selected",(x+10,y+103),cv2.FONT_HERSHEY_SIMPLEX,.37,(175,183,195),1,cv2.LINE_AA)
+  if show_final:
+   axis_highlights=(highlights or {}).get(axis,{})
+   optimal=axis_highlights.get("optimal_final_similarity");best=axis_highlights.get("best_heatmap_confidence")
+   optimal_text="n/a" if optimal is None else f"{float(optimal['midpoint_n']):.4g}"
+   best_text="n/a" if best is None else f"{float(best['midpoint_n']):.4g}"
+   text=f"{axis.upper()} final-match N={optimal_text} | best-heatmap N={best_text}"
+  else:
+   values=[candidate["threshold_n"] for candidate in _enabled_candidates(result,axis,audit)]
+   shown=values[:5];text=f"{axis.upper()} enabled N: "+(", ".join(f"{value:.4g}" for value in shown) if shown else "none")
+   if len(values)>len(shown):text+=f"  (+{len(values)-len(shown)} more)"
+  cv2.putText(im,text,(x+10,y+52+row*25),cv2.FONT_HERSHEY_SIMPLEX,.43,color,1,cv2.LINE_AA)
+ cv2.putText(im,"Star = final-similarity optimum | X = best heat-map confidence" if show_final else "Plateau-middle candidates; no final N selected",(x+10,y+103),cv2.FONT_HERSHEY_SIMPLEX,.37,(175,183,195),1,cv2.LINE_AA)
 
-def _scatter_panel(audit,video_id,size):
+def _scatter_panel(audit,video_id,size,result=None,show_heatmap=False):
  """Render all-video vx/vz plateau points and emphasize the current eval video."""
  import cv2,numpy as np
  import matplotlib
  matplotlib.use("Agg")
  from matplotlib.backends.backend_agg import FigureCanvasAgg
  from matplotlib.figure import Figure
- points=list(audit.get("points",[])); fig=Figure(figsize=(4.8,10.4),dpi=100,facecolor="#181b20"); canvas=FigureCanvasAgg(fig); axes=fig.subplots(2,1)
+ from src.exp_july.perception.ego_axis_threshold_segmentation import _confidence_surface
+ points=list(audit.get("points",[])); fig=Figure(figsize=(6.2 if show_heatmap else 4.8,10.4),dpi=100,facecolor="#181b20"); canvas=FigureCanvasAgg(fig); axes=fig.subplots(2,1)
+ highlights=_step7b_scatter_highlights(result or {},audit) if show_heatmap else {}
  for ax,axis in zip(axes,("vx","vz")):
   rows=[p for p in points if p.get("axis")==axis]; current=[p for p in rows if str(p.get("video_id",""))==str(video_id)]; others=[p for p in rows if str(p.get("video_id",""))!=str(video_id)]
   ax.set_facecolor("#262a31")
-  for split,color,marker in (("train","#4b8fca","o"),("eval","#a36bc1","D")):
-   subset=[p for p in others if p.get("split")==split and p.get("enabled")]
-   if subset:ax.scatter([p["midpoint_n"] for p in subset],[p["segment_count"] for p in subset],s=24,c=color,marker=marker,alpha=.7,label=f"other {split}")
-  disabled=[p for p in others if not p.get("enabled")]
-  if disabled:ax.scatter([p["midpoint_n"] for p in disabled],[p["segment_count"] for p in disabled],s=22,c="#777777",marker="x",alpha=.55,label="disabled")
-  if current:ax.scatter([p["midpoint_n"] for p in current],[p["segment_count"] for p in current],s=150,c="#00f5ff",marker="*",edgecolors="white",linewidths=1.1,zorder=8,label="CURRENT VIDEO")
   limits=audit.get("plot_limits_by_axis",{}).get(axis,{})
+  if show_heatmap:
+   train=[p for p in rows if p.get("split")=="train" and p.get("enabled")]
+   bounds=(float(limits.get("x_min",0.)),float(limits.get("x_max",1.)),float(limits.get("y_min",0.)),float(limits.get("y_max",1.)))
+   model=_confidence_surface(train,bounds=bounds) if train else None
+   if model is not None:ax.contourf(model["x"],model["y"],model["confidence"],levels=np.linspace(0.,1.,13),cmap="viridis",alpha=.72,zorder=0)
+   enabled_current=[p for p in current if p.get("enabled")]
+   disabled_current=[p for p in current if not p.get("enabled")]
+   if enabled_current:ax.scatter([p["midpoint_n"] for p in enabled_current],[p["segment_count"] for p in enabled_current],s=52,c="#e35daf",marker="D",edgecolors="white",linewidths=.8,zorder=6,label="eval enabled N")
+   if disabled_current:ax.scatter([p["midpoint_n"] for p in disabled_current],[p["segment_count"] for p in disabled_current],s=38,c="#8a8a8a",marker="x",linewidths=1.1,zorder=5,label="eval disabled N")
+   axis_highlights=highlights.get(axis,{})
+   optimal=axis_highlights.get("optimal_final_similarity");best=axis_highlights.get("best_heatmap_confidence")
+   if optimal is not None:ax.scatter([optimal["midpoint_n"]],[optimal["segment_count"]],s=260,c="#f6e85c",marker="*",edgecolors="#111111",linewidths=1.1,zorder=9,label="best match to 7B final")
+   if best is not None:ax.scatter([best["midpoint_n"]],[best["segment_count"]],s=190,c="#00f5ff",marker="X",edgecolors="#111111",linewidths=1.0,zorder=10,label="best heat-map confidence")
+  else:
+   for split,color,marker in (("train","#4b8fca","o"),("eval","#a36bc1","D")):
+    subset=[p for p in others if p.get("split")==split and p.get("enabled")]
+    if subset:ax.scatter([p["midpoint_n"] for p in subset],[p["segment_count"] for p in subset],s=24,c=color,marker=marker,alpha=.7,label=f"other {split}")
+   disabled=[p for p in others if not p.get("enabled")]
+   if disabled:ax.scatter([p["midpoint_n"] for p in disabled],[p["segment_count"] for p in disabled],s=22,c="#777777",marker="x",alpha=.55,label="disabled")
+   if current:ax.scatter([p["midpoint_n"] for p in current],[p["segment_count"] for p in current],s=150,c="#00f5ff",marker="*",edgecolors="white",linewidths=1.1,zorder=8,label="CURRENT VIDEO")
   if limits:
    ax.set_xlim(float(limits.get("x_min",0.)),float(limits["x_max"]));ax.set_ylim(float(limits.get("y_min",0.)),float(limits["y_max"]))
-  ax.set_title(f"{axis.upper()} plateaus",color="white",fontsize=13,fontweight="bold");ax.set_xlabel("middle N",color="#e5e5e5",fontsize=10);ax.set_ylabel("segments",color="#e5e5e5",fontsize=10);ax.tick_params(colors="#dddddd",labelsize=8);ax.grid(True,alpha=.2,color="white")
+  ax.set_title(f"{axis.upper()} eval thresholds + train heat map" if show_heatmap else f"{axis.upper()} plateaus",color="white",fontsize=15 if show_heatmap else 13,fontweight="bold");ax.set_xlabel("middle N",color="#e5e5e5",fontsize=12 if show_heatmap else 10);ax.set_ylabel("segments",color="#e5e5e5",fontsize=12 if show_heatmap else 10);ax.tick_params(colors="#dddddd",labelsize=10 if show_heatmap else 8);ax.grid(True,alpha=.2,color="white")
   for spine in ax.spines.values():spine.set_color("#888888")
-  ax.legend(fontsize=7,loc="best",facecolor="#30343b",labelcolor="white",framealpha=.9)
- fig.suptitle(f"ALL-VIDEO PLATEAUS\ncurrent={video_id}",color="white",fontsize=14,fontweight="bold");fig.tight_layout(rect=(0,.01,1,.94));canvas.draw();rgba=np.asarray(canvas.buffer_rgba());bgr=cv2.cvtColor(rgba,cv2.COLOR_RGBA2BGR)
+  ax.legend(fontsize=10 if show_heatmap else 7,loc="best",facecolor="#30343b",labelcolor="white",framealpha=.94,borderpad=.7,labelspacing=.55,handlelength=1.8)
+ fig.suptitle(("TRAIN HEAT MAP + EVAL VIDEO\n" if show_heatmap else "ALL-VIDEO PLATEAUS\n")+f"current={video_id}",color="white",fontsize=14,fontweight="bold");fig.tight_layout(rect=(0,.01,1,.94));canvas.draw();rgba=np.asarray(canvas.buffer_rgba());bgr=cv2.cvtColor(rgba,cv2.COLOR_RGBA2BGR)
  return cv2.resize(bgr,size,interpolation=cv2.INTER_AREA)
 
 def render_eval_signal_segmentation_chart(result,audit,output_path):
@@ -453,7 +502,7 @@ def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.,show
  import cv2,numpy as np
  frames=list(ego_video.get("frames",[]))
  if not frames:return {"status":"skipped","reason":"no_frames","path":None}
- path=Path(output_path);path.parent.mkdir(parents=True,exist_ok=True);vx=_candidate(result,"vx",audit);vz=_candidate(result,"vz",audit);W,H,C1,C2=1920,1080,1000,1440;scatter_panel=_scatter_panel(audit,result.get("video_id",""),(W-C2-40,H-164));wr=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"mp4v"),max(1.,float(fps)),(W,H))
+ path=Path(output_path);path.parent.mkdir(parents=True,exist_ok=True);vx=_candidate(result,"vx",audit);vz=_candidate(result,"vz",audit);W,H=1920,1080;C1,C2=(900,1370) if show_final else (1000,1440);right_panel_highlights=_step7b_scatter_highlights(result,audit) if show_final else {};scatter_panel=_scatter_panel(audit,result.get("video_id",""),(W-C2-40,H-164),result=result,show_heatmap=show_final);wr=cv2.VideoWriter(str(path),cv2.VideoWriter_fourcc(*"mp4v"),max(1.,float(fps)),(W,H))
  if not wr.isOpened():raise RuntimeError(f"Could not open Step 7A MP4 writer: {path}")
  ids=[int(f.get("frame_index",i)) for i,f in enumerate(frames)]
  for i,f in enumerate(frames):
@@ -461,8 +510,8 @@ def render_axis_segmentation_mp4(result,ego_video,audit,output_path,fps=10.,show
   if src is not None:s=min((C1-44)/src.shape[1],650/src.shape[0]);src=cv2.resize(src,(int(src.shape[1]*s),int(src.shape[0]*s)));x=22+(C1-44-src.shape[1])//2;y=48+(650-src.shape[0])//2;im[y:y+src.shape[0],x:x+src.shape[1]]=src
   else:cv2.putText(im,"SOURCE FRAME UNAVAILABLE",(190,370),cv2.FONT_HERSHEY_DUPLEX,1.2,(80,100,235),2,cv2.LINE_AA)
   cv2.putText(im,f"STEP {step_label} EGO SEGMENTATION | FRAME {ids[i]}",(22,32),cv2.FONT_HERSHEY_DUPLEX,.78,(245,245,245),2,cv2.LINE_AA);cw=(C1-66)//2;_chart(im,(22,730,cw,320),frames,"vx",i);_chart(im,(44+cw,730,cw,320),frames,"vz",i)
-  cv2.line(im,(C1,0),(C1,H),(95,100,110),2);cv2.line(im,(C2,0),(C2,H),(95,100,110),2);x=C1+24;w=C2-C1-48;cv2.putText(im,"CANDIDATES + FINAL PREDICTIONS" if show_final else "ENABLED SEGMENTATION CANDIDATES",(x,44),cv2.FONT_HERSHEY_DUPLEX,.72,(255,255,255),2,cv2.LINE_AA);_candidate_stack(im,(x,62,w,H-88),result,audit,ids,i,show_final=show_final)
-  _threshold_summary(im,C2+20,18,W-C2-40,result,audit)
+  cv2.line(im,(C1,0),(C1,H),(95,100,110),2);cv2.line(im,(C2,0),(C2,H),(95,100,110),2);x=C1+24;w=C2-C1-48;cv2.putText(im,"CANDIDATES + FINAL PREDICTIONS" if show_final else "ENABLED SEGMENTATION CANDIDATES",(x,44),cv2.FONT_HERSHEY_DUPLEX,.72,(255,255,255),2,cv2.LINE_AA);_candidate_stack(im,(x,62,w,H-88),result,audit,ids,i,show_final=show_final,highlights=right_panel_highlights)
+  _threshold_summary(im,C2+20,18,W-C2-40,result,audit,show_final=show_final,highlights=right_panel_highlights)
   scatter_y=142;im[scatter_y:scatter_y+scatter_panel.shape[0],C2+20:C2+20+scatter_panel.shape[1]]=scatter_panel
   wr.write(im)
- wr.release();return {"status":"rendered","path":str(path),"fps":float(fps),"num_frames":len(frames),"layout":"source_signals_left_"+("candidates_plus_final_predictions" if show_final else "enabled_candidates_only")+"_middle_scatters_right","step_label":str(step_label),"show_final":bool(show_final),"vx_candidate":vx,"vz_candidate":vz,"vx_enabled_candidates":_enabled_candidates(result,"vx",audit),"vz_enabled_candidates":_enabled_candidates(result,"vz",audit)}
+ wr.release();return {"status":"rendered","path":str(path),"fps":float(fps),"num_frames":len(frames),"layout":"source_signals_left_"+("candidates_plus_final_predictions_middle_train_heatmap_eval_highlights_right" if show_final else "enabled_candidates_only_middle_scatters_right"),"step_label":str(step_label),"show_final":bool(show_final),"right_panel_highlights":right_panel_highlights,"vx_candidate":vx,"vz_candidate":vz,"vx_enabled_candidates":_enabled_candidates(result,"vx",audit),"vz_enabled_candidates":_enabled_candidates(result,"vz",audit)}

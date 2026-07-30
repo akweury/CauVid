@@ -59,7 +59,8 @@ class DetectDrivingMiniCacheTest(unittest.TestCase):
             predictions_csv_file.write_text("header\n", encoding="utf-8")
             class_summary_csv_file.write_text("header\n", encoding="utf-8")
             payload = {
-                "schema_version": 6,
+                "schema_version": detect_driving_mini._DETECTION_SCHEMA_VERSION,
+                "candidate_branch_enabled": True,
                 "video_id": "video_cache",
                 "frames": [self._cached_frame()],
                 "od_calibration": {
@@ -83,6 +84,7 @@ class DetectDrivingMiniCacheTest(unittest.TestCase):
                     output_root=output_root,
                     force_recompute=False,
                     render_video=False,
+                    enable_candidate_branch=True,
                 )
 
             self.assertTrue(result["from_cache"])

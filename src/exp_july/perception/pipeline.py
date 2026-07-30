@@ -4580,6 +4580,11 @@ def step2_detection(env, args):
         reuse_copied_cache and manifest_path.exists()
     )
     if use_cached_detection:
+        if not manifest_path.exists():
+            raise RuntimeError(
+                "Step 2 was configured to skip detection, but the detection "
+                f"manifest does not exist: {manifest_path}"
+            )
         with manifest_path.open("r", encoding="utf-8") as f:
             manifest = json.load(f)
         video_entries = {
@@ -4587,12 +4592,51 @@ def step2_detection(env, args):
             for entry in manifest.get("videos", [])
             if str(entry.get("video_id", "")).strip()
         }
+        def has_cache_reference(video_id):
+            video_id = str(video_id)
+            if (output_root / video_id / "detections.json").is_file():
+                return True
+            stored_path = str(
+                video_entries.get(video_id, {}).get("detections_json", "")
+            ).strip()
+            if not stored_path:
+                return False
+            relocated_path = _relocated_cache_path(
+                stored_path,
+                env["dataset_root"],
+                get_pipeline_output_root(),
+                video_id=video_id,
+                key_hint="detections_json",
+            )
+            return Path(relocated_path).is_file()
+
+        missing_cached_video_ids = [
+            str(video_id)
+            for video_id in videos
+            if not has_cache_reference(video_id)
+        ]
+        if missing_cached_video_ids:
+            missing_text = ", ".join(missing_cached_video_ids)
+            if skip_step:
+                raise RuntimeError(
+                    "Step 2 was configured to skip detection, but its cache is "
+                    f"incomplete. Missing requested videos: {missing_text}. "
+                    f"Manifest: {manifest_path}"
+                )
+            print(
+                "[step 2][warn] copied detection cache is incomplete for the "
+                f"current run; recomputing detection. missing_videos={missing_text}",
+                flush=True,
+            )
+            use_cached_detection = False
+    if use_cached_detection:
         detections = []
         for video_id in videos:
-            entry = video_entries[video_id]
+            video_id = str(video_id)
+            entry = video_entries.get(video_id, {})
             local_detections_path = output_root / video_id / "detections.json"
             stored_path = str(entry.get("detections_json", "")).strip()
-            detections_path = local_detections_path if local_detections_path.exists() else Path(
+            detections_path = local_detections_path if local_detections_path.is_file() else Path(
                 _relocated_cache_path(
                     stored_path,
                     env["dataset_root"],

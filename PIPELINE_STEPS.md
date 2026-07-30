@@ -270,8 +270,16 @@ Outputs are written to
 `07b_ego_axis_consensus_segmentation/{train,eval}/<video_id>/final_axis_segmentation.json`.
 For at most three eval videos, Step 7B writes all MP4s into one shared folder:
 `07b_ego_axis_consensus_segmentation/eval_visualizations/`. Files are named
-`<video_id>_final_consensus.mp4`; each middle panel appends a yellow-bordered
-`FINAL PREDICTION` bar below the axis's enabled candidates.
+`<video_id>_final_consensus.mp4`. Each middle panel appends a yellow-bordered
+`FINAL PREDICTION` bar below each axis's enabled candidates. The right panel
+shows the train-fitted candidate-confidence heat map without train scatter
+points and overlays only the current eval video's thresholds. A yellow star
+marks the threshold whose segmentation is most similar to the Step 7B final
+sequence, while a cyan X marks the eval threshold with the highest heat-map
+confidence; both markers are retained when they identify the same threshold.
+The corresponding middle-panel candidate bars carry large `FINAL BEST` and
+`HEATMAP BEST` badges with thick lime/orange borders. A candidate selected by
+both criteria receives both badges and a double border.
 
 The dataset-level chart
 `07b_ego_axis_consensus_segmentation/train_optimal_n_with_eval_scatter.png` uses
