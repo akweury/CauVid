@@ -364,7 +364,7 @@ def _run_pipeline(
     # weighted, minimum-length-constrained final sequence for each axis.
     ego_final_state = _tracked_step(
         tracker,
-        "07b_semantic_consensus_optimal_n",
+        "07b_shared_eval_mp4_folder",
         lambda: step7b_optimal_segmentation_selection(ego_final_state),
     )
     # Step 8: repair trajectories first; split events receive new track IDs.

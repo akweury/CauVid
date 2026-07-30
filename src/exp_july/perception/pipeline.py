@@ -3937,6 +3937,8 @@ def step7b_optimal_segmentation_selection(step7a_state):
     final_results = copy.deepcopy(candidate_results)
     output_root = get_pipeline_output_root() / "07b_ego_axis_consensus_segmentation"
     output_root.mkdir(parents=True, exist_ok=True)
+    eval_visualization_root = output_root / "eval_visualizations"
+    eval_visualization_root.mkdir(parents=True, exist_ok=True)
     visualization_max_eval_videos = int(config.get("visualization_max_eval_videos", 3))
     visualized_eval_ids = set(
         sorted(str(value) for value in step7a_state.get("step7_eval_video_ids", []))[:visualization_max_eval_videos]
@@ -3976,7 +3978,9 @@ def step7b_optimal_segmentation_selection(step7a_state):
         result["step7b_final_segmentation_path"] = str(final_path)
         final_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
         if data_split == "eval" and video_id in visualized_eval_ids:
-            visualization_path = video_output_root / "final_consensus_visualization.mp4"
+            visualization_path = (
+                eval_visualization_root / f"{video_id}_final_consensus.mp4"
+            )
             visual = render_axis_segmentation_mp4(
                 result, ego_by_video.get(video_id, {}), plateau_audit,
                 visualization_path, show_final=True, step_label="7B",
@@ -4017,7 +4021,7 @@ def step7b_optimal_segmentation_selection(step7a_state):
         json.dumps(optimal_n_scatter, indent=2), encoding="utf-8",
     )
     manifest = {
-        "version": 3,
+        "version": 6,
         "stage": "7b_ego_axis_consensus_segmentation",
         "method": "semantic_corrected_enabled_candidate_confidence_weighted_min_length_dp",
         "num_videos": len(final_results),
@@ -4050,6 +4054,8 @@ def step7b_optimal_segmentation_selection(step7a_state):
         "num_selected_train_optimal_n": int(optimal_n_scatter.get("num_train_optimal_points", 0)),
         "num_selected_eval_optimal_n": int(optimal_n_scatter.get("num_eval_optimal_points", 0)),
         "visualization_scope": "at_most_configured_eval_videos",
+        "eval_visualization_output_root": str(eval_visualization_root),
+        "eval_visualization_layout": "single_shared_folder_video_id_filenames",
         "visualized_eval_video_ids": sorted(visualized_eval_ids),
         "num_visualized_eval_videos": len(visualization_mp4s),
         "visualization_mp4s": visualization_mp4s,

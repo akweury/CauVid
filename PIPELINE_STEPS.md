@@ -8,18 +8,24 @@ media, and audit artifacts.
 
 ## Execution overview
 
+**High-level pipeline chart:** [PIPELINE_HIGH_LEVEL.pdf](./PIPELINE_HIGH_LEVEL.pdf)
+
 ```text
-1 Init → 2 Detection → 3 Tracking → 6 3D Positions → 7 Ego Motion
-→ 7 Empty → 7 Train/Eval Split → 7A Axis Threshold Segmentation
-→ 8 Trajectory Repair → 8A Relative Motion → 8B Signal Evidence
-→ 8C Pattern/Cohort Repair → 8D Validation
-→ 8E Semantic Protection → 8F Final Validation → 8G Ego Refinement
-→ 8H Visualization → 8I Threshold Calibration
-→ 9 Segmentation → 10 Segment Motion → 11–18 Rule Learning/Refinement
+1 Init → 2 Detection → 3 Tracking → 6 3D Positions
+→ 7 Compatibility Shell (empty) → 7 Train/Eval Split
+→ 7A Enabled Axis Candidates → 7B Semantic-Corrected Consensus + Optimal N
+→ 8 Track Repair → 8A Relative Motion → 8B Signal Evidence
+→ 8C Cohort Clustering → 8D Closed-Loop Repair → 8E Validation
+→ 8F Statistics → 8G Materialization → 8H Visualization
+→ 8I Audit Dashboard → 8J Provenance → 8K Handoff
+→ 9–18 Downstream Scaffolds
 ```
 
 Steps 4 and 5 were removed. Downstream processing uses the object detections and
 tracks from Steps 2 and 3 directly.
+
+The implemented trajectory path currently runs through Step 8K. Steps 9–18
+remain downstream interface scaffolds rather than production processing stages.
 
 ## Step descriptions
 
@@ -60,17 +66,17 @@ recomputation.
 
 **Output directory:** `06_driving_mini_3d_positions/`
 
-### Step 7 — Empty
+### Step 7 — Compatibility shell and active substeps
 
 ```text
-Step 6 geometry → empty Step 7 → 4:1 video split → Step 7A
-→ empty Step 7B selection interface → Step 8
+Step 6 geometry → empty Step 7 compatibility state → 4:1 video split
+→ Step 7A enabled candidates → Step 7B consensus + optimal N → Step 8
 ```
 
-Step 7 itself is empty. Step 7A is the only Step 7 substep that performs
-analysis and obtains the continuous ego signals internally. Step 7B is a
-callable identity interface reserved for future optimal-candidate selection;
-the former executable 7B–7F pipeline remains disabled.
+The top-level Step 7 compatibility state remains empty when execution stops at
+`max_step=7`. In longer runs, the deterministic train/evaluation split, Step 7A,
+and Step 7B execute before Step 8. The former 7B–7F background-evidence and
+rule-refinement branch remains disabled.
 
 ### Pre-7A — Train/evaluation split
 
@@ -262,16 +268,24 @@ similarity and the selected candidate provenance.
 
 Outputs are written to
 `07b_ego_axis_consensus_segmentation/{train,eval}/<video_id>/final_axis_segmentation.json`.
-For at most three eval videos, Step 7B also writes
-`final_consensus_visualization.mp4`; its middle panel appends a yellow-bordered
-`FINAL PREDICTION` bar below each axis's enabled candidates.
+For at most three eval videos, Step 7B writes all MP4s into one shared folder:
+`07b_ego_axis_consensus_segmentation/eval_visualizations/`. Files are named
+`<video_id>_final_consensus.mp4`; each middle panel appends a yellow-bordered
+`FINAL PREDICTION` bar below the axis's enabled candidates.
 
 The dataset-level chart
 `07b_ego_axis_consensus_segmentation/train_optimal_n_with_eval_scatter.png` uses
 a 1×2 `vx`/`vz` layout. Each video contributes at most one point per axis at
 `(optimal N, selected candidate segment count)`. The confidence heat-map
-background is fitted exclusively from train-video optimal points; held-out eval
-optimal points are then overlaid as magenta diamonds and do not affect the fit. The matching points, train-fitted confidence model, and held-out metrics are also saved to `train_optimal_n_with_eval_scatter.json`.
+background is fitted exclusively from train-video optimal points and rendered
+with a fully opaque, high-resolution Viridis map so low-confidence areas remain
+colored rather than washed out to gray. Train points are not rendered as
+scatter markers. Only held-out eval optimal points
+are visible, overlaid as magenta diamonds without affecting the fit. Each
+subplot adapts its x-range to its eval optimal-`N` range with padding; if no eval
+point exists, it falls back to the train optimal-`N` range. The matching points,
+train-fitted confidence model, plot limits, and held-out metrics are also saved
+to `train_optimal_n_with_eval_scatter.json`.
 
 ### Step 8 — Track repair
 
@@ -285,11 +299,14 @@ tracklets → split/clean tracks → canonical track IDs
 canonical tracks + ego motion → relative position/velocity signals
 ```
 
-### Step 8 threshold epoch — Freeze policy
+### Archived Step 8 threshold epoch — Disabled
 
 ```text
 pending threshold policy → activate → freeze for this run
 ```
+
+This legacy activation point is retained in the code archive but is not invoked
+by the current pipeline.
 
 ### Step 8B — Symbolize signals
 

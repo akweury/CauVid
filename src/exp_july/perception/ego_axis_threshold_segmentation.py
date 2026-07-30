@@ -1373,17 +1373,40 @@ def render_train_optimal_n_scatter(
     all_points = []
     confidence_regions = {}
     evaluation_metrics = {}
+    plot_limits_by_axis = {}
     for plot_axis, axis in zip(axes, ("vx", "vz")):
         train_rows = collect(train_results, axis, "train")
         eval_rows = collect(eval_results, axis, "eval")
         all_points.extend(train_rows + eval_rows)
-        bounds = (0.0, 1.2 * limits[axis]["x"], 0.0, 1.2 * limits[axis]["y"])
+        x_source_rows = eval_rows if eval_rows else train_rows
+        x_values = [float(row["midpoint_n"]) for row in x_source_rows]
+        if x_values:
+            x_min_data, x_max_data = min(x_values), max(x_values)
+            x_span = x_max_data - x_min_data
+            x_padding = max(
+                0.10 * x_span,
+                0.05 * max(abs(x_min_data), abs(x_max_data), 1.0),
+                1e-3,
+            )
+            x_min = max(0.0, x_min_data - x_padding)
+            x_max = x_max_data + x_padding
+            if x_max <= x_min:
+                x_max = x_min + max(1.0, x_padding)
+        else:
+            x_min, x_max = 0.0, max(1.0, 1.2 * limits[axis]["x"])
+        bounds = (x_min, x_max, 0.0, 1.2 * limits[axis]["y"])
+        plot_limits_by_axis[axis] = {
+            "x_min": float(x_min), "x_max": float(x_max),
+            "y_min": float(bounds[2]), "y_max": float(bounds[3]),
+            "x_range_source": "eval_optimal_n" if eval_rows else "train_optimal_n_fallback",
+        }
         model = _confidence_surface(train_rows, bounds=bounds)
         confidence_regions[axis] = None if model is None else model["audit"]
         if model is not None:
             heatmap = plot_axis.contourf(
                 model["x"], model["y"], model["confidence"],
-                levels=np.linspace(0.0, 1.0, 13), cmap="viridis", alpha=0.52, zorder=0,
+                levels=np.linspace(0.0, 1.0, 25), cmap="viridis",
+                alpha=1.0, antialiased=True, zorder=0,
             )
             figure.colorbar(
                 heatmap, ax=plot_axis, fraction=0.046, pad=0.03,
@@ -1394,13 +1417,6 @@ def render_train_optimal_n_scatter(
         else:
             for row in eval_rows:
                 row["train_density_confidence"] = None
-        if train_rows:
-            plot_axis.scatter(
-                [row["midpoint_n"] for row in train_rows],
-                [row["segment_count"] for row in train_rows],
-                s=82, color="#2878B5", marker="o", edgecolors="white",
-                linewidths=0.9, alpha=0.88, label="train optimal N", zorder=5,
-            )
         if eval_rows:
             plot_axis.scatter(
                 [row["midpoint_n"] for row in eval_rows],
@@ -1417,19 +1433,22 @@ def render_train_optimal_n_scatter(
             "value": None if not eval_confidences else float(sum(eval_confidences) / len(eval_confidences)),
             "num_train_optimal_points": len(train_rows),
             "num_eval_optimal_points": len(eval_rows),
+            "train_points_used_for_heatmap_only": True,
+            "visible_scatter_split": "eval_only",
         }
         plot_axis.axhline(limits[axis]["y"], color="#666666", linestyle="--", linewidth=1.2)
         plot_axis.axvline(limits[axis]["x"], color="#999999", linestyle=":", linewidth=1.4)
         plot_axis.set_xlim(bounds[0], bounds[1])
         plot_axis.set_ylim(bounds[2], bounds[3])
         plot_axis.set_title(
-            f"{axis.upper()} optimal N | train={len(train_rows)} | eval={len(eval_rows)}",
+            f"{axis.upper()} optimal N | heatmap train={len(train_rows)} | shown eval={len(eval_rows)}",
             fontsize=14, fontweight="bold",
         )
         plot_axis.set_xlabel("Optimal threshold N", fontsize=12)
         plot_axis.set_ylabel("Segments in most-similar candidate", fontsize=12)
-        plot_axis.grid(True, alpha=0.2)
-        plot_axis.legend(fontsize=9, loc="best")
+        plot_axis.grid(True, color="white", alpha=0.12, linewidth=0.7)
+        if eval_rows:
+            plot_axis.legend(fontsize=9, loc="best")
     figure.suptitle(
         "Step 7B optimal N per video | train-fitted heat map + eval overlay",
         fontsize=17, fontweight="bold",
@@ -1441,12 +1460,23 @@ def render_train_optimal_n_scatter(
         "path": str(output_path),
         "method": "one_most_similar_candidate_optimal_n_per_video",
         "heatmap_fit_split": "train_only",
-        "eval_usage": "overlay_and_held_out_density_evaluation_only",
+        "eval_usage": "visible_scatter_and_held_out_density_evaluation_only",
+        "visible_scatter_split": "eval_only",
+        "train_points_visible": False,
+        "x_range_policy": "eval_optimal_n_range_with_padding_else_train_fallback",
+        "heatmap_style": {
+            "colormap": "viridis",
+            "opacity": 1.0,
+            "contour_levels": 25,
+            "grid_color": "white",
+            "grid_alpha": 0.12,
+        },
         "num_train_videos": len(train_results),
         "num_eval_videos": len(eval_results),
         "num_train_optimal_points": sum(row["split"] == "train" for row in all_points),
         "num_eval_optimal_points": sum(row["split"] == "eval" for row in all_points),
         "confidence_regions": confidence_regions,
         "evaluation_metrics": evaluation_metrics,
+        "plot_limits_by_axis": plot_limits_by_axis,
         "points": all_points,
     }

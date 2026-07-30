@@ -64,6 +64,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             manifest_exists = Path(output["ego_axis_consensus_segmentation_manifest_path"]).exists()
             final_path_exists = Path(output["ego_axis_final_segmentation"][0]["step7b_final_segmentation_path"]).exists()
             optimal_chart_exists = Path(output["ego_axis_consensus_segmentation_manifest"]["optimal_n_scatter"]["path"]).exists()
+            shared_visual_root_exists = Path(output["ego_axis_consensus_segmentation_manifest"]["eval_visualization_output_root"]).is_dir()
         self.assertEqual(
             state["ego_axis_threshold_segmentation"][0]["final_segmentation"]["status"],
             "pending_step7b_consensus_merge",
@@ -75,6 +76,11 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         self.assertEqual(final_result["vx_segmentation"]["optimal_n_selection"]["status"], "selected")
         self.assertEqual(final_result["vz_segmentation"]["optimal_n_selection"]["status"], "selected")
         self.assertTrue(optimal_chart_exists)
+        self.assertTrue(shared_visual_root_exists)
+        self.assertEqual(
+            output["ego_axis_consensus_segmentation_manifest"]["eval_visualization_layout"],
+            "single_shared_folder_video_id_filenames",
+        )
         self.assertTrue(manifest_exists)
         self.assertTrue(final_path_exists)
 
@@ -125,6 +131,14 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             self.assertTrue(Path(audit["path"]).exists())
         self.assertEqual(audit["num_train_optimal_points"], 4)
         self.assertEqual(audit["num_eval_optimal_points"], 2)
+        self.assertFalse(audit["train_points_visible"])
+        self.assertEqual(audit["visible_scatter_split"], "eval_only")
+        self.assertEqual(audit["heatmap_style"]["colormap"], "viridis")
+        self.assertEqual(audit["heatmap_style"]["opacity"], 1.0)
+        self.assertEqual(audit["heatmap_style"]["contour_levels"], 25)
+        self.assertEqual(audit["plot_limits_by_axis"]["vx"]["x_range_source"], "eval_optimal_n")
+        self.assertLess(audit["plot_limits_by_axis"]["vx"]["x_min"], 12.0)
+        self.assertGreater(audit["plot_limits_by_axis"]["vx"]["x_max"], 12.0)
         self.assertEqual(
             {row["split"] for row in audit["points"]}, {"train", "eval"},
         )
