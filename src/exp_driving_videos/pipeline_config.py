@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Sequence
 
 import config
+from src.exp_driving_videos.modules import rule_constraints
 from src.exp_driving_videos.modules.pipe_utils.exp_driving_utils import load_pattern_cfg_file
 
 
@@ -381,6 +382,32 @@ def get_initial_rule_pruning_cfg() -> Dict[str, Any]:
     if isinstance(override_budgets, dict):
         merged_budgets.update(override_budgets)
     resolved["category_budgets"] = merged_budgets
+    return resolved
+
+
+def get_rule_constraints_cfg() -> Dict[str, Any]:
+    """Resolve the background-knowledge constraint section.
+
+    `functional_predicates` merges onto the defaults rather than replacing them, so
+    a config only needs to name the predicates it wants to add or re-key.
+    """
+
+    defaults = {
+        "mode": rule_constraints.MODE_DERIVED,
+        "functional_predicates": dict(rule_constraints.DEFAULT_FUNCTIONAL_PREDICATES),
+        "forbidden_atoms": [],
+        "forbidden_combinations": [],
+    }
+    resolved = _load_cfg_section(
+        defaults,
+        path=("rule_constraints",),
+        warn_label="rule constraints",
+    )
+    merged_functional = dict(defaults["functional_predicates"])
+    override_functional = resolved.get("functional_predicates")
+    if isinstance(override_functional, dict):
+        merged_functional.update(override_functional)
+    resolved["functional_predicates"] = merged_functional
     return resolved
 
 

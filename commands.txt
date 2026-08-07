@@ -1,0 +1,8 @@
+pip install joblib
+pip install numba
+pip install matplotlib
+pip install opencv-python
+apt-get install -y libgl1
+apt-get install -y libglib2.0-0
+pip install scikit-learn
+pip install -U numba

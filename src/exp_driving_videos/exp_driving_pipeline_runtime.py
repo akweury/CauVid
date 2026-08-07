@@ -113,6 +113,7 @@ from src.exp_driving_videos import od_calibration_loop as od_calibration_loop_ut
 from src.exp_driving_videos import pipeline_config as driving_pipeline_config
 from src.exp_driving_videos import pipeline_data as driving_pipeline_data
 from src.exp_driving_videos.modules import detect_driving_mini
+from src.exp_driving_videos.modules import rule_constraints
 from src.exp_driving_videos.modules import candidate_rules_driving_mini
 from src.exp_driving_videos.modules import causal_rule_reselection_driving_mini
 from src.exp_driving_videos.modules import candidate_contribution_summary_driving_mini
@@ -178,6 +179,7 @@ _get_target_head_atoms_cfg = driving_pipeline_config.get_target_head_atoms_cfg
 _get_temporal_rule_examples_cfg = driving_pipeline_config.get_temporal_rule_examples_cfg
 _get_candidate_rules_cfg = driving_pipeline_config.get_candidate_rules_cfg
 _get_initial_rule_pruning_cfg = driving_pipeline_config.get_initial_rule_pruning_cfg
+_get_rule_constraints_cfg = driving_pipeline_config.get_rule_constraints_cfg
 _get_extended_rules_cfg = driving_pipeline_config.get_extended_rules_cfg
 _get_final_rules_cfg = driving_pipeline_config.get_final_rules_cfg
 _get_rule_pool_and_selector_diagnostic_cfg = (
@@ -394,6 +396,8 @@ class PipelineContext:
     effective_video_ids: List[str]
     has_explicit_video_selection: bool = False
     recompute_cfg: Dict[str, Any] = field(default_factory=dict)
+    # CLI override for rule_constraints.mode; None keeps the configured value.
+    rule_constraints_mode: Optional[str] = None
     od_loop_iteration_index: int = 1
     force_full_iteration_recompute: bool = False
     defer_stop_after_gate: bool = False
@@ -836,6 +840,7 @@ def _build_pipeline_context(
     iteration_index: int = 1,
     force_full_recompute: bool = False,
     defer_stop_after_gate: bool = False,
+    rule_constraints_mode: Optional[str] = None,
 ) -> PipelineContext:
     return PipelineContext(
         effective_video_ids=_resolve_video_ids(video_ids, video_count),
@@ -847,7 +852,17 @@ def _build_pipeline_context(
         od_loop_iteration_index=int(iteration_index),
         force_full_iteration_recompute=bool(force_full_recompute),
         defer_stop_after_gate=bool(defer_stop_after_gate),
+        rule_constraints_mode=rule_constraints_mode,
     )
+
+
+def _resolve_rule_constraints_cfg(ctx: PipelineContext) -> Dict[str, Any]:
+    """Config-file constraints with the CLI mode override applied."""
+
+    cfg = dict(_get_rule_constraints_cfg())
+    if ctx.rule_constraints_mode is not None:
+        cfg["mode"] = ctx.rule_constraints_mode
+    return cfg
 
 
 def _run_object_detection_step(
@@ -2627,9 +2642,12 @@ def run_step_15_merge_initial_rules(ctx: PipelineContext, runner: StepRunner) ->
 
 
 def run_step_15b_initial_rule_pruning(ctx: PipelineContext, runner: StepRunner) -> None:
-    pruning_cfg = _get_initial_rule_pruning_cfg()
+    pruning_cfg = dict(_get_initial_rule_pruning_cfg())
+    rule_constraints_cfg = _resolve_rule_constraints_cfg(ctx)
+    pruning_cfg["rule_constraints"] = rule_constraints_cfg
     runner.announce_step("15B", "initial_rule_pruning")
     runner.log("15B", f"cfg={pruning_cfg}")
+    runner.log("15B", f"rule_constraints_mode={rule_constraints_cfg.get('mode', 'off')}")
     if not ctx.merged_candidate_rules:
         ctx.merged_candidate_rules = _load_cached_merged_initial_rules()
         runner.log(
@@ -2665,13 +2683,16 @@ def run_step_15b_initial_rule_pruning(ctx: PipelineContext, runner: StepRunner) 
 
 
 def run_step_16_extended_rules(ctx: PipelineContext, runner: StepRunner) -> None:
-    extended_rules_cfg = _get_extended_rules_cfg()
+    extended_rules_cfg = dict(_get_extended_rules_cfg())
+    rule_constraints_cfg = _resolve_rule_constraints_cfg(ctx)
+    extended_rules_cfg["rule_constraints"] = rule_constraints_cfg
     initial_rules_payload = ctx.initial_rules_for_extension or ctx.merged_candidate_rules
     if not initial_rules_payload:
         initial_rules_payload = _load_cached_initial_rules_for_extension()
         ctx.initial_rules_for_extension = initial_rules_payload
     runner.announce_step("16", "extended_rules_driving_mini")
     runner.log("16", f"cfg={extended_rules_cfg}")
+    runner.log("16", f"rule_constraints_mode={rule_constraints_cfg.get('mode', 'off')}")
     runner.log("16", f"input_initial_rules={int(initial_rules_payload.get('num_rules', 0))}")
     runner.log("16", f"recompute={bool(ctx.recompute_cfg.get('extended_rules', True))}")
     with runner.module_output("16"):
@@ -3841,11 +3862,13 @@ def _run_single_pass_pipeline(
     video_ids: Optional[List[str]],
     video_count: int | None,
     force_full_recompute: bool = False,
+    rule_constraints_mode: Optional[str] = None,
 ) -> None:
     ctx = _build_pipeline_context(
         video_ids=video_ids,
         video_count=video_count,
         force_full_recompute=force_full_recompute,
+        rule_constraints_mode=rule_constraints_mode,
     )
     effective_start_target = start_target
     warm_start_blocker = ""
@@ -3882,6 +3905,7 @@ def _run_od_calibration_loop(
     video_count: int | None,
     loop_cfg: od_calibration_loop_utils.ODCalibrationLoopConfig,
     force_full_recompute: bool = False,
+    rule_constraints_mode: Optional[str] = None,
 ) -> PipelineContext:
     final_ctx: Optional[PipelineContext] = None
     for iteration_index in range(1, int(loop_cfg.max_iterations) + 1):
@@ -3895,6 +3919,7 @@ def _run_od_calibration_loop(
             iteration_index=iteration_index,
             force_full_recompute=iteration_force_full_recompute,
             defer_stop_after_gate=True,
+            rule_constraints_mode=rule_constraints_mode,
         )
         effective_start_target = start_target
         warm_start_blocker = ""
@@ -4008,6 +4033,23 @@ def parse_args() -> argparse.Namespace:
             "`full_pipeline` forces recompute from step 0."
         ),
     )
+    parser.add_argument(
+        "--rule-constraints",
+        dest="rule_constraints_mode",
+        choices=(
+            rule_constraints.MODE_OFF,
+            rule_constraints.MODE_DERIVED,
+            rule_constraints.MODE_DERIVED_AND_AUTHORED,
+        ),
+        default=None,
+        help=(
+            "Override rule_constraints.mode without editing YAML. "
+            "`off` builds and evaluates every rule combination (naive baseline). "
+            "`derived` skips combinations that are impossible because a state predicate "
+            "is single-valued. `derived_and_authored` also applies the asserted "
+            "constraints from the config. Defaults to the configured mode."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -4018,7 +4060,11 @@ def main(
     video_count: int | None = None,
     od_calibration_iterations: int | None = None,
     recompute_preset: str | None = None,
+    rule_constraints_mode: str | None = None,
 ) -> None:
+    if rule_constraints_mode is not None:
+        # Fail here rather than deep inside step 16.
+        rule_constraints_mode = rule_constraints.normalize_mode(rule_constraints_mode)
     if video_count is not None and video_count < 1:
         raise ValueError(f"video_count must be >= 1. Found {video_count}.")
     if od_calibration_iterations is not None and od_calibration_iterations < 1:
@@ -4058,6 +4104,7 @@ def main(
                 video_count=video_count,
                 loop_cfg=loop_cfg,
                 force_full_recompute=force_full_recompute,
+                rule_constraints_mode=rule_constraints_mode,
             )
             runner.log("19", f"od_calibration_loop_stop_reason={ctx.od_loop_stop_reason or 'completed'}")
             if resolved_stop_target == "19":
@@ -4077,6 +4124,7 @@ def main(
             video_ids=video_ids,
             video_count=video_count,
             force_full_recompute=force_full_recompute,
+            rule_constraints_mode=rule_constraints_mode,
         )
     except _PipelineStopRequested:
         return
@@ -4091,4 +4139,5 @@ if __name__ == "__main__":
         video_count=args.video_count,
         od_calibration_iterations=args.od_calibration_iterations,
         recompute_preset=args.recompute_preset,
+        rule_constraints_mode=args.rule_constraints_mode,
     )

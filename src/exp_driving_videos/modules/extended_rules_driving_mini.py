@@ -32,6 +32,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 import config
+from src.exp_driving_videos.modules import rule_constraints
 from src.exp_driving_videos.modules.extended_rules_pruning import (
     apply_pruning_strategies,
     normalize_strategy_names,
@@ -119,6 +120,8 @@ def _cfg_key_subset(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "max_round_rules": _normalized_round_rule_budgets(cfg),
         "max_round_rules_by_category": _normalized_round_category_budgets(cfg),
         "parents_for_next_round": _normalized_next_round_parent_cfg(cfg),
+        # Keeps a constrained run from reusing the naive run's cached pool.
+        "rule_constraints": rule_constraints.normalize_constraints_cfg(cfg.get("rule_constraints")),
     }
 
 
@@ -1372,6 +1375,8 @@ def process_rules(
     allow_candidate_candidate_extension = bool(cfg.get("allow_candidate_candidate_extension", False))
     max_segment_context_atoms_per_rule = int(cfg.get("max_segment_context_atoms_per_rule", 1))
     per_parent_extension_top_k = int(cfg.get("per_parent_extension_top_k", 25))
+    constraints = rule_constraints.normalize_constraints_cfg(cfg.get("rule_constraints"))
+    constraints_enabled = rule_constraints.is_enabled(constraints)
     post_extension_pruning_cfg = _post_extension_pruning_cfg(cfg)
     normalized_max_round_rules = _normalized_round_rule_budgets(cfg)
     normalized_max_round_rules_by_category = _normalized_round_category_budgets(cfg)
@@ -1401,6 +1406,8 @@ def process_rules(
         "max_round_rules": normalized_max_round_rules,
         "max_round_rules_by_category": normalized_max_round_rules_by_category,
         "parents_for_next_round": normalized_parents_for_next_round,
+        # Keeps a constrained run from reusing the naive run's cached pool.
+        "rule_constraints": constraints,
     }
 
     out_root = output_root or get_output_root()
@@ -1500,6 +1507,13 @@ def process_rules(
         f"provenance_quality={allowed_extension_atom_pool_counts['provenance_quality']}"
     )
     print(f"  prune_strategies: {prune_strategies}")
+    print(
+        "  rule_constraints: "
+        f"mode={constraints['mode']} | "
+        f"functional_predicates={len(constraints['functional_predicates'])} | "
+        f"forbidden_atoms={len(constraints['forbidden_atoms'])} | "
+        f"forbidden_combinations={len(constraints['forbidden_combinations'])}"
+    )
 
     round_summaries: List[Dict[str, Any]] = []
     rounds: List[Dict[str, Any]] = []
@@ -1528,6 +1542,8 @@ def process_rules(
         num_pruned_same_confidence_smaller_evidence = 0
         num_pruned_provenance_dominance = 0
         num_pruned_candidate_candidate_disabled = 0
+        num_pruned_background_knowledge_conflict = 0
+        background_knowledge_conflict_reasons: Dict[str, int] = {}
         num_pruned_parent_top_k = 0
         num_pruned_round_budget = 0
         num_pruned_next_round_parent_budget = 0
@@ -1607,6 +1623,39 @@ def process_rules(
                     else:
                         total_pruned_candidate_rule_counts["accepted_only_rules"] += 1
                     continue
+
+                # Background knowledge rules this body out before the expensive
+                # evidence intersection, so the combination is never evaluated.
+                constraint_reason = (
+                    rule_constraints.body_conflict(new_body_atoms, constraints)
+                    if constraints_enabled
+                    else ""
+                )
+                if constraint_reason:
+                    num_pruned += 1
+                    num_pruned_background_knowledge_conflict += 1
+                    reason_kind = rule_constraints.conflict_kind(constraint_reason)
+                    background_knowledge_conflict_reasons[reason_kind] = (
+                        background_knowledge_conflict_reasons.get(reason_kind, 0) + 1
+                    )
+                    provenance_summary = _summarize_rule_candidate_provenance(
+                        body_atom_templates=new_body_atoms,
+                        evidence_entries=[],
+                    )
+                    category = _rule_candidate_category(
+                        {**provenance_summary, "body_atom_templates": list(new_body_atoms)}
+                    )
+                    total_pruned_candidate_rule_counts["all_rules"] += 1
+                    if category == "mixed_accepted_candidate":
+                        total_pruned_candidate_rule_counts["mixed_accepted_candidate_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    elif category == "candidate_only":
+                        total_pruned_candidate_rule_counts["candidate_only_rules"] += 1
+                        total_pruned_candidate_rule_counts["candidate_involving_rules"] += 1
+                    else:
+                        total_pruned_candidate_rule_counts["accepted_only_rules"] += 1
+                    continue
+
                 num_candidates_generated += 1
                 intersected_evidence = _intersect_evidence_sets(parent_evidence_set, initial_evidence_set)
 
@@ -1838,6 +1887,10 @@ def process_rules(
                 "pruned_no_marginal_gain": num_pruned_no_marginal_gain,
                 "pruned_provenance_dominance": num_pruned_provenance_dominance,
                 "pruned_candidate_candidate_disabled": num_pruned_candidate_candidate_disabled,
+                "pruned_background_knowledge_conflict": num_pruned_background_knowledge_conflict,
+                "background_knowledge_conflict_reasons": dict(
+                    sorted(background_knowledge_conflict_reasons.items())
+                ),
                 "pruned_parent_top_k": num_pruned_parent_top_k,
                 "pruned_round_budget": num_pruned_round_budget,
                 "deduplicated_body": num_deduplicated_body,
@@ -1885,6 +1938,10 @@ def process_rules(
                 "pruned_no_marginal_gain": num_pruned_no_marginal_gain,
                 "pruned_provenance_dominance": num_pruned_provenance_dominance,
                 "pruned_candidate_candidate_disabled": num_pruned_candidate_candidate_disabled,
+                "pruned_background_knowledge_conflict": num_pruned_background_knowledge_conflict,
+                "background_knowledge_conflict_reasons": dict(
+                    sorted(background_knowledge_conflict_reasons.items())
+                ),
                 "pruned_parent_top_k": num_pruned_parent_top_k,
                 "pruned_round_budget": num_pruned_round_budget,
                 "deduplicated_body": num_deduplicated_body,
@@ -1927,7 +1984,8 @@ def process_rules(
             f"no_marginal_gain={num_pruned_no_marginal_gain} | "
             f"candidate_candidate_disabled={num_pruned_candidate_candidate_disabled} | "
             f"same_confidence_smaller_evidence={num_pruned_same_confidence_smaller_evidence} | "
-            f"provenance_dominance={num_pruned_provenance_dominance}"
+            f"provenance_dominance={num_pruned_provenance_dominance} | "
+            f"background_knowledge_conflict={num_pruned_background_knowledge_conflict}"
         )
         print(
             "    post_extension_pruning: "
@@ -2005,6 +2063,7 @@ def process_rules(
             "pruned_rule_counts": total_pruned_candidate_rule_counts,
         },
         "candidate_rule_flow_summary": candidate_rule_flow_summary,
+        "rule_constraints": constraints,
         "all_kept_rules": all_kept_rules,
         "round_summaries": round_summaries,
         "rounds": rounds,

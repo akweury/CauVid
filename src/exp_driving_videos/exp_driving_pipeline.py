@@ -46,6 +46,7 @@ def main(
     video_count: int | None = None,
     od_calibration_iterations: int | None = None,
     recompute_preset: str | None = None,
+    rule_constraints_mode: str | None = None,
 ) -> None:
     """Run the pipeline through the shared runtime implementation."""
 
@@ -56,6 +57,7 @@ def main(
         video_count=video_count,
         od_calibration_iterations=od_calibration_iterations,
         recompute_preset=recompute_preset,
+        rule_constraints_mode=rule_constraints_mode,
     )
 
 
@@ -68,4 +70,5 @@ if __name__ == "__main__":
         video_count=args.video_count,
         od_calibration_iterations=args.od_calibration_iterations,
         recompute_preset=args.recompute_preset,
+        rule_constraints_mode=args.rule_constraints_mode,
     )
