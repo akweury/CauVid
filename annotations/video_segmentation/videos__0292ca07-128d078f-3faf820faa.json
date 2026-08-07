@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "annotation_version": "1.1",
+  "annotator": "Jing",
+  "updated_at": "2026-08-07T19:08:59.297801+00:00",
+  "video": {
+    "id": "videos__0292ca07-128d078f-3faf820faa",
+    "path": "videos/0292ca07-128d078f.mov",
+    "fps": 30.039721946375373,
+    "frame_count": 1210,
+    "duration_seconds": 40.28
+  },
+  "keyframes": [
+    {
+      "frame": 0,
+      "timestamp": 0.0,
+      "label": "moving_forward"
+    }
+  ],
+  "segments": [
+    {
+      "start_frame": 0,
+      "end_frame": 1209,
+      "start_timestamp": 0.0,
+      "end_timestamp": 40.246711,
+      "label": "moving_forward"
+    }
+  ]
+}

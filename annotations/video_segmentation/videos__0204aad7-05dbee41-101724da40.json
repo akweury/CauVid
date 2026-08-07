@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "annotation_version": "1.1",
+  "annotator": "Jing",
+  "updated_at": "2026-08-07T19:41:13.686715+00:00",
+  "video": {
+    "id": "videos__0204aad7-05dbee41-101724da40",
+    "path": "videos/0204aad7-05dbee41.mov",
+    "fps": 30.01499500166611,
+    "frame_count": 1201,
+    "duration_seconds": 40.013333
+  },
+  "keyframes": [
+    {
+      "frame": 0,
+      "timestamp": 0.0,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 989,
+      "timestamp": 32.950197,
+      "label": "stationary"
+    },
+    {
+      "frame": 1033,
+      "timestamp": 34.416131,
+      "label": "moving_forward"
+    }
+  ],
+  "segments": [
+    {
+      "start_frame": 0,
+      "end_frame": 988,
+      "start_timestamp": 0.0,
+      "end_timestamp": 32.91688,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 989,
+      "end_frame": 1032,
+      "start_timestamp": 32.950197,
+      "end_timestamp": 34.382814,
+      "label": "stationary"
+    },
+    {
+      "start_frame": 1033,
+      "end_frame": 1200,
+      "start_timestamp": 34.416131,
+      "end_timestamp": 39.980017,
+      "label": "moving_forward"
+    }
+  ]
+}

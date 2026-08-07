@@ -1,0 +1,49 @@
+annotation_version: "1.1"
+
+supported_extensions: [.mp4, .avi, .mov, .mkv, .m4v, .webm]
+playback_speeds: [0.25, 0.5, 1.0, 2.0, 4.0]
+
+display:
+  # Match exp_july frame extraction: apply MOV/MP4 display rotation metadata.
+  apply_rotation_metadata: true
+  # Used only when metadata is absent and stored height is greater than width.
+  # -90 follows the pipeline convention and displays the frame clockwise.
+  portrait_fallback_rotation: -90
+
+# Colors use RGB order. Customize these labels for the annotation task.
+labels:
+  - id: turning_left
+    name: Left
+    key: "4"
+    color: [255, 180, 60]
+  - id: turning_right
+    name: Right
+    key: "6"
+    color: [210, 100, 255]
+  - id: moving_forward
+    name: Forward
+    key: "8"
+    color: [70, 200, 100]
+  - id: moving_backward
+    name: Backward
+    key: "2"
+    color: [235, 95, 90]
+  - id: stationary
+    name: Stationary
+    key: "5"
+    color: [80, 170, 255]
+
+# Actions accept a single printable character or LEFT, RIGHT, UP, DOWN.
+# Arrow codes are normalized across Linux, macOS, Windows, and Qt backends.
+shortcuts:
+  quit: q
+  play_pause: " "
+  previous_frame: LEFT
+  next_frame: RIGHT
+  previous_video: "-"
+  next_video: "+"
+  previous_keyframe: z
+  next_keyframe: c
+  delete_keyframe: x
+  speed_down: DOWN
+  speed_up: UP

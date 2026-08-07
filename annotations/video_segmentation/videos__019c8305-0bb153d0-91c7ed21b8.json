@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "annotation_version": "1.1",
+  "annotator": "Jing",
+  "updated_at": "2026-08-07T18:54:06.280698+00:00",
+  "video": {
+    "id": "videos__019c8305-0bb153d0-91c7ed21b8",
+    "path": "videos/019c8305-0bb153d0.mov",
+    "fps": 30.12812538872994,
+    "frame_count": 1211,
+    "duration_seconds": 40.195
+  },
+  "keyframes": [
+    {
+      "frame": 0,
+      "timestamp": 0.0,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 343,
+      "timestamp": 11.384711,
+      "label": "turning_left"
+    },
+    {
+      "frame": 430,
+      "timestamp": 14.272378,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 562,
+      "timestamp": 18.653666,
+      "label": "turning_left"
+    },
+    {
+      "frame": 659,
+      "timestamp": 21.873249,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 1105,
+      "timestamp": 36.676693,
+      "label": "turning_left"
+    },
+    {
+      "frame": 1156,
+      "timestamp": 38.369463,
+      "label": "moving_forward"
+    }
+  ],
+  "segments": [
+    {
+      "start_frame": 0,
+      "end_frame": 342,
+      "start_timestamp": 0.0,
+      "end_timestamp": 11.351519,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 343,
+      "end_frame": 429,
+      "start_timestamp": 11.384711,
+      "end_timestamp": 14.239187,
+      "label": "turning_left"
+    },
+    {
+      "start_frame": 430,
+      "end_frame": 561,
+      "start_timestamp": 14.272378,
+      "end_timestamp": 18.620475,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 562,
+      "end_frame": 658,
+      "start_timestamp": 18.653666,
+      "end_timestamp": 21.840058,
+      "label": "turning_left"
+    },
+    {
+      "start_frame": 659,
+      "end_frame": 1104,
+      "start_timestamp": 21.873249,
+      "end_timestamp": 36.643501,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 1105,
+      "end_frame": 1155,
+      "start_timestamp": 36.676693,
+      "end_timestamp": 38.336272,
+      "label": "turning_left"
+    },
+    {
+      "start_frame": 1156,
+      "end_frame": 1210,
+      "start_timestamp": 38.369463,
+      "end_timestamp": 40.161808,
+      "label": "moving_forward"
+    }
+  ]
+}

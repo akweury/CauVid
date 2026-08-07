@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "annotation_version": "1.1",
+  "annotator": "Jing",
+  "updated_at": "2026-08-07T19:54:25.806023+00:00",
+  "video": {
+    "id": "videos__029ad1d1-8c9b02b1-6a68ae46c5",
+    "path": "videos/029ad1d1-8c9b02b1.mov",
+    "fps": 30.061120119745542,
+    "frame_count": 1205,
+    "duration_seconds": 40.085
+  },
+  "keyframes": [
+    {
+      "frame": 0,
+      "timestamp": 0.0,
+      "label": "stationary"
+    },
+    {
+      "frame": 107,
+      "timestamp": 3.559415,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 242,
+      "timestamp": 8.050266,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 650,
+      "timestamp": 21.622614,
+      "label": "turning_right"
+    },
+    {
+      "frame": 759,
+      "timestamp": 25.24856,
+      "label": "moving_forward"
+    },
+    {
+      "frame": 1002,
+      "timestamp": 33.332091,
+      "label": "stationary"
+    },
+    {
+      "frame": 1117,
+      "timestamp": 37.157631,
+      "label": "moving_forward"
+    }
+  ],
+  "segments": [
+    {
+      "start_frame": 0,
+      "end_frame": 106,
+      "start_timestamp": 0.0,
+      "end_timestamp": 3.526149,
+      "label": "stationary"
+    },
+    {
+      "start_frame": 107,
+      "end_frame": 241,
+      "start_timestamp": 3.559415,
+      "end_timestamp": 8.017,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 242,
+      "end_frame": 649,
+      "start_timestamp": 8.050266,
+      "end_timestamp": 21.589349,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 650,
+      "end_frame": 758,
+      "start_timestamp": 21.622614,
+      "end_timestamp": 25.215295,
+      "label": "turning_right"
+    },
+    {
+      "start_frame": 759,
+      "end_frame": 1001,
+      "start_timestamp": 25.24856,
+      "end_timestamp": 33.298826,
+      "label": "moving_forward"
+    },
+    {
+      "start_frame": 1002,
+      "end_frame": 1116,
+      "start_timestamp": 33.332091,
+      "end_timestamp": 37.124365,
+      "label": "stationary"
+    },
+    {
+      "start_frame": 1117,
+      "end_frame": 1204,
+      "start_timestamp": 37.157631,
+      "end_timestamp": 40.051734,
+      "label": "moving_forward"
+    }
+  ]
+}
