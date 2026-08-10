@@ -363,7 +363,14 @@ main() {
       [[ "$custom_data" == "1" ]] && data_scale="custom_${video_count}"
       evaluation_seed="$(resolve_seed "$evaluation_seed")"
       configure_run_output "$data_scale" "$evaluation_seed"
+      if [[ "$data_scale" == "full" ]]; then
+        export CAUVID_WANDB_ENABLED=1
+        export CAUVID_WANDB_PROJECT="${CAUVID_WANDB_PROJECT:-cauvid-exp-august}"
+        export CAUVID_WANDB_GROUP="${CAUVID_WANDB_GROUP:-full}"
+        export CAUVID_WANDB_RUN_NAME="${CAUVID_WANDB_RUN_NAME:-full-seed-${evaluation_seed}}"
+      fi
       echo "[d3] run scale=$data_scale videos=$video_count seed=$evaluation_seed output=$PIPELINE_OUTPUT"
+      [[ "$data_scale" == "full" ]] && echo "[d3] wandb enabled project=$CAUVID_WANDB_PROJECT run=$CAUVID_WANDB_RUN_NAME"
       if [[ "$evaluate_after_run" == "1" && "$max_step" -lt 8 ]]; then
         echo "[d3][error] --evaluate requires --step 8 or later" >&2
         exit 1

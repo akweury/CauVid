@@ -61,6 +61,28 @@ class _NullTracker:
         return None
 
 
+def _wandb_tracker(*, video_ids, video_count, seed, max_step):
+    enabled = os.environ.get("CAUVID_WANDB_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return _NullTracker()
+    from src.exp_july.wandb_tracking import WandbTracker
+
+    return WandbTracker(
+        enabled=True,
+        project=os.environ.get("CAUVID_WANDB_PROJECT", "cauvid-exp-august"),
+        run_name=os.environ.get("CAUVID_WANDB_RUN_NAME"),
+        mode=os.environ.get("CAUVID_WANDB_MODE"),
+        config={
+            "pipeline": "exp_august",
+            "video_ids": list(video_ids) if video_ids is not None else None,
+            "video_count": video_count,
+            "seed": int(seed),
+            "max_step": int(max_step),
+            "data_scale": modules.data_scale_name(video_count),
+        },
+    )
+
+
 class _SelectedTqdmStream:
     """Forward selected real nested tqdm bars with canonical public labels."""
 
@@ -266,7 +288,12 @@ def run_pipeline(
 
 def main(**kwargs):
     """Programmatic entry point kept deliberately free of reasoning options."""
-    tracker = kwargs.pop("tracker", None) or _NullTracker()
+    tracker = kwargs.pop("tracker", None) or _wandb_tracker(
+        video_ids=kwargs.get("video_ids"),
+        video_count=kwargs.get("video_count"),
+        seed=kwargs.get("seed", modules.DEFAULT_DATA_SELECTION_SEED),
+        max_step=kwargs.get("max_step", 11),
+    )
     try:
         result = run_pipeline(tracker=tracker, **kwargs)
     except BaseException as exc:

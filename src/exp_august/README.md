@@ -46,6 +46,11 @@ Step 5 uses the canonical nested sequence
 `05_ego_motion_abstraction/05b_ego_axis_threshold_segmentation/`, and
 `05_ego_motion_abstraction/05c_ego_axis_consensus_segmentation/`.
 
+Full-scale runs automatically enable Weights & Biases using project
+`cauvid-exp-august`, group `full`, and run name `full-seed-<seed>`. Set
+`WANDB_API_KEY` on the host before launching. Debug, small, and custom scales
+do not enable W&B automatically.
+
 ```bash
 # Show all options
 ./d3.sh --help

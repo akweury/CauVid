@@ -355,15 +355,16 @@ class YOLOWorldDetector(ObjectDetector):
         if self._resolved_predict_batch_size is not None:
             predict_kwargs["batch"] = int(self._resolved_predict_batch_size)
         if self._resolved_half_precision is not None:
-            # Ultralytics 8.4 unified inference precision under ``quantize``.
-            # The legacy ``half`` flag now emits a deprecation warning.
-            predict_kwargs["quantize"] = 16 if self._resolved_half_precision else None
+            # ``half`` is part of the stable prediction API across the
+            # Ultralytics releases used by CauVid. ``quantize`` is an export
+            # option in some releases and is rejected by model.predict().
+            predict_kwargs["half"] = bool(self._resolved_half_precision)
         runtime_device = str(self._runtime_device or self.device or "cpu").strip()
         if runtime_device.lower() == "auto":
             runtime_device = "cpu"
         if runtime_device:
             predict_kwargs["device"] = runtime_device
-        return  self._model.predict(
+        return self._model.predict(
             **predict_kwargs,
         )
 

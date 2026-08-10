@@ -11,7 +11,7 @@ from src.exp_nuScenes.detection_pipeline import YOLOWorldDetector
 
 
 class YOLOWorldDetectorPredictTests(unittest.TestCase):
-    def test_predict_batch_uses_ultralytics_quantize_argument(self) -> None:
+    def test_predict_batch_uses_supported_ultralytics_half_argument(self) -> None:
         detector = YOLOWorldDetector(device="cuda:0")
         detector._model = mock.Mock()
         detector._model.predict.return_value = []
@@ -32,10 +32,10 @@ class YOLOWorldDetectorPredictTests(unittest.TestCase):
             imgsz=640,
             verbose=False,
             batch=8,
-            quantize=16,
+            half=True,
             device="cuda:0",
         )
-        self.assertNotIn("half", detector._model.predict.call_args.kwargs)
+        self.assertNotIn("quantize", detector._model.predict.call_args.kwargs)
 
 
 if __name__ == "__main__":

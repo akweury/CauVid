@@ -39,6 +39,27 @@ class ExpAugustPipelineTests(unittest.TestCase):
         self.assertEqual(summary, "Device: CPU | Intel Xeon Gold 6338 CPU @ 2.00GHz")
         self.assertLessEqual(len(summary.split(" | ")[1]), 48)
 
+    def test_wandb_tracker_uses_august_full_scale_metadata(self):
+        tracker = Mock()
+        with patch.dict(
+            os.environ,
+            {
+                "CAUVID_WANDB_ENABLED": "1",
+                "CAUVID_WANDB_PROJECT": "project",
+                "CAUVID_WANDB_RUN_NAME": "full-seed-726381",
+            },
+            clear=True,
+        ), patch("src.exp_july.wandb_tracking.WandbTracker", return_value=tracker) as tracker_class:
+            result = pipeline._wandb_tracker(
+                video_ids=None, video_count=961, seed=726381, max_step=11
+            )
+        self.assertIs(result, tracker)
+        kwargs = tracker_class.call_args.kwargs
+        self.assertEqual(kwargs["project"], "project")
+        self.assertEqual(kwargs["run_name"], "full-seed-726381")
+        self.assertEqual(kwargs["config"]["pipeline"], "exp_august")
+        self.assertEqual(kwargs["config"]["data_scale"], "full")
+
     def test_real_video_tqdm_is_forwarded_instead_of_stage_one_of_one(self):
         output = StringIO()
         stream = pipeline._SelectedTqdmStream(output, ((r".*", "Step 4 Trajectories"),))
