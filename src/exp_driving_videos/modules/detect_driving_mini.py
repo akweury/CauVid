@@ -1133,6 +1133,14 @@ def run(
                 f"Cache fast path ({mode_label}): "
                 f"reusing manifest-backed detection cache for {len(fast_cached_results)} videos"
             )
+            with tqdm(
+                total=len(target_videos),
+                desc="Step 2 Object Detection",
+                unit="video",
+                dynamic_ncols=True,
+            ) as progress:
+                progress.set_postfix_str("cached", refresh=False)
+                progress.update(len(fast_cached_results))
             print(f"Step 2 complete: {_format_step_progress(len(fast_cached_results), len(target_videos))}")
             print(f"Outputs: {manifest_path.parent}")
             return fast_cached_results
@@ -1179,8 +1187,9 @@ def run(
     video_results: List[Dict[str, Any]] = []
     try:
         total_videos = len(target_videos)
-        with tqdm(total=total_videos, desc="Detection videos", unit="video", dynamic_ncols=True) as progress:
+        with tqdm(total=total_videos, desc="Step 2 Object Detection", unit="video", dynamic_ncols=True) as progress:
             for video_id in target_videos:
+                progress.set_postfix_str(f"{video_id} | running", refresh=True)
                 result = process_video(
                     video_id=video_id,
                     detector=detector,

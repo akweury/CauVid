@@ -8,7 +8,7 @@ import platform
 import re
 import sys
 import time
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Callable
 
@@ -172,9 +172,15 @@ def _tracked(tracker, name: str, operation: Callable, detail: str | None = None)
         else ((r".*", step_label),)
     )
     progress_stream = _SelectedTqdmStream(sys.stderr, progress_specs)
+    if step_number == 2:
+        # Ultralytics configures Python logging during its first prediction.
+        # Keep stderr native for that stage; wrapping it can trigger logging's
+        # recursive emergency handler on some server/runtime combinations.
+        progress_stream.saw_progress = True
     try:
         with open(os.devnull, "w", encoding="utf-8") as quiet:
-            with redirect_stdout(quiet), redirect_stderr(progress_stream):
+            stderr_context = nullcontext() if step_number == 2 else redirect_stderr(progress_stream)
+            with redirect_stdout(quiet), stderr_context:
                 state = operation()
         if not isinstance(state, dict):
             raise TypeError(f"{name} returned {type(state).__name__}; expected dict")
