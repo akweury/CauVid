@@ -13,6 +13,7 @@ Output layout:
         detection_predictions.csv
         detection_class_summary.csv
         detection_video_summary.csv
+        detection_results.pdf
         <video_id>/
             detections.json
                 - legacy accepted boxes in boxes/scores/labels
@@ -39,6 +40,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from tqdm import tqdm
 
 try:
     import cv2
@@ -137,7 +140,7 @@ def detector_dependency_warnings(*, render_video: bool = True) -> List[str]:
             )
     if not bool(status.get("detector_backend_available", False)):
         warnings.append(
-            "Detector backend dependencies are missing; Step 1 detection cannot run until they are installed. "
+            "Detector backend dependencies are missing; Step 2 detection cannot run until they are installed. "
             f"Import error: {status.get('detector_backend_error', 'unknown')}"
         )
     return warnings
@@ -146,7 +149,7 @@ def detector_dependency_warnings(*, render_video: bool = True) -> List[str]:
 def ensure_detector_runtime_available(*, render_video: bool = True) -> bool:
     if YOLOWorldDetector is None:
         raise RuntimeError(
-            "Step 1 detection dependencies are unavailable. "
+            "Step 2 detection dependencies are unavailable. "
             + " ".join(detector_dependency_warnings(render_video=render_video))
         )
     return True
@@ -348,6 +351,82 @@ def _write_csv(path: Path, fieldnames: List[str], rows: List[Dict[str, Any]]) ->
         writer.writeheader()
         for row in rows:
             writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _write_detection_charts_pdf(
+    path: Path,
+    prediction_rows: List[Dict[str, Any]],
+    class_summary_rows: List[Dict[str, Any]],
+    video_summary_rows: List[Dict[str, Any]],
+) -> None:
+    """Write the three primary detection summaries as a multipage PDF."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with PdfPages(path) as pdf:
+        # Page 1: accepted and candidate detections by class.
+        ranked_classes = sorted(
+            class_summary_rows,
+            key=lambda row: int(row.get("num_total_bboxes", 0) or 0),
+            reverse=True,
+        )[:20]
+        labels = [str(row.get("class_name", "unknown")) for row in ranked_classes]
+        accepted = [int(row.get("num_accepted_bboxes", 0) or 0) for row in ranked_classes]
+        candidates = [int(row.get("num_candidate_bboxes", 0) or 0) for row in ranked_classes]
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        positions = list(range(len(labels)))
+        ax.barh(positions, accepted, label="Accepted", color="#2e86de")
+        ax.barh(positions, candidates, left=accepted, label="Candidates", color="#f39c12")
+        ax.set_yticks(positions, labels=labels)
+        ax.invert_yaxis()
+        ax.set_xlabel("Bounding boxes")
+        ax.set_title("Step 01 Detection — Results by Class")
+        ax.legend()
+        ax.grid(axis="x", alpha=0.25)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 2: accepted and candidate detections by video.
+        video_labels = [str(row.get("video_id", "unknown")) for row in video_summary_rows]
+        video_accepted = [int(row.get("num_accepted_bboxes", 0) or 0) for row in video_summary_rows]
+        video_candidates = [int(row.get("num_candidate_bboxes", 0) or 0) for row in video_summary_rows]
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        positions = list(range(len(video_labels)))
+        ax.bar(positions, video_accepted, label="Accepted", color="#2e86de")
+        ax.bar(positions, video_candidates, bottom=video_accepted, label="Candidates", color="#f39c12")
+        ax.set_xticks(positions, labels=video_labels, rotation=45, ha="right")
+        ax.set_ylabel("Bounding boxes")
+        ax.set_title("Step 01 Detection — Results by Video")
+        ax.legend()
+        ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 3: confidence-score distributions for accepted and candidate boxes.
+        accepted_scores = [float(row.get("score", 0.0) or 0.0) for row in prediction_rows if bool(row.get("accepted", False))]
+        candidate_scores = [float(row.get("score", 0.0) or 0.0) for row in prediction_rows if not bool(row.get("accepted", False))]
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        bins = [index / 20 for index in range(21)]
+        if accepted_scores:
+            ax.hist(accepted_scores, bins=bins, alpha=0.75, label="Accepted", color="#2e86de")
+        if candidate_scores:
+            ax.hist(candidate_scores, bins=bins, alpha=0.75, label="Candidates", color="#f39c12")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_xlabel("Detection confidence")
+        ax.set_ylabel("Bounding boxes")
+        ax.set_title("Step 01 Detection — Confidence Distribution")
+        if accepted_scores or candidate_scores:
+            ax.legend()
+        ax.grid(axis="y", alpha=0.25)
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
 
 
 def _quality_bucket(detection: Dict[str, Any]) -> str:
@@ -1002,7 +1081,7 @@ def run(
     policy_marker = od_calibration_policy_utils.current_policy_marker(resolved_calibration_policy)
     manifest_path = effective_output_root / "detection_manifest.json"
 
-    print(f"Step 1 detection: {_format_step_progress(0, len(target_videos))}")
+    print(f"Step 2 detection: {_format_step_progress(0, len(target_videos))}")
     print(f"Model: {model_name} | classes: {len(effective_classes)}")
     print(f"Render video: {effective_render_video}")
     print(
@@ -1035,12 +1114,26 @@ def run(
             enable_candidate_branch=enable_candidate_branch,
         )
         if fast_cached_results is not None:
+            cached_prediction_rows: List[Dict[str, Any]] = []
+            for cached_result in fast_cached_results:
+                cached_prediction_rows.extend(
+                    _build_prediction_rows(
+                        cached_result.get("frames", []),
+                        video_id=str(cached_result.get("video_id", "")),
+                    )
+                )
+            _write_detection_charts_pdf(
+                effective_output_root / "detection_results.pdf",
+                cached_prediction_rows,
+                _build_class_summary_rows(cached_prediction_rows),
+                _build_video_summary_rows(fast_cached_results),
+            )
             mode_label = "validated cache" if check_cache else "unchecked manifest cache"
             print(
                 f"Cache fast path ({mode_label}): "
                 f"reusing manifest-backed detection cache for {len(fast_cached_results)} videos"
             )
-            print(f"Step 1 complete: {_format_step_progress(len(fast_cached_results), len(target_videos))}")
+            print(f"Step 2 complete: {_format_step_progress(len(fast_cached_results), len(target_videos))}")
             print(f"Outputs: {manifest_path.parent}")
             return fast_cached_results
 
@@ -1086,25 +1179,11 @@ def run(
     video_results: List[Dict[str, Any]] = []
     try:
         total_videos = len(target_videos)
-        for index, video_id in enumerate(target_videos, start=1):
-            result = process_video(
-                video_id=video_id,
-                detector=detector,
-                od_calibration_policy=resolved_calibration_policy,
-                background_rule_relevance_prior_results=background_rule_relevance_prior_results,
-                frames_root=effective_frames_root,
-                output_root=effective_output_root,
-                force_recompute=force_recompute,
-                render_video=effective_render_video,
-                check_cache=check_cache,
-                enable_candidate_branch=enable_candidate_branch,
-            )
-            if (
-                bool(result.get("_requires_detection", False))
-            ):
+        with tqdm(total=total_videos, desc="Detection videos", unit="video", dynamic_ncols=True) as progress:
+            for video_id in target_videos:
                 result = process_video(
                     video_id=video_id,
-                    detector=_ensure_detector(),
+                    detector=detector,
                     od_calibration_policy=resolved_calibration_policy,
                     background_rule_relevance_prior_results=background_rule_relevance_prior_results,
                     frames_root=effective_frames_root,
@@ -1114,9 +1193,23 @@ def run(
                     check_cache=check_cache,
                     enable_candidate_branch=enable_candidate_branch,
                 )
-            video_results.append(result)
-            cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
-            print(f"Progress: {_format_step_progress(index, total_videos)} | {video_id} | {cache_tag}")
+                if bool(result.get("_requires_detection", False)):
+                    result = process_video(
+                        video_id=video_id,
+                        detector=_ensure_detector(),
+                        od_calibration_policy=resolved_calibration_policy,
+                        background_rule_relevance_prior_results=background_rule_relevance_prior_results,
+                        frames_root=effective_frames_root,
+                        output_root=effective_output_root,
+                        force_recompute=force_recompute,
+                        render_video=effective_render_video,
+                        check_cache=check_cache,
+                        enable_candidate_branch=enable_candidate_branch,
+                    )
+                video_results.append(result)
+                cache_tag = "cached" if bool(result.get("from_cache", False)) else "done"
+                progress.set_postfix_str(f"{video_id} | {cache_tag}", refresh=False)
+                progress.update(1)
     finally:
         if detector is not None:
             detector.teardown()
@@ -1174,6 +1267,7 @@ def run(
             "detection_predictions_csv": str(effective_output_root / "detection_predictions.csv"),
             "detection_class_summary_csv": str(effective_output_root / "detection_class_summary.csv"),
             "detection_video_summary_csv": str(effective_output_root / "detection_video_summary.csv"),
+            "detection_results_pdf": str(effective_output_root / "detection_results.pdf"),
         },
     }
     aggregate_predictions_csv_path = effective_output_root / "detection_predictions.csv"
@@ -1194,10 +1288,16 @@ def run(
         _VIDEO_SUMMARY_CSV_FIELDS,
         video_summary_rows,
     )
+    _write_detection_charts_pdf(
+        effective_output_root / "detection_results.pdf",
+        all_prediction_rows,
+        aggregate_class_summary_rows,
+        video_summary_rows,
+    )
     with manifest_path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
 
-    print(f"Step 1 complete: {_format_step_progress(len(video_results), len(target_videos))}")
+    print(f"Step 2 complete: {_format_step_progress(len(video_results), len(target_videos))}")
     print(f"Outputs: {manifest_path.parent}")
     print(
         f"Detections: {manifest['num_detections_total']} accepted + "

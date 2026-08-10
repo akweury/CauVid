@@ -1,20 +1,78 @@
 import os
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.exp_august import modules
 from src.exp_august import pipeline
+from src.exp_august.splits import create_split_manifest
 
 
 class ExpAugustPipelineTests(unittest.TestCase):
     def test_public_pipeline_has_only_paper_one_stages(self):
         self.assertEqual(len(pipeline.PIPELINE_STEPS), 11)
+        self.assertEqual(len(pipeline.STEP_FUNCTION_NAMES), 11)
+        self.assertEqual(pipeline.STEP_FUNCTION_NAMES[1], "Object Detection")
         forbidden = ("target", "rule", "causal")
         for name in pipeline.PIPELINE_STEPS:
             self.assertFalse(any(token in name for token in forbidden), name)
         self.assertEqual(pipeline.PIPELINE_STEPS[-1], "symbolic_scene_representation")
+
+    def test_nested_logs_are_suppressed_by_the_public_step_progress(self):
+        output = StringIO()
+        with patch("sys.stdout", output), patch("sys.stderr", output):
+            result = pipeline._tracked(
+                pipeline._NullTracker(),
+                "04_3d_trajectory_construction",
+                lambda: (print("[step 6] positions"), {"videos": ["v1"]})[1],
+            )
+        self.assertEqual(result["videos"], ["v1"])
+        self.assertIn("Step 4 Trajectories", output.getvalue())
+        self.assertNotIn("step 6", output.getvalue().lower())
+        self.assertLessEqual(len([line for line in output.getvalue().splitlines() if line.strip()]), 4)
+
+    def test_detection_device_summary_is_compact(self):
+        with patch("platform.processor", return_value="Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz"):
+            summary = pipeline._detection_device_summary({"detection_args": {"device": "cpu"}})
+        self.assertEqual(summary, "Device: CPU | Intel Xeon Gold 6338 CPU @ 2.00GHz")
+        self.assertLessEqual(len(summary.split(" | ")[1]), 48)
+
+    def test_real_video_tqdm_is_forwarded_instead_of_stage_one_of_one(self):
+        output = StringIO()
+        stream = pipeline._SelectedTqdmStream(output, ((r".*", "Step 4 Trajectories"),))
+        stream.write("[step 6] positions_3d:  70%|#######   | 7/10 [00:07<00:03]")
+        stream.write("\r[step 6] positions_3d: 100%|##########| 10/10 [00:10<00:00]\n")
+        stream.write("another nested bar: 100%|##########| 3/3\n")
+        self.assertTrue(stream.saw_progress)
+        self.assertIn("10/10", output.getvalue())
+        self.assertIn("Step 4 Trajectories: 100%", output.getvalue())
+        self.assertNotIn("step 6", output.getvalue().lower())
+        self.assertNotIn("3/3", output.getvalue())
+
+    def test_step5_forwards_exactly_three_canonical_mini_step_bars(self):
+        output = StringIO()
+        stream = pipeline._SelectedTqdmStream(
+            output,
+            (
+                (r"\[step 7\]\s*ego_motion", "Step 5a Ego Motion"),
+                (r"\[step 7a\]\s*axis_threshold_segmentation", "Step 5b Axis Threshold Segmentation"),
+                (r"\[step 7b\]\s*consensus_merge", "Step 5c Axis Consensus Segmentation"),
+            ),
+        )
+        for description in (
+            "[step 7] ego_motion",
+            "[step 7a] axis_threshold_segmentation",
+            "[step 7a] eval visualizations",
+            "[step 7b] consensus_merge",
+        ):
+            stream.write(f"{description}: 100%|##########| 10/10\n")
+        text = output.getvalue()
+        self.assertIn("Step 5a Ego Motion: 100%", text)
+        self.assertIn("Step 5b Axis Threshold Segmentation: 100%", text)
+        self.assertIn("Step 5c Axis Consensus Segmentation: 100%", text)
+        self.assertNotIn("eval visualizations", text)
 
     def test_runner_executes_eleven_coherent_modules_in_order(self):
         calls = []
@@ -53,6 +111,63 @@ class ExpAugustPipelineTests(unittest.TestCase):
         self.assertIs(result, first)
         detection.assert_not_called()
 
+    def test_dataset_selection_is_seeded_and_defaults_to_first_generated_seed(self):
+        available = ["video_c", "video_a", "video_d", "video_b"]
+        expected_manifest = create_split_manifest(available, 2, modules.DATA_SELECTION_SEEDS[0])
+        expected = [
+            video_id
+            for name in ("train", "eval", "test")
+            for video_id in expected_manifest[f"{name}_video_ids"]
+        ]
+        july = Mock()
+        july.step1_init.return_value = {"videos": expected}
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"CAUVID_PIPELINE_OUTPUT_PATH": tmp}
+        ), patch.object(modules.config, "get_mini_video_ids", return_value=available), patch.object(
+            modules, "_july", return_value=july
+        ):
+            result = modules.dataset_initialization(video_count=2)
+
+        july.step1_init.assert_called_once_with(video_ids=expected, video_count=None)
+        self.assertEqual(result["data_selection"]["seed"], modules.DATA_SELECTION_SEEDS[0])
+        self.assertEqual(result["data_selection"]["available_seeds"], list(modules.DATA_SELECTION_SEEDS))
+        self.assertEqual(result["data_split_manifest"]["counts"], {"train": 2, "eval": 0, "test": 0})
+
+    def test_explicit_video_ids_are_not_reordered(self):
+        july = Mock()
+        july.step1_init.return_value = {"videos": ["video_b"]}
+        july.step7_train_eval_split.side_effect = lambda state: state
+        with patch.object(modules, "_july", return_value=july):
+            result = modules.dataset_initialization(["video_b", "video_a"], 1, seed=930241)
+        july.step1_init.assert_called_once_with(video_ids=["video_b", "video_a"], video_count=1)
+        self.assertEqual(result["data_selection"]["method"], "explicit_video_ids")
+
+    def test_step1_creates_august_output_root_on_a_fresh_machine(self):
+        july = Mock()
+        july.step1_init.return_value = {"videos": ["video-a"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing" / "pipeline_august"
+            with patch.dict(
+                os.environ, {"CAUVID_PIPELINE_OUTPUT_PATH": str(root)}
+            ), patch.object(modules.config, "get_mini_video_ids", return_value=["video-a"]), patch.object(
+                modules, "_july", return_value=july
+            ):
+                modules.dataset_initialization(video_count=1)
+            self.assertTrue(root.is_dir())
+            self.assertTrue((root / "data_split_manifest.json").is_file())
+
+    def test_native_output_is_isolated_by_scale_and_seed(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True), patch.object(
+            modules.config, "get_output_path", return_value=Path(tmp)
+        ):
+            debug = modules.get_august_output_root(10, 726381)
+            small = modules.get_august_output_root(100, 184957)
+            full = modules.get_august_output_root(961, 930241)
+        self.assertEqual(debug, Path(tmp) / "pipeline_august" / "debug" / "seed_726381")
+        self.assertEqual(small, Path(tmp) / "pipeline_august" / "small" / "seed_184957")
+        self.assertEqual(full, Path(tmp) / "pipeline_august" / "full" / "seed_930241")
+
     def test_output_environment_is_scoped_and_restored(self):
         observed = {}
 
@@ -79,8 +194,15 @@ class ExpAugustPipelineTests(unittest.TestCase):
 
         self.assertEqual(result["ego_motion_module_status"], "completed")
         self.assertNotIn("step7_status", result)
-        july.step7a_axis_threshold_segmentation.assert_called_once()
-        july.step7b_optimal_segmentation_selection.assert_called_once_with(axis)
+        july.step7a_axis_threshold_segmentation.assert_called_once_with(
+            state,
+            render_candidate_filter_comparisons=False,
+            output_subdir="05b_ego_axis_threshold_segmentation",
+        )
+        july.step7b_optimal_segmentation_selection.assert_called_once_with(
+            axis,
+            output_subdir="05c_ego_axis_consensus_segmentation",
+        )
 
     def test_refinement_diagnostics_are_optional(self):
         state = {"videos": ["v1"]}
@@ -97,11 +219,32 @@ class ExpAugustPipelineTests(unittest.TestCase):
             "step8k_trajectory_handoff",
         ):
             getattr(july, name).return_value = state
-        with patch.object(modules, "_july", return_value=july):
+        with patch.dict(os.environ, {}, clear=True), patch.object(modules, "_july", return_value=july):
             modules.trajectory_refinement(state)
         july.step8h_trajectory_repair_visualization.assert_not_called()
         july.step8i_trajectory_audit_dashboard.assert_not_called()
         july.step8j_trajectory_provenance_audit.assert_not_called()
+        clustering_generator = july.step8c_trajectory_clustering.call_args.kwargs["llm_generate"]
+        repair_generator = july.step8d_closed_loop_trajectory_repair.call_args.kwargs["llm_generate"]
+        self.assertIs(clustering_generator, modules._offline_refinement_generator)
+        self.assertIs(repair_generator, modules._offline_refinement_generator)
+
+    def test_refinement_uses_openai_backend_when_key_is_configured(self):
+        state = {"videos": ["v1"]}
+        july = Mock()
+        for name in (
+            "step8_trajectory_repair", "step8a_relative_object_motion", "step8b_signal_evidence",
+            "step8c_trajectory_clustering", "step8d_closed_loop_trajectory_repair",
+            "step8e_repaired_trajectory_validation", "step8f_trajectory_statistics",
+            "step8g_repaired_track_materialization", "step8k_trajectory_handoff",
+        ):
+            getattr(july, name).return_value = state
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "configured"}), patch.object(
+            modules, "_july", return_value=july
+        ):
+            result = modules.trajectory_refinement(state)
+        self.assertIsNone(july.step8c_trajectory_clustering.call_args.kwargs["llm_generate"])
+        self.assertEqual(result["trajectory_refinement_llm_backend"], "openai")
 
     def test_symbolic_output_contains_evaluation_and_traceability_handoffs(self):
         symbolic = [{"video_id": "v1", "num_segments": 2, "num_atoms": 7}]

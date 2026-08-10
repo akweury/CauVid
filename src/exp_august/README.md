@@ -16,29 +16,64 @@ Run these commands from the repository root. `d3.sh` uses the same command
 style as the July `d2.sh` launcher, but runs only `exp_august` and writes to a
 separate August output directory.
 
+Standard runs are isolated by scale and seed:
+
+```text
+pipeline_august/
+  debug/seed_726381/   # 10 videos
+  debug/seed_184957/
+  debug/seed_930241/
+  small/seed_.../      # 100 videos per seed
+  full/seed_.../       # 961 videos per seed
+  custom_N/seed_.../   # explicit --data N runs
+```
+
+Each run directory contains that run's pipeline artifacts and its own
+`evaluation/` directory. If `CAUVID_AUGUST_EVALUATION_HOST` is set, the same
+`<scale>/seed_<value>/` hierarchy is created below that evaluation root.
+On the first run, `data_split_manifest.json` records a deterministic 70/15/15
+train/eval/test partition. The manifest is authoritative on reruns: the same
+scale and seed reuse exactly the same video IDs, and missing videos or a
+seed/count mismatch produce an error instead of silently changing the split.
+Test videos are selected exclusively from valid segment annotations under
+`annotations/` (override with `CAUVID_ANNOTATIONS_PATH`). If fewer annotated
+videos exist than the nominal 15% test target, all available annotated videos
+are used for test, eval remains 15%, and the remainder is assigned to train.
+The manifest records both requested and realized counts.
+
+Step 5 uses the canonical nested sequence
+`05_ego_motion_abstraction/05a_ego_motion/`,
+`05_ego_motion_abstraction/05b_ego_axis_threshold_segmentation/`, and
+`05_ego_motion_abstraction/05c_ego_axis_consensus_segmentation/`.
+
 ```bash
 # Show all options
 ./d3.sh --help
 
-# Run all 11 stages with the default data selection and all GPUs
+# Run the default debug scale (10 videos), seed 1, on all GPUs
 ./d3.sh
 
-# Run 10 videos through Step 11 on GPU 0
-./d3.sh run --gpu 0 --step 11 --data 10
+# Run the three standard scales
+./d3.sh run --gpu 0 --scale debug # 10 videos
+./d3.sh run --gpu 0 --scale small # 100 videos
+./d3.sh run --gpu 0 --scale full  # 961 videos
 
-# --video-count is an alias for --data
-./d3.sh run --gpu 0 --step 11 --video-count 10
+# Each scale supports seed indexes 1-3 (726381, 184957, 930241)
+./d3.sh run --gpu 0 --scale small --seed 2
+
+# --data selects a custom scale; --video-count is an alias
+./d3.sh run --gpu 0 --data 25 --seed 3
 
 # Stop after temporal video segmentation
-./d3.sh run --gpu 0 --step 8 --data 10
+./d3.sh run --gpu 0 --step 8 --scale debug
 
 # Run the pipeline and immediately evaluate its test split
 ./d3.sh run --gpu 0 --step 8 \
-  --evaluate --split test --seed 20260809 \
+  --scale debug --evaluate --split test --seed 1 \
   --test-ratio 0.2 --tolerances 1,3,5,10
 
 # Evaluate existing cached August predictions without rerunning the pipeline
-./d3.sh evaluate --split test --seed 20260809 \
+./d3.sh evaluate --scale debug --split test --seed 1 \
   --test-ratio 0.2 --tolerances 1,3,5,10
 
 # Generate optional trajectory visualizations, dashboards, and audits
@@ -103,7 +138,8 @@ before invoking `d3.sh`. The launcher forwards these variables into the
 container without embedding their values in the script.
 
 Its default artifacts are written below the configured pipeline output at
-`exp_august/`. Pass `--output-root PATH` (or set
+`output/pipeline_august/<scale>/seed_<seed>/`. Step 1 creates the complete run
+directory recursively when it does not exist. Pass `--output-root PATH` (or set
 `CAUVID_AUGUST_OUTPUT_PATH`) to isolate a particular run. The runner scopes
 July's `CAUVID_PIPELINE_OUTPUT_PATH` internally and restores it afterward.
 
@@ -117,6 +153,13 @@ Evaluation consumers should use `temporal_segments` for boundary/label metrics
 and `symbolic_scene_representation` (plus `ego_motion` and
 `segment_object_motion`) for symbolic metrics. `exp_august_traceability.json`
 records the cross-module lineage and preserved confidence/provenance fields.
+
+Step 8 automatically evaluates its annotated test partition and writes a
+single-page subplot report to
+`08_temporal_video_segmentation/evaluation/test/step_08_test_evaluation_charts.pdf`.
+Coverage and aggregate scalar results are presented as tables; boundary
+performance, per-class F1, and the confusion matrix are presented as charts.
+The same directory contains the JSON and CSV evaluation artifacts.
 
 ## Video-segmentation evaluation
 
@@ -135,10 +178,10 @@ python -m src.exp_august.evaluation \
   --tolerances 1 3 5 10
 ```
 
-Use `--split dev` for parameter development. The deterministic split manifest
-is saved with every evaluation; its test IDs are explicitly evaluation-only.
-`--split all` is available for descriptive whole-dataset reporting, not model
-selection.
+Use `--split eval` for parameter development (`dev` remains a compatibility
+alias). The run-level deterministic manifest is reused by every evaluation;
+its test IDs are explicitly evaluation-only. `--split all` is available for
+descriptive whole-dataset reporting, not model selection.
 
 The annotations use raw-video frames while August predictions use the prepared
 lower-rate timeline. The adapter maps prediction intervals onto the annotated

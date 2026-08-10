@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
+import re
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Callable
+
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import config
 from src.exp_august import modules
 
 
@@ -32,6 +35,20 @@ PIPELINE_STEPS = (
     "symbolic_scene_representation",
 )
 
+STEP_FUNCTION_NAMES = (
+    "Initialization",
+    "Object Detection",
+    "Tracking",
+    "Trajectories",
+    "Egomotion",
+    "Refinement",
+    "Relativity",
+    "Segmentation",
+    "Abstraction",
+    "Selection",
+    "Symbolization",
+)
+
 
 class _NullTracker:
     def log_state(self, _name, state, **_kwargs):
@@ -44,18 +61,113 @@ class _NullTracker:
         return None
 
 
-def _tracked(tracker, name: str, operation: Callable):
+class _SelectedTqdmStream:
+    """Forward selected real nested tqdm bars with canonical public labels."""
+
+    def __init__(self, stream, specifications):
+        self.stream = stream
+        self.specifications = list(specifications)
+        self.used = set()
+        self.active = False
+        self.active_index = None
+        self.active_label = None
+        self.saw_progress = False
+
+    def write(self, value):
+        if not self.active:
+            if not re.search(r"\d+%\|.*\|\s*\d+/\d+", value):
+                return len(value)
+            description = re.split(r"\s*\d+%\|", value.lstrip("\r"), maxsplit=1)[0].strip()
+            selected = next(
+                (
+                    (index, label)
+                    for index, (pattern, label) in enumerate(self.specifications)
+                    if index not in self.used and re.search(pattern, description, flags=re.IGNORECASE)
+                ),
+                None,
+            )
+            if selected is None:
+                return len(value)
+            self.active_index, self.active_label = selected
+            self.active = True
+            self.saw_progress = True
+        value = re.sub(
+            r"(^|\r)[^\r\n]*?:\s*(?=\d+%\|)",
+            lambda match: f"{match.group(1)}{self.active_label}: ",
+            value,
+        )
+        written = self.stream.write(value)
+        if "\n" in value:
+            self.used.add(self.active_index)
+            self.active = False
+            self.active_index = None
+            self.active_label = None
+        return written
+
+    def flush(self):
+        return self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def _short_device_model(value: str, fallback: str) -> str:
+    model = " ".join(str(value or "").replace("NVIDIA", "").replace("(R)", "").split()).strip()
+    model = re.sub(r"\s+Family\s+\d+\s+Model\s+\d+\s+Stepping\s+\d+.*$", "", model, flags=re.IGNORECASE)
+    model = model.replace("AuthenticAMD", "").replace("GenuineIntel", "").strip(" ,")
+    return (model or fallback)[:48]
+
+
+def _detection_device_summary(state: dict) -> str:
+    requested = str((state.get("detection_args") or {}).get("device", "cpu")).lower()
+    if requested != "cpu":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return f"Device: GPU | {_short_device_model(torch.cuda.get_device_name(0), 'CUDA')}"
+        except (ImportError, RuntimeError):
+            pass
+    cpu_model = platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "CPU")
+    return f"Device: CPU | {_short_device_model(cpu_model, 'CPU')}"
+
+
+def _tracked(tracker, name: str, operation: Callable, detail: str | None = None):
+    step_number = int(name.split("_", 1)[0])
+    step_label = f"Step {step_number} {STEP_FUNCTION_NAMES[step_number - 1]}"
+    print(f"\n\n{'-' * 72}", flush=True)
+    print(step_label, flush=True)
+    if detail:
+        print(detail, flush=True)
     started = time.perf_counter()
+    progress_specs = (
+        (
+            (r"\[step 7\]\s*ego_motion", "Step 5a Ego Motion"),
+            (r"\[step 7a\]\s*axis_threshold_segmentation", "Step 5b Axis Threshold Segmentation"),
+            (r"\[step 7b\]\s*consensus_merge", "Step 5c Axis Consensus Segmentation"),
+        )
+        if step_number == 5
+        else ((r".*", step_label),)
+    )
+    progress_stream = _SelectedTqdmStream(sys.stderr, progress_specs)
     try:
-        state = operation()
+        with open(os.devnull, "w", encoding="utf-8") as quiet:
+            with redirect_stdout(quiet), redirect_stderr(progress_stream):
+                state = operation()
         if not isinstance(state, dict):
             raise TypeError(f"{name} returned {type(state).__name__}; expected dict")
         if not state.get("videos"):
             raise RuntimeError(f"{name} produced no videos")
+        if not progress_stream.saw_progress:
+            video_count = len(state.get("videos", []))
+            with tqdm(total=video_count, desc=step_label, unit="video", dynamic_ncols=True, leave=True) as progress:
+                progress.update(video_count)
     except BaseException as exc:
         tracker.log_failure(name, exc, duration_seconds=time.perf_counter() - started)
+        print(f"FAILED: {exc}", flush=True)
         raise
-    return tracker.log_state(name, state, duration_seconds=time.perf_counter() - started)
+    duration = time.perf_counter() - started
+    return tracker.log_state(name, state, duration_seconds=duration)
 
 
 @contextmanager
@@ -77,6 +189,7 @@ def run_pipeline(
     *,
     video_ids=None,
     video_count=None,
+    seed: int = modules.DEFAULT_DATA_SELECTION_SEED,
     max_step: int = 11,
     output_root: Path | str | None = None,
     diagnostics: bool = False,
@@ -95,22 +208,26 @@ def run_pipeline(
     root = (
         Path(output_root)
         if output_root is not None
-        else Path(
-            os.environ.get(
-                "CAUVID_AUGUST_OUTPUT_PATH",
-                config.get_output_path("pipeline_output") / "exp_august",
-            )
-        )
+        else modules.get_august_output_root(video_count, seed)
     )
     root = root.expanduser().absolute()
     root.mkdir(parents=True, exist_ok=True)
     tracker = tracker or _NullTracker()
 
     with _august_output_environment(root):
-        state = _tracked(tracker, "01_dataset_initialization", lambda: modules.dataset_initialization(video_ids, video_count))
+        state = _tracked(
+            tracker,
+            "01_dataset_initialization",
+            lambda: modules.dataset_initialization(video_ids, video_count, seed),
+        )
         if max_step == 1:
             return state
-        state = _tracked(tracker, "02_object_detection", lambda: modules.object_detection(state))
+        state = _tracked(
+            tracker,
+            "02_object_detection",
+            lambda: modules.object_detection(state),
+            detail=_detection_device_summary(state),
+        )
         if max_step == 2:
             return state
         state = _tracked(tracker, "03_object_tracking", lambda: modules.object_tracking(state))
@@ -163,6 +280,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="Run the exp_august Paper-1 pipeline")
     parser.add_argument("--video-ids", nargs="*", default=None)
     parser.add_argument("--video-count", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=modules.DEFAULT_DATA_SELECTION_SEED)
     parser.add_argument("--max-step", type=int, choices=range(1, 12), default=11)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--diagnostics", action="store_true", help="Run optional July visualization/dashboard/provenance audits")
@@ -175,6 +293,7 @@ if __name__ == "__main__":
     result = main(
         video_ids=args.video_ids,
         video_count=args.video_count,
+        seed=args.seed,
         max_step=args.max_step,
         output_root=args.output_root,
         diagnostics=args.diagnostics,

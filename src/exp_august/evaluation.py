@@ -774,8 +774,8 @@ def evaluate_dataset(
     annotations_path = Path(annotations_root)
     prediction_path = Path(predictions_root)
     output_path = Path(output_root)
-    if split not in {"dev", "test", "all"}:
-        raise ValueError("split must be dev, test, or all")
+    if split not in {"train", "eval", "dev", "test", "all"}:
+        raise ValueError("split must be train, eval, dev, test, or all")
     tolerances = tuple(sorted({int(value) for value in tolerances if int(value) >= 0}))
     if not tolerances:
         raise ValueError("at least one non-negative boundary tolerance is required")
@@ -791,8 +791,32 @@ def evaluate_dataset(
         else:
             valid_annotations[timeline.video_id] = timeline
 
-    assignments = deterministic_split(list(valid_annotations), seed, test_ratio)
-    selected_ids = sorted(valid_annotations) if split == "all" else assignments[split]
+    persisted_manifest_path = prediction_path / "data_split_manifest.json"
+    persisted_manifest = None
+    if persisted_manifest_path.is_file():
+        persisted_manifest = json.loads(persisted_manifest_path.read_text(encoding="utf-8"))
+        if int(persisted_manifest.get("seed", -1)) != int(seed):
+            raise ValueError(
+                f"Evaluation seed {seed} does not match run manifest seed "
+                f"{persisted_manifest.get('seed')}"
+            )
+        assignments = {
+            name: sorted(
+                video_id
+                for video_id in persisted_manifest.get(f"{name}_video_ids", [])
+                if video_id in valid_annotations
+            )
+            for name in ("train", "eval", "test")
+        }
+        selected_ids = (
+            sorted({video_id for values in assignments.values() for video_id in values})
+            if split == "all"
+            else assignments["eval" if split == "dev" else split]
+        )
+    else:
+        legacy_assignments = deterministic_split(list(valid_annotations), seed, test_ratio)
+        assignments = {"train": [], "eval": legacy_assignments["dev"], "test": legacy_assignments["test"]}
+        selected_ids = sorted(valid_annotations) if split == "all" else assignments["eval" if split == "dev" else split]
     predictions, invalid_predictions = discover_predictions(prediction_path)
     matched_ids = [video_id for video_id in selected_ids if video_id in predictions]
     invalid_prediction_ids = {
@@ -810,12 +834,12 @@ def evaluate_dataset(
     ]
     per_video = [evaluate_video(valid_annotations[video_id], predictions[video_id], tolerances) for video_id in matched_ids]
     aggregate = _aggregate(per_video, tolerances)
-    split_manifest = {
+    split_manifest = persisted_manifest or {
         "version": 1,
         "method": "sha256(seed:video_id)_ordered_holdout",
         "seed": int(seed),
         "test_ratio": float(test_ratio),
-        "dev_video_ids": assignments["dev"],
+        "eval_video_ids": assignments["eval"],
         "test_video_ids": assignments["test"],
         "policy": "test IDs are evaluation-only and must not be used for threshold or parameter selection",
     }
@@ -880,7 +904,7 @@ def _parse_args():
     parser.add_argument("--predictions", type=Path, required=True, help="August output root, state JSON, or temporal_segmentation.json")
     parser.add_argument("--annotations", type=Path, default=_default_annotations())
     parser.add_argument("--output", type=Path, default=Path("evaluation/exp_august_video_segmentation"))
-    parser.add_argument("--split", choices=("dev", "test", "all"), default="test")
+    parser.add_argument("--split", choices=("train", "eval", "dev", "test", "all"), default="test")
     parser.add_argument("--seed", type=int, default=20260809)
     parser.add_argument("--test-ratio", type=float, default=0.2)
     parser.add_argument("--tolerances", type=int, nargs="+", default=list(DEFAULT_TOLERANCES))

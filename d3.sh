@@ -13,8 +13,10 @@ OUTPUT_ROOT="${CAUVID_OUTPUT_ROOT:-/storage-01/ml-jsha/storage/CauVid_output}"
 RAW_DATASET="${CAUVID_RAW_DRIVING_DATASET:-$STORAGE_ROOT/driving-video-with-object-tracking}"
 DRIVING_MINI="${CAUVID_DRIVING_MINI_HOST:-$STORAGE_ROOT/driving_mini}"
 NUSCENES="${CAUVID_NUSCENES_HOST:-$STORAGE_ROOT/nuScenes}"
-PIPELINE_OUTPUT="${CAUVID_OUTPUT_AUGUST_HOST:-$OUTPUT_ROOT/pipeline_august}"
-EVALUATION_OUTPUT="${CAUVID_AUGUST_EVALUATION_HOST:-$PIPELINE_OUTPUT/evaluation}"
+PIPELINE_OUTPUT_BASE="${CAUVID_OUTPUT_AUGUST_HOST:-$OUTPUT_ROOT/pipeline_august}"
+EVALUATION_OUTPUT_BASE="${CAUVID_AUGUST_EVALUATION_HOST:-}"
+PIPELINE_OUTPUT="$PIPELINE_OUTPUT_BASE"
+EVALUATION_OUTPUT="$PIPELINE_OUTPUT/evaluation"
 OUTPUT_DIR="${CAUVID_OUTPUT_HOST:-$OUTPUT_ROOT/output}"
 LOGS_DIR="${CAUVID_LOGS_HOST:-$OUTPUT_ROOT/logs}"
 TORCH_CACHE="${CAUVID_TORCH_CACHE_HOST:-$STORAGE_ROOT/.cache/torch}"
@@ -45,17 +47,44 @@ usage() {
   echo "Run options:"
   echo "  --gpu ID                GPU device ID or 'all'"
   echo "  --step N                Last August step to run (1-11, default: 11)"
-  echo "  --data N                Number of videos (alias: --video-count)"
+  echo "  --scale NAME            debug=10, small=100, full=961 (default: debug)"
+  echo "  --data N                Custom video count (alias: --video-count)"
+  echo "  --seed N                Seed value or index 1, 2, 3 (default: 1)"
   echo "  --diagnostics           Enable optional visualization/dashboard audits"
   echo "  --render-candidate-filter-comparisons"
   echo "  --evaluate              Evaluate predictions after the pipeline finishes"
   echo ""
   echo "Evaluation options:"
-  echo "  --split NAME            dev, test, or all (default: test)"
-  echo "  --seed N                Deterministic split seed (default: 20260809)"
+  echo "  --scale NAME            Select the matching run output"
+  echo "  --split NAME            train, eval, test, or all (default: test)"
+  echo "  Seeds:                  1=726381, 2=184957, 3=930241"
   echo "  --test-ratio R          Test fraction (default: 0.2)"
   echo "  --tolerances LIST       Comma-separated frame tolerances (default: 1,3,5,10)"
   echo "  CAUVID_AUGUST_EVALUATION_HOST overrides the host evaluation output root"
+}
+
+resolve_seed() {
+  case "$1" in
+    1) echo "726381" ;;
+    2) echo "184957" ;;
+    3) echo "930241" ;;
+    726381|184957|930241) echo "$1" ;;
+    *)
+      echo "[d3][error] --seed must be 1, 2, 3, or one of 726381, 184957, 930241" >&2
+      return 1
+      ;;
+  esac
+}
+
+configure_run_output() {
+  local scale="$1"
+  local seed="$2"
+  PIPELINE_OUTPUT="$PIPELINE_OUTPUT_BASE/$scale/seed_$seed"
+  if [[ -n "$EVALUATION_OUTPUT_BASE" ]]; then
+    EVALUATION_OUTPUT="$EVALUATION_OUTPUT_BASE/$scale/seed_$seed"
+  else
+    EVALUATION_OUTPUT="$PIPELINE_OUTPUT/evaluation"
+  fi
 }
 
 ensure_image() {
@@ -138,6 +167,7 @@ run_container() {
   local max_step="${2:-11}"
   local diagnostics="${3:-0}"
   local render_comparisons="${4:-0}"
+  local seed="${5:-726381}"
   runtime_env_args
   docker_mount_args
 
@@ -170,9 +200,10 @@ run_container() {
     -e EXP_AUGUST_MAX_STEP="$max_step" \
     -e EXP_AUGUST_DIAGNOSTICS="$diagnostics" \
     -e EXP_AUGUST_RENDER_COMPARISONS="$render_comparisons" \
+    -e EXP_AUGUST_DATA_SEED="$seed" \
     --name "$CONTAINER_NAME" \
     "$IMAGE_NAME" \
-    sh -lc 'python -c "import os; from src.exp_august.pipeline import main; count=os.getenv(\"EXP_AUGUST_VIDEO_COUNT\", \"\"); main(video_count=int(count) if count else None, max_step=int(os.getenv(\"EXP_AUGUST_MAX_STEP\", \"11\")), diagnostics=os.getenv(\"EXP_AUGUST_DIAGNOSTICS\", \"0\") == \"1\", render_candidate_filter_comparisons=os.getenv(\"EXP_AUGUST_RENDER_COMPARISONS\", \"0\") == \"1\")"'
+    sh -lc 'python -c "import os; from src.exp_august.pipeline import main; count=os.getenv(\"EXP_AUGUST_VIDEO_COUNT\", \"\"); main(video_count=int(count) if count else None, seed=int(os.getenv(\"EXP_AUGUST_DATA_SEED\", \"726381\")), max_step=int(os.getenv(\"EXP_AUGUST_MAX_STEP\", \"11\")), diagnostics=os.getenv(\"EXP_AUGUST_DIAGNOSTICS\", \"0\") == \"1\", render_candidate_filter_comparisons=os.getenv(\"EXP_AUGUST_RENDER_COMPARISONS\", \"0\") == \"1\")"'
 }
 
 evaluate_container() {
@@ -241,13 +272,15 @@ set_gpu() {
 
 main() {
   local cmd="${1:-run}"
-  local video_count=""
+  local data_scale="debug"
+  local video_count="10"
+  local custom_data="0"
   local max_step="11"
   local diagnostics="0"
   local render_comparisons="0"
   local evaluate_after_run="0"
   local evaluation_split="test"
-  local evaluation_seed="20260809"
+  local evaluation_seed="726381"
   local evaluation_test_ratio="0.2"
   local evaluation_tolerances="1,3,5,10"
 
@@ -270,6 +303,12 @@ main() {
             ;;
           --data|--video-count)
             video_count="${2:?missing video count}"
+            custom_data="1"
+            shift 2
+            ;;
+          --scale)
+            data_scale="${2:?missing data scale}"
+            custom_data="0"
             shift 2
             ;;
           --diagnostics)
@@ -311,12 +350,26 @@ main() {
         echo "[d3][error] --step must be an integer from 1 through 11" >&2
         exit 1
       fi
+      case "$data_scale" in
+        debug) [[ "$custom_data" == "1" ]] || video_count="10" ;;
+        small) [[ "$custom_data" == "1" ]] || video_count="100" ;;
+        full) [[ "$custom_data" == "1" ]] || video_count="961" ;;
+        *) echo "[d3][error] --scale must be debug, small, or full" >&2; exit 1 ;;
+      esac
+      if ! [[ "$video_count" =~ ^[1-9][0-9]*$ ]]; then
+        echo "[d3][error] --data must be a positive integer" >&2
+        exit 1
+      fi
+      [[ "$custom_data" == "1" ]] && data_scale="custom_${video_count}"
+      evaluation_seed="$(resolve_seed "$evaluation_seed")"
+      configure_run_output "$data_scale" "$evaluation_seed"
+      echo "[d3] run scale=$data_scale videos=$video_count seed=$evaluation_seed output=$PIPELINE_OUTPUT"
       if [[ "$evaluate_after_run" == "1" && "$max_step" -lt 8 ]]; then
         echo "[d3][error] --evaluate requires --step 8 or later" >&2
         exit 1
       fi
-      if [[ ! "$evaluation_split" =~ ^(dev|test|all)$ ]]; then
-        echo "[d3][error] --split must be dev, test, or all" >&2
+      if [[ ! "$evaluation_split" =~ ^(train|eval|dev|test|all)$ ]]; then
+        echo "[d3][error] --split must be train, eval, test, or all" >&2
         exit 1
       fi
       if [[ ! "$evaluation_tolerances" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
@@ -327,7 +380,7 @@ main() {
       validate_driving_mini
       [[ "$evaluate_after_run" == "1" ]] && validate_annotations
       ensure_image
-      run_container "$video_count" "$max_step" "$diagnostics" "$render_comparisons"
+      run_container "$video_count" "$max_step" "$diagnostics" "$render_comparisons" "$evaluation_seed"
       if [[ "$evaluate_after_run" == "1" ]]; then
         evaluate_container "$evaluation_split" "$evaluation_seed" "$evaluation_test_ratio" "$evaluation_tolerances"
       fi
@@ -336,6 +389,10 @@ main() {
       shift || true
       while [[ $# -gt 0 ]]; do
         case "$1" in
+          --scale)
+            data_scale="${2:?missing data scale}"
+            shift 2
+            ;;
           --split)
             evaluation_split="${2:?missing evaluation split}"
             shift 2
@@ -359,10 +416,17 @@ main() {
             ;;
         esac
       done
-      if [[ ! "$evaluation_split" =~ ^(dev|test|all)$ ]]; then
-        echo "[d3][error] --split must be dev, test, or all" >&2
+      if [[ ! "$evaluation_split" =~ ^(train|eval|dev|test|all)$ ]]; then
+        echo "[d3][error] --split must be train, eval, test, or all" >&2
         exit 1
       fi
+      if ! [[ "$data_scale" =~ ^(debug|small|full|custom_[1-9][0-9]*)$ ]]; then
+        echo "[d3][error] --scale must be debug, small, full, or custom_N" >&2
+        exit 1
+      fi
+      evaluation_seed="$(resolve_seed "$evaluation_seed")"
+      configure_run_output "$data_scale" "$evaluation_seed"
+      echo "[d3] evaluate scale=$data_scale seed=$evaluation_seed input=$PIPELINE_OUTPUT"
       if [[ ! "$evaluation_tolerances" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
         echo "[d3][error] --tolerances must be comma-separated non-negative integers" >&2
         exit 1

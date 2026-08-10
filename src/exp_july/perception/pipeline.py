@@ -3670,6 +3670,7 @@ def step7_train_eval_split(position_state, train_ratio=4, eval_ratio=1):
 def step7a_axis_threshold_segmentation(
     position_state,
     render_candidate_filter_comparisons=False,
+    output_subdir="07a_ego_axis_threshold_segmentation",
 ):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, materialize_enabled_candidates, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
@@ -3704,12 +3705,14 @@ def step7a_axis_threshold_segmentation(
     consensus_min_segment_length_vz = int(
         step7a_config.get("consensus_min_segment_length_vz", 6)
     )
-    output_root = get_pipeline_output_root() / "07a_ego_axis_threshold_segmentation"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "train").mkdir(parents=True, exist_ok=True)
     (output_root / "eval").mkdir(parents=True, exist_ok=True)
+    (output_root / "test").mkdir(parents=True, exist_ok=True)
     train_video_ids = set(str(value) for value in position_state.get("step7_train_video_ids", []))
     eval_video_ids = set(str(value) for value in position_state.get("step7_eval_video_ids", []))
+    test_video_ids = set(str(value) for value in position_state.get("step7_test_video_ids", []))
     visualized_eval_video_ids = set(
         sorted(eval_video_ids)[:visualization_max_eval_videos]
     )
@@ -3726,7 +3729,7 @@ def step7a_axis_threshold_segmentation(
             "consensus_min_segment_length_vx": consensus_min_segment_length_vx,
             "consensus_min_segment_length_vz": consensus_min_segment_length_vz,
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
-        data_split = "eval" if video_id in eval_video_ids else "train"
+        data_split = "test" if video_id in test_video_ids else ("eval" if video_id in eval_video_ids else "train")
         video_output_root = output_root / data_split / video_id
         path = video_output_root / "axis_threshold_segmentation.json"
         cached = None
@@ -3938,7 +3941,10 @@ def step7a_axis_threshold_segmentation(
 
 
 
-def step7b_optimal_segmentation_selection(step7a_state):
+def step7b_optimal_segmentation_selection(
+    step7a_state,
+    output_subdir="07b_ego_axis_consensus_segmentation",
+):
     """Merge Step 7A enabled candidates into one final sequence per axis."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import apply_semantic_candidate_confidence_correction, finalize_enabled_consensus, materialize_enabled_candidates, render_train_optimal_n_scatter, select_optimal_n_by_final_similarity
     from src.exp_july.perception.ego_axis_threshold_visualization import render_axis_segmentation_mp4
@@ -3949,7 +3955,7 @@ def step7b_optimal_segmentation_selection(step7a_state):
     semantic_penalty = float(config.get("semantic_opposite_transition_penalty", 0.5))
     candidate_results = list(step7a_state.get("ego_axis_threshold_segmentation", []))
     final_results = copy.deepcopy(candidate_results)
-    output_root = get_pipeline_output_root() / "07b_ego_axis_consensus_segmentation"
+    output_root = get_pipeline_output_root() / output_subdir
     output_root.mkdir(parents=True, exist_ok=True)
     eval_visualization_root = output_root / "eval_visualizations"
     eval_visualization_root.mkdir(parents=True, exist_ok=True)

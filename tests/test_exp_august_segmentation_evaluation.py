@@ -9,6 +9,7 @@ from src.exp_august.evaluation import deterministic_split
 from src.exp_august.evaluation import evaluate_dataset
 from src.exp_august.evaluation import evaluate_video
 from src.exp_august.evaluation import load_annotation
+from src.exp_august.evaluation_report import write_test_evaluation_pdf
 
 
 def timeline(video_id, num_frames, segments):
@@ -119,6 +120,7 @@ class ExpAugustSegmentationEvaluationTests(unittest.TestCase):
             (predictions / "temporal_segmentation.json").write_text(json.dumps(prediction), encoding="utf-8")
 
             results = evaluate_dataset(predictions, annotations, output, split="all", seed=3, test_ratio=0.5)
+            report = write_test_evaluation_pdf(results, output / "step_08_test_evaluation_charts.pdf")
 
             self.assertEqual(results["matching"]["valid_annotations"], 2)
             self.assertEqual(results["matching"]["invalid_annotations"], 1)
@@ -137,6 +139,8 @@ class ExpAugustSegmentationEvaluationTests(unittest.TestCase):
                 "split_manifest.json",
             ):
                 self.assertTrue((output / filename).is_file(), filename)
+            self.assertTrue(report.is_file())
+            self.assertGreater(report.stat().st_size, 1000)
 
 
 if __name__ == "__main__":

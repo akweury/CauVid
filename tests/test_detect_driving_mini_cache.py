@@ -26,6 +26,7 @@ class DetectDrivingMiniCacheTest(unittest.TestCase):
                     "feedback_bonus": 0.0,
                     "score_used_for_candidate_ranking": 0.95,
                     "accepted": True,
+                    "bbox": [10, 20, 50, 80],
                 }
             ],
             "candidate_detections": [
@@ -39,6 +40,7 @@ class DetectDrivingMiniCacheTest(unittest.TestCase):
                     "score_used_for_candidate_ranking": 0.22,
                     "accepted": False,
                     "candidate_source": "low_confidence",
+                    "bbox": [15, 25, 35, 65],
                 }
             ],
             "od_calibration": {
@@ -123,6 +125,29 @@ class DetectDrivingMiniCacheTest(unittest.TestCase):
             self.assertEqual(len(results), 1)
             ensure_runtime_mock.assert_not_called()
             detector_cls_mock.assert_not_called()
+            pdf_path = output_root / "detection_results.pdf"
+            self.assertTrue(pdf_path.is_file())
+            self.assertEqual(pdf_path.read_bytes()[:4], b"%PDF")
+
+    def test_detection_charts_pdf_contains_summary_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_path = Path(tmpdir) / "detection_results.pdf"
+            predictions = [
+                {"video_id": "video_a", "class_name": "car", "score": 0.9, "accepted": True},
+                {"video_id": "video_a", "class_name": "person", "score": 0.2, "accepted": False},
+            ]
+            classes = [
+                {"class_name": "car", "num_total_bboxes": 1, "num_accepted_bboxes": 1, "num_candidate_bboxes": 0},
+                {"class_name": "person", "num_total_bboxes": 1, "num_accepted_bboxes": 0, "num_candidate_bboxes": 1},
+            ]
+            videos = [
+                {"video_id": "video_a", "num_accepted_bboxes": 1, "num_candidate_bboxes": 1},
+            ]
+
+            detect_driving_mini._write_detection_charts_pdf(pdf_path, predictions, classes, videos)
+
+            self.assertTrue(pdf_path.is_file())
+            self.assertEqual(pdf_path.read_bytes()[:4], b"%PDF")
 
 
 if __name__ == "__main__":
