@@ -960,7 +960,7 @@ def finalize_enabled_consensus(result, plateau_audit=None, vx_minimum_segment_le
     return result
 
 
-def render_segment_count_chart(result, output_path):
+def render_segment_count_chart(result, output_path, step_label="7A"):
     """Render all qualifying vx/vz segment-count plateaus for one video."""
     import matplotlib
     matplotlib.use("Agg")
@@ -1013,7 +1013,7 @@ def render_segment_count_chart(result, output_path):
         axis.grid(True, alpha=0.25)
         axis.legend(fontsize=8.5, loc="best")
     figure.suptitle(
-        f"Step 7A raw vs filtered segment counts | video={result.get('video_id', '')}",
+        f"Step {step_label} raw vs filtered segment counts | video={result.get('video_id', '')}",
         fontsize=15, fontweight="bold",
     )
     figure.savefig(output_path, dpi=160)
@@ -1106,6 +1106,7 @@ def render_all_video_plateau_scatter(
     results, output_path, eval_results=None,
     vx_seg_max_count=8, vz_seg_max_count=5,
     max_plateau_middle_th_vx=250.0, max_plateau_middle_th_vz=70.0,
+    step_label="7A",
 ):
     """Fit training confidence heat maps and evaluate held-out points."""
     import matplotlib
@@ -1223,7 +1224,7 @@ def render_all_video_plateau_scatter(
         plot_axis.set_ylabel("Number of temporal segments at N", fontsize=12)
         plot_axis.grid(True, alpha=0.2)
         plot_axis.legend(fontsize=8.5, loc="best")
-    figure.suptitle("Step 7A train-fitted confidence c(N, temporal segments)", fontsize=17, fontweight="bold")
+    figure.suptitle(f"Step {step_label} train-fitted confidence c(N, temporal segments)", fontsize=17, fontweight="bold")
     figure.savefig(output_path, dpi=170)
     plt.close(figure)
     return {
@@ -1338,6 +1339,7 @@ def render_train_optimal_n_scatter(
     train_results, eval_results, output_path,
     vx_seg_max_count=8, vz_seg_max_count=5,
     max_plateau_middle_th_vx=250.0, max_plateau_middle_th_vz=70.0,
+    step_label="7B",
 ):
     """Render one optimal-N point/video, fitting heat maps from train only."""
     import matplotlib
@@ -1450,7 +1452,7 @@ def render_train_optimal_n_scatter(
         if eval_rows:
             plot_axis.legend(fontsize=9, loc="best")
     figure.suptitle(
-        "Step 7B optimal N per video | train-fitted heat map + eval overlay",
+        f"Step {step_label} optimal N per video | train-fitted heat map + eval overlay",
         fontsize=17, fontweight="bold",
     )
     figure.savefig(output_path, dpi=170)

@@ -446,7 +446,7 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
             "filter_comparison_max_candidates": 2,
         }
 
-        def touch_chart(_result, path):
+        def touch_chart(_result, path, **_kwargs):
             path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"chart"); return str(path)
 
         def scatter(_train, path, **_kwargs):
@@ -455,10 +455,10 @@ class Step7AAxisThresholdSegmentationTests(unittest.TestCase):
         def visual(_result, _ego, _audit, path, **_kwargs):
             path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"mp4"); return {"status": "rendered", "path": str(path)}
 
-        def signal_chart(_result, _audit, path):
+        def signal_chart(_result, _audit, path, **_kwargs):
             path = Path(path); path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(b"png"); return {"status": "rendered", "path": str(path)}
 
-        def filter_comparisons(_result, output_root, max_candidates=20):
+        def filter_comparisons(_result, output_root, max_candidates=20, **_kwargs):
             charts = []
             for axis in ("vx", "vz"):
                 for index in range(max_candidates):

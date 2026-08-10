@@ -241,7 +241,7 @@ def _scatter_panel(audit,video_id,size,result=None,show_heatmap=False):
  fig.suptitle(("TRAIN HEAT MAP + EVAL VIDEO\n" if show_heatmap else "ALL-VIDEO PLATEAUS\n")+f"current={video_id}",color="white",fontsize=14,fontweight="bold");fig.tight_layout(rect=(0,.01,1,.94));canvas.draw();rgba=np.asarray(canvas.buffer_rgba());bgr=cv2.cvtColor(rgba,cv2.COLOR_RGBA2BGR)
  return cv2.resize(bgr,size,interpolation=cv2.INTER_AREA)
 
-def render_eval_signal_segmentation_chart(result,audit,output_path):
+def render_eval_signal_segmentation_chart(result,audit,output_path,step_label="7A"):
  """Render every qualifying vx/vz candidate with enabled/disabled status."""
  import matplotlib
  matplotlib.use("Agg")
@@ -276,7 +276,7 @@ def render_eval_signal_segmentation_chart(result,audit,output_path):
     ax.text(.98,.88,"DISABLED",transform=ax.transAxes,ha="right",va="top",fontsize=16,fontweight="bold",color="#d65a50",alpha=.30)
    ax.set_xlabel("Frame index");ax.set_ylabel(f"Ego {axis}");ax.grid(True,alpha=.22);ax.legend(loc="best",fontsize=8,ncol=2)
    if indices:ax.set_xlim(min(indices)-.5,max(indices)+.5)
- fig.suptitle(f"Step 7A qualifying threshold segmentations (enabled + disabled) | video={result.get('video_id','')} | rows={k}",fontsize=16,fontweight="bold")
+ fig.suptitle(f"Step {step_label} qualifying threshold segmentations (enabled + disabled) | video={result.get('video_id','')} | rows={k}",fontsize=16,fontweight="bold")
  fig.savefig(path,dpi=170);plt.close(fig)
  return {"status":"rendered","path":str(path),"layout":"k_by_2_all_qualifying_threshold_segmentations","num_rows":k,"vx_candidates":candidates["vx"],"vz_candidates":candidates["vz"],"vx_enabled_candidates":[row for row in candidates["vx"] if row["enabled"]],"vz_enabled_candidates":[row for row in candidates["vz"] if row["enabled"]],"vx_disabled_candidates":[row for row in candidates["vx"] if not row["enabled"]],"vz_disabled_candidates":[row for row in candidates["vz"] if not row["enabled"]]}
 
@@ -286,7 +286,7 @@ def _segment_length_rows(segments,tolerance):
   row=dict(segment);duration=int(row.get("duration_frames",int(row["end_frame"])-int(row["start_frame"])+1));row["duration_frames"]=duration;row["length_class"]="short" if duration<=tolerance else "long";rows.append(row)
  return rows
 
-def render_eval_candidate_filter_comparisons(result, output_root, max_candidates=20):
+def render_eval_candidate_filter_comparisons(result, output_root, max_candidates=20, step_label="7A"):
     """Render 4x1 raw/filtered segmentation and confidence charts."""
     import matplotlib
     matplotlib.use("Agg")
@@ -455,7 +455,7 @@ def render_eval_candidate_filter_comparisons(result, output_root, max_candidates
             draw_confidence(axes[3], "AFTER frame-label confidence", filtered_frame_labels)
             axes[3].set_xlabel("Frame index")
             figure.suptitle(
-                f"Step 7A {axis.upper()} candidate {rank}/{len(candidates)} | "
+                f"Step {step_label} {axis.upper()} candidate {rank}/{len(candidates)} | "
                 f"N={threshold:.6g} | tolerance={tolerance} frames | "
                 f"video={result.get('video_id', '')}",
                 fontsize=15, fontweight="bold",

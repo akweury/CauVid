@@ -204,10 +204,12 @@ def ego_motion_abstraction(
             canonical,
             render_candidate_filter_comparisons=render_candidate_filter_comparisons,
             output_subdir="05b_ego_axis_threshold_segmentation",
+            display_step_label="5B",
         )
         selected = july.step7b_optimal_segmentation_selection(
             axis_state,
             output_subdir="05c_ego_axis_consensus_segmentation",
+            display_step_label="5C",
         )
     return _stage(
         {**state, **selected, "ego_motion_module_status": "completed"},

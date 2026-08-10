@@ -219,10 +219,12 @@ class ExpAugustPipelineTests(unittest.TestCase):
             state,
             render_candidate_filter_comparisons=False,
             output_subdir="05b_ego_axis_threshold_segmentation",
+            display_step_label="5B",
         )
         july.step7b_optimal_segmentation_selection.assert_called_once_with(
             axis,
             output_subdir="05c_ego_axis_consensus_segmentation",
+            display_step_label="5C",
         )
 
     def test_refinement_diagnostics_are_optional(self):

@@ -3671,6 +3671,7 @@ def step7a_axis_threshold_segmentation(
     position_state,
     render_candidate_filter_comparisons=False,
     output_subdir="07a_ego_axis_threshold_segmentation",
+    display_step_label="7A",
 ):
     """Enumerate stable multi-threshold plateaus for ego vz/vx segmentation."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import VERSION, materialize_enabled_candidates, render_all_video_plateau_scatter, render_segment_count_chart, segment_video
@@ -3758,7 +3759,7 @@ def step7a_axis_threshold_segmentation(
             cached_videos += 1
         chart_path = path.parent / "axis_threshold_segment_counts.png"
         if video_id in visualized_eval_video_ids and (recomputed or not chart_path.exists()):
-            render_segment_count_chart(cached, chart_path)
+            render_segment_count_chart(cached, chart_path, step_label=display_step_label)
         cached["data_split"] = data_split
         cached["output_directory"] = str(video_output_root)
         cached["segment_count_chart"] = (
@@ -3783,6 +3784,7 @@ def step7a_axis_threshold_segmentation(
         vz_seg_max_count=vz_seg_max_count,
         max_plateau_middle_th_vx=max_plateau_middle_th_vx,
         max_plateau_middle_th_vz=max_plateau_middle_th_vz,
+        step_label=display_step_label,
     )
     for result in results:
         materialize_enabled_candidates(result, overall_scatter)
@@ -3802,17 +3804,20 @@ def step7a_axis_threshold_segmentation(
         filter_comparison_root = video_output_root / "candidate_filter_comparisons"
         visualization_fingerprint = hashlib.sha256(json.dumps({
             "version": VERSION,
-            "visualization_layout": "eval_only_enabled_candidates_no_final_v10",
+            "visualization_layout": "eval_only_enabled_candidates_no_final_v11",
+            "display_step_label": display_step_label,
             "source_fingerprint": result.get("source_fingerprint"),
             "confidence_points": [row for row in overall_scatter.get("points", []) if str(row.get("video_id", "")) == video_id],
         }, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
         signal_chart_fingerprint = hashlib.sha256(json.dumps({
             "visualization_fingerprint": visualization_fingerprint,
-            "signal_chart_layout": "k_by_2_compact_titles_enabled_disabled_v4",
+            "signal_chart_layout": "k_by_2_compact_titles_enabled_disabled_v5",
+            "display_step_label": display_step_label,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         filter_comparison_fingerprint = hashlib.sha256(json.dumps({
             "source_fingerprint": result.get("source_fingerprint"),
-            "layout": "4x1_viridis_gradient_confidence_v8",
+            "layout": "4x1_viridis_gradient_confidence_v9",
+            "display_step_label": display_step_label,
             "max_candidates_per_axis": filter_comparison_max_candidates,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         cached_visual = result.get("visualization", {})
@@ -3820,14 +3825,14 @@ def step7a_axis_threshold_segmentation(
                 and cached_visual.get("source_fingerprint") == visualization_fingerprint):
             visual = cached_visual
         else:
-            visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path, show_final=False, step_label="7A")
+            visual = render_axis_segmentation_mp4(result, ego_by_video.get(video_id, {}), overall_scatter, visualization_path, show_final=False, step_label=display_step_label)
             visual["source_fingerprint"] = visualization_fingerprint
         cached_signal_chart = result.get("signal_segmentation_chart", {})
         if (signal_chart_path.exists() and cached_signal_chart.get("status") == "rendered"
                 and cached_signal_chart.get("source_fingerprint") == signal_chart_fingerprint):
             signal_chart = cached_signal_chart
         else:
-            signal_chart = render_eval_signal_segmentation_chart(result, overall_scatter, signal_chart_path)
+            signal_chart = render_eval_signal_segmentation_chart(result, overall_scatter, signal_chart_path, step_label=display_step_label)
             signal_chart["source_fingerprint"] = signal_chart_fingerprint
         if render_candidate_filter_comparisons:
             cached_filter_comparison = result.get("candidate_filter_comparisons", {})
@@ -3845,6 +3850,7 @@ def step7a_axis_threshold_segmentation(
                 filter_comparison = render_eval_candidate_filter_comparisons(
                     result, filter_comparison_root,
                     max_candidates=filter_comparison_max_candidates,
+                    step_label=display_step_label,
                 )
                 filter_comparison["source_fingerprint"] = filter_comparison_fingerprint
         else:
@@ -3944,6 +3950,7 @@ def step7a_axis_threshold_segmentation(
 def step7b_optimal_segmentation_selection(
     step7a_state,
     output_subdir="07b_ego_axis_consensus_segmentation",
+    display_step_label="7B",
 ):
     """Merge Step 7A enabled candidates into one final sequence per axis."""
     from src.exp_july.perception.ego_axis_threshold_segmentation import apply_semantic_candidate_confidence_correction, finalize_enabled_consensus, materialize_enabled_candidates, render_train_optimal_n_scatter, select_optimal_n_by_final_similarity
@@ -4003,7 +4010,7 @@ def step7b_optimal_segmentation_selection(
             )
             visual = render_axis_segmentation_mp4(
                 result, ego_by_video.get(video_id, {}), plateau_audit,
-                visualization_path, show_final=True, step_label="7B",
+                visualization_path, show_final=True, step_label=display_step_label,
             )
             result["step7b_visualization"] = visual
             visualization_mp4s.append(visual)
@@ -4034,6 +4041,7 @@ def step7b_optimal_segmentation_selection(
         vz_seg_max_count=int(config.get("vz_seg_max_count", 5)),
         max_plateau_middle_th_vx=float(config.get("max_plateau_middle_th_vx", 250.0)),
         max_plateau_middle_th_vz=float(config.get("max_plateau_middle_th_vz", 70.0)),
+        step_label=display_step_label,
     )
     optimal_n_scatter_audit_path = output_root / "train_optimal_n_with_eval_scatter.json"
     optimal_n_scatter["audit_path"] = str(optimal_n_scatter_audit_path)
