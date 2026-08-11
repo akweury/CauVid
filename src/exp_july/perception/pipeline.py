@@ -7579,9 +7579,10 @@ def _step8c_input_fingerprint(state):
     ]
     return _step8_cache_fingerprint(
         {
-            "schema": "step8c-trajectory-clustering-v2",
+            "schema": "step8c-trajectory-clustering-v3-strict-holdout",
             "dataset": state.get("dataset_name", "driving_mini"),
             "evidence": evidence_rows,
+            "split_policy": state.get("trajectory_refinement_split_policy", {}),
         }
     )
 
@@ -7643,7 +7644,30 @@ def step8c_trajectory_clustering(state, llm_generate=None):
         state.get("trajectory_motion_evidence", []),
     )
     tracks = symbolic_tracks(evidence, state.get("relative_object_motion", []))
-    metadata_catalog = attach_static_metadata(tracks)
+    split_policy = dict(state.get("trajectory_refinement_split_policy", {}))
+    strict_holdout = bool(split_policy.get("strict_test_holdout", False))
+    train_video_ids = {str(value) for value in split_policy.get("train_video_ids", [])}
+    eval_video_ids = {str(value) for value in split_policy.get("eval_video_ids", [])}
+    test_video_ids = {str(value) for value in split_policy.get("test_video_ids", [])}
+    if strict_holdout:
+        if not train_video_ids:
+            raise RuntimeError("Strict test holdout requires a non-empty training split")
+        if not test_video_ids:
+            raise RuntimeError("Strict test holdout requires a non-empty test split")
+        if (train_video_ids & eval_video_ids) or (train_video_ids & test_video_ids) or (eval_video_ids & test_video_ids):
+            raise RuntimeError("Strict test holdout split IDs must be pairwise disjoint")
+        fit_tracks = [track for track in tracks if str(track.get("video_id", "")) in train_video_ids]
+        if not fit_tracks:
+            raise RuntimeError("Strict test holdout produced no training tracks for cohort fitting")
+        metadata_catalog = attach_static_metadata(fit_tracks)
+        # Apply only the frozen train-fitted bucket transform to every split.
+        attach_static_metadata(
+            tracks,
+            bucket_boundaries=metadata_catalog.get("bucket_boundaries", {}),
+        )
+    else:
+        fit_tracks = tracks
+        metadata_catalog = attach_static_metadata(tracks)
     raw_rules = llm_call(
         "cohort_rule_generation",
         rule_generation_prompt(dataset, metadata_catalog),
@@ -7652,9 +7676,17 @@ def step8c_trajectory_clustering(state, llm_generate=None):
     )
     compiled_policy = compile_rules(raw_rules)
     cohorts = assign_cohorts(tracks, compiled_policy["rules"])
-    summaries = cohort_statistics(cohorts, None)
+    fit_cohorts = {
+        cohort_id: [
+            track for track in cohort_tracks
+            if not strict_holdout or str(track.get("video_id", "")) in train_video_ids
+        ]
+        for cohort_id, cohort_tracks in cohorts.items()
+    }
+    fit_cohorts = {key: values for key, values in fit_cohorts.items() if values}
+    summaries = cohort_statistics(fit_cohorts, None)
     manifest = {
-        "version": 1,
+        "version": 2,
         "stage": "8c_trajectory_clustering",
         "repairs_performed": 0,
         "num_tracks": len(tracks),
@@ -7664,6 +7696,13 @@ def step8c_trajectory_clustering(state, llm_generate=None):
         "cohort_track_counts": {
             key: len(value) for key, value in sorted(cohorts.items())
         },
+        "strict_test_holdout": strict_holdout,
+        "policy_fit_split": "train" if strict_holdout else "all",
+        "policy_fit_video_ids": sorted(train_video_ids) if strict_holdout else sorted({str(row.get("video_id", "")) for row in tracks}),
+        "policy_calibration_video_ids": sorted(eval_video_ids) if strict_holdout else [],
+        "application_only_test_video_ids": sorted(test_video_ids) if strict_holdout else [],
+        "num_policy_fit_tracks": len(fit_tracks),
+        "test_tracks_used_for_policy_fit": sum(str(track.get("video_id", "")) in test_video_ids for track in fit_tracks) if strict_holdout else None,
         "input_fingerprint": input_fingerprint,
         "whole_step_cache_hit": False,
     }

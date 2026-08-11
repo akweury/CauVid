@@ -41,6 +41,15 @@ videos exist than the nominal 15% test target, all available annotated videos
 are used for test, eval remains 15%, and the remainder is assigned to train.
 The manifest records both requested and realized counts.
 
+Step 6 enforces the persisted split as a strict test holdout. Static metadata
+bucket boundaries, cohort rules, cohort statistics, and statistical policy
+updates are fitted on train only. Repair-parameter calibration and policy
+validation use eval only. Test trajectories are assigned with the frozen
+train-fitted transform and receive the frozen repair policy, but cannot update
+any fitted policy, statistic, or threshold. Test inference artifacts may be
+cached, but are never consumed by fitting or calibration. The audit is written to
+`06_trajectory_refinement/strict_test_holdout_audit.json`.
+
 Step 5 uses the canonical nested sequence
 `05_ego_motion_abstraction/05a_ego_motion/`,
 `05_ego_motion_abstraction/05b_ego_axis_threshold_segmentation/`, and

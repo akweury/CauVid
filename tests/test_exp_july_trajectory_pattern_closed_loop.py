@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -273,6 +274,54 @@ class TrajectoryPatternClosedLoopTests(unittest.TestCase):
                     "repair_cache_hit"
                 ]
             )
+
+    def test_strict_holdout_fits_train_calibrates_eval_and_only_applies_to_test(self):
+        source = state()
+        video_ids = ("train-video", "eval-video", "test-video")
+        for key in ("uncertain_signal_evidence", "relative_object_motion", "ego_motion"):
+            replicated = []
+            for video_id in video_ids:
+                row = copy.deepcopy(source[key][0])
+                row["video_id"] = video_id
+                replicated.append(row)
+            source[key] = replicated
+        source["videos"] = list(video_ids)
+        source["trajectory_refinement_split_policy"] = {
+            "version": 1,
+            "mode": "train_fit_eval_calibrate_test_apply",
+            "strict_test_holdout": True,
+            "train_video_ids": ["train-video"],
+            "eval_video_ids": ["eval-video"],
+            "test_video_ids": ["test-video"],
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "src.exp_july.perception.pipeline.get_pipeline_output_root",
+            return_value=Path(tmp),
+        ), patch.dict(
+            os.environ,
+            {"CAUVID_STEP8D_WORKERS": "1"},
+            clear=False,
+        ):
+            clustered = step8c_trajectory_clustering(source, llm_generate=llm)
+            clustering = clustered["trajectory_clustering_manifest"]
+            self.assertTrue(clustering["strict_test_holdout"])
+            self.assertEqual(clustering["policy_fit_video_ids"], ["train-video"])
+            self.assertEqual(clustering["policy_calibration_video_ids"], ["eval-video"])
+            self.assertEqual(clustering["application_only_test_video_ids"], ["test-video"])
+            self.assertEqual(clustered["trajectory_cohort_metadata_catalog"]["track_count"], 1)
+            repaired = step8d_closed_loop_trajectory_repair(clustered, llm_generate=llm)
+            repair = repaired["trajectory_pattern_manifest"]
+            self.assertTrue(repair["strict_test_holdout"])
+            self.assertEqual(repair["policy_fit_video_ids"], ["train-video"])
+            self.assertEqual(repair["policy_calibration_video_ids"], ["eval-video"])
+            self.assertEqual(repair["application_only_test_video_ids"], ["test-video"])
+            self.assertEqual(repair["test_tracks_used_for_policy_fit"], 0)
+            self.assertEqual(repair["test_tracks_used_for_policy_calibration"], 0)
+            record_ids = {row["video_id"] for row in repaired["trajectory_pattern_records"]}
+            self.assertEqual(record_ids, set(video_ids))
+            strict_root = Path(tmp) / "08d_closed_loop_trajectory_repair" / "strict_holdout_v1"
+            self.assertTrue((strict_root / "policies" / "active_policy.json").is_file())
+            self.assertTrue((strict_root / "cohorts" / "frozen_policy.json").is_file())
 
     def test_pending_policy_activates_only_at_the_next_epoch_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:

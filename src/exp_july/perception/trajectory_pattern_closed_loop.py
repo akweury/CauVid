@@ -778,7 +778,21 @@ def promote(root,candidate,review,metrics):
     return decision
 
 def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini",llm_generate=None,postprocess=True):
-    root=Path(output_root);root.mkdir(parents=True,exist_ok=True); audit=root/"llm_audit";statsroot=root/"statistics"
+    root=Path(output_root);root.mkdir(parents=True,exist_ok=True)
+    split_policy=dict(state.get("trajectory_refinement_split_policy",{}))
+    strict_holdout=bool(split_policy.get("strict_test_holdout",False))
+    official_train_ids={str(value) for value in split_policy.get("train_video_ids",[])}
+    official_eval_ids={str(value) for value in split_policy.get("eval_video_ids",[])}
+    official_test_ids={str(value) for value in split_policy.get("test_video_ids",[])}
+    if strict_holdout:
+        if not official_train_ids or not official_test_ids:
+            raise RuntimeError("Strict test holdout requires non-empty train and test splits")
+        if (official_train_ids&official_eval_ids) or (official_train_ids&official_test_ids) or (official_eval_ids&official_test_ids):
+            raise RuntimeError("Strict test holdout split IDs must be pairwise disjoint")
+    stateful_root=root/"strict_holdout_v1" if strict_holdout else root
+    stateful_root.mkdir(parents=True,exist_ok=True)
+    audit=stateful_root/"llm_audit"
+    statsroot=stateful_root/"statistics"
     dataset=str(state.get("dataset_name",dataset))
     current=json.loads((statsroot/"current_table.json").read_text()) if (statsroot/"current_table.json").exists() else {}
     input_evidence=state.get(
@@ -800,7 +814,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         cohort_statistics, compile_operator_plans, compile_rules,
         operator_library, repair_selection_prompt, rule_generation_prompt,
     )
-    policy_root=root/"policies"
+    policy_root=stateful_root/"policies"
     from src.exp_july.perception.trajectory_pattern_epoch import begin_epoch
     epoch_id,frozen_policy,epoch_snapshot=begin_epoch(policy_root)
     precomputed_rules = dict(state.get("trajectory_cohort_rule_policy", {}))
@@ -819,6 +833,8 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
           flush=True,
         )
     else:
+        if strict_holdout:
+            raise RuntimeError("Strict test holdout requires train-fitted Step 8C cohort rules")
         metadata_catalog=attach_static_metadata(tracks)
         raw_rules=llm_call(
             "cohort_rule_generation",
@@ -833,9 +849,27 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
             f(os.environ.get("CAUVID_STEP8C_SYSTEMATIC_ANOMALY_RATE","0.20"),0.20),
         )
     )
-    cohort_summaries=cohort_statistics(
-        cohorts,validation_thresholds,systematic_anomaly_rate,
-    )
+    if strict_holdout:
+        def _cohorts_for(video_ids):
+            selected=set(video_ids)
+            subset={
+                cohort_id:[track for track in cohort_tracks if str(track.get("video_id","")) in selected]
+                for cohort_id,cohort_tracks in cohorts.items()
+            }
+            return {cohort_id:cohort_tracks for cohort_id,cohort_tracks in subset.items() if cohort_tracks}
+        fit_cohorts=_cohorts_for(official_train_ids)
+        if not fit_cohorts:
+            raise RuntimeError("Strict test holdout produced no training cohorts")
+        cohort_summaries=cohort_statistics(
+            fit_cohorts,validation_thresholds,systematic_anomaly_rate,
+        )
+        non_fit_cohorts=_cohorts_for(official_eval_ids|official_test_ids)
+        if non_fit_cohorts:
+            cohort_statistics(non_fit_cohorts,validation_thresholds,systematic_anomaly_rate)
+    else:
+        cohort_summaries=cohort_statistics(
+            cohorts,validation_thresholds,systematic_anomaly_rate,
+        )
     repair_library=operator_library(EXECUTORS)
     raw_operator_plans=llm_call(
         "cohort_repair_selection",
@@ -845,12 +879,18 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     initial_cohort_plans=compile_operator_plans(
         raw_operator_plans,cohort_summaries,repair_library,
     )
-    from src.exp_july.perception.trajectory_pattern_epoch import (
-        fixed_video_split as fixed_cohort_video_split,
-    )
-    cohort_update_video_ids,cohort_validation_video_ids=fixed_cohort_video_split(
-        [track.get("video_id","") for track in tracks]
-    )
+    if strict_holdout:
+        cohort_update_video_ids=sorted(official_train_ids)
+        cohort_validation_video_ids=sorted(official_eval_ids)
+        if not cohort_validation_video_ids:
+            raise RuntimeError("Strict test holdout requires a non-empty evaluation split for calibration")
+    else:
+        from src.exp_july.perception.trajectory_pattern_epoch import (
+            fixed_video_split as fixed_cohort_video_split,
+        )
+        cohort_update_video_ids,cohort_validation_video_ids=fixed_cohort_video_split(
+            [track.get("video_id","") for track in tracks]
+        )
     downstream_feedback_path=policy_root/"downstream_feedback.json"
     downstream_feedback=(
         json.loads(downstream_feedback_path.read_text())
@@ -871,7 +911,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     cohort_policy_fingerprint=hashlib.sha256(
         json.dumps(cohort_policy_payload,sort_keys=True,separators=(",",":")).encode()
     ).hexdigest()[:16]
-    cohort_root=root/"cohorts";cohort_root.mkdir(parents=True,exist_ok=True)
+    cohort_root=stateful_root/"cohorts";cohort_root.mkdir(parents=True,exist_ok=True)
     (cohort_root/"metadata_catalog.json").write_text(json.dumps(metadata_catalog,indent=2))
     (cohort_root/"compiled_rules.json").write_text(json.dumps(compiled_rule_policy,indent=2))
     (cohort_root/"cohort_statistics.json").write_text(json.dumps(cohort_summaries,indent=2))
@@ -920,7 +960,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         track_items.append({"track":track,"candidates":candidates})
     review_interval=max(1,int(os.environ.get("CAUVID_STEP8C_REVIEW_INTERVAL_TRACKS","500")))
     runtime_monitor=Step8CRuntimeMonitor(
-        root/"runtime_monitor",len(track_items),
+        stateful_root/"runtime_monitor",len(track_items),
         rolling_window=max(5,int(os.environ.get("CAUVID_STEP8C_MONITOR_WINDOW","50"))),
     )
     interpretations={};llm_telemetry={};compact_inputs={}
@@ -934,7 +974,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
           "batch_size":0,"retry_count":0,"escalated_to_single":False,"latency":0.0,
           "estimated_token_cost":0.0,"validation_outcome":"deterministic_epoch_policy"}
         runtime_monitor.interpretation_complete(llm_telemetry[uid],compact_inputs[uid])
-    repair_cache_root=root/"repair_cache"
+    repair_cache_root=stateful_root/"repair_cache"
     repair_cache_root.mkdir(parents=True,exist_ok=True)
     statistics_fingerprint=hashlib.sha256(
         json.dumps(current,sort_keys=True,separators=(",",":"),default=str).encode()
@@ -1106,13 +1146,17 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
         records.append(rec);material[track["video_id"]].append({"track_id":track["track_id"],
           "_repair_selected":applied,"_final_observations":finalobs,
           "modified_frame_ids":selected.get("modified_frame_ids",[]) if selected else []})
-        td=root/"tracks"/track["video_id"];td.mkdir(parents=True,exist_ok=True)
+        td=stateful_root/"tracks"/track["video_id"];td.mkdir(parents=True,exist_ok=True)
         (td/f"track_{track['track_id']:04d}.json").write_text(json.dumps(rec,indent=2))
         runtime_monitor.track_complete(rec)
     original=list(state.get("relative_object_motion",[]))
     refined=[_materialize_repaired_relative_video(v,material[str(v.get("video_id",""))]) for v in original]
     version=int(current.get("version",0))+1
-    update_video_ids,validation_video_ids=fixed_video_split([row["video_id"] for row in records])
+    if strict_holdout:
+        update_video_ids=sorted(official_train_ids)
+        validation_video_ids=sorted(official_eval_ids)
+    else:
+        update_video_ids,validation_video_ids=fixed_video_split([row["video_id"] for row in records])
     update_set=set(update_video_ids);validation_set=set(validation_video_ids)
     update_records=[row for row in records if row["video_id"] in update_set]
     validation_records=[row for row in records if row["video_id"] in validation_set]
@@ -1130,7 +1174,7 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
                "num_independent_validation_records":len(validation_evaluated)}
     statsroot.mkdir(parents=True,exist_ok=True)
     (statsroot/f"candidate_table_v{version:04d}.json").write_text(json.dumps(candidate,indent=2))
-    review_root=root/"epoch_reviews";review_root.mkdir(parents=True,exist_ok=True)
+    review_root=stateful_root/"epoch_reviews";review_root.mkdir(parents=True,exist_ok=True)
     reviews=[];promotion_decisions=[]
     for offset in range(0,len(update_records),review_interval):
         interval_index=offset//review_interval+1;interval_records=update_records[offset:offset+review_interval]
@@ -1164,6 +1208,14 @@ def run_trajectory_pattern_closed_loop(state,output_root,*,dataset="driving_mini
     runtime_state=runtime_monitor.finalize()
     manifest={"version":VERSION,"method":"prior_guided_statistical_signal_repair",
       "dataset":dataset,
+      "strict_test_holdout":strict_holdout,
+      "policy_fit_video_ids":sorted(official_train_ids) if strict_holdout else update_video_ids,
+      "policy_calibration_video_ids":sorted(official_eval_ids) if strict_holdout else validation_video_ids,
+      "application_only_test_video_ids":sorted(official_test_ids) if strict_holdout else [],
+      "test_tracks_used_for_policy_fit":sum(str(track.get("video_id","")) in official_test_ids for cohort_tracks in fit_cohorts.values() for track in cohort_tracks) if strict_holdout else None,
+      "test_tracks_used_for_policy_calibration":sum(str(track.get("video_id","")) in official_test_ids and str(track.get("video_id","")) in set(cohort_validation_video_ids) for cohort_tracks in cohorts.values() for track in cohort_tracks) if strict_holdout else None,
+      "test_ground_truth_used":False,
+      "stateful_artifact_root":str(stateful_root),
       "input_evidence_type":state.get("step8b_evidence_type","legacy_trajectory_motion_evidence"),
       "input_source_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_source_tracks",len(records))),
       "input_active_tracks":int(dict(state.get("uncertain_signal_evidence_manifest",{})).get("num_active_tracks",len(records))),

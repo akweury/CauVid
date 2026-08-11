@@ -234,10 +234,26 @@ def trajectory_refinement(state: State, *, diagnostics: bool = False) -> State:
     july = _july()
     llm_generate = None if os.environ.get("OPENAI_API_KEY", "").strip() else _offline_refinement_generator
     root = get_august_output_root() / "06_trajectory_refinement"
+    train_video_ids = list(state.get("step7_train_video_ids", []))
+    eval_video_ids = list(state.get("step7_eval_video_ids", []))
+    test_video_ids = list(state.get("step7_test_video_ids", []))
+    strict_test_holdout = bool(test_video_ids)
+    split_policy = {
+        "version": 1,
+        "mode": "train_fit_eval_calibrate_test_apply",
+        "strict_test_holdout": strict_test_holdout,
+        "train_video_ids": train_video_ids,
+        "eval_video_ids": eval_video_ids,
+        "test_video_ids": test_video_ids,
+        "test_role": "application_only",
+        "test_ground_truth_available_to_refinement": False,
+    }
+    working_state = {**state, "trajectory_refinement_split_policy": split_policy}
     with _module_output_root(root):
-        refined = july.step8_trajectory_repair(state, state)
-        refined = july.step8a_relative_object_motion(state, refined)
+        refined = july.step8_trajectory_repair(working_state, working_state)
+        refined = july.step8a_relative_object_motion(working_state, refined)
         refined = july.step8b_signal_evidence(refined)
+        refined["trajectory_refinement_split_policy"] = split_policy
         refined = july.step8c_trajectory_clustering(refined, llm_generate=llm_generate)
         refined = july.step8d_closed_loop_trajectory_repair(refined, llm_generate=llm_generate)
         refined = july.step8e_repaired_trajectory_validation(refined)
@@ -267,11 +283,35 @@ def trajectory_refinement(state: State, *, diagnostics: bool = False) -> State:
         ),
         encoding="utf-8",
     )
+    split_audit = {
+        **split_policy,
+        "train_eval_disjoint": not bool(set(train_video_ids) & set(eval_video_ids)),
+        "train_test_disjoint": not bool(set(train_video_ids) & set(test_video_ids)),
+        "eval_test_disjoint": not bool(set(eval_video_ids) & set(test_video_ids)),
+        "clustering_manifest": dict(refined.get("trajectory_clustering_manifest", {})),
+        "repair_manifest": dict(refined.get("trajectory_pattern_manifest", {})),
+    }
+    split_audit["strict_holdout_verified"] = not strict_test_holdout or (
+        split_audit["train_eval_disjoint"]
+        and split_audit["train_test_disjoint"]
+        and split_audit["eval_test_disjoint"]
+        and bool(split_audit["clustering_manifest"].get("strict_test_holdout"))
+        and bool(split_audit["repair_manifest"].get("strict_test_holdout"))
+        and int(split_audit["clustering_manifest"].get("test_tracks_used_for_policy_fit", -1)) == 0
+        and int(split_audit["repair_manifest"].get("test_tracks_used_for_policy_fit", -1)) == 0
+        and int(split_audit["repair_manifest"].get("test_tracks_used_for_policy_calibration", -1)) == 0
+    )
+    (root / "strict_test_holdout_audit.json").write_text(
+        json.dumps(split_audit, indent=2), encoding="utf-8"
+    )
     return _stage(
         {
             **state,
             **refined,
             "trajectory_refinement_llm_backend": llm_backend,
+            "trajectory_refinement_split_policy": split_policy,
+            "trajectory_refinement_split_audit": split_audit,
+            "trajectory_refinement_split_audit_path": str(root / "strict_test_holdout_audit.json"),
         },
         6,
         "trajectory_refinement",

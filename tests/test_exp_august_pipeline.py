@@ -228,7 +228,12 @@ class ExpAugustPipelineTests(unittest.TestCase):
         )
 
     def test_refinement_diagnostics_are_optional(self):
-        state = {"videos": ["v1"]}
+        state = {
+            "videos": ["train", "eval", "test"],
+            "step7_train_video_ids": ["train"],
+            "step7_eval_video_ids": ["eval"],
+            "step7_test_video_ids": ["test"],
+        }
         july = Mock()
         for name in (
             "step8_trajectory_repair",
@@ -248,6 +253,9 @@ class ExpAugustPipelineTests(unittest.TestCase):
         july.step8i_trajectory_audit_dashboard.assert_not_called()
         july.step8j_trajectory_provenance_audit.assert_not_called()
         clustering_generator = july.step8c_trajectory_clustering.call_args.kwargs["llm_generate"]
+        clustering_state = july.step8c_trajectory_clustering.call_args.args[0]
+        self.assertTrue(clustering_state["trajectory_refinement_split_policy"]["strict_test_holdout"])
+        self.assertEqual(clustering_state["trajectory_refinement_split_policy"]["test_video_ids"], ["test"])
         repair_generator = july.step8d_closed_loop_trajectory_repair.call_args.kwargs["llm_generate"]
         self.assertIs(clustering_generator, modules._offline_refinement_generator)
         self.assertIs(repair_generator, modules._offline_refinement_generator)

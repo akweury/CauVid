@@ -156,13 +156,31 @@ def _track_base_metadata(track: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def attach_static_metadata(tracks: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    """Attach static-only attributes, using dataset quantiles for image buckets."""
+def attach_static_metadata(
+    tracks: Sequence[Dict[str, Any]],
+    *,
+    bucket_boundaries: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Attach static-only attributes using fitted or supplied image buckets.
+
+    Supplying ``bucket_boundaries`` applies a previously fitted transform. It
+    is used by the August strict-holdout path so eval/test tracks cannot change
+    quantiles fitted on the training split.
+    """
     base_rows = [_track_base_metadata(track) for track in tracks]
     area_rows = [row["bbox_area_mean"] for row in base_rows]
     center_rows = [row["bbox_center_x_mean"] for row in base_rows]
-    area_q25, area_q75 = _quantile(area_rows, 0.25), _quantile(area_rows, 0.75)
-    center_q33, center_q67 = _quantile(center_rows, 1.0 / 3.0), _quantile(center_rows, 2.0 / 3.0)
+    fitted_boundaries = dict(bucket_boundaries or {})
+    area_q25 = _f(fitted_boundaries.get("bbox_area_q25"), _quantile(area_rows, 0.25))
+    area_q75 = _f(fitted_boundaries.get("bbox_area_q75"), _quantile(area_rows, 0.75))
+    center_q33 = _f(
+        fitted_boundaries.get("bbox_center_x_q33"),
+        _quantile(center_rows, 1.0 / 3.0),
+    )
+    center_q67 = _f(
+        fitted_boundaries.get("bbox_center_x_q67"),
+        _quantile(center_rows, 2.0 / 3.0),
+    )
     for track, metadata in zip(tracks, base_rows):
         length = int(metadata["track_length"])
         metadata.update(
