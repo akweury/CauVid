@@ -10,6 +10,38 @@ Run it independently with:
 python -m src.exp_august.pipeline --video-count 1 --max-step 11
 ```
 
+## Step 3: object mask tracking
+
+Step 3 now uses a detector-guided hybrid tracker. ByteTrack first supplies
+bootstrap IDs and box prompts. When a local SAM 2 checkpoint is available,
+`SAM2VideoPredictor` propagates one binary masklet per object and a Hungarian
+assignment reconciles it with each frame's available mask, RAFT flow, box,
+class, and depth evidence. Missing cues are omitted and the remaining weights
+are renormalized; a box is never persisted or reported as a SAM mask.
+
+The default `auto` backend remains runnable on machines without SAM 2 weights:
+it falls back to ByteTrack and records `mask_semantics: none` plus the exact
+reason in `tracks.json`. Select `hybrid_mask` or strict mode when an experiment
+must fail rather than use the fallback.
+
+```bash
+# Local checkpoint, with an error if hybrid tracking cannot run
+python -m src.exp_august.pipeline --video-count 1 --max-step 3 \
+  --tracking-backend hybrid_mask \
+  --sam2-model weights/sam2/sam2_t.pt \
+  --sam2-device cuda:0 \
+  --mask-tracking-strict
+
+# Permit Ultralytics to obtain the named checkpoint when it is not local
+python -m src.exp_august.pipeline --video-count 1 --max-step 3 \
+  --tracking-backend auto --sam2-model sam2_t.pt --sam2-allow-download
+```
+
+The VS Code debug configuration selects `auto` and looks for
+`weights/sam2/sam2_t.pt`. Step 3 writes `mask_tracking_manifest.json`; aligned
+per-frame fields include `mask_paths`, `mask_sources`, `association_scores`,
+`tracking_confidences`, `visibility_states`, and `association_evidence`.
+
 ## Docker usage (`d3.sh`)
 
 Run these commands from the repository root. `d3.sh` uses the same command
@@ -108,7 +140,7 @@ do not enable W&B automatically.
 | ---: | --- |
 | 1 | Dataset Initialization |
 | 2 | Object Detection |
-| 3 | Object Tracking |
+| 3 | Object Mask Tracking |
 | 4 | 3D Trajectory Construction |
 | 5 | Ego Motion Abstraction |
 | 6 | Trajectory Refinement |

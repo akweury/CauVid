@@ -1,0 +1,250 @@
+% Compile with LuaLaTeX:
+%   lualatex -interaction=nonstopmode -halt-on-error STEP3_MULTI_EVIDENCE_TRACKING.tex
+% The page is exactly 16:9. All positions are explicit for stable review.
+\documentclass[10pt]{article}
+\usepackage[paperwidth=16in,paperheight=9in,margin=0in]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,backgrounds,calc,fit,positioning}
+\pagestyle{empty}
+\setmainfont{Arial}
+\hyphenpenalty=10000
+\exhyphenpenalty=10000
+
+\definecolor{ink}{HTML}{172033}
+\definecolor{muted}{HTML}{526173}
+\definecolor{bluefill}{HTML}{EAF3FF}
+\definecolor{bluestroke}{HTML}{2F6FB3}
+\definecolor{greenfill}{HTML}{EAF8F0}
+\definecolor{greenstroke}{HTML}{2E7D5B}
+\definecolor{purplefill}{HTML}{F2ECFF}
+\definecolor{purplestroke}{HTML}{6842A8}
+\definecolor{amberfill}{HTML}{FFF5DC}
+\definecolor{amberstroke}{HTML}{A66B10}
+\definecolor{orangefill}{HTML}{FFF0E6}
+\definecolor{orangestroke}{HTML}{B85C2E}
+\definecolor{redfill}{HTML}{FDECEC}
+\definecolor{redstroke}{HTML}{A34848}
+\definecolor{slatefill}{HTML}{F2F5F8}
+\definecolor{slatestroke}{HTML}{657487}
+
+\newcommand{\twobullets}[2]{%
+  \parbox{2.10in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\threebullets}[3]{%
+  \parbox{2.10in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\inputcontent}[2]{%
+  \parbox{2.20in}{\raggedright
+  \textbf{\fontsize{12.5}{14}\selectfont #1}\\[2pt]
+  {\fontsize{11.5}{13.2}\selectfont #2}}}
+
+\begin{document}
+\begin{tikzpicture}[
+  remember picture,
+  overlay,
+  shift={(current page.south west)},
+  x=1in,
+  y=1in,
+  every node/.style={font=\fontsize{12}{14}\selectfont,text=ink,align=center},
+  stage/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.25pt,
+    minimum height=1.38in,
+    text width=2.10in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=greenfill,
+    draw=greenstroke
+  },
+  input/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.1pt,
+    minimum height=0.77in,
+    text width=2.20in,
+    inner xsep=6pt,
+    inner ysep=5pt,
+    align=left
+  },
+  output/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.35pt,
+    minimum height=1.42in,
+    text width=2.20in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=purplefill,
+    draw=purplestroke
+  },
+  role/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.0pt,
+    minimum height=0.90in,
+    text width=1.68in,
+    inner xsep=5pt,
+    inner ysep=6pt,
+    fill=white
+  },
+  flow/.style={
+    -{Latex[length=3.5mm,width=2.2mm]},
+    line width=1.45pt,
+    draw=ink,
+    rounded corners=8pt
+  },
+  support/.style={
+    -{Latex[length=3.1mm,width=2.0mm]},
+    line width=1.15pt,
+    draw=slatestroke,
+    rounded corners=7pt
+  },
+  recurrence/.style={
+    -{Latex[length=3.8mm,width=2.4mm]},
+    line width=1.8pt,
+    draw=purplestroke,
+    rounded corners=10pt
+  },
+  edgelabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{14}{16}\selectfont,
+    text=ink
+  },
+  smalllabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{11.5}{13}\selectfont,
+    text=muted
+  }
+]
+
+\path[use as bounding box] (0,0) rectangle (16,9);
+
+% Header
+\node[font=\bfseries\fontsize{20}{23}\selectfont,anchor=north west]
+  at (0.40,8.78) {Step 3 - Multi-Evidence Object Tracking};
+\node[font=\fontsize{11.5}{13}\selectfont,text=muted,anchor=north west]
+  at (0.42,8.40) {Associate frame-local observations into persistent image-space object identities};
+\node[font=\bfseries\fontsize{11}{13}\selectfont,text=purplestroke,anchor=north east]
+  at (15.60,8.69) {Output: ID-consistent mask tracks};
+
+% Input evidence panel
+\begin{scope}[on background layer]
+  \filldraw[fill=bluefill!34,draw=bluestroke!65,line width=1.2pt,rounded corners=10pt]
+    (0.38,1.47) rectangle (3.38,8.02);
+\end{scope}
+\node[font=\bfseries\fontsize{14}{16}\selectfont,anchor=west]
+  at (0.62,7.78) {Inputs at frame $t$};
+
+\node[input,fill=slatefill,draw=slatestroke] (prior) at (1.88,6.56)
+  {\inputcontent{Previous track state $\mathcal{T}_{t-1}$}
+  {track ID, last mask/box, class and depth history}};
+
+\node[input,fill=bluefill,draw=bluestroke] (objects) at (1.88,5.50)
+  {\inputcontent{Objects $D_t$ (YOLO)}
+  {boxes, classes, detection confidence}};
+
+\node[input,fill=greenfill,draw=greenstroke] (masks) at (1.88,4.43)
+  {\inputcontent{Masks $S_t$ (SAM 2)}
+  {frame-local instance support}};
+
+\node[input,fill=amberfill,draw=amberstroke] (flowin) at (1.88,3.36)
+  {\inputcontent{Flow $F_{t-1\rightarrow t}$ (RAFT)}
+  {dense displacement and validity}};
+
+\node[input,fill=orangefill,draw=orangestroke] (depthin) at (1.88,2.29)
+  {\inputcontent{Depth $Z_t$ (DA3)}
+  {relative depth and confidence}};
+
+% Main processing chain
+\node[stage] (candidate) at (4.78,6.56)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.1 - Candidate Construction}\\[7pt]
+   \twobullets{pair active tracks with current instances}
+              {retain birth, gap and death alternatives}};
+
+\node[stage,text width=3.34in,minimum height=2.38in,fill=greenfill!70]
+  (score) at (8.05,6.56)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.2 - Multi-cue Association Score}\\[7pt]
+   \begin{minipage}{3.08in}
+   \fontsize{11.5}{13.5}\selectfont
+   \begin{tabular}{@{}>{\bfseries}l@{\quad}l@{}}
+   Mask & $s_{\mathrm{mask}}=\operatorname{IoU}(S^{i}_{t},S^{j}_{t})$\\[2pt]
+   Flow & $s_{\mathrm{flow}}=\operatorname{IoU}(\operatorname{warp}_{F}(S^{i}_{t-1}),S^{j}_{t})$\\[2pt]
+   Box & $s_{\mathrm{box}}=\operatorname{IoU}(B^{i}_{t},B^{j}_{t})$\\[2pt]
+   Class & $s_{\mathrm{class}}=\operatorname{compat}(c_i,c_j)$\\[2pt]
+   Depth & $s_{\mathrm{depth}}=\operatorname{sim}(z_i,z_j)$
+   \end{tabular}
+   \end{minipage}\\[8pt]
+   {\fontsize{12}{14}\selectfont
+   $A_{ij}=\dfrac{\sum_{c\in\mathcal{C}_{ij}}w_c s_c(i,j)}
+   {\sum_{c\in\mathcal{C}_{ij}}w_c}$}\\[5pt]
+   {\bfseries\fontsize{11.5}{13}\selectfont Normalize over available cues only}};
+
+\node[stage,fill=amberfill,draw=amberstroke] (assign) at (11.42,6.56)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.3 - Gating + Assignment}\\[7pt]
+   \threebullets{remove infeasible pairs}
+                {Hungarian one-to-one matching}
+                {reject $A_{ij}<\tau$}};
+
+\node[stage,fill=orangefill,draw=orangestroke] (update) at (14.20,6.56)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.4 - Track Lifecycle Update}\\[7pt]
+   \threebullets{match: retain ID}
+                {instance only: create ID}
+                {track only: occluded/lost}};
+
+\node[output] (tracks) at (14.20,3.42)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.5 - Object Track Set}\\[7pt]
+   \threebullets{ID-aligned masks and boxes}
+                {confidence and visibility state}
+                {association evidence and provenance}};
+
+% Main arrows. The four frame-local cues are represented by one bundle arrow;
+% individual fan-in lines are intentionally omitted for visual clarity.
+\draw[flow] (prior.east) -- node[edgelabel,above=7pt] {$\mathcal{T}_{t-1}$} (candidate.west);
+
+\coordinate (evidenceout) at (3.38,4.45);
+\draw[flow] (evidenceout) .. controls +(0.72,0.12) and +(-0.70,-0.42) .. (candidate.south);
+\node[edgelabel,anchor=west] at (4.38,5.12) {$D_t,S_t,F_t,Z_t$};
+
+\draw[flow] (candidate.east) -- node[edgelabel,above=7pt] {$(i,j)$} (score.west);
+\draw[flow] (score.east) -- node[edgelabel,above=7pt] {$[A_{ij}]$} (assign.west);
+\draw[flow] (assign.east) -- node[smalllabel,above=9pt] {matched pairs} (update.west);
+\draw[flow] (update.south) -- node[edgelabel,right=8pt] {$\mathcal{T}_{t}$} (tracks.north);
+
+% Evidence role cards
+\node[font=\bfseries\fontsize{13}{15}\selectfont,anchor=west]
+  at (4.00,4.28) {Why each cue matters};
+
+\node[role,draw=bluestroke] (rY) at (4.92,3.58)
+  {\textbf{YOLO}\\[3pt]{\fontsize{11.5}{13}\selectfont detection and semantic anchor}};
+\node[role,draw=greenstroke] (rS) at (6.83,3.58)
+  {\textbf{SAM 2}\\[3pt]{\fontsize{11.5}{13}\selectfont precise spatial support}};
+\node[role,draw=amberstroke] (rF) at (8.74,3.58)
+  {\textbf{RAFT}\\[3pt]{\fontsize{11.5}{13}\selectfont temporal mask displacement}};
+\node[role,draw=orangestroke] (rZ) at (10.65,3.58)
+  {\textbf{DA3}\\[3pt]{\fontsize{11.5}{13}\selectfont depth continuity and ordering}};
+
+\node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
+      text width=7.20in,minimum height=0.62in,inner sep=6pt,
+      font=\bfseries\fontsize{11.5}{13.5}\selectfont]
+  (boundary) at (8.00,2.15)
+  {Boundary: Step 3 establishes image-space identity only; metric 3D position, speed and physical trajectories are deferred to Steps 4-5.};
+
+% Temporal recurrence: the output becomes the previous state at the next frame.
+\draw[recurrence] (tracks.east) -- ++(0.34,0) |- (15.73,1.14) -- (0.20,1.14) |- (prior.west);
+\node[edgelabel,text=purplestroke,anchor=south] at (8.00,1.27)
+  {advance to frame $t+1$};
+
+% Compact footer
+\node[anchor=south west,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (0.42,0.30) {Missing cues are explicit; unavailable terms are omitted rather than treated as contradictory evidence.};
+\node[anchor=south east,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (15.58,0.30) {Persistent IDs are assigned in Step 3, not Step 2.};
+
+\end{tikzpicture}
+\end{document}

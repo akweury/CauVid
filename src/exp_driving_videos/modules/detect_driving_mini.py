@@ -27,7 +27,7 @@ Usage:
     python src/exp_driving_videos/detect_driving_mini.py \\
         --video 0153f03b-3b26c404 \\
         --confidence-threshold 0.25 \\
-        --yolo-model yolov8s-worldv2.pt \\
+        --yolo-model weights/yolo/yolov8s-worldv2.pt \\
         --force-recompute
 """
 
@@ -1036,7 +1036,7 @@ def process_video(
 
 def run(
     video_ids: Optional[List[str]] = None,
-    model_name: str = "yolov8s-worldv2.pt",
+    model_name: str = "weights/yolo/yolov8s-worldv2.pt",
     classes: Optional[List[str]] = None,
     confidence_threshold: float = 0.3,
     nms_iou_threshold: float = 0.5,
@@ -1330,7 +1330,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video", action="append", default=[], dest="video",
                         help="Video ID(s) to process. Repeat for multiple. Default: all.")
-    parser.add_argument("--yolo-model", default="yolov8s-worldv2.pt", dest="yolo_model")
+    parser.add_argument(
+        "--yolo-model",
+        default="weights/yolo/yolov8s-worldv2.pt",
+        dest="yolo_model",
+    )
     parser.add_argument("--classes", nargs="+", default=None,
                         help="Custom class vocabulary. Default: YOLO_WORLD_DEFAULT_CLASSES.")
     parser.add_argument("--confidence-threshold", type=float, default=0.3, dest="confidence_threshold")

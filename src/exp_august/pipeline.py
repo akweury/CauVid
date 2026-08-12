@@ -38,7 +38,7 @@ PIPELINE_STEPS = (
 STEP_FUNCTION_NAMES = (
     "Initialization",
     "Object Detection",
-    "Tracking",
+    "Mask Tracking",
     "Trajectories",
     "Egomotion",
     "Refinement",
@@ -222,6 +222,11 @@ def run_pipeline(
     output_root: Path | str | None = None,
     diagnostics: bool = False,
     render_candidate_filter_comparisons: bool = False,
+    tracking_backend: str | None = None,
+    sam2_model: Path | str | None = None,
+    sam2_device: str | None = None,
+    sam2_allow_download: bool | None = None,
+    mask_tracking_strict: bool | None = None,
     tracker=None,
 ):
     """Run August through ``max_step``; Step 11 is the hard final boundary."""
@@ -258,7 +263,22 @@ def run_pipeline(
         )
         if max_step == 2:
             return state
-        state = _tracked(tracker, "03_object_tracking", lambda: modules.object_tracking(state))
+        tracking_overrides = {
+            key: value
+            for key, value in {
+                "backend": tracking_backend,
+                "sam2_model": str(sam2_model) if sam2_model is not None else None,
+                "device": sam2_device,
+                "allow_model_download": sam2_allow_download,
+                "strict": mask_tracking_strict,
+            }.items()
+            if value is not None
+        }
+        state = _tracked(
+            tracker,
+            "03_object_tracking",
+            lambda: modules.object_tracking(state, tracking_overrides=tracking_overrides),
+        )
         if max_step == 3:
             return state
         state = _tracked(tracker, "04_3d_trajectory_construction", lambda: modules.trajectory_construction_3d(state))
@@ -318,6 +338,26 @@ def _parse_args():
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--diagnostics", action="store_true", help="Run optional July visualization/dashboard/provenance audits")
     parser.add_argument("--render-candidate-filter-comparisons", action="store_true")
+    parser.add_argument(
+        "--tracking-backend",
+        choices=("auto", "hybrid_mask", "bytetrack"),
+        default=None,
+        help="Step 3 backend; auto uses hybrid mask tracking only when a SAM 2 checkpoint is available",
+    )
+    parser.add_argument("--sam2-model", type=Path, default=None, help="Local SAM 2 checkpoint")
+    parser.add_argument("--sam2-device", default=None, help="SAM 2 inference device, for example cuda:0 or cpu")
+    parser.add_argument(
+        "--sam2-allow-download",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow Ultralytics to download a checkpoint named by --sam2-model",
+    )
+    parser.add_argument(
+        "--mask-tracking-strict",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Fail instead of falling back to ByteTrack when hybrid mask tracking cannot run",
+    )
     return parser.parse_args()
 
 
@@ -331,5 +371,10 @@ if __name__ == "__main__":
         output_root=args.output_root,
         diagnostics=args.diagnostics,
         render_candidate_filter_comparisons=args.render_candidate_filter_comparisons,
+        tracking_backend=args.tracking_backend,
+        sam2_model=args.sam2_model,
+        sam2_device=args.sam2_device,
+        sam2_allow_download=args.sam2_allow_download,
+        mask_tracking_strict=args.mask_tracking_strict,
     )
     print(f"done videos={len(result['videos'])} final_step={min(args.max_step, 11)}")

@@ -168,14 +168,36 @@ def object_detection(state: State) -> State:
     return _stage({**state, **result}, 2, "object_detection", ("july:02",))
 
 
-def object_tracking(state: State) -> State:
-    # August Step 3 is July Step 3 unchanged.
+def object_tracking(
+    state: State, *, tracking_overrides: Dict[str, Any] | None = None
+) -> State:
+    """Run a detector-guided SAM 2 tracker with an auditable ByteTrack fallback."""
+
+    from src.exp_august import mask_tracking
+
+    base_mask_tracking = dict(state["tracking_args"].get("mask_tracking", {}))
+    tracking_args = {
+        **state["tracking_args"],
+        "output_root": get_august_output_root() / "03_object_tracking",
+        "mask_tracking": {**base_mask_tracking, **dict(tracking_overrides or {})},
+    }
     canonical = {
         **state,
-        "tracking_args": {**state["tracking_args"], "output_root": get_august_output_root() / "03_object_tracking"},
+        "tracking_args": tracking_args,
     }
-    result = _july().step3_tracking(canonical)
-    return _stage({**state, **result}, 3, "object_tracking", ("july:03",))
+    bootstrap = _july().step3_tracking(canonical)
+    result = mask_tracking.run(
+        detection_state=state,
+        tracking_state=bootstrap,
+        tracking_args=tracking_args,
+        project_root=config.PROJECT_ROOT,
+    )
+    return _stage(
+        {**state, **result},
+        3,
+        "object_tracking",
+        ("july:03:bytetrack_bootstrap", "august:sam2_multicue_mask_tracking"),
+    )
 
 
 def trajectory_construction_3d(state: State) -> State:

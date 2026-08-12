@@ -69,7 +69,7 @@ DEFAULT_DETECTION_CONFIG: Dict[str, Any] = {
     "force_recompute": False,
     "detector": {
         "name": "yolo_world",
-        "model": "yolov8s-worldv2.pt",
+        "model": "weights/yolo/yolov8s-worldv2.pt",
         "confidence_threshold": 0.3,
         "nms_iou_threshold": 0.5,
         # Custom text classes for YOLO-World's open-vocabulary mode.
@@ -191,8 +191,10 @@ class YOLOWorldDetector(ObjectDetector):
     list of text prompts and the model will detect matching objects.
 
     Args:
-        model_name: Ultralytics YOLO-World checkpoint, e.g. "yolov8s-worldv2.pt"
-            or "yolov8l-worldv2.pt" for higher accuracy at the cost of speed.
+        model_name: Ultralytics YOLO-World checkpoint, e.g.
+            "weights/yolo/yolov8s-worldv2.pt" or
+            "weights/yolo/yolov8l-worldv2.pt" for higher accuracy at the cost
+            of speed.
         classes: List of text class names to detect.  If empty, the model's
             built-in COCO-80 vocabulary is used unchanged.
         confidence_threshold: Minimum score to keep a detection.
@@ -203,7 +205,7 @@ class YOLOWorldDetector(ObjectDetector):
 
     def __init__(
         self,
-        model_name: str = "yolov8s-worldv2.pt",
+        model_name: str = "weights/yolo/yolov8s-worldv2.pt",
         classes: Optional[List[str]] = None,
         confidence_threshold: float = 0.3,
         nms_iou_threshold: float = 0.5,
@@ -924,7 +926,10 @@ def parse_args() -> argparse.Namespace:
         "--yolo-model",
         default=None,
         dest="yolo_model",
-        help="YOLO-World checkpoint, e.g. yolov8s-worldv2.pt (small/fast) or yolov8l-worldv2.pt (large/accurate).",
+        help=(
+            "YOLO-World checkpoint, e.g. weights/yolo/yolov8s-worldv2.pt "
+            "(small/fast) or weights/yolo/yolov8l-worldv2.pt (large/accurate)."
+        ),
     )
     parser.add_argument(
         "--classes",
@@ -972,7 +977,7 @@ def main() -> None:
         classes = list(YOLO_WORLD_DEFAULT_CLASSES)
 
     detector: ObjectDetector = YOLOWorldDetector(
-        model_name=str(det_cfg.get("model", "yolov8s-worldv2.pt")),
+        model_name=str(det_cfg.get("model", "weights/yolo/yolov8s-worldv2.pt")),
         classes=classes,
         confidence_threshold=float(det_cfg.get("confidence_threshold", 0.3)),
         nms_iou_threshold=float(det_cfg.get("nms_iou_threshold", 0.5)),

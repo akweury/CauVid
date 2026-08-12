@@ -110,8 +110,7 @@ run_container() {
   [[ -n "${CAUVID_WANDB_MAX_VIDEOS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_VIDEOS)
   [[ -n "${CAUVID_WANDB_MAX_ARTIFACT_FILES:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_ARTIFACT_FILES)
 
-  [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
-  [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
+  [[ -d "$ROOT_DIR/weights" ]] && model_mounts+=(-v "$ROOT_DIR/weights:/app/weights:ro")
 
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
   docker run --rm \
@@ -176,8 +175,7 @@ shell_container() {
   [[ -n "${CAUVID_WANDB_INIT_TIMEOUT_SECONDS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_INIT_TIMEOUT_SECONDS)
   [[ -n "${CAUVID_WANDB_MAX_VIDEOS:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_VIDEOS)
   [[ -n "${CAUVID_WANDB_MAX_ARTIFACT_FILES:-}" ]] && runtime_env_args+=(-e CAUVID_WANDB_MAX_ARTIFACT_FILES)
-  [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
-  [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && model_mounts+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
+  [[ -d "$ROOT_DIR/weights" ]] && model_mounts+=(-v "$ROOT_DIR/weights:/app/weights:ro")
 
   docker rm -f "${CONTAINER_NAME}-shell" 2>/dev/null || true
   docker run -it --rm \

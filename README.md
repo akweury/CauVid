@@ -2,7 +2,13 @@
 video reasoning by nesy and causal models
 
 ---
-## 
+
+## Documentation
+
+- [Pipeline documentation](./docs/pipeline/)
+- [`exp_august` design, flowchart, and known issues](./docs/exp_august/)
+- [Video segmentation annotation guide](./docs/video_annotation.md)
+- [Executable `exp_august` guide](./src/exp_august/README.md)
 
 
 ## Setup
@@ -12,7 +18,7 @@ video reasoning by nesy and causal models
 3. run `pip install -r requirements.txt`
 4. On a remote server, set the data root for Docker/Python runs:
    ```bash
-   source ./set_cauvid_data_root.sh /storage-01/ml-jsha/CauVid_Data
+   source ./scripts/set_cauvid_data_root.sh /storage-01/ml-jsha/CauVid_Data
    ```
 5. Prepare the driving dataset if needed:
    ```bash

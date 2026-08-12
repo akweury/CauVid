@@ -12,7 +12,7 @@ output/
 dataset/
 temp/
 wandb/
-
+weights/
 # macOS metadata
 .DS_Store
 **/.DS_Store
@@ -26,6 +26,11 @@ checkpoints/**
 *.ckpt
 *.safetensors
 *.onnx
+
+# These two repository-managed YOLO-World checkpoints are intentionally kept.
+!weights/yolo/
+!weights/yolo/yolov8l-worldv2.pt
+!weights/yolo/yolov8s-worldv2.pt
 
 # Large video files
 *.mov

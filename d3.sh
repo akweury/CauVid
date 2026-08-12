@@ -158,8 +158,7 @@ runtime_env_args() {
 
 docker_mount_args() {
   MODEL_MOUNTS=()
-  [[ -f "$ROOT_DIR/yolov8l-worldv2.pt" ]] && MODEL_MOUNTS+=(-v "$ROOT_DIR/yolov8l-worldv2.pt:/app/yolov8l-worldv2.pt:ro")
-  [[ -f "$ROOT_DIR/yolov8s-worldv2.pt" ]] && MODEL_MOUNTS+=(-v "$ROOT_DIR/yolov8s-worldv2.pt:/app/yolov8s-worldv2.pt:ro")
+  [[ -d "$ROOT_DIR/weights" ]] && MODEL_MOUNTS+=(-v "$ROOT_DIR/weights:/app/weights:ro")
 }
 
 run_container() {
