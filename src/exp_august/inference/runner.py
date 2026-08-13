@@ -28,6 +28,8 @@ from src.exp_august.inference.step02_neural_evidence import (
 )
 from src.exp_august.inference.step03_object_tracking import run_step3
 from src.exp_august.inference.step03_visualization import render_step3_visualizations
+from src.exp_august.inference.step04_geometry_scale import run_step4
+from src.exp_august.inference.step04_visualization import render_step4_visualizations
 
 
 def _parse_args() -> argparse.Namespace:
@@ -58,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=config.get_output_path("output") / "pipeline_august" / "world_state",
     )
-    parser.add_argument("--max-step", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument(
         "--objects-backend",
         choices=("yolo_world", "disabled"),
@@ -113,6 +115,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize-step3", action="store_true")
     parser.add_argument("--step3-example-frame-count", type=int, default=4)
     parser.add_argument("--no-step3-video", action="store_true")
+    parser.add_argument("--camera-fx-px", type=float)
+    parser.add_argument("--camera-fy-px", type=float)
+    parser.add_argument("--camera-cx-px", type=float)
+    parser.add_argument("--camera-cy-px", type=float)
+    parser.add_argument("--horizontal-fov-degrees", type=float, default=90.0)
+    parser.add_argument("--horizontal-fov-min-degrees", type=float, default=60.0)
+    parser.add_argument("--horizontal-fov-max-degrees", type=float, default=120.0)
+    parser.add_argument("--geometry-min-support-pixels", type=int, default=16)
+    parser.add_argument("--geometry-min-valid-depth-fraction", type=float, default=0.25)
+    parser.add_argument("--geometry-background-flow-stride", type=int, default=16)
+    parser.add_argument("--geometry-min-pose-correspondences", type=int, default=32)
+    parser.add_argument("--visualize-step4", action="store_true")
+    parser.add_argument("--step4-example-frame-count", type=int, default=4)
+    parser.add_argument("--step4-maximum-tracks", type=int, default=12)
+    parser.add_argument("--no-step4-video", action="store_true")
     return parser.parse_args()
 
 
@@ -224,6 +241,32 @@ def main() -> int:
             render_video=not args.no_step3_video,
         )
         print(f"Step 3 visualizations: {visualization_manifest}")
+    if args.max_step == 3:
+        return 0
+    step4 = run_step4(
+        tracking_store_path=step3.store_path,
+        camera_fx_px=args.camera_fx_px,
+        camera_fy_px=args.camera_fy_px,
+        camera_cx_px=args.camera_cx_px,
+        camera_cy_px=args.camera_cy_px,
+        horizontal_fov_degrees=args.horizontal_fov_degrees,
+        horizontal_fov_min_degrees=args.horizontal_fov_min_degrees,
+        horizontal_fov_max_degrees=args.horizontal_fov_max_degrees,
+        minimum_support_pixels=args.geometry_min_support_pixels,
+        minimum_valid_depth_fraction=args.geometry_min_valid_depth_fraction,
+        background_flow_sample_stride=args.geometry_background_flow_stride,
+        minimum_pose_correspondences=args.geometry_min_pose_correspondences,
+    )
+    print(f"Step 4 completed: {len(step4.video_manifests)} video(s)")
+    print(f"Geometry store: {step4.store_path}")
+    if args.visualize_step4:
+        visualization_manifest = render_step4_visualizations(
+            geometry_store_path=step4.store_path,
+            example_frame_count=args.step4_example_frame_count,
+            maximum_tracks=args.step4_maximum_tracks,
+            render_video=not args.no_step4_video,
+        )
+        print(f"Step 4 visualizations: {visualization_manifest}")
     return 0
 
 

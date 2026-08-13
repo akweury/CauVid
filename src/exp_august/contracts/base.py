@@ -101,6 +101,7 @@ class ArtifactOwner(str, Enum):
     STEP1_INIT = "step1_init"
     STEP2_NEURAL_EVIDENCE = "step2_neural_evidence"
     STEP3_OBJECT_TRACKING = "step3_object_tracking"
+    STEP4_GEOMETRY_SCALE = "step4_geometry_scale"
 
 
 class TrackState(str, Enum):

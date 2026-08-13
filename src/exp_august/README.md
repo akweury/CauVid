@@ -4,7 +4,7 @@ There are currently two explicit execution paths:
 
 - `src.exp_august.pipeline` is the frozen legacy linear baseline.
 - `src.exp_august.inference.runner` is the target annotation-free world-state
-  pipeline. Its implemented boundaries currently cover Steps 1-3.
+  pipeline. Its implemented boundaries currently cover Steps 1-4.
 
 ## Target Step 1: Init
 
@@ -144,10 +144,110 @@ evidence disposition, and observed/lost track-frame coverage all close.
 With `--visualize-step3`, each video also receives annotated canonical-frame
 PNGs, a four-frame contact sheet, candidate-archive panels, and an MP4 under
 `visualizations/<video-id>/`. Selected observations show stable ID, class,
-detection confidence, association score, box, mask fill, and mask contour.
+detection confidence, association score, box, mask fill, mask contour, and the
+object-masked depth representation/support, median, IQR, and valid fraction.
 Candidate panels deliberately keep flow-forward, flow-backward, unassigned, and
 unobservable hypotheses separate. `step3_visualization_manifest.json` indexes
 all outputs. Use `--no-step3-video` when only still images are needed.
+
+## Target Step 4: Geometry and Scale
+
+Step 4 consumes the immutable `TrackingStore`; it never reruns YOLO, SAM 2,
+RAFT, or DA3. It verifies the Step 3 package and referenced mask/depth/flow
+artifacts, forms a camera-intrinsics hypothesis, estimates relative camera
+motion from background RAFT correspondences when sufficiently conditioned, and
+back-projects each usable object-mask depth distribution into camera-centric
+3D. Depth artifacts reserved by the Step 3 `EvidenceUsePlan` as `check_only`
+are not used for geometry fitting.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 4 \
+  --canonical-fps 1 \
+  --objects-backend yolo_world \
+  --masks-backend sam2 \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --horizontal-fov-degrees 90 \
+  --visualize-step4 \
+  --device cuda:0
+```
+
+When calibrated intrinsics are known, replace the FOV assumption with
+`--camera-fx-px`, `--camera-fy-px`, and optional `--camera-cx-px` /
+`--camera-cy-px`. Supplying these values records their provenance but does not
+by itself mark the calibration externally validated.
+
+Step 4 adds:
+
+```text
+<output-root>/<run-id>/04_geometry_scale/config_<hash>/
+  geometry_store.json
+  videos/<video-id>.geometry.json
+  visualizations/step4_visualization_manifest.json
+  visualizations/<video-id>/frames/*.png
+  visualizations/<video-id>/*_step4_examples.png
+  visualizations/<video-id>/*_camera_centric_points_3d.png
+  visualizations/<video-id>/*_geometry_timeline.png
+  visualizations/<video-id>/*_camera_motion_diagnostics.png
+  visualizations/<video-id>/*_relative_static_scene.json
+  visualizations/<video-id>/*_relative_static_sandbox_3d.png
+  visualizations/<video-id>/depth_geometry_examples/*.png
+  visualizations/<video-id>/*_step4_geometry.mp4
+```
+
+Each per-track observation stores the robust 3D median, IQR and MAD, pixel
+support and valid-depth fraction, intrinsics/scale hypothesis IDs, reprojection
+check, and source artifact links. With the current single-frame DA3 output,
+these coordinates use `relative_unit`; `scale_to_meters` is deliberately absent.
+Camera translation is reported only as a direction (`up_to_scale`). Ground
+plane and metric scale remain explicitly `unobservable` until independent
+evidence supports them.
+
+With `--visualize-step4`, the canonical frames show the selected mask, stable
+track ID, camera-centric XYZ median, Z interquartile range, valid-depth fraction,
+and pixel centroid. Separate 16:9 plots show camera-frame 3D point sequences,
+XYZ-versus-time uncertainty bands, and background-flow camera-motion residuals.
+Depth example panels place the source frame beside the depth artifact actually
+used for back-projection. Every output explicitly states its coordinate frame
+and unit: current DA3 sequences are **not** labeled as metric world trajectories.
+`step4_visualization_manifest.json` indexes all products and preserves this
+semantic warning. Use `--no-step4-video` to omit the MP4 while retaining the
+still frames and diagnostic plots.
+
+The relative static-scene sandbox is a conservative first world-frame view.
+It accumulates observable pairwise rotations and translation directions,
+estimates normalized translation steps from repeated stationary-semantic tracks
+when available, and places the resulting ego camera centers and static landmark
+candidates in component-local coordinates. Traffic lights, signs, hydrants and
+similar classes receive the static semantic prior; low-motion residual tracks
+are used only as a marked fallback when no such class is available. Squares
+denote candidates whose transformed observations cluster consistently, while
+X markers expose inconsistent candidates. Failed pose links start a new local
+component rather than being silently bridged. The companion JSON stores every
+pose, scale cue, transform, landmark observation, spread and limitation.
+
+For a useful ego path, use a denser geometry timeline than the 0.2 FPS quick
+debug default. A one-video reconstruction run is:
+
+```bash
+./d4.sh run --gpu 0 --step 4 --data 1 --seed 1 \
+  --canonical-fps 5 --diagnostics
+```
+
+This is substantially more expensive because YOLO, SAM 2, RAFT and DA3 process
+the denser canonical sequence. It remains normalized relative reconstruction,
+not metric trajectory ground truth.
+
+For remote Docker execution, use the independent D4 launcher:
+
+```bash
+./d4.sh run --gpu 0 --step 4 --scale debug --seed 1 --diagnostics
+```
+
+D4 writes under `CAUVID_OUTPUT_D4_HOST` (default
+`pipeline_august_target`) and refuses a path overlapping D3's output tree.
 
 ## Legacy linear baseline
 

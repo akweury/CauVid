@@ -167,15 +167,15 @@
 
 \node[input,fill=orangefill,draw=orangestroke] (depthin) at (1.88,2.29)
   {\inputcontent{Depth $Z_t$ (DA3)}
-  {relative depth and confidence}};
+  {full-frame relative field, validity and confidence}};
 
 % Main processing chain
 \node[stage] (candidate) at (4.78,6.56)
-  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.1 - Candidate Construction}\\[7pt]
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.1 - Candidate Tracks}\\[7pt]
    \twobullets{pair active tracks with current instances}
-              {retain new / missed / retired alternatives}};
+              {attach mask support + robust object depth $\delta_t$}};
 
-\node[stage,text width=3.34in,minimum height=2.38in,fill=greenfill!70]
+\node[stage,text width=3.34in,minimum height=2.58in,fill=greenfill!70]
   (score) at (8.05,6.56)
   {\textbf{\fontsize{13.5}{15.5}\selectfont 3.2 - Multi-cue Association Score}\\[7pt]
    \begin{minipage}{3.08in}
@@ -185,9 +185,12 @@
    Flow & $s_{\mathrm{flow}}=\operatorname{IoU}(\operatorname{warp}_{F}(S^{i}_{t-1}),S^{j}_{t})$\\[2pt]
    Box & $s_{\mathrm{box}}=\operatorname{IoU}(B^{i}_{t},B^{j}_{t})$\\[2pt]
    Class & $s_{\mathrm{class}}=\operatorname{compat}(c_i,c_j)$\\[2pt]
-   Depth & $s_{\mathrm{depth}}=\operatorname{sim}(z_i,z_j)$
+   Depth & $s_{\mathrm{depth}}=\operatorname{sim}(\delta^i_{t-1},\delta^j_t)$
    \end{tabular}
-   \end{minipage}\\[8pt]
+   \end{minipage}\\[5pt]
+   {\fontsize{10.8}{12.5}\selectfont
+   $\delta^j_t=\operatorname{stats}\!\left(Z_t\mid\operatorname{erode}(S^j_t)\right)$:
+   median, IQR, MAD, validity}\\[5pt]
    {\fontsize{12}{14}\selectfont
    $A_{ij}=\dfrac{\sum_{c\in\mathcal{C}_{ij}}w_c s_c(i,j)}
    {\sum_{c\in\mathcal{C}_{ij}}w_c}$}\\[5pt]
@@ -201,14 +204,14 @@
 
 \node[stage,fill=orangefill,draw=orangestroke] (update) at (14.20,6.56)
   {\textbf{\fontsize{13.5}{15.5}\selectfont 3.4 - Track State Logging}\\[7pt]
-   \threebullets{update active / lost / retired}
+   \threebullets{attach observation + depth $\delta_t$}
                 {log start / gap / end markers}
                 {retain unmatched evidence}};
 
 \node[output] (tracks) at (14.20,3.42)
   {\textbf{\fontsize{13.5}{15.5}\selectfont 3.5 - Tracking Package}\\[7pt]
-   \threebullets{ID-aligned track view}
-                {artifact refs + uncertainty}
+   \threebullets{ID-consistent mask tracks}
+                {per-observation depth stats + refs}
                 {candidate and state audit trail}};
 
 % Main arrows. The four frame-local cues are represented by one bundle arrow;
@@ -233,7 +236,7 @@
    \textbullet\ RGB + all detections \quad
    \textbullet\ masks / logits + mask candidates\\[2pt]
    \textbullet\ forward / backward flow \quad
-   \textbullet\ depth + confidence\\[2pt]
+   \textbullet\ full-frame depth + validity / confidence\\[2pt]
    \textbullet\ content hashes, transforms and model / config provenance
    \end{minipage}\\[4pt]
    {\bfseries\fontsize{11.5}{13}\selectfont Store once; compress, chunk and deduplicate without lossy replacement}};
@@ -245,13 +248,13 @@
 % The package has two destinations: Step 4 consumes the complete package,
 % while its current track-state view recurs as the prior for frame t+1.
 \coordinate (stepfour) at (15.78,3.42);
-\draw[flow] (tracks.east) -- node[edgelabel,above=7pt] {$\mathcal{T}$} (stepfour);
+\draw[flow] (tracks.east) -- node[edgelabel,above=7pt] {$\mathcal{P}_3$} (stepfour);
 
 \node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
       text width=7.20in,minimum height=0.62in,inner sep=6pt,
       font=\bfseries\fontsize{11.5}{13.5}\selectfont]
   (boundary) at (8.00,2.15)
-  {Boundary: Step 3 associates and archives evidence only; lifecycle causes, metric 3D states, speed and physical explanations are deferred.};
+  {Boundary: $\delta_t$ is an object-masked relative-depth descriptor, not a metric 3D position; geometry, scale, speed and physical explanations are deferred.};
 
 % Temporal recurrence: the output becomes the previous state at the next frame.
 \draw[recurrence] (tracks.south) -- ++(0,-0.30) |- (0.20,1.14) |- (prior.west);
@@ -260,7 +263,7 @@
 
 % Compact footer
 \node[anchor=south west,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
-  at (0.42,0.30) {Missing cues are explicit; unavailable terms are omitted rather than treated as contradictory evidence.};
+  at (0.42,0.30) {Debug overlays expose label, ID, mask, association, depth median / IQR and valid fraction.};
 \node[anchor=south east,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
   at (15.58,0.30) {Persistent IDs are assigned in Step 3, not Step 2.};
 

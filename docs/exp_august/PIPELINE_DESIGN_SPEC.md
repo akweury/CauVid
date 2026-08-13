@@ -306,7 +306,7 @@ without performing deep semantic or physical reasoning.
 
 **Primary implementation**
 
-1. **3.1 - Candidate Construction:** pair active tracks with current instances,
+1. **3.1 - Candidate Tracks:** pair active tracks with current instances,
    retain explicit new/missed/retired alternatives, and compute only the
    lightweight deterministic descriptors needed for association. For example,
    compute a robust depth descriptor from the eroded mask interior:
@@ -327,12 +327,18 @@ without performing deep semantic or physical reasoning.
    start/gap/reappearance/end markers. `max_age`, end-of-video, failed gate, or
    missing observation is recorded only as an operational trigger; Step 3 does
    not claim that the object exited, was occluded, or was missed by a model.
-5. **3.5 - Object Track and Evidence Set:** materialize ID-aligned masks, boxes,
-   confidence and state markers, plus the raw-evidence index, full candidate
-   audit, unassigned evidence pool, uncertainty, transforms, and provenance.
+5. **3.5 - Tracking Package:** materialize ID-aligned masks, boxes, confidence,
+   per-observation depth descriptors and state markers, plus the raw-evidence
+   index, full candidate audit, unassigned evidence pool, uncertainty,
+   transforms, and provenance.
    After manifest closure, apply the frozen, seed-controlled evidence-role
    policy to artifact references and write `EvidenceUsePlan` $\Pi$. This
    assignment does not inspect annotations or future evaluation scores.
+
+The Step 3 diagnostic overlay exposes the object label, persistent ID, selected
+mask, detection and association confidence, depth representation/support,
+masked median, IQR, and valid fraction. These depth values remain relative DA3
+descriptors; the visualization must not label them as metric distance.
 
 **Evidence-retention contract**
 
@@ -562,9 +568,52 @@ inventing one metric value.
 **Output:** a ranked `GeometryHypothesisSet` $\mathcal{G}$ containing one or more
 `GeometryHypothesis` records.
 
-**Current repository:** partially aligned through July's `step6_positions_3d`.
-Its camera-pose, scale observability, and uncertainty behavior require a
-separate audit before it can satisfy this contract.
+**Current repository:** target Step 4 is implemented in
+`src/exp_august/inference/step04_geometry_scale.py`, with immutable contracts in
+`src/exp_august/contracts/geometry.py`. It verifies the Step 3 store and every
+selected mask/depth/flow artifact before use. A provided pinhole calibration or
+a frozen horizontal-FOV prior defines $K$. Available fit-role RAFT background
+correspondences are filtered by tracked foreground masks and used to estimate
+pairwise essential matrices, camera rotation, and translation direction; the
+translation magnitude remains explicitly `up_to_scale`. For each usable track
+observation, the selected mask is eroded (or a marked inner-box fallback is
+used), valid depth pixels are back-projected, and robust camera-centric 3D
+median/IQR/MAD statistics plus a centroid reprojection check are written to the
+typed `GeometryStore`. Depth artifacts frozen as `check_only` by Step 3 are not
+used for this fit.
+
+The implementation intentionally emits `relative` scale with no
+`scale_to_meters` for current DA3 evidence. Ground-plane estimation,
+camera-height/object-size scale candidates, multi-hypothesis calibration,
+covariance propagation, and world-coordinate pose accumulation remain open;
+their fields are explicit `unobservable` states rather than placeholder metric
+values. Thus the executable stage currently satisfies relative camera-centric
+lifting and provenance, but not the full metric multi-hypothesis claim above.
+
+The executable Step 4 visualization is implemented in
+`src/exp_august/inference/step04_visualization.py`. It produces annotated
+canonical frames and an optional MP4, depth/mask/back-projection example panels,
+a camera-coordinate 3D point-sequence plot with Z-IQR whiskers, XYZ temporal
+plots with interquartile bands, and camera-motion inlier/residual/translation-
+direction diagnostics. The visualization manifest declares
+`world_trajectory_claimed: false`: without validated pose accumulation and
+metric scale, connecting camera-frame observations is a diagnostic temporal
+sequence rather than a physical world trajectory. This guard prevents Step 4
+debug output from pre-empting the Step 5 motion-estimation claim.
+
+The same module now emits a first `RelativeStaticScene` diagnostic and a 3D
+ego/static-object sandbox. Pairwise camera rotations are accumulated without
+alteration. Translation-direction magnitudes are normalized from repeated
+stationary-semantic tracks when their cross-frame residual is sufficiently
+conditioned; low-motion tracks are an explicitly marked fallback only when no
+stationary semantic anchor exists. Camera centers form the red ego path.
+Repeated transformed landmark observations are summarized by a robust median,
+axis IQR and radial spread, producing `supported` or `inconsistent` static
+markers. Missing pose edges produce independent component-local origins and are
+never interpolated. The JSON records that metric scale and a final physical
+world trajectory are not claimed. A higher-rate canonical geometry timeline
+(approximately 5--10 FPS) is required for useful RAFT/essential-matrix pose
+continuity; the 0.2 FPS quick-debug setting is unsuitable for a coherent path.
 
 ---
 
