@@ -114,6 +114,7 @@ validate_output_isolation() {
       exit 1
       ;;
   esac
+  return 0
 }
 
 ensure_image() {
@@ -161,6 +162,7 @@ validate_driving_mini() {
     echo "[d4][error] Set CAUVID_DRIVING_MINI_HOST to the prepared dataset directory." >&2
     exit 1
   fi
+  return 0
 }
 
 runtime_env_args() {
@@ -175,11 +177,15 @@ runtime_env_args() {
   do
     [[ -n "${!name:-}" ]] && RUNTIME_ENV_ARGS+=(-e "$name")
   done
+  # With `set -e`, the final false optional-variable test must not become the
+  # function status and silently terminate the launcher before `docker run`.
+  return 0
 }
 
 docker_mount_args() {
   MODEL_MOUNTS=()
   [[ -d "$ROOT_DIR/weights" ]] && MODEL_MOUNTS+=(-v "$ROOT_DIR/weights:/app/weights:ro")
+  return 0
 }
 
 run_container() {
