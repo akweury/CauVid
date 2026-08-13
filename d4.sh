@@ -124,10 +124,23 @@ ensure_image() {
 
 prepare_dirs() {
   validate_output_isolation
+
+  # Docker bind mounts do not reliably create a missing host directory with
+  # the intended ownership. Create and validate the complete D4 output tree
+  # before starting the container.
+  if ! mkdir -p "$PIPELINE_OUTPUT_BASE" "$PIPELINE_OUTPUT"; then
+    echo "[d4][error] Could not create the D4 output directory: $PIPELINE_OUTPUT" >&2
+    exit 1
+  fi
+  if [[ ! -d "$PIPELINE_OUTPUT" || ! -w "$PIPELINE_OUTPUT" ]]; then
+    echo "[d4][error] D4 output directory is not writable: $PIPELINE_OUTPUT" >&2
+    exit 1
+  fi
+  echo "[d4] output directory ready: $PIPELINE_OUTPUT"
+
   mkdir -p \
     "$DRIVING_MINI" \
     "$NUSCENES" \
-    "$PIPELINE_OUTPUT" \
     "$OUTPUT_DIR" \
     "$LOGS_DIR" \
     "$TORCH_CACHE" \
