@@ -4,7 +4,86 @@
 
 ## 总览
 
-`exp_august` 可以完成从驾驶视频到符号场景表示的 11 步流水线，但目前仍具有明显的研究型代码特征。最重要的问题集中在：接口缺乏类型约束、公开阶段与真实计算边界不一致、Step 8 强制耦合评估、Step 10 尚未真正实现重要对象选择，以及多代实验代码和配置共存造成的认知与维护负担。
+`exp_august` 可以完成从驾驶视频到符号场景表示的 11 步线性流水线，但尚未实现目标设计中的 training-free analysis-by-synthesis loop。最重要的问题分为两类：一类影响论文主张，包括 Steps 5-9 的 world-hypothesis beam、forward verification、bounded repair 和 best-ever selection 尚未落地，以及物理状态缺少独立真实性验证；另一类影响工程可靠性，包括接口缺乏类型约束、公开阶段与真实计算边界不一致、Step 8 强制耦合评估、Step 10 尚未真正实现重要对象选择，以及多代实验代码和配置共存。
+
+## P0-R：会削弱论文核心主张的研究方法缺口
+
+### R1. 目标闭环尚未存在于可执行 runner 中
+
+**现状**
+
+目标设计把 Steps 5-9 定义为主要方法：构建 Top-K world hypotheses、前向预测其 mask/flow/depth/background signatures、诊断冲突、执行有界局部重估计，并通过统一规则保留 best-ever hypothesis。当前 `pipeline.py` 仍按一次性的 11 步顺序运行：公开 Step 5 是 ego-motion abstraction，Step 7 是 relative-motion handoff，Step 8 的局部重估计不是显式阶段，Step 9 scorer/beam/stop controller 不存在。
+
+**影响**
+
+- 流程图中的反馈箭头目前不是可复现算法；
+- 无法进行 open-loop versus closed-loop 的核心消融；
+- 无法证明修正后选择的是历史最优解释，而不是最后一次处理结果；
+- 审稿人容易将系统视为 pretrained components 与手工规则的工程串联。
+
+**建议**
+
+- 先实现类型化 `WorldHypothesis`、immutable parent/child diff 和 diverse Top-K beam；
+- 将 Step 6 forward prediction、Step 8 local solver、Step 9 feasibility/selection 做成独立可测试模块；
+- 给每轮循环记录输入 beam、residual packet、repair proposal、child hypotheses、排名和停止原因；
+- 在 runner 中增加明确的 iteration/compute budget，而不是在旧 Step 6 内隐式修复。
+
+### R2. 当前验证可能形成 circular self-consistency
+
+**现状**
+
+现有设计主要使用同一批 mask、flow、depth 和 tracks 生成轨迹并检查轨迹。尚未实现冻结的 `EvidenceUsePlan`，也没有区分 solver 可拟合的 evidence 与只用于候选接受的 check-only evidence。
+
+**影响**
+
+- residual 下降可能只是模型更贴合自身输入，并不表示更接近真实 world state；
+- 物理平滑可能掩盖错误 scale、pose、mask 或 identity association；
+- 无法区分 `externally supported` 与 `self_consistency_only` 的结果。
+
+**建议**
+
+- 在 Step 3 manifest closure 后生成冻结的 `EvidenceUsePlan`；
+- 使用 backward flow、未选 mask candidates、unmatched detections、固定时空验证点或 cue holdout 作为 check-only evidence；
+- Step 8 optimizer 禁止读取当前 repair 的 check-only cues；
+- Step 9 要求 check residual 改善或在冻结容差内不退化。
+
+### R3. Temporal segmentation 不能单独验证真实物理状态
+
+**现状**
+
+最终评估重点是人工 temporal segmentation，但论文目标还包括相机/ego 运动、物体 3D 轨迹、速度、加速度和尺度。Segmentation 标签只能验证状态边界或类别，不能证明 metric trajectory 正确。
+
+**影响**
+
+- 即使 segmentation F1 提高，也不能推出速度或 3D trajectory 更接近真实值；
+- 物理合理但错误的轨迹可能获得良好的分段结果；
+- “恢复真实 world state”的论文主张缺乏直接证据。
+
+**建议**
+
+- 在至少一个 benchmark/subset 上加入 pose、trajectory、speed 或 scale reference；
+- 报告每次 repair 的 internal-residual change 与 external-error change；
+- 增加 uncertainty coverage 和按 `metric/relative/ambiguous/unobservable` 分层的结果；
+- 如果无法获得物理 ground truth，将论文主张限制为 segmentation 与 evidence/physics self-consistency。
+
+### R4. Step 4 尚未执行正式的 scale observability test
+
+**现状**
+
+当前实现主要是基于 bbox center、depth median 和近似焦距得到 camera-frame pseudo-3D。尚未形成相机位姿、地面、尺度候选及 covariance，也没有把输出分类为 `metric | relative | ambiguous | unobservable`。
+
+**影响**
+
+- 单目不可辨识情况下可能输出虚假的精确速度；
+- 后续物理约束可能在错误尺度上产生看似合理的轨迹；
+- uncertainty 无法反映 scale 与 camera-pose 的耦合。
+
+**建议**
+
+- 实现 condition/posterior-spread based observability gate；
+- 保留多个 scale-conditioned hypotheses，而不是提前选择单值；
+- uncertainty 必须联合传播到 Step 5 的速度、加速度和 object trajectories；
+- 不可观测时输出 relative state、宽区间或 `unobservable`。
 
 ## P0：会阻止正常使用或影响实验有效性的问题
 
@@ -69,11 +148,16 @@ important_objects:
 
 ## P1：高维护风险或容易导致隐性错误的问题
 
-### 3. 整条流水线依赖大型、非类型化的 `state: dict`
+### 3. 遗留线性流水线依赖大型、非类型化的 `state: dict`
 
 **现状**
 
 每一步接收并返回一个不断扩展的字典。字段包括 `videos`、`detections`、`tracks`、`positions_3d`、`ego_motion`、`relative_object_motion`、`temporal_segments` 等，但缺少统一 schema、静态类型和运行时契约验证。
+
+截至 2026-08-13，目标 runner 的 Steps 1-3 已使用版本化 Pydantic
+contracts、阶段配置哈希和带内容哈希的 `ArtifactRef`，因此这一问题已在
+新路径的前三个边界得到局部解决；遗留 `pipeline.py` 及目标 Steps 4-11
+仍未迁移，不能将该风险标记为整体关闭。
 
 **影响**
 
@@ -229,7 +313,7 @@ August 并非独立算法实现，而是组合：
 - 将纯函数计算和有副作用的 artifact 写入分离。
 - 把阶段编排限制在较薄的 adapter 层。
 
-### 9. Step 2 的日志处理存在特殊运行时规避逻辑
+### 9. 遗留 Step 2 的日志处理存在特殊运行时规避逻辑
 
 **现状**
 
@@ -298,7 +382,7 @@ August 并非独立算法实现，而是组合：
 
 1. 解耦 Step 8 预测与评估，保证无标签推理可运行。
 2. 明确 Step 10 是 baseline，随后实现和评估真正的重要对象选择。
-3. 为 11 个阶段建立版本化输入/输出 schema。
+3. 沿用目标 Steps 1-3 的 Pydantic 模式，为 Steps 4-11 建立版本化输入/输出 schema 和适配器。
 4. 修正 Step 6/7 的真实计算边界和公开语义。
 5. 提取稳定共享核心，减少 August 对实验目录实现的直接依赖。
 6. 统一缓存元数据、指纹和相对路径规则。

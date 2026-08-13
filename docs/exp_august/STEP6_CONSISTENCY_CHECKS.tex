@@ -1,0 +1,255 @@
+% Compile with LuaLaTeX:
+%   lualatex -interaction=nonstopmode -halt-on-error STEP6_CONSISTENCY_CHECKS.tex
+% The page is exactly 16:9. All positions are explicit for stable review.
+\documentclass[10pt]{article}
+\usepackage[paperwidth=16in,paperheight=9in,margin=0in]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,backgrounds,calc,positioning}
+\pagestyle{empty}
+\setmainfont{Arial}
+\hyphenpenalty=10000
+\exhyphenpenalty=10000
+
+\definecolor{ink}{HTML}{172033}
+\definecolor{muted}{HTML}{526173}
+\definecolor{bluefill}{HTML}{EAF3FF}
+\definecolor{bluestroke}{HTML}{2F6FB3}
+\definecolor{greenfill}{HTML}{EAF8F0}
+\definecolor{greenstroke}{HTML}{2E7D5B}
+\definecolor{purplefill}{HTML}{F2ECFF}
+\definecolor{purplestroke}{HTML}{6842A8}
+\definecolor{amberfill}{HTML}{FFF5DC}
+\definecolor{amberstroke}{HTML}{A66B10}
+\definecolor{orangefill}{HTML}{FFF0E6}
+\definecolor{orangestroke}{HTML}{B85C2E}
+\definecolor{redfill}{HTML}{FDECEC}
+\definecolor{redstroke}{HTML}{A34848}
+\definecolor{slatefill}{HTML}{F2F5F8}
+\definecolor{slatestroke}{HTML}{657487}
+
+\newcommand{\twobullets}[2]{%
+  \parbox{2.26in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\threebullets}[3]{%
+  \parbox{2.10in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\inputcontent}[2]{%
+  \parbox{2.18in}{\raggedright
+  \textbf{\fontsize{12.5}{14.5}\selectfont #1}\\[3pt]
+  {\fontsize{11.5}{13.2}\selectfont #2}}}
+
+\begin{document}
+\begin{tikzpicture}[
+  remember picture,
+  overlay,
+  shift={(current page.south west)},
+  x=1in,
+  y=1in,
+  every node/.style={font=\fontsize{12}{14}\selectfont,text=ink,align=center},
+  context/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.25pt,
+    minimum height=1.78in,
+    text width=2.14in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=greenfill,
+    draw=greenstroke
+  },
+  check/.style={
+    draw,
+    rounded corners=6pt,
+    line width=1.15pt,
+    minimum height=0.88in,
+    text width=2.34in,
+    inner xsep=7pt,
+    inner ysep=6pt,
+    align=left
+  },
+  input/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.1pt,
+    minimum height=0.88in,
+    text width=2.18in,
+    inner xsep=6pt,
+    inner ysep=6pt,
+    align=left
+  },
+  aggregate/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.3pt,
+    minimum height=2.18in,
+    text width=2.10in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=redfill,
+    draw=redstroke
+  },
+  output/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.35pt,
+    minimum height=1.88in,
+    text width=2.14in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=purplefill,
+    draw=purplestroke
+  },
+  flow/.style={
+    -{Latex[length=3.5mm,width=2.2mm]},
+    line width=1.45pt,
+    draw=ink,
+    rounded corners=7pt
+  },
+  bus/.style={
+    line width=1.35pt,
+    draw=slatestroke,
+    rounded corners=6pt
+  },
+  edgelabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{14}{16}\selectfont,
+    text=ink
+  },
+  smalllabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{11.5}{13}\selectfont,
+    text=muted
+  }
+]
+
+\path[use as bounding box] (0,0) rectangle (16,9);
+
+% Header
+\node[font=\bfseries\fontsize{20}{23}\selectfont,anchor=north west]
+  at (0.40,8.78) {Step 6 - Forward Prediction and Consistency Verification};
+\node[font=\fontsize{11.5}{13}\selectfont,text=muted,anchor=north west]
+  at (0.42,8.40) {Forward-project each physical world state, then test its predicted video signatures against independent evidence};
+\node[font=\bfseries\fontsize{11}{13}\selectfont,text=purplestroke,anchor=north east]
+  at (15.60,8.69) {Output: per-hypothesis residual packets and localized conflicts};
+
+% Input panel
+\begin{scope}[on background layer]
+  \filldraw[fill=bluefill!34,draw=bluestroke!65,line width=1.2pt,rounded corners=10pt]
+    (0.38,1.47) rectangle (3.25,8.02);
+\end{scope}
+\node[font=\bfseries\fontsize{14}{16}\selectfont,anchor=west]
+  at (0.62,7.78) {Inputs};
+\node[font=\fontsize{12}{14}\selectfont,text=muted,anchor=west]
+  at (0.62,7.45) {$\mathcal{I}_6=\{\mathcal{B}_i,\mathcal{O},\mathcal{T},\mathcal{G},\mathcal{K},\Pi\}$};
+
+\node[input,fill=purplefill,draw=purplestroke] (beam) at (1.81,6.62)
+  {\inputcontent{Hypothesis Beam $\mathcal{B}_i$}
+  {immutable world states, alternatives and uncertainty}};
+
+\node[input,fill=greenfill,draw=greenstroke] (trackgeo) at (1.81,5.39)
+  {\inputcontent{Tracks + Geometry $\mathcal{T},\mathcal{G}$}
+  {mask candidates, pose, scale and 3D observations}};
+
+\node[input,fill=bluefill,draw=bluestroke] (observations) at (1.81,4.16)
+  {\inputcontent{Neural Evidence $\mathcal{O}$}
+  {RGB, detections, masks, flow and depth via artifact refs}};
+
+\node[input,fill=amberfill,draw=amberstroke] (knowledge) at (1.81,3.02)
+  {\inputcontent{Frozen Constraints $\mathcal{K}$}
+  {physics ranges, semantic rules and observability conditions}};
+
+\node[input,fill=slatefill,draw=slatestroke] (useplan) at (1.81,1.99)
+  {\inputcontent{Evidence Use Plan $\Pi$}
+  {freeze fit/check cue roles; verify hashes and immutable states}};
+
+% Evaluation context
+\node[context] (context) at (4.75,5.02)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 6.1 - Forward Prediction + Reprojection}\\[7pt]
+   \threebullets{project each 3D state into the video}
+                {predict mask / flow / depth / background}
+                {propagate uncertainty + observability}};
+
+% Five parallel check families
+\node[check,fill=greenfill,draw=greenstroke] (obscheck) at (7.85,7.34)
+  {\textbf{\fontsize{13}{15}\selectfont 6.2 - Observation Fit}\\[5pt]
+   \twobullets{mask / box reprojection on check cues}{held-out depth and flow agreement}};
+
+\node[check,fill=bluefill,draw=bluestroke] (egocheck) at (7.85,6.18)
+  {\textbf{\fontsize{13}{15}\selectfont 6.3 - Ego + Background}\\[5pt]
+   \twobullets{static / forward / turn signatures}{background temporal coherence}};
+
+\node[check,fill=purplefill,draw=purplestroke] (objectcheck) at (7.85,5.02)
+  {\textbf{\fontsize{13}{15}\selectfont 6.4 - Object + Identity}\\[5pt]
+   \twobullets{mask, depth and relative-motion continuity}{gap / occlusion / relink alternatives}};
+
+\node[check,fill=amberfill,draw=amberstroke] (physicscheck) at (7.85,3.86)
+  {\textbf{\fontsize{13}{15}\selectfont 6.5 - Physical Plausibility}\\[5pt]
+   \twobullets{speed, acceleration, jerk and curvature}{uncertainty-aware bounds}};
+
+\node[check,fill=orangefill,draw=orangestroke] (logiccheck) at (7.85,2.70)
+  {\textbf{\fontsize{13}{15}\selectfont 6.6 - Semantic Logic}\\[5pt]
+   \twobullets{road / vehicle / pedestrian relations}{evaluate observable rules only}};
+
+% Aggregation and output
+\node[aggregate] (aggregate) at (10.95,5.02)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 6.7 - Constraint Aggregation}\\[7pt]
+   \threebullets{keep fit and check residuals separate}
+                {separate hard violations from soft residuals}
+                {localize peaks, windows and components}
+                };
+
+\node[output] (packet) at (13.72,5.02)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 6.8 - Residual Packet}\\[7pt]
+   \threebullets{constraint IDs + residual curves}
+                {conflict windows + components}
+                {hard status + evidence provenance}};
+
+% Input boundary to evaluation context
+\coordinate (inputout) at (3.25,5.02);
+\draw[flow] (inputout) -- node[edgelabel,above=7pt] {$\mathcal{I}_6$} (context.west);
+
+% Fan-out bus for independent check families
+\coordinate (leftbusmid) at (6.25,5.02);
+\draw[bus] (context.east) -- node[smalllabel,above=7pt] {$\mathcal{V}_i$} (leftbusmid);
+\draw[bus] (6.25,2.70) -- (6.25,7.34);
+\draw[flow] (6.25,7.34) -- (obscheck.west);
+\draw[flow] (6.25,6.18) -- (egocheck.west);
+\draw[flow] (6.25,5.02) -- (objectcheck.west);
+\draw[flow] (6.25,3.86) -- (physicscheck.west);
+\draw[flow] (6.25,2.70) -- (logiccheck.west);
+
+% Fan-in bus preserves each residual family separately
+\draw[flow] (obscheck.east) -- node[smalllabel,above=5pt] {$r_{\mathrm{obs}}$} (9.45,7.34);
+\draw[flow] (egocheck.east) -- node[smalllabel,above=5pt] {$r_{\mathrm{ego}}$} (9.45,6.18);
+\draw[flow] (objectcheck.east) -- node[smalllabel,above=5pt] {$r_{\mathrm{obj}}$} (9.45,5.02);
+\draw[flow] (physicscheck.east) -- node[smalllabel,above=5pt] {$r_{\mathrm{phys}}$} (9.45,3.86);
+\draw[flow] (logiccheck.east) -- node[smalllabel,above=5pt] {$r_{\mathrm{sem}}$} (9.45,2.70);
+\draw[bus] (9.45,2.70) -- (9.45,7.34);
+\draw[flow] (9.45,5.02) -- node[edgelabel,above=7pt] {$\mathbf{r}_i$} (aggregate.west);
+
+\draw[flow] (aggregate.east) -- node[edgelabel,above=7pt] {$\bar{\mathcal{R}}_i$} (packet.west);
+\coordinate (stepseven) at (15.80,5.02);
+\draw[flow] (packet.east) -- node[edgelabel,above=7pt] {$\mathcal{R}_i$} (stepseven);
+
+% Boundary note
+\node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
+      text width=10.05in,minimum height=0.66in,inner sep=6pt,
+      font=\bfseries\fontsize{11.5}{13.5}\selectfont]
+  (boundary) at (9.46,1.42)
+  {Evaluation boundary: Step 6 predicts and measures; it does not repair, select, or access annotations. Check evidence cannot be optimized by the current repair. Missing evidence reduces evaluability and is not automatically a violation.};
+
+% Notation and footer
+\node[anchor=south west,font=\fontsize{11.5}{13}\selectfont,text=muted]
+  at (3.72,0.68) {$\Pi$ frozen fit/check evidence roles · $\mathcal{V}_i$ predicted video context · $r_*$ residual family ·
+  $\mathcal{R}_i$ auditable residual packet};
+\node[anchor=south west,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (0.42,0.28) {Every residual is tied to a hypothesis, constraint, time window, uncertainty model and evidence reference.};
+\node[anchor=south east,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (15.58,0.28) {Step 7 packages the most informative conflict windows for diagnosis.};
+
+\end{tikzpicture}
+\end{document}

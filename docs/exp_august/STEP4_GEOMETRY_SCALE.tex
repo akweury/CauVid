@@ -1,0 +1,240 @@
+% Compile with LuaLaTeX:
+%   lualatex -interaction=nonstopmode -halt-on-error STEP4_GEOMETRY_SCALE.tex
+% The page is exactly 16:9. All positions are explicit for stable review.
+\documentclass[10pt]{article}
+\usepackage[paperwidth=16in,paperheight=9in,margin=0in]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,backgrounds,calc,positioning}
+\pagestyle{empty}
+\setmainfont{Arial}
+\hyphenpenalty=10000
+\exhyphenpenalty=10000
+
+\definecolor{ink}{HTML}{172033}
+\definecolor{muted}{HTML}{526173}
+\definecolor{bluefill}{HTML}{EAF3FF}
+\definecolor{bluestroke}{HTML}{2F6FB3}
+\definecolor{greenfill}{HTML}{EAF8F0}
+\definecolor{greenstroke}{HTML}{2E7D5B}
+\definecolor{purplefill}{HTML}{F2ECFF}
+\definecolor{purplestroke}{HTML}{6842A8}
+\definecolor{amberfill}{HTML}{FFF5DC}
+\definecolor{amberstroke}{HTML}{A66B10}
+\definecolor{orangefill}{HTML}{FFF0E6}
+\definecolor{orangestroke}{HTML}{B85C2E}
+\definecolor{redfill}{HTML}{FDECEC}
+\definecolor{redstroke}{HTML}{A34848}
+\definecolor{slatefill}{HTML}{F2F5F8}
+\definecolor{slatestroke}{HTML}{657487}
+
+\newcommand{\twobullets}[2]{%
+  \parbox{2.12in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\threebullets}[3]{%
+  \parbox{2.12in}{\raggedright\fontsize{12}{14}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\inputcontent}[2]{%
+  \parbox{2.18in}{\raggedright
+  \textbf{\fontsize{12.5}{14.5}\selectfont #1}\\[3pt]
+  {\fontsize{11.5}{13.2}\selectfont #2}}}
+
+\begin{document}
+\begin{tikzpicture}[
+  remember picture,
+  overlay,
+  shift={(current page.south west)},
+  x=1in,
+  y=1in,
+  every node/.style={font=\fontsize{12}{14}\selectfont,text=ink,align=center},
+  stage/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.25pt,
+    minimum height=1.52in,
+    text width=2.12in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=greenfill,
+    draw=greenstroke
+  },
+  input/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.1pt,
+    minimum height=0.92in,
+    text width=2.18in,
+    inner xsep=6pt,
+    inner ysep=6pt,
+    align=left
+  },
+  output/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.35pt,
+    minimum height=1.65in,
+    text width=2.12in,
+    inner xsep=8pt,
+    inner ysep=9pt,
+    fill=purplefill,
+    draw=purplestroke
+  },
+  flow/.style={
+    -{Latex[length=3.5mm,width=2.2mm]},
+    line width=1.45pt,
+    draw=ink,
+    rounded corners=8pt
+  },
+  reference/.style={
+    -{Latex[length=3.1mm,width=2.0mm]},
+    line width=1.3pt,
+    draw=purplestroke,
+    densely dashed,
+    rounded corners=7pt
+  },
+  edgelabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{14}{16}\selectfont,
+    text=ink
+  },
+  smalllabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{11.5}{13}\selectfont,
+    text=muted
+  }
+]
+
+\path[use as bounding box] (0,0) rectangle (16,9);
+
+% Header
+\node[font=\bfseries\fontsize{20}{23}\selectfont,anchor=north west]
+  at (0.40,8.78) {Step 4 - Geometry and Metric-Scale Hypotheses};
+\node[font=\fontsize{11.5}{13}\selectfont,text=muted,anchor=north west]
+  at (0.42,8.40) {Transform track-aligned image evidence into validated camera and object geometry};
+\node[font=\bfseries\fontsize{11}{13}\selectfont,text=purplestroke,anchor=north east]
+  at (15.60,8.69) {Output: ranked geometry hypotheses with uncertainty};
+
+% Input panel
+\begin{scope}[on background layer]
+  \filldraw[fill=bluefill!34,draw=bluestroke!65,line width=1.2pt,rounded corners=10pt]
+    (0.38,1.47) rectangle (3.25,8.02);
+\end{scope}
+\node[font=\bfseries\fontsize{14}{16}\selectfont,anchor=west]
+  at (0.62,7.78) {Inputs};
+\node[font=\fontsize{12}{14}\selectfont,text=muted,anchor=west]
+  at (0.62,7.45) {$\mathcal{I}_4=\{\mathcal{T},r_x,\mathcal{K}\}$};
+
+\node[input,fill=purplefill,draw=purplestroke] (package) at (1.81,6.57)
+  {\inputcontent{Tracking Package $\mathcal{T}$}
+  {track view, mask candidates, state and association audit}};
+
+\node[input,minimum height=1.18in,fill=bluefill,draw=bluestroke] (store) at (1.81,5.13)
+  {\inputcontent{Evidence Store $r_x$}
+  {RGB, masks/logits, flow, depth, confidence and transforms}};
+
+\node[input,fill=amberfill,draw=amberstroke] (priors) at (1.81,3.59)
+  {\inputcontent{Metadata + Priors $\mathcal{K}$}
+  {camera data when available; frozen height, size and road ranges}};
+
+\node[draw=slatestroke,fill=slatefill,rounded corners=5pt,line width=1.0pt,
+      text width=2.18in,minimum height=0.86in,inner sep=6pt]
+  (gate) at (1.81,2.15)
+  {\textbf{Retention Gate}\\[3pt]
+   {\fontsize{11.5}{13}\selectfont require references, transforms and hashes to resolve}};
+
+\draw[reference] (package.south) -- node[smalllabel,right=6pt,text=purplestroke]
+  {$r_x$} (store.north);
+
+% Processing graph
+\node[stage] (align) at (4.75,5.83)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.1 - Resolve + Align Evidence}\\[7pt]
+   \threebullets{resolve immutable artifact refs}
+                {align time and coordinates}
+                {preserve candidates + uncertainty}};
+
+\node[stage,fill=greenfill!72] (pose) at (7.55,6.86)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.2 - Camera Motion}\\[7pt]
+   \threebullets{exclude tracked foreground}
+                {fit motion on background}
+                {retain pose candidates + covariance}};
+
+\node[stage,fill=bluefill,draw=bluestroke] (ground) at (7.55,4.55)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.3 - Intrinsics + Ground}\\[7pt]
+   \threebullets{validate or estimate $K$}
+                {fit horizon / road plane}
+                {extract ground-contact anchors}};
+
+\node[stage,minimum height=1.72in,fill=amberfill,draw=amberstroke] (scale) at (10.47,5.83)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.4 - Scale Hypotheses}\\[7pt]
+   \threebullets{use metric depth only if validated}
+                {camera-height / size / road priors}
+                {emit scale status + interval}};
+
+\node[stage,minimum height=1.72in,fill=orangefill,draw=orangestroke] (lift) at (13.35,5.83)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.5 - Lift to Candidate 3D}\\[7pt]
+   \twobullets{consolidate masked depth + anchors}
+              {back-project and transform with covariance}\\[6pt]
+   {\fontsize{11.5}{13}\selectfont
+    $X_c=zK^{-1}p,\quad X_w=R_{wc}X_c+t_{wc}$}};
+
+\node[stage,text width=2.32in,minimum height=1.70in,fill=redfill,draw=redstroke]
+  (validate) at (10.47,2.95)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.6 - Geometric Validation}\\[7pt]
+   \threebullets{mask / box reprojection residuals}
+                {flow, depth and ground agreement}
+                {reject hard failures; rank survivors}};
+
+\node[output] (geometry) at (13.46,2.95)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 4.7 - Geometry Hypothesis Set}\\[7pt]
+   \threebullets{camera pose + scale interval}
+                {per-track 3D observations}
+                {covariance, residuals + provenance}};
+
+% Input bundle. Raw arrays are read through refs rather than copied into tracks.
+\coordinate (inputout) at (3.25,5.83);
+\draw[flow] (inputout) -- node[edgelabel,above=7pt] {$\mathcal{I}_4$} (align.west);
+
+% Alignment splits into two complementary estimators.
+\draw[flow] (align.east) .. controls +(0.36,0.16) and +(-0.42,-0.06) ..
+  node[smalllabel,pos=0.58,above=7pt] {$E^{\mathrm{bg}}$} (pose.west);
+\draw[flow] (align.east) .. controls +(0.36,-0.16) and +(-0.42,0.06) ..
+  node[smalllabel,pos=0.58,below=7pt] {$E^{\mathrm{geo}}$} (ground.west);
+
+% Pose and ground/calibration candidates jointly constrain scale.
+\draw[flow] (pose.east) .. controls +(0.42,0.00) and +(-0.42,0.30) ..
+  node[edgelabel,pos=0.52,above=8pt] {$\mathcal{P}$} (scale.north west);
+\draw[flow] (ground.east) .. controls +(0.42,0.00) and +(-0.42,-0.30) ..
+  node[edgelabel,pos=0.52,below=8pt] {$\mathcal{C}$} (scale.south west);
+
+\draw[flow] (scale.east) -- node[edgelabel,above=8pt] {$s^{1:k}$} (lift.west);
+
+% 3D candidates descend into validation and then become the Step 4 output.
+\draw[flow] (lift.south) -- ++(0,-0.43) -| node[edgelabel,pos=0.62,above=9pt]
+  {$\mathcal{X}^{1:k}$} (validate.north);
+\draw[flow] (validate.east) -- node[edgelabel,above=8pt] {$\mathcal{G}^{1:k}$} (geometry.west);
+
+\coordinate (stepfive) at (15.80,2.95);
+\draw[flow] (geometry.east) -- node[edgelabel,above=7pt] {$\mathcal{G}$} (stepfive);
+
+% Boundary note
+\node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
+      text width=9.60in,minimum height=0.66in,inner sep=6pt,
+      font=\bfseries\fontsize{11.5}{13.5}\selectfont]
+  (boundary) at (9.48,1.35)
+  {Observability boundary: monocular scale may be relative, ambiguous, or unobservable. Report a hypothesis set and interval; claim metric 3D only when scale is supported and validated.};
+
+\node[anchor=south west,font=\fontsize{11.5}{13}\selectfont,text=muted]
+  at (3.90,0.68) {$E^{\mathrm{bg}}$ background evidence · $E^{\mathrm{geo}}$ geometry evidence ·
+  $\mathcal{P}$ pose · $\mathcal{C}$ calibration/ground · $s$ scale · $\mathcal{X}$ 3D candidates · $\mathcal{G}$ geometry};
+
+% Footer
+\node[anchor=south west,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (0.42,0.30) {Step 4 reads Step 3 artifacts by reference; it does not rerun YOLO, SAM 2, RAFT or DA3.};
+\node[anchor=south east,font=\fontsize{10.5}{12.5}\selectfont,text=muted]
+  at (15.58,0.30) {Metric motion states and physical trajectories are estimated in Step 5.};
+
+\end{tikzpicture}
+\end{document}

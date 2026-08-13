@@ -1,290 +1,203 @@
-# exp_august 无标注知识约束闭环 Pipeline
+# `exp_august` Training-free World-State Inference
 
-本文档描述计划中的 `exp_august` 主流程。系统在推断阶段只接收视频及预先冻结的通用配置/知识，不读取人工 segmentation。人工标注只能在最终预测冻结后，由独立评估程序读取。
+本文件解释 `exp_august` 的主流程图。系统对每个视频独立执行
+**training-free, evidence-grounded, knowledge-constrained inference**：预训练视觉模型、物理知识、规则、阈值和 prompt 在测试前冻结；视频内可以优化 latent world state，但不能更新跨视频共享的模型参数。
 
-## TikZ flowchart (authoritative version)
+人工标注不参与感知、world-state 构建、修正、候选排序或停止判断。只有在预测及其 manifest 冻结后，独立 evaluator 才能读取 held-out references。
 
-- Editable source: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex)
-- Review and print version: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.pdf`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.pdf)
-- Markdown/browser version: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.svg`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.svg)
+## Authoritative flowchart
+
+- Editable TikZ: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex)
+- Review PDF: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.pdf`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.pdf)
+- Browser SVG: [`EXP_AUGUST_CLOSED_LOOP_FLOWCHART.svg`](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.svg)
 
 ![TikZ-generated 16:9 closed-loop pipeline](./EXP_AUGUST_CLOSED_LOOP_FLOWCHART.svg)
 
-The TikZ version uses absolute coordinates for all modules and nodes. Arrow
-routes, bend points, and mathematical-label offsets can be adjusted
-independently. Nodes summarize responsibilities with short task bullets, while
-edge symbols carry the data semantics. `KEY` marks the main methodological
-highlight of selected nodes. Node body text is fixed at 12 pt, with a 4 pt gap
-between each title and its bullets. All numbered-step bullets are left-aligned;
-the two-row notation legend also uses 12 pt text. Edge symbols use transparent
-backgrounds. Compile it with LuaLaTeX:
+TikZ 版本采用显式坐标并固定为 16:9。节点正文为 12 pt，箭头上的符号使用透明背景。所有图中文字均为英文。编译命令：
 
 ```powershell
 lualatex -interaction=nonstopmode -halt-on-error EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex
 ```
 
-<!-- Legacy Mermaid draft retained in source only; it is intentionally hidden
-because TikZ is the authoritative diagram.
+## Four-module interpretation
 
-四个主模块采用 2×2 顺时针布局，更充分地利用 16:9 屏幕：左上完成视频观测，右上建立初始状态和约束，右下执行重估计与选优，左下冻结输出并进行独立盲评估。箭头采用 LaTeX notation，节点字号为 16px，箭头记号单独放大。
+### Module I - Video to Replayable Evidence
 
-```mermaid
-%%{init: {"flowchart": {"htmlLabels": true, "curve": "basis", "nodeSpacing": 30, "rankSpacing": 48, "padding": 18, "wrappingWidth": 240, "useMaxWidth": true}, "themeVariables": {"fontSize": "16px"}, "themeCSS": ".edgeLabel { font-size: 21px !important; font-weight: 600 !important; transform: translateY(-10px); } .edgeLabel .katex { font-size: 1.2em !important; } .edgeLabel rect, .labelBkg { opacity: 0.94 !important; rx: 6px; ry: 6px; } .nodeLabel { line-height: 1.3; }"}}%%
-flowchart TB
-    subgraph ROW_TOP[" "]
-        direction LR
+Steps 1-3 只负责生成和保存视觉证据：
 
-        subgraph MOD_A["I · VIDEO → OBSERVATIONS"]
-            direction TB
-            subgraph A_TOP[" "]
-                direction LR
-                V["<b>原始视频</b><br/>IN · RGB / FPS / 分辨率<br/>OUT · 帧与时间轴"]
-                K["<b>冻结知识与配置</b><br/>IN · 物理/类别先验<br/>OUT · config version"]
-                S1["<b>Step 1 · Video-only Init</b><br/>IN · 视频 + config<br/>OUT · manifest"]
+- Step 1 验证视频并建立可逆的统一时间轴；
+- Step 2 分别提取 detection、mask、optical flow 和 depth，不进行跨 cue 融合；
+- Step 3 建立 ID-consistent mask tracks，保存所有候选、拒绝项、缺失项和 provenance，并用冻结策略生成 `EvidenceUsePlan` $\Pi$。
 
-                V -->|"$$\mathcal{X}$$"| S1
-                K -->|"$$\mathcal{K}$$"| S1
-            end
+该模块不是论文的主要推理贡献，但必须保证后续阶段能够重新检查原始证据，而无需重新运行神经模型。
 
-            subgraph A_BOTTOM[" "]
-                direction LR
-                S2["<b>Step 2 · 视觉观测</b><br/>IN · 帧序列<br/>OUT · 检测/光流/深度"]
-                S3["<b>Step 3 · 多假设跟踪</b><br/>IN · 视觉观测<br/>OUT · tracks/静态参考"]
-                S4["<b>Step 4 · 几何与尺度</b><br/>IN · tracks/背景/深度<br/>OUT · 位姿/尺度候选"]
+### Module II - Uncertain World Hypotheses
 
-                S2 -->|"$$\mathcal{O}$$"| S3
-                S3 -->|"$$\mathcal{T}$$"| S4
-            end
+Steps 4-5 将图像空间证据转化为多个可审计的世界解释：
 
-            %% 直接从 Step 1 右侧绕向 Step 2，避免箭头落在两行中央。
-            S1 -->|"$$\mathcal{M}$$"| S2
-        end
+- Step 4 估计相机位姿、地面和尺度候选，并明确输出
+  `metric | relative | ambiguous | unobservable`；
+- Step 5 联合估计 ego 与 objects 的位置、速度、加速度、朝向及不确定性；
+- 不同 scale、pose、identity association 和 occlusion 解释形成多样化的 Top-K beam。
 
-        subgraph MOD_B["II · INITIAL STATE → CONSTRAINTS"]
-            direction TB
-            subgraph B_TOP[" "]
-                direction LR
-                S5["<b>Step 5 · 联合状态</b><br/>IN · 位姿/尺度/tracks<br/>OUT · 初始世界假设"]
-                H["<b>Top-K 世界假设</b><br/>IN · 初始状态或上一轮 beam<br/>OUT · 当前候选集"]
+Step 5 的输出不是一条已被强制平滑的轨迹，而是多个完整且不可变的 `WorldHypothesis`。
 
-                S5 -->|"$$\mathcal{H}_0$$"| H
-            end
+### Module III - Analysis-by-Synthesis Loop
 
-            subgraph B_BOTTOM[" "]
-                direction LR
-                S6["<b>Step 6 · 一致性检测</b><br/>IN · 假设/观测/冻结知识<br/>OUT · 多维约束残差"]
-                S7["<b>Step 7 · 证据检查</b><br/>IN · 残差/关键帧/曲线<br/>OUT · 冲突证据包"]
-                REPAIR["<b>知识 + 数值修正</b><br/>IN · 证据/允许参数空间<br/>OUT · 有界修正方案<br/>LLM 不直接生成数值"]
+Steps 6-9 是论文的主要算法贡献：
 
-                S6 -->|"$$\mathcal{R}_i$$"| S7
-                S7 -->|"$$\mathcal{E}_i$$"| REPAIR
-            end
+1. Step 6 将每个 3D world hypothesis 前向投影，预测其应在视频中产生的 mask、flow、depth 和 background-motion signatures；
+2. 预测值与原始视觉证据比较，得到按 uncertainty 和 observability 归一化的 residual；
+3. Step 7 定位失败的组件与时间窗口，并从冻结的 allow-list 中选择修正操作；
+4. Step 8 只重新估计受影响的 latent variables 和局部窗口；
+5. Step 9 先检查 hard feasibility，再使用 check evidence、复杂度和不确定性进行统一排序；
+6. 未满足停止条件时，将新的 Top-K beam 送回 Step 6。
 
-            %% 从 Top-K 节点直接弯折进入一致性检测。
-            H -->|"$$\mathcal{B}_i$$"| S6
-        end
+这个循环优化的是单个视频的 latent world state，不是模型权重。
 
-        %% 跨模块边在本行末尾连接模块容器，以保持严格 2×2 排列。
-        MOD_A -->|"$$\left(\mathcal{G},\mathcal{O},\mathcal{K}\right)$$"| MOD_B
-    end
+### Module IV - Freeze to Blind Evaluation
 
-    subgraph ROW_BOTTOM[" "]
-        direction RL
+搜索历史中的 best-ever hypothesis 被冻结为 world state，然后生成 temporal segments、symbolic scene 和可视化输出。Evaluator 在独立进程中读取冻结预测和 held-out references，不能把结果写回 inference。
 
-        subgraph MOD_C["III · RE-ESTIMATE → SELECT"]
-            direction TB
-            subgraph C_TOP[" "]
-                direction LR
-                S8["<b>Step 8 · 局部重估计</b><br/>IN · 修正方案/冲突窗口<br/>OUT · 新候选假设"]
-                S9["<b>Step 9 · 统一评分</b><br/>IN · 候选/全部残差<br/>OUT · Hard/soft 分项分数"]
+## Notation legend
 
-                S8 -->|"$$\mathcal{H}_{i+1}^{1:n}$$"| S9
-            end
-
-            subgraph C_BOTTOM[" "]
-                direction LR
-                BEST["<b>Best-ever Register</b><br/>IN · 本轮候选排名<br/>OUT · Top-K / 历史最优 / ΔJ"]
-                STOP{"<b>停止条件</b><br/>硬约束通过？<br/>ΔJ ≤ ε / 预算耗尽？"}
-                LOOPBACK["<b>↺ Feedback to Module II</b><br/>继续时输出下一轮 hypothesis beam"]
-
-                BEST -->|"$$\mathcal{H}^{*},\;\Delta J_i$$"| STOP
-                STOP ==>|"$$C_i=0:\;\mathcal{B}_{i+1}$$"| LOOPBACK
-            end
-
-            %% 从评分节点直接弯折到历史最优寄存器。
-            S9 -->|"$$\mathcal{Q}_i$$"| BEST
-        end
-
-        subgraph MOD_D["IV · FREEZE → BLIND EVALUATION"]
-            direction TB
-            subgraph D_TOP[" "]
-                direction LR
-                FREEZE["<b>冻结历史最优解释</b><br/>IN · best-ever hypothesis<br/>OUT · 不可变物理状态"]
-                S10["<b>Step 10 · Temporal Segmentation</b><br/>IN · 冻结状态/change points<br/>OUT · 边界/标签/置信度"]
-                S11["<b>Step 11 · 符号场景</b><br/>IN · segments/轨迹/审计<br/>OUT · atoms/曲线/provenance"]
-
-                FREEZE -->|"$$\mathcal{W}^{*}$$"| S10
-                S10 -->|"$$\mathcal{Z}^{*}$$"| S11
-            end
-
-            subgraph D_BOTTOM[" "]
-                direction LR
-                PRED[("<b>冻结 Predictions</b><br/>JSON / CSV / 视频 / manifest")]
-                ANN[("<b>人工 Segmentation</b><br/>仅 Evaluator 可读")]
-                EV["<b>独立盲评估</b><br/>IN · predictions + annotations<br/>OUT · F1/tIoU/混淆矩阵"]
-
-                PRED -. "$$\mathcal{P}^{*}$$" .-> EV
-                ANN -. "$$\mathcal{Y}$$" .-> EV
-            end
-
-            %% 从符号场景节点直接弯折到冻结预测。
-            S11 -->|"$$\mathcal{A}^{*}$$"| PRED
-        end
-
-        %% direction RL 固定 Module IV 在左、Module III 在右。
-        MOD_C -->|"$$C_i=1:\;\mathcal{H}^{*}$$"| MOD_D
-    end
-
-    %% 只用单向 row-level 边固定上下两行；任何真实节点的跨模块边
-    %% 都会使 Dagre 忽略嵌套 direction，并把四个主模块排成一列。
-    ROW_TOP -->|"$$\Delta_i$$"| ROW_BOTTOM
-
-    classDef source fill:#eaf3ff,stroke:#2f6fb3,stroke-width:1.8px,color:#172033;
-    classDef observe fill:#eaf8f0,stroke:#2e7d5b,stroke-width:1.8px,color:#172033;
-    classDef hypothesis fill:#fff5dc,stroke:#a66b10,stroke-width:1.8px,color:#172033;
-    classDef reasoning fill:#fff0e6,stroke:#b85c2e,stroke-width:1.8px,color:#172033;
-    classDef score fill:#fff9df,stroke:#8c7318,stroke-width:1.8px,color:#172033;
-    classDef frozen fill:#f2ecff,stroke:#6842a8,stroke-width:1.8px,color:#172033;
-    classDef evaluation fill:#fdecec,stroke:#a34848,stroke-width:1.8px,color:#172033;
-
-    class V,K source;
-    class S1,S2,S3,S4 observe;
-    class S5,H,S6,S7,S8 hypothesis;
-    class REPAIR reasoning;
-    class S9,BEST,STOP,LOOPBACK score;
-    class FREEZE,S10,S11,PRED frozen;
-    class ANN,EV evaluation;
-
-    style ROW_TOP fill:transparent,stroke:transparent,color:transparent;
-    style ROW_BOTTOM fill:transparent,stroke:transparent,color:transparent;
-    style A_TOP fill:transparent,stroke:transparent,color:transparent;
-    style A_BOTTOM fill:transparent,stroke:transparent,color:transparent;
-    style B_TOP fill:transparent,stroke:transparent,color:transparent;
-    style B_BOTTOM fill:transparent,stroke:transparent,color:transparent;
-    style C_TOP fill:transparent,stroke:transparent,color:transparent;
-    style C_BOTTOM fill:transparent,stroke:transparent,color:transparent;
-    style D_TOP fill:transparent,stroke:transparent,color:transparent;
-    style D_BOTTOM fill:transparent,stroke:transparent,color:transparent;
-    style MOD_A fill:#f8fbff,stroke:#8baed1,stroke-width:1.4px;
-    style MOD_B fill:#fffbf2,stroke:#d29a3a,stroke-width:1.4px;
-    style MOD_C fill:#fffdf4,stroke:#b99d35,stroke-width:1.4px;
-    style MOD_D fill:#faf8ff,stroke:#9c82c8,stroke-width:1.4px;
-```
-
-> 渲染要求：箭头上的 LaTeX 使用 Mermaid 的 KaTeX 支持。若预览中显示原始 `$$...$$`，需要升级到支持数学公式的 Mermaid 版本或 VS Code Mermaid 预览扩展。
--->
-
-### Notation legend
-
-| 记号 | 含义 | 主要内容 |
+| Notation | Meaning | Main contents |
 |---:|---|---|
-| $\mathcal{X}$ | Video input | RGB 帧、FPS、分辨率和统一时间轴 |
-| $\mathcal{K}$ | Frozen knowledge | 配置哈希、物理范围、类别知识和允许的修正边界 |
-| $\mathcal{M}$ | Video manifest | 视频 ID、运行 ID、时间轴及输入指纹 |
-| $\mathcal{O}_t=(D_t,S_t,F_t,Z_t,U_t)$ | Neural evidence store | YOLO detections、SAM 2 masks、RAFT optical flow、DA3 depth 及各自的不确定性；尚未执行跨帧关联或 evidence fusion |
-| $\mathcal{T}$ | ID-aligned object masklets | 由 detector-guided SAM 2 video propagation 与 multi-cue Hungarian association 产生；包含时序 boxes、真实 masks、flow/depth 关联证据、tracking confidence、遮挡状态及 provenance |
-| $\mathcal{G}$ | Geometry hypotheses | 相机位姿、地面模型、尺度候选及置信区间 |
-| $\mathcal{H}_0$ | Initial world hypothesis | 初始 Ego 状态和对象 3D 世界轨迹 |
-| $\mathcal{B}_i$ | Hypothesis beam | 第 $i$ 轮输入的一组 Top-K 世界假设 |
-| $\mathcal{R}_i$ | Constraint residuals | 重投影、光流、物理、背景和语义残差 |
-| $\mathcal{E}_i$ | Evidence packet | 关键帧、冲突窗口、曲线和可疑组件 |
-| $\Delta_i$ | Repair proposals | 第 $i$ 轮有界的尺度、位姿、滤波、track 或阈值修正 |
-| $\mathcal{H}_{i+1}^{1:n}$ | Re-estimated hypotheses | 应用 $\Delta_i$ 后局部重算得到的新候选集合 |
-| $\mathcal{Q}_i$ | Scored ranking | Hard-constraint 状态、分项分数、Top-K、`best_ever` 和 $\Delta J_i$ |
-| $C_i$ | Stop decision | $0$ 表示继续循环；$1$ 表示停止并冻结历史最优解释 |
-| $\mathcal{H}^{*}$ | Best explanation | 整个搜索历史中统一评分最优的世界解释 |
-| $\mathcal{W}^{*}$ | Frozen world state | 冻结的 Ego/Object 位置、速度、加速度、yaw-rate 和轨迹 |
-| $\mathcal{Z}^{*}$ | Final segmentation | 最终片段边界、运动标签、边界证据和置信度 |
-| $\mathcal{A}^{*}$ | Symbolic scene | Logic atoms、物理曲线、候选排名和 provenance |
-| $\mathcal{P}^{*}$ | Frozen predictions | 只读的 JSON、CSV、视频、曲线和冻结 manifest |
-| $\mathcal{Y}$ | Human annotations | 人工 segmentation；只允许独立 Evaluator 读取 |
+| $\mathcal X$ | Raw video | RGB frames, timestamps, FPS and source geometry |
+| $\Theta$ | Frozen neural models | YOLO, SAM 2, RAFT and DA3 checkpoints/configuration |
+| $\mathcal K$ | Frozen knowledge | Physical limits, semantic rules and permitted repair bounds |
+| $\mathcal M$ | Video manifest | Canonical timeline, run ID, fingerprints and model versions |
+| $\mathcal O$ | Independent neural evidence | Detections, masks, forward/backward flow, depth, confidence and transforms |
+| $\mathcal T$ | Tracking package | ID-consistent tracks plus immutable candidate/evidence archive |
+| $\mathcal G$ | Geometry hypothesis set | Pose, ground, scale, 3D observations, covariance and observability |
+| $\mathcal H_i$ | World hypothesis | Camera, scale, ego/object dynamics, associations and uncertainty |
+| $\mathcal B_i$ | Hypothesis beam | Diverse Top-K world hypotheses at iteration $i$ |
+| $\Pi$ | Evidence-use plan | Frozen designation of fit, check-only and report-only evidence |
+| $\mathcal R_i$ | Residual packet | Fit/check residuals, physical violations and conflict windows |
+| $\Delta_i$ | Repair proposal | Bounded operator, variables, window, parameter range and expected effect |
+| $\mathcal Q_i$ | Scored ranking | Feasibility, score terms, rank, Top-K and improvement |
+| $C_i$ | Stop decision | $0$: continue; $1$: freeze the best-ever explanation |
+| $\mathcal H^*$ | Best explanation | Best feasible hypothesis over the entire search history |
+| $\mathcal W^*$ | Frozen world state | Ego/object trajectories, motion states, uncertainty and provenance |
+| $\mathcal Z^*$ | Temporal segmentation | Boundaries, labels and confidence derived from the frozen state |
+| $\mathcal P^*$ | Frozen prediction package | World state, tracks, segments, curves and immutable manifest |
+| $\mathcal Y$ | Held-out references | Pose/trajectory when available and human segmentation labels |
 
-### Arrow legend
+## Step input/output contract
 
-- `→`：阶段之间传递数据或状态。
-- `⇒`：闭环控制信号；$C_i=0$ 时把 $\mathcal{B}_{i+1}$ 送入下一轮。
-- `⇢`：只读评估数据；$\mathcal{P}^{*}$ 和 $\mathcal{Y}$ 均不得反馈到推断流程。
-- 下标 $i$ 表示当前迭代轮次；星号 $*$ 表示已经选优并冻结。
-
-## 步骤输入输出契约
-
-| 步骤 | 主要输入 | 主要输出 | 是否允许使用人工 segmentation |
+| Step | Primary input | Primary output | Annotation access |
 |---|---|---|---:|
-| Step 1：初始化 | 原始视频、冻结配置、随机种子 | Video validation、timeline normalization、运行 ID | 否 |
-| Step 2：神经感知 | RGB 帧 | 独立的 YOLO detections、SAM 2 masks、RAFT flow、DA3 depth 和不确定性 | 否 |
-| Step 3：目标 mask 跟踪 | $\mathcal{O}_t$ 神经证据包 | ByteTrack 仅生成 detector track prompts；SAM 2 Video Predictor 传播 masks；Hungarian matcher 融合 mask/RAFT flow/box/class/depth，输出稳定 ID masklets 与遮挡审计 | 否 |
-| Step 4：几何与尺度假设 | 背景特征、tracks、深度、相机元数据 | 相机位姿、地面、metric-scale 候选及区间 | 否 |
-| Step 5：初始联合状态 | 位姿、尺度和 tracks | `WorldHypothesis H0`：Ego 与对象的 3D 状态 | 否 |
-| Step 6：一致性检测 | 当前假设、原始观测、知识库 | 约束违反、残差、冲突帧、疑似错误组件 | 否 |
-| Step 7：证据选择与知识推理 | 异常窗口、关键帧、运动曲线 | 结构化证据包、LLM/VLM 修正建议 | 否 |
-| Step 8：局部重新估计 | 修正方案、受影响窗口 | 多个新的 `WorldHypothesis` 候选 | 否 |
-| Step 9：评分与循环控制 | 候选假设及约束残差 | Top-K、历史最优 `H*`、停止决定 | 否 |
-| Step 10：最终时间分段 | 冻结的 `H*` | 片段、标签、边界证据和置信度 | 否 |
-| Step 11：符号化与报告 | Segments、轨迹、推理审计 | Logic atoms、物理曲线、provenance、冻结预测 | 否 |
-| 独立评估 | 冻结预测、人工 segmentation | Boundary F1、分类 F1、tIoU、混淆矩阵 | 是，仅只读评估 |
+| 1 - Init | $\mathcal X$, frozen configuration | validated `VideoManifest` $\mathcal M$ | No |
+| 2 - Neural Evidence | canonical RGB, $\Theta$ | independent evidence store $\mathcal O$ | No |
+| 3 - Object Tracking | $\mathcal O$ | replayable $\mathcal T$ and frozen evidence roles $\Pi$ | No |
+| 4 - Geometry + Observability | $\mathcal T$, $\mathcal O$, $\mathcal K$ | ranked geometry set $\mathcal G$ | No |
+| 5 - Joint World State | $\mathcal G$, $\mathcal T$, $\mathcal O$ | initial beam $\mathcal B_0$ | No |
+| 6 - Predict + Verify | $\mathcal B_i$, $\mathcal O$, $\Pi$, $\mathcal K$ | auditable residual packets $\mathcal R_i$ | No |
+| 7 - Diagnose + Propose | $\mathcal R_i$ and referenced evidence | bounded repair proposals $\Delta_i$ | No |
+| 8 - Local Re-estimation | parents, $\Delta_i$, affected windows | child hypotheses $\mathcal H_{i+1}^{1:n}$ | No |
+| 9 - Select + Retain | parents, children, fit/check residuals | $\mathcal Q_i$, $\mathcal B_{i+1}$, $\mathcal H^*$, $C_i$ | No |
+| 10 - Segmentation | frozen $\mathcal W^*$ | temporal segmentation $\mathcal Z^*$ | No |
+| 11 - Scene Output | $\mathcal W^*$, $\mathcal Z^*$ | symbolic scene and frozen $\mathcal P^*$ | No |
+| Independent evaluation | $\mathcal P^*$, $\mathcal Y$ | physical, tracking, segmentation and calibration metrics | Read-only |
 
-## 闭环允许修改的内容
+## Evidence-use plan and anti-circularity
 
-每轮修正只能在预先声明的候选空间中进行：
+物理上更平滑的轨迹不一定更接近真实情况。为避免“使用同一证据生成假设，再用该证据证明假设正确”，每次 run 在 world-state inference 前冻结 `EvidenceUsePlan` $\Pi$：
 
-- 静态背景参考对象集合；
-- 相机位姿与深度尺度候选；
-- Ego 速度、加速度和 yaw-rate 的滤波/平滑模型；
-- Track 的关联、拆分、合并及遮挡恢复；
-- 异常深度或异常光流观测的权重；
-- 局部运动状态阈值和 change point；
-- 受冲突影响时间窗口内的检测、跟踪和几何重算。
+- **fit evidence**：允许 numerical solver 用于状态估计；
+- **check-only evidence**：只用于候选接受、排序或非退化检查，当前 repair 不得优化它；
+- **report-only references**：人工标注或外部传感器，只能在 freeze 后评估。
 
-LLM/VLM 只能给出结构化错误归因、约束选择和有限修正建议，不能直接输出最终逐帧速度、轨迹或 segmentation 标签。
+可作为 check-only 的信息包括 backward flow、未被选中的 mask candidates、unmatched detections、固定抽取的时空验证点以及某些 cue-family holdouts。每个 residual 必须注明其 evidence role。若一个实验无法提供独立 check evidence，结果必须明确标记为 `self-consistency only`，不能宣称恢复了真实 world state。
 
-## 最优解释评分
+## Forward verification
 
-```text
-J(H) =
-  w_obs        * observation_error
-+ w_reproject  * reprojection_error
-+ w_flow       * background_flow_error
-+ w_physics    * physics_violation
-+ w_semantic   * semantic_violation
-+ w_complexity * explanation_complexity
-+ w_uncertainty* unresolved_uncertainty
-```
+对于 hypothesis $\mathcal H_i$ 和 cue family $c$：
 
-先用 hard constraints 淘汰非法候选，再依据上述 soft score 排序。最终输出必须采用整个搜索历史中的最优解释，而不是简单采用最后一轮结果。
+$$
+\hat y_{c,t}=g_c(\mathcal H_i),
+\qquad
+r_{c,t}=d_c(y_{c,t},\hat y_{c,t}),
+$$
 
-## 数据隔离规则
+$$
+z_{c,t}=\frac{r_{c,t}}
+{\sqrt{\sigma^2_{\mathrm{obs},c,t}+\sigma^2_{\mathrm{pred},c,t}+\epsilon}}.
+$$
 
-1. Pipeline 进程不得挂载或读取 `annotations/video_segmentation`。
-2. 人工标注不得参与阈值选择、候选排序、循环停止、超参数调整或 LLM 提示构造。
-3. 推断完成后写入冻结 manifest，其中包含代码版本、配置哈希、模型版本和输出哈希。
-4. Evaluator 只读冻结预测和人工标注，不能回写 pipeline 状态。
-5. 用于反复开发的标注集合属于 `dev/eval`；正式 `test` 必须保持隐藏并只做最终报告。
+Step 6 必须分别保存 observation、ego/background、object/identity、physics 和 semantic residual，不得过早压缩成一个分数。缺失证据降低 evaluability，而不是自动构成 violation。
 
-## 计划中的核心状态对象
+## Bounded repair operators
+
+闭环只能从版本化 allow-list 中选择操作：
+
+- `relink_track`, `split_track`, `switch_mask_candidate`；
+- `switch_pose_candidate`, `switch_scale_candidate`；
+- `invalidate_or_downweight_cue`；
+- `refit_local_dynamics`, `adjust_process_noise`；
+- `mark_occluded`, `mark_unobservable`, `leave_unresolved`。
+
+每个 proposal 必须声明 parent hypothesis、受影响变量、时间窗口、参数范围、目标 residual、预期 check-evidence 变化和计算预算。原始 evidence 不允许修改或删除。LLM/VLM 是可选诊断器，只能返回结构化失败类别和 allow-listed operator，不能直接写入物理数值。
+
+## Selection and acceptance
+
+候选先通过 hard feasibility gate，再进行 soft ranking：
+
+$$
+J(\mathcal H)=
+J_{\mathrm{fit}}
++\lambda_{\mathrm{check}}J_{\mathrm{check}}
++\lambda_{\mathrm{phys}}J_{\mathrm{phys}}
++\lambda_{\mathrm{complex}}J_{\mathrm{complex}}
++\lambda_{\mathrm{unc}}J_{\mathrm{unc}}.
+$$
+
+新候选只有在以下条件成立时才可替换 parent：
+
+1. 不新增 hard violation；
+2. 目标 fit residual 改善；
+3. check residual 改善或在冻结容差内不退化；
+4. uncertainty 没有被无证据地缩小；
+5. 改善超过复杂度与计算代价。
+
+最终冻结整个搜索历史中的 best-ever hypothesis，而不是最后一轮结果。无法得到唯一解时输出多峰假设、宽区间或 `unobservable`，不能强制生成精确速度。
+
+## Training-free experimental protocol
+
+- **Development videos:** 用于设计算法、规则、阈值和 prompt；不执行梯度训练。
+- **Optional calibration videos:** 只用于 uncertainty calibration 或阈值校准。
+- **Blind test videos:** 系统冻结后逐视频独立运行；不能跨视频更新权重、先验或 prompt。
+
+预训练模型可在外部数据上训练，但在本文 pipeline 内全部冻结。因此更准确的表述是 `training-free target-video inference`，而不是声称整个系统从未使用任何训练数据。
+
+## Paper-facing falsifiable claims
+
+论文至少应验证：
+
+1. 闭环降低 held-out trajectory/pose/segmentation error，而不只是降低自身 residual；
+2. analysis-by-synthesis 优于 raw pipeline 和普通 smoothing；
+3. uncertainty interval 具有合理 coverage，且系统能识别 scale ambiguity 与 unobservable cases；
+4. training-free inference 能在冻结配置下跨视频或跨数据集工作；
+5. 去除 check evidence、physics、beam search、repair 或 LLM 后的性能变化可被独立测量。
+
+如果缺少 pose/trajectory ground truth，只能报告 segmentation 和 self-consistency 结果，并将“恢复真实物理量”作为尚未被完全验证的限制。
+
+## Canonical world-state object
 
 ```text
 WorldHypothesis
 ├── hypothesis_id / parent_id / iteration
-├── camera_pose_trajectory
-├── metric_scale_hypothesis + confidence_interval
-├── ego_state: position, velocity, acceleration, yaw_rate
-├── object_world_trajectories
-├── observation_assignments
-├── constraint_residuals
+├── camera_pose_trajectory + covariance
+├── scale_hypothesis + observability + interval
+├── ego_state: position, velocity, acceleration, heading, yaw_rate
+├── object_world_trajectories + motion states
+├── observation_assignments + evidence roles
+├── fit_residuals / check_residuals / physical_residuals
 ├── hard_constraint_status
+├── uncertainty + evaluability
 ├── score_breakdown
 ├── repair_history
 └── provenance
 ```
 
-该对象应替代闭环内部对大型无类型 `state: dict` 的任意修改；现有 `state` 可以暂时保留为步骤间的外层兼容容器。
+闭环内部应以该类型化对象替代对大型 `state: dict` 的任意原地修改。现有 `state` 只作为迁移期间的兼容容器。

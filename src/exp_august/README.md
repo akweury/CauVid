@@ -1,16 +1,167 @@
 # exp_august
 
-`exp_august` is the Paper-1-only pipeline:
+There are currently two explicit execution paths:
+
+- `src.exp_august.pipeline` is the frozen legacy linear baseline.
+- `src.exp_august.inference.runner` is the target annotation-free world-state
+  pipeline. Its implemented boundaries currently cover Steps 1-3.
+
+## Target Step 1: Init
+
+The target Step 1 reads raw videos only. It does not discover annotations,
+labels, prepared frame folders, or train/test membership. It validates each
+video, fingerprints the input, applies display orientation, and maps source
+timestamps to a deterministic canonical timeline. Dense RGB frames are not
+duplicated: the versioned manifest preserves the source-frame mapping needed to
+decode them on demand.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 1 \
+  --canonical-fps 10 \
+  --decode-validation sample
+```
+
+Use `--video-ids ID ...` or `--video-paths PATH ...` for explicit inputs.
+`--decode-validation full` checks every canonical frame; `sample` checks a
+deterministic spread while retaining all frame mappings; `none` performs probe
+validation only. Outputs are written below:
+
+```text
+<output-root>/<run-id>/01_init/
+  init_bundle.json
+  videos/<video-id>.manifest.json
+```
+
+The contract implementation is under `src/exp_august/contracts/`; Step 1 is
+under `src/exp_august/inference/step01_init.py`. The output JSON is immutable,
+schema-versioned, content-addressed, and reload-validated by Pydantic.
+
+## Target Step 2: Neural Evidence
+
+Step 2 uses the Step 1 source-frame mapping to decode canonical, orientation-
+normalized frames on demand. It extracts independent evidence only: no tracking,
+persistent object identity, evidence fusion, or physical inference occurs here.
+YOLO-World retains primary detections and lower-confidence candidates with stable
+frame-local IDs. Optional SAM 2, RAFT-Small, and Depth Anything 3 backends write
+frame-local masks, adjacent-frame bidirectional flow, and single-frame relative
+depth. The models run sequentially and release GPU memory between passes; frames
+are decoded again on demand instead of being duplicated into a JPEG cache.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 2 \
+  --canonical-fps 1 \
+  --objects-backend yolo_world \
+  --yolo-model weights/yolo/yolov8s-worldv2.pt \
+  --masks-backend sam2 \
+  --sam2-model weights/sam2/sam2_t.pt \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --depth-process-resolution 504 \
+  --batch-size 4 \
+  --device cuda:0
+```
+
+Local weights are required by default. Add `--allow-model-download` only when a
+run is explicitly permitted to resolve missing YOLO, SAM 2, or RAFT weights.
+DA3 follows the Hugging Face cache policy used by the repository depth module.
+Torchvision RAFT requires both image dimensions, after padding to a multiple of
+eight, to be at least 128 pixels; the backend fails early with this constraint.
+
+Step 2 adds:
+
+```text
+<output-root>/<run-id>/02_neural_evidence/config_<hash>/
+  neural_evidence_store.json
+  videos/<video-id>.evidence.json
+  artifacts/masks/<video-id>/frame_<index>/mask_<rank>.png
+  artifacts/flow/<video-id>/frame_<source>_to_<target>_<direction>.npz
+  artifacts/depth/<video-id>/frame_<index>.npz
+```
+
+Each dense artifact records shape, dtype, coordinate space, content hash, and
+provenance. Flow artifacts retain the dense field, domain-valid mask,
+forward/backward consistency mask, and residual error. Depth artifacts retain
+depth, validity, and model confidence when supplied; DA3 output is deliberately
+typed as `relative`, not meters. The configuration hash includes model identity,
+vocabulary, thresholds, device declaration, and batch settings, so alternative
+Step 2 configurations cannot overwrite one another.
+
+The dense backends default to `disabled` because they are compute-intensive.
+Use `--objects-backend disabled`, `--masks-backend disabled`,
+`--flow-backend disabled`, or `--depth-backend disabled` to exercise a partial
+pipeline. A disabled or missing cue is explicitly `unavailable`; an executed
+model with no result is `empty`; a temporal endpoint or a SAM frame with no
+eligible detector prompt is `not_applicable`.
+
+## Target Step 3: Object Tracking
+
+Step 3 reads the immutable `NeuralEvidenceStore` and builds ID-consistent,
+image-space mask tracks. It forms every active-track/current-instance pair,
+computes mask IoU, RAFT-warped mask IoU, box IoU, class consistency, and robust
+masked-depth consistency, normalizes weights over cues that are actually
+available, then applies deterministic gates and one-to-one Hungarian assignment.
+This stage does not estimate 3D position, metric speed, or physical causes for
+an object's appearance or disappearance.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 3 \
+  --canonical-fps 0.2 \
+  --objects-backend yolo_world \
+  --yolo-model weights/yolo/yolov8s-worldv2.pt \
+  --masks-backend sam2 \
+  --sam2-model weights/sam2/sam2_t.pt \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --depth-process-resolution 224 \
+  --tracking-max-age-frames 2 \
+  --tracking-min-score 0.30 \
+  --visualize-step3 \
+  --device cuda:0
+```
+
+Step 3 adds:
+
+```text
+<output-root>/<run-id>/03_object_tracking/config_<hash>/
+  tracking_store.json
+  videos/<video-id>.tracking.json
+  artifacts/mask_candidates/<video-id>/<track-id>/*.png
+```
+
+The per-video `TrackingPackage` contains the track view plus the complete
+association ledger, input references, evidence dispositions, forward/backward
+gap-mask candidates, unassigned evidence, factual state markers, deterministic
+transforms, a downstream `EvidenceUsePlan`, and a machine-checkable retention
+report. It is not published unless hashes/shapes, candidate-pair accounting,
+evidence disposition, and observed/lost track-frame coverage all close.
+
+With `--visualize-step3`, each video also receives annotated canonical-frame
+PNGs, a four-frame contact sheet, candidate-archive panels, and an MP4 under
+`visualizations/<video-id>/`. Selected observations show stable ID, class,
+detection confidence, association score, box, mask fill, and mask contour.
+Candidate panels deliberately keep flow-forward, flow-backward, unassigned, and
+unobservable hypotheses separate. `step3_visualization_manifest.json` indexes
+all outputs. Use `--no-step3-video` when only still images are needed.
+
+## Legacy linear baseline
+
+The legacy `exp_august` path is:
 
 `Raw Video -> Object Tracks -> 3D Trajectories -> Trajectory Refinement -> Ego/Object Motion -> Temporal Segmentation -> Symbolic Representation`
 
-Run it independently with:
+Run the legacy baseline independently with:
 
 ```bash
 python -m src.exp_august.pipeline --video-count 1 --max-step 11
 ```
 
-## Step 3: object mask tracking
+## Legacy Step 3: object mask tracking
 
 Step 3 now uses a detector-guided hybrid tracker. ByteTrack first supplies
 bootstrap IDs and box prompts. When a local SAM 2 checkpoint is available,

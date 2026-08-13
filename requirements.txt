@@ -15,6 +15,7 @@ seaborn
 # Data handling
 pathlib2
 dataclasses-json
+pydantic>=2,<3
 pandas
 PyYAML
 
@@ -29,6 +30,7 @@ kagglehub
 imageio
 imageio-ffmpeg
 wandb
+pytest>=8,<10
 
 # Depth Anything 3 dependencies
 omegaconf

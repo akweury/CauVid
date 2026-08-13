@@ -81,15 +81,16 @@
     fill=purplefill,
     draw=purplestroke
   },
-  role/.style={
+  storage/.style={
     draw,
-    rounded corners=5pt,
-    line width=1.0pt,
-    minimum height=0.90in,
-    text width=1.68in,
-    inner xsep=5pt,
-    inner ysep=6pt,
-    fill=white
+    rounded corners=7pt,
+    line width=1.25pt,
+    minimum height=1.16in,
+    text width=6.72in,
+    inner xsep=8pt,
+    inner ysep=8pt,
+    fill=bluefill!45,
+    draw=bluestroke
   },
   flow/.style={
     -{Latex[length=3.5mm,width=2.2mm]},
@@ -101,6 +102,13 @@
     -{Latex[length=3.1mm,width=2.0mm]},
     line width=1.15pt,
     draw=slatestroke,
+    rounded corners=7pt
+  },
+  reference/.style={
+    -{Latex[length=3.2mm,width=2.0mm]},
+    line width=1.35pt,
+    draw=purplestroke,
+    densely dashed,
     rounded corners=7pt
   },
   recurrence/.style={
@@ -131,7 +139,7 @@
 \node[font=\fontsize{11.5}{13}\selectfont,text=muted,anchor=north west]
   at (0.42,8.40) {Associate frame-local observations into persistent image-space object identities};
 \node[font=\bfseries\fontsize{11}{13}\selectfont,text=purplestroke,anchor=north east]
-  at (15.60,8.69) {Output: ID-consistent mask tracks};
+  at (15.60,8.69) {Output: ID-consistent tracks + replayable evidence};
 
 % Input evidence panel
 \begin{scope}[on background layer]
@@ -165,7 +173,7 @@
 \node[stage] (candidate) at (4.78,6.56)
   {\textbf{\fontsize{13.5}{15.5}\selectfont 3.1 - Candidate Construction}\\[7pt]
    \twobullets{pair active tracks with current instances}
-              {retain birth, gap and death alternatives}};
+              {retain new / missed / retired alternatives}};
 
 \node[stage,text width=3.34in,minimum height=2.38in,fill=greenfill!70]
   (score) at (8.05,6.56)
@@ -192,16 +200,16 @@
                 {reject $A_{ij}<\tau$}};
 
 \node[stage,fill=orangefill,draw=orangestroke] (update) at (14.20,6.56)
-  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.4 - Track Lifecycle Update}\\[7pt]
-   \threebullets{match: retain ID}
-                {instance only: create ID}
-                {track only: occluded/lost}};
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.4 - Track State Logging}\\[7pt]
+   \threebullets{update active / lost / retired}
+                {log start / gap / end markers}
+                {retain unmatched evidence}};
 
 \node[output] (tracks) at (14.20,3.42)
-  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.5 - Object Track Set}\\[7pt]
-   \threebullets{ID-aligned masks and boxes}
-                {confidence and visibility state}
-                {association evidence and provenance}};
+  {\textbf{\fontsize{13.5}{15.5}\selectfont 3.5 - Tracking Package}\\[7pt]
+   \threebullets{ID-aligned track view}
+                {artifact refs + uncertainty}
+                {candidate and state audit trail}};
 
 % Main arrows. The four frame-local cues are represented by one bundle arrow;
 % individual fan-in lines are intentionally omitted for visual clarity.
@@ -213,30 +221,40 @@
 
 \draw[flow] (candidate.east) -- node[edgelabel,above=7pt] {$(i,j)$} (score.west);
 \draw[flow] (score.east) -- node[edgelabel,above=7pt] {$[A_{ij}]$} (assign.west);
-\draw[flow] (assign.east) -- node[smalllabel,above=9pt] {matched pairs} (update.west);
+\draw[flow] (assign.east) -- node[edgelabel,above=9pt] {$\mathcal{M}_t$} (update.west);
 \draw[flow] (update.south) -- node[edgelabel,right=8pt] {$\mathcal{T}_{t}$} (tracks.north);
 
-% Evidence role cards
-\node[font=\bfseries\fontsize{13}{15}\selectfont,anchor=west]
-  at (4.00,4.28) {Why each cue matters};
+% Dense evidence is stored once. The Tracking Package contains references,
+% indexes and audit records instead of copying the tensors.
+\node[storage] (store) at (7.90,3.52)
+  {\textbf{\fontsize{13.5}{15.5}\selectfont Immutable Evidence Store}\\[6pt]
+   \begin{minipage}{6.50in}
+   \raggedright\fontsize{12}{14}\selectfont
+   \textbullet\ RGB + all detections \quad
+   \textbullet\ masks / logits + mask candidates\\[2pt]
+   \textbullet\ forward / backward flow \quad
+   \textbullet\ depth + confidence\\[2pt]
+   \textbullet\ content hashes, transforms and model / config provenance
+   \end{minipage}\\[4pt]
+   {\bfseries\fontsize{11.5}{13}\selectfont Store once; compress, chunk and deduplicate without lossy replacement}};
 
-\node[role,draw=bluestroke] (rY) at (4.92,3.58)
-  {\textbf{YOLO}\\[3pt]{\fontsize{11.5}{13}\selectfont detection and semantic anchor}};
-\node[role,draw=greenstroke] (rS) at (6.83,3.58)
-  {\textbf{SAM 2}\\[3pt]{\fontsize{11.5}{13}\selectfont precise spatial support}};
-\node[role,draw=amberstroke] (rF) at (8.74,3.58)
-  {\textbf{RAFT}\\[3pt]{\fontsize{11.5}{13}\selectfont temporal mask displacement}};
-\node[role,draw=orangestroke] (rZ) at (10.65,3.58)
-  {\textbf{DA3}\\[3pt]{\fontsize{11.5}{13}\selectfont depth continuity and ordering}};
+\draw[flow] (3.38,3.52) -- node[smalllabel,above=8pt] {write once} (store.west);
+\draw[reference] (tracks.west) -- node[smalllabel,above=8pt,text=purplestroke]
+  {$r_x$: artifact refs} (store.east);
+
+% The package has two destinations: Step 4 consumes the complete package,
+% while its current track-state view recurs as the prior for frame t+1.
+\coordinate (stepfour) at (15.78,3.42);
+\draw[flow] (tracks.east) -- node[edgelabel,above=7pt] {$\mathcal{T}$} (stepfour);
 
 \node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
       text width=7.20in,minimum height=0.62in,inner sep=6pt,
       font=\bfseries\fontsize{11.5}{13.5}\selectfont]
   (boundary) at (8.00,2.15)
-  {Boundary: Step 3 establishes image-space identity only; metric 3D position, speed and physical trajectories are deferred to Steps 4-5.};
+  {Boundary: Step 3 associates and archives evidence only; lifecycle causes, metric 3D states, speed and physical explanations are deferred.};
 
 % Temporal recurrence: the output becomes the previous state at the next frame.
-\draw[recurrence] (tracks.east) -- ++(0.34,0) |- (15.73,1.14) -- (0.20,1.14) |- (prior.west);
+\draw[recurrence] (tracks.south) -- ++(0,-0.30) |- (0.20,1.14) |- (prior.west);
 \node[edgelabel,text=purplestroke,anchor=south] at (8.00,1.27)
   {advance to frame $t+1$};
 

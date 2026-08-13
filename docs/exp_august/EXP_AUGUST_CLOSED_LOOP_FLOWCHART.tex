@@ -1,11 +1,11 @@
 % Compile with LuaLaTeX:
-%   lualatex -interaction=nonstopmode EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex
-% The page is exactly 16:9. All module and node positions are explicit.
+%   lualatex -interaction=nonstopmode -halt-on-error EXP_AUGUST_CLOSED_LOOP_FLOWCHART.tex
+% The page is exactly 16:9. Positions are explicit for stable review.
 \documentclass[10pt]{article}
 \usepackage[paperwidth=16in,paperheight=9in,margin=0in]{geometry}
 \usepackage{fontspec}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,backgrounds,calc,fit,positioning,shapes.geometric}
+\usetikzlibrary{arrows.meta,backgrounds,calc,positioning,shapes.geometric}
 \pagestyle{empty}
 \setmainfont{Arial}
 \hyphenpenalty=10000
@@ -26,240 +26,202 @@
 \definecolor{redfill}{HTML}{FDECEC}
 \definecolor{redstroke}{HTML}{A34848}
 
-% Boxes explain responsibilities; edge symbols carry the data semantics.
-\newcommand{\tasktwo}[2]{{\fontsize{12}{13.8}\selectfont
-    \textbullet\ #1\\\textbullet\ #2}}
-\newcommand{\tasktwoleft}[2]{{\fontsize{12}{13.8}\selectfont
-    \parbox{1.82in}{\raggedright
-    \textbullet\ #1\\\textbullet\ #2}}}
-\newcommand{\taskfour}[4]{{\fontsize{12}{13.8}\selectfont
-    \textbullet\ #1\\\textbullet\ #2\\
-    \textbullet\ #3\\\textbullet\ #4}}
-\newcommand{\taskfourleft}[4]{{\fontsize{12}{13.8}\selectfont
-    \parbox{1.72in}{\raggedright
-    \textbullet\ #1\\\textbullet\ #2\\
-    \textbullet\ #3\\\textbullet\ #4}}}
-\newcommand{\taskkey}[3]{{\fontsize{12}{13.8}\selectfont
-    \textbullet\ #1\\\textbullet\ #2\\
-    \textcolor{orangestroke}{\bfseries KEY: #3}}}
-\newcommand{\taskkeyleft}[3]{{\fontsize{12}{13.8}\selectfont
-    \parbox{1.82in}{\raggedright
-    \textbullet\ #1\\\textbullet\ #2\\
-    \textcolor{orangestroke}{\bfseries KEY: #3}}}}
-\newcommand{\taskkeywide}[3]{{\fontsize{12}{13.8}\selectfont
-    \parbox{2.16in}{\raggedright
-    \textbullet\ #1\\\textbullet\ #2\\
-    \textcolor{orangestroke}{\bfseries KEY: #3}}}}
-\newcommand{\nodeinfo}[1]{{\fontsize{12}{13.8}\selectfont #1}}
+\newcommand{\twobullets}[2]{%
+  \parbox{1.80in}{\raggedright\fontsize{12}{13.8}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\twobulletssmall}[2]{%
+  \parbox{1.54in}{\raggedright\fontsize{12}{13.8}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\threebullets}[3]{%
+  \parbox{1.88in}{\raggedright\fontsize{12}{13.8}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\fourbullets}[4]{%
+  \parbox{1.86in}{\raggedright\fontsize{12}{13.8}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3\\\textbullet\ #4}}
+\newcommand{\corebullets}[3]{%
+  \parbox{1.94in}{\raggedright\fontsize{12}{13.8}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\
+  \textcolor{orangestroke}{\bfseries CORE: #3}}}
 
 \begin{document}
 \begin{tikzpicture}[
-    remember picture,
-    overlay,
-    shift={(current page.south west)},
-    x=1in,
-    y=1in,
-    every node/.style={font=\fontsize{12}{14}\selectfont,text=ink,align=center},
-    box/.style={
-        draw,
-        rounded corners=5pt,
-        line width=1.15pt,
-        minimum height=1.04in,
-        text width=2.02in,
-        inner xsep=6pt,
-        inner ysep=7pt,
-        fill=white
-    },
-    source/.style={box,fill=bluefill,draw=bluestroke},
-    observe/.style={box,fill=greenfill,draw=greenstroke},
-    hypothesis/.style={box,fill=amberfill,draw=amberstroke},
-    reasoning/.style={box,fill=orangefill,draw=orangestroke,text width=2.28in},
-    frozen/.style={box,fill=purplefill,draw=purplestroke},
-    evaluation/.style={box,fill=redfill,draw=redstroke},
-    decision/.style={
-        diamond,
-        aspect=2.0,
-        draw=amberstroke,
-        fill=amberfill,
-        line width=1.15pt,
-        inner xsep=3pt,
-        inner ysep=2pt,
-        text width=1.44in,
-        font=\fontsize{10.5}{12}\selectfont
-    },
-    flow/.style={-{Latex[length=3.2mm,width=2.0mm]},line width=1.35pt,draw=ink,rounded corners=7pt},
-    feedback/.style={-{Latex[length=3.5mm,width=2.2mm]},line width=2.0pt,draw=amberstroke,rounded corners=9pt},
-    readonly/.style={-{Latex[length=3.2mm,width=2.0mm]},line width=1.25pt,draw=redstroke,densely dashed,rounded corners=7pt},
-    flowlabel/.style={
-        fill=none,
-        inner sep=0pt,
-        font=\fontsize{14}{15}\selectfont
-    },
-    smalllabel/.style={flowlabel,font=\fontsize{11.5}{13}\selectfont},
-    moduletitle/.style={font=\bfseries\fontsize{13.5}{15}\selectfont,anchor=west,text=ink},
-    subtitle/.style={font=\fontsize{8.5}{10}\selectfont,text=muted}
+  remember picture,
+  overlay,
+  shift={(current page.south west)},
+  x=1in,
+  y=1in,
+  every node/.style={font=\fontsize{12}{14}\selectfont,text=ink,align=center},
+  box/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.15pt,
+    minimum height=1.04in,
+    text width=2.02in,
+    inner xsep=6pt,
+    inner ysep=7pt,
+    fill=white
+  },
+  source/.style={box,fill=bluefill,draw=bluestroke},
+  evidence/.style={box,fill=greenfill,draw=greenstroke},
+  hypothesis/.style={box,fill=amberfill,draw=amberstroke,text width=2.24in},
+  reasoning/.style={box,fill=orangefill,draw=orangestroke,text width=2.02in},
+  frozen/.style={box,fill=purplefill,draw=purplestroke},
+  evaluation/.style={box,fill=redfill,draw=redstroke},
+  decision/.style={
+    diamond,
+    aspect=2.05,
+    draw=amberstroke,
+    fill=amberfill,
+    line width=1.2pt,
+    inner xsep=3pt,
+    inner ysep=2pt,
+    text width=1.42in,
+    font=\fontsize{10.5}{12}\selectfont
+  },
+  flow/.style={-{Latex[length=3.2mm,width=2.0mm]},line width=1.35pt,draw=ink,rounded corners=7pt},
+  feedback/.style={-{Latex[length=3.5mm,width=2.2mm]},line width=2.0pt,draw=amberstroke,rounded corners=9pt},
+  readonly/.style={-{Latex[length=3.2mm,width=2.0mm]},line width=1.25pt,draw=redstroke,densely dashed,rounded corners=7pt},
+  flowlabel/.style={fill=none,inner sep=0pt,font=\fontsize{14}{15}\selectfont},
+  smalllabel/.style={flowlabel,font=\fontsize{11.5}{13}\selectfont},
+  moduletitle/.style={font=\bfseries\fontsize{13.5}{15}\selectfont,anchor=west,text=ink},
+  subtitle/.style={font=\fontsize{9.5}{11}\selectfont,text=muted}
 ]
 
-% ---------------------------------------------------------------------------
-% Fixed 16:9 frame and four fixed module quadrants.
-% ---------------------------------------------------------------------------
 \path[use as bounding box] (0,0) rectangle (16,9);
 \node[font=\bfseries\fontsize{19}{22}\selectfont,anchor=north west]
-    at (0.34,8.83) {Video-only Knowledge-constrained Closed-loop Inference};
+  at (0.34,8.83) {Training-free Evidence-grounded World-State Inference};
 \node[subtitle,anchor=north east]
-    at (15.66,8.80) {No human segmentation is accessible before predictions are frozen};
+  at (15.66,8.80) {Per-video inference only · no cross-video learning · annotations remain sealed until freeze};
 
+% Four fixed 16:9 quadrants.
 \begin{scope}[on background layer]
-    \filldraw[fill=bluefill!25,draw=bluestroke!60,line width=1.2pt,rounded corners=10pt]
-        (0.30,4.70) rectangle (7.82,8.38);
-    \filldraw[fill=amberfill!35,draw=amberstroke!65,line width=1.2pt,rounded corners=10pt]
-        (8.18,4.70) rectangle (15.70,8.38);
-    \filldraw[fill=purplefill!32,draw=purplestroke!65,line width=1.2pt,rounded corners=10pt]
-        (0.30,0.78) rectangle (7.82,4.40);
-    \filldraw[fill=amberfill!22,draw=amberstroke!65,line width=1.2pt,rounded corners=10pt]
-        (8.18,0.78) rectangle (15.70,4.40);
+  \filldraw[fill=bluefill!25,draw=bluestroke!60,line width=1.2pt,rounded corners=10pt]
+    (0.30,4.70) rectangle (7.82,8.38);
+  \filldraw[fill=amberfill!35,draw=amberstroke!65,line width=1.2pt,rounded corners=10pt]
+    (8.18,4.70) rectangle (15.70,8.38);
+  \filldraw[fill=purplefill!32,draw=purplestroke!65,line width=1.2pt,rounded corners=10pt]
+    (0.30,0.78) rectangle (7.82,4.40);
+  \filldraw[fill=orangefill!25,draw=orangestroke!65,line width=1.2pt,rounded corners=10pt]
+    (8.18,0.78) rectangle (15.70,4.40);
 \end{scope}
 
-\node[moduletitle] at (0.52,8.19) {I · VIDEO $\rightarrow$ OBSERVATIONS};
-\node[moduletitle] at (8.40,8.19) {II · INITIAL STATE $\rightarrow$ CONSTRAINTS};
+\node[moduletitle] at (0.52,8.19) {I · VIDEO $\rightarrow$ REPLAYABLE EVIDENCE};
+\node[moduletitle] at (8.40,8.19) {II · UNCERTAIN WORLD HYPOTHESES};
 \node[moduletitle] at (0.52,4.21) {IV · FREEZE $\rightarrow$ BLIND EVALUATION};
-\node[moduletitle] at (8.40,4.21) {III · RE-ESTIMATE $\rightarrow$ SELECT};
+\node[moduletitle] at (8.40,4.21) {III · ANALYSIS-BY-SYNTHESIS LOOP};
 
 % ---------------------------------------------------------------------------
-% Module I — upper left. Explicit serpentine path prevents central overlaps.
+% Module I - evidence extraction only.
 % ---------------------------------------------------------------------------
-\node[source,text width=1.72in] (video) at (1.35,7.43)
-    {\textbf{Raw Video}\\[4pt]\tasktwo{decode RGB frames}{preserve timing}};
-\node[source,text width=1.72in] (knowledge) at (1.35,6.28)
-    {\textbf{Frozen Knowledge}\\[4pt]\tasktwo{encode physics priors}{freeze rule set}};
-\node[observe] (s1) at (4.15,7.43)
-    {\textbf{Step 1 · Init}\\[4pt]
-     \tasktwoleft{Video Validation}{Timeline Normalization}};
-\node[observe] (s2) at (6.63,7.27)
-    {\textbf{Step 2 · Neural Perception}\\[4pt]
-     \taskfourleft{Objects (YOLO)}{Masks (SAM 2)}{Optical Flow (RAFT)}{Depth (DA3)}};
-\node[observe,text width=2.36in] (s3) at (3.95,5.54)
-    {\textbf{Step 3 · Object Tracking}\\[4pt]
-     \nodeinfo{\parbox{2.16in}{\raggedright\textbullet\ Build ID consistent mask tracks}}};
-\node[observe] (s4) at (6.63,5.54)
-    {\textbf{Step 4 · Geometry/Scale}\\[4pt]
-     \taskkeyleft{recover camera pose}{resolve metric scale}{multi-cue geometry}};
+\node[source,text width=1.72in] (video) at (1.35,7.22)
+  {\textbf{Raw Video}\\[4pt]\twobulletssmall{decode RGB frames}{preserve source timing}};
+\node[source,text width=1.72in] (system) at (1.35,5.52)
+  {\textbf{Frozen System}\\[4pt]\twobulletssmall{pretrained models $\Theta$}{physics + logic $\mathcal K$}};
+\node[evidence,text width=1.90in] (s1) at (3.82,7.22)
+  {\textbf{Step 1 · Init}\\[4pt]\twobullets{validate video}{normalize timeline}};
+\node[evidence,text width=2.12in,minimum height=1.34in] (s2) at (6.40,7.10)
+  {\textbf{Step 2 · Neural Evidence}\\[4pt]
+   \fourbullets{Objects (YOLO)}{Masks (SAM 2)}{Flow (RAFT)}{Depth (DA3)}};
+\node[evidence,text width=2.30in] (s3) at (4.86,5.43)
+  {\textbf{Step 3 · Object Tracking}\\[4pt]
+   \twobullets{build ID-consistent mask tracks}{archive all candidates + provenance}};
 
-\draw[flow] (video.east) .. controls +(0.65,0.08) and +(-0.58,0.26) ..
-    node[flowlabel,pos=0.47,yshift=10pt] {$\mathcal{X}$} (s1.north west);
-\draw[flow] (knowledge.east) .. controls +(0.68,0.00) and +(-0.62,-0.26) ..
-    node[flowlabel,pos=0.48,yshift=-12pt] {$\mathcal{K}$} (s1.south west);
-\draw[flow] (s1.east) -- node[flowlabel,above=8pt] {$\mathcal{M}$} (s2.west);
-\draw[flow] (s2.south) .. controls +(-0.58,-0.33) and +(0.72,0.30) ..
-    node[flowlabel,pos=0.48,yshift=12pt] {$\mathcal{O}_t$} (s3.north);
-\draw[flow] (s3.east) -- node[flowlabel,above=8pt] {$\mathcal{T}$} (s4.west);
+\draw[flow] (video.east) -- node[flowlabel,above=8pt] {$\mathcal X$} (s1.west);
+\draw[flow] (s1.east) -- node[flowlabel,above=8pt] {$\mathcal M$} (s2.west);
+\draw[flow] (system.east) -- (3.12,5.52) -- (3.12,6.26) -- (5.20,6.26)
+  -- (s2.south west);
+\node[smalllabel] at (4.22,6.40) {$\Theta,\mathcal K$};
+\draw[flow] (s2.south) .. controls +(-0.18,-0.42) and +(0.68,0.33) ..
+  node[flowlabel,pos=0.48,xshift=15pt,yshift=4pt] {$\mathcal O$} (s3.north);
 
 % ---------------------------------------------------------------------------
-% Module II — upper right.
+% Module II - construct explicit alternative world states.
 % ---------------------------------------------------------------------------
-\node[hypothesis] (s5) at (9.48,7.19)
-    {\textbf{Step 5 · Joint State}\\[4pt]
-     \tasktwoleft{fuse ego + object states}{initialize world models}};
-\node[hypothesis] (beam) at (11.94,7.19)
-    {\textbf{Top-K Hypotheses}\\[4pt]
-     \tasktwo{preserve alternatives}{retain uncertainty}};
-\node[hypothesis] (s6) at (14.40,7.19)
-    {\textbf{Step 6 · Consistency}\\[4pt]
-     \taskkeyleft{compute residuals}{test temporal coherence}{physical plausibility}};
-\node[hypothesis] (s7) at (9.55,5.55)
-    {\textbf{Step 7 · Evidence Check}\\[4pt]
-     \taskkeyleft{sample keyframes}{localize conflicts}{logic checks}};
-\node[reasoning] (repair) at (12.48,5.55)
-    {\textbf{Knowledge + Numerical Repair}\\[4pt]
-     \taskkey{propose bounded repairs}{solve parameters}{LLM + numeric solver}};
+\node[hypothesis] (s4) at (9.82,7.08)
+  {\textbf{Step 4 · Geometry + Observability}\\[4pt]
+   \threebullets{estimate camera pose + ground}{retain scale alternatives}{mark observability incl. unobservable}};
+\node[hypothesis] (s5) at (13.33,7.08)
+  {\textbf{Step 5 · Joint World State}\\[4pt]
+   \threebullets{estimate ego + object dynamics}{branch scale + association choices}{propagate uncertainty}};
+\node[hypothesis,text width=2.38in] (beam) at (11.96,5.38)
+  {\textbf{Top-K World Hypotheses $\mathcal B_0$}\\[4pt]
+   \twobullets{immutable and reproducible alternatives}{diverse pose / scale / identity explanations}};
 
-\draw[flow] (s5.east) -- node[flowlabel,above=8pt] {$\mathcal{H}_0$} (beam.west);
-\draw[flow] (beam.east) -- node[flowlabel,above=8pt] {$\mathcal{B}_i$} (s6.west);
-\draw[flow] (s6.south) -- ++(0,-0.34) -| node[flowlabel,pos=0.56,above=11pt] {$\mathcal{R}_i$} (s7.north);
-\draw[flow] (s7.east) -- node[flowlabel,above=8pt] {$\mathcal{E}_i$} (repair.west);
-
-% Module I -> II. The label is shifted above the inter-module bridge.
-\draw[flow] (s4.east) -- ++(0.30,0) |- node[smalllabel,pos=0.42,yshift=11pt]
-    {$\bigl(\mathcal{G},\mathcal{O}_t,\mathcal{K}\bigr)$} (s5.west);
+\draw[flow] (s3.east) -- (7.98,5.43) -- (7.98,7.72) -- (8.52,7.72)
+  -- node[smalllabel,pos=0.55,yshift=11pt]
+  {$\mathcal I_W=\{\mathcal T,\mathcal O,\Pi,\mathcal K\}$} (s4.north west);
+\draw[flow] (s4.east) -- node[flowlabel,above=8pt] {$\mathcal G$} (s5.west);
+\draw[flow] (s5.south) .. controls +(0,-0.42) and +(0.68,0.32) ..
+  node[smalllabel,pos=0.48,xshift=18pt,yshift=3pt] {$\mathcal H_0^{1:n}$} (beam.north east);
 
 % ---------------------------------------------------------------------------
-% Module III — lower right.
+% Module III - the paper-facing core algorithm.
 % ---------------------------------------------------------------------------
-\node[hypothesis] (s8) at (9.48,3.28)
-    {\textbf{Step 8 · Local Re-estimation}\\[4pt]
-     \tasktwoleft{re-estimate local windows}{generate variants}};
-\node[hypothesis] (s9) at (11.94,3.28)
-    {\textbf{Step 9 · Unified Score}\\[4pt]
-     \tasktwoleft{enforce hard constraints}{rank soft residuals}};
-\node[hypothesis] (best) at (14.40,3.28)
-    {\textbf{Best-ever Register}\\[4pt]
-     \tasktwo{retain the Top-K beam}{track best-ever score}};
-\node[decision] (stop) at (9.48,1.62)
-    {\textbf{Stop?}\\[4pt]\tasktwo{constraints pass}{$\Delta J_i\leq\varepsilon$ or budget}};
-\node[hypothesis,text width=2.10in] (loopback) at (12.48,1.62)
-    {\textbf{Feedback Return}\\[4pt]
-     \tasktwo{form the next beam}{preserve provenance}};
+\node[reasoning] (s6) at (9.47,3.28)
+  {\textbf{Step 6 · Predict + Verify}\\[4pt]
+   \corebullets{render expected mask / flow / depth / background}{measure normalized fit / check residuals}{analysis-by-synthesis}};
+\node[reasoning] (s7) at (11.91,3.28)
+  {\textbf{Step 7 · Diagnose + Propose}\\[4pt]
+   \threebullets{localize component + window}{select allow-listed repair}{LLM optional; never numeric}};
+\node[reasoning] (s8) at (14.35,3.28)
+  {\textbf{Step 8 · Local Re-estimation}\\[4pt]
+   \corebullets{change bounded latent variables}{solve the affected window only}{evidence-preserving repair}};
+\node[reasoning] (s9) at (14.35,1.63)
+  {\textbf{Step 9 · Select + Retain}\\[4pt]
+   \corebullets{hard feasibility first}{score check evidence + uncertainty}{best-ever Top-K}};
+\node[decision] (stop) at (11.38,1.63)
+  {\textbf{Stop?}\\[4pt]
+   constraints pass\\$\Delta J_i\leq\varepsilon$\\or budget ends};
 
-\draw[flow] (s8.east) -- node[smalllabel,above=9pt] {$\mathcal{H}_{i+1}^{1:n}$} (s9.west);
-\draw[flow] (s9.east) -- node[flowlabel,above=8pt] {$\mathcal{Q}_i$} (best.west);
-\draw[flow] (best.south) -- ++(0,-0.31) -| node[smalllabel,pos=0.32,right=8pt]
-    {$\mathcal{H}^{*},\Delta J_i$} (stop.east);
-\draw[feedback] (stop.east) -- node[smalllabel,above=9pt] {$C_i=0$} (loopback.west);
-\draw[feedback]
-    (loopback.east) -- (15.57,1.62) -- (15.57,7.86)
-    -- (11.94,7.86)
-    -- (beam.north);
-\node[smalllabel] at (13.75,8.01) {$\mathcal{B}_{i+1}$};
+\draw[flow] (beam.south) -- (11.96,4.55) -- node[smalllabel,above=9pt]
+  {$\mathcal B_i$} (8.02,4.55) -- (8.02,3.28) -- (s6.west);
+\draw[flow] (s6.east) -- node[flowlabel,above=8pt] {$\mathcal R_i$} (s7.west);
+\draw[flow] (s7.east) -- node[flowlabel,above=8pt] {$\Delta_i$} (s8.west);
+\draw[flow] (s8.south) -- node[smalllabel,right=7pt] {$\mathcal H_{i+1}^{1:n}$} (s9.north);
+\draw[flow] (s9.west) -- node[flowlabel,above=8pt] {$\mathcal Q_i$} (stop.east);
 
-% Module II -> III.
-\draw[flow] (repair.south) -- ++(0,-0.34) -| node[flowlabel,pos=0.46,above=11pt]
-    {$\Delta_i$} (s8.north);
+% Feedback is accepted only after check-evidence scoring in Step 9.
+\draw[feedback] (stop.south) -- (11.38,0.66) -- (15.86,0.66) -- (15.86,4.55)
+  -- (13.55,4.55) -- (13.55,5.38) -- (beam.east);
+\node[smalllabel,text=amberstroke] at (14.60,4.66) {$C_i=0:\ \mathcal B_{i+1}$};
 
 % ---------------------------------------------------------------------------
-% Module IV — lower left. Flow proceeds right-to-left, matching the 2x2 cycle.
+% Module IV - immutable outputs and external evaluation.
 % ---------------------------------------------------------------------------
-\node[frozen] (freeze) at (6.62,3.20)
-    {\textbf{Freeze Best Explanation}\\[4pt]
-     \taskkey{lock the best hypothesis}{seal inference artifacts}{leakage-free freeze}};
-\node[frozen] (s10) at (4.15,3.20)
-    {\textbf{Step 10 · Segmentation}\\[4pt]
-     \tasktwoleft{locate change points}{assign segment labels}};
-\node[frozen] (s11) at (1.66,3.20)
-    {\textbf{Step 11 · Symbolic Scene}\\[4pt]
-     \tasktwoleft{build scene atoms}{attach provenance}};
-\node[frozen] (pred) at (1.66,1.55)
-    {\textbf{Frozen Predictions}\\[4pt]
-     \tasktwo{export JSON + CSV}{render video + manifest}};
-\node[evaluation] (eval) at (4.15,1.55)
-    {\textbf{Independent Evaluator}\\[4pt]
-     \tasktwo{measure F1 + tIoU}{analyze confusion}};
-\node[evaluation] (ann) at (6.62,1.55)
-    {\textbf{Human Segmentation}\\[4pt]
-     \taskkey{provide reference labels}{support blind evaluation}{held-out labels}};
+\node[frozen] (freeze) at (6.62,3.18)
+  {\textbf{Freeze Best World State}\\[4pt]
+   \threebullets{select best-ever $\mathcal H^*$}{seal code / config / output hashes}{close inference before labels}};
+\node[frozen] (s10) at (4.15,3.18)
+  {\textbf{Step 10 · Segmentation}\\[4pt]
+   \twobullets{locate physical change points}{assign motion segments}};
+\node[frozen] (s11) at (1.66,3.18)
+  {\textbf{Step 11 · Scene Output}\\[4pt]
+   \twobullets{export world trajectories}{materialize symbolic scene}};
+\node[frozen] (pred) at (1.66,1.50)
+  {\textbf{Frozen Predictions}\\[4pt]
+   \twobullets{world state + uncertainty}{segments + provenance}};
+\node[evaluation] (eval) at (4.15,1.50)
+  {\textbf{Independent Evaluator}\\[4pt]
+   \twobullets{world-state + tracking metrics}{segmentation + calibration metrics}};
+\node[evaluation] (refs) at (6.62,1.50)
+  {\textbf{Held-out References}\\[4pt]
+   \twobullets{pose / trajectory when available}{human segmentation labels}};
 
-\draw[flow] (freeze.west) -- node[flowlabel,above=8pt] {$\mathcal{W}^{*}$} (s10.east);
-\draw[flow] (s10.west) -- node[flowlabel,above=8pt] {$\mathcal{Z}^{*}$} (s11.east);
-\draw[flow] (s11.south) -- node[flowlabel,right=8pt] {$\mathcal{A}^{*}$} (pred.north);
-\draw[readonly] (pred.east) -- node[flowlabel,above=8pt] {$\mathcal{P}^{*}$} (eval.west);
-\draw[readonly] (ann.west) -- node[flowlabel,above=8pt] {$\mathcal{Y}$} (eval.east);
+\draw[flow] (stop.west) -- node[smalllabel,above=9pt] {$C_i=1:\ \mathcal H^*$}
+  (8.02,1.63) -- (8.02,3.18) -- (freeze.east);
+\draw[flow] (freeze.west) -- node[flowlabel,above=8pt] {$\mathcal W^*$} (s10.east);
+\draw[flow] (s10.west) -- node[flowlabel,above=8pt] {$\mathcal Z^*$} (s11.east);
+\draw[flow] (s11.south) -- node[flowlabel,right=8pt] {$\mathcal A^*$} (pred.north);
+\draw[readonly] (pred.east) -- node[flowlabel,above=8pt] {$\mathcal P^*$} (eval.west);
+\draw[readonly] (refs.west) -- node[flowlabel,above=8pt] {$\mathcal Y$} (eval.east);
 
-% Module III -> IV. Short bridge across the central gutter.
-\draw[flow] (stop.west) -- ++(-0.30,0) |- (freeze.east);
-\node[smalllabel] at (8.02,3.39) {$C_i=1:\ \mathcal{H}^{*}$};
-
-% ---------------------------------------------------------------------------
-% Compact notation strip. Full definitions remain in the companion Markdown.
-% ---------------------------------------------------------------------------
+% Compact notation strip. The companion Markdown defines each item fully.
 \node[anchor=south west,font=\fontsize{12}{13.8}\selectfont,text=muted,align=left]
-at (0.38,0.38) {%
-$\mathcal{X}$ video · $\mathcal{K}$ knowledge · $\mathcal{O}_t$ neural evidence ·
-$\mathcal{T}$ ID-aligned masklets · $\mathcal{G}$ geometry · $\mathcal{B}_i$ beam ·
-$\mathcal{R}_i$ residuals · $\mathcal{E}_i$ evidence};
+  at (0.38,0.38) {$\mathcal X$ video · $\Theta$ frozen neural models · $\mathcal K$ frozen knowledge ·
+  $\mathcal O$ independent evidence · $\mathcal T$ tracks + archive · $\mathcal G$ geometry};
 \node[anchor=south west,font=\fontsize{12}{13.8}\selectfont,text=muted,align=left]
-at (0.38,0.11) {%
-$\Delta_i$ repairs · $\mathcal{H}^{*}$ best explanation · $\mathcal{W}^{*}$ frozen world ·
-$\mathcal{Z}^{*}$ segments · $\mathcal{A}^{*}$ symbolic scene ·
-$\mathcal{P}^{*}$ predictions · $\mathcal{Y}$ human labels};
+  at (0.38,0.11) {$\mathcal B_i$ world-state beam · $\Pi$ fit/check roles · $\mathcal R_i$ residuals · $\Delta_i$ bounded repair ·
+  $\mathcal H^*$ best explanation · $\mathcal W^*$ frozen world · $\mathcal Y$ evaluation-only references};
 
 \end{tikzpicture}
 \end{document}
