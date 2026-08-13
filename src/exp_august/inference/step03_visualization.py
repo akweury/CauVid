@@ -12,6 +12,7 @@ import numpy as np
 
 from src.exp_august.contracts import (
     ArtifactOwner,
+    DepthDescriptor,
     MaskCandidateSource,
     TrackingStore,
     VideoManifest,
@@ -48,31 +49,56 @@ def _read_mask(
 
 def _label(
     image: np.ndarray,
-    text: str,
+    text: str | tuple[str, ...],
     origin: tuple[int, int],
     color: tuple[int, int, int],
     scale: float = 0.55,
 ) -> None:
     x, y = origin
-    (width, height), baseline = cv2.getTextSize(
-        text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1
-    )
+    lines = (text,) if isinstance(text, str) else text
+    metrics = [
+        cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        for line in lines
+    ]
+    width = max(size[0][0] for size in metrics)
+    line_advance = max(size[0][1] + size[1] + 4 for size in metrics)
+    block_height = line_advance * len(lines) + 4
+    top = max(0, y - block_height)
     cv2.rectangle(
         image,
-        (x, max(0, y - height - baseline - 5)),
-        (min(image.shape[1] - 1, x + width + 8), y + 3),
+        (x, top),
+        (
+            min(image.shape[1] - 1, x + width + 8),
+            min(image.shape[0] - 1, top + block_height),
+        ),
         color,
         -1,
     )
-    cv2.putText(
-        image,
-        text,
-        (x + 4, y - 2),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        (20, 20, 20),
-        1,
-        cv2.LINE_AA,
+    baseline_y = top + metrics[0][0][1] + 2
+    for line, ((_, height), _) in zip(lines, metrics):
+        cv2.putText(
+            image,
+            line,
+            (x + 4, baseline_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+        baseline_y += line_advance
+
+
+def _depth_label(descriptor: DepthDescriptor | None) -> str:
+    if descriptor is None:
+        return "depth unavailable"
+    representation = "metric" if descriptor.representation.value == "metric" else "relative"
+    support = "mask" if descriptor.support_source == "eroded_mask" else "box"
+    unit = "m" if descriptor.unit.value == "meter" else "rel"
+    return (
+        f"depth {representation}/{support} | med {descriptor.median:.2f} {unit} "
+        f"| IQR {descriptor.q25:.2f}-{descriptor.q75:.2f} "
+        f"| valid {descriptor.valid_fraction:.0%}"
     )
 
 
@@ -144,7 +170,12 @@ def _render_tracking_frame(
         text = f"ID {short_id} | {observation.class_name} | det {observation.confidence:.2f}"
         if score is not None:
             text += f" | assoc {score:.2f}"
-        _label(canvas, text, (x1, max(20, y1)), color)
+        _label(
+            canvas,
+            (text, _depth_label(observation.depth_descriptor)),
+            (x1, max(44, y1)),
+            color,
+        )
 
     header_height = max(42, image.shape[0] // 18)
     cv2.rectangle(canvas, (0, 0), (image.shape[1], header_height), (18, 24, 34), -1)
@@ -408,9 +439,20 @@ def render_step3_visualizations(
         json.dumps(
             {
                 "schema_name": "step3_visualization_manifest",
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_id": store.run_id,
                 "tracking_store_sha256": sha256_file(store_path),
+                "track_overlay_fields": [
+                    "track_id",
+                    "class_name",
+                    "detection_confidence",
+                    "association_score",
+                    "depth_representation",
+                    "depth_support_source",
+                    "depth_median",
+                    "depth_iqr",
+                    "depth_valid_fraction",
+                ],
                 "videos": manifest_rows,
             },
             indent=2,
