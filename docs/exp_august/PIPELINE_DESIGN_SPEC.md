@@ -521,10 +521,11 @@ SAM masks and bidirectional flow-warped alternatives instead.
 
 ---
 
-### Step 4 — Geometry / Scale
+### Step 4 — Relative Camera Geometry + 3D Observation Lift
 
-**Purpose:** convert image-space observations into camera, scale, and 3D
-geometry hypotheses with uncertainty.
+**Purpose:** estimate relative camera geometry and lift image-space tracks into
+camera-centric 3D observations with uncertainty. This stage provides geometric
+initialization; it does not yet claim final ego or object physical trajectories.
 
 **Detailed subfigure:** [`STEP4_GEOMETRY_SCALE.pdf`](./STEP4_GEOMETRY_SCALE.pdf)
 ([TikZ source](./STEP4_GEOMETRY_SCALE.tex)).
@@ -537,10 +538,10 @@ immutable evidence archive), camera metadata, and frozen physical priors.
 1. **4.1 - Resolve and Align Evidence:** require the Step 3 retention gate to
    pass; resolve immutable artifact references; align timestamps, coordinates,
    masks, flow, depth and uncertainty without discarding alternatives.
-2. **4.2 - Camera Motion:** exclude tracked foreground support and estimate
-   background camera motion using robust visual odometry/SLAM or equivalent
-   geometry. Retain viable pose candidates and covariance rather than one
-   unqualified path.
+2. **4.2 - Relative Camera Motion:** exclude tracked foreground support and
+   estimate pairwise camera motion using robust visual odometry/SLAM or
+   equivalent geometry. Retain viable pose edges, disconnected pose components
+   and covariance rather than forcing one global path.
 3. **4.3 - Intrinsics and Ground:** validate available camera metadata or
    estimate intrinsics candidates; fit horizon/road-plane candidates and derive
    ground-contact anchors with uncertainty.
@@ -549,15 +550,17 @@ immutable evidence archive), camera metadata, and frozen physical priors.
    Retain alternatives, confidence intervals and an explicit scale-observability
    state: `metric`, `relative`, `ambiguous`, or `unobservable`.
 5. **4.5 - Lift to Candidate 3D:** consolidate the full masked-depth
-   distribution and anchors, then back-project and transform observations:
-   $X_c=zK^{-1}p$ and $X_w=R_{wc}X_c+t_{wc}$. Propagate mask, depth, calibration,
-   pose and scale covariance.
+   distribution and anchors, then back-project observations as
+   $X_c=zK^{-1}p$. A pose component may express them in a component-local frame
+   for diagnostics, but only Step 5 may promote them into a globally consistent
+   world frame. Propagate mask, depth, calibration, pose and scale covariance.
 6. **4.6 - Geometric Validation:** measure mask/box reprojection, background-flow
    agreement, depth consistency, ground contact and scale plausibility. Reject
    hard failures and rank the surviving candidates.
-7. **4.7 - Geometry Hypothesis Set:** emit camera pose trajectories, calibration
-   and ground candidates, scale intervals, per-track 3D observations,
-   covariance, residuals and provenance.
+7. **4.7 - Relative Geometry Package:** emit pairwise camera poses and pose
+   components, calibration and ground candidates, scale intervals,
+   camera-centric per-track 3D observations, covariance, residuals and
+   provenance.
 
 Monocular scale is not assumed to be observable. Step 4 must run an explicit
 observability test using cue availability, conditioning and posterior spread.
@@ -565,8 +568,9 @@ When evidence cannot support a unique metric scale, it emits multiple
 scale-conditioned candidates, a wide interval, or `unobservable` rather than
 inventing one metric value.
 
-**Output:** a ranked `GeometryHypothesisSet` $\mathcal{G}$ containing one or more
-`GeometryHypothesis` records.
+**Output:** a ranked relative geometry package $\mathcal{G}_{\mathrm{rel}}$
+containing one or more `GeometryHypothesis` records. Its pose components and 3D
+observations are inputs to Step 5, not final physical tracks.
 
 **Current repository:** target Step 4 is implemented in
 `src/exp_august/inference/step04_geometry_scale.py`, with immutable contracts in
@@ -614,23 +618,32 @@ never interpolated. The JSON records that metric scale and a final physical
 world trajectory are not claimed. A higher-rate canonical geometry timeline
 (approximately 5--10 FPS) is required for useful RAFT/essential-matrix pose
 continuity; the 0.2 FPS quick-debug setting is unsuitable for a coherent path.
+Disconnected components are visualized in separate 3D subplots and separate
+16:9 component figures; no shared placement is implied. Plot-box geometry
+preserves an elongated forward dimension instead of forcing a cube, and only
+the two temporal endpoints of each component receive frame labels.
 
 ---
 
-### Step 5 — Joint State
+### Step 5 — Joint Ego/Object World Reconstruction
 
-**Purpose:** instantiate complete, uncertainty-aware alternative world states;
-do not collapse ambiguous geometry, scale or association into one smoothed path.
+**Purpose:** connect compatible ego pose components, separate ego/camera motion
+from object motion, and instantiate complete uncertainty-aware alternative world
+states. Do not collapse ambiguous geometry, scale or association into one
+smoothed path.
 
-**Inputs:** $\mathcal{G}$, $\mathcal{T}$, $\mathcal{O}$, $\Pi$, and frozen
-knowledge $\mathcal K$.
+**Inputs:** $\mathcal{G}_{\mathrm{rel}}$, $\mathcal{T}^{2D}$,
+$\mathcal{O}$, $\Pi$, and frozen knowledge $\mathcal K$.
 
 **Primary implementation**
 
-1. **5.1 - Branch discrete alternatives:** instantiate viable combinations of
-   camera pose, ground, scale, mask candidate and identity/relink choices. A
+1. **5.1 - Connect and branch alternatives:** join pose components only when
+   cross-component evidence supports the transformation, then instantiate
+   viable combinations of camera pose, ground, scale, mask candidate and
+   identity/relink choices. Unsupported joins remain separate hypotheses. A
    branch stores only references and diffs, not duplicated dense artifacts.
-2. **5.2 - Estimate continuous states:** jointly estimate
+2. **5.2 - Estimate continuous states:** jointly separate ego/camera motion
+   from residual object motion and estimate
    $\mathbf s_t=[\mathbf p_t,\mathbf v_t,\mathbf a_t,\theta_t,\dot\theta_t]$
    for ego and each observable object. Use an uncertainty-aware smoother,
    factor graph or constrained spline, while preserving unsmoothed observations.
@@ -657,9 +670,24 @@ a distribution or finite hypothesis set, not one forced answer.
 **Output:** initial world hypotheses $\mathcal{H}_0^{1:n}$ and diverse Top-K
 beam $\mathcal{B}_0$.
 
-**Current repository:** target stage not implemented. Current public Step 5 is
-`ego_motion_abstraction`; it does not create the canonical joint
-`WorldHypothesis` beam described here.
+**Current repository:** the first target implementation is in
+`src/exp_august/inference/step05_joint_world_reconstruction.py`, with immutable
+contracts in `src/exp_august/contracts/world_state.py`. It accumulates supported
+Step 4 pose edges without bridging failed links, estimates relative translation
+magnitude from repeated static-semantic observations when conditioned, places
+ego and object states in component-local frames, propagates position uncertainty
+into speed intervals, classifies initial object motion, and emits an immutable
+`HypothesisBeam` $\mathcal B_0$. Relative DA3 inputs remain `relative_unit`; no
+m/s claim is made. The current beam branches over evidence-distinct Step 4 scale
+hypotheses and adds bounded one-variable `static`/`moving` alternatives for
+ambiguous object motion while retaining the ambiguous parent. It does not yet
+implement the full factor graph, track-relink/mask branching, joint combinatorial
+branching, or duplicate-pruning policy described above. Those refinements remain
+Step 5 work rather than being silently delegated to Step 6.
+
+`src/exp_august/inference/step05_visualization.py` renders component-local ego
+and ego-compensated object trajectories plus speed intervals. It explicitly
+marks the selected rank-1 state as an initial, not Step 6-verified, hypothesis.
 
 ---
 
@@ -1019,16 +1047,17 @@ particular YOLO/SAM/RAFT/depth backends.
 
 ## 6. Target design versus current runner
 
-The same number currently refers to different concepts after Step 4. Until the
-runner is refactored, always use the module name as well as the step number.
+The target runner now implements Steps 1-5 with their flowchart meanings. The
+legacy public runner still uses different concepts after Step 4, so always name
+the execution path and module as well as the step number.
 
 | Target flowchart step | Target module | Current repository location | Alignment |
 |---:|---|---|---|
 | 1 | Init | Target `inference/step01_init.py`; legacy public Step 1 remains | Typed boundary implemented and consumed by target Step 2 |
 | 2 | Neural Perception | Target `inference/step02_neural_evidence.py`; legacy public Step 2 remains | Typed YOLO/SAM 2/RAFT/DA3 evidence store implemented |
 | 3 | Object Tracking | Target `inference/step03_object_tracking.py`; legacy public Step 3 remains | Typed replayable TrackingPackage implemented |
-| 4 | Geometry / Scale | Public Step 4 `trajectory_construction_3d` | Partial |
-| 5 | Joint World State | Public Step 5 is `ego_motion_abstraction` | Mismatch |
+| 4 | Relative Geometry + 3D Lift | Target `inference/step04_geometry_scale.py`; legacy public Step 4 remains | Typed relative geometry implemented; metric/ground alternatives remain partial |
+| 5 | Joint Ego/Object World Reconstruction | Target `inference/step05_joint_world_reconstruction.py`; legacy public Step 5 remains | Typed component-local reconstruction and initial beam implemented; full branching/factor graph remain partial |
 | 6 | Predict + Verify | Public Step 6 `trajectory_refinement` | Partial overlap; no forward renderer or fit/check split |
 | 7 | Diagnose + Propose | Public Step 7 is `relative_motion_representation` | Mismatch |
 | 8 | Local Re-estimation | Internal portions of current Step 6 | Not explicit |
@@ -1061,7 +1090,7 @@ cue-use counters are zero.
 | Step 1 → 2 | Every frame has a canonical timestamp and reversible source mapping |
 | Step 2 → 3 | Evidence tensors share coordinates; missing cues are explicit |
 | Step 3 → 4 | `retention_report.pass=true`; manifest accounting closes; all hashes/references resolve; every active/lost track-frame has an observed mask, a non-empty candidate bank, or an explicit unobservable marker; all decisions, unmatched observations, gap records, transforms and provenance are readable without rerunning Steps 2-3 |
-| Step 4 → 5 | Pose/scale alternatives include covariance and `metric/relative/ambiguous/unobservable` status |
+| Step 4 → 5 | Pairwise poses, pose components, camera-centric 3D observations and scale alternatives include covariance and `metric/relative/ambiguous/unobservable` status; no final world trajectory is claimed |
 | Step 5 → 6 | Every hypothesis is immutable, parented and reproducible; $\Pi$ fixes fit/check evidence roles |
 | Step 6 → 7 | Every residual identifies predicted/observed values, uncertainty, role, constraint, time window and evidence path |
 | Repair → 8 | Every edit uses an allow-listed operator and is bounded, permitted and independently replayable |
@@ -1076,8 +1105,9 @@ cue-use counters are zero.
    addition to the frame-local Step 2 masks. Step 3 remains the owner of
    canonical persistent IDs.
 2. Choose the camera-pose backend and a formal metric-scale observability test.
-3. Specify the Step 5 factor graph/state-space estimator, discrete branching
-   policy, uncertainty representation and duplicate-pruning rule.
+3. Extend the implemented Step 5 baseline with a factor graph/state-space
+   estimator, track-relink/mask discrete branches, calibrated uncertainty and a
+   duplicate-pruning rule.
 4. Implement the Step 6 forward models for mask, flow, depth and background,
    plus a frozen `EvidenceUsePlan` policy with adequate check-only coverage.
 5. Define hard versus soft physical constraints by road context and uncertainty.
@@ -1106,7 +1136,7 @@ cue-use counters are zero.
 | 2026-08-13 | Step 3 performs shallow identity association and evidence archiving, not deep lifecycle reasoning. | Step 3 records factual state markers and preserves all raw/candidate evidence; Steps 6-8 infer, validate and revise explanations without rerunning Steps 2-3. |
 | 2026-08-13 | Step 3 sufficiency means input completeness and traceability, not guaranteed future observability. | A manifest-closure, hash-fidelity, lineage and decision-completeness gate produces `retention_report`; Step 4 fails closed if Step 3 silently loses available input. |
 | 2026-08-13 | Lost-track intervals retain a multi-source mask candidate bank rather than one fused/imputed mask. | Direct, forward, backward, flow-warped and unassigned candidates remain distinguishable; fully occluded pixels are marked latent/unobservable, allowing later relinking or explanation without rerunning the front end. |
-| 2026-08-13 | Step 4 emits a ranked geometry hypothesis set rather than forcing one metric reconstruction. | Camera pose, calibration/ground and scale alternatives retain covariance, residuals and an explicit metric/relative/ambiguous/unobservable state before Step 5 estimates motion. |
+| 2026-08-13 | Step 4 emits a ranked relative-geometry package rather than forcing one metric reconstruction. | Pairwise camera pose components, camera-centric 3D observations, calibration/ground and scale alternatives retain covariance, residuals and an explicit metric/relative/ambiguous/unobservable state; Step 5 alone forms globally expressed ego/object motion hypotheses. |
 | 2026-08-13 | Step 6 evaluates five residual families in parallel and only aggregates/localizes violations. | Observation, ego/background, object/identity, physics and semantic residuals remain separately auditable; repair, best-hypothesis selection and human labels stay outside Step 6. |
 | 2026-08-13 | The pipeline remains training-free on target videos. | Per-video latent states may be optimized, but no shared parameter, prior, threshold or prompt is updated across blind-test videos. |
 | 2026-08-13 | Steps 5-9 are the paper-facing method; Steps 1-3 are evidence infrastructure. | The paper will claim an uncertainty-aware analysis-by-synthesis loop, not novelty from chaining pretrained components. |
@@ -1116,6 +1146,7 @@ cue-use counters are zero.
 | 2026-08-13 | Target Step 2 implements independent YOLO, frame-local SAM 2, bidirectional RAFT and single-frame DA3 passes. | Dense cues remain unfused, share canonical image coordinates, carry content hashes, and DA3 is explicitly relative until Step 4 resolves scale. |
 | 2026-08-13 | Step 2 models run sequentially and canonical frames are decoded per pass. | Peak GPU residency is bounded without creating a permanent RGB/JPEG cache; the source hash and canonical timeline remain the common reference. |
 | 2026-08-13 | Target Step 3 uses deterministic multi-cue Hungarian association and publishes only after retention closure. | Every candidate pair and disposition is auditable; gap masks remain separate forward/backward/explicitly-unobservable alternatives, while semantic lifecycle causes remain deferred. |
+| 2026-08-14 | Target Step 5 emits the typed initial beam $\mathcal B_0$. | Supported pose edges form independent ego components; object observations are ego-motion compensated inside those components; relative units, uncertainty, unresolved evidence and the lack of Step 6 verification remain explicit. |
 
 ## 11. Maintenance procedure
 

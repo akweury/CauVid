@@ -4,7 +4,7 @@ There are currently two explicit execution paths:
 
 - `src.exp_august.pipeline` is the frozen legacy linear baseline.
 - `src.exp_august.inference.runner` is the target annotation-free world-state
-  pipeline. Its implemented boundaries currently cover Steps 1-4.
+  pipeline. Its implemented boundaries currently cover Steps 1-5.
 
 ## Target Step 1: Init
 
@@ -193,6 +193,7 @@ Step 4 adds:
   visualizations/<video-id>/*_camera_motion_diagnostics.png
   visualizations/<video-id>/*_relative_static_scene.json
   visualizations/<video-id>/*_relative_static_sandbox_3d.png
+  visualizations/<video-id>/relative_static_sandbox_components/*.png
   visualizations/<video-id>/depth_geometry_examples/*.png
   visualizations/<video-id>/*_step4_geometry.mp4
 ```
@@ -225,8 +226,12 @@ similar classes receive the static semantic prior; low-motion residual tracks
 are used only as a marked fallback when no such class is available. Squares
 denote candidates whose transformed observations cluster consistently, while
 X markers expose inconsistent candidates. Failed pose links start a new local
-component rather than being silently bridged. The companion JSON stores every
-pose, scale cue, transform, landmark observation, spread and limitation.
+component rather than being silently bridged. The overview gives every
+component its own 3D subplot and each component is also exported as an
+independent 16:9 figure. The forward axis is elongated according to the local
+motion extent rather than forced into a cube; only the first and last frame of
+each segment are labeled. The companion JSON stores every pose, scale cue,
+transform, landmark observation, spread and limitation.
 
 For a useful ego path, use a denser geometry timeline than the 0.2 FPS quick
 debug default. A one-video reconstruction run is:
@@ -248,6 +253,67 @@ For remote Docker execution, use the independent D4 launcher:
 
 D4 writes under `CAUVID_OUTPUT_D4_HOST` (default
 `pipeline_august_target`) and refuses a path overlapping D3's output tree.
+
+## Target Step 5: Joint Ego/Object World Reconstruction
+
+Step 5 consumes the immutable `GeometryStore` and creates the initial world-
+state beam $\mathcal B_0$. It accumulates only supported pairwise camera-pose
+edges, keeps failed-link components in independent local frames, transforms
+camera-centric object observations into those component frames, subtracts ego
+motion, and estimates initial ego/object velocity with propagated intervals.
+Static, moving, ambiguous, and unobservable are explicit states; a semantic
+static class is only a prior and never overrides contradictory motion evidence.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 5 \
+  --canonical-fps 5 \
+  --objects-backend yolo_world \
+  --masks-backend sam2 \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --world-top-k 5 \
+  --visualize-step5 \
+  --device cuda:0
+```
+
+Step 5 adds:
+
+```text
+<output-root>/<run-id>/05_world_reconstruction/input_<geometry-hash>/config_<hash>/
+  world_state_store.json
+  videos/<video-id>.world_state.json
+  visualizations/step5_visualization_manifest.json
+  visualizations/<video-id>/initial_world_hypothesis_3d.png
+  visualizations/<video-id>/initial_motion_intervals.png
+  visualizations/<video-id>/components/*.png
+  visualizations/<video-id>/step5_summary.json
+```
+
+`WorldHypothesis`, `EgoPoseComponent`, `ObjectTrajectoryHypothesis`, uncertainty
+fields, unresolved observations, construction score, and `HypothesisBeam` are
+strict immutable contracts. With current DA3 evidence, output remains in
+`relative_unit`; velocities are relative units per second, not m/s. A missing
+pose edge is never interpolated. `top_k` is a capacity rather than a required
+count. The current implementation emits evidence-distinct scale branches and,
+for ambiguous object motion, auditable one-variable `static`/`moving`
+alternatives. It retains the unconstrained ambiguous parent and does not form
+the combinatorial product merely to fill the beam.
+
+Step 5 visualization shows the best initial hypothesis, not verified truth.
+The component-local 3D plots contain the ego path and ego-compensated object
+paths; motion plots show speed intervals. All summaries declare
+`step6_verified: false`. Step 6 will be responsible for rendering each
+hypothesis back into mask/flow/depth/background evidence and deciding whether
+these initial explanations survive.
+
+For the remote Docker launcher:
+
+```bash
+./d4.sh run --gpu 0 --step 5 --data 1 --seed 1 \
+  --canonical-fps 5 --diagnostics
+```
 
 ## Legacy linear baseline
 

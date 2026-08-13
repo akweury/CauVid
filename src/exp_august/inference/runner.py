@@ -30,6 +30,8 @@ from src.exp_august.inference.step03_object_tracking import run_step3
 from src.exp_august.inference.step03_visualization import render_step3_visualizations
 from src.exp_august.inference.step04_geometry_scale import run_step4
 from src.exp_august.inference.step04_visualization import render_step4_visualizations
+from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
+from src.exp_august.inference.step05_visualization import render_step5_visualizations
 
 
 def _parse_args() -> argparse.Namespace:
@@ -60,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=config.get_output_path("output") / "pipeline_august" / "world_state",
     )
-    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4), default=4)
+    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5), default=5)
     parser.add_argument(
         "--objects-backend",
         choices=("yolo_world", "disabled"),
@@ -130,6 +132,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--step4-example-frame-count", type=int, default=4)
     parser.add_argument("--step4-maximum-tracks", type=int, default=12)
     parser.add_argument("--no-step4-video", action="store_true")
+    parser.add_argument("--world-top-k", type=int, default=5)
+    parser.add_argument("--world-min-motion-observations", type=int, default=2)
+    parser.add_argument("--world-static-displacement-threshold", type=float, default=0.25)
+    parser.add_argument("--world-moving-displacement-threshold", type=float, default=0.75)
+    parser.add_argument("--visualize-step5", action="store_true")
+    parser.add_argument("--step5-maximum-objects", type=int, default=12)
     return parser.parse_args()
 
 
@@ -267,6 +275,23 @@ def main() -> int:
             render_video=not args.no_step4_video,
         )
         print(f"Step 4 visualizations: {visualization_manifest}")
+    if args.max_step == 4:
+        return 0
+    step5 = run_step5(
+        geometry_store_path=step4.store_path,
+        top_k=args.world_top_k,
+        minimum_motion_observations=args.world_min_motion_observations,
+        static_displacement_threshold=args.world_static_displacement_threshold,
+        moving_displacement_threshold=args.world_moving_displacement_threshold,
+    )
+    print(f"Step 5 completed: {len(step5.video_manifests)} video(s)")
+    print(f"World-state store: {step5.store_path}")
+    if args.visualize_step5:
+        visualization_manifest = render_step5_visualizations(
+            world_state_store_path=step5.store_path,
+            maximum_objects=args.step5_maximum_objects,
+        )
+        print(f"Step 5 visualizations: {visualization_manifest}")
     return 0
 
 

@@ -36,6 +36,7 @@ class CoordinateSpace(str, Enum):
     IMAGE_PIXELS = "image_pixels"
     CAMERA_3D = "camera_3d"
     EGO_3D = "ego_3d"
+    COMPONENT_LOCAL_3D = "component_local_3d"
     WORLD_3D = "world_3d"
 
 
@@ -102,6 +103,14 @@ class ArtifactOwner(str, Enum):
     STEP2_NEURAL_EVIDENCE = "step2_neural_evidence"
     STEP3_OBJECT_TRACKING = "step3_object_tracking"
     STEP4_GEOMETRY_SCALE = "step4_geometry_scale"
+    STEP5_WORLD_RECONSTRUCTION = "step5_world_reconstruction"
+
+
+class MotionState(str, Enum):
+    STATIC = "static"
+    MOVING = "moving"
+    AMBIGUOUS = "ambiguous"
+    UNOBSERVABLE = "unobservable"
 
 
 class TrackState(str, Enum):

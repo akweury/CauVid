@@ -23,21 +23,21 @@ lualatex -interaction=nonstopmode -halt-on-error EXP_AUGUST_CLOSED_LOOP_FLOWCHAR
 
 ### Module I - Video to Replayable Evidence
 
-Steps 1-3 只负责生成和保存视觉证据：
+Steps 1-3 只负责生成、保存并沿时间轴组织二维视觉证据：
 
 - Step 1 验证视频并建立可逆的统一时间轴；
 - Step 2 分别提取 detection、mask、optical flow 和 depth，不进行跨 cue 融合；
-- Step 3 建立 ID-consistent mask tracks，保存所有候选、拒绝项、缺失项和 provenance，并用冻结策略生成 `EvidenceUsePlan` $\Pi$。
+- Step 3 将 frame-local evidence 沿时间轴关联，建立 ID-consistent 2D mask tracks，保存所有候选、拒绝项、缺失项和 provenance，并用冻结策略生成 `EvidenceUsePlan` $\Pi$。
 
-该模块不是论文的主要推理贡献，但必须保证后续阶段能够重新检查原始证据，而无需重新运行神经模型。
+Step 3 的结果仍在二维图像/时间域中；它不是物理轨迹，也不负责恢复 ego motion。该模块不是论文的主要推理贡献，但必须保证后续阶段能够重新检查原始证据，而无需重新运行神经模型。
 
 ### Module II - Uncertain World Hypotheses
 
-Steps 4-5 将图像空间证据转化为多个可审计的世界解释：
+Steps 4-5 将二维时序证据先转换为相对三维观测，再构造成多个可审计的世界解释：
 
-- Step 4 估计相机位姿、地面和尺度候选，并明确输出
-  `metric | relative | ambiguous | unobservable`；
-- Step 5 联合估计 ego 与 objects 的位置、速度、加速度、朝向及不确定性；
+- Step 4 估计相邻帧间的相对 camera pose，将 tracked observations 提升到 camera-centric 3D，并保存 pose components、地面/尺度候选和 observability；
+- Step 4 的 relative ego components 与 static-landmark sandbox 是几何初始化和诊断结果，不是最终 ego/object physical tracking；
+- Step 5 连接可连接的 ego pose components，联合分离 camera/ego motion 与 object motion，并估计世界坐标中的位置、速度、加速度、朝向及不确定性；
 - 不同 scale、pose、identity association 和 occlusion 解释形成多样化的 Top-K beam。
 
 Step 5 的输出不是一条已被强制平滑的轨迹，而是多个完整且不可变的 `WorldHypothesis`。
@@ -68,8 +68,8 @@ Steps 6-9 是论文的主要算法贡献：
 | $\mathcal K$ | Frozen knowledge | Physical limits, semantic rules and permitted repair bounds |
 | $\mathcal M$ | Video manifest | Canonical timeline, run ID, fingerprints and model versions |
 | $\mathcal O$ | Independent neural evidence | Detections, masks, forward/backward flow, depth, confidence and transforms |
-| $\mathcal T$ | Tracking package | ID-consistent tracks plus immutable candidate/evidence archive |
-| $\mathcal G$ | Geometry hypothesis set | Pose, ground, scale, 3D observations, covariance and observability |
+| $\mathcal T^{2D}$ | 2D tracking package | ID-consistent mask tracks plus immutable candidate/evidence archive |
+| $\mathcal G_{\mathrm{rel}}$ | Relative geometry package | Pairwise camera poses, pose components, ground/scale alternatives, camera-frame 3D observations, covariance and observability |
 | $\mathcal H_i$ | World hypothesis | Camera, scale, ego/object dynamics, associations and uncertainty |
 | $\mathcal B_i$ | Hypothesis beam | Diverse Top-K world hypotheses at iteration $i$ |
 | $\Pi$ | Evidence-use plan | Frozen designation of fit, check-only and report-only evidence |
@@ -89,9 +89,9 @@ Steps 6-9 是论文的主要算法贡献：
 |---|---|---|---:|
 | 1 - Init | $\mathcal X$, frozen configuration | validated `VideoManifest` $\mathcal M$ | No |
 | 2 - Neural Evidence | canonical RGB, $\Theta$ | independent evidence store $\mathcal O$ | No |
-| 3 - Object Tracking | $\mathcal O$ | replayable $\mathcal T$ and frozen evidence roles $\Pi$ | No |
-| 4 - Geometry + Observability | $\mathcal T$, $\mathcal O$, $\mathcal K$ | ranked geometry set $\mathcal G$ | No |
-| 5 - Joint World State | $\mathcal G$, $\mathcal T$, $\mathcal O$ | initial beam $\mathcal B_0$ | No |
+| 3 - Object Tracking | $\mathcal O$ | replayable 2D tracks $\mathcal T^{2D}$ and frozen evidence roles $\Pi$ | No |
+| 4 - Relative Geometry + 3D Lift | $\mathcal T^{2D}$, $\mathcal O$, $\mathcal K$ | relative geometry package $\mathcal G_{\mathrm{rel}}$ | No |
+| 5 - Joint World Reconstruction | $\mathcal G_{\mathrm{rel}}$, $\mathcal T^{2D}$, $\mathcal O$ | globally expressed ego/object hypotheses and initial beam $\mathcal B_0$ | No |
 | 6 - Predict + Verify | $\mathcal B_i$, $\mathcal O$, $\Pi$, $\mathcal K$ | auditable residual packets $\mathcal R_i$ | No |
 | 7 - Diagnose + Propose | $\mathcal R_i$ and referenced evidence | bounded repair proposals $\Delta_i$ | No |
 | 8 - Local Re-estimation | parents, $\Delta_i$, affected windows | child hypotheses $\mathcal H_{i+1}^{1:n}$ | No |

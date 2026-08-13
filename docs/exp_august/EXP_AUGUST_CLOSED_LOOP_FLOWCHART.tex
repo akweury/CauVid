@@ -106,7 +106,7 @@
 \end{scope}
 
 \node[moduletitle] at (0.52,8.19) {I · VIDEO $\rightarrow$ REPLAYABLE EVIDENCE};
-\node[moduletitle] at (8.40,8.19) {II · UNCERTAIN WORLD HYPOTHESES};
+\node[moduletitle] at (8.40,8.19) {II · RELATIVE GEOMETRY $\rightarrow$ WORLD HYPOTHESES};
 \node[moduletitle] at (0.52,4.21) {IV · FREEZE $\rightarrow$ BLIND EVALUATION};
 \node[moduletitle] at (8.40,4.21) {III · ANALYSIS-BY-SYNTHESIS LOOP};
 
@@ -122,9 +122,9 @@
 \node[evidence,text width=2.12in,minimum height=1.34in] (s2) at (6.40,7.10)
   {\textbf{Step 2 · Neural Evidence}\\[4pt]
    \fourbullets{Objects (YOLO)}{Masks (SAM 2)}{Flow (RAFT)}{Depth (DA3)}};
-\node[evidence,text width=2.30in] (s3) at (4.86,5.43)
+\node[evidence,text width=2.30in,minimum height=1.28in] (s3) at (4.86,5.43)
   {\textbf{Step 3 · Object Tracking}\\[4pt]
-   \twobullets{build ID-consistent mask tracks}{archive all candidates + provenance}};
+   \threebullets{associate 2D evidence over time}{build ID-consistent mask tracks}{retain candidates + provenance}};
 
 \draw[flow] (video.east) -- node[flowlabel,above=8pt] {$\mathcal X$} (s1.west);
 \draw[flow] (s1.east) -- node[flowlabel,above=8pt] {$\mathcal M$} (s2.west);
@@ -137,20 +137,20 @@
 % ---------------------------------------------------------------------------
 % Module II - construct explicit alternative world states.
 % ---------------------------------------------------------------------------
-\node[hypothesis] (s4) at (9.82,7.08)
-  {\textbf{Step 4 · Geometry + Observability}\\[4pt]
-   \threebullets{estimate camera pose + ground}{retain scale alternatives}{mark observability incl. unobservable}};
-\node[hypothesis] (s5) at (13.33,7.08)
-  {\textbf{Step 5 · Joint World State}\\[4pt]
-   \threebullets{estimate ego + object dynamics}{branch scale + association choices}{propagate uncertainty}};
+\node[hypothesis,minimum height=1.30in] (s4) at (9.82,7.08)
+  {\textbf{Step 4 · Relative Geometry + 3D Lift}\\[4pt]
+   \threebullets{estimate pairwise camera pose}{lift tracks to camera-frame 3D}{expose components + observability}};
+\node[hypothesis,minimum height=1.30in] (s5) at (13.33,7.08)
+  {\textbf{Step 5 · Joint World Reconstruction}\\[4pt]
+   \threebullets{connect ego pose components}{separate ego / object motion}{infer world trajectories + uncertainty}};
 \node[hypothesis,text width=2.38in] (beam) at (11.96,5.38)
   {\textbf{Top-K World Hypotheses $\mathcal B_0$}\\[4pt]
    \twobullets{immutable and reproducible alternatives}{diverse pose / scale / identity explanations}};
 
 \draw[flow] (s3.east) -- (7.98,5.43) -- (7.98,7.72) -- (8.52,7.72)
-  -- node[smalllabel,pos=0.55,yshift=11pt]
-  {$\mathcal I_W=\{\mathcal T,\mathcal O,\Pi,\mathcal K\}$} (s4.north west);
-\draw[flow] (s4.east) -- node[flowlabel,above=8pt] {$\mathcal G$} (s5.west);
+  -- (s4.north west);
+\node[flowlabel,anchor=west] at (8.08,6.52) {$\mathcal T^{2D}$};
+\draw[flow] (s4.east) -- node[flowlabel,above=8pt] {$\mathcal G_{\rm rel}$} (s5.west);
 \draw[flow] (s5.south) .. controls +(0,-0.42) and +(0.68,0.32) ..
   node[smalllabel,pos=0.48,xshift=18pt,yshift=3pt] {$\mathcal H_0^{1:n}$} (beam.north east);
 
@@ -218,7 +218,7 @@
 % Compact notation strip. The companion Markdown defines each item fully.
 \node[anchor=south west,font=\fontsize{12}{13.8}\selectfont,text=muted,align=left]
   at (0.38,0.38) {$\mathcal X$ video · $\Theta$ frozen neural models · $\mathcal K$ frozen knowledge ·
-  $\mathcal O$ independent evidence · $\mathcal T$ tracks + archive · $\mathcal G$ geometry};
+  $\mathcal O$ independent evidence · $\mathcal T^{2D}$ 2D tracks + archive · $\mathcal G_{\rm rel}$ relative geometry + 3D observations};
 \node[anchor=south west,font=\fontsize{12}{13.8}\selectfont,text=muted,align=left]
   at (0.38,0.11) {$\mathcal B_i$ world-state beam · $\Pi$ fit/check roles · $\mathcal R_i$ residuals · $\Delta_i$ bounded repair ·
   $\mathcal H^*$ best explanation · $\mathcal W^*$ frozen world · $\mathcal Y$ evaluation-only references};

@@ -20,6 +20,7 @@ import numpy as np
 
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from src.exp_august.contracts import (
     ArtifactOwner,
@@ -616,7 +617,7 @@ def _sandbox_coordinates(point: list[float] | np.ndarray) -> np.ndarray:
     return np.asarray((x, z, -y), dtype=np.float64)
 
 
-def _plot_relative_static_sandbox(scene: dict, output_path: Path) -> None:
+def _plot_relative_static_sandbox_legacy(scene: dict, output_path: Path) -> None:
     figure = plt.figure(figsize=(12.8, 7.2), dpi=150)
     axis = figure.add_subplot(111, projection="3d")
     for component in scene["ego_components"]:
@@ -745,6 +746,198 @@ def _plot_relative_static_sandbox(scene: dict, output_path: Path) -> None:
     figure.subplots_adjust(left=0.03, right=0.77, bottom=0.06, top=0.88)
     figure.savefig(output_path, bbox_inches="tight")
     plt.close(figure)
+
+
+def _draw_static_landmark(axis, landmark: dict, *, compact: bool) -> list[np.ndarray]:
+    observations = np.asarray(
+        [_sandbox_coordinates(row) for row in landmark["world_observations"]],
+        dtype=np.float64,
+    )
+    median = _sandbox_coordinates(landmark["median_world_position"])
+    color = _rgb_color(landmark["track_id"])
+    axis.scatter(
+        observations[:, 0], observations[:, 1], observations[:, 2],
+        color=[color], s=12 if compact else 18, alpha=0.25,
+    )
+    marker = "s" if landmark["static_consistency"] == "supported" else "X"
+    axis.scatter(
+        [median[0]], [median[1]], [median[2]], color=[color],
+        edgecolors="black", linewidths=0.6, marker=marker,
+        s=48 if compact else 78,
+    )
+    axis.text(
+        median[0], median[1], median[2],
+        f" ID {_short_id(landmark['track_id'])}",
+        fontsize=6 if compact else 8,
+    )
+    q25 = _sandbox_coordinates(landmark["axis_q25"])
+    q75 = _sandbox_coordinates(landmark["axis_q75"])
+    for dimension in range(3):
+        lower, upper = sorted((q25[dimension], q75[dimension]))
+        segment = np.vstack((median, median))
+        segment[0, dimension] = lower
+        segment[1, dimension] = upper
+        axis.plot(
+            segment[:, 0], segment[:, 1], segment[:, 2],
+            color=color, alpha=0.55, linewidth=1.0 if compact else 1.3,
+        )
+    return [*observations, q25, q75]
+
+
+def _set_sandbox_axis_geometry(axis, points: list[np.ndarray]) -> None:
+    """Use data-aware, forward-emphasized geometry instead of a cubic box."""
+
+    if points:
+        values = np.asarray(points, dtype=np.float64)
+        lower = np.min(values, axis=0)
+        upper = np.max(values, axis=0)
+        spans = np.maximum(upper - lower, 1e-3)
+        padding = np.maximum(spans * 0.08, 0.04)
+        axis.set_xlim(lower[0] - padding[0], upper[0] + padding[0])
+        axis.set_ylim(lower[1] - padding[1], upper[1] + padding[1])
+        axis.set_zlim(lower[2] - padding[2], upper[2] + padding[2])
+    else:
+        spans = np.ones(3, dtype=np.float64)
+    # Axis order is lateral X, forward Z, vertical Y. Preserve measured
+    # proportions while keeping the semantic forward dimension visibly long.
+    lateral = max(float(spans[0]), 0.08 * float(spans[1]))
+    vertical = max(float(spans[2]), 0.06 * float(spans[1]))
+    forward = max(float(spans[1]), 2.5 * lateral, 4.0 * vertical)
+    axis.set_box_aspect((lateral, forward, vertical))
+
+
+def _draw_sandbox_component(
+    axis,
+    component: dict,
+    landmarks: list[dict],
+    *,
+    compact: bool,
+) -> None:
+    poses = component["poses"]
+    points = np.asarray(
+        [_sandbox_coordinates(row["camera_center_world"]) for row in poses],
+        dtype=np.float64,
+    )
+    plot_points: list[np.ndarray] = [*points]
+    if points.size:
+        axis.plot(
+            points[:, 0], points[:, 1], points[:, 2], "o-",
+            color="#d62728", linewidth=1.7 if compact else 2.4,
+            markersize=3.5 if compact else 5.5,
+        )
+        endpoints = [(0, "start")]
+        if len(poses) > 1:
+            endpoints.append((-1, "end"))
+        for index, role in endpoints:
+            point = points[index]
+            pose = poses[index]
+            axis.text(
+                point[0], point[1], point[2],
+                f" {role} f{pose['frame_index']}",
+                color="#8b1a1a", fontsize=6 if compact else 8,
+            )
+    for landmark in landmarks:
+        plot_points.extend(_draw_static_landmark(axis, landmark, compact=compact))
+    _set_sandbox_axis_geometry(axis, plot_points)
+    first_frame = poses[0]["frame_index"] if poses else "?"
+    last_frame = poses[-1]["frame_index"] if poses else "?"
+    axis.set_title(
+        f"Component {component['component_id']} | frames {first_frame}-{last_frame} | "
+        f"{len(poses)} ego points",
+        fontsize=9 if compact else 13,
+        pad=8 if compact else 16,
+    )
+    axis.set_xlabel("X right", fontsize=7 if compact else 10, labelpad=2 if compact else 8)
+    axis.set_ylabel(
+        "Z forward (normalized)", fontsize=7 if compact else 10,
+        labelpad=3 if compact else 9,
+    )
+    axis.set_zlabel("Y up", fontsize=7 if compact else 10, labelpad=2 if compact else 8)
+    axis.xaxis.set_major_locator(MaxNLocator(4))
+    axis.yaxis.set_major_locator(MaxNLocator(6))
+    axis.zaxis.set_major_locator(MaxNLocator(4))
+    axis.tick_params(labelsize=6 if compact else 8, pad=0 if compact else 2)
+    # View almost across the lateral axis so the elongated forward dimension
+    # occupies the horizontal canvas instead of collapsing into a thin diagonal.
+    axis.view_init(elev=18, azim=-8)
+
+
+def _plot_relative_static_sandbox(
+    scene: dict,
+    output_path: Path,
+    component_root: Path,
+) -> list[Path]:
+    """Render a component overview and one independent figure per component."""
+
+    components = scene["ego_components"]
+    landmarks_by_component: dict[int, list[dict]] = defaultdict(list)
+    for landmark in scene["static_landmarks"]:
+        landmarks_by_component[int(landmark["component_id"])].append(landmark)
+
+    columns = min(3, max(1, len(components)))
+    rows = max(1, math.ceil(len(components) / columns))
+    figure = plt.figure(figsize=(6.4 * columns, 5.0 * rows), dpi=150)
+    for plot_index, component in enumerate(components, start=1):
+        axis = figure.add_subplot(rows, columns, plot_index, projection="3d")
+        _draw_sandbox_component(
+            axis, component,
+            landmarks_by_component[int(component["component_id"])],
+            compact=True,
+        )
+    figure.suptitle(
+        f"{scene['video_id']}: disconnected relative ego components\n"
+        "Each panel has its own origin and display scale; forward is elongated. "
+        "Only segment endpoints are labeled.",
+        fontsize=15, y=0.995,
+    )
+    figure.text(
+        0.5, 0.008,
+        "Red: ego camera centers | square: consistent static candidate | "
+        "X: inconsistent | normalized relative, not metric ground truth",
+        ha="center", fontsize=9,
+    )
+    figure.subplots_adjust(
+        left=0.02, right=0.98, bottom=0.04, top=0.94,
+        wspace=0.05, hspace=0.16,
+    )
+    figure.savefig(output_path, bbox_inches="tight")
+    plt.close(figure)
+
+    component_root.mkdir(parents=True, exist_ok=True)
+    component_paths = []
+    for component in components:
+        component_id = int(component["component_id"])
+        poses = component["poses"]
+        first_frame = int(poses[0]["frame_index"])
+        last_frame = int(poses[-1]["frame_index"])
+        component_path = component_root / (
+            f"component_{component_id:02d}_frames_{first_frame:04d}_{last_frame:04d}.png"
+        )
+        detail = plt.figure(figsize=(12.8, 7.2), dpi=150)
+        axis = detail.add_subplot(111, projection="3d")
+        component_landmarks = landmarks_by_component[component_id]
+        _draw_sandbox_component(
+            axis, component, component_landmarks, compact=False,
+        )
+        detail.suptitle(
+            f"{scene['video_id']}: relative ego component {component_id}\n"
+            "Independent local origin; forward-axis geometry is not constrained to a cube.",
+            fontsize=15, y=0.98,
+        )
+        detail.text(
+            0.5, 0.025,
+            f"static candidates={len(component_landmarks)} | "
+            "normalized relative coordinates | not metric ground truth",
+            ha="center", fontsize=9,
+        )
+        detail.subplots_adjust(left=0.04, right=0.96, bottom=0.08, top=0.86)
+        # Preserve the requested 16:9 canvas. Tight bounding-box export can
+        # crop titles and turn a forward-elongated 3D box into a nearly square
+        # raster even when the underlying axes are correctly proportioned.
+        detail.savefig(component_path)
+        plt.close(detail)
+        component_paths.append(component_path)
+    return component_paths
 
 
 def _plot_camera_points_3d(
@@ -1043,6 +1236,7 @@ def render_step4_visualizations(
         timeline_path = video_root / f"{geometry.video_id}_geometry_timeline.png"
         motion_path = video_root / f"{geometry.video_id}_camera_motion_diagnostics.png"
         sandbox_path = video_root / f"{geometry.video_id}_relative_static_sandbox_3d.png"
+        sandbox_component_root = video_root / "relative_static_sandbox_components"
         static_scene_path = video_root / f"{geometry.video_id}_relative_static_scene.json"
         _plot_camera_points_3d(geometry, points_path, maximum_tracks)
         _plot_geometry_timeline(geometry, timeline_path, maximum_tracks)
@@ -1052,7 +1246,11 @@ def render_step4_visualizations(
             json.dumps(static_scene, indent=2),
             encoding="utf-8",
         )
-        _plot_relative_static_sandbox(static_scene, sandbox_path)
+        sandbox_component_paths = _plot_relative_static_sandbox(
+            static_scene,
+            sandbox_path,
+            sandbox_component_root,
+        )
 
         manifest_rows.append(
             {
@@ -1074,6 +1272,10 @@ def render_step4_visualizations(
                 "camera_motion_diagnostics": motion_path.relative_to(output_root).as_posix(),
                 "relative_static_scene": static_scene_path.relative_to(output_root).as_posix(),
                 "relative_static_sandbox_3d": sandbox_path.relative_to(output_root).as_posix(),
+                "relative_static_sandbox_components": [
+                    path.relative_to(output_root).as_posix()
+                    for path in sandbox_component_paths
+                ],
                 "relative_static_scene_summary": static_scene["summary"],
                 "video": video_path.relative_to(output_root).as_posix() if render_video else None,
             }
@@ -1084,7 +1286,7 @@ def render_step4_visualizations(
         json.dumps(
             {
                 "schema_name": "step4_visualization_manifest",
-                "schema_version": 2,
+                "schema_version": 3,
                 "run_id": store.run_id,
                 "geometry_store_sha256": sha256_file(store_path),
                 "semantic_warning": (

@@ -13,7 +13,9 @@ from src.exp_august.contracts import (
     DetectionTier,
     GeometryStore,
     Observability,
+    VideoWorldStateManifest,
     VideoGeometryManifest,
+    WorldStateStore,
 )
 from src.exp_august.contracts.codec import read_contract, sha256_file
 from src.exp_august.inference.depth_backend import DepthFrameOutput
@@ -27,6 +29,8 @@ from src.exp_august.inference.step04_visualization import (
     _relative_static_scene,
     render_step4_visualizations,
 )
+from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
+from src.exp_august.inference.step05_visualization import render_step5_visualizations
 
 
 class _Objects:
@@ -329,6 +333,45 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                 static_scene["coordinate_unit"],
                 "normalized_relative_translation_step",
             )
+            self.assertEqual(
+                len(row["relative_static_sandbox_components"]),
+                static_scene["summary"]["component_count"],
+            )
+            self.assertTrue(
+                all(
+                    (visual_root / path).is_file()
+                    for path in row["relative_static_sandbox_components"]
+                )
+            )
+
+            step5 = run_step5(geometry_store_path=step4.store_path, top_k=3)
+            restored_world_store = read_contract(step5.store_path, WorldStateStore)
+            self.assertEqual(restored_world_store, step5.store)
+            world_reference = restored_world_store.video_world_states[0]
+            world_manifest_path = step5.stage_root / world_reference.relative_path
+            world_manifest = read_contract(world_manifest_path, VideoWorldStateManifest)
+            self.assertEqual(world_manifest.video_id, "tiny")
+            self.assertTrue(world_manifest.initial_beam.hypotheses)
+            self.assertFalse(
+                world_manifest.initial_beam.hypotheses[0].metric_scale_claimed
+            )
+            step5_visualization_path = render_step5_visualizations(
+                world_state_store_path=step5.store_path,
+                maximum_objects=5,
+            )
+            self.assertTrue(step5_visualization_path.is_file())
+            step5_visualization = json.loads(
+                step5_visualization_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                step5_visualization["schema_name"],
+                "step5_visualization_manifest",
+            )
+            step5_row = step5_visualization["videos"][0]
+            for key in ("world_3d", "motion_intervals", "summary"):
+                self.assertTrue(
+                    (step5_visualization_path.parent / step5_row[key]).is_file()
+                )
 
     def test_step4_rejects_tampered_tracking_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -42,18 +42,18 @@ fi
 
 usage() {
   echo "Usage:"
-  echo "  ./d4.sh run --gpu 0 --step 4 --scale debug --seed 1 --diagnostics"
+  echo "  ./d4.sh run --gpu 0 --step 5 --scale debug --seed 1 --diagnostics"
   echo "  ./d4.sh                 # run the new pipeline with debug defaults"
   echo "  ./d4.sh build           # build the Docker image"
   echo "  ./d4.sh shell --gpu 0   # open an interactive container shell"
   echo ""
   echo "Run options (d3-compatible names):"
   echo "  --gpu ID                GPU device ID or 'all'"
-  echo "  --step N                Last target-pipeline step (1-4, default: 4)"
+  echo "  --step N                Last target-pipeline step (1-5, default: 5)"
   echo "  --scale NAME            debug=10, small=100, full=961 (default: debug)"
   echo "  --data N                Custom video count (alias: --video-count)"
   echo "  --seed N                Seed value or index 1, 2, 3 (default: 1)"
-  echo "  --diagnostics           Render Step 3 and Step 4 diagnostic outputs"
+  echo "  --diagnostics           Render Step 3, Step 4 and Step 5 diagnostics"
   echo "  --render-candidate-filter-comparisons"
   echo "                           Compatibility alias enabling diagnostics"
   echo ""
@@ -65,6 +65,7 @@ usage() {
   echo "  --no-step3-video        Render example frames but not the summary video"
   echo "  --no-step4-video        Render Step 4 plots/frames but not its summary video"
   echo "  --horizontal-fov DEG    Frozen Step 4 camera FOV prior (default: 90)"
+  echo "  --world-top-k N         Maximum initial Step 5 hypotheses (default: 5)"
   echo ""
   echo "Seeds: 1=726381, 2=184957, 3=930241"
   echo "Output: CAUVID_OUTPUT_D4_HOST (default: .../pipeline_august_target)"
@@ -126,8 +127,6 @@ ensure_image() {
 }
 
 prepare_dirs() {
-  validate_output_isolation
-
   # Docker bind mounts do not reliably create a missing host directory with
   # the intended ownership. Create and validate the complete D4 output tree
   # before starting the container.
@@ -139,7 +138,16 @@ prepare_dirs() {
     echo "[d4][error] D4 output directory is not writable: $PIPELINE_OUTPUT" >&2
     exit 1
   fi
-  echo "[d4] output directory ready: $PIPELINE_OUTPUT"
+  # Resolve symlinks and relative components only after the directories exist.
+  # The canonical paths make overlap checks and Docker's bind source explicit.
+  PIPELINE_OUTPUT_BASE="$(cd "$PIPELINE_OUTPUT_BASE" && pwd -P)"
+  PIPELINE_OUTPUT="$(cd "$PIPELINE_OUTPUT" && pwd -P)"
+  if [[ -d "$D3_OUTPUT_BASE" ]]; then
+    D3_OUTPUT_BASE="$(cd "$D3_OUTPUT_BASE" && pwd -P)"
+  fi
+  validate_output_isolation
+  echo "[d4] host output directory ready: $PIPELINE_OUTPUT"
+  echo "[d4] bind mapping: $PIPELINE_OUTPUT -> /output/pipeline_august_target"
 
   mkdir -p \
     "$DRIVING_MINI" \
@@ -148,6 +156,66 @@ prepare_dirs() {
     "$LOGS_DIR" \
     "$TORCH_CACHE" \
     "$HF_CACHE"
+}
+
+verify_output_bind_mount() {
+  local probe_name=".d4_host_mount_probe_$$"
+  local probe_path="$PIPELINE_OUTPUT/$probe_name"
+  if ! printf '%s\n' "$PIPELINE_OUTPUT" >"$probe_path"; then
+    echo "[d4][error] Could not create host mount probe: $probe_path" >&2
+    exit 1
+  fi
+  if docker run --rm \
+    --mount "type=bind,src=$PIPELINE_OUTPUT,dst=/output/pipeline_august_target" \
+    "$IMAGE_NAME" \
+    sh -c "test -f /output/pipeline_august_target/$probe_name && test -w /output/pipeline_august_target"
+  then
+    :
+  else
+    rm -f -- "$probe_path"
+    echo "[d4][error] Docker did not receive the intended writable host bind mount." >&2
+    echo "[d4][error] Host: $PIPELINE_OUTPUT" >&2
+    echo "[d4][error] Container: /output/pipeline_august_target" >&2
+    exit 1
+  fi
+  rm -f -- "$probe_path"
+  echo "[d4] writable output bind verified"
+}
+
+verify_persisted_run_output() {
+  local max_step="$1"
+  local diagnostics="$2"
+  local marker_path="$3"
+  local expected_name="init_bundle.json"
+  local artifact_path=""
+  case "$max_step" in
+    2) expected_name="neural_evidence_store.json" ;;
+    3) expected_name="tracking_store.json" ;;
+    4) expected_name="geometry_store.json" ;;
+    5) expected_name="world_state_store.json" ;;
+  esac
+  artifact_path="$(find "$PIPELINE_OUTPUT" -type f -newer "$marker_path" -name "$expected_name" -print -quit 2>/dev/null)"
+  if [[ -z "$artifact_path" ]]; then
+    echo "[d4][error] Container exited successfully, but no new $expected_name exists on the host." >&2
+    echo "[d4][error] Checked host directory: $PIPELINE_OUTPUT" >&2
+    echo "[d4][error] The run is not considered persisted." >&2
+    return 1
+  fi
+  echo "[d4] persisted host artifact: $artifact_path"
+
+  if [[ "$diagnostics" == "1" && "$max_step" -ge 3 ]]; then
+    local visualization_name="step3_visualization_manifest.json"
+    [[ "$max_step" -ge 4 ]] && visualization_name="step4_visualization_manifest.json"
+    [[ "$max_step" -ge 5 ]] && visualization_name="step5_visualization_manifest.json"
+    local visualization_path=""
+    visualization_path="$(find "$PIPELINE_OUTPUT" -type f -newer "$marker_path" -name "$visualization_name" -print -quit 2>/dev/null)"
+    if [[ -z "$visualization_path" ]]; then
+      echo "[d4][error] Expected host visualization is missing: $visualization_name" >&2
+      echo "[d4][error] Checked host directory: $PIPELINE_OUTPUT" >&2
+      return 1
+    fi
+    echo "[d4] persisted host visualization: $visualization_path"
+  fi
 }
 
 validate_driving_mini() {
@@ -202,9 +270,11 @@ run_container() {
   local no_step3_video="$9"
   local horizontal_fov="${10}"
   local no_step4_video="${11}"
+  local world_top_k="${12}"
   local runner_args=()
   local yolo_model="$YOLO_MODEL"
   local sam2_model="$SAM2_MODEL"
+  local run_marker="$PIPELINE_OUTPUT/.d4_run_started_$$"
 
   runtime_env_args
   docker_mount_args
@@ -241,16 +311,21 @@ run_container() {
     --tracking-min-score 0.30
     --device cuda:0
     --horizontal-fov-degrees "$horizontal_fov"
+    --world-top-k "$world_top_k"
   )
   if [[ "$diagnostics" == "1" ]]; then
-    runner_args+=(--visualize-step3 --visualize-step4)
+    runner_args+=(--visualize-step3 --visualize-step4 --visualize-step5)
   fi
   [[ "$allow_model_download" == "1" ]] && runner_args+=(--allow-model-download)
   [[ "$no_step3_video" == "1" ]] && runner_args+=(--no-step3-video)
   [[ "$no_step4_video" == "1" ]] && runner_args+=(--no-step4-video)
 
+  if ! touch -- "$run_marker"; then
+    echo "[d4][error] Could not create run marker in host output: $run_marker" >&2
+    return 1
+  fi
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  docker run --rm \
+  if docker run --rm \
     "${GPU_ARGS[@]}" \
     -v "$ROOT_DIR/src:/app/src:ro" \
     -v "$ROOT_DIR/configs:/app/configs:ro" \
@@ -258,7 +333,7 @@ run_container() {
     -v "$RAW_DATASET:/raw_driving_data:ro" \
     -v "$DRIVING_MINI:/dataset/driving_mini:ro" \
     -v "$NUSCENES:/dataset/nuScenes:ro" \
-    -v "$PIPELINE_OUTPUT:/output/pipeline_august_target" \
+    --mount "type=bind,src=$PIPELINE_OUTPUT,dst=/output/pipeline_august_target" \
     -v "$OUTPUT_DIR:/output/output" \
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/cache/torch" \
@@ -280,6 +355,18 @@ run_container() {
     --name "$CONTAINER_NAME" \
     "$IMAGE_NAME" \
     python -m src.exp_august.inference.runner "${runner_args[@]}"
+  then
+    :
+  else
+    local docker_status=$?
+    rm -f -- "$run_marker"
+    return "$docker_status"
+  fi
+  if ! verify_persisted_run_output "$max_step" "$diagnostics" "$run_marker"; then
+    rm -f -- "$run_marker"
+    return 1
+  fi
+  rm -f -- "$run_marker"
 }
 
 shell_container() {
@@ -294,7 +381,7 @@ shell_container() {
     -v "$RAW_DATASET:/raw_driving_data:ro" \
     -v "$DRIVING_MINI:/dataset/driving_mini:ro" \
     -v "$NUSCENES:/dataset/nuScenes:ro" \
-    -v "$PIPELINE_OUTPUT:/output/pipeline_august_target" \
+    --mount "type=bind,src=$PIPELINE_OUTPUT,dst=/output/pipeline_august_target" \
     -v "$OUTPUT_DIR:/output/output" \
     -v "$LOGS_DIR:/logs" \
     -v "$TORCH_CACHE:/cache/torch" \
@@ -318,7 +405,7 @@ main() {
   local data_scale="debug"
   local video_count="10"
   local custom_data="0"
-  local max_step="4"
+  local max_step="5"
   local diagnostics="0"
   local seed="1"
   local canonical_fps="0.2"
@@ -329,6 +416,7 @@ main() {
   local no_step4_video="0"
   local evaluate_requested="0"
   local horizontal_fov="90"
+  local world_top_k="5"
 
   [[ "$cmd" == --* && "$cmd" != "--help" ]] && cmd="run"
   case "$cmd" in
@@ -357,6 +445,7 @@ main() {
           --no-step3-video) no_step3_video="1"; shift ;;
           --no-step4-video) no_step4_video="1"; shift ;;
           --horizontal-fov) horizontal_fov="${2:?missing horizontal FOV}"; shift 2 ;;
+          --world-top-k) world_top_k="${2:?missing Top-K value}"; shift 2 ;;
           --evaluate) evaluate_requested="1"; shift ;;
           --split|--test-ratio|--tolerances)
             # Parse d3 evaluation options so the final error explains the real issue.
@@ -372,7 +461,7 @@ main() {
         echo "[d4][error] d4 will not invoke the legacy d3 evaluator." >&2
         exit 1
       fi
-      [[ "$max_step" =~ ^[1-4]$ ]] || { echo "[d4][error] --step must be 1, 2, 3, or 4" >&2; exit 1; }
+      [[ "$max_step" =~ ^[1-5]$ ]] || { echo "[d4][error] --step must be 1, 2, 3, 4, or 5" >&2; exit 1; }
       case "$data_scale" in
         debug) [[ "$custom_data" == "1" ]] || video_count="10" ;;
         small) [[ "$custom_data" == "1" ]] || video_count="100" ;;
@@ -382,6 +471,8 @@ main() {
       [[ "$video_count" =~ ^[1-9][0-9]*$ ]] || { echo "[d4][error] --data must be a positive integer" >&2; exit 1; }
       [[ "$batch_size" =~ ^[1-9][0-9]*$ ]] || { echo "[d4][error] --batch-size must be a positive integer" >&2; exit 1; }
       [[ "$depth_resolution" =~ ^[1-9][0-9]*$ ]] || { echo "[d4][error] --depth-resolution must be a positive integer" >&2; exit 1; }
+      [[ "$world_top_k" =~ ^[1-9][0-9]*$ ]] || { echo "[d4][error] --world-top-k must be a positive integer" >&2; exit 1; }
+      (( world_top_k <= 64 )) || { echo "[d4][error] --world-top-k must be at most 64" >&2; exit 1; }
       [[ "$custom_data" == "1" ]] && data_scale="custom_$video_count"
       seed="$(resolve_seed "$seed")"
       configure_run_output "$data_scale" "$seed"
@@ -390,10 +481,11 @@ main() {
       prepare_dirs
       validate_driving_mini
       ensure_image
+      verify_output_bind_mount
       run_container "$video_count" "$max_step" "$diagnostics" "$seed" \
         "$canonical_fps" "$batch_size" "$depth_resolution" \
         "$allow_model_download" "$no_step3_video" "$horizontal_fov" \
-        "$no_step4_video"
+        "$no_step4_video" "$world_top_k"
       ;;
     evaluate)
       echo "[d4][error] Evaluation for the new typed pipeline is not implemented." >&2
@@ -411,6 +503,7 @@ main() {
       configure_run_output "shell" "manual"
       prepare_dirs
       ensure_image
+      verify_output_bind_mount
       shell_container
       ;;
     help|-h|--help) usage ;;
