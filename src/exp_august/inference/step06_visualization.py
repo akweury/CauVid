@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import textwrap
 from pathlib import Path
 
 import cv2
@@ -40,6 +41,19 @@ _FAMILY_BGR = {
     "physics": (55, 55, 210),
     "semantic": (80, 155, 55),
 }
+
+_KEY_RED = (55, 65, 205)
+_KEY_BLUE = (205, 115, 35)
+_KEY_GREEN = (70, 145, 75)
+_KEY_ORANGE = (35, 135, 220)
+_TEXT_DARK = (30, 35, 43)
+_TEXT_MUTED = (76, 82, 92)
+_PANEL_WIDTH = 1920
+_PANEL_HEIGHT = 1080
+_HEADER_HEIGHT = 130
+_FRAME_REGION_WIDTH = 1280
+_SIDE_LEFT = 1304
+_SIDE_RIGHT = 1894
 
 
 def _run_root(path: Path) -> Path:
@@ -146,12 +160,12 @@ def _draw_track_support(
     residual,
     step2_root: Path,
     step3_root: Path,
-) -> tuple[float, float] | None:
-    _, observation = _track_observation(
+) -> tuple[tuple[float, float] | None, object | None, object | None]:
+    track, observation = _track_observation(
         tracking, residual.track_id, residual.start_frame_index
     )
     if observation is None:
-        return None
+        return None, track, None
     mask = _selected_mask(
         tracking=tracking,
         observation=observation,
@@ -175,7 +189,7 @@ def _draw_track_support(
         int, (round(box.x1), round(box.y1), round(box.x2), round(box.y2))
     )
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 3)
-    return 0.5 * (box.x1 + box.x2), 0.5 * (box.y1 + box.y2)
+    return (0.5 * (box.x1 + box.x2), 0.5 * (box.y1 + box.y2)), track, observation
 
 
 def _draw_prediction_observation(image: np.ndarray, residual, origin) -> None:
@@ -192,12 +206,270 @@ def _draw_prediction_observation(image: np.ndarray, residual, origin) -> None:
         if origin is None:
             origin = (image.shape[1] / 2.0, image.shape[0] / 2.0)
         start = tuple(int(round(value)) for value in origin)
-        for vector, color in ((predicted, (255, 205, 40)), (observed, (40, 170, 255))):
+        vectors = (np.asarray(predicted[:2]), np.asarray(observed[:2]))
+        maximum_norm = max(float(np.linalg.norm(vector)) for vector in vectors)
+        display_scale = min(1.0, 180.0 / max(maximum_norm, 1e-6))
+        margin = 8.0
+        for vector in vectors:
+            for axis, limit in ((0, image.shape[1]), (1, image.shape[0])):
+                component = float(vector[axis])
+                if abs(component) < 1e-8:
+                    continue
+                available = (
+                    limit - margin - origin[axis]
+                    if component > 0
+                    else origin[axis] - margin
+                )
+                display_scale = min(display_scale, max(0.0, available / abs(component)))
+        for vector, color in ((vectors[0], _KEY_RED), (vectors[1], _KEY_BLUE)):
             end = (
-                int(np.clip(round(origin[0] + vector[0]), 0, image.shape[1] - 1)),
-                int(np.clip(round(origin[1] + vector[1]), 0, image.shape[0] - 1)),
+                int(round(origin[0] + display_scale * vector[0])),
+                int(round(origin[1] + display_scale * vector[1])),
             )
-            cv2.arrowedLine(image, start, end, color, 4, cv2.LINE_AA, tipLength=0.18)
+            cv2.arrowedLine(image, start, end, color, 5, cv2.LINE_AA, tipLength=0.18)
+            cv2.circle(image, end, 6, color, -1, cv2.LINE_AA)
+        cv2.putText(
+            image,
+            f"Shared arrow scale: {display_scale:.3g}x",
+            (24, 42),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (245, 245, 245),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(image, "Predicted motion", (24, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.65, _KEY_RED, 2, cv2.LINE_AA)
+        cv2.putText(image, "RAFT flow", (245, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.65, _KEY_BLUE, 2, cv2.LINE_AA)
+
+
+def _flow_diagnosis(residual) -> tuple[str, float, float] | None:
+    if "flow" not in residual.metric_name:
+        return None
+    predicted = np.asarray(residual.predicted_values[:2], dtype=np.float64)
+    observed = np.asarray(residual.observed_values[:2], dtype=np.float64)
+    if predicted.size != 2 or observed.size != 2:
+        return None
+    predicted_norm = float(np.linalg.norm(predicted))
+    observed_norm = float(np.linalg.norm(observed))
+    epsilon = 1e-6
+    direction = residual.flow_direction_error_deg
+    if direction is None:
+        cosine = float(np.dot(predicted, observed) / max(predicted_norm * observed_norm, epsilon))
+        direction = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+    ratio = residual.flow_magnitude_ratio
+    if ratio is None:
+        ratio = max(predicted_norm, observed_norm, epsilon) / max(
+            min(predicted_norm, observed_norm), epsilon
+        )
+    direction_conflict = direction > 30.0
+    magnitude_conflict = ratio > 1.5
+    if direction_conflict and magnitude_conflict:
+        label = "direction + magnitude conflict"
+    elif direction_conflict:
+        label = "direction conflict"
+    elif magnitude_conflict:
+        label = "magnitude conflict"
+    else:
+        label = "endpoint mismatch without dominant component"
+    return label, float(direction), float(ratio)
+
+
+def _section_label(
+    image: np.ndarray,
+    *,
+    y: int,
+    label: str,
+    accent: tuple[int, int, int],
+) -> int:
+    del accent
+    cv2.putText(
+        image,
+        label,
+        (_SIDE_LEFT, y + 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.68,
+        _TEXT_DARK,
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.line(
+        image,
+        (_SIDE_LEFT, y + 38),
+        (_SIDE_RIGHT, y + 38),
+        (205, 210, 216),
+        2,
+    )
+    return y + 58
+
+
+def _bullet_text(
+    image: np.ndarray,
+    text: str,
+    *,
+    y: int,
+    level: int = 0,
+    important: bool = False,
+    accent: tuple[int, int, int] = (120, 120, 120),
+) -> int:
+    x = _SIDE_LEFT + 10 + 25 * level
+    text_x = x + 20
+    wrap_width = 61 - 5 * level
+    lines = textwrap.wrap(text, width=max(28, wrap_width)) or [""]
+    line_height = 31 if important else 28
+    block_height = line_height * len(lines) + 8
+    radius = 6 if level == 0 else 4
+    cv2.circle(image, (x + 4, y - 6), radius, accent if important else (105, 112, 122), -1)
+    for index, line in enumerate(lines):
+        cv2.putText(
+            image,
+            line,
+            (text_x, y + index * line_height),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.64 if important else 0.57,
+            accent if important else _TEXT_MUTED,
+            2 if important else 1,
+            cv2.LINE_AA,
+        )
+    return y + block_height
+
+
+def _pale_color(color: tuple[int, int, int]) -> tuple[int, int, int]:
+    return tuple(int(0.88 * 247 + 0.12 * value) for value in color)
+
+
+def _rich_bullet(
+    image: np.ndarray,
+    segments: list[tuple[str, tuple[int, int, int], bool]],
+    *,
+    y: int,
+    level: int = 0,
+) -> int:
+    bullet_x = _SIDE_LEFT + 10 + 25 * level
+    start_x = bullet_x + 20
+    x = start_x
+    baseline = y
+    scale = 0.64 if level == 0 else 0.57
+    thickness = 2 if level == 0 else 1
+    line_height = 32 if level == 0 else 29
+    cv2.circle(
+        image,
+        (bullet_x + 4, baseline - 6),
+        6 if level == 0 else 4,
+        segments[0][1] if segments else _TEXT_MUTED,
+        -1,
+    )
+    for text, color, highlighted in segments:
+        (width, height), baseline_pad = cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+        )
+        if x + width > _SIDE_RIGHT and x > start_x:
+            x = start_x
+            baseline += line_height
+        if highlighted:
+            cv2.rectangle(
+                image,
+                (x - 4, baseline - height - 5),
+                (x + width + 4, baseline + baseline_pad + 4),
+                _pale_color(color),
+                -1,
+            )
+        cv2.putText(
+            image,
+            text,
+            (x, baseline),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+        x += width + 4
+    return baseline + 32
+
+
+def _conflict_relation(residual) -> str:
+    descriptions = {
+        "object_reprojection": "Predicted image position vs observed object centroid",
+        "heldout_object_depth": "Predicted object depth vs held-out depth evidence",
+        "heldout_object_backward_flow": "Predicted object motion vs held-out RAFT backward flow",
+        "heldout_background_backward_flow": "Ego-predicted background flow vs held-out RAFT flow",
+        "trajectory_temporal_gap": "Expected continuous trajectory vs missing temporal support",
+        "ego_acceleration_bound": "Estimated ego acceleration vs physical plausibility bound",
+        "object_acceleration_bound": "Estimated object acceleration vs physical plausibility bound",
+        "ego_speed_bound": "Estimated ego speed vs physical plausibility bound",
+        "object_speed_bound": "Estimated object speed vs physical plausibility bound",
+        "semantic_static_motion": "Predicted object motion vs semantic-static prior",
+        "track_endpoint_accounting": "Track endpoint vs required lifecycle explanation",
+    }
+    return descriptions.get(
+        residual.constraint_id,
+        f"Predicted state vs {residual.metric_name.replace('_', ' ')} evidence",
+    )
+
+
+def _subject_segments(*, residual, track):
+    if residual.track_id is not None:
+        short_id = residual.track_id.rsplit(":", 1)[-1].lstrip("0") or "0"
+        class_name = track.primary_class if track is not None else "object"
+        return [
+            ("Object: ", _TEXT_DARK, False),
+            (class_name, _KEY_RED, True),
+            ("  |  Track ID ", _TEXT_DARK, False),
+            (short_id, _KEY_BLUE, True),
+        ]
+    if residual.family.value == "ego_background":
+        return [
+            ("Ego vehicle", _KEY_RED, True),
+            (" and ", _TEXT_DARK, False),
+            ("background", _KEY_BLUE, True),
+        ]
+    return [("Ego/world state", _KEY_RED, True)]
+
+
+def _relation_segments(residual):
+    descriptions = {
+        "object_reprojection": ("Predicted image position", "observed object centroid"),
+        "heldout_object_depth": ("Predicted object depth", "held-out depth evidence"),
+        "heldout_object_backward_flow": (
+            "Predicted object motion",
+            "held-out RAFT backward flow",
+        ),
+        "heldout_background_backward_flow": (
+            "Ego-predicted background flow",
+            "held-out RAFT flow",
+        ),
+        "trajectory_temporal_gap": (
+            "Expected continuous trajectory",
+            "missing temporal support",
+        ),
+        "ego_acceleration_bound": (
+            "Estimated ego acceleration",
+            "physical plausibility bound",
+        ),
+        "object_acceleration_bound": (
+            "Estimated object acceleration",
+            "physical plausibility bound",
+        ),
+        "ego_speed_bound": ("Estimated ego speed", "physical plausibility bound"),
+        "object_speed_bound": (
+            "Estimated object speed",
+            "physical plausibility bound",
+        ),
+        "semantic_static_motion": ("Predicted object motion", "semantic-static prior"),
+        "track_endpoint_accounting": (
+            "Track endpoint",
+            "required lifecycle explanation",
+        ),
+    }
+    predicted, observed = descriptions.get(
+        residual.constraint_id,
+        ("Predicted state", residual.metric_name.replace("_", " ") + " evidence"),
+    )
+    return [
+        (predicted, _KEY_RED, True),
+        ("  vs  ", _TEXT_DARK, False),
+        (observed, _KEY_BLUE, True),
+    ]
 
 
 def _conflict_panel(
@@ -211,7 +483,7 @@ def _conflict_panel(
     step3_root: Path,
 ) -> np.ndarray:
     annotated = frame.copy()
-    origin = _draw_track_support(
+    origin, track, _ = _draw_track_support(
         annotated,
         tracking=tracking,
         residual=residual,
@@ -219,52 +491,152 @@ def _conflict_panel(
         step3_root=step3_root,
     )
     _draw_prediction_observation(annotated, residual, origin)
-    view = cv2.resize(annotated, (1100, 619), interpolation=cv2.INTER_AREA)
-    canvas = np.full((900, 1600, 3), 247, dtype=np.uint8)
-    canvas[110:729, :1100] = view
-    canvas[:110] = (24, 29, 38)
+    view = cv2.resize(annotated, (1260, 709), interpolation=cv2.INTER_AREA)
+    canvas = np.full((_PANEL_HEIGHT, _PANEL_WIDTH, 3), 247, dtype=np.uint8)
+    canvas[_HEADER_HEIGHT:, :_FRAME_REGION_WIDTH] = (22, 26, 33)
+    canvas[250:959, 10:1270] = view
+    canvas[:_HEADER_HEIGHT] = (24, 29, 38)
     family_color = _FAMILY_BGR[residual.family.value]
-    cv2.rectangle(canvas, (0, 105), (1600, 110), family_color, -1)
-    title = (
-        f"Step 6 conflict | rank {packet.hypothesis_rank} | {residual.family.value} / "
-        f"{residual.constraint_id}"
-    )
-    _put_lines(
+    cv2.rectangle(
         canvas,
-        [title, f"frame {residual.start_frame_index} | severity {residual.severity.value}"],
-        origin=(24, 42),
-        scale=0.72,
-        color=(245, 245, 245),
-        line_height=38,
-        thickness=2,
+        (0, _HEADER_HEIGHT - 6),
+        (_PANEL_WIDTH, _HEADER_HEIGHT),
+        family_color,
+        -1,
     )
-    side_lines = [
-        "Residual",
-        f"z score: {float(residual.normalized_residual):.3f}",
-        f"raw: {float(residual.raw_residual):.3f} {residual.metric_unit}",
-        f"uncertainty: {float(residual.uncertainty):.3f}",
-        f"threshold: {float(residual.threshold):.3f}",
-        "",
-        "Prediction / observation",
-        f"predicted: {_format_values(residual.predicted_values)}",
-        f"observed: {_format_values(residual.observed_values)}",
-        "",
-        "Evidence status",
-        f"basis: {residual.evaluation_basis.value}",
-        f"role: {residual.evidence_role.value if residual.evidence_role else 'none'}",
-        f"cue: {residual.cue_family.value if residual.cue_family else 'none'}",
-        f"check-supported window: {str(conflict.check_evidence_supported).lower()}",
-        "",
-        f"component: {residual.component_id or 'none'}",
-        f"track: {(residual.track_id or 'none').rsplit(':', 1)[-1]}",
-    ]
-    _put_lines(canvas, side_lines, origin=(1130, 148), scale=0.54, line_height=28)
-    reason_lines = [
-        f"Reason: {residual.reason}",
-        "Yellow cross/arrow = predicted; orange circle/arrow = observed.",
-        "A conflict is a diagnostic result; Step 6 does not repair or select hypotheses.",
-    ]
-    _put_lines(canvas, reason_lines, origin=(26, 775), scale=0.55, line_height=36)
+    cv2.line(
+        canvas,
+        (_FRAME_REGION_WIDTH, _HEADER_HEIGHT),
+        (_FRAME_REGION_WIDTH, _PANEL_HEIGHT),
+        (208, 212, 218),
+        2,
+    )
+    title = f"Step 6 Conflict | Hypothesis Rank {packet.hypothesis_rank:02d} | Frame {residual.start_frame_index:06d}"
+    cv2.putText(
+        canvas,
+        title,
+        (28, 51),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.88,
+        (245, 245, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    subtitle = (
+        f"{residual.family.value.replace('_', ' ').upper()}  /  "
+        f"{residual.constraint_id.replace('_', ' ').upper()}  /  "
+        f"{residual.severity.value.replace('_', ' ').upper()}"
+    )
+    cv2.putText(
+        canvas,
+        subtitle,
+        (28, 101),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.70,
+        (245, 245, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    y = 154
+    y = _section_label(canvas, y=y, label="CONFLICT SUBJECT", accent=family_color)
+    y = _rich_bullet(
+        canvas,
+        _subject_segments(residual=residual, track=track),
+        y=y,
+    )
+    component = residual.component_id.rsplit(":", 1)[-1] if residual.component_id else "none"
+    y = _bullet_text(
+        canvas,
+        f"Component {component}; frame {residual.start_frame_index}; time {residual.start_timestamp_s:.2f} s",
+        y=y,
+        level=1,
+    )
+    y += 10
+    y = _section_label(canvas, y=y, label="WHAT CONFLICTS", accent=_KEY_ORANGE)
+    y = _rich_bullet(
+        canvas,
+        _relation_segments(residual),
+        y=y,
+    )
+    y = _rich_bullet(
+        canvas,
+        [
+            ("Predicted", _KEY_RED, False),
+            (f": {_format_values(residual.predicted_values)}", _TEXT_MUTED, False),
+        ],
+        y=y,
+        level=1,
+    )
+    y = _rich_bullet(
+        canvas,
+        [
+            ("Observed", _KEY_BLUE, False),
+            (f": {_format_values(residual.observed_values)}", _TEXT_MUTED, False),
+        ],
+        y=y,
+        level=1,
+    )
+    flow_diagnosis = _flow_diagnosis(residual)
+    if flow_diagnosis is not None:
+        diagnosis, direction_error, magnitude_ratio = flow_diagnosis
+        y = _rich_bullet(
+            canvas,
+            [
+                (diagnosis, _KEY_ORANGE, True),
+                (
+                    f"  |  direction {direction_error:.1f} deg; magnitude {magnitude_ratio:.2f}x",
+                    _TEXT_MUTED,
+                    False,
+                ),
+            ],
+            y=y,
+            level=1,
+        )
+        if residual.constraint_id == "heldout_background_backward_flow":
+            y = _bullet_text(
+                canvas,
+                "Arrows are spatial-median summaries; residual is median per-point endpoint error",
+                y=y,
+                level=1,
+            )
+    y += 10
+    y = _section_label(canvas, y=y, label="WHY IT IS FLAGGED", accent=_KEY_RED)
+    y = _bullet_text(
+        canvas,
+        "Residual exceeds the configured conflict threshold",
+        y=y,
+    )
+    y = _bullet_text(
+        canvas,
+        f"Residual {float(residual.raw_residual):.3f} {residual.metric_unit}; threshold {float(residual.threshold):.3f}",
+        y=y,
+        level=1,
+    )
+    y = _bullet_text(
+        canvas,
+        f"Normalized z {float(residual.normalized_residual):.3f}; uncertainty {float(residual.uncertainty):.3f}",
+        y=y,
+        level=1,
+    )
+    y += 10
+    y = _section_label(canvas, y=y, label="EVIDENCE", accent=_KEY_GREEN)
+    evidence_role = residual.evidence_role.value if residual.evidence_role else "none"
+    basis = residual.evaluation_basis.value.replace("_", " ")
+    y = _rich_bullet(
+        canvas,
+        [
+            (basis, _KEY_GREEN, True),
+            ("  |  role: ", _TEXT_DARK, False),
+            (evidence_role, _KEY_BLUE, True),
+        ],
+        y=y,
+    )
+    _bullet_text(
+        canvas,
+        f"Cue: {residual.cue_family.value if residual.cue_family else 'none'}; check-supported window: {str(conflict.check_evidence_supported).lower()}",
+        y=y,
+        level=1,
+    )
     return canvas
 
 
@@ -435,6 +807,10 @@ def render_step6_visualizations(
             summary = video_root / f"rank_{packet.hypothesis_rank:02d}_family_summary.png"
             conflict_root = video_root / f"rank_{packet.hypothesis_rank:02d}_conflicts"
             conflict_root.mkdir(parents=True, exist_ok=True)
+            # This directory is owned by the renderer. Remove panels from an older
+            # render so changed ordering or limits cannot leave mixed templates.
+            for stale_panel in conflict_root.glob("*.png"):
+                stale_panel.unlink()
             conflict_audit = video_root / f"rank_{packet.hypothesis_rank:02d}_conflicts.json"
             conflict_audit.write_text(
                 json.dumps(
@@ -499,12 +875,11 @@ def render_step6_visualizations(
                 panel_images.append(panel)
             contact_sheet = None
             if panel_images:
-                tiles = [
-                    cv2.resize(panel, (800, 450), interpolation=cv2.INTER_AREA)
-                    for panel in panel_images[:4]
-                ]
+                tiles = panel_images[:4]
                 while len(tiles) < 4:
-                    tiles.append(np.full_like(tiles[0], 247))
+                    tiles.append(
+                        np.full((_PANEL_HEIGHT, _PANEL_WIDTH, 3), 247, dtype=np.uint8)
+                    )
                 sheet = np.vstack((np.hstack(tiles[:2]), np.hstack(tiles[2:4])))
                 contact_sheet = (
                     video_root
@@ -518,6 +893,7 @@ def render_step6_visualizations(
                 "evaluable_fraction": packet.evaluable_fraction,
                 "check_evidence_residual_count": packet.check_evidence_residual_count,
                 "conflict_window_count": len(packet.conflict_windows),
+                "rendered_conflict_panel_count": len(conflict_paths),
                 "check_supported_conflict_count": packet.check_supported_conflict_count,
                 "timeline": timeline.relative_to(output_root).as_posix(),
                 "family_summary": summary.relative_to(output_root).as_posix(),
@@ -530,6 +906,11 @@ def render_step6_visualizations(
                     if contact_sheet is not None
                     else None
                 ),
+                "conflict_panel_resolution": [_PANEL_WIDTH, _PANEL_HEIGHT],
+                "conflict_overview_resolution": [
+                    2 * _PANEL_WIDTH,
+                    2 * _PANEL_HEIGHT,
+                ],
             })
         videos.append({
             "video_id": video_id,

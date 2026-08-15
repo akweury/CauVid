@@ -304,6 +304,8 @@ def _residual(
     evidence_keys: Iterable[str] = (), evidence_artifacts: Iterable[ArtifactLink] = (),
     hard: bool = False, limitations: Iterable[str] = (), end_frame: int | None = None,
     end_timestamp: float | None = None,
+    flow_direction_error_deg: float | None = None,
+    flow_magnitude_ratio: float | None = None,
 ) -> ResidualRecord:
     evaluable = raw is not None and normalized is not None
     return ResidualRecord(
@@ -328,6 +330,12 @@ def _residual(
         normalized_residual=float(normalized) if evaluable else None,
         uncertainty=float(uncertainty) if evaluable else None,
         threshold=float(threshold) if evaluable else None,
+        flow_direction_error_deg=(
+            float(flow_direction_error_deg) if evaluable and flow_direction_error_deg is not None else None
+        ),
+        flow_magnitude_ratio=(
+            float(flow_magnitude_ratio) if evaluable and flow_magnitude_ratio is not None else None
+        ),
         severity=_severity(normalized if evaluable else None, hard=hard, config=config),
         evaluable=evaluable,
         hard_constraint=hard,
@@ -336,6 +344,31 @@ def _residual(
         reason=reason,
         limitations=tuple(limitations),
     )
+
+
+def _flow_diagnostics(predicted: np.ndarray, observed: np.ndarray) -> tuple[float, float]:
+    """Return direction error and a symmetric magnitude ratio for two 2-D flows."""
+    predicted_norm = float(np.linalg.norm(predicted))
+    observed_norm = float(np.linalg.norm(observed))
+    epsilon = 1e-6
+    cosine = float(
+        np.dot(predicted, observed)
+        / max(predicted_norm * observed_norm, epsilon)
+    )
+    direction_error = float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+    magnitude_ratio = float(
+        max(predicted_norm, observed_norm, epsilon)
+        / max(min(predicted_norm, observed_norm), epsilon)
+    )
+    return direction_error, magnitude_ratio
+
+
+def _flow_uncertainty(*, base_sigma: float, fb_error: np.ndarray) -> float:
+    """Combine configured pixel noise with RAFT forward/backward disagreement."""
+    finite = np.asarray(fb_error, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    consistency_sigma = float(np.median(finite)) if finite.size else 0.0
+    return float(np.hypot(base_sigma, consistency_sigma))
 
 
 def _fit_reprojection_residuals(*, hypothesis, geometry, config):
@@ -460,6 +493,7 @@ def _check_object_flow_residuals(*, hypothesis, video, resolver, config):
         payload = _read_npz(resolver.path(assignment.artifact))
         flow = np.asarray(payload.get("flow"))
         valid = np.asarray(payload.get("domain_valid"), dtype=bool)
+        fb_error = np.asarray(payload.get("fb_error"))
         if "consistency_valid" in payload:
             valid &= np.asarray(payload["consistency_valid"], dtype=bool)
         for trajectory in hypothesis.object_trajectories:
@@ -481,14 +515,21 @@ def _check_object_flow_residuals(*, hypothesis, video, resolver, config):
             predicted = projected_source[0] - projected_target[0]
             observed = np.median(flow[selected], axis=0)
             raw = float(np.linalg.norm(predicted - observed))
+            uncertainty = _flow_uncertainty(
+                base_sigma=config.flow_sigma_px,
+                fb_error=fb_error[selected] if fb_error.shape == shape else np.empty(0),
+            )
+            direction_error, magnitude_ratio = _flow_diagnostics(predicted, observed)
             rows.append(_residual(
                 hypothesis_id=hypothesis.hypothesis_id, family=ResidualFamily.OBJECT_IDENTITY,
                 constraint_id="heldout_object_backward_flow", basis=EvaluationBasis.CHECK_EVIDENCE,
                 role=EvidenceRole.CHECK_ONLY, cue=CueFamily.FLOW_BACKWARD,
                 frame=target_frame, timestamp=target[1], metric_name="flow_endpoint_error",
-                metric_unit="pixel", raw=raw, normalized=raw / config.flow_sigma_px,
-                uncertainty=config.flow_sigma_px, threshold=config.conflict_z_threshold * config.flow_sigma_px,
+                metric_unit="pixel", raw=raw, normalized=raw / uncertainty,
+                uncertainty=uncertainty, threshold=config.conflict_z_threshold * uncertainty,
                 predicted=predicted, observed=observed,
+                flow_direction_error_deg=direction_error,
+                flow_magnitude_ratio=magnitude_ratio,
                 reason="world trajectory displacement checked against held-out backward flow", config=config,
                 component_id=trajectory.component_id, track_id=trajectory.track_id,
                 evidence_keys=(assignment.evidence_key,), evidence_artifacts=(assignment.artifact,),
@@ -547,6 +588,7 @@ def _check_background_flow_residuals(*, hypothesis, video, resolver, config):
         flow_payload = _read_npz(resolver.path(assignment.artifact))
         depth_payload = _read_npz(resolver.path(depth_link))
         flow = np.asarray(flow_payload.get("flow"))
+        fb_error = np.asarray(flow_payload.get("fb_error"))
         flow_valid = np.asarray(flow_payload.get("domain_valid"), dtype=bool)
         if "consistency_valid" in flow_payload:
             flow_valid &= np.asarray(flow_payload["consistency_valid"], dtype=bool)
@@ -628,6 +670,20 @@ def _check_background_flow_residuals(*, hypothesis, video, resolver, config):
             observed = flow[yy[in_front], xx[in_front]].astype(np.float64)
             endpoint_errors = np.linalg.norm(predicted - observed, axis=1)
             raw = float(np.median(endpoint_errors))
+            predicted_summary = np.median(predicted, axis=0)
+            observed_summary = np.median(observed, axis=0)
+            selected_fb_error = (
+                fb_error[yy[in_front], xx[in_front]]
+                if fb_error.shape == shape
+                else np.empty(0)
+            )
+            uncertainty = _flow_uncertainty(
+                base_sigma=config.flow_sigma_px,
+                fb_error=selected_fb_error,
+            )
+            direction_error, magnitude_ratio = _flow_diagnostics(
+                predicted_summary, observed_summary
+            )
             rows.append(_residual(
                 hypothesis_id=hypothesis.hypothesis_id,
                 family=ResidualFamily.EGO_BACKGROUND,
@@ -640,11 +696,13 @@ def _check_background_flow_residuals(*, hypothesis, video, resolver, config):
                 metric_name="median_background_flow_endpoint_error",
                 metric_unit="pixel",
                 raw=raw,
-                normalized=raw / config.flow_sigma_px,
-                uncertainty=config.flow_sigma_px,
-                threshold=config.conflict_z_threshold * config.flow_sigma_px,
-                predicted=np.median(predicted, axis=0),
-                observed=np.median(observed, axis=0),
+                normalized=raw / uncertainty,
+                uncertainty=uncertainty,
+                threshold=config.conflict_z_threshold * uncertainty,
+                predicted=predicted_summary,
+                observed=observed_summary,
+                flow_direction_error_deg=direction_error,
+                flow_magnitude_ratio=magnitude_ratio,
                 reason="ego motion predicts rigid background flow checked against held-out RAFT flow",
                 config=config,
                 component_id=component.component_id,
@@ -654,6 +712,7 @@ def _check_background_flow_residuals(*, hypothesis, video, resolver, config):
                     "depth_is_support_not_independent_holdout_evidence",
                     "foreground_exclusion_uses_step3_masks",
                     "relative_depth_and_translation_share_nonmetric_scale",
+                    "displayed_vectors_are_spatial_medians_while_residual_is_median_endpoint_error",
                 ),
             ))
         if not matched_component:

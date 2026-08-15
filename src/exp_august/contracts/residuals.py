@@ -71,8 +71,8 @@ class Step6InputSnapshot(ContractModel):
 class Step6ConfigSnapshot(ContractModel):
     schema_name: Literal["step6_config"] = "step6_config"
     schema_version: Literal[1] = 1
-    implementation_version: Literal["step06_predict_verify_v1"] = (
-        "step06_predict_verify_v1"
+    implementation_version: Literal["step06_predict_verify_v2"] = (
+        "step06_predict_verify_v2"
     )
 
     maximum_hypotheses: Annotated[int, Field(gt=0, le=64)]
@@ -120,6 +120,8 @@ class ResidualRecord(ContractModel):
     normalized_residual: NonNegativeFloat | None = None
     uncertainty: NonNegativeFloat | None = None
     threshold: NonNegativeFloat | None = None
+    flow_direction_error_deg: NonNegativeFloat | None = None
+    flow_magnitude_ratio: NonNegativeFloat | None = None
     severity: ResidualSeverity
     evaluable: bool
     hard_constraint: bool
@@ -144,6 +146,11 @@ class ResidualRecord(ContractModel):
             raise ValueError("evaluable residuals require complete numerical fields")
         if not self.evaluable and any(value is not None for value in numerical):
             raise ValueError("non-evaluable residuals cannot carry numerical claims")
+        flow_diagnostics = (self.flow_direction_error_deg, self.flow_magnitude_ratio)
+        if not self.evaluable and any(value is not None for value in flow_diagnostics):
+            raise ValueError("non-evaluable residuals cannot carry flow diagnostics")
+        if self.flow_direction_error_deg is not None and self.flow_direction_error_deg > 180.0:
+            raise ValueError("flow direction error must be within [0, 180] degrees")
         if self.evaluation_basis == EvaluationBasis.CHECK_EVIDENCE:
             if self.evidence_role != EvidenceRole.CHECK_ONLY:
                 raise ValueError("check-evidence residuals require check_only role")

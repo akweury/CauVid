@@ -332,7 +332,13 @@ The implemented baseline checks:
   held-out backward RAFT flow;
 - object temporal gaps, metric speed/acceleration bounds when metric scale is
   available, relative acceleration diagnostics otherwise, and a soft
-  semantic-static prior.
+semantic-static prior.
+
+Flow verification retains endpoint error as the primary residual, augments the
+configured pixel uncertainty with the median RAFT forward/backward consistency
+error, and records direction error plus a symmetric magnitude ratio. This
+separates direction conflicts from motion-scale conflicts without normalizing
+the two vectors independently.
 
 Missing poses, masks, depth, or temporal support produce `not_evaluable`
 records, not zero residuals or violations. Every evaluable held-out result
@@ -374,9 +380,17 @@ The comparison plot reports conflict counts and evidence coverage across the
 beam but is not a new ranking score. Each conflict panel displays the concrete
 video frame, selected track mask/box when applicable, predicted-versus-observed
 pixel or flow marks, residual magnitude, evidence role, cue family, component,
-track, and whether the window is supported by held-out evidence. By default at
+track, and whether the window is supported by held-out evidence. Flow arrows
+use one shared display scale, with predicted motion in the same red
+used by the right-hand `Predicted` label and RAFT evidence in the same blue used
+by `Observed`. Flow panels also state direction error, magnitude ratio, and the
+resulting conflict type. Background arrows are explicitly identified as
+spatial-median summaries because their residual remains the more robust median
+of per-point endpoint errors. By default at
 most eight conflict panels are rendered per hypothesis; change this with
-`--step6-maximum-conflict-panels`.
+`--step6-maximum-conflict-panels`. Every individual conflict panel is rendered
+at 1920x1080. The 2x2 conflict overview preserves each panel at that resolution
+and is therefore rendered at 3840x2160 rather than downsampling its subfigures.
 
 On the remote server:
 

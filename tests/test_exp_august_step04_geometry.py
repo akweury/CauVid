@@ -433,15 +433,19 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                     (step6_visual_root / packet_row["conflict_audit"]).is_file()
                 )
                 if packet_row["conflict_overview"] is not None:
-                    self.assertTrue(
-                        (step6_visual_root / packet_row["conflict_overview"]).is_file()
-                    )
+                    overview_path = step6_visual_root / packet_row["conflict_overview"]
+                    self.assertTrue(overview_path.is_file())
+                    overview_image = cv2.imread(str(overview_path))
+                    self.assertEqual(overview_image.shape[:2], (2160, 3840))
                 self.assertTrue(
                     all(
                         (step6_visual_root / path).is_file()
                         for path in packet_row["conflict_panels"]
                     )
                 )
+                for path in packet_row["conflict_panels"]:
+                    panel_image = cv2.imread(str(step6_visual_root / path))
+                    self.assertEqual(panel_image.shape[:2], (1080, 1920))
 
     def test_step4_rejects_tampered_tracking_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:
