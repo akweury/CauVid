@@ -30,6 +30,7 @@ from src.exp_august.contracts import (
     VideoTrackingManifest,
 )
 from src.exp_august.contracts.codec import read_contract, sha256_file
+from src.exp_august.inference.artifact_io import read_image_artifact
 from src.exp_august.inference.frames import CanonicalFrameProvider
 
 
@@ -85,7 +86,7 @@ class _ArtifactReader:
         return path
 
     def mask(self, link, shape: tuple[int, int]) -> np.ndarray:
-        image = cv2.imread(str(self.path(link)), cv2.IMREAD_GRAYSCALE)
+        image = read_image_artifact(self.path(link), cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise RuntimeError(f"could not decode mask artifact: {self.path(link)}")
         if image.shape != shape:

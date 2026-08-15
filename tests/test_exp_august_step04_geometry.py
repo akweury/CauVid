@@ -13,6 +13,9 @@ from src.exp_august.contracts import (
     DetectionTier,
     GeometryStore,
     Observability,
+    ResidualStore,
+    ResidualFamily,
+    EvaluationBasis,
     VideoWorldStateManifest,
     VideoGeometryManifest,
     WorldStateStore,
@@ -31,6 +34,8 @@ from src.exp_august.inference.step04_visualization import (
 )
 from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
 from src.exp_august.inference.step05_visualization import render_step5_visualizations
+from src.exp_august.inference.step06_predict_verify import run_step6
+from src.exp_august.inference.step06_visualization import render_step6_visualizations
 
 
 class _Objects:
@@ -368,9 +373,74 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                 "step5_visualization_manifest",
             )
             step5_row = step5_visualization["videos"][0]
-            for key in ("world_3d", "motion_intervals", "summary"):
+            for key in ("world_3d", "summary"):
                 self.assertTrue(
                     (step5_visualization_path.parent / step5_row[key]).is_file()
+                )
+            self.assertTrue(step5_row["motion_intervals"])
+            self.assertTrue(
+                all(
+                    (step5_visualization_path.parent / path).is_file()
+                    for path in step5_row["motion_intervals"]
+                )
+            )
+
+            step6 = run_step6(world_state_store_path=step5.store_path)
+            restored_residual_store = read_contract(step6.store_path, ResidualStore)
+            self.assertEqual(restored_residual_store, step6.store)
+            residual_manifest = step6.video_manifests[0]
+            self.assertEqual(
+                len(residual_manifest.packets),
+                len(world_manifest.initial_beam.hypotheses),
+            )
+            self.assertTrue(residual_manifest.validation.overall_pass)
+            for packet in residual_manifest.packets:
+                self.assertFalse(packet.repair_applied)
+                self.assertFalse(packet.selection_applied)
+                self.assertEqual(
+                    tuple(row.family for row in packet.family_summaries),
+                    tuple(ResidualFamily),
+                )
+                self.assertTrue(packet.residuals)
+                self.assertTrue(
+                    all(
+                        row.evidence_role is not None and row.evidence_artifacts
+                        for row in packet.residuals
+                        if row.evaluation_basis == EvaluationBasis.CHECK_EVIDENCE
+                    )
+                )
+            step6_visualization_path = render_step6_visualizations(
+                residual_store_path=step6.store_path,
+                maximum_hypotheses=2,
+            )
+            self.assertTrue(step6_visualization_path.is_file())
+            step6_visualization = json.loads(
+                step6_visualization_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                step6_visualization["schema_name"],
+                "step6_visualization_manifest",
+            )
+            self.assertFalse(step6_visualization["selection_applied"])
+            self.assertFalse(step6_visualization["repair_applied"])
+            step6_visual_root = step6_visualization_path.parent
+            step6_video_row = step6_visualization["videos"][0]
+            self.assertTrue(
+                (step6_visual_root / step6_video_row["hypothesis_comparison"]).is_file()
+            )
+            for packet_row in step6_video_row["packets"]:
+                self.assertTrue(
+                    (step6_visual_root / packet_row["conflict_audit"]).is_file()
+                )
+                if packet_row["conflict_overview"] is not None:
+                    self.assertTrue(
+                        (step6_visual_root / packet_row["conflict_overview"]).is_file()
+                    )
+                self.assertTrue(
+                    all(
+                        (step6_visual_root / path).is_file()
+                        for path in packet_row["conflict_panels"]
+                    )
                 )
 
     def test_step4_rejects_tampered_tracking_manifest(self):

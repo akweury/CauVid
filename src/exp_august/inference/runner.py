@@ -32,6 +32,8 @@ from src.exp_august.inference.step04_geometry_scale import run_step4
 from src.exp_august.inference.step04_visualization import render_step4_visualizations
 from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
 from src.exp_august.inference.step05_visualization import render_step5_visualizations
+from src.exp_august.inference.step06_predict_verify import run_step6
+from src.exp_august.inference.step06_visualization import render_step6_visualizations
 
 
 def _parse_args() -> argparse.Namespace:
@@ -62,7 +64,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=config.get_output_path("output") / "pipeline_august" / "world_state",
     )
-    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5), default=5)
+    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5, 6), default=6)
     parser.add_argument(
         "--objects-backend",
         choices=("yolo_world", "disabled"),
@@ -138,6 +140,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--world-moving-displacement-threshold", type=float, default=0.75)
     parser.add_argument("--visualize-step5", action="store_true")
     parser.add_argument("--step5-maximum-objects", type=int, default=12)
+    parser.add_argument("--verification-maximum-hypotheses", type=int, default=64)
+    parser.add_argument("--verification-projection-sigma-px", type=float, default=5.0)
+    parser.add_argument("--verification-depth-log-sigma", type=float, default=0.35)
+    parser.add_argument("--verification-flow-sigma-px", type=float, default=3.0)
+    parser.add_argument("--verification-conflict-z", type=float, default=3.0)
+    parser.add_argument("--verification-hard-z", type=float, default=6.0)
+    parser.add_argument("--visualize-step6", action="store_true")
+    parser.add_argument("--step6-maximum-hypotheses", type=int, default=5)
+    parser.add_argument("--step6-maximum-conflict-panels", type=int, default=8)
     return parser.parse_args()
 
 
@@ -292,6 +303,26 @@ def main() -> int:
             maximum_objects=args.step5_maximum_objects,
         )
         print(f"Step 5 visualizations: {visualization_manifest}")
+    if args.max_step == 5:
+        return 0
+    step6 = run_step6(
+        world_state_store_path=step5.store_path,
+        maximum_hypotheses=args.verification_maximum_hypotheses,
+        projection_sigma_px=args.verification_projection_sigma_px,
+        depth_log_sigma=args.verification_depth_log_sigma,
+        flow_sigma_px=args.verification_flow_sigma_px,
+        conflict_z_threshold=args.verification_conflict_z,
+        hard_z_threshold=args.verification_hard_z,
+    )
+    print(f"Step 6 completed: {len(step6.video_manifests)} video(s)")
+    print(f"Residual store: {step6.store_path}")
+    if args.visualize_step6:
+        visualization_manifest = render_step6_visualizations(
+            residual_store_path=step6.store_path,
+            maximum_hypotheses=args.step6_maximum_hypotheses,
+            maximum_conflict_panels=args.step6_maximum_conflict_panels,
+        )
+        print(f"Step 6 visualizations: {visualization_manifest}")
     return 0
 
 

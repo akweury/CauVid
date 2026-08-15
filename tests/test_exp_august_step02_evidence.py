@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -189,6 +190,51 @@ def _write_tiny_video(path: Path) -> None:
 
 
 class ExpAugustStep02EvidenceTests(unittest.TestCase):
+    def test_step3_mask_decoding_isolated_from_global_imread_patch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            video_dir = root / "dataset" / "videos"
+            video_dir.mkdir(parents=True)
+            _write_tiny_video(video_dir / "tiny.avi")
+            step1 = run_step1(
+                output_root=root / "output",
+                dataset_root=root / "dataset",
+                video_ids=["tiny"],
+                canonical_fps=3.0,
+                decode_validation_mode="sample",
+                decode_sample_count=3,
+            )
+            step2 = run_step2(
+                init_bundle_path=step1.bundle_path,
+                object_backend=_FakeObjectBackend(),
+                object_classes=["car"],
+                primary_confidence=0.3,
+                candidate_confidence=0.05,
+                nms_iou=0.7,
+                inference_size=640,
+                batch_size=2,
+                device="cpu",
+                mask_backend=_FakeMaskBackend(),
+            )
+
+            native_imread = cv2.imread
+
+            def channel_expanding_imread(filename, flags=cv2.IMREAD_COLOR):
+                image = native_imread(filename, flags)
+                if image is not None and image.ndim == 2:
+                    return image[:, :, None]
+                return image
+
+            with patch.object(cv2, "imread", side_effect=channel_expanding_imread):
+                step3 = run_step3(neural_evidence_store_path=step2.store_path)
+                visualization_manifest = render_step3_visualizations(
+                    tracking_store_path=step3.store_path,
+                    render_video=False,
+                )
+
+            self.assertTrue(step3.video_manifests[0].retention_report.overall_pass)
+            self.assertTrue(visualization_manifest.is_file())
+
     def test_provider_and_step2_preserve_canonical_timeline(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

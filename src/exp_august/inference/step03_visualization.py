@@ -19,6 +19,7 @@ from src.exp_august.contracts import (
     VideoTrackingManifest,
 )
 from src.exp_august.contracts.codec import read_contract, sha256_file
+from src.exp_august.inference.artifact_io import read_image_artifact
 from src.exp_august.inference.frames import CanonicalFrameProvider
 
 
@@ -40,8 +41,8 @@ def _read_mask(
         if link.owner == ArtifactOwner.STEP2_NEURAL_EVIDENCE
         else step3_root
     )
-    image = cv2.imread(
-        str(root / link.artifact.relative_path),
+    image = read_image_artifact(
+        root / link.artifact.relative_path,
         cv2.IMREAD_GRAYSCALE,
     )
     return None if image is None else image > 0

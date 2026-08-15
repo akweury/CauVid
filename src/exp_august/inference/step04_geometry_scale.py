@@ -51,6 +51,7 @@ from src.exp_august.contracts.codec import (
     sha256_file,
     write_contract,
 )
+from src.exp_august.inference.artifact_io import read_image_artifact
 
 
 @dataclass(frozen=True)
@@ -205,7 +206,7 @@ def _camera_matrix(intrinsics: CameraIntrinsicsHypothesis) -> np.ndarray:
 
 
 def _read_mask(path: Path, expected_shape: tuple[int, int]) -> np.ndarray:
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    image = read_image_artifact(path, cv2.IMREAD_GRAYSCALE)
     if image is None:
         raise RuntimeError(f"Step 4 could not decode mask: {path}")
     mask = image > 0

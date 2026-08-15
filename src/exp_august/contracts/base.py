@@ -104,6 +104,7 @@ class ArtifactOwner(str, Enum):
     STEP3_OBJECT_TRACKING = "step3_object_tracking"
     STEP4_GEOMETRY_SCALE = "step4_geometry_scale"
     STEP5_WORLD_RECONSTRUCTION = "step5_world_reconstruction"
+    STEP6_VERIFICATION = "step6_verification"
 
 
 class MotionState(str, Enum):
@@ -111,6 +112,29 @@ class MotionState(str, Enum):
     MOVING = "moving"
     AMBIGUOUS = "ambiguous"
     UNOBSERVABLE = "unobservable"
+
+
+class ResidualFamily(str, Enum):
+    OBSERVATION = "observation"
+    EGO_BACKGROUND = "ego_background"
+    OBJECT_IDENTITY = "object_identity"
+    PHYSICS = "physics"
+    SEMANTIC = "semantic"
+
+
+class EvaluationBasis(str, Enum):
+    FIT_EVIDENCE = "fit_evidence"
+    CHECK_EVIDENCE = "check_evidence"
+    SELF_CONSISTENCY = "self_consistency"
+    FROZEN_KNOWLEDGE = "frozen_knowledge"
+    NOT_EVALUABLE = "not_evaluable"
+
+
+class ResidualSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    VIOLATION = "violation"
+    HARD_VIOLATION = "hard_violation"
 
 
 class TrackState(str, Enum):

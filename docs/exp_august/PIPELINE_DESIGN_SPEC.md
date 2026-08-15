@@ -753,9 +753,19 @@ evidence supports a residual family, its result is tagged
 
 **Output:** `ResidualPacket` $\mathcal{R}_i$ per hypothesis.
 
-**Current repository:** partially overlaps with trajectory refinement and its
-validation logic, but there is no unified residual contract evaluated against
-each `WorldHypothesis` in a Top-K beam.
+**Current repository:** the target runner implements a typed baseline in
+`inference/step06_predict_verify.py`. Every `WorldHypothesis` receives a strict
+`HypothesisResidualPacket`; fit evidence, seeded check-only evidence,
+non-evaluable checks, conflict windows, hard/soft status and artifact lineage
+remain separate. Implemented forward checks include fitted centroid
+reprojection, held-out object depth, held-out backward object flow, rigid
+background flow from ego pose/depth, temporal gaps, speed/acceleration and a
+soft semantic-static prior. `step06_visualization.py` renders beam comparison,
+per-hypothesis residual timelines, family accounting, machine-readable conflict
+audits, and concrete keyframe panels with mask/box support and predicted-versus-
+observed image/flow marks, without choosing a winner. Dense mask
+rendering, explicit lifecycle-cause hypotheses, road-context physical limits,
+jerk/curvature/yaw and calibrated predictive uncertainty remain open.
 
 ---
 
@@ -1047,7 +1057,7 @@ particular YOLO/SAM/RAFT/depth backends.
 
 ## 6. Target design versus current runner
 
-The target runner now implements Steps 1-5 with their flowchart meanings. The
+The target runner now implements Steps 1-6 with their flowchart meanings. The
 legacy public runner still uses different concepts after Step 4, so always name
 the execution path and module as well as the step number.
 
@@ -1058,7 +1068,7 @@ the execution path and module as well as the step number.
 | 3 | Object Tracking | Target `inference/step03_object_tracking.py`; legacy public Step 3 remains | Typed replayable TrackingPackage implemented |
 | 4 | Relative Geometry + 3D Lift | Target `inference/step04_geometry_scale.py`; legacy public Step 4 remains | Typed relative geometry implemented; metric/ground alternatives remain partial |
 | 5 | Joint Ego/Object World Reconstruction | Target `inference/step05_joint_world_reconstruction.py`; legacy public Step 5 remains | Typed component-local reconstruction and initial beam implemented; full branching/factor graph remain partial |
-| 6 | Predict + Verify | Public Step 6 `trajectory_refinement` | Partial overlap; no forward renderer or fit/check split |
+| 6 | Predict + Verify | Target `inference/step06_predict_verify.py`; legacy public Step 6 remains | Typed residual packets, frozen fit/check separation and baseline forward checks implemented; dense mask/lifecycle/context models remain partial |
 | 7 | Diagnose + Propose | Public Step 7 is `relative_motion_representation` | Mismatch |
 | 8 | Local Re-estimation | Internal portions of current Step 6 | Not explicit |
 | 9 | Select + Retain | No single corresponding module | Missing |
@@ -1108,8 +1118,10 @@ cue-use counters are zero.
 3. Extend the implemented Step 5 baseline with a factor graph/state-space
    estimator, track-relink/mask discrete branches, calibrated uncertainty and a
    duplicate-pruning rule.
-4. Implement the Step 6 forward models for mask, flow, depth and background,
-   plus a frozen `EvidenceUsePlan` policy with adequate check-only coverage.
+4. Extend the implemented Step 6 baseline with dense mask rendering, explicit
+   lifecycle-cause tests, calibrated predictive uncertainty and coverage-aware
+   check-only sampling. Flow/depth/background checks and the frozen
+   `EvidenceUsePlan` boundary are already executable.
 5. Define hard versus soft physical constraints by road context and uncertainty.
 6. Freeze the deterministic diagnosis taxonomy and complete repair allow-list;
    define an optional structured LLM/VLM schema only after the deterministic
@@ -1147,6 +1159,7 @@ cue-use counters are zero.
 | 2026-08-13 | Step 2 models run sequentially and canonical frames are decoded per pass. | Peak GPU residency is bounded without creating a permanent RGB/JPEG cache; the source hash and canonical timeline remain the common reference. |
 | 2026-08-13 | Target Step 3 uses deterministic multi-cue Hungarian association and publishes only after retention closure. | Every candidate pair and disposition is auditable; gap masks remain separate forward/backward/explicitly-unobservable alternatives, while semantic lifecycle causes remain deferred. |
 | 2026-08-14 | Target Step 5 emits the typed initial beam $\mathcal B_0$. | Supported pose edges form independent ego components; object observations are ego-motion compensated inside those components; relative units, uncertainty, unresolved evidence and the lack of Step 6 verification remain explicit. |
+| 2026-08-14 | Target Step 6 emits immutable residual packets for every Step 5 hypothesis. | Fitted reprojection, held-out depth/backward-flow checks, ego/background rendering, physics/semantic diagnostics and conflict localization are auditable; missing evidence is `not_evaluable`, while repair and selection remain outside Step 6. |
 
 ## 11. Maintenance procedure
 

@@ -16,6 +16,8 @@ from .step04_geometry_scale import Step4Result, run_step4
 from .step04_visualization import render_step4_visualizations
 from .step05_joint_world_reconstruction import Step5Result, run_step5
 from .step05_visualization import render_step5_visualizations
+from .step06_predict_verify import Step6Result, run_step6
+from .step06_visualization import render_step6_visualizations
 
 __all__ = [
     "DisabledObjectBackend",
@@ -30,6 +32,7 @@ __all__ = [
     "Step3Result",
     "Step4Result",
     "Step5Result",
+    "Step6Result",
     "VideoValidationError",
     "YoloWorldEvidenceBackend",
     "run_step1",
@@ -37,7 +40,9 @@ __all__ = [
     "run_step3",
     "run_step4",
     "run_step5",
+    "run_step6",
     "render_step3_visualizations",
     "render_step4_visualizations",
     "render_step5_visualizations",
+    "render_step6_visualizations",
 ]

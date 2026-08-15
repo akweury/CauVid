@@ -40,9 +40,9 @@ def _set_axis_geometry(axis, points: list[np.ndarray]) -> None:
         axis.set_zlim(lower[2] - padding[2], upper[2] + padding[2])
     else:
         spans = np.ones(3, dtype=np.float64)
-    lateral = max(float(spans[0]), 0.08 * float(spans[1]))
+    lateral = max(float(spans[0]), 0.50 * float(spans[1]))
     vertical = max(float(spans[2]), 0.06 * float(spans[1]))
-    forward = max(float(spans[1]), 2.5 * lateral, 4.0 * vertical)
+    forward = max(float(spans[1]), 2.0 * lateral, 4.0 * vertical)
     axis.set_box_aspect((lateral, forward, vertical))
 
 
@@ -121,27 +121,39 @@ def _plot_world(
     components = hypothesis.ego_components
     columns = min(3, max(1, len(components)))
     rows = max(1, math.ceil(len(components) / columns))
-    figure = plt.figure(figsize=(6.4 * columns, 5.0 * rows), dpi=150)
+    # Extra height per row accommodates per-subplot legends and title clearance.
+    figure = plt.figure(figsize=(6.4 * columns, 5.8 * rows), dpi=150)
     if components:
         for index, component in enumerate(components, start=1):
             axis = figure.add_subplot(rows, columns, index, projection="3d")
             _draw_component(axis, component, by_component[component.component_id], compact=True)
+            handles, labels = axis.get_legend_handles_labels()
+            if handles:
+                axis.legend(handles[:8], labels[:8], loc="upper left", fontsize=6,
+                            markerscale=0.8, handlelength=1.2, borderpad=0.4)
     else:
         axis = figure.add_subplot(111, projection="3d")
         axis.text2D(0.5, 0.5, "World reconstruction unobservable", transform=axis.transAxes, ha="center")
     figure.suptitle(
-        f"Initial world hypothesis rank {hypothesis.rank} | "
-        f"frame={hypothesis.world_frame_status} | unit={hypothesis.coordinate_unit.value}\n"
-        "Red: ego; objects are transformed after ego-motion compensation. Not Step 6 verified.",
-        fontsize=14, y=0.995,
+        f"Initial World Hypothesis — rank {hypothesis.rank} | "
+        f"frame status: {hypothesis.world_frame_status} | unit: {hypothesis.coordinate_unit.value}",
+        fontsize=13, y=0.99,
     )
-    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.04, top=0.90, wspace=0.05)
+    # bottom=0.06 reserves space for the caption line below the subplots.
+    figure.subplots_adjust(left=0.02, right=0.98, bottom=0.06, top=0.86, wspace=0.06, hspace=0.12)
+    figure.text(
+        0.5, 0.01,
+        "Red line: ego trajectory  |  objects ego-motion compensated  |  "
+        "markers: ■ static  ●  moving  ◆ ambiguous  ✕ unobservable  |  not Step 6 verified",
+        ha="center", va="bottom", fontsize=9, color="#444444",
+    )
     figure.savefig(overview_path)
     plt.close(figure)
 
     component_root.mkdir(parents=True, exist_ok=True)
     paths = []
-    for component in components:
+    total_components = len(components)
+    for comp_idx, component in enumerate(components, start=1):
         path = component_root / f"{component.component_id.replace(':', '_')}.png"
         detail = plt.figure(figsize=(12.8, 7.2), dpi=150)
         axis = detail.add_subplot(111, projection="3d")
@@ -149,8 +161,10 @@ def _plot_world(
         handles, labels = axis.get_legend_handles_labels()
         if handles:
             axis.legend(handles[:12], labels[:12], loc="upper left", fontsize=8)
+        total_frames = len(component.frame_indices)
         detail.suptitle(
-            f"Step 5 component-local ego/object reconstruction: {component.component_id}\n"
+            f"Step 5 component {comp_idx:03d}/{total_components:03d}: {component.component_id} | "
+            f"frames {component.frame_indices[0]}-{component.frame_indices[-1]} ({total_frames} total)\n"
             f"{hypothesis.coordinate_unit.value}; independent origin; uncertainty retained",
             fontsize=15, y=0.98,
         )
@@ -161,55 +175,171 @@ def _plot_world(
     return paths
 
 
-def _plot_motion(hypothesis, output_path: Path, maximum_objects: int) -> None:
-    figure, axes = plt.subplots(2, 1, figsize=(12.8, 7.2), dpi=150, sharex=False)
+def _plot_motion(hypothesis, output_root: Path, maximum_objects: int) -> list[Path]:
+    """Ego overview + one figure per object trajectory written into output_root."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    unit = hypothesis.coordinate_unit.value
+
+    # Pre-collect ego rows so they can be reused as a reference panel in each object figure.
+    ego_by_component: list[tuple] = []
     for component in hypothesis.ego_components:
         rows = [row for row in component.poses if row.speed is not None]
-        if not rows:
-            continue
-        times = np.asarray([row.timestamp_s for row in rows])
-        speeds = np.asarray([row.speed for row in rows])
-        lower = np.asarray([row.speed_interval[0] for row in rows])
-        upper = np.asarray([row.speed_interval[1] for row in rows])
-        axes[0].plot(times, speeds, linewidth=1.8, label=component.component_id)
-        axes[0].fill_between(times, lower, upper, alpha=0.18)
+        if rows:
+            ego_by_component.append((
+                component.component_id,
+                np.asarray([r.timestamp_s for r in rows]),
+                np.asarray([r.speed for r in rows]),
+                np.asarray([r.speed_interval[0] for r in rows]),
+                np.asarray([r.speed_interval[1] for r in rows]),
+            ))
+
+    # Ego-only overview figure.
+    ego_fig, ego_ax = plt.subplots(1, 1, figsize=(12.8, 4.2), dpi=150)
+    if ego_by_component:
+        for cid, times, speeds, lower, upper in ego_by_component:
+            ego_ax.plot(times, speeds, linewidth=1.8, label=cid)
+            ego_ax.fill_between(times, lower, upper, alpha=0.18)
+    else:
+        ego_ax.text(0.5, 0.5, "No ego speed data available",
+                    transform=ego_ax.transAxes, ha="center", va="center",
+                    fontsize=12, color="gray", style="italic")
+    ego_ax.set_title("Relative ego speed with propagated interval")
+    ego_ax.set_xlabel("Time (s)")
+    ego_ax.set_ylabel(f"Speed ({unit}/s)")
+    ego_ax.grid(alpha=0.25)
+    h, l = ego_ax.get_legend_handles_labels()
+    if h:
+        ego_ax.legend(h, l, fontsize=8)
+    ego_fig.suptitle(
+        "Step 5 initial motion estimates — intervals are not metric when unit=relative_unit",
+        fontsize=13,
+    )
+    ego_fig.tight_layout(rect=(0, 0, 1, 0.94))
+    ego_path = output_root / "ego_speed.png"
+    ego_fig.savefig(ego_path)
+    plt.close(ego_fig)
+    paths.append(ego_path)
+
+    # Combined overview: ego on top, all objects overlaid on bottom.
     trajectories = sorted(
         hypothesis.object_trajectories,
         key=lambda row: (-len(row.observations), row.trajectory_id),
     )[:maximum_objects]
+    total_objects = len(trajectories)
+
+    combined_fig, (comb_ego_ax, comb_obj_ax) = plt.subplots(2, 1, figsize=(12.8, 7.2), dpi=150, sharex=False)
+    if ego_by_component:
+        for cid, times, speeds, lower, upper in ego_by_component:
+            comb_ego_ax.plot(times, speeds, linewidth=1.8, label=cid)
+            comb_ego_ax.fill_between(times, lower, upper, alpha=0.18)
+    else:
+        comb_ego_ax.text(0.5, 0.5, "No ego speed data available",
+                         transform=comb_ego_ax.transAxes, ha="center", va="center",
+                         fontsize=11, color="gray", style="italic")
+    comb_ego_ax.set_title("Ego speed with propagated interval")
+    comb_ego_ax.set_xlabel("Time (s)")
+    comb_ego_ax.set_ylabel(f"Speed ({unit}/s)")
+    comb_ego_ax.grid(alpha=0.25)
+    h, l = comb_ego_ax.get_legend_handles_labels()
+    if h:
+        comb_ego_ax.legend(h, l, fontsize=8)
     for trajectory in trajectories:
-        rows = [row for row in trajectory.observations if row.speed is not None]
-        if not rows:
+        obj_rows = [row for row in trajectory.observations if row.speed is not None]
+        if not obj_rows:
             continue
-        times = np.asarray([row.timestamp_s for row in rows])
-        speeds = np.asarray([row.speed for row in rows])
-        lower = np.asarray([row.speed_interval[0] for row in rows])
-        upper = np.asarray([row.speed_interval[1] for row in rows])
+        obj_times = np.asarray([r.timestamp_s for r in obj_rows])
+        obj_speeds = np.asarray([r.speed for r in obj_rows])
+        obj_lower = np.asarray([r.speed_interval[0] for r in obj_rows])
+        obj_upper = np.asarray([r.speed_interval[1] for r in obj_rows])
         color = _color(trajectory.track_id)
         track_label = trajectory.track_id.rsplit(":", 1)[-1]
         label = (
-            f"{trajectory.class_name} ID {track_label} "
-            f"{trajectory.component_id.rsplit(':', 1)[-1]} "
-            f"{trajectory.motion_state.value}"
+            f"{trajectory.class_name} {track_label} "
+            f"[{trajectory.motion_state.value}]"
         )
-        axes[1].plot(times, speeds, color=color, linewidth=1.5, label=label)
-        axes[1].fill_between(times, lower, upper, color=color, alpha=0.14)
-    axes[0].set_title("Relative ego speed with propagated interval")
-    axes[1].set_title("Ego-compensated object speed with propagated interval")
-    for axis in axes:
-        axis.set_xlabel("Time (s)")
-        axis.set_ylabel(f"Speed ({hypothesis.coordinate_unit.value}/s)")
-        axis.grid(alpha=0.25)
-        handles, labels = axis.get_legend_handles_labels()
-        if handles:
-            axis.legend(handles[:12], labels[:12], fontsize=8, ncol=2)
-    figure.suptitle(
+        comb_obj_ax.plot(obj_times, obj_speeds, color=color, linewidth=1.5, label=label)
+        comb_obj_ax.fill_between(obj_times, obj_lower, obj_upper, color=color, alpha=0.12)
+    if not any(
+        any(row.speed is not None for row in t.observations) for t in trajectories
+    ):
+        comb_obj_ax.text(0.5, 0.5, "No object speed data available",
+                         transform=comb_obj_ax.transAxes, ha="center", va="center",
+                         fontsize=11, color="gray", style="italic")
+    comb_obj_ax.set_title(f"All object speeds ego-motion compensated (top {total_objects})")
+    comb_obj_ax.set_xlabel("Time (s)")
+    comb_obj_ax.set_ylabel(f"Speed ({unit}/s)")
+    comb_obj_ax.grid(alpha=0.25)
+    h, l = comb_obj_ax.get_legend_handles_labels()
+    if h:
+        comb_obj_ax.legend(h[:12], l[:12], fontsize=7, ncol=2)
+    combined_fig.suptitle(
         "Step 5 initial motion estimates — intervals are not metric when unit=relative_unit",
-        fontsize=14,
+        fontsize=13,
     )
-    figure.tight_layout(rect=(0, 0, 1, 0.95))
-    figure.savefig(output_path)
-    plt.close(figure)
+    combined_fig.tight_layout(rect=(0, 0, 1, 0.95))
+    combined_path = output_root / "all_objects_overview.png"
+    combined_fig.savefig(combined_path)
+    plt.close(combined_fig)
+    paths.append(combined_path)
+
+    # Per-object figures: ego reference on top, object speed on bottom.
+    total_objects = len(trajectories)
+    for obj_idx, trajectory in enumerate(trajectories, start=1):
+        obj_rows = [row for row in trajectory.observations if row.speed is not None]
+        if not obj_rows:
+            continue
+        obj_times = np.asarray([r.timestamp_s for r in obj_rows])
+        obj_speeds = np.asarray([r.speed for r in obj_rows])
+        obj_lower = np.asarray([r.speed_interval[0] for r in obj_rows])
+        obj_upper = np.asarray([r.speed_interval[1] for r in obj_rows])
+        color = _color(trajectory.track_id)
+        track_label = trajectory.track_id.rsplit(":", 1)[-1]
+        comp_label = trajectory.component_id.rsplit(":", 1)[-1]
+
+        figure, (ax_ego, ax_obj) = plt.subplots(2, 1, figsize=(12.8, 7.2), dpi=150, sharex=False)
+        if ego_by_component:
+            for cid, times, speeds, lower, upper in ego_by_component:
+                ax_ego.plot(times, speeds, linewidth=1.5, label=cid)
+                ax_ego.fill_between(times, lower, upper, alpha=0.15)
+        else:
+            ax_ego.text(0.5, 0.5, "No ego speed data available",
+                        transform=ax_ego.transAxes, ha="center", va="center",
+                        fontsize=11, color="gray", style="italic")
+        ax_ego.set_title("Ego speed (reference)")
+        ax_ego.set_xlabel("Time (s)")
+        ax_ego.set_ylabel(f"Speed ({unit}/s)")
+        ax_ego.grid(alpha=0.25)
+        h, l = ax_ego.get_legend_handles_labels()
+        if h:
+            ax_ego.legend(h, l, fontsize=8)
+
+        ax_obj.plot(obj_times, obj_speeds, color=color, linewidth=1.8,
+                    label=f"{trajectory.class_name} {trajectory.motion_state.value}")
+        ax_obj.fill_between(obj_times, obj_lower, obj_upper, color=color, alpha=0.18)
+        ax_obj.set_title(
+            f"Object speed — {trajectory.class_name} ID {track_label} | "
+            f"component {comp_label} | {trajectory.motion_state.value} | n={len(obj_rows)} obs"
+        )
+        ax_obj.set_xlabel("Time (s)")
+        ax_obj.set_ylabel(f"Speed ({unit}/s)")
+        ax_obj.grid(alpha=0.25)
+        ax_obj.legend(fontsize=8)
+
+        figure.suptitle(
+            f"Step 5 object {obj_idx:03d}/{total_objects:03d}: "
+            f"{trajectory.class_name} ID {track_label}\n"
+            "Intervals are not metric when unit=relative_unit",
+            fontsize=13,
+        )
+        figure.tight_layout(rect=(0, 0, 1, 0.93))
+        safe_id = track_label.replace("/", "_").replace("\\", "_")
+        obj_path = output_root / f"object_{obj_idx:03d}_{trajectory.class_name}_{safe_id}.png"
+        figure.savefig(obj_path)
+        plt.close(figure)
+        paths.append(obj_path)
+
+    return paths
 
 
 def render_step5_visualizations(
@@ -238,14 +368,13 @@ def render_step5_visualizations(
         video_root = visualization_root / video_id
         video_root.mkdir(parents=True, exist_ok=True)
         world_path = video_root / "initial_world_hypothesis_3d.png"
-        motion_path = video_root / "initial_motion_intervals.png"
         component_paths = _plot_world(
             hypothesis,
             world_path,
             video_root / "components",
             maximum_objects,
         )
-        _plot_motion(hypothesis, motion_path, maximum_objects)
+        motion_paths = _plot_motion(hypothesis, video_root / "motion", maximum_objects)
         summary_path = video_root / "step5_summary.json"
         summary = {
             "schema_name": "step5_visualization_summary",
@@ -276,7 +405,9 @@ def render_step5_visualizations(
                 "video_id": video_id,
                 "visualized_hypothesis_id": hypothesis.hypothesis_id,
                 "world_3d": world_path.relative_to(visualization_root).as_posix(),
-                "motion_intervals": motion_path.relative_to(visualization_root).as_posix(),
+                "motion_intervals": [
+                    p.relative_to(visualization_root).as_posix() for p in motion_paths
+                ],
                 "component_world_3d": [
                     path.relative_to(visualization_root).as_posix() for path in component_paths
                 ],

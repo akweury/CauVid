@@ -59,7 +59,10 @@ from src.exp_august.contracts.codec import (
     sha256_file,
     write_contract,
 )
-from src.exp_august.inference.artifact_io import write_mask_artifact
+from src.exp_august.inference.artifact_io import (
+    read_image_artifact,
+    write_mask_artifact,
+)
 
 
 @dataclass(frozen=True)
@@ -175,8 +178,8 @@ def _mask_key(frame_index: int, proposal_id: str) -> str:
 def _load_mask(stage_root: Path, mask: MaskObservation | None) -> np.ndarray | None:
     if mask is None:
         return None
-    image = cv2.imread(
-        str(stage_root / mask.mask_ref.relative_path),
+    image = read_image_artifact(
+        stage_root / mask.mask_ref.relative_path,
         cv2.IMREAD_GRAYSCALE,
     )
     if image is None:
@@ -557,9 +560,14 @@ def _verify_input_artifacts(
             continue
         if reference.shape:
             try:
+                expected_shape = tuple(int(value) for value in reference.shape)
                 if reference.media_type == "image/png":
-                    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-                    actual_shape = None if image is None else tuple(image.shape)
+                    image = read_image_artifact(path, cv2.IMREAD_UNCHANGED)
+                    actual_shape = (
+                        None
+                        if image is None
+                        else tuple(int(value) for value in image.shape)
+                    )
                 elif path.suffix.lower() == ".npz":
                     with np.load(path, allow_pickle=False) as payload:
                         primary = (
@@ -567,10 +575,14 @@ def _verify_input_artifacts(
                             if "flow" in payload
                             else payload["depth"] if "depth" in payload else None
                         )
-                    actual_shape = None if primary is None else tuple(primary.shape)
+                    actual_shape = (
+                        None
+                        if primary is None
+                        else tuple(int(value) for value in primary.shape)
+                    )
                 else:
-                    actual_shape = reference.shape
-                if actual_shape != reference.shape:
+                    actual_shape = expected_shape
+                if actual_shape != expected_shape:
                     shape_mismatch.append(reference.artifact_id)
                     continue
             except (OSError, ValueError, KeyError):

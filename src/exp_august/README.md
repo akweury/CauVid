@@ -304,14 +304,84 @@ the combinatorial product merely to fill the beam.
 Step 5 visualization shows the best initial hypothesis, not verified truth.
 The component-local 3D plots contain the ego path and ego-compensated object
 paths; motion plots show speed intervals. All summaries declare
-`step6_verified: false`. Step 6 will be responsible for rendering each
-hypothesis back into mask/flow/depth/background evidence and deciding whether
-these initial explanations survive.
+`step6_verified: false`. Step 6 evaluates every beam member independently; it
+does not retroactively turn the Step 5 rank-1 construction into verified truth.
 
 For the remote Docker launcher:
 
 ```bash
 ./d4.sh run --gpu 0 --step 5 --data 1 --seed 1 \
+  --canonical-fps 5 --diagnostics
+```
+
+## Target Step 6: Forward Prediction and Consistency Verification
+
+Step 6 consumes the immutable Step 5 beam and the archived Step 2-4 evidence.
+It forward-projects every available hypothesis, evaluates five separately
+auditable residual families, and emits one `HypothesisResidualPacket` per beam
+member. The stage never edits a trajectory and never selects a winner.
+
+The implemented baseline checks:
+
+- fitted object-centroid reprojection, explicitly labeled as fit/self-
+  consistency rather than independent validation;
+- seeded held-out object depth where interpolation and a pose make it
+  observable;
+- held-out backward RAFT flow for object trajectories;
+- rigid-background flow predicted from ego pose and depth, checked against
+  held-out backward RAFT flow;
+- object temporal gaps, metric speed/acceleration bounds when metric scale is
+  available, relative acceleration diagnostics otherwise, and a soft
+  semantic-static prior.
+
+Missing poses, masks, depth, or temporal support produce `not_evaluable`
+records, not zero residuals or violations. Every evaluable held-out result
+retains its evidence key and content-addressed artifact reference. Current
+limitations are also explicit: dense mask rendering, lifecycle-cause testing,
+road-context-conditioned physical limits, jerk/curvature/yaw checks, and
+calibrated predictive uncertainty remain to be implemented.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 6 \
+  --canonical-fps 5 \
+  --objects-backend yolo_world \
+  --masks-backend sam2 \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --world-top-k 5 \
+  --visualize-step6 \
+  --device cuda:0
+```
+
+Step 6 adds:
+
+```text
+<output-root>/<run-id>/06_predict_verify/input_<world-hash>/config_<hash>/
+  residual_store.json
+  videos/<video-id>.residuals.json
+  visualizations/step6_visualization_manifest.json
+  visualizations/<video-id>/hypothesis_comparison.png
+  visualizations/<video-id>/rank_<rank>_residual_timeline.png
+  visualizations/<video-id>/rank_<rank>_family_summary.png
+  visualizations/<video-id>/rank_<rank>_conflict_overview.png
+  visualizations/<video-id>/rank_<rank>_conflicts.json
+  visualizations/<video-id>/rank_<rank>_conflicts/*.png
+```
+
+The comparison plot reports conflict counts and evidence coverage across the
+beam but is not a new ranking score. Each conflict panel displays the concrete
+video frame, selected track mask/box when applicable, predicted-versus-observed
+pixel or flow marks, residual magnitude, evidence role, cue family, component,
+track, and whether the window is supported by held-out evidence. By default at
+most eight conflict panels are rendered per hypothesis; change this with
+`--step6-maximum-conflict-panels`.
+
+On the remote server:
+
+```bash
+./d4.sh run --gpu 0 --step 6 --data 1 --seed 1 \
   --canonical-fps 5 --diagnostics
 ```
 

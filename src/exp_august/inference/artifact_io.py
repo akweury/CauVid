@@ -19,6 +19,27 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
     temporary.replace(path)
 
 
+def read_image_artifact(
+    path: Path,
+    flags: int = cv2.IMREAD_UNCHANGED,
+) -> np.ndarray | None:
+    """Decode an image without relying on process-global ``cv2.imread``.
+
+    Ultralytics replaces ``cv2.imread`` at import time and expands grayscale
+    images from ``(height, width)`` to ``(height, width, 1)``. Dense evidence
+    contracts describe masks as two-dimensional arrays, so decode the bytes
+    directly through OpenCV instead of using that mutable entry point.
+    """
+
+    try:
+        encoded = np.frombuffer(path.read_bytes(), dtype=np.uint8)
+    except OSError:
+        return None
+    if encoded.size == 0:
+        return None
+    return cv2.imdecode(encoded, flags)
+
+
 def write_mask_artifact(
     *,
     stage_root: Path,
