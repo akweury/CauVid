@@ -34,6 +34,8 @@ from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
 from src.exp_august.inference.step05_visualization import render_step5_visualizations
 from src.exp_august.inference.step06_predict_verify import run_step6
 from src.exp_august.inference.step06_visualization import render_step6_visualizations
+from src.exp_august.inference.step07_diagnose_propose import run_step7
+from src.exp_august.inference.step07_visualization import render_step7_visualizations
 
 
 def _parse_args() -> argparse.Namespace:
@@ -64,7 +66,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=config.get_output_path("output") / "pipeline_august" / "world_state",
     )
-    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5, 6), default=6)
+    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5, 6, 7), default=7)
     parser.add_argument(
         "--objects-backend",
         choices=("yolo_world", "disabled"),
@@ -149,6 +151,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize-step6", action="store_true")
     parser.add_argument("--step6-maximum-hypotheses", type=int, default=5)
     parser.add_argument("--step6-maximum-conflict-panels", type=int, default=8)
+    parser.add_argument("--diagnosis-maximum-proposals", type=int, default=16)
+    parser.add_argument("--diagnosis-maximum-keyframes", type=int, default=8)
+    parser.add_argument("--diagnosis-context-frames", type=int, default=2)
+    parser.add_argument("--diagnosis-merge-gap-frames", type=int, default=1)
+    parser.add_argument("--diagnosis-maximum-discrete-candidates", type=int, default=8)
+    parser.add_argument("--repair-solver-iterations", type=int, default=100)
+    parser.add_argument("--repair-maximum-children", type=int, default=3)
+    parser.add_argument("--repair-wall-time-seconds", type=float, default=10.0)
+    parser.add_argument("--visualize-step7", action="store_true")
+    parser.add_argument("--step7-maximum-hypotheses", type=int, default=5)
+    parser.add_argument("--step7-maximum-proposal-panels", type=int, default=8)
     return parser.parse_args()
 
 
@@ -323,6 +336,28 @@ def main() -> int:
             maximum_conflict_panels=args.step6_maximum_conflict_panels,
         )
         print(f"Step 6 visualizations: {visualization_manifest}")
+    if args.max_step == 6:
+        return 0
+    step7 = run_step7(
+        residual_store_path=step6.store_path,
+        maximum_proposals_per_hypothesis=args.diagnosis_maximum_proposals,
+        maximum_keyframes_per_evidence_packet=args.diagnosis_maximum_keyframes,
+        conflict_context_frames=args.diagnosis_context_frames,
+        cross_family_merge_gap_frames=args.diagnosis_merge_gap_frames,
+        maximum_discrete_candidates=args.diagnosis_maximum_discrete_candidates,
+        default_solver_iterations=args.repair_solver_iterations,
+        default_maximum_child_hypotheses=args.repair_maximum_children,
+        default_wall_time_seconds=args.repair_wall_time_seconds,
+    )
+    print(f"Step 7 completed: {len(step7.video_manifests)} video(s)")
+    print(f"Repair-proposal store: {step7.store_path}")
+    if args.visualize_step7:
+        visualization_manifest = render_step7_visualizations(
+            repair_proposal_store_path=step7.store_path,
+            maximum_hypotheses=args.step7_maximum_hypotheses,
+            maximum_proposal_panels=args.step7_maximum_proposal_panels,
+        )
+        print(f"Step 7 visualizations: {visualization_manifest}")
     return 0
 
 

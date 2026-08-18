@@ -1,4 +1,17 @@
-"""Independent runner for the Paper-1 ``exp_august`` pipeline."""
+"""ARCHIVED legacy linear baseline for ``exp_august``.
+
+This module is retained only for reproducibility of the original 11-step
+linear experiment.  It is not the current August inference pipeline and must
+not be used to interpret the target Step 5/6/7 semantics.
+
+Current entry point::
+
+    python -m src.exp_august.inference.runner
+
+New development belongs under :mod:`src.exp_august.inference`.  Keep this
+archived implementation frozen except for compatibility or reproducibility
+fixes.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +46,12 @@ PIPELINE_STEPS = (
     "segment_motion_abstraction",
     "important_object_selection",
     "symbolic_scene_representation",
+)
+
+LEGACY_ARCHIVE_NOTICE = (
+    "[exp_august archive] src.exp_august.pipeline is the frozen legacy "
+    "11-step linear baseline; use `python -m src.exp_august.inference.runner` "
+    "for the current pipeline."
 )
 
 STEP_FUNCTION_NAMES = (
@@ -229,7 +248,7 @@ def run_pipeline(
     mask_tracking_strict: bool | None = None,
     tracker=None,
 ):
-    """Run August through ``max_step``; Step 11 is the hard final boundary."""
+    """Run the archived baseline through ``max_step`` for reproducibility."""
     max_step = int(max_step)
     if not 1 <= max_step <= len(PIPELINE_STEPS):
         raise ValueError("max_step must be between 1 and 11")
@@ -330,7 +349,12 @@ def main(**kwargs):
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Run the exp_august Paper-1 pipeline")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the ARCHIVED exp_august 11-step linear baseline. "
+            "The current pipeline is src.exp_august.inference.runner."
+        )
+    )
     parser.add_argument("--video-ids", nargs="*", default=None)
     parser.add_argument("--video-count", type=int, default=None)
     parser.add_argument("--seed", type=int, default=modules.DEFAULT_DATA_SELECTION_SEED)
@@ -362,6 +386,7 @@ def _parse_args():
 
 
 if __name__ == "__main__":
+    print(LEGACY_ARCHIVE_NOTICE, file=sys.stderr, flush=True)
     args = _parse_args()
     result = main(
         video_ids=args.video_ids,

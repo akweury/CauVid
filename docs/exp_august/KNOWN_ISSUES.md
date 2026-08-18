@@ -1,5 +1,9 @@
 # exp_august 主要问题整理
 
+> **归档说明：** 本文的仓库审查对象是旧的
+> `src/exp_august/pipeline.py` 线性流水线，不代表当前
+> `src/exp_august/inference/runner.py` 的实现状态。旧流水线仅保留用于历史结果复现。
+
 本文档依据 `src/exp_august/pipeline.py` 的实际调用链整理，范围覆盖 `exp_august`、其复用的 `exp_july/perception` 实现，以及 `exp_driving_videos/modules` 中被 August 激活的下游模块。
 
 ## 总览

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Docker launcher for the Paper-1-only exp_august pipeline.  Its interface is
-# intentionally parallel to d2.sh, while its container and output paths are
-# isolated from exp_july.
+# ARCHIVED Docker launcher for the frozen Paper-1 exp_august linear baseline.
+# Use d4.sh for the current annotation-free target pipeline.  d3.sh remains
+# available only for reproducibility of historical results.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${CAUVID_IMAGE_NAME:-cauvid:latest}"
@@ -37,6 +37,8 @@ else
 fi
 
 usage() {
+  echo "ARCHIVED: d3.sh runs the frozen legacy baseline; use ./d4.sh for the current pipeline."
+  echo ""
   echo "Usage:"
   echo "  ./d3.sh run --gpu 0 --step 8 --evaluate --split test"
   echo "  ./d3.sh evaluate --split test    # evaluate existing predictions only"
@@ -284,6 +286,9 @@ main() {
   local evaluation_tolerances="1,3,5,10"
 
   [[ "$cmd" == --* && "$cmd" != "--help" ]] && cmd="run"
+  if [[ "$cmd" != "help" && "$cmd" != "-h" && "$cmd" != "--help" ]]; then
+    echo "[d3][archive] Running the frozen legacy baseline. Use ./d4.sh for the current pipeline." >&2
+  fi
   case "$cmd" in
     build)
       docker build -t "$IMAGE_NAME" "$ROOT_DIR"

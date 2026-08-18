@@ -1,10 +1,12 @@
 # exp_august
 
-There are currently two explicit execution paths:
+There are two explicit execution paths, but only one is current:
 
-- `src.exp_august.pipeline` is the frozen legacy linear baseline.
 - `src.exp_august.inference.runner` is the target annotation-free world-state
-  pipeline. Its implemented boundaries currently cover Steps 1-5.
+  pipeline. Its implemented boundaries currently cover Steps 1-7.
+- `src.exp_august.pipeline` is an **archived, frozen legacy linear baseline**
+  retained only for reproducibility. Its step numbers do not describe the
+  current pipeline. Do not add new pipeline work to it.
 
 ## Target Step 1: Init
 
@@ -399,13 +401,81 @@ On the remote server:
   --canonical-fps 5 --diagnostics
 ```
 
-## Legacy linear baseline
+## Target Step 7: Diagnose + Propose
+
+Step 7 reads the immutable Step 6 residual packets, clusters temporally and
+structurally related conflict windows, selects deterministic failure categories,
+and emits only allow-listed bounded repair proposals. It does not change or
+rank any Step 5 hypothesis. Check-only evidence may support a diagnosis and
+future acceptance decision, but every persisted effect explicitly forbids using
+that evidence as a Step 8 optimization target.
+
+Implemented deterministic diagnoses cover identity/mask errors, isolated depth
+jumps, pose drift, scale ambiguity, dynamics mismatch, supported acute
+maneuvers, semantic-prior mismatch, occlusion/unobservability, and unresolved
+conflicts. An optional LLM/VLM diagnosis path is not enabled in this baseline.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 7 \
+  --canonical-fps 5 \
+  --objects-backend yolo_world \
+  --masks-backend sam2 \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --world-top-k 5 \
+  --device cuda:0 \
+  --visualize-step7
+```
+
+Step 7 adds:
+
+```text
+<output-root>/<run-id>/07_diagnose_propose/input_<residual-hash>/config_<hash>/
+  repair_proposal_store.json
+  videos/<video-id>.repairs.json
+  visualizations/step7_visualization_manifest.json
+  visualizations/<video-id>/diagnosis_operator_summary.png
+  visualizations/<video-id>/rank_<rank>_diagnosis_timeline.png
+  visualizations/<video-id>/rank_<rank>_proposals.json
+  visualizations/<video-id>/rank_<rank>_proposals/*.png
+  visualizations/<video-id>/rank_<rank>_proposal_overview.png
+```
+
+Each video manifest contains an `EvidencePacket`, keyframe/source-frame
+mappings, structured diagnoses, affected variables and windows, parameter
+bounds, expected fit/check residual effects, compute budgets, deferred
+conflicts, and explicit no-mutation/no-selection flags.
+
+With `--visualize-step7`, the runner also writes hypothesis-level diagnosis and
+operator accounting, a temporal proposal view, a machine-readable proposal
+audit, and evidence-grounded 1920x1080 proposal panels. Each panel shows the
+source-mapped keyframe, selected mask/box support when available,
+predicted-versus-observed geometry, diagnosis confidence, the allow-listed
+operator, affected variables, parameter bounds and the immutable-state safety
+boundary. A 2x2 overview is emitted at 3840x2160 without downsampling its
+subfigures. Limit the rendered beam and panel count with
+`--step7-maximum-hypotheses` and `--step7-maximum-proposal-panels`.
+
+On the remote server:
+
+```bash
+./d4.sh run --gpu 0 --step 7 --data 1 --seed 1 \
+  --canonical-fps 5 --diagnostics
+```
+
+## Archived legacy linear baseline
+
+> **Archive notice:** Everything in this section describes the historical
+> linear baseline. For current Step 1-7 behavior, use the target sections above
+> and `src.exp_august.inference.runner` (or `d4.sh`).
 
 The legacy `exp_august` path is:
 
 `Raw Video -> Object Tracks -> 3D Trajectories -> Trajectory Refinement -> Ego/Object Motion -> Temporal Segmentation -> Symbolic Representation`
 
-Run the legacy baseline independently with:
+Reproduce the archived baseline, when explicitly needed, with:
 
 ```bash
 python -m src.exp_august.pipeline --video-count 1 --max-step 11
@@ -443,11 +513,12 @@ The VS Code debug configuration selects `auto` and looks for
 per-frame fields include `mask_paths`, `mask_sources`, `association_scores`,
 `tracking_confidences`, `visibility_states`, and `association_evidence`.
 
-## Docker usage (`d3.sh`)
+## Archived Docker usage (`d3.sh`)
 
-Run these commands from the repository root. `d3.sh` uses the same command
-style as the July `d2.sh` launcher, but runs only `exp_august` and writes to a
-separate August output directory.
+`d3.sh` is also archived and exists only to reproduce the legacy baseline.
+Use `d4.sh` for current August inference. If historical reproduction is
+explicitly required, run these commands from the repository root; `d3.sh`
+writes to a separate legacy August output directory.
 
 Standard runs are isolated by scale and seed:
 

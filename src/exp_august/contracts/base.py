@@ -105,6 +105,7 @@ class ArtifactOwner(str, Enum):
     STEP4_GEOMETRY_SCALE = "step4_geometry_scale"
     STEP5_WORLD_RECONSTRUCTION = "step5_world_reconstruction"
     STEP6_VERIFICATION = "step6_verification"
+    STEP7_DIAGNOSIS = "step7_diagnosis"
 
 
 class MotionState(str, Enum):
@@ -135,6 +136,40 @@ class ResidualSeverity(str, Enum):
     WARNING = "warning"
     VIOLATION = "violation"
     HARD_VIOLATION = "hard_violation"
+
+
+class FailureCategory(str, Enum):
+    IDENTITY_ERROR = "identity_error"
+    MASK_ERROR = "mask_error"
+    DEPTH_JUMP = "depth_jump"
+    POSE_DRIFT = "pose_drift"
+    SCALE_AMBIGUITY = "scale_ambiguity"
+    INVALID_STATIC_BACKGROUND_ASSUMPTION = "invalid_static_background_assumption"
+    DYNAMICS_MISMATCH = "dynamics_mismatch"
+    TRUE_ACUTE_MANEUVER = "true_acute_maneuver"
+    UNOBSERVABLE_EVIDENCE = "unobservable_evidence"
+    SEMANTIC_PRIOR_MISMATCH = "semantic_prior_mismatch"
+    UNRESOLVED_CONFLICT = "unresolved_conflict"
+
+
+class RepairOperator(str, Enum):
+    RELINK_TRACK = "relink_track"
+    SPLIT_TRACK = "split_track"
+    SWITCH_MASK_CANDIDATE = "switch_mask_candidate"
+    SWITCH_POSE_CANDIDATE = "switch_pose_candidate"
+    SWITCH_SCALE_CANDIDATE = "switch_scale_candidate"
+    INVALIDATE_OR_DOWNWEIGHT_CUE = "invalidate_or_downweight_cue"
+    REFIT_LOCAL_DYNAMICS = "refit_local_dynamics"
+    ADJUST_PROCESS_NOISE = "adjust_process_noise"
+    MARK_OCCLUDED = "mark_occluded"
+    MARK_UNOBSERVABLE = "mark_unobservable"
+    LEAVE_UNRESOLVED = "leave_unresolved"
+
+
+class ExpectedEffectDirection(str, Enum):
+    DECREASE = "decrease"
+    NON_DEGRADATION = "non_degradation"
+    UNKNOWN = "unknown"
 
 
 class TrackState(str, Enum):

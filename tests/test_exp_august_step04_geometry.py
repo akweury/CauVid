@@ -14,9 +14,11 @@ from src.exp_august.contracts import (
     GeometryStore,
     Observability,
     ResidualStore,
+    RepairProposalStore,
     ResidualFamily,
     EvaluationBasis,
     VideoWorldStateManifest,
+    VideoRepairProposalManifest,
     VideoGeometryManifest,
     WorldStateStore,
 )
@@ -36,6 +38,8 @@ from src.exp_august.inference.step05_joint_world_reconstruction import run_step5
 from src.exp_august.inference.step05_visualization import render_step5_visualizations
 from src.exp_august.inference.step06_predict_verify import run_step6
 from src.exp_august.inference.step06_visualization import render_step6_visualizations
+from src.exp_august.inference.step07_diagnose_propose import run_step7
+from src.exp_august.inference.step07_visualization import render_step7_visualizations
 
 
 class _Objects:
@@ -446,6 +450,81 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                 for path in packet_row["conflict_panels"]:
                     panel_image = cv2.imread(str(step6_visual_root / path))
                     self.assertEqual(panel_image.shape[:2], (1080, 1920))
+
+            world_store_sha256_before_step7 = sha256_file(step5.store_path)
+            step7 = run_step7(residual_store_path=step6.store_path)
+            self.assertEqual(
+                sha256_file(step5.store_path), world_store_sha256_before_step7
+            )
+            restored_repair_store = read_contract(
+                step7.store_path, RepairProposalStore
+            )
+            self.assertEqual(restored_repair_store, step7.store)
+            repair_reference = restored_repair_store.video_repair_proposals[0]
+            repair_manifest_path = step7.stage_root / repair_reference.relative_path
+            repair_manifest = read_contract(
+                repair_manifest_path, VideoRepairProposalManifest
+            )
+            self.assertEqual(repair_manifest.video_id, "tiny")
+            self.assertTrue(repair_manifest.validation.overall_pass)
+            self.assertEqual(
+                len(repair_manifest.packets), len(residual_manifest.packets)
+            )
+            self.assertTrue(
+                all(not row.world_state_mutated for row in repair_manifest.packets)
+            )
+            self.assertTrue(
+                all(
+                    not effect.optimized_by_step8
+                    for packet in repair_manifest.packets
+                    for proposal in packet.proposals
+                    for effect in proposal.expected_residual_effects
+                    if effect.evaluation_basis
+                    in {
+                        EvaluationBasis.CHECK_EVIDENCE,
+                        EvaluationBasis.NOT_EVALUABLE,
+                    }
+                )
+            )
+            step7_visualization_path = render_step7_visualizations(
+                repair_proposal_store_path=step7.store_path,
+                maximum_hypotheses=2,
+                maximum_proposal_panels=2,
+            )
+            self.assertTrue(step7_visualization_path.is_file())
+            step7_visualization = json.loads(
+                step7_visualization_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                step7_visualization["schema_name"],
+                "step7_visualization_manifest",
+            )
+            self.assertFalse(step7_visualization["world_state_mutated"])
+            self.assertFalse(step7_visualization["selection_applied"])
+            self.assertFalse(step7_visualization["check_evidence_optimized"])
+            step7_visual_root = step7_visualization_path.parent
+            step7_video_row = step7_visualization["videos"][0]
+            self.assertTrue(
+                (
+                    step7_visual_root
+                    / step7_video_row["diagnosis_operator_summary"]
+                ).is_file()
+            )
+            for packet_row in step7_video_row["packets"]:
+                self.assertTrue(
+                    (step7_visual_root / packet_row["timeline"]).is_file()
+                )
+                self.assertTrue(
+                    (step7_visual_root / packet_row["proposal_audit"]).is_file()
+                )
+                for path in packet_row["proposal_panels"]:
+                    panel_image = cv2.imread(str(step7_visual_root / path))
+                    self.assertEqual(panel_image.shape[:2], (1080, 1920))
+                if packet_row["proposal_overview"] is not None:
+                    overview_image = cv2.imread(
+                        str(step7_visual_root / packet_row["proposal_overview"])
+                    )
+                    self.assertEqual(overview_image.shape[:2], (2160, 3840))
 
     def test_step4_rejects_tampered_tracking_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

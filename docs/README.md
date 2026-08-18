@@ -13,7 +13,8 @@ remain focused on executable entry points and standard project configuration.
 
 - [Living pipeline design specification](./exp_august/PIPELINE_DESIGN_SPEC.md)
 - [Closed-loop design and notation](./exp_august/EXP_AUGUST_CLOSED_LOOP_FLOWCHART.md)
-- [Known issues and repository review](./exp_august/KNOWN_ISSUES.md)
+- [Step 7 diagnosis and bounded-proposal diagram](./exp_august/STEP7_DIAGNOSE_PROPOSE.pdf)
+- [Archived legacy-pipeline review](./exp_august/KNOWN_ISSUES.md)
 - [Executable pipeline guide](../src/exp_august/README.md)
 
 ## Annotation
