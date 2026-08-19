@@ -111,6 +111,19 @@ from .repairs import (
     Step7ValidationSummary,
     VideoRepairProposalManifest,
 )
+from .local_reestimation import (
+    DiscreteStateChange,
+    HypothesisReestimationPacket,
+    LocalReestimationCandidate,
+    LocalReestimationStore,
+    NumericStateChange,
+    ObjectiveTerms,
+    ProposalReestimationResult,
+    Step8ConfigSnapshot,
+    Step8InputSnapshot,
+    Step8ValidationSummary,
+    VideoLocalReestimationManifest,
+)
 from .tracking import (
     ArtifactLink,
     AssociationCueValue,
@@ -256,4 +269,15 @@ __all__ = [
     "Step7InputSnapshot",
     "Step7ValidationSummary",
     "VideoRepairProposalManifest",
+    "DiscreteStateChange",
+    "HypothesisReestimationPacket",
+    "LocalReestimationCandidate",
+    "LocalReestimationStore",
+    "NumericStateChange",
+    "ObjectiveTerms",
+    "ProposalReestimationResult",
+    "Step8ConfigSnapshot",
+    "Step8InputSnapshot",
+    "Step8ValidationSummary",
+    "VideoLocalReestimationManifest",
 ]

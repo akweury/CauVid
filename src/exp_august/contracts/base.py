@@ -106,6 +106,7 @@ class ArtifactOwner(str, Enum):
     STEP5_WORLD_RECONSTRUCTION = "step5_world_reconstruction"
     STEP6_VERIFICATION = "step6_verification"
     STEP7_DIAGNOSIS = "step7_diagnosis"
+    STEP8_LOCAL_REESTIMATION = "step8_local_reestimation"
 
 
 class MotionState(str, Enum):

@@ -36,6 +36,8 @@ from src.exp_august.inference.step06_predict_verify import run_step6
 from src.exp_august.inference.step06_visualization import render_step6_visualizations
 from src.exp_august.inference.step07_diagnose_propose import run_step7
 from src.exp_august.inference.step07_visualization import render_step7_visualizations
+from src.exp_august.inference.step08_local_reestimation import run_step8
+from src.exp_august.inference.step08_visualization import render_step8_visualizations
 
 
 def _parse_args() -> argparse.Namespace:
@@ -66,7 +68,9 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=config.get_output_path("output") / "pipeline_august" / "world_state",
     )
-    parser.add_argument("--max-step", type=int, choices=(1, 2, 3, 4, 5, 6, 7), default=7)
+    parser.add_argument(
+        "--max-step", type=int, choices=(1, 2, 3, 4, 5, 6, 7, 8), default=8
+    )
     parser.add_argument(
         "--objects-backend",
         choices=("yolo_world", "disabled"),
@@ -162,6 +166,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--visualize-step7", action="store_true")
     parser.add_argument("--step7-maximum-hypotheses", type=int, default=5)
     parser.add_argument("--step7-maximum-proposal-panels", type=int, default=8)
+    parser.add_argument("--reestimation-maximum-candidates", type=int, default=3)
+    parser.add_argument("--reestimation-fit-weight", type=float, default=1.0)
+    parser.add_argument("--reestimation-physics-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--reestimation-minimum-position-std", type=float, default=1e-6
+    )
+    parser.add_argument("--visualize-step8", action="store_true")
+    parser.add_argument("--step8-maximum-hypotheses", type=int, default=5)
+    parser.add_argument("--step8-maximum-proposal-panels", type=int, default=8)
     return parser.parse_args()
 
 
@@ -358,6 +371,24 @@ def main() -> int:
             maximum_proposal_panels=args.step7_maximum_proposal_panels,
         )
         print(f"Step 7 visualizations: {visualization_manifest}")
+    if args.max_step == 7:
+        return 0
+    step8 = run_step8(
+        repair_proposal_store_path=step7.store_path,
+        maximum_candidates_per_proposal=args.reestimation_maximum_candidates,
+        fit_objective_weight=args.reestimation_fit_weight,
+        physics_objective_weight=args.reestimation_physics_weight,
+        minimum_position_std=args.reestimation_minimum_position_std,
+    )
+    print(f"Step 8 completed: {len(step8.video_manifests)} video(s)")
+    print(f"Local re-estimation store: {step8.store_path}")
+    if args.visualize_step8:
+        visualization_manifest = render_step8_visualizations(
+            local_reestimation_store_path=step8.store_path,
+            maximum_hypotheses=args.step8_maximum_hypotheses,
+            maximum_proposal_panels=args.step8_maximum_proposal_panels,
+        )
+        print(f"Step 8 visualizations: {visualization_manifest}")
     return 0
 
 

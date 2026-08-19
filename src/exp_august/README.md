@@ -450,12 +450,12 @@ conflicts, and explicit no-mutation/no-selection flags.
 
 With `--visualize-step7`, the runner also writes hypothesis-level diagnosis and
 operator accounting, a temporal proposal view, a machine-readable proposal
-audit, and evidence-grounded 1920x1080 proposal panels. Each panel shows the
+audit, and one evidence-grounded 1920x1320 panel per proposal. Each panel shows the
 source-mapped keyframe, selected mask/box support when available,
 predicted-versus-observed geometry, diagnosis confidence, the allow-listed
 operator, affected variables, parameter bounds and the immutable-state safety
-boundary. A 2x2 overview is emitted at 3840x2160 without downsampling its
-subfigures. Limit the rendered beam and panel count with
+boundary. Proposals are deliberately not combined into a contact-sheet overview.
+Limit the rendered beam and panel count with
 `--step7-maximum-hypotheses` and `--step7-maximum-proposal-panels`.
 
 On the remote server:
@@ -465,10 +465,76 @@ On the remote server:
   --canonical-fps 5 --diagnostics
 ```
 
+## Target Step 8: Local Re-estimation
+
+Step 8 consumes the immutable Step 7 proposal store and creates zero or more
+bounded child hypotheses per proposal. The baseline supports local dynamics
+refits, process-noise scaling, explicit occlusion/unobservability marking and
+`leave_unresolved`. It recomputes only fit/self-consistency and frozen-physics
+terms. Check-only residuals are persisted in the exclusion audit and are not
+read by the optimizer. Step 8 never chooses a winner; feasibility, acceptance
+and ranking belong to Step 9.
+
+```bash
+python -m src.exp_august.inference.runner \
+  --video-count 1 \
+  --max-step 8 \
+  --canonical-fps 5 \
+  --objects-backend yolo_world \
+  --masks-backend sam2 \
+  --flow-backend raft \
+  --depth-backend da3 \
+  --world-top-k 5 \
+  --device cuda:0 \
+  --reestimation-maximum-candidates 3 \
+  --visualize-step8
+```
+
+Step 8 adds:
+
+```text
+<output-root>/<run-id>/08_local_reestimation/input_<proposal-hash>/config_<hash>/
+  local_reestimation_store.json
+  videos/<video-id>.reestimation.json
+  visualizations/step8_visualization_manifest.json
+  visualizations/<video-id>/rank_<rank>_proposals/
+    proposal_<number>_frame_<frame>_<operator>.png
+```
+
+Each video manifest records the complete Step 3–7 lineage, one result per
+proposal, immutable parent IDs, child candidates, objective terms, optimized
+fit/physics residual IDs, excluded check-only residual IDs, reversible numeric
+or discrete diffs, and boundary/bounds/budget validation flags. Operators that
+need a mutable tracking or archived candidate-bank child representation are
+reported as `unsupported`; Step 8 does not fabricate an equivalent world-state
+change.
+
+The local-dynamics solver is quantitative: it fixes the proposal-window
+endpoints, linearly interpolates between them, evaluates deterministic candidate
+strengths, clips every interior position update to the proposal's declared
+standard-deviation bound, and recomputes interior velocity/speed. These are
+candidate states only; Step 9 will decide whether any should replace the parent.
+
+With `--visualize-step8`, every proposal is rendered to its own compact
+1920x1220 image; proposals are never combined into an overview. The upper row
+uses the same source frame twice, with the immutable parent in blue and one
+representative child state in green. Thick arrows show the state-space change,
+not fabricated pixel motion. The lower region plots every numeric child against
+the declared sigma bound, compares parent/child objective totals, and highlights
+changed-state counts, excluded check-only residuals and the absence of Step 8
+selection. Titles and highlights use normal case rather than all caps.
+
+On the remote server:
+
+```bash
+./d4.sh run --gpu 0 --step 8 --data 1 --seed 1 \
+  --canonical-fps 5 --diagnostics
+```
+
 ## Archived legacy linear baseline
 
 > **Archive notice:** Everything in this section describes the historical
-> linear baseline. For current Step 1-7 behavior, use the target sections above
+> linear baseline. For current Step 1-8 behavior, use the target sections above
 > and `src.exp_august.inference.runner` (or `d4.sh`).
 
 The legacy `exp_august` path is:

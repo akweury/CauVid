@@ -12,6 +12,7 @@ from src.exp_august.contracts import (
     DepthRepresentation,
     DetectionTier,
     GeometryStore,
+    LocalReestimationStore,
     Observability,
     ResidualStore,
     RepairProposalStore,
@@ -19,6 +20,7 @@ from src.exp_august.contracts import (
     EvaluationBasis,
     VideoWorldStateManifest,
     VideoRepairProposalManifest,
+    VideoLocalReestimationManifest,
     VideoGeometryManifest,
     WorldStateStore,
 )
@@ -40,6 +42,8 @@ from src.exp_august.inference.step06_predict_verify import run_step6
 from src.exp_august.inference.step06_visualization import render_step6_visualizations
 from src.exp_august.inference.step07_diagnose_propose import run_step7
 from src.exp_august.inference.step07_visualization import render_step7_visualizations
+from src.exp_august.inference.step08_local_reestimation import run_step8
+from src.exp_august.inference.step08_visualization import render_step8_visualizations
 
 
 class _Objects:
@@ -531,6 +535,105 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                     )
                 self.assertIsNone(packet_row["proposal_overview"])
                 self.assertEqual(packet_row["proposal_overview_resolution"], [0, 0])
+
+            world_store_sha256_before_step8 = sha256_file(step5.store_path)
+            world_manifest_sha256_before_step8 = sha256_file(world_manifest_path)
+            step8 = run_step8(
+                repair_proposal_store_path=step7.store_path,
+                maximum_candidates_per_proposal=2,
+            )
+            self.assertEqual(
+                sha256_file(step5.store_path), world_store_sha256_before_step8
+            )
+            self.assertEqual(
+                sha256_file(world_manifest_path), world_manifest_sha256_before_step8
+            )
+            restored_reestimation_store = read_contract(
+                step8.store_path, LocalReestimationStore
+            )
+            self.assertEqual(restored_reestimation_store, step8.store)
+            reestimation_reference = (
+                restored_reestimation_store.video_local_reestimations[0]
+            )
+            reestimation_manifest_path = (
+                step8.stage_root / reestimation_reference.relative_path
+            )
+            reestimation_manifest = read_contract(
+                reestimation_manifest_path, VideoLocalReestimationManifest
+            )
+            self.assertEqual(reestimation_manifest.video_id, "tiny")
+            self.assertTrue(reestimation_manifest.validation.overall_pass)
+            self.assertEqual(
+                reestimation_manifest.validation.check_evidence_optimization_violations,
+                0,
+            )
+            self.assertEqual(reestimation_manifest.validation.parent_mutation_count, 0)
+            self.assertEqual(reestimation_manifest.validation.selection_count, 0)
+            self.assertTrue(
+                all(not packet.parent_mutated for packet in reestimation_manifest.packets)
+            )
+            for packet in reestimation_manifest.packets:
+                for result in packet.proposal_results:
+                    for candidate in result.candidates:
+                        self.assertFalse(candidate.raw_evidence_mutated)
+                        self.assertFalse(candidate.selection_applied)
+                        self.assertTrue(
+                            set(candidate.optimized_residual_ids).isdisjoint(
+                                candidate.excluded_check_residual_ids
+                            )
+                        )
+                        if candidate.status == "instantiated":
+                            self.assertNotEqual(
+                                candidate.child_hypothesis.hypothesis_id,
+                                candidate.parent_hypothesis_id,
+                            )
+                            self.assertTrue(
+                                candidate.numerical_changes
+                                or candidate.discrete_changes
+                            )
+                            self.assertTrue(candidate.boundary_preserved)
+                            self.assertTrue(candidate.parameter_bounds_satisfied)
+                            self.assertTrue(candidate.compute_budget_honored)
+            step8_visualization_path = render_step8_visualizations(
+                local_reestimation_store_path=step8.store_path,
+                maximum_hypotheses=2,
+                maximum_proposal_panels=2,
+            )
+            self.assertTrue(step8_visualization_path.is_file())
+            step8_visualization = json.loads(
+                step8_visualization_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                step8_visualization["schema_name"],
+                "step8_visualization_manifest",
+            )
+            self.assertFalse(step8_visualization["parent_state_mutated"])
+            self.assertFalse(step8_visualization["raw_evidence_mutated"])
+            self.assertFalse(step8_visualization["selection_applied"])
+            self.assertFalse(step8_visualization["check_evidence_optimized"])
+            for packet_row in step8_visualization["videos"][0]["packets"]:
+                self.assertIsNone(packet_row["proposal_overview"])
+                self.assertEqual(packet_row["proposal_overview_resolution"], [0, 0])
+                self.assertEqual(
+                    packet_row["proposal_panel_resolution"], [1920, 1220]
+                )
+                for proposal_row in packet_row["proposals"]:
+                    panel_path = (
+                        step8_visualization_path.parent / proposal_row["panel"]
+                    )
+                    self.assertTrue(panel_path.is_file())
+                    panel = cv2.imread(str(panel_path))
+                    panel_width, panel_height = packet_row[
+                        "proposal_panel_resolution"
+                    ]
+                    self.assertEqual(panel.shape[:2], (panel_height, panel_width))
+            repair_manifest_path.write_bytes(
+                repair_manifest_path.read_bytes() + b" "
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "missing or truncated|integrity check"
+            ):
+                run_step8(repair_proposal_store_path=step7.store_path)
 
     def test_step4_rejects_tampered_tracking_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

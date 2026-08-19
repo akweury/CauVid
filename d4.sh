@@ -42,18 +42,18 @@ fi
 
 usage() {
   echo "Usage:"
-  echo "  ./d4.sh run --gpu 0 --step 7 --scale debug --seed 1 --diagnostics"
-  echo "  ./d4.sh                 # run the new pipeline through Step 7 with debug defaults"
+  echo "  ./d4.sh run --gpu 0 --step 8 --scale debug --seed 1 --diagnostics"
+  echo "  ./d4.sh                 # run the new pipeline through Step 8 with debug defaults"
   echo "  ./d4.sh build           # build the Docker image"
   echo "  ./d4.sh shell --gpu 0   # open an interactive container shell"
   echo ""
   echo "Run options (d3-compatible names):"
   echo "  --gpu ID                GPU device ID or 'all'"
-  echo "  --step N                Last target-pipeline step (1-7, default: 7)"
+  echo "  --step N                Last target-pipeline step (1-8, default: 8)"
   echo "  --scale NAME            debug=10, small=100, full=961 (default: debug)"
   echo "  --data N                Custom video count (alias: --video-count)"
   echo "  --seed N                Seed value or index 1, 2, 3 (default: 1)"
-  echo "  --diagnostics           Render Step 3 through Step 7 diagnostics"
+  echo "  --diagnostics           Render available Step 3 through Step 8 diagnostics"
   echo "  --render-candidate-filter-comparisons"
   echo "                           Compatibility alias enabling diagnostics"
   echo ""
@@ -195,6 +195,7 @@ verify_persisted_run_output() {
     5) expected_name="world_state_store.json" ;;
     6) expected_name="residual_store.json" ;;
     7) expected_name="repair_proposal_store.json" ;;
+    8) expected_name="local_reestimation_store.json" ;;
   esac
   artifact_path="$(find "$PIPELINE_OUTPUT" -type f -newer "$marker_path" -name "$expected_name" -print -quit 2>/dev/null)"
   if [[ -z "$artifact_path" ]]; then
@@ -211,6 +212,7 @@ verify_persisted_run_output() {
     [[ "$max_step" -ge 5 ]] && visualization_name="step5_visualization_manifest.json"
     [[ "$max_step" -ge 6 ]] && visualization_name="step6_visualization_manifest.json"
     [[ "$max_step" -ge 7 ]] && visualization_name="step7_visualization_manifest.json"
+    [[ "$max_step" -ge 8 ]] && visualization_name="step8_visualization_manifest.json"
     local visualization_path=""
     visualization_path="$(find "$PIPELINE_OUTPUT" -type f -newer "$marker_path" -name "$visualization_name" -print -quit 2>/dev/null)"
     if [[ -z "$visualization_path" ]]; then
@@ -318,7 +320,7 @@ run_container() {
     --world-top-k "$world_top_k"
   )
   if [[ "$diagnostics" == "1" ]]; then
-    runner_args+=(--visualize-step3 --visualize-step4 --visualize-step5 --visualize-step6 --visualize-step7)
+    runner_args+=(--visualize-step3 --visualize-step4 --visualize-step5 --visualize-step6 --visualize-step7 --visualize-step8)
   fi
   [[ "$allow_model_download" == "1" ]] && runner_args+=(--allow-model-download)
   [[ "$no_step3_video" == "1" ]] && runner_args+=(--no-step3-video)
@@ -409,7 +411,7 @@ main() {
   local data_scale="debug"
   local video_count="10"
   local custom_data="0"
-  local max_step="7"
+  local max_step="8"
   local diagnostics="0"
   local seed="1"
   local canonical_fps="0.2"
@@ -465,7 +467,7 @@ main() {
         echo "[d4][error] d4 will not invoke the legacy d3 evaluator." >&2
         exit 1
       fi
-      [[ "$max_step" =~ ^[1-7]$ ]] || { echo "[d4][error] --step must be 1, 2, 3, 4, 5, 6, or 7" >&2; exit 1; }
+      [[ "$max_step" =~ ^[1-8]$ ]] || { echo "[d4][error] --step must be 1, 2, 3, 4, 5, 6, 7, or 8" >&2; exit 1; }
       case "$data_scale" in
         debug) [[ "$custom_data" == "1" ]] || video_count="10" ;;
         small) [[ "$custom_data" == "1" ]] || video_count="100" ;;

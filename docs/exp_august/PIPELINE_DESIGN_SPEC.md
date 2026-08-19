@@ -848,9 +848,10 @@ a safe repair.
 
 **Current repository:** the versioned allow-list, typed bounds, expected
 residual effects and per-proposal budgets are connected to the canonical Step 7
-evidence and residual packets. The numerical solver that instantiates these
-proposals remains Step 8 work; the archived July 8C-8G repair stack is not used
-by the target runner.
+evidence and residual packets. Target Step 8 now instantiates the world-state
+operators that the current boundary can represent directly. Operators that
+require a mutable tracking or candidate-bank child are retained as explicit
+`unsupported` audit records rather than being simulated with invented state.
 
 ---
 
@@ -883,8 +884,40 @@ hypotheses.
 
 **Output:** re-estimated candidates $\mathcal{H}_{i+1}^{1:n}$.
 
-**Current repository:** target stage not implemented as an explicit public
-module. Some local repair behavior exists inside current Step 6.
+**Current repository:** implemented in
+`inference/step08_local_reestimation.py` with typed contracts in
+`contracts/local_reestimation.py`. The deterministic baseline supports bounded
+local dynamics refits, process-noise scaling, explicit occlusion and
+unobservability marking, and `leave_unresolved`. Each proposal produces its own
+audited result and zero or more immutable child hypotheses. Persisted candidate
+records contain objective terms, optimized and excluded residual IDs, changed
+fields/frames, reversible before/after values, boundary/bounds/budget guards,
+and explicit no-mutation/no-selection flags. Check-only residuals are never
+passed to the objective; candidate acceptance remains Step 9 work.
+
+For the baseline local-dynamics operator, the first and last state in the
+proposal window are fixed. For every interior state, the solver forms the
+boundary interpolation $l_t$, sweeps deterministic strengths
+$\alpha_j=j/n$, and applies the axis-wise bounded update
+
+$$
+p'_t = p_t + \operatorname{clip}\!\left(
+\alpha_j(\ell_t-p_t), -k\sigma_t, k\sigma_t
+\right),
+$$
+
+where $k$ is the proposal's declared maximum state/pose delta in standard
+deviations. Interior velocity and speed are then recomputed by centered finite
+differences. Thus Step 7's arrow names an operator and its permitted direction;
+Step 8 supplies concrete, bounded candidate values and records their measured
+objective terms.
+
+The Step 8 visualization emits one 1920x1220 panel per proposal. It compares
+parent and child overlays on the same source frame, uses thick state-space
+arrows, plots all instantiated candidates against their declared numerical
+bound, and reports objective, reversible-diff and evidence-isolation accounting.
+No multi-proposal overview is produced and no displayed candidate is labeled as
+selected.
 
 ---
 
@@ -1079,7 +1112,7 @@ particular YOLO/SAM/RAFT/depth backends.
 
 ## 6. Target design versus current runner
 
-The target runner now implements Steps 1-7 with their flowchart meanings. The
+The target runner now implements Steps 1-8 with their flowchart meanings. The
 legacy public runner still uses different concepts after Step 4, so always name
 the execution path and module as well as the step number.
 
@@ -1092,7 +1125,7 @@ the execution path and module as well as the step number.
 | 5 | Joint Ego/Object World Reconstruction | Target `inference/step05_joint_world_reconstruction.py`; legacy public Step 5 remains | Typed component-local reconstruction and initial beam implemented; full branching/factor graph remain partial |
 | 6 | Predict + Verify | Target `inference/step06_predict_verify.py`; legacy public Step 6 remains | Typed residual packets, frozen fit/check separation and baseline forward checks implemented; dense mask/lifecycle/context models remain partial |
 | 7 | Diagnose + Propose | Target `inference/step07_diagnose_propose.py`; legacy public Step 7 remains | Typed evidence packets, deterministic diagnoses, bounded proposals and rendered evidence bundles implemented; optional LLM/VLM remains open |
-| 8 | Local Re-estimation | Internal portions of current Step 6 | Not explicit |
+| 8 | Local Re-estimation | Target `inference/step08_local_reestimation.py` | Typed bounded candidates, reversible diffs and fit/check isolation implemented; tracking/candidate-bank rewrites remain explicit unsupported records |
 | 9 | Select + Retain | No single corresponding module | Missing |
 | 10 | Segmentation | Current public Step 8 | Numbering/isolation mismatch |
 | 11 | Symbolic Scene | Current public Steps 9-11 | Substantially aligned |
@@ -1183,6 +1216,7 @@ cue-use counters are zero.
 | 2026-08-14 | Target Step 5 emits the typed initial beam $\mathcal B_0$. | Supported pose edges form independent ego components; object observations are ego-motion compensated inside those components; relative units, uncertainty, unresolved evidence and the lack of Step 6 verification remain explicit. |
 | 2026-08-14 | Target Step 6 emits immutable residual packets for every Step 5 hypothesis. | Fitted reprojection, held-out depth/backward-flow checks, ego/background rendering, physics/semantic diagnostics and conflict localization are auditable; missing evidence is `not_evaluable`, while repair and selection remain outside Step 6. |
 | 2026-08-18 | Target Step 7 emits deterministic typed diagnoses, bounded allow-listed proposals and proposal visualizations. | The diagnosis-to-repair boundary is auditable while world state remains immutable and check-only evidence remains forbidden as a Step 8 optimization target. |
+| 2026-08-19 | Target Step 8 instantiates bounded local child hypotheses without selection. | Parent and raw evidence remain immutable; fit/physics drive re-estimation, check-only residuals are excluded, every child carries a reversible diff, and Step 9 retains sole ownership of acceptance/ranking. |
 
 ## 11. Maintenance procedure
 

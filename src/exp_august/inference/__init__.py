@@ -20,6 +20,8 @@ from .step06_predict_verify import Step6Result, run_step6
 from .step06_visualization import render_step6_visualizations
 from .step07_diagnose_propose import Step7Result, run_step7
 from .step07_visualization import render_step7_visualizations
+from .step08_local_reestimation import Step8Result, run_step8
+from .step08_visualization import render_step8_visualizations
 
 __all__ = [
     "DisabledObjectBackend",
@@ -36,6 +38,7 @@ __all__ = [
     "Step5Result",
     "Step6Result",
     "Step7Result",
+    "Step8Result",
     "VideoValidationError",
     "YoloWorldEvidenceBackend",
     "run_step1",
@@ -45,9 +48,11 @@ __all__ = [
     "run_step5",
     "run_step6",
     "run_step7",
+    "run_step8",
     "render_step3_visualizations",
     "render_step4_visualizations",
     "render_step5_visualizations",
     "render_step6_visualizations",
     "render_step7_visualizations",
+    "render_step8_visualizations",
 ]
