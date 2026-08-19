@@ -517,7 +517,10 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                 self.assertTrue(
                     (step7_visual_root / packet_row["proposal_audit"]).is_file()
                 )
-                for path in packet_row["proposal_panels"]:
+                for proposal_number, path in enumerate(
+                    packet_row["proposal_panels"], start=1
+                ):
+                    self.assertIn(f"proposal_{proposal_number:02d}_", Path(path).name)
                     panel_image = cv2.imread(str(step7_visual_root / path))
                     panel_width, panel_height = packet_row[
                         "proposal_panel_resolution"
@@ -526,23 +529,8 @@ class ExpAugustStep04GeometryTests(unittest.TestCase):
                         panel_image.shape[:2],
                         (panel_height, panel_width),
                     )
-                if packet_row["proposal_overview"] is not None:
-                    overview_image = cv2.imread(
-                        str(step7_visual_root / packet_row["proposal_overview"])
-                    )
-                    expected_width, expected_height = packet_row[
-                        "proposal_overview_resolution"
-                    ]
-                    self.assertEqual(
-                        overview_image.shape[:2],
-                        (expected_height, expected_width),
-                    )
-                    self.assertEqual(
-                        expected_width * expected_height,
-                        packet_row["rendered_proposal_panel_count"]
-                        * panel_width
-                        * panel_height,
-                    )
+                self.assertIsNone(packet_row["proposal_overview"])
+                self.assertEqual(packet_row["proposal_overview_resolution"], [0, 0])
 
     def test_step4_rejects_tampered_tracking_manifest(self):
         with tempfile.TemporaryDirectory() as temporary:

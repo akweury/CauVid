@@ -267,6 +267,7 @@ class ExpAugustStep07DiagnosisTests(unittest.TestCase):
             image_bgr=source_image,
         )
         panel = _proposal_panel(
+            proposal_number=1,
             frame=frame,
             packet=packet,
             diagnosis=packet.diagnoses[0],
@@ -278,7 +279,7 @@ class ExpAugustStep07DiagnosisTests(unittest.TestCase):
             step3_root=Path("/unused/step3"),
         )
 
-        self.assertEqual(panel.shape, (960, 1920, 3))
+        self.assertEqual(panel.shape, (1320, 1920, 3))
         self.assertTrue(np.all(source_image == 190))
         self.assertFalse(packet.world_state_mutated)
 
