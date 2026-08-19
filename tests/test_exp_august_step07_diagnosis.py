@@ -278,7 +278,7 @@ class ExpAugustStep07DiagnosisTests(unittest.TestCase):
             step3_root=Path("/unused/step3"),
         )
 
-        self.assertEqual(panel.shape, (1080, 1920, 3))
+        self.assertEqual(panel.shape, (960, 1920, 3))
         self.assertTrue(np.all(source_image == 190))
         self.assertFalse(packet.world_state_mutated)
 

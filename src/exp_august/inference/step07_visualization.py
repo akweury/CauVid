@@ -48,15 +48,21 @@ _OPERATOR_BGR = {
 }
 
 _PANEL_WIDTH = 1920
-_PANEL_HEIGHT = 1080
-_HEADER_HEIGHT = 120
+_PANEL_HEIGHT = 960
+_HEADER_HEIGHT = 96
 _IMAGE_LEFT = 42
-_IMAGE_TOP = 150
-_IMAGE_WIDTH = 1120
-_IMAGE_HEIGHT = 700
-_SIDE_LEFT = 1205
-_SIDE_RIGHT = 1878
-_TIMELINE_Y = 994
+_IMAGE_TOP = 116
+_IMAGE_GAP = 24
+_IMAGE_WIDTH = 906
+_IMAGE_HEIGHT = 510
+_TEXT_TOP = 674
+_TEXT_COLUMN_GAP = 44
+_TEXT_COLUMN_WIDTH = 895
+_TIMELINE_Y = 902
+_DARK = (37, 40, 45)
+_MUTED = (83, 88, 96)
+_SUCCESS = (58, 145, 67)
+_TARGET = (57, 158, 94)
 
 
 def _run_root(path: Path) -> Path:
@@ -143,6 +149,80 @@ def _put_lines(
 
 def _wrapped(value: str, width: int = 58) -> list[str]:
     return textwrap.wrap(str(value), width=width, break_long_words=False) or [""]
+
+
+def _put_label_value(
+    image: np.ndarray,
+    *,
+    label: str,
+    value: str,
+    origin: tuple[int, int],
+    value_color: tuple[int, int, int],
+    scale: float = 0.55,
+    thickness: int = 1,
+) -> int:
+    """Draw a black label followed by a highlighted value on the same line."""
+
+    x, y = origin
+    label_text = f"{label}: "
+    cv2.putText(
+        image,
+        label_text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        _DARK,
+        thickness,
+        cv2.LINE_AA,
+    )
+    label_width = cv2.getTextSize(
+        label_text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+    )[0][0]
+    cv2.putText(
+        image,
+        value,
+        (x + label_width, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        value_color,
+        max(2, thickness),
+        cv2.LINE_AA,
+    )
+    return y
+
+
+def _fit_frame(image: np.ndarray, *, width: int, height: int) -> np.ndarray:
+    canvas = np.full((height, width, 3), 24, dtype=np.uint8)
+    source_height, source_width = image.shape[:2]
+    scale = min(width / source_width, height / source_height)
+    rendered = cv2.resize(
+        image,
+        (
+            max(1, int(round(source_width * scale))),
+            max(1, int(round(source_height * scale))),
+        ),
+        interpolation=cv2.INTER_AREA,
+    )
+    top = (height - rendered.shape[0]) // 2
+    left = (width - rendered.shape[1]) // 2
+    canvas[top : top + rendered.shape[0], left : left + rendered.shape[1]] = rendered
+    return canvas
+
+
+def _frame_label(image: np.ndarray, label: str, *, color: tuple[int, int, int]) -> None:
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, 0), (image.shape[1], 52), color, -1)
+    cv2.addWeighted(overlay, 0.88, image, 0.12, 0.0, image)
+    cv2.putText(
+        image,
+        label,
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def _track_observation(tracking, track_id: str | None, frame_index: int):
@@ -265,6 +345,37 @@ def _draw_residual_geometry(image: np.ndarray, residual, origin, color) -> None:
                 for index in range(2)
             )
             cv2.arrowedLine(image, start, end, arrow_color, 4, cv2.LINE_AA, tipLength=0.2)
+
+
+def _draw_repair_target_geometry(image: np.ndarray, residual, origin) -> None:
+    """Visualize the proposal's target without presenting it as an executed result."""
+
+    if residual is None:
+        return
+    observed = tuple(float(value) for value in residual.observed_values)
+    if residual.metric_name == "pixel_reprojection_error" and len(observed) >= 2:
+        target = tuple(int(round(value)) for value in observed[:2])
+        cv2.circle(image, target, 13, _TARGET, 4, cv2.LINE_AA)
+    elif "flow" in residual.metric_name and len(observed) >= 2:
+        origin = origin or (image.shape[1] / 2.0, image.shape[0] / 2.0)
+        start = tuple(int(round(value)) for value in origin)
+        vector = np.asarray(observed[:2])
+        display_scale = min(1.0, 180.0 / max(float(np.linalg.norm(vector)), 1e-6))
+        end = tuple(
+            int(round(start[index] + display_scale * vector[index]))
+            for index in range(2)
+        )
+        cv2.arrowedLine(image, start, end, _TARGET, 6, cv2.LINE_AA, tipLength=0.2)
+    cv2.putText(
+        image,
+        "TARGET: REDUCE MODEL / OBSERVATION DISAGREEMENT",
+        (22, image.shape[0] - 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        _TARGET,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def _comparison(packets, path: Path) -> None:
@@ -440,9 +551,9 @@ def _proposal_panel(
     cv2.putText(
         canvas,
         f"STEP 7 REPAIR PROPOSAL | HYPOTHESIS RANK {packet.hypothesis_rank:02d}",
-        (42, 55),
+        (42, 47),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.10,
+        0.90,
         (255, 255, 255),
         2,
         cv2.LINE_AA,
@@ -451,16 +562,17 @@ def _proposal_panel(
         canvas,
         f"{diagnosis.category.value.upper().replace('_', ' ')}  ->  "
         f"{proposal.operator.value.upper().replace('_', ' ')}",
-        (42, 96),
+        (42, 79),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.76,
+        0.61,
         (245, 248, 252),
         2,
         cv2.LINE_AA,
     )
-    annotated = frame.image_bgr.copy()
-    origin, _ = _draw_track_support(
-        annotated,
+
+    before = frame.image_bgr.copy()
+    before_origin, _ = _draw_track_support(
+        before,
         tracking=tracking,
         residual=residual,
         frame_index=frame.frame_index,
@@ -468,116 +580,201 @@ def _proposal_panel(
         step2_root=step2_root,
         step3_root=step3_root,
     )
-    _draw_residual_geometry(annotated, residual, origin, color)
-    image_region = canvas[
+    _draw_residual_geometry(before, residual, before_origin, color)
+
+    preview = frame.image_bgr.copy()
+    preview_origin, _ = _draw_track_support(
+        preview,
+        tracking=tracking,
+        residual=residual,
+        frame_index=frame.frame_index,
+        color=_TARGET,
+        step2_root=step2_root,
+        step3_root=step3_root,
+    )
+    _draw_repair_target_geometry(preview, residual, preview_origin)
+
+    before = _fit_frame(before, width=_IMAGE_WIDTH, height=_IMAGE_HEIGHT)
+    preview = _fit_frame(preview, width=_IMAGE_WIDTH, height=_IMAGE_HEIGHT)
+    _frame_label(before, "BEFORE | CURRENT EVIDENCE + RESIDUAL", color=_DARK)
+    _frame_label(
+        preview,
+        "AFTER TARGET PREVIEW | NOT EXECUTED IN STEP 7",
+        color=_TARGET,
+    )
+    right_image_left = _IMAGE_LEFT + _IMAGE_WIDTH + _IMAGE_GAP
+    canvas[
         _IMAGE_TOP : _IMAGE_TOP + _IMAGE_HEIGHT,
         _IMAGE_LEFT : _IMAGE_LEFT + _IMAGE_WIDTH,
-    ]
-    source_height, source_width = annotated.shape[:2]
-    scale = min(_IMAGE_WIDTH / source_width, _IMAGE_HEIGHT / source_height)
-    rendered = cv2.resize(
-        annotated,
-        (max(1, int(round(source_width * scale))), max(1, int(round(source_height * scale)))),
-        interpolation=cv2.INTER_AREA,
-    )
-    top = (_IMAGE_HEIGHT - rendered.shape[0]) // 2
-    left = (_IMAGE_WIDTH - rendered.shape[1]) // 2
-    image_region[:] = 25
-    image_region[top : top + rendered.shape[0], left : left + rendered.shape[1]] = rendered
-    cv2.rectangle(
-        canvas,
-        (_IMAGE_LEFT, _IMAGE_TOP),
-        (_IMAGE_LEFT + _IMAGE_WIDTH, _IMAGE_TOP + _IMAGE_HEIGHT),
-        (75, 82, 92),
-        2,
-    )
+    ] = before
+    canvas[
+        _IMAGE_TOP : _IMAGE_TOP + _IMAGE_HEIGHT,
+        right_image_left : right_image_left + _IMAGE_WIDTH,
+    ] = preview
+    for left in (_IMAGE_LEFT, right_image_left):
+        cv2.rectangle(
+            canvas,
+            (left, _IMAGE_TOP),
+            (left + _IMAGE_WIDTH, _IMAGE_TOP + _IMAGE_HEIGHT),
+            (75, 82, 92),
+            2,
+        )
     cv2.putText(
         canvas,
-        f"canonical frame {frame.frame_index:06d} | time {frame.timestamp_s:.2f} s",
-        (_IMAGE_LEFT, _IMAGE_TOP + _IMAGE_HEIGHT + 34),
+        f"Same source frame {frame.frame_index:06d} | {frame.timestamp_s:.2f} s | target preview is not a repaired RGB frame",
+        (_IMAGE_LEFT, _IMAGE_TOP + _IMAGE_HEIGHT + 27),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.62,
-        (70, 76, 86),
+        0.49,
+        _MUTED,
         1,
         cv2.LINE_AA,
     )
 
-    y = _put_lines(
+    left_x = _IMAGE_LEFT
+    right_x = _IMAGE_LEFT + _TEXT_COLUMN_WIDTH + _TEXT_COLUMN_GAP
+    y = _TEXT_TOP
+    cv2.putText(
         canvas,
-        [
-            f"Diagnosis confidence: {diagnosis.confidence:.0%}",
-            f"Proposal status: {proposal.status}",
-            f"Window: frames {proposal.start_frame_index}-{proposal.end_frame_index}",
-        ],
-        origin=(_SIDE_LEFT, 176),
-        scale=0.62,
-        line_height=32,
-        thickness=2,
+        "DIAGNOSIS & PROPOSAL",
+        (left_x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.59,
+        _DARK,
+        2,
+        cv2.LINE_AA,
     )
-    y += 12
+    y += 31
+    _put_label_value(
+        canvas,
+        label="Diagnosis",
+        value=(
+            f"{diagnosis.category.value.upper().replace('_', ' ')}  "
+            f"({diagnosis.confidence:.0%} CONFIDENCE)"
+        ),
+        origin=(left_x, y),
+        value_color=color,
+        scale=0.52,
+    )
+    y += 27
+    _put_label_value(
+        canvas,
+        label="Repair",
+        value=(
+            f"{proposal.operator.value.upper().replace('_', ' ')}  "
+            f"[{proposal.status.upper()}]"
+        ),
+        origin=(left_x, y),
+        value_color=_SUCCESS if proposal.status == "ready" else color,
+        scale=0.52,
+    )
+    y += 27
+    _put_label_value(
+        canvas,
+        label="Window",
+        value=f"FRAMES {proposal.start_frame_index}-{proposal.end_frame_index}",
+        origin=(left_x, y),
+        value_color=color,
+        scale=0.52,
+    )
+    y += 34
     cv2.putText(
         canvas,
         "WHY",
-        (_SIDE_LEFT, y),
+        (left_x, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.66,
-        color,
+        0.55,
+        _DARK,
         2,
         cv2.LINE_AA,
     )
-    y += 30
-    y = _put_lines(canvas, _wrapped(diagnosis.rationale), origin=(_SIDE_LEFT, y), line_height=25)
-    y += 12
+    y += 27
+    _put_lines(
+        canvas,
+        _wrapped(diagnosis.rationale, 78),
+        origin=(left_x, y),
+        scale=0.47,
+        color=_MUTED,
+        line_height=22,
+    )
+
+    y = _TEXT_TOP
+    cv2.putText(
+        canvas,
+        "SCOPE & SAFETY",
+        (right_x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.59,
+        _DARK,
+        2,
+        cv2.LINE_AA,
+    )
+    y += 31
     cv2.putText(
         canvas,
         "AFFECTED VARIABLES",
-        (_SIDE_LEFT, y),
+        (right_x, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.66,
-        color,
+        0.50,
+        _DARK,
         2,
         cv2.LINE_AA,
     )
-    y += 30
+    y += 26
     y = _put_lines(
         canvas,
         [f"- {value}" for value in proposal.affected_variables],
-        origin=(_SIDE_LEFT, y),
-        line_height=25,
+        origin=(right_x, y),
+        scale=0.47,
+        color=color,
+        line_height=21,
+        thickness=2,
     )
-    y += 12
+    y += 5
     cv2.putText(
         canvas,
         "BOUNDS",
-        (_SIDE_LEFT, y),
+        (right_x, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.66,
-        color,
+        0.50,
+        _DARK,
         2,
         cv2.LINE_AA,
     )
-    y += 30
-    y = _put_lines(canvas, _parameter_lines(proposal), origin=(_SIDE_LEFT, y), line_height=24)
-    y += 10
+    y += 26
+    y = _put_lines(
+        canvas,
+        _parameter_lines(proposal),
+        origin=(right_x, y),
+        scale=0.45,
+        color=color,
+        line_height=21,
+        thickness=2,
+    )
+    y += 3
     cv2.putText(
         canvas,
         "SAFETY",
-        (_SIDE_LEFT, y),
+        (right_x, y),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.66,
-        color,
+        0.50,
+        _DARK,
         2,
         cv2.LINE_AA,
     )
-    y += 30
+    y += 26
     safety = [
-        "Parent hypothesis: immutable",
-        "Raw evidence mutation: forbidden",
-        "Diagnoser numeric state values: forbidden",
+        "IMMUTABLE parent + raw evidence | diagnoser cannot invent state values",
     ]
     if residual is not None and residual.evaluation_basis.value == "check_evidence":
-        safety.append("CHECK-ONLY: diagnosis/acceptance; never optimized")
-    _put_lines(canvas, safety, origin=(_SIDE_LEFT, y), line_height=25)
+        safety.append("CHECK-ONLY evidence: acceptance test; NEVER an optimization target")
+    _put_lines(
+        canvas,
+        safety,
+        origin=(right_x, y),
+        scale=0.43,
+        color=_MUTED,
+        line_height=21,
+    )
 
     x0, x1 = 80, _PANEL_WIDTH - 80
     cv2.line(canvas, (x0, _TIMELINE_Y), (x1, _TIMELINE_Y), (95, 103, 114), 2)
@@ -621,7 +818,7 @@ def _proposal_panel(
     cv2.putText(
         canvas,
         "proposal window / evidence keyframes",
-        (x0, _TIMELINE_Y - 34),
+        (x0, _TIMELINE_Y - 31),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
         (70, 77, 87),
@@ -753,10 +950,20 @@ def render_step7_visualizations(
                 panel_images.append(panel)
             overview = None
             if panel_images:
-                tiles = panel_images[:4]
-                while len(tiles) < 4:
-                    tiles.append(np.full((_PANEL_HEIGHT, _PANEL_WIDTH, 3), 247, dtype=np.uint8))
-                overview_image = np.vstack((np.hstack(tiles[:2]), np.hstack(tiles[2:4])))
+                tiles = panel_images[:maximum_proposal_panels]
+                maximum_columns = int(np.ceil(np.sqrt(len(tiles) * 16.0 / 9.0)))
+                column_count = max(
+                    factor
+                    for factor in range(1, len(tiles) + 1)
+                    if len(tiles) % factor == 0 and factor <= maximum_columns
+                )
+                row_count = len(tiles) // column_count
+                overview_image = np.vstack(
+                    [
+                        np.hstack(tiles[row * column_count : (row + 1) * column_count])
+                        for row in range(row_count)
+                    ]
+                )
                 overview = overview_path
                 _write_image(overview, overview_image)
             packet_rows.append(
@@ -780,8 +987,8 @@ def render_step7_visualizations(
                     ),
                     "proposal_panel_resolution": [_PANEL_WIDTH, _PANEL_HEIGHT],
                     "proposal_overview_resolution": [
-                        2 * _PANEL_WIDTH,
-                        2 * _PANEL_HEIGHT,
+                        int(overview_image.shape[1]) if overview is not None else 0,
+                        int(overview_image.shape[0]) if overview is not None else 0,
                     ],
                 }
             )
