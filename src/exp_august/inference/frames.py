@@ -89,20 +89,35 @@ class CanonicalFrameProvider:
                 f"expected {expected.width}x{expected.height}"
             )
 
+    def _decode_source_frame_sequentially(self, source_frame_index: int) -> np.ndarray:
+        """Decode one frame without relying on codec/container random seeking."""
+        capture = self._open()
+        try:
+            for decoded_source_index in range(source_frame_index + 1):
+                ok, image = capture.read()
+                if not ok or image is None:
+                    raise FrameDecodeError(
+                        f"sequential decode failed at source frame {decoded_source_index} "
+                        f"while requesting source frame {source_frame_index}: {self.source_path}"
+                    )
+        finally:
+            capture.release()
+        return image
+
     def get_frame(self, frame_index: int) -> CanonicalFrame:
         if not 0 <= frame_index < len(self.manifest.frames):
             raise IndexError(f"canonical frame index out of range: {frame_index}")
         record = self.manifest.frames[frame_index]
         capture = self._open()
         try:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, float(record.source_frame_index))
-            ok, image = capture.read()
+            seek_ok = capture.set(
+                cv2.CAP_PROP_POS_FRAMES, float(record.source_frame_index)
+            )
+            ok, image = capture.read() if seek_ok else (False, None)
         finally:
             capture.release()
-        if not ok:
-            raise FrameDecodeError(
-                f"decode failed at source frame {record.source_frame_index}: {self.source_path}"
-            )
+        if not ok or image is None:
+            image = self._decode_source_frame_sequentially(record.source_frame_index)
         self._validate_image(image, frame_index)
         return CanonicalFrame(
             video_id=self.manifest.video_id,
@@ -160,4 +175,3 @@ class CanonicalFrameProvider:
                 batch = []
         if batch:
             yield tuple(batch)
-
