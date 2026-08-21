@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import textwrap
 from pathlib import Path
 
 import cv2
@@ -25,30 +24,40 @@ from src.exp_august.inference.frames import CanonicalFrameProvider
 
 _WIDTH = 1920
 _HEIGHT = 1220
-_HEADER_BOTTOM = 104
-_FRAME_TOP = 124
 _FRAME_HEIGHT = 448
 _FRAME_GAP = 24
 _FRAME_WIDTH = (_WIDTH - 84 - _FRAME_GAP) // 2
-_CHART_TOP = 632
-_CHART_BOTTOM = 956
-_TEXT_TOP = 988
 
 _WHITE = (250, 250, 250)
 _DARK = (34, 38, 45)
 _MUTED = (87, 93, 102)
 _GRID = (219, 222, 226)
 _PARENT = (196, 115, 35)
+# High-contrast Okabe-Ito-inspired colors (stored as OpenCV BGR).  Candidate
+# identity should remain legible without relying on several shades of green.
 _CHILDREN = (
-    (79, 154, 77),
-    (47, 139, 92),
-    (39, 122, 109),
-    (48, 151, 139),
-    (67, 165, 154),
-    (83, 178, 166),
+    (115, 158, 0),    # bluish green
+    (0, 94, 213),     # vermillion
+    (167, 121, 204),  # reddish purple
+    (0, 159, 230),    # orange
+    (178, 114, 0),    # blue
+    (233, 180, 86),   # sky blue
 )
 _WARNING = (37, 126, 214)
 _ERROR = (58, 67, 196)
+_REASON_COLORS = {
+    "identity_error": (115, 158, 0),
+    "mask_error": (0, 94, 213),
+    "depth_jump": (167, 121, 204),
+    "pose_drift": (178, 114, 0),
+    "scale_ambiguity": (0, 159, 230),
+    "invalid_static_background_assumption": (233, 180, 86),
+    "dynamics_mismatch": (42, 181, 211),
+    "true_acute_maneuver": (164, 82, 219),
+    "unobservable_evidence": (112, 112, 112),
+    "semantic_prior_mismatch": (148, 133, 0),
+    "unresolved_conflict": (58, 67, 196),
+}
 
 
 def _run_root(path: Path) -> Path:
@@ -160,27 +169,6 @@ def _put(
     )
 
 
-def _label_value(
-    image: np.ndarray,
-    *,
-    label: str,
-    value: str,
-    origin: tuple[int, int],
-    color: tuple[int, int, int],
-    scale: float = 0.72,
-) -> None:
-    label_text = f"{label}: "
-    _put(image, label_text, origin, scale=scale, color=_DARK)
-    width = cv2.getTextSize(
-        label_text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2
-    )[0][0]
-    _put(image, value, (origin[0] + width, origin[1]), scale=scale, color=color)
-
-
-def _wrapped(value: str, width: int) -> list[str]:
-    return textwrap.wrap(str(value), width=width, break_long_words=False) or [""]
-
-
 def _fit_frame(image: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     canvas = np.full((_FRAME_HEIGHT, _FRAME_WIDTH, 3), 24, dtype=np.uint8)
     source_height, source_width = image.shape[:2]
@@ -199,13 +187,6 @@ def _fit_frame(image: np.ndarray) -> tuple[np.ndarray, float, int, int]:
     return canvas, scale, left, top
 
 
-def _frame_banner(image: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
-    overlay = image.copy()
-    cv2.rectangle(overlay, (0, 0), (image.shape[1], 56), color, -1)
-    cv2.addWeighted(overlay, 0.90, image, 0.10, 0.0, image)
-    _put(image, text, (20, 39), scale=0.75, color=(255, 255, 255), thickness=2)
-
-
 def _subjects(proposal, residual_packet) -> tuple[tuple[str, ...], tuple[str, ...]]:
     residuals = {row.residual_id: row for row in residual_packet.residuals}
     rows = [residuals[value] for value in proposal.target_residual_ids if value in residuals]
@@ -214,6 +195,404 @@ def _subjects(proposal, residual_packet) -> tuple[tuple[str, ...], tuple[str, ..
     )
     tracks = tuple(dict.fromkeys(row.track_id for row in rows if row.track_id is not None))
     return components, tracks
+
+
+def _target_scope(
+    proposal, component_ids: tuple[str, ...], track_ids: tuple[str, ...]
+) -> str:
+    affects_ego = any(
+        value.startswith("ego_components") for value in proposal.affected_variables
+    )
+    affects_objects = any(
+        value.startswith("object_trajectories") for value in proposal.affected_variables
+    )
+    if affects_ego and affects_objects:
+        subject = "ego/camera + tracked-object motion"
+    elif affects_ego:
+        subject = "ego/camera motion"
+    elif affects_objects:
+        subject = "tracked-object motion"
+    else:
+        subject = "world-state variables"
+    identifiers = []
+    if component_ids:
+        identifiers.append("component " + ",".join(component_ids))
+    if track_ids:
+        identifiers.append("track " + ",".join(track_ids))
+    return subject + (" | " + " | ".join(identifiers) if identifiers else "")
+
+
+def _target_kind(
+    proposal,
+    component_ids: tuple[str, ...] = (),
+    track_ids: tuple[str, ...] = (),
+) -> str:
+    affects_ego = any(
+        value.startswith("ego_components") for value in proposal.affected_variables
+    )
+    affects_objects = any(
+        value.startswith("object_trajectories") for value in proposal.affected_variables
+    )
+    if affects_ego and affects_objects:
+        return "ego_and_object"
+    if affects_ego:
+        return "ego"
+    if affects_objects:
+        return "object"
+    if track_ids:
+        return "object"
+    if component_ids:
+        return "ego"
+    return "state"
+
+
+def _draw_target_frame(
+    canvas: np.ndarray,
+    *,
+    frame,
+    tracking,
+    track_ids: tuple[str, ...],
+    target_kind: str,
+) -> None:
+    image, scale, pad_x, pad_y = _fit_frame(frame.image_bgr)
+    if target_kind in {"object", "ego_and_object"} and track_ids:
+        track = next(
+            (row for row in tracking.tracks if row.track_id == track_ids[0]), None
+        )
+        observation = _track_observation(tracking, track_ids, frame.frame_index)
+        if observation is not None:
+            _, _, box = _anchor(
+                observation=observation,
+                scale=scale,
+                left=pad_x,
+                top=pad_y,
+                frame_shape=image.shape,
+            )
+            if box is not None:
+                color = _candidate_color(0)
+                cv2.rectangle(image, box[:2], box[2:], color, 5)
+                class_name = track.primary_class if track is not None else "OBJECT"
+                label = f"{class_name} | {track_ids[0]}"
+                label_width = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.62, 2
+                )[0][0]
+                label_y = max(32, box[1])
+                cv2.rectangle(
+                    image,
+                    (box[0], label_y - 30),
+                    (min(_FRAME_WIDTH - 1, box[0] + label_width + 18), label_y + 4),
+                    color,
+                    -1,
+                )
+                _put(
+                    image,
+                    label,
+                    (box[0] + 8, label_y - 7),
+                    scale=0.62,
+                    color=(255, 255, 255),
+                )
+    if target_kind in {"ego", "ego_and_object"}:
+        cv2.rectangle(image, (18, 16), (116, 62), _PARENT, -1)
+        _put(
+            image,
+            "EGO",
+            (34, 49),
+            scale=0.88,
+            color=(255, 255, 255),
+            thickness=2,
+        )
+    canvas[100 : 100 + _FRAME_HEIGHT, 30 : 30 + _FRAME_WIDTH] = image
+
+
+def _series_rows(proposal, residual_packet):
+    by_id = {row.residual_id: row for row in residual_packet.residuals}
+    targets = [
+        by_id[value]
+        for value in proposal.target_residual_ids
+        if value in by_id and by_id[value].evaluable
+    ]
+    if not targets:
+        return ()
+    metric = max(
+        {row.metric_name for row in targets},
+        key=lambda name: (
+            sum(row.metric_name == name for row in targets),
+            max(
+                (
+                    float(row.normalized_residual or 0.0)
+                    for row in targets
+                    if row.metric_name == name
+                ),
+                default=0.0,
+            ),
+        ),
+    )
+    component_ids = {row.component_id for row in targets if row.component_id is not None}
+    track_ids = {row.track_id for row in targets if row.track_id is not None}
+    rows = [
+        row
+        for row in residual_packet.residuals
+        if row.evaluable
+        and row.metric_name == metric
+        and proposal.start_frame_index <= row.start_frame_index <= proposal.end_frame_index
+        and (not component_ids or row.component_id in component_ids)
+        and (not track_ids or row.track_id in track_ids)
+    ]
+    return tuple(sorted(rows or targets, key=lambda row: row.start_frame_index))
+
+
+def _value_magnitude(values) -> float:
+    array = np.asarray(values, dtype=np.float64)
+    return (
+        float(array.reshape(-1)[0])
+        if array.size == 1
+        else float(np.linalg.norm(array))
+    )
+
+
+def _aggregate_series(rows, attribute: str) -> dict[int, float]:
+    grouped: dict[int, list[float]] = {}
+    for row in rows:
+        grouped.setdefault(row.start_frame_index, []).append(
+            _value_magnitude(getattr(row, attribute))
+        )
+    return {
+        frame: float(np.median(values)) for frame, values in sorted(grouped.items())
+    }
+
+
+def _draw_cause_chart(
+    canvas: np.ndarray, *, proposal, residual_packet, reason_color
+) -> None:
+    panel_left, panel_right = 990, 1880
+    panel_top, panel_bottom = 100, 548
+    rows = _series_rows(proposal, residual_packet)
+    cv2.rectangle(
+        canvas, (panel_left, panel_top), (panel_right, panel_bottom), _GRID, 2
+    )
+    cv2.rectangle(
+        canvas, (panel_left, panel_top), (panel_left + 8, panel_bottom), reason_color, -1
+    )
+    if not rows:
+        _put(
+            canvas,
+            "NO COMPARABLE RESIDUAL SERIES",
+            (panel_left + 190, panel_top + 230),
+            scale=0.78,
+            color=_MUTED,
+        )
+        return
+    current = _aggregate_series(rows, "raw_residual")
+    acceptable = _aggregate_series(rows, "threshold")
+    frames = sorted(set(current) & set(acceptable))
+    if not frames:
+        return
+    values = [current[frame] for frame in frames] + [acceptable[frame] for frame in frames]
+    low, high = min(values), max(values)
+    padding = max((high - low) * 0.12, abs(high) * 0.05, 1e-6)
+    low, high = low - padding, high + padding
+    plot_left, plot_right = panel_left + 78, panel_right - 28
+    plot_top, plot_bottom = panel_top + 92, panel_bottom - 54
+
+    def to_x(frame_index: int) -> int:
+        return int(
+            round(
+                plot_left
+                + (plot_right - plot_left)
+                * (frame_index - proposal.start_frame_index)
+                / max(1, proposal.end_frame_index - proposal.start_frame_index)
+            )
+        )
+
+    def to_y(value: float) -> int:
+        return int(round(plot_bottom - (plot_bottom - plot_top) * (value - low) / (high - low)))
+
+    for fraction in (0.0, 0.5, 1.0):
+        y = int(round(plot_bottom - fraction * (plot_bottom - plot_top)))
+        cv2.line(canvas, (plot_left, y), (plot_right, y), _GRID, 1)
+        _put(
+            canvas,
+            f"{low + fraction * (high - low):.3g}",
+            (panel_left + 8, y + 6),
+            scale=0.48,
+            color=_MUTED,
+            thickness=1,
+        )
+    cv2.rectangle(canvas, (plot_left, plot_top), (plot_right, plot_bottom), _DARK, 2)
+    for values_by_frame, color in ((current, reason_color), (acceptable, _DARK)):
+        points = np.asarray(
+            [(to_x(frame), to_y(values_by_frame[frame])) for frame in frames],
+            dtype=np.int32,
+        )
+        if len(points) > 1:
+            cv2.polylines(canvas, [points], False, color, 5, cv2.LINE_AA)
+        for point in points:
+            cv2.circle(canvas, tuple(point), 7, color, -1, cv2.LINE_AA)
+    metric = rows[0].metric_name.replace("_", " ").upper()
+    unit = rows[0].metric_unit.replace("_", " ")
+    _put(
+        canvas,
+        f"CAUSE | {metric} ({unit})",
+        (panel_left + 24, panel_top + 37),
+        scale=0.72,
+        color=reason_color,
+    )
+    _put(canvas, "CURRENT ERROR", (panel_right - 340, panel_top + 72), scale=0.55, color=reason_color)
+    _put(
+        canvas,
+        "ACCEPTABLE LIMIT",
+        (panel_right - 165, panel_top + 72),
+        scale=0.55,
+        color=_DARK,
+    )
+    _put(canvas, str(proposal.start_frame_index), (plot_left - 8, plot_bottom + 34), scale=0.48, color=_MUTED, thickness=1)
+    _put(canvas, str(proposal.end_frame_index), (plot_right - 24, plot_bottom + 34), scale=0.48, color=_MUTED, thickness=1)
+
+
+def _draw_effect_chart(canvas: np.ndarray, *, result) -> None:
+    left, right = 30, 1880
+    top, bottom = 580, 895
+    candidates = _instantiated(result)[:6]
+    cv2.rectangle(canvas, (left, top), (right, bottom), _GRID, 2)
+    _put(canvas, "EFFECT | OBJECTIVE ERROR", (left + 20, top + 38), scale=0.74)
+    _put(canvas, "LOWER", (left + 405, top + 38), scale=0.56, color=_candidate_color(0))
+    if not candidates:
+        _put(canvas, result.status.replace("_", " ").upper(), (left + 720, top + 170), scale=0.9, color=_WARNING)
+        return
+    maximum = max(
+        1e-12,
+        max(float(row.objective_before.total) for row in candidates),
+        max(float(row.objective_after.total) for row in candidates),
+    )
+    chart_left, chart_right = left + 235, right - 72
+    row_height = min(42, 220 // len(candidates))
+    for index, candidate in enumerate(candidates):
+        y = top + 78 + index * row_height
+        before = float(candidate.objective_before.total)
+        after = float(candidate.objective_after.total)
+        before_x = chart_left + int((chart_right - chart_left) * before / maximum)
+        after_x = chart_left + int((chart_right - chart_left) * after / maximum)
+        color = _candidate_color(index)
+        _put(canvas, f"C{index + 1:02d}", (left + 24, y + 7), scale=0.56, color=color)
+        cv2.line(canvas, (chart_left, y), (before_x, y), _PARENT, 8, cv2.LINE_AA)
+        cv2.circle(canvas, (before_x, y), 8, _PARENT, -1, cv2.LINE_AA)
+        cv2.arrowedLine(
+            canvas,
+            (before_x, y),
+            (after_x, y),
+            color,
+            5,
+            cv2.LINE_AA,
+            tipLength=0.025,
+        )
+        cv2.circle(canvas, (after_x, y), 9, color, -1, cv2.LINE_AA)
+        _put(canvas, f"{before:.3g}", (max(chart_left, before_x - 54), y - 11), scale=0.44, color=_PARENT, thickness=1)
+        _put(canvas, f"{after:.3g}", (max(chart_left, after_x - 24), y + 23), scale=0.44, color=color, thickness=1)
+
+
+def _draw_audit_table(
+    canvas: np.ndarray, *, proposal, result, target_kind: str
+) -> None:
+    top = 925
+    columns = (30, 190, 600, 790, 1080, 1235, 1410, 1600, 1885)
+    headers = ("CANDIDATE", "CHANGED TARGET", "MAX DELTA", "OBJECTIVE", "FRAMES", "BOUND", "BOUNDARY", "STATUS")
+    table_bottom = 1138
+    cv2.rectangle(canvas, (30, top), (1885, table_bottom), _GRID, 2)
+    for index, header in enumerate(headers):
+        _put(canvas, header, (columns[index] + 8, top + 27), scale=0.48, color=_MUTED, thickness=1)
+    cv2.line(canvas, (30, top + 40), (1885, top + 40), _GRID, 2)
+    changed_target = {
+        "ego": "ego position -> velocity/speed",
+        "object": "object position -> velocity/speed",
+        "ego_and_object": "ego + object dynamics",
+        "state": "world state",
+    }[target_kind]
+    candidates = _instantiated(result)[:6]
+    rows = candidates or result.candidates[:1]
+    bound = _maximum_sigma(proposal)
+    for index, candidate in enumerate(rows):
+        y0 = top + 40 + index * 29
+        y = y0 + 21
+        if y0 + 29 > table_bottom:
+            break
+        if index:
+            cv2.line(canvas, (30, y0), (1885, y0), _GRID, 1)
+        color = _candidate_color(index) if candidate.status == "instantiated" else _WARNING
+        sigma = max(
+            (
+                float(change.maximum_standardized_delta)
+                for change in candidate.numerical_changes
+                if change.maximum_standardized_delta is not None
+            ),
+            default=0.0,
+        )
+        changed_frames = len({row.frame_index for row in candidate.numerical_changes})
+        objective = (
+            f"{candidate.objective_before.total:.3g} -> {candidate.objective_after.total:.3g}"
+            if candidate.objective_before is not None and candidate.objective_after is not None
+            else "-"
+        )
+        values = (
+            f"C{index + 1:02d}",
+            changed_target,
+            f"{sigma:.2f} sigma",
+            objective,
+            str(changed_frames),
+            f"<= {bound:g} sigma" if bound is not None else "-",
+            "yes" if candidate.boundary_preserved else "no",
+            "not selected" if candidate.status == "instantiated" else candidate.status.replace("_", " "),
+        )
+        for column, value in enumerate(values):
+            _put(
+                canvas,
+                value,
+                (columns[column] + 8, y),
+                scale=0.46,
+                color=color if column in {0, 2, 3} else _DARK,
+                thickness=1 if column not in {0, 2, 3} else 2,
+            )
+
+
+def _draw_reason_row(canvas: np.ndarray, *, active_diagnosis, diagnoses) -> None:
+    top, bottom = 1152, 1202
+    categories = _reason_categories(active_diagnosis, diagnoses)
+    cv2.rectangle(canvas, (30, top), (1885, bottom), _GRID, 2)
+    _put(canvas, "CAUSES", (44, top + 32), scale=0.54, color=_DARK)
+    labels = [category.value.replace("_", " ").upper() for category in categories]
+    available = 1885 - 160
+    scale = 0.50
+    widths = [
+        cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0][0]
+        for label in labels
+    ]
+    required = sum(width + 42 for width in widths)
+    if required > available:
+        scale = max(0.28, scale * available / required)
+        widths = [
+            cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)[0][0]
+            for label in labels
+        ]
+    x = 154
+    for category, label, width in zip(categories, labels, widths):
+        color = _reason_color(category)
+        active = category == active_diagnosis.category
+        cv2.rectangle(
+            canvas,
+            (x, top + 15),
+            (x + (22 if active else 16), top + 35),
+            color,
+            -1,
+        )
+        text_x = x + (30 if active else 24)
+        _put(
+            canvas,
+            label,
+            (text_x, top + 33),
+            scale=scale,
+            color=color,
+            thickness=2 if active else 1,
+        )
+        x = text_x + width + 22
 
 
 def _track_observation(tracking, track_ids: tuple[str, ...], frame_index: int):
@@ -230,6 +609,22 @@ def _track_observation(tracking, track_ids: tuple[str, ...], frame_index: int):
 
 def _candidate_color(index: int) -> tuple[int, int, int]:
     return _CHILDREN[index % len(_CHILDREN)]
+
+
+def _reason_color(category) -> tuple[int, int, int]:
+    value = category.value if hasattr(category, "value") else str(category)
+    return _REASON_COLORS.get(value, _MUTED)
+
+
+def _reason_categories(active_diagnosis, diagnoses) -> tuple[object, ...]:
+    ordered = [active_diagnosis.category]
+    ordered.extend(row.category for row in diagnoses)
+    ordered.extend(
+        alternative
+        for row in diagnoses
+        for alternative in row.alternative_categories
+    )
+    return tuple(dict.fromkeys(ordered))
 
 
 def _instantiated(result):
@@ -289,113 +684,6 @@ def _anchor(
     return (x1 + x2) // 2, (y1 + y2) // 2, (x1, y1, x2, y2)
 
 
-def _arrow_delta(change) -> tuple[int, int]:
-    if change is None:
-        return 92, -50
-    before = np.asarray(change.before_values, dtype=np.float64)
-    after = np.asarray(change.after_values, dtype=np.float64)
-    delta = after - before
-    dx = float(delta[0]) if delta.size else 0.0
-    dy = float(-(delta[2] if delta.size >= 3 else delta[1] if delta.size >= 2 else 0.0))
-    vector = np.asarray((dx, dy), dtype=np.float64)
-    norm = float(np.linalg.norm(vector))
-    if norm < 1e-12:
-        vector = np.asarray((1.0, -0.55), dtype=np.float64)
-        norm = float(np.linalg.norm(vector))
-    sigma = float(change.maximum_standardized_delta or 1.0)
-    length = float(np.clip(54.0 + 34.0 * sigma, 64.0, 152.0))
-    vector = vector / norm * length
-    return int(round(vector[0])), int(round(vector[1]))
-
-
-def _draw_frame_pair(
-    canvas: np.ndarray,
-    *,
-    frame,
-    tracking,
-    track_ids,
-    candidate,
-    change,
-) -> None:
-    left_image, scale, pad_x, pad_y = _fit_frame(frame.image_bgr)
-    right_image = left_image.copy()
-    observation = _track_observation(tracking, track_ids, frame.frame_index)
-    anchor_x, anchor_y, box = _anchor(
-        observation=observation,
-        scale=scale,
-        left=pad_x,
-        top=pad_y,
-        frame_shape=left_image.shape,
-    )
-    if box is not None:
-        cv2.rectangle(left_image, box[:2], box[2:], _PARENT, 5)
-        cv2.rectangle(right_image, box[:2], box[2:], _PARENT, 4)
-    cv2.circle(left_image, (anchor_x, anchor_y), 13, _PARENT, -1, cv2.LINE_AA)
-    cv2.circle(left_image, (anchor_x, anchor_y), 20, (255, 255, 255), 3, cv2.LINE_AA)
-    _frame_banner(left_image, "parent state", _PARENT)
-
-    if candidate.status == "instantiated":
-        color = _candidate_color(0)
-        delta_x, delta_y = _arrow_delta(change)
-        end_x = int(np.clip(anchor_x + delta_x, 24, _FRAME_WIDTH - 24))
-        end_y = int(np.clip(anchor_y + delta_y, 80, _FRAME_HEIGHT - 24))
-        cv2.circle(right_image, (anchor_x, anchor_y), 11, _PARENT, -1, cv2.LINE_AA)
-        cv2.arrowedLine(
-            right_image,
-            (anchor_x, anchor_y),
-            (end_x, end_y),
-            color,
-            9,
-            cv2.LINE_AA,
-            tipLength=0.20,
-        )
-        cv2.circle(right_image, (end_x, end_y), 14, color, -1, cv2.LINE_AA)
-        label = "child candidate | not selected"
-        if candidate.discrete_changes and not candidate.numerical_changes:
-            _put(
-                right_image,
-                candidate.discrete_changes[0].after_value.replace("_", " "),
-                (max(24, anchor_x - 150), min(_FRAME_HEIGHT - 26, anchor_y + 74)),
-                scale=0.68,
-                color=color,
-            )
-    else:
-        color = _ERROR if candidate.status == "unsupported" else _WARNING
-        cv2.rectangle(
-            right_image,
-            (anchor_x - 128, anchor_y - 38),
-            (anchor_x + 128, anchor_y + 38),
-            color,
-            5,
-        )
-        _put(
-            right_image,
-            candidate.status.replace("_", " "),
-            (anchor_x - 108, anchor_y + 10),
-            scale=0.72,
-            color=color,
-        )
-        label = f"{candidate.status.replace('_', ' ')} | no child"
-    _frame_banner(right_image, label, color)
-    _put(
-        right_image,
-        "state-space arrow; source frame is unchanged",
-        (20, _FRAME_HEIGHT - 18),
-        scale=0.56,
-        color=(238, 238, 238),
-        thickness=1,
-    )
-    canvas[
-        _FRAME_TOP : _FRAME_TOP + _FRAME_HEIGHT,
-        30 : 30 + _FRAME_WIDTH,
-    ] = left_image
-    right_x = 30 + _FRAME_WIDTH + _FRAME_GAP
-    canvas[
-        _FRAME_TOP : _FRAME_TOP + _FRAME_HEIGHT,
-        right_x : right_x + _FRAME_WIDTH,
-    ] = right_image
-
-
 def _maximum_sigma(proposal) -> float | None:
     for bound in proposal.parameter_bounds:
         if bound.parameter_name in {
@@ -404,231 +692,6 @@ def _maximum_sigma(proposal) -> float | None:
         }:
             return float(bound.upper_bound)
     return None
-
-
-def _candidate_sigma_series(candidate) -> dict[int, float]:
-    values: dict[int, float] = {}
-    for change in candidate.numerical_changes:
-        if change.maximum_standardized_delta is None:
-            continue
-        values[change.frame_index] = max(
-            values.get(change.frame_index, 0.0),
-            float(change.maximum_standardized_delta),
-        )
-    return values
-
-
-def _draw_delta_chart(canvas: np.ndarray, *, proposal, result) -> None:
-    x0, x1 = 72, 1160
-    y0, y1 = _CHART_TOP + 58, _CHART_BOTTOM - 42
-    _put(canvas, "bounded state change", (52, _CHART_TOP + 28), scale=0.82)
-    candidates = _instantiated(result)
-    series = [_candidate_sigma_series(row) for row in candidates]
-    bound = _maximum_sigma(proposal)
-    ymax = max(
-        1.0,
-        float(bound or 0.0),
-        max((max(row.values(), default=0.0) for row in series), default=0.0),
-    )
-    cv2.rectangle(canvas, (x0, y0), (x1, y1), _DARK, 2)
-    for fraction in (0.0, 0.5, 1.0):
-        y = int(round(y1 - fraction * (y1 - y0)))
-        cv2.line(canvas, (x0, y), (x1, y), _GRID, 1)
-        _put(
-            canvas,
-            f"{fraction * ymax:.2g}",
-            (x0 - 58, y + 6),
-            scale=0.53,
-            color=_MUTED,
-            thickness=1,
-        )
-    start, end = proposal.start_frame_index, proposal.end_frame_index
-
-    def to_x(frame_index: int) -> int:
-        return int(round(x0 + (x1 - x0) * (frame_index - start) / max(1, end - start)))
-
-    def to_y(value: float) -> int:
-        return int(round(y1 - (y1 - y0) * value / ymax))
-
-    if bound is not None:
-        y = to_y(bound)
-        cv2.line(canvas, (x0, y), (x1, y), _ERROR, 3, cv2.LINE_AA)
-        _put(canvas, f"bound {bound:g} sigma", (x1 - 190, y - 10), scale=0.54, color=_ERROR)
-    plotted = False
-    for index, (candidate, values) in enumerate(zip(candidates[:6], series[:6])):
-        if not values:
-            continue
-        plotted = True
-        color = _candidate_color(index)
-        points = [(to_x(frame), to_y(value)) for frame, value in sorted(values.items())]
-        if len(points) == 1:
-            cv2.circle(canvas, points[0], 9, color, -1, cv2.LINE_AA)
-        else:
-            cv2.polylines(
-                canvas, [np.asarray(points, dtype=np.int32)], False, color, 5, cv2.LINE_AA
-            )
-            for point in points:
-                cv2.circle(canvas, point, 7, color, -1, cv2.LINE_AA)
-        _put(
-            canvas,
-            f"candidate {index + 1:02d}",
-            (x0 + 16 + index * 168, y0 + 28),
-            scale=0.52,
-            color=color,
-            thickness=2,
-        )
-    if not plotted:
-        if candidates and any(row.discrete_changes for row in candidates):
-            change = next(row.discrete_changes[0] for row in candidates if row.discrete_changes)
-            _label_value(
-                canvas,
-                label="before",
-                value=change.before_value.replace("_", " "),
-                origin=(x0 + 70, y0 + 104),
-                color=_PARENT,
-                scale=0.77,
-            )
-            cv2.arrowedLine(
-                canvas,
-                (x0 + 300, y0 + 142),
-                (x0 + 780, y0 + 142),
-                _candidate_color(0),
-                9,
-                cv2.LINE_AA,
-                tipLength=0.06,
-            )
-            _label_value(
-                canvas,
-                label="after",
-                value=change.after_value.replace("_", " "),
-                origin=(x0 + 800, y0 + 150),
-                color=_candidate_color(0),
-                scale=0.77,
-            )
-        else:
-            _put(
-                canvas,
-                "no numerical child state was emitted",
-                (x0 + 250, y0 + 145),
-                scale=0.79,
-                color=_MUTED,
-            )
-    _put(canvas, str(start), (x0 - 8, y1 + 31), scale=0.56, color=_MUTED, thickness=1)
-    _put(canvas, str(end), (x1 - 24, y1 + 31), scale=0.56, color=_MUTED, thickness=1)
-    _put(canvas, "frame", (x0 + (x1 - x0) // 2 - 28, y1 + 34), scale=0.56, color=_MUTED)
-    _put(canvas, "position update (sigma)", (x0, y0 - 12), scale=0.55, color=_MUTED)
-
-
-def _draw_objective_chart(canvas: np.ndarray, *, result) -> None:
-    x0, x1 = 1240, 1870
-    _put(canvas, "objective total | lower is better", (x0, _CHART_TOP + 28), scale=0.82)
-    candidates = _instantiated(result)[:6]
-    if not candidates:
-        audit = result.candidates[0]
-        _label_value(
-            canvas,
-            label="result",
-            value=audit.status.replace("_", " "),
-            origin=(x0 + 24, _CHART_TOP + 112),
-            color=_ERROR if audit.status == "unsupported" else _WARNING,
-            scale=0.82,
-        )
-        lines = _wrapped("; ".join(audit.limitations), 52)[:3]
-        for index, line in enumerate(lines):
-            _put(
-                canvas,
-                line,
-                (x0 + 24, _CHART_TOP + 166 + index * 38),
-                scale=0.63,
-                color=_MUTED,
-                thickness=1,
-            )
-        return
-    values = [float(row.objective_before.total) for row in candidates]
-    values += [float(row.objective_after.total) for row in candidates]
-    maximum = max(max(values, default=0.0), 1e-12)
-    chart_left = x0 + 164
-    chart_right = x1 - 12
-    row_height = min(68, max(42, 250 // len(candidates)))
-    for index, candidate in enumerate(candidates):
-        y = _CHART_TOP + 78 + index * row_height
-        before = float(candidate.objective_before.total)
-        after = float(candidate.objective_after.total)
-        _put(canvas, f"candidate {index + 1:02d}", (x0, y + 13), scale=0.57, color=_DARK)
-        before_x = chart_left + int((chart_right - chart_left) * before / maximum)
-        after_x = chart_left + int((chart_right - chart_left) * after / maximum)
-        cv2.line(canvas, (chart_left, y - 8), (before_x, y - 8), _PARENT, 10, cv2.LINE_AA)
-        cv2.line(
-            canvas,
-            (chart_left, y + 13),
-            (after_x, y + 13),
-            _candidate_color(index),
-            10,
-            cv2.LINE_AA,
-        )
-        _put(canvas, f"{before:.3g}", (min(before_x + 8, chart_right - 52), y - 2), scale=0.49, color=_PARENT)
-        _put(canvas, f"{after:.3g}", (min(after_x + 8, chart_right - 52), y + 24), scale=0.49, color=_candidate_color(index))
-    _put(canvas, "parent", (chart_left, _CHART_BOTTOM - 16), scale=0.55, color=_PARENT)
-    _put(canvas, "child", (chart_left + 112, _CHART_BOTTOM - 16), scale=0.55, color=_candidate_color(0))
-    _put(canvas, "Step 9 decides acceptance", (x1 - 244, _CHART_BOTTOM - 16), scale=0.55, color=_MUTED)
-
-
-def _change_accounting(result) -> tuple[int, int, int]:
-    candidates = _instantiated(result)
-    numeric = sum(len(row.numerical_changes) for row in candidates)
-    discrete = sum(len(row.discrete_changes) for row in candidates)
-    frames = {
-        change.frame_index
-        for row in candidates
-        for change in row.numerical_changes
-    }
-    return numeric, discrete, len(frames)
-
-
-def _draw_text_region(canvas: np.ndarray, *, proposal, result, store) -> None:
-    left_x, right_x = 52, 1010
-    _put(canvas, "Quantitative change", (left_x, _TEXT_TOP), scale=0.86)
-    numeric, discrete, frames = _change_accounting(result)
-    candidates = _instantiated(result)
-    rows = (
-        ("child candidates", str(len(candidates)), _candidate_color(0)),
-        ("changed states", f"{numeric} numeric | {discrete} discrete", _candidate_color(0)),
-        ("changed frames", str(frames), _candidate_color(0)),
-        (
-            "boundary",
-            "preserved" if all(row.boundary_preserved for row in result.candidates) else "failed",
-            _candidate_color(0),
-        ),
-    )
-    for index, (label, value, color) in enumerate(rows):
-        _label_value(
-            canvas,
-            label=label,
-            value=value,
-            origin=(left_x, _TEXT_TOP + 48 + index * 43),
-            color=color,
-            scale=0.72,
-        )
-    _put(canvas, "Optimization safety", (right_x, _TEXT_TOP), scale=0.86)
-    all_candidates = result.candidates
-    optimized = len({value for row in all_candidates for value in row.optimized_residual_ids})
-    excluded = len({value for row in all_candidates for value in row.excluded_check_residual_ids})
-    safety = (
-        ("objective", f"fit {store.config.fit_objective_weight:g} + physics {store.config.physics_objective_weight:g}", _candidate_color(0)),
-        ("optimized residuals", str(optimized), _candidate_color(0)),
-        ("check-only excluded", str(excluded), _WARNING),
-        ("selection", "none | parent retained", _PARENT),
-    )
-    for index, (label, value, color) in enumerate(safety):
-        _label_value(
-            canvas,
-            label=label,
-            value=value,
-            origin=(right_x, _TEXT_TOP + 48 + index * 43),
-            color=color,
-            scale=0.72,
-        )
-    cv2.line(canvas, (960, _TEXT_TOP - 18), (960, _HEIGHT - 28), _GRID, 2)
 
 
 def _proposal_panel(
@@ -640,51 +703,54 @@ def _proposal_panel(
     tracking,
     frame,
     parent_rank: int,
-    store,
+    diagnosis,
+    diagnoses,
 ) -> np.ndarray:
     canvas = np.full((_HEIGHT, _WIDTH, 3), _WHITE, dtype=np.uint8)
+    component_ids, track_ids = _subjects(proposal, residual_packet)
+    target_kind = _target_kind(proposal, component_ids, track_ids)
     status_color = (
         _candidate_color(0)
         if result.status == "candidates_generated"
         else _ERROR if result.status == "unsupported" else _WARNING
     )
-    cv2.rectangle(canvas, (0, 0), (18, _HEADER_BOTTOM), status_color, -1)
-    title = f"proposal {proposal_number:02d} | {proposal.operator.value.replace('_', ' ')}"
-    _put(canvas, title, (42, 51), scale=1.02, color=_DARK, thickness=2)
+    cv2.rectangle(canvas, (0, 0), (_WIDTH, 74), _DARK, -1)
     _put(
         canvas,
-        f"parent rank {parent_rank:02d} | frames {proposal.start_frame_index}-{proposal.end_frame_index} | {result.status.replace('_', ' ')}",
-        (43, 86),
-        scale=0.67,
-        color=_MUTED,
-        thickness=1,
+        f"STEP 8  |  {proposal.operator.value.replace('_', ' ').upper()}  |  PROPOSAL {proposal_number:02d}",
+        (30, 47),
+        scale=0.82,
+        color=(255, 255, 255),
+        thickness=2,
     )
-    _label_value(
+    _put(
         canvas,
-        label="result",
-        value=(
-            f"{len(_instantiated(result))} child candidates | none selected"
-            if _instantiated(result)
-            else "no child emitted"
-        ),
-        origin=(1350, 64),
+        f"RANK {parent_rank:02d}  |  FRAMES {proposal.start_frame_index}-{proposal.end_frame_index}  |  {result.status.replace('_', ' ').upper()}",
+        (1290, 47),
+        scale=0.55,
         color=status_color,
-        scale=0.66,
+        thickness=2,
     )
-    representative = _representative_candidate(result)
-    _, track_ids = _subjects(proposal, residual_packet)
-    _, change = _display_change(representative, proposal)
-    _draw_frame_pair(
+    _draw_target_frame(
         canvas,
         frame=frame,
         tracking=tracking,
         track_ids=track_ids,
-        candidate=representative,
-        change=change,
+        target_kind=target_kind,
     )
-    _draw_delta_chart(canvas, proposal=proposal, result=result)
-    _draw_objective_chart(canvas, result=result)
-    _draw_text_region(canvas, proposal=proposal, result=result, store=store)
+    _draw_cause_chart(
+        canvas,
+        proposal=proposal,
+        residual_packet=residual_packet,
+        reason_color=_reason_color(diagnosis.category),
+    )
+    _draw_effect_chart(canvas, result=result)
+    _draw_audit_table(
+        canvas, proposal=proposal, result=result, target_kind=target_kind
+    )
+    _draw_reason_row(
+        canvas, active_diagnosis=diagnosis, diagnoses=diagnoses
+    )
     return canvas
 
 
@@ -734,6 +800,9 @@ def render_step8_visualizations(
                 stale.unlink()
             repair_packet = repair_packets[packet.parent_hypothesis_id]
             proposal_by_id = {row.proposal_id: row for row in repair_packet.proposals}
+            diagnosis_by_id = {
+                row.diagnosis_id: row for row in repair_packet.diagnoses
+            }
             residual_packet = residual_packets[packet.parent_hypothesis_id]
             rendered = []
             for proposal_number, result in enumerate(
@@ -753,7 +822,8 @@ def render_step8_visualizations(
                     tracking=tracking,
                     frame=frame_cache[frame_index],
                     parent_rank=parents[packet.parent_hypothesis_id].rank,
-                    store=store,
+                    diagnosis=diagnosis_by_id[proposal.diagnosis_id],
+                    diagnoses=repair_packet.diagnoses,
                 )
                 panel_path = proposal_root / (
                     f"proposal_{proposal_number:02d}_frame_{frame_index:06d}_"
@@ -764,6 +834,17 @@ def render_step8_visualizations(
                     {
                         "proposal_id": proposal.proposal_id,
                         "operator": proposal.operator.value,
+                        "diagnosis_category": diagnosis_by_id[
+                            proposal.diagnosis_id
+                        ].category.value,
+                        "diagnosis_rationale": diagnosis_by_id[
+                            proposal.diagnosis_id
+                        ].rationale,
+                        "affected_variables": list(proposal.affected_variables),
+                        "target_scope": _target_scope(
+                            proposal,
+                            *_subjects(proposal, residual_packet),
+                        ),
                         "result_status": result.status,
                         "child_candidate_count": sum(
                             row.status == "instantiated" for row in result.candidates
