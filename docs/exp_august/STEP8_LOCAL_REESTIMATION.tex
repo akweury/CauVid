@@ -1,0 +1,242 @@
+% Compile with LuaLaTeX:
+%   lualatex -interaction=nonstopmode -halt-on-error STEP8_LOCAL_REESTIMATION.tex
+% The page is exactly 16:9. All positions are explicit for stable review.
+\documentclass[10pt]{article}
+\usepackage[paperwidth=16in,paperheight=9in,margin=0in]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,backgrounds,calc,positioning}
+\pagestyle{empty}
+\setmainfont{Arial}
+\hyphenpenalty=10000
+\exhyphenpenalty=10000
+
+\definecolor{ink}{HTML}{172033}
+\definecolor{muted}{HTML}{526173}
+\definecolor{bluefill}{HTML}{EAF3FF}
+\definecolor{bluestroke}{HTML}{2F6FB3}
+\definecolor{greenfill}{HTML}{EAF8F0}
+\definecolor{greenstroke}{HTML}{2E7D5B}
+\definecolor{purplefill}{HTML}{F2ECFF}
+\definecolor{purplestroke}{HTML}{6842A8}
+\definecolor{amberfill}{HTML}{FFF5DC}
+\definecolor{amberstroke}{HTML}{A66B10}
+\definecolor{orangefill}{HTML}{FFF0E6}
+\definecolor{orangestroke}{HTML}{B85C2E}
+\definecolor{redfill}{HTML}{FDECEC}
+\definecolor{redstroke}{HTML}{A34848}
+\definecolor{slatefill}{HTML}{F2F5F8}
+\definecolor{slatestroke}{HTML}{657487}
+
+\newcommand{\twobullets}[2]{%
+  \parbox{1.78in}{\raggedright\fontsize{10.7}{12.6}\selectfont
+  \textbullet\ #1\\\textbullet\ #2}}
+\newcommand{\threebullets}[3]{%
+  \parbox{1.80in}{\raggedright\fontsize{10.4}{12.2}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\compactthree}[3]{%
+  \parbox{1.46in}{\raggedright\fontsize{9.9}{11.5}\selectfont
+  \textbullet\ #1\\\textbullet\ #2\\\textbullet\ #3}}
+\newcommand{\inputcontent}[2]{%
+  \parbox{1.72in}{\raggedright
+  \textbf{\fontsize{11.6}{13.5}\selectfont #1}\\[3pt]
+  {\fontsize{10.6}{12.4}\selectfont #2}}}
+
+\begin{document}
+\begin{tikzpicture}[
+  remember picture,
+  overlay,
+  shift={(current page.south west)},
+  x=1in,
+  y=1in,
+  every node/.style={font=\fontsize{11.5}{13.5}\selectfont,text=ink,align=center},
+  input/.style={
+    draw,
+    rounded corners=5pt,
+    line width=1.1pt,
+    minimum height=0.96in,
+    text width=1.72in,
+    inner xsep=6pt,
+    inner ysep=6pt,
+    align=left
+  },
+  stage/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.2pt,
+    minimum height=1.76in,
+    text width=1.80in,
+    inner xsep=7pt,
+    inner ysep=8pt
+  },
+  compactstage/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.2pt,
+    minimum height=1.76in,
+    text width=1.52in,
+    inner xsep=4pt,
+    inner ysep=8pt
+  },
+  branch/.style={
+    draw,
+    rounded corners=6pt,
+    line width=1.1pt,
+    minimum height=1.22in,
+    text width=1.80in,
+    inner xsep=6pt,
+    inner ysep=6pt
+  },
+  output/.style={
+    draw,
+    rounded corners=7pt,
+    line width=1.35pt,
+    minimum height=2.12in,
+    text width=1.50in,
+    inner xsep=5pt,
+    inner ysep=8pt,
+    fill=purplefill,
+    draw=purplestroke
+  },
+  flow/.style={
+    -{Latex[length=3.3mm,width=2.1mm]},
+    line width=1.4pt,
+    draw=ink,
+    rounded corners=6pt
+  },
+  audit/.style={
+    -{Latex[length=3.0mm,width=1.9mm]},
+    line width=1.2pt,
+    draw=slatestroke,
+    densely dashed,
+    rounded corners=5pt
+  },
+  bus/.style={
+    line width=1.25pt,
+    draw=slatestroke,
+    rounded corners=5pt
+  },
+  edgelabel/.style={
+    fill=none,
+    inner sep=1pt,
+    font=\fontsize{12.2}{14.2}\selectfont,
+    text=ink
+  }
+]
+
+\path[use as bounding box] (0,0) rectangle (16,9);
+
+% Header
+\node[font=\bfseries\fontsize{20}{23}\selectfont,anchor=north west]
+  at (0.40,8.78) {Step 8 - Bounded Local Re-estimation and Child Hypothesis Generation};
+\node[font=\fontsize{11.4}{13}\selectfont,text=muted,anchor=north west]
+  at (0.42,8.40) {Instantiate each Step 7 proposal inside its declared scope; emit auditable alternatives without mutating or selecting the parent};
+\node[font=\bfseries\fontsize{10.8}{12.8}\selectfont,text=purplestroke,anchor=north east]
+  at (15.60,8.69) {Output: immutable child candidates, reversible diffs and audit records};
+
+% Inputs
+\begin{scope}[on background layer]
+  \filldraw[fill=bluefill!34,draw=bluestroke!65,line width=1.2pt,rounded corners=10pt]
+    (0.38,1.58) rectangle (2.66,8.02);
+\end{scope}
+\node[font=\bfseries\fontsize{14}{16}\selectfont,anchor=west]
+  at (0.58,7.77) {Inputs};
+\node[font=\fontsize{10.8}{12.6}\selectfont,text=muted,anchor=west]
+  at (0.58,7.45) {$\mathcal{I}_8=\{\Delta_i,\mathcal H_i,\mathcal R_i,\Pi,\mathcal K\}$};
+
+\node[input,fill=orangefill,draw=orangestroke] (proposal) at (1.52,6.57)
+  {\inputcontent{Step 7 Proposal $\Delta_i$}
+  {operator, variables, frame window, bounds, effects and budget}};
+
+\node[input,fill=purplefill,draw=purplestroke] (parent) at (1.52,5.22)
+  {\inputcontent{Parent Hypothesis $\mathcal H_i$}
+  {ego poses, object trajectories, scale and observability state}};
+
+\node[input,fill=redfill,draw=redstroke] (residuals) at (1.52,3.87)
+  {\inputcontent{Residual Packet $\mathcal R_i$}
+  {target IDs, component or track IDs, uncertainty and evidence lineage}};
+
+\node[input,fill=slatefill,draw=slatestroke] (policy) at (1.52,2.52)
+  {\inputcontent{Frozen Policy $\Pi,\mathcal K$}
+  {fit versus check-only roles, limits, solver policy and contracts}};
+
+% Main stages
+\node[stage,fill=greenfill,draw=greenstroke] (scope) at (3.90,5.05)
+  {\textbf{\fontsize{12.8}{14.8}\selectfont 8.1 - Validate and Scope}\\[7pt]
+   \threebullets{verify hashes, ownership and identities}
+                {map residuals to subject + frame window}
+                {freeze parent, raw evidence and roles}};
+
+\node[stage,fill=amberfill,draw=amberstroke] (dispatch) at (6.30,5.05)
+  {\textbf{\fontsize{12.8}{14.8}\selectfont 8.2 - Permission Gate}\\[7pt]
+   \threebullets{check operator allow-list and budget}
+                {restrict mutable fields and bounds}
+                {dispatch with no neural re-extraction}};
+
+\node[branch,fill=bluefill,draw=bluestroke] (numerical) at (8.72,6.53)
+  {\textbf{\fontsize{12.1}{14.1}\selectfont Numerical Refit}\\[5pt]
+   \twobullets{local dynamics or process-noise candidates}
+              {fixed boundaries; recompute velocity and speed}};
+
+\node[branch,fill=greenfill,draw=greenstroke] (discrete) at (8.72,4.90)
+  {\textbf{\fontsize{12.1}{14.1}\selectfont Discrete State Change}\\[5pt]
+   \twobullets{mark occluded or unobservable}
+              {record categorical before and after values}};
+
+\node[branch,fill=redfill,draw=redstroke] (unsupported) at (8.72,3.27)
+  {\textbf{\fontsize{12.1}{14.1}\selectfont Unsupported Audit}\\[5pt]
+   \twobullets{tracking or candidate-bank rewrite required}
+              {emit explicit unsupported or unresolved status}};
+
+\node[compactstage,fill=orangefill,draw=orangestroke] (candidate) at (10.76,5.05)
+  {\textbf{\fontsize{11.6}{13.4}\selectfont 8.3 - Materialize Candidates}\\[7pt]
+   \compactthree{deterministic strengths up to child cap}
+                {new child ID plus reversible field diff}
+                {parent remains byte-for-byte immutable}};
+
+\node[compactstage,fill=amberfill,draw=amberstroke] (objective) at (12.58,5.05)
+  {\textbf{\fontsize{11.6}{13.4}\selectfont 8.4 - Objective and Guards}\\[7pt]
+   \compactthree{$J=w_fJ_{\mathrm{fit}}+w_pJ_{\mathrm{phys}}$}
+                {exclude every check-only residual}
+                {verify bounds, boundary and compute budget}};
+
+\node[output] (typed) at (14.70,5.05)
+  {\textbf{\fontsize{11.7}{13.5}\selectfont 8.5 - Typed Output}\\[7pt]
+   \compactthree{zero or more child hypotheses}
+                {objective terms, diffs and limitations}
+                {candidate, no-change, unsupported or unresolved}};
+
+% Main flow
+\draw[flow] (2.66,5.05) -- node[edgelabel,above=7pt] {$\mathcal I_8$} (scope.west);
+\draw[flow] (scope.east) -- (dispatch.west);
+\coordinate (dispatchbus) at (7.52,5.05);
+\draw[bus] (dispatch.east) -- (dispatchbus);
+\draw[bus] (7.52,3.27) -- (7.52,6.53);
+\draw[flow] (7.52,6.53) -- (numerical.west);
+\draw[flow] (7.52,4.90) -- (discrete.west);
+\draw[audit] (7.52,3.27) -- (unsupported.west);
+\draw[flow] (numerical.east) -| ([xshift=-0.18in]candidate.west) -- (candidate.west);
+\draw[flow] (discrete.east) -- (candidate.west);
+\draw[audit] (unsupported.east) -| ([xshift=-0.18in]candidate.west) -- (candidate.west);
+\draw[flow] (candidate.east) -- (objective.west);
+\draw[flow] (objective.east) -- (typed.west);
+\draw[flow] (typed.east) -- (15.78,5.05);
+
+% Safety boundary
+\node[draw=redstroke,fill=redfill,rounded corners=5pt,line width=1.0pt,
+      text width=12.20in,minimum height=0.72in,inner sep=7pt,
+      font=\bfseries\fontsize{11.0}{13.0}\selectfont]
+  at (9.24,1.45)
+  {Step 8 generates alternatives only: parent state and raw evidence are immutable, check-only evidence cannot drive optimization, and no candidate is accepted, ranked or selected here.};
+
+% Footer
+\node[anchor=south west,font=\fontsize{10.7}{12.6}\selectfont,text=muted]
+  at (2.98,0.68) {Visualization branch: target frame (EGO or labeled object box), current error versus acceptable limit, candidate objective movement, audit table and color-linked possible causes.};
+\node[anchor=south west,font=\fontsize{10.0}{12.0}\selectfont,text=muted]
+  at (0.42,0.27) {Implemented by inference/step08\_local\_reestimation.py with contracts/local\_reestimation.py.};
+\node[anchor=south east,font=\fontsize{10.0}{12.0}\selectfont,text=muted]
+  at (15.58,0.27) {Step 9 owns feasibility, independent check evaluation, ranking and retention.};
+
+\end{tikzpicture}
+\end{document}

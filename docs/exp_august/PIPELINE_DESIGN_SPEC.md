@@ -857,6 +857,11 @@ require a mutable tracking or candidate-bank child are retained as explicit
 
 ### Step 8 — Local Re-estimation
 
+Detailed 16:9 subfigure: [`STEP8_LOCAL_REESTIMATION.pdf`](./STEP8_LOCAL_REESTIMATION.pdf)
+for review/print, [`STEP8_LOCAL_REESTIMATION.svg`](./STEP8_LOCAL_REESTIMATION.svg)
+for browser/Markdown, and [`STEP8_LOCAL_REESTIMATION.tex`](./STEP8_LOCAL_REESTIMATION.tex)
+for editing.
+
 **Purpose:** apply each permitted repair only where needed and generate new
 hypotheses.
 
@@ -912,12 +917,14 @@ differences. Thus Step 7's arrow names an operator and its permitted direction;
 Step 8 supplies concrete, bounded candidate values and records their measured
 objective terms.
 
-The Step 8 visualization emits one 1920x1220 panel per proposal. It compares
-parent and child overlays on the same source frame, uses thick state-space
-arrows, plots all instantiated candidates against their declared numerical
-bound, and reports objective, reversible-diff and evidence-isolation accounting.
-No multi-proposal overview is produced and no displayed candidate is labeled as
-selected.
+The Step 8 visualization emits one 1920x1220 panel per proposal. Its target
+frame shows only `EGO` for ego-state changes or a labeled bounding box for an
+object-state change. A cause plot compares the current residual error with its
+acceptable limit; its color matches the active diagnosis in the bottom row of
+all primary and alternative causes. Candidate objective movement is visualized
+separately, while numerical changes, bounds, boundary preservation and status
+remain in a compact audit table. No multi-proposal overview is produced and no
+displayed candidate is labeled as selected.
 
 ---
 

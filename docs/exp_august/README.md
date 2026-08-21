@@ -17,6 +17,9 @@
 - [`STEP7_DIAGNOSE_PROPOSE.tex`](./STEP7_DIAGNOSE_PROPOSE.tex): editable 16:9 TikZ subfigure for Step 7 failure diagnosis and bounded repair proposals.
 - [`STEP7_DIAGNOSE_PROPOSE.pdf`](./STEP7_DIAGNOSE_PROPOSE.pdf): review and print version of the Step 7 subfigure.
 - [`STEP7_DIAGNOSE_PROPOSE.svg`](./STEP7_DIAGNOSE_PROPOSE.svg): browser/Markdown vector version of the Step 7 subfigure.
+- [`STEP8_LOCAL_REESTIMATION.tex`](./STEP8_LOCAL_REESTIMATION.tex): editable 16:9 TikZ subfigure for Step 8 bounded local re-estimation and child hypothesis generation.
+- [`STEP8_LOCAL_REESTIMATION.pdf`](./STEP8_LOCAL_REESTIMATION.pdf): review and print version of the Step 8 subfigure.
+- [`STEP8_LOCAL_REESTIMATION.svg`](./STEP8_LOCAL_REESTIMATION.svg): browser/Markdown vector version of the Step 8 subfigure.
 - [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md): archived review of the legacy linear
   baseline; it is not the status report for the current inference runner.
 - [`src/exp_august/README.md`](../../src/exp_august/README.md): commands for running and evaluating the implemented pipeline.
