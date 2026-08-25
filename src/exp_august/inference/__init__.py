@@ -1,5 +1,6 @@
 """Target training-free inference implementation for ``exp_august``."""
 
+from .association import AssociationOutcome, assign_one_to_one_matches
 from .step01_init import Step1Result, VideoValidationError, run_step1
 from .depth_backend import Da3DepthEvidenceBackend, DisabledDepthBackend
 from .flow_backend import DisabledFlowBackend, RaftFlowEvidenceBackend
@@ -24,6 +25,7 @@ from .step08_local_reestimation import Step8Result, run_step8
 from .step08_visualization import render_step8_visualizations
 
 __all__ = [
+    "AssociationOutcome",
     "DisabledObjectBackend",
     "Da3DepthEvidenceBackend",
     "DisabledDepthBackend",
@@ -41,6 +43,7 @@ __all__ = [
     "Step8Result",
     "VideoValidationError",
     "YoloWorldEvidenceBackend",
+    "assign_one_to_one_matches",
     "run_step1",
     "run_step2",
     "run_step3",

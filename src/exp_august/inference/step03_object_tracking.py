@@ -8,7 +8,6 @@ from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 from src.exp_august.contracts import (
     ArtifactLink,
@@ -53,6 +52,7 @@ from src.exp_august.contracts import (
     VideoEvidenceManifest,
     VideoTrackingManifest,
 )
+from src.exp_august.inference.association import assign_one_to_one_matches
 from src.exp_august.contracts.codec import (
     hash_payload,
     read_contract,
@@ -1145,34 +1145,15 @@ def _build_video_package(
                 evaluations[(track.track_id, instance.detection.detection_id)] = evaluation
         expected_pairs += len(evaluations)
 
-        selected_pairs: set[tuple[str, str]] = set()
-        if active_tracks and instances:
-            cost = np.full((len(active_tracks), len(instances)), 1e6, dtype=np.float64)
-            for track_index, track in enumerate(active_tracks):
-                for instance_index, instance in enumerate(instances):
-                    evaluation = evaluations[(track.track_id, instance.detection.detection_id)]
-                    if evaluation.feasible:
-                        cost[track_index, instance_index] = 1.0 - evaluation.total_score
-            rows, columns = linear_sum_assignment(cost)
-            for row, column in zip(rows, columns):
-                evaluation = evaluations[
-                    (active_tracks[row].track_id, instances[column].detection.detection_id)
-                ]
-                if evaluation.feasible and evaluation.total_score >= config.minimum_assignment_score:
-                    selected_pairs.add((evaluation.track_id, evaluation.detection_id))
-
-        ranks: dict[tuple[str, str], int] = {}
-        for track in active_tracks:
-            ordered = sorted(
-                (
-                    evaluation
-                    for (track_id, _), evaluation in evaluations.items()
-                    if track_id == track.track_id
-                ),
-                key=lambda item: (-item.total_score, item.detection_id),
-            )
-            for rank, evaluation in enumerate(ordered, 1):
-                ranks[(evaluation.track_id, evaluation.detection_id)] = rank
+        assignment = assign_one_to_one_matches(
+            track_ids=[track.track_id for track in active_tracks],
+            detection_ids=[instance.detection.detection_id for instance in instances],
+            score_by_pair={pair: evaluation.total_score for pair, evaluation in evaluations.items()},
+            feasible_by_pair={pair: evaluation.feasible for pair, evaluation in evaluations.items()},
+            minimum_score=config.minimum_assignment_score,
+        )
+        selected_pairs = set(assignment.selected_pairs)
+        ranks = assignment.rank_by_pair
         selected_detection_ids = {detection_id for _, detection_id in selected_pairs}
         for evaluation in sorted(evaluations.values(), key=lambda item: (item.track_id, item.detection_id)):
             pair = (evaluation.track_id, evaluation.detection_id)
