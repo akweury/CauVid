@@ -264,27 +264,7 @@ class WaymoCOCOConverter():
                       sort_keys=False)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--tfrecord_dir', required=True, type=str)
-    parser.add_argument('--work_dir', default='.', type=str)
-    parser.add_argument('--image_dirname', required=True, type=str)
-    parser.add_argument('--image_filename_prefix', default=None, type=str)
-    parser.add_argument('--skip_write_image', action='store_true')
-    parser.add_argument('--label_dirname', default='annotations', type=str)
-    parser.add_argument('--label_filename', required=True, type=str)
-    parser.add_argument('--json_indent', default=None, type=int)
-    parser.add_argument('--add_waymo_info', action='store_true')
-    parser.add_argument(
-        '--frame_index_ones_place',
-        default=None,
-        type=int,
-        help='extract 1/10 size dataset based on ones place of frame index.')
-    parser.add_argument('--sequence_limit',
-                        default=None,
-                        type=int,
-                        help='limit number of sequences. useful for debug.')
-    args = parser.parse_args()
+def main(args):
 
     image_dir = os.path.join(args.work_dir, args.image_dirname)
     label_dir = os.path.join(args.work_dir, args.label_dirname)

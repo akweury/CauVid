@@ -29,7 +29,6 @@ def step_0_setup(args):
         args.device = "cuda:0"
         args.dataset_path = Path('/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
-
     # dgx
     elif args.machine == "dgx":
         print("\n##### Running on DGX #####\n")
@@ -83,6 +82,7 @@ def step_0_setup(args):
 
 
 def get_step_01_input(args):
+
     data_num = args.data_num
     if args.dataset == "bdd100k":
         video_dir = args.dataset_path / "videos"
@@ -152,16 +152,40 @@ def get_step_01_input(args):
                 
             }
     elif args.dataset == "roadpp":
-        raw_file_path = args.dataset_path
+        video_dir = args.dataset_path / "videos"
+        frame_dir = args.dataset_path / "frames"
+        depth_dir = args.dataset_path / "depth_maps"
+        flow_dir = args.dataset_path / "flows"
+        gt_json_file = args.dataset_path / "road_waymo_trainval_v1.0.json"
+        os.makedirs(frame_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
+        os.makedirs(flow_dir, exist_ok=True)
+
+        all_video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
+        all_frame_paths = [os.path.join(frame_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
+        all_depth_paths = [os.path.join(depth_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
+        all_video_ids = [os.path.splitext(os.path.basename(f))[0] for f in all_video_paths]
+        all_flow_paths = [os.path.join(flow_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
+
         output_dir = args.output_dir / "step01_output"
         os.makedirs(output_dir, exist_ok=True)
+
         input_data = {
+                        "use_gt":args.use_gt,
+                        "gt_json_file": gt_json_file,
                         "allow_model_download": ALLOW_MODEL_DOWNLOAD,
+                        "video_ids": all_video_ids,
+                        "video_path": all_video_paths,
+                        "frame_path": all_frame_paths,
+                        "depth_path": all_depth_paths,
+                        "flow_path": all_flow_paths,
                         "output_dir": output_dir,
+                        "frame_rate":  args.frame_rate,
                         "device": args.device,
                         "primary_confidence": args.primary_confidence,
                         "nms_iou": args.nms_iou,
                         "mask_label_top_k": getattr(args, "mask_label_top_k", 3),
+                        "data_num": args.data_num,
                         # Flow model
                         "flow_consistency_threshold_px": args.flow_consistency_threshold_px,                        
         }
@@ -171,4 +195,45 @@ def get_step_01_input(args):
     
     
 
+    return input_data
+
+
+def get_step_02_input(args):
+    output_dir = args.output_dir / "step02_output"
+    os.makedirs(output_dir, exist_ok=True)
+    input_data = {
+        'use_gt': args.use_gt,
+        "output_dir": output_dir,
+        "device": args.device,
+        "step01_output_dir": args.output_dir / "step01_output",
+        "mask_iou_th": args.mask_iou_th,
+        "top_k": args.tracker_top_k,
+        "window_size": args.tracker_window_size,
+        "frame_rate": args.frame_rate,
+    }
+    
+    return input_data
+
+
+
+def get_step_03_input(args):
+    output_dir = args.output_dir / "step03_output"
+    os.makedirs(output_dir, exist_ok=True)
+    input_data = {
+        "output_dir": output_dir,
+        "step01_output_dir": args.output_dir / "step01_output",
+        "step02_output_dir": args.output_dir / "step02_output",
+        "device": args.device,
+    }
+    return input_data
+
+
+def get_step_04_input(args):
+    output_dir = args.output_dir / "step04_output"
+    os.makedirs(output_dir, exist_ok=True)
+    input_data = {
+        "output_dir": output_dir,
+        "step03_output_dir": args.output_dir / "step03_output",
+        "device": args.device,
+    }
     return input_data

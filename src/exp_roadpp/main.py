@@ -1,9 +1,9 @@
 import numpy as np
 
 
-from exp_roadpp import utils_pipe
-from src.exp_roadpp import step01, step02
-from src.exp_roadpp import config
+import utils_pipe
+import step01, step02, step03, step04
+import config
 
 
 
@@ -19,6 +19,15 @@ def main():
     # step 2: estimate the 3D pose of each object in each frame.
     step02_input = config.get_step_02_input(args)
     step02.main(step02_input)
+
+    # step 3: take trajectories as input, output symbolic facts
+    step03_input = config.get_step_03_input(args)
+    step03.main(step03_input)
+
+    # step 4: causal reasoning
+    step_04_input = config.get_step_04_input(args)
+    step04.main(step_04_input)
+
     return   
 
 

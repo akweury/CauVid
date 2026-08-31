@@ -1,7 +1,8 @@
 {
+    "use_gt": true,
     "data_num": "1",
     "mask_iou_th": 0.1,
-    "bdd100k_frame_rate": 10,
+    "frame_rate": 10,
     "primary_confidence": 0.3,
     "candidate_confidence": 0.05,
     "nms_iou": 0.5,
