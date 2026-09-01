@@ -1,3 +1,5 @@
+from collections import Counter
+
 import utils_data 
 
 
@@ -11,18 +13,75 @@ def time_overlap(start1, end1, start2, end2):
 class Rule:
     head: None
     body: None
-    def __init__(self, fact_tuple):
+    def __init__(self, fact_tuple, support=1, total_support=1, evidence_count=1):
         self.head = {'av_action_id': fact_tuple[0]}
-        self.body = {'agent_class': fact_tuple[1], 
-                     'action': fact_tuple[2], 
-                     'location': fact_tuple[3]
-                     }
+        self.body = {
+            'agent_class': fact_tuple[1],
+            'action': tuple(fact_tuple[2]) if isinstance(fact_tuple[2], (list, tuple)) else (fact_tuple[2],),
+            'location': tuple(fact_tuple[3]) if isinstance(fact_tuple[3], (list, tuple)) else (fact_tuple[3],),
+        }
+        self.support = int(support)
+        self.total_support = max(1, int(total_support))
+        self.evidence_count = max(1, int(evidence_count))
+
+    @property
+    def confidence(self):
+        return float(self.support / self.evidence_count)
+
+    @property
+    def coverage(self):
+        return float(self.support / self.total_support)
+
+    @property
+    def rank_key(self):
+        return [
+            -int(self.support),
+            -round(self.coverage, 12),
+            -round(self.confidence, 12),
+            int(self.head['av_action_id']),
+            int(self.body['agent_class']),
+            list(self.body['action']),
+            list(self.body['location']),
+        ]
+
+    def to_dict(self):
+        return {
+            'head': self.head,
+            'body': {
+                'agent_class': self.body['agent_class'],
+                'action': list(self.body['action']),
+                'location': list(self.body['location']),
+            },
+            'support': self.support,
+            'total_support': self.total_support,
+            'coverage': self.coverage,
+            'confidence': self.confidence,
+            'rank_key': list(self.rank_key),
+        }
     
 
 
 class Language:
     def __init__(self, ):
         pass
+
+    @staticmethod
+    def _flatten_ids(values):
+        flattened = []
+        for value in values:
+            if isinstance(value, (list, tuple, set)):
+                flattened.extend(value)
+            else:
+                flattened.append(value)
+        return tuple(flattened)
+
+    @staticmethod
+    def _rule_signature(head, agent_class, action_ids, loc_ids):
+        return (head, agent_class, tuple(action_ids), tuple(loc_ids))
+
+    def evaluate_rule(self, rule, support, total_support, evidence_count):
+        return Rule(rule, support=support, total_support=total_support, evidence_count=evidence_count).to_dict()
+
     def segs2atoms(self,target, segments, frames=None):
         atoms = []
         if target == "av":
@@ -119,20 +178,54 @@ class Language:
         return facts
 
     def facts2rules(self, facts):
-        fact_tuples = []
+        rule_supports = Counter()
+        rule_evidence = Counter()
         for fact in facts:
             if 'av_action_id' not in fact:
                 continue
             head = fact['av_action_id']
             for agent in fact['agents']:
-                actions = [pair['action_ids'] for pair in agent['frame-action-location']]
-                locs = [pair['loc_ids'] for pair in agent['frame-action-location']]
+                frame_action_location = agent.get('frame-action-location', []) or []
+                if not frame_action_location:
+                    continue
                 agent_class = agent['class']
-                
-                agent_fact_tuples = [(head, agent_class, tuple(a), tuple(l)) for a in actions for l in locs]
-                fact_tuples.extend(agent_fact_tuples)
-        fact_tuples = list(set(fact_tuples))
-        rules = [Rule(fact_tuple) for fact_tuple in fact_tuples]
+
+                action_options = []
+                loc_options = []
+                for pair in frame_action_location:
+                    action_ids = self._flatten_ids(pair.get('action_ids', []))
+                    loc_ids = self._flatten_ids(pair.get('loc_ids', []))
+                    if not action_ids or not loc_ids:
+                        continue
+                    action_options.append(action_ids)
+                    loc_options.append(loc_ids)
+
+                if not action_options or not loc_options:
+                    continue
+
+                evidence_count = len(action_options) * len(loc_options)
+                for action_ids in action_options:
+                    for loc_ids in loc_options:
+                        signature = self._rule_signature(head, agent_class, action_ids, loc_ids)
+                        rule_supports[signature] += 1
+                        rule_evidence[signature] += evidence_count
+
+        total_support_by_head = Counter()
+        for (head, _agent_class, _action_ids, _loc_ids), support in rule_supports.items():
+            total_support_by_head[head] += support
+
+        rules = []
+        for signature, support in rule_supports.items():
+            head, agent_class, action_ids, loc_ids = signature
+            rule = self.evaluate_rule(
+                (head, agent_class, action_ids, loc_ids),
+                support=support,
+                total_support=total_support_by_head[head],
+                evidence_count=rule_evidence[signature],
+            )
+            rules.append(rule)
+
+        rules.sort(key=lambda row: tuple(row['rank_key']))
         return rules
 
 
