@@ -111,25 +111,6 @@ def _video_to_low_fps_frames(frame_rate, frame_paths):
     ]
     return low_frame_paths
 
-
-
-
-def _frames_to_gt(video_id,frame_rate, gt_data, output_dir):
-    track_data = {}
-    for f_id, file_name in gt_data.items():
-        frame_data = utils_data.load_json(file_name)
-        vid = frame_data["vid"]
-        data = frame_data["data"]
-        track_data[vid] = {
-            'agent_tubes':data['agent_tubes'],
-            'action_tubes':data['action_tubes']
-            }
-
-    with open(track_file, "w", encoding="utf-8") as handle:
-        import json
-        json.dump(track_data, handle, indent=2)
-
-
 def _frames_to_objects(video_id, frame_rate, frame_paths, obj_dir, od_model):
     pass
 
