@@ -8,6 +8,16 @@ def time_overlap(start1, end1, start2, end2):
     return max(start1, start2) <= min(end1, end2)
 
 
+class Rule:
+    head: None
+    body: None
+    def __init__(self, fact_tuple):
+        self.head = {'av_action_id': fact_tuple[0]}
+        self.body = {'agent_class': fact_tuple[1], 
+                     'action': fact_tuple[2], 
+                     'location': fact_tuple[3]
+                     }
+    
 
 
 class Language:
@@ -109,15 +119,20 @@ class Language:
         return facts
 
     def facts2rules(self, facts):
-        rules = []
+        fact_tuples = []
         for fact in facts:
-            rule = {
-                'start_frame': fact['start_frame'],
-                'end_frame': fact['end_frame'],
-                'agents': fact['agents'],
-                'av_action_id': fact.get('av_action_id', None),
-            }
-            rules.append(rule)
+            if 'av_action_id' not in fact:
+                continue
+            head = fact['av_action_id']
+            for agent in fact['agents']:
+                actions = [pair['action_ids'] for pair in agent['frame-action-location']]
+                locs = [pair['loc_ids'] for pair in agent['frame-action-location']]
+                agent_class = agent['class']
+                
+                agent_fact_tuples = [(head, agent_class, tuple(a), tuple(l)) for a in actions for l in locs]
+                fact_tuples.extend(agent_fact_tuples)
+        fact_tuples = list(set(fact_tuples))
+        rules = [Rule(fact_tuple) for fact_tuple in fact_tuples]
         return rules
 
 
