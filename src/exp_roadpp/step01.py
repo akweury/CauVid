@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import json
 
-import utils_data
+from src.exp_roadpp import utils_data
 
 
 def split_gt_json_files(gt_json_file, out_dir, data_num):

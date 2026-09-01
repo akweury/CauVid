@@ -7,8 +7,8 @@ import sys
 import time
 from pathlib import Path
 
-import config 
-import utils_data
+from src.exp_roadpp import config 
+from src.exp_roadpp import utils_data
 
 def parse_args():
     parser = argparse.ArgumentParser(
