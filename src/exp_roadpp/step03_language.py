@@ -78,7 +78,10 @@ class Language:
     @staticmethod
     def _rule_signature(head, agent_class, action_ids, loc_ids):
         return (head, agent_class, tuple(action_ids), tuple(loc_ids))
-
+    @staticmethod
+    def _body_signature(agent_class, action_ids, loc_ids):
+        return (agent_class, tuple(action_ids), tuple(loc_ids))
+        
     def evaluate_rule(self, rule, support, total_support, evidence_count):
         return Rule(rule, support=support, total_support=total_support, evidence_count=evidence_count).to_dict()
 
@@ -179,7 +182,7 @@ class Language:
 
     def facts2rules(self, facts):
         rule_supports = Counter()
-        rule_evidence = Counter()
+        head_supports = Counter()
         for fact in facts:
             if 'av_action_id' not in fact:
                 continue
@@ -193,8 +196,8 @@ class Language:
                 action_options = []
                 loc_options = []
                 for pair in frame_action_location:
-                    action_ids = self._flatten_ids(pair.get('action_ids', []))
-                    loc_ids = self._flatten_ids(pair.get('loc_ids', []))
+                    action_ids = self._flatten_ids(pair["action_ids"])
+                    loc_ids = self._flatten_ids(pair['loc_ids'])
                     if not action_ids or not loc_ids:
                         continue
                     action_options.append(action_ids)
@@ -203,27 +206,31 @@ class Language:
                 if not action_options or not loc_options:
                     continue
 
-                evidence_count = len(action_options) * len(loc_options)
-                for action_ids in action_options:
-                    for loc_ids in loc_options:
-                        signature = self._rule_signature(head, agent_class, action_ids, loc_ids)
-                        rule_supports[signature] += 1
-                        rule_evidence[signature] += evidence_count
+                unique_pairs = list(dict.fromkeys(zip(action_options, loc_options)))
+                for action_ids, loc_ids in unique_pairs:
+                    signature = self._body_signature(agent_class, action_ids, loc_ids)
+                    if signature not in rule_supports:
+                        rule_supports[signature] = {}
+                    if head not in rule_supports[signature]:
+                        rule_supports[signature][head] = 0
+                    rule_supports[signature][head] += 1
 
-        total_support_by_head = Counter()
-        for (head, _agent_class, _action_ids, _loc_ids), support in rule_supports.items():
-            total_support_by_head[head] += support
+                    if head not in head_supports:
+                        head_supports[head] = 0
+                    head_supports[head] += 1
+
 
         rules = []
         for signature, support in rule_supports.items():
-            head, agent_class, action_ids, loc_ids = signature
-            rule = self.evaluate_rule(
-                (head, agent_class, action_ids, loc_ids),
-                support=support,
-                total_support=total_support_by_head[head],
-                evidence_count=rule_evidence[signature],
-            )
-            rules.append(rule)
+            agent_class, action_ids, loc_ids = signature
+            for head, count in support.items():
+                rule = self.evaluate_rule(
+                    (head, agent_class, action_ids, loc_ids),
+                    support=count,
+                    total_support=head_supports[head],
+                    evidence_count=sum(support.values()),
+                )
+                rules.append(rule)
 
         rules.sort(key=lambda row: tuple(row['rank_key']))
         return rules

@@ -1,6 +1,6 @@
 {
     "use_gt": true,
-    "data_num": "10",
+    "data_num": "full",
     "mask_iou_th": 0.1,
     "frame_rate": 10,
     "primary_confidence": 0.3,

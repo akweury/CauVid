@@ -10,21 +10,13 @@ from src.exp_roadpp import utils_data
 
 
 def split_gt_json_files(gt_json_file, out_dir, data_num):
-
     # if out_dir has not _gt.json files, create them
     if not any(fname.endswith("_gt.json") for fname in os.listdir(out_dir)):
         # Implement the logic to split the GT JSON file if needed
         print(f"Splitting GT JSON file: {gt_json_file}")
         json_data = utils_data.load_json(gt_json_file)
-        if data_num != 'all':
-            data_num = int(data_num)
-        else:
-            data_num = float('inf')
-        all_vids = []
         counter = 0
         for vid, data in tqdm(json_data['db'].items(), desc="Splitting GT for videos"):
-            if counter >= data_num:
-                break
             if "agent_tubes" not in data:
                 continue
             json_file_name = os.path.join(out_dir, f"{vid}_gt.json")
@@ -157,7 +149,6 @@ def main(input_data):
 
     data_num = input_data.get("data_num", "all")
     split_gt_json_files(input_data["gt_json_file"], gt_dir, data_num)
-    all_gt_paths = load_gt_json_file(gt_dir)
     
     if data_num != "all":
         data_num = int(data_num)

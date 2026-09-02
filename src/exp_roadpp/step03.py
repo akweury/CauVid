@@ -277,10 +277,9 @@ def _rank_rules_with_model(rules, model):
     return ranked_rules
 
 
-def _learn_rule_aggregation(fact_file, rules, output_dir):
-    facts = utils_data.load_json(fact_file)
+def _learn_rule_aggregation(rules, facts, output_dir):
+    
     dataset = _build_rule_learning_dataset(facts, rules)
-
     train_indices, val_indices, test_indices = _split_example_indices(len(dataset["examples"]))
     feature_matrix = dataset["feature_matrix"]
     labels = np.asarray(dataset["labels"], dtype=np.int64)
@@ -326,9 +325,23 @@ def _learn_rule_aggregation(fact_file, rules, output_dir):
     utils_data.save_json(selected_rules, output_dir / "rule_aggregation_rules.json")
     return selected_rules
 
+def _rules_to_global(rule_files, fact_files, bs_model, output_dir):
+    r_0 = []
+    for rule_file in rule_files:
+        r_0.extend(utils_data.load_json(rule_file))
+    global_facts = []
+    for fact_file in fact_files:
+        global_facts.extend(utils_data.load_json(fact_file))
 
-def _facts_to_rules(fact_files, lang, beam_search_model, output_dir):
+    
+    r_k = bs_model.search(r_0)
+    rules = _learn_rule_aggregation(r_k, global_facts, output_dir)
+    
+    
+
+def _facts_to_rules(fact_files, lang, output_dir):
     rule_files = []
+    
     for fact_file in fact_files:
         print(f"Converting facts to rules for {fact_file}")
         fact_data = utils_data.load_json(fact_file)
@@ -339,13 +352,8 @@ def _facts_to_rules(fact_files, lang, beam_search_model, output_dir):
         if output_file.exists():
             print(f"Rules file already exists: {output_file}")
             continue
-
         r_0 = lang.facts2rules(fact_data)
-        _ = beam_search_model.search(r_0)
-        rules = _learn_rule_aggregation(fact_file, r_0, output_dir)
-
-        utils_data.save_json(rules, output_file)
-
+        utils_data.save_json(r_0, output_file)
     return rule_files
 
 
@@ -360,6 +368,6 @@ def main(input_data):
     beam_search_model = BeamSearch()
     atom_files = _tracks_to_atoms(track_files, language_model, output_dir)
     fact_files = _atoms_to_facts(atom_files, language_model, output_dir)
-    _facts_to_rules(fact_files, language_model, beam_search_model, output_dir)
-
+    rule_files = _facts_to_rules(fact_files, language_model, output_dir)
+    _rules_to_global(rule_files,fact_files, beam_search_model, output_dir)
     print("\n--------- Step 03 Done ---------------\n")
