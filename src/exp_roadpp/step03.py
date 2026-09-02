@@ -1,5 +1,6 @@
 from pathlib import Path
 import random
+from tqdm import tqdm
 
 import numpy as np
 from scipy import sparse
@@ -16,14 +17,13 @@ from src.exp_roadpp.step03_beam_search import BeamSearch
 
 def _tracks_to_atoms(track_files, lang, output_dir):
     atom_files = []
-    for track_file in track_files:
+    for track_file in tqdm(track_files, desc="Tracks to Atoms"):
         track_data = utils_data.load_json(track_file)
         vid = track_data["vid"]
         output_file = Path(output_dir) / f"{vid}_atoms.json"
         atom_files.append(output_file)
 
         if output_file.exists():
-            print(f"Atoms file already exists: {output_file}")
             continue
 
         agent_tubes = track_data["data"]["agent_tubes"]
@@ -39,15 +39,13 @@ def _tracks_to_atoms(track_files, lang, output_dir):
 
 def _atoms_to_facts(atom_files, lang, output_dir):
     fact_files = []
-    for atom_file in atom_files:
-        print(f"Converting atoms to rules for {atom_file}")
+    for atom_file in tqdm(atom_files, desc="Atoms to Facts"):
         atom_data = utils_data.load_json(atom_file)
         vid = Path(atom_file).stem.replace("_atoms", "")
         output_file = Path(output_dir) / f"{vid}_facts.json"
         fact_files.append(output_file)
 
         if output_file.exists():
-            print(f"Facts file already exists: {output_file}")
             continue
 
         facts = lang.atoms2facts(atom_data)
@@ -342,15 +340,13 @@ def _rules_to_global(rule_files, fact_files, bs_model, output_dir):
 def _facts_to_rules(fact_files, lang, output_dir):
     rule_files = []
     
-    for fact_file in fact_files:
-        print(f"Converting facts to rules for {fact_file}")
+    for fact_file in tqdm(fact_files, desc="Facts to Rules"):
         fact_data = utils_data.load_json(fact_file)
         vid = Path(fact_file).stem.replace("_facts", "")
         output_file = Path(output_dir) / f"{vid}_rules.json"
         rule_files.append(output_file)
 
         if output_file.exists():
-            print(f"Rules file already exists: {output_file}")
             continue
         r_0 = lang.facts2rules(fact_data)
         utils_data.save_json(r_0, output_file)
@@ -361,13 +357,22 @@ def main(input_data):
     print("\n------- Step 03 -------\n")
     output_dir = input_data["output_dir"]
     step01_output_dir = input_data["step01_output_dir"]
-    track_dir = step01_output_dir / "gt"
-    track_files = list(track_dir.glob("*_gt.json"))
+    train_ids = input_data["train_ids"]
+    test_ids = input_data["test_ids"]
+    track_dir = input_data["dataset_path"] / "gt"
+
+    if input_data["use_gt"]:
+        track_files = list(track_dir.glob("*_gt.json"))
+    else:
+        raise NotImplementedError("Non-GT tracking is not implemented.")
+    
+    train_track_files = [f for f in track_files if any(tid in f.stem for tid in train_ids)]
+    test_track_files = [f for f in track_files if any(tid in f.stem for tid in test_ids)]
 
     language_model = Language()
     beam_search_model = BeamSearch()
-    atom_files = _tracks_to_atoms(track_files, language_model, output_dir)
-    fact_files = _atoms_to_facts(atom_files, language_model, output_dir)
-    rule_files = _facts_to_rules(fact_files, language_model, output_dir)
-    _rules_to_global(rule_files,fact_files, beam_search_model, output_dir)
+    train_atom_files = _tracks_to_atoms(train_track_files, language_model, output_dir)
+    train_fact_files = _atoms_to_facts(train_atom_files, language_model, output_dir)
+    rule_files = _facts_to_rules(train_fact_files, language_model, output_dir)
+    _rules_to_global(rule_files, train_fact_files, beam_search_model, output_dir)
     print("\n--------- Step 03 Done ---------------\n")

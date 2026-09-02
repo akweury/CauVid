@@ -132,25 +132,30 @@ def main(input_data):
     mask_label_top_k = int(input_data.get("mask_label_top_k", 3))
     all_video_ids = input_data["video_ids"]
     all_video_paths = input_data["video_path"]
+    dataset_path = input_data["dataset_path"]
     all_frame_paths = input_data["frame_path"]
     all_depth_paths = input_data["depth_path"]
     all_flow_paths = input_data["flow_path"]
+    all_test_video_paths = input_data["test_video_path"]
+    all_test_video_ids = input_data["test_video_ids"]
     output_dir = input_data["output_dir"]
     frame_rate = input_data["frame_rate"]
     
     obj_dir = output_dir / "objects"
     mask_dir = output_dir / "masks"
     record_dir = output_dir / "records"
-    gt_dir = output_dir / "gt"
+    gt_dir = dataset_path / "gt"
     os.makedirs(obj_dir, exist_ok=True)
     os.makedirs(mask_dir, exist_ok=True)
     os.makedirs(record_dir, exist_ok=True)
     os.makedirs(gt_dir, exist_ok=True)
 
-    data_num = input_data.get("data_num", "all")
+
+
+    data_num = input_data.get("data_num", "full")
     split_gt_json_files(input_data["gt_json_file"], gt_dir, data_num)
     
-    if data_num != "all":
+    if data_num != "full":
         data_num = int(data_num)
         all_video_paths = all_video_paths[:data_num]
         all_depth_paths = all_depth_paths[:data_num]

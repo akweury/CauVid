@@ -1,0 +1,23 @@
+{
+    "use_gt": true,
+    "data_num": "200",
+    "mask_iou_th": 0.1,
+    "frame_rate": 10,
+    "primary_confidence": 0.3,
+    "candidate_confidence": 0.05,
+    "nms_iou": 0.5,
+    "inference_size": 640,
+    "driving_mini_obj_classes": ["car","truck","bus","motorcycle","bicycle","person","traffic light","stop sign","building","tree","crosswalk"],
+    "sam_prompt_candidates": true,
+    "semseg_enabled": true,
+    "semseg_model_path": "nvidia/segformer-b5-finetuned-ade-640-640",
+    "semseg_target_labels": ["sky", "road", "sidewalk", "terrain", "building", "vegetation", "wall", "fence"],
+    "mask_label_top_k": 3,
+    "driving_mini_od_model": "weights/yolo/yolov8l-worldv2.pt",
+    "sam2_model": "weights/sam2/sam2_t.pt",
+    "depth_model": "depth-anything/DA3-Large",
+    "depth_process_resolution": 504,
+    "flow_consistency_threshold_px":1.5,
+    "tracker_top_k": 5,
+    "tracker_window_size": 5
+}

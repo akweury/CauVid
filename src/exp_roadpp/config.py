@@ -57,24 +57,6 @@ def step_0_setup(args):
     # test the dataset path
     if os.path.exists(args.dataset_path):
         print(f"\n##### Dataset path exists: {args.dataset_path} #####\n")
-        # print the number of videos in the dataset path
-        # video_path = os.path.join(args.dataset_path, "videos")
-        # frames_path = os.path.join(args.dataset_path, "frames")
-        # depth_maps_path = os.path.join(args.dataset_path, "depth_maps")
-    #     if os.path.exists(video_path):
-    #         print(f"\n##### Number of videos in the dataset path: {len(os.listdir(video_path))} #####\n")
-    #     else:
-    #         raise ValueError(f"Video path does not exist: {video_path}")
-    #     if os.path.exists(frames_path):
-    #         print(f"\n##### Number of frames in the dataset path: {len(os.listdir(frames_path))} #####\n")
-    #     else:
-    #         os.makedirs(frames_path, exist_ok=True)
-    #     if os.path.exists(depth_maps_path):
-    #         print(f"\n##### Number of depth maps in the dataset path: {len(os.listdir(depth_maps_path))} #####\n")
-    #     else:
-    #         os.makedirs(depth_maps_path, exist_ok=True)
-    # else:
-    #     raise ValueError(f"Dataset path does not exist: {args.dataset_path}")
 
     return args
 
@@ -153,6 +135,7 @@ def get_step_01_input(args):
             }
     elif args.dataset == "roadpp":
         video_dir = args.dataset_path / "videos"
+        test_video_dir = args.dataset_path / "test_videos"
         frame_dir = args.dataset_path / "frames"
         depth_dir = args.dataset_path / "depth_maps"
         flow_dir = args.dataset_path / "flows"
@@ -162,15 +145,18 @@ def get_step_01_input(args):
         os.makedirs(flow_dir, exist_ok=True)
 
         all_video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
+        all_test_video_paths = [os.path.join(test_video_dir, f) for f in os.listdir(test_video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
         all_frame_paths = [os.path.join(frame_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
         all_depth_paths = [os.path.join(depth_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
         all_video_ids = [os.path.splitext(os.path.basename(f))[0] for f in all_video_paths]
+        all_test_video_ids = [os.path.splitext(os.path.basename(f))[0] for f in all_test_video_paths]
         all_flow_paths = [os.path.join(flow_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
 
         output_dir = args.output_dir / "step01_output"
         os.makedirs(output_dir, exist_ok=True)
 
         input_data = {
+                        "dataset_path": args.dataset_path,
                         "use_gt":args.use_gt,
                         "gt_json_file": gt_json_file,
                         "allow_model_download": ALLOW_MODEL_DOWNLOAD,
@@ -179,6 +165,8 @@ def get_step_01_input(args):
                         "frame_path": all_frame_paths,
                         "depth_path": all_depth_paths,
                         "flow_path": all_flow_paths,
+                        "test_video_path": all_test_video_paths,
+                        "test_video_ids": all_test_video_ids,
                         "output_dir": output_dir,
                         "frame_rate":  args.frame_rate,
                         "device": args.device,
@@ -219,11 +207,17 @@ def get_step_02_input(args):
 def get_step_03_input(args):
     output_dir = args.output_dir / "step03_output"
     os.makedirs(output_dir, exist_ok=True)
+    train_ids = [os.path.splitext(os.path.basename(f))[0] for f in os.listdir(args.dataset_path / "videos") if f.endswith(('.mp4', '.avi', '.mov'))]
+    test_ids = [os.path.splitext(os.path.basename(f))[0] for f in os.listdir(args.dataset_path / "test_videos") if f.endswith(('.mp4', '.avi', '.mov'))]
     input_data = {
+        "use_gt": args.use_gt,
+        "dataset_path": args.dataset_path,
         "output_dir": output_dir,
         "step01_output_dir": args.output_dir / "step01_output",
         "step02_output_dir": args.output_dir / "step02_output",
         "device": args.device,
+        "train_ids": train_ids,
+        "test_ids": test_ids,
     }
     return input_data
 
