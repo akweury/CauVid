@@ -11,10 +11,28 @@ from src.exp_roadpp import utils_data
 
 def split_gt_json_files(gt_json_file, out_dir, data_num, all_video_ids, all_test_video_ids):
     all_train_gt_json_files = [out_dir/f"{f}_gt.json" for f in all_video_ids]
-    
+    label_file = out_dir / "label.json"
     # if any json files not exist, then load the gt json file
-    if not any(os.path.exists(f) for f in all_train_gt_json_files):
+    if not any(os.path.exists(f) for f in all_train_gt_json_files) or not os.path.exists(label_file):
         json_data = utils_data.load_json(gt_json_file)
+        utils_data.save_json({
+            "all_input_labels": json_data["all_input_labels"],
+            "all_av_action_labels": json_data["all_av_action_labels"],
+            "av_action_labels": json_data["av_action_labels"],
+            "agent_labels": json_data["agent_labels"],
+            "action_labels": json_data["action_labels"],
+            "loc_labels": json_data["loc_labels"],
+            "duplex_labels": json_data["duplex_labels"],
+            "triplet_labels": json_data["triplet_labels"],
+            "old_loc_labels": json_data["old_loc_labels"],
+            "label_types": json_data["label_types"],
+            "all_duplex_labels": json_data["all_duplex_labels"],
+            "all_loc_labels": json_data["all_loc_labels"],
+            "all_agent_labels": json_data["all_agent_labels"],
+            "all_action_labels": json_data["all_action_labels"],
+            "duplex_childs": json_data["duplex_childs"],
+            "triplet_childs": json_data["triplet_childs"]
+        }, label_file)
         for vid, data in json_data['db'].items():
             if "agent_tubes" not in data:
                 continue
@@ -28,6 +46,9 @@ def split_gt_json_files(gt_json_file, out_dir, data_num, all_video_ids, all_test
                     "vid": vid,
                     "data": data
                     }, json_file_name)
+        
+
+    
 
 def load_gt_json_file(gt_dir):
     gt_json_dict = {}

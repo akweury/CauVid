@@ -2,8 +2,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
+from src.exp_roadpp import utils_data
 
-def visualize_rule_aggregation_results(dataset_summary, output_dir):
+
+def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir):
     if not dataset_summary:
         print("No dataset summary to visualize.")
         return
@@ -14,7 +16,10 @@ def visualize_rule_aggregation_results(dataset_summary, output_dir):
         print("No test accuracy per class to visualize.")
         return
 
-    classes = list(test_accuracy_per_class.keys())
+    labels = utils_data.load_json(Path(dataset_path)/ "gt" / "label.json")["all_input_labels"]
+    class_ids = list(test_accuracy_per_class.keys())
+    classes = [labels[int(cid)] for cid in class_ids]
+
     accuracies = list(test_accuracy_per_class.values())
 
     plt.figure(figsize=(10, 6))

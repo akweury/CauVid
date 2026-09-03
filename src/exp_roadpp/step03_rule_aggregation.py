@@ -9,28 +9,8 @@ from scipy import sparse
 import random
 
 
-def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
-    indices = list(range(num_examples))
-    if num_examples <= 2:
-        return indices, indices, indices
 
-    rng = random.Random(int(seed))
-    rng.shuffle(indices)
 
-    train_end = max(1, int(round(num_examples * float(train_fraction))))
-    val_end = max(train_end + 1, int(round(num_examples * float(train_fraction + val_fraction))))
-    val_end = min(num_examples - 1, val_end)
-
-    train_indices = indices[:train_end]
-    val_indices = indices[train_end:val_end]
-    test_indices = indices[val_end:]
-
-    if not val_indices:
-        val_indices = indices[-1:]
-    if not test_indices:
-        test_indices = indices[-1:]
-
-    return train_indices, val_indices, test_indices
 def _normalize_rule(rule):
     normalized = dict(rule)
     head = dict(normalized.get("head", {}))
@@ -92,7 +72,8 @@ def _rule_fires_on_fact(rule, fact):
     return False
 
 
-def build_rule_learning_dataset(facts, rules, output_dir):
+def build_rule_learning_dataset(facts, rules, output_dir, train_indices, val_indices):
+
     dataset_file = Path(output_dir) / "rule_learning_dataset.npz"
     if dataset_file.exists():
         npz =  np.load(dataset_file, allow_pickle=True)
@@ -100,10 +81,8 @@ def build_rule_learning_dataset(facts, rules, output_dir):
             "rules": _unwrap_cached_npz_value(npz["rules"]),
             "train_matrix": _unwrap_cached_npz_value(npz["train_matrix"]),
             "val_matrix": _unwrap_cached_npz_value(npz["val_matrix"]),
-            "test_matrix": _unwrap_cached_npz_value(npz["test_matrix"]),
             "train_labels": np.asarray(npz["train_labels"], dtype=np.int64),
             "val_labels": np.asarray(npz["val_labels"], dtype=np.int64),
-            "test_labels": np.asarray(npz["test_labels"], dtype=np.int64),
         }
 
     if sparse is None:
@@ -142,31 +121,84 @@ def build_rule_learning_dataset(facts, rules, output_dir):
         shape=(len(facts), len(normalized_rules)),
         dtype=np.float32,
     )
-    train_indices, val_indices, test_indices = _split_example_indices(len(examples))
-    
     if isinstance(feature_matrix, np.ndarray) and feature_matrix.ndim == 0:
-        feature_matrix = feature_matrix.item()
+        feature_matrix = feature_matrix.item()    
 
     train_matrix = feature_matrix[train_indices]
     val_matrix = feature_matrix[val_indices]
-    test_matrix = feature_matrix[test_indices]
     labels = np.array(labels)
     train_labels = labels[train_indices]
     val_labels = labels[val_indices]
-    test_labels = labels[test_indices]
 
     data = {
         'train_matrix': train_matrix,
         'val_matrix': val_matrix,
-        'test_matrix': test_matrix,
         'train_labels': train_labels,
         'val_labels': val_labels,
+        'rules': normalized_rules,
+    }
+    save_dataset(data, dataset_file)
+
+    return data
+
+
+def build_rule_learning_test_dataset(facts, rules, output_dir, test_indices):
+
+    dataset_file = Path(output_dir) / "rule_learning_test_dataset.npz"
+    if dataset_file.exists():
+        npz =  np.load(dataset_file, allow_pickle=True)
+        return {
+            "rules": _unwrap_cached_npz_value(npz["rules"]),
+            "test_matrix": _unwrap_cached_npz_value(npz["test_matrix"]),
+            "test_labels": np.asarray(npz["test_labels"], dtype=np.int64),
+        }
+    normalized_rules = [_normalize_rule(rule) for rule in rules]
+    row_indices = []
+    col_indices = []
+    data = []
+    examples = []
+    labels = []
+
+    for row_index, fact in tqdm(enumerate(facts), total=len(facts), desc="Building rule learning test dataset"):
+        label = int(fact.get("av_action_id", -1))
+        labels.append(label)
+        examples.append(
+            {
+                "example_id": row_index,
+                "av_action_id": label,
+                "start_frame": int(fact.get("start_frame", -1)),
+                "end_frame": None if fact.get("end_frame", None) in {None, float("inf")} else int(fact.get("end_frame", -1)),
+                "num_agents": len(fact.get("agents", [])),
+            }
+        )
+
+        for col_index, rule in enumerate(normalized_rules):
+            if _rule_fires_on_fact(rule, fact):
+                row_indices.append(row_index)
+                col_indices.append(col_index)
+                data.append(1)
+
+    feature_matrix = sparse.csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(len(facts), len(normalized_rules)),
+        dtype=np.float32,
+    )
+    if isinstance(feature_matrix, np.ndarray) and feature_matrix.ndim == 0:
+        feature_matrix = feature_matrix.item()    
+
+    test_matrix = feature_matrix[test_indices]
+    labels = np.array(labels)
+    test_labels = labels[test_indices]
+
+    data = {
+        'test_matrix': test_matrix,
         'test_labels': test_labels,
         'rules': normalized_rules,
     }
     save_dataset(data, dataset_file)
 
     return data
+
 
 
 def _rule_signature(rule):
@@ -275,48 +307,18 @@ def _rank_rules_with_model(rules, model):
 
 def learn_rule_aggregation(dataset):
 
-    train_matrix = dataset["train_matrix"]
+    feature_matrix = dataset["train_matrix"]
     val_matrix = dataset["val_matrix"]
-    train_labels = dataset["train_labels"]
     val_labels = dataset["val_labels"]
+    labels = dataset["train_labels"]
+    
 
-    model, selection_summary = _fit_rule_aggregation_lr(train_matrix,train_labels, val_matrix, val_labels,seed=7)
+    model, selection_summary = _fit_rule_aggregation_lr(feature_matrix, labels, val_matrix, val_labels,seed=7)
     ranked_rules = _rank_rules_with_model(dataset["rules"], model)
     return ranked_rules, model
 
 
 
-
-def test_global_rules(model, rules, language_model, dataset, output_dir):
-
-    os.makedirs(output_dir, exist_ok=True)
-    test_matrix = dataset["test_matrix"]
-    test_labels = dataset["test_labels"]
-
-    if isinstance(test_matrix, np.ndarray) and test_matrix.ndim == 0:
-        test_matrix = test_matrix.item()    
-
-    test_pred = model.predict(test_matrix)
-
-    test_accuracy = float(accuracy_score(test_labels, test_pred)) if len(test_labels) else 0.0
-    test_f1_macro = float(f1_score(test_labels, test_pred, average="macro")) if len(test_labels) else 0.0
-
-    # accuracy on each class
-    test_accuracy_per_class = {}
-    if len(test_labels):
-        for class_label in set(test_labels):
-            class_indices = [i for i, label in enumerate(test_labels) if label == class_label]
-            class_correct = sum(1 for i in class_indices if test_pred[i] == class_label)
-            test_accuracy_per_class[int(class_label)] = float(class_correct) / len(class_indices) if class_indices else 0.0
-
-    dataset_summary = {
-        "test_label_count": len(set(test_labels)),
-        "test_accuracy": test_accuracy,
-        "test_f1_macro": test_f1_macro,
-        "test_accuracy_per_class": test_accuracy_per_class,
-    }
-
-    return dataset_summary
 
 
 
