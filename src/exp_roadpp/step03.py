@@ -90,8 +90,8 @@ def test_global_rules(model, rules, language_model, output_dir, track_dir, test_
     
     dataset = build_rule_learning_test_dataset(facts, rules, output_dir, test_indices)
     os.makedirs(output_dir, exist_ok=True)
-    test_matrix = dataset["test_matrix"]
-    test_labels = dataset["test_labels"]
+    test_matrix = dataset["feature_matrix"]
+    test_labels = dataset["labels"]
 
     if isinstance(test_matrix, np.ndarray) and test_matrix.ndim == 0:
         test_matrix = test_matrix.item()    
@@ -118,9 +118,10 @@ def test_global_rules(model, rules, language_model, output_dir, track_dir, test_
 
     return dataset_summary
 
-def _rules_to_global(track_dir, all_rules, train_indices, val_indices, test_indices, all_facts, lang_model, output_dir, test_output_dir):
-    dataset = build_rule_learning_dataset(all_facts, all_rules, output_dir, train_indices, val_indices)
-    ranked_rules, model = learn_rule_aggregation(dataset)
+def _rules_to_global(track_dir, all_rules, train_indices, val_indices, test_indices, all_facts,val_facts, lang_model, output_dir, test_output_dir):
+    train_dataset = build_rule_learning_dataset(all_facts, all_rules, output_dir, train_indices)
+    val_dataset = build_rule_learning_dataset(val_facts, all_rules, output_dir, val_indices)
+    ranked_rules, model = learn_rule_aggregation(train_dataset,val_dataset)
     dataset_summary = test_global_rules(model, ranked_rules, lang_model, test_output_dir, track_dir, test_indices)
     utils_data.save_json(dataset_summary, test_output_dir / "rule_aggregation_summary.json")
     return ranked_rules, model, dataset_summary
@@ -164,7 +165,11 @@ def main(input_data):
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
     fact_files, all_facts = _atoms_to_facts(train_ids, language_model, output_dir)
     all_rules = _facts_to_rules(train_ids, language_model, output_dir)
-    ranked_rules, rule_model, dataset_summary = _rules_to_global(track_dir,all_rules,train_indices, val_indices, test_indices, all_facts, language_model, output_dir, test_output_dir)
+
+    _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
+    _, val_facts = _atoms_to_facts(val_ids, language_model, output_dir)
+
+    ranked_rules, rule_model, dataset_summary = _rules_to_global(track_dir, all_rules, train_indices, val_indices, test_indices, all_facts,val_facts, language_model, output_dir, test_output_dir)
     dataset_path = input_data["dataset_path"]
     visualize_rule_aggregation_results(dataset_path, dataset_summary, test_output_dir)
     

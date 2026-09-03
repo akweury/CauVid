@@ -72,17 +72,15 @@ def _rule_fires_on_fact(rule, fact):
     return False
 
 
-def build_rule_learning_dataset(facts, rules, output_dir, train_indices, val_indices):
+def build_rule_learning_dataset(facts, rules, output_dir, train_indices):
 
     dataset_file = Path(output_dir) / "rule_learning_dataset.npz"
     if dataset_file.exists():
         npz =  np.load(dataset_file, allow_pickle=True)
         return {
             "rules": _unwrap_cached_npz_value(npz["rules"]),
-            "train_matrix": _unwrap_cached_npz_value(npz["train_matrix"]),
-            "val_matrix": _unwrap_cached_npz_value(npz["val_matrix"]),
-            "train_labels": np.asarray(npz["train_labels"], dtype=np.int64),
-            "val_labels": np.asarray(npz["val_labels"], dtype=np.int64),
+            "feature_matrix": _unwrap_cached_npz_value(npz["feature_matrix"]),
+            "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
 
     if sparse is None:
@@ -125,16 +123,12 @@ def build_rule_learning_dataset(facts, rules, output_dir, train_indices, val_ind
         feature_matrix = feature_matrix.item()    
 
     train_matrix = feature_matrix[train_indices]
-    val_matrix = feature_matrix[val_indices]
     labels = np.array(labels)
     train_labels = labels[train_indices]
-    val_labels = labels[val_indices]
 
     data = {
-        'train_matrix': train_matrix,
-        'val_matrix': val_matrix,
-        'train_labels': train_labels,
-        'val_labels': val_labels,
+        'feature_matrix': train_matrix,
+        'labels': train_labels,
         'rules': normalized_rules,
     }
     save_dataset(data, dataset_file)
@@ -229,7 +223,7 @@ def _fit_rule_aggregation_lr(train_matrix, train_labels, val_matrix, val_labels,
     # Evaluated C=1.0: {'c_value': 1.0, 'validation_accuracy': 0.9671052631578947, 'validation_f1_macro': 0.9346958647854106, 'nonzero_rule_count': 1295}
     # Evaluated C=5.0: {'c_value': 5.0, 'validation_accuracy': 0.975328947368421, 'validation_f1_macro': 0.9437663887993266, 'nonzero_rule_count': 1812}
     # Evaluated C=10.0: {'c_value': 10.0, 'validation_accuracy': 0.9819078947368421, 'validation_f1_macro': 0.951205349022739, 'nonzero_rule_count': 2193}
-    c_values = [10.0]
+    c_values = [0.05,0.1,0.5,1.0,5.0,10.0]
     best_model = None
     best_key = None
     best_summary = None
@@ -305,16 +299,16 @@ def _rank_rules_with_model(rules, model):
     )
     return ranked_rules
 
-def learn_rule_aggregation(dataset):
+def learn_rule_aggregation(train_dataset, val_dataset):
 
-    feature_matrix = dataset["train_matrix"]
-    val_matrix = dataset["val_matrix"]
-    val_labels = dataset["val_labels"]
-    labels = dataset["train_labels"]
+    train_matrix = train_dataset["feature_matrix"]
+    val_matrix = val_dataset["feature_matrix"]
+    val_labels = val_dataset["labels"]
+    labels = train_dataset["labels"]
     
 
-    model, selection_summary = _fit_rule_aggregation_lr(feature_matrix, labels, val_matrix, val_labels,seed=7)
-    ranked_rules = _rank_rules_with_model(dataset["rules"], model)
+    model, selection_summary = _fit_rule_aggregation_lr(train_matrix, labels, val_matrix, val_labels, seed=7)
+    ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
     return ranked_rules, model
 
 
