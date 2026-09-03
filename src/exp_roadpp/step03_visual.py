@@ -18,9 +18,9 @@ def visualize_rule_aggregation_results(dataset_summary, output_dir):
     accuracies = list(test_accuracy_per_class.values())
 
     plt.figure(figsize=(10, 6))
-    sns.barplot(x=accuracies, y=classes)
-    plt.xlabel("Test Accuracy")
-    plt.ylabel("Class Label")
+    sns.barplot(x=classes, y=accuracies)
+    plt.xlabel("Class Label")
+    plt.ylabel("Test Accuracy")
     plt.title("Test Accuracy per Class")
     plt.tight_layout()
     plt.savefig(Path(output_dir) / "test_accuracy_per_class.png")

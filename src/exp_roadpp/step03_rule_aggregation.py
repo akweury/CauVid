@@ -307,7 +307,7 @@ def test_global_rules(model, rules, language_model, dataset, output_dir):
         for class_label in set(test_labels):
             class_indices = [i for i, label in enumerate(test_labels) if label == class_label]
             class_correct = sum(1 for i in class_indices if test_pred[i] == class_label)
-            test_accuracy_per_class[class_label] = float(class_correct) / len(class_indices) if class_indices else 0.0
+            test_accuracy_per_class[int(class_label)] = float(class_correct) / len(class_indices) if class_indices else 0.0
 
     dataset_summary = {
         "test_label_count": len(set(test_labels)),
