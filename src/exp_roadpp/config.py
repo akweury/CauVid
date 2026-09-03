@@ -209,6 +209,10 @@ def get_step_03_input(args):
     os.makedirs(output_dir, exist_ok=True)
     train_ids = [os.path.splitext(os.path.basename(f))[0] for f in os.listdir(args.dataset_path / "videos") if f.endswith(('.mp4', '.avi', '.mov'))]
     test_ids = [os.path.splitext(os.path.basename(f))[0] for f in os.listdir(args.dataset_path / "test_videos") if f.endswith(('.mp4', '.avi', '.mov'))]
+
+    if args.data_num != "all":
+        train_ids = train_ids[:int(args.data_num)]
+        
     input_data = {
         "use_gt": args.use_gt,
         "dataset_path": args.dataset_path,

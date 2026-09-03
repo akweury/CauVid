@@ -88,7 +88,6 @@ class Language:
     def segs2atoms(self,target, segments, frames=None):
         atoms = []
         if target == "av":
-            print("Processing AV segments")
             for seg_id, segment in segments.items():
                 label_id = segment["label_id"]
                 frames = segment["frames"]
@@ -103,7 +102,6 @@ class Language:
                     "end_frame": end_frame
                 })
         elif target == "agents":
-            print("Processing agent segments")
             action_loc_pairs = utils_data.build_agent_frame_action_loc_pairs(segments, frames)
             for seg_id, segment in segments.items():
                 label_id = segment["label_id"]

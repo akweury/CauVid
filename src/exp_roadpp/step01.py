@@ -9,22 +9,25 @@ import json
 from src.exp_roadpp import utils_data
 
 
-def split_gt_json_files(gt_json_file, out_dir, data_num):
-    # if out_dir has not _gt.json files, create them
-    if not any(fname.endswith("_gt.json") for fname in os.listdir(out_dir)):
-        # Implement the logic to split the GT JSON file if needed
-        print(f"Splitting GT JSON file: {gt_json_file}")
+def split_gt_json_files(gt_json_file, out_dir, data_num, all_video_ids, all_test_video_ids):
+    all_train_gt_json_files = [out_dir/f"{f}_gt.json" for f in all_video_ids]
+    
+    # if any json files not exist, then load the gt json file
+    if not any(os.path.exists(f) for f in all_train_gt_json_files):
         json_data = utils_data.load_json(gt_json_file)
-        counter = 0
-        for vid, data in tqdm(json_data['db'].items(), desc="Splitting GT for videos"):
+        for vid, data in json_data['db'].items():
             if "agent_tubes" not in data:
                 continue
-            json_file_name = os.path.join(out_dir, f"{vid}_gt.json")
-            utils_data.save_json({
-                "vid": vid,
-                "data": data
-                }, json_file_name)
-            counter += 1
+            if vid in all_test_video_ids:
+                json_file_name = os.path.join(out_dir, f"{vid}_gt_test.json")
+            else:
+                json_file_name = os.path.join(out_dir, f"{vid}_gt.json")
+            if not os.path.exists(json_file_name):
+                print(f"Creating GT JSON file: {json_file_name}")
+                utils_data.save_json({
+                    "vid": vid,
+                    "data": data
+                    }, json_file_name)
 
 def load_gt_json_file(gt_dir):
     gt_json_dict = {}
@@ -153,7 +156,7 @@ def main(input_data):
 
 
     data_num = input_data.get("data_num", "full")
-    split_gt_json_files(input_data["gt_json_file"], gt_dir, data_num)
+    split_gt_json_files(input_data["gt_json_file"], gt_dir, data_num, all_video_ids,all_test_video_ids)
     
     if data_num != "full":
         data_num = int(data_num)
