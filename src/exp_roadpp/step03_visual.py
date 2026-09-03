@@ -16,7 +16,7 @@ def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir
         print("No test accuracy per class to visualize.")
         return
 
-    labels = utils_data.load_json(Path(dataset_path)/ "gt" / "label.json")["all_input_labels"]
+    labels = utils_data.load_json(Path(dataset_path)/ "gt" / "label.json")
     class_ids = list(test_accuracy_per_class.keys())
     classes = [labels[int(cid)] for cid in class_ids]
 
