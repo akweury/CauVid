@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument("--machine", type=str, default="ml-pulsar", help="Machine name, default is ml-pulsar")
 
     parser.add_argument("--device", type=str, default="cpu", help="Device to use, default is cpu")
+    
+    parser.add_argument("--skip_lr", type=str, default="True", help="Whether to skip rule learning, default is True")
 
     args = parser.parse_args()
 

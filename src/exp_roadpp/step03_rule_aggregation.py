@@ -7,7 +7,6 @@ from pathlib import Path
 from tqdm import tqdm
 from scipy import sparse
 import random
-import torch
 
 
 
@@ -25,23 +24,78 @@ def _unwrap_cached_npz_value(value):
 
 
 
-def _rule_fires_on_fact(rule, fact):
-    if int(fact["av_action_id"]) != int(rule["head"]["av_action_id"]):
-        return False
+def _flatten_ids(values):
+    flattened = []
+    for value in values or []:
+        if isinstance(value, (list, tuple, set)):
+            flattened.extend(value)
+        else:
+            flattened.append(value)
+    return tuple(flattened)
 
-    agent_class = int(rule["body"]["agent_class"])
-    action_ids = tuple(rule["body"].get("action", []))
-    location_ids = tuple(rule["body"].get("location", []))
-    for agent in fact.get("agents", []):
-        if int(agent["class"]) != agent_class:
+
+def _rule_body_signature(rule):
+    body = rule["body"]
+    return (
+        int(body["agent_class"]),
+        tuple(body.get("action", [])),
+        tuple(body.get("location", [])),
+    )
+
+
+def _build_body_signature_index(rules):
+    """Map each rule's body signature (agent_class, action_ids, location_ids) to
+    the list of rule column indices sharing that body, so a fact's agent
+    behaviors can be matched against all candidate rules with a single dict
+    lookup instead of scanning every rule."""
+    index = {}
+    for rule_index, rule in enumerate(rules):
+        index.setdefault(_rule_body_signature(rule), []).append(rule_index)
+    return index
+
+
+def _fact_matching_rule_indices(fact, body_signature_index):
+    matches = []
+    for agent in fact.get("agents", []) or []:
+        agent_class = agent.get("class")
+        if agent_class is None:
             continue
         for pair in agent.get("frame-action-location", []) or []:
-            if tuple(pair.get("action_ids", [])) == action_ids and tuple(pair.get("loc_ids", [])) == location_ids:
-                return True
-    return False
+            action_ids = _flatten_ids(pair.get("action_ids", []))
+            loc_ids = _flatten_ids(pair.get("loc_ids", []))
+            if not action_ids or not loc_ids:
+                continue
+            rule_indices = body_signature_index.get((int(agent_class), action_ids, loc_ids))
+            if rule_indices:
+                matches.extend(rule_indices)
+    return matches
 
 
-def build_rule_learning_dataset(facts, rules, output_dir,  all_rule_supports, all_head_supports):
+def _build_fact_rule_matrix(facts, rules, desc):
+    body_signature_index = _build_body_signature_index(rules)
+
+    row_indices = []
+    col_indices = []
+    data = []
+    labels = []
+
+    for row_index, fact in enumerate(tqdm(facts, total=len(facts), desc=desc)):
+        labels.append(int(fact.get("av_action_id", -1)))
+        rule_indices = _fact_matching_rule_indices(fact, body_signature_index)
+        if rule_indices:
+            row_indices.extend([row_index] * len(rule_indices))
+            col_indices.extend(rule_indices)
+            data.extend([1] * len(rule_indices))
+
+    feature_matrix = sparse.csr_matrix(
+        (data, (row_indices, col_indices)),
+        shape=(len(facts), len(rules)),
+        dtype=np.float32,
+    )
+    return feature_matrix, np.asarray(labels, dtype=np.int64)
+
+
+def build_rule_learning_dataset(facts, rules, output_dir, all_rule_supports, all_head_supports):
     dataset_file = Path(output_dir) / "rule_learning_dataset.npz"
 
     if dataset_file.exists():
@@ -51,41 +105,8 @@ def build_rule_learning_dataset(facts, rules, output_dir,  all_rule_supports, al
             "feature_matrix": _unwrap_cached_npz_value(npz["feature_matrix"]),
             "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
-    
-    row_indices = []
-    col_indices = []
-    data = []
-    labels = []
-    matrix = torch.zeros((len(all_rule_supports), len(rules)), dtype=torch.float32)
 
-    rules_dict = {}
-    for rule_index, rule in enumerate(rules):
-        body_signature = (rule['body']['agent_class'], 
-                          tuple(rule["body"]["action"]), 
-                          tuple(rule["body"]["location"]))
-        action_label = int(rule["head"]["av_action_id"])
-        rules_dict[(action_label, body_signature)] = rule_index
-
-    for row_index, body_signature in tqdm(enumerate(all_rule_supports), total=len(all_rule_supports), desc="Building rule learning dataset"):
-        for action_label in all_rule_supports[body_signature]:
-            labels.append(action_label)
-            rule_signature = (int(action_label),body_signature)
-            rule_index = rules_dict[rule_signature]
-            matrix[row_index, rule_index] = all_rule_supports[body_signature][action_label]
-            
-
-
-        # labels.append(fact["av_action_id"])
-        # for col_index, rule in enumerate(rules):
-        #     if _rule_fires_on_fact(rule, fact):
-        #         row_indices.append(row_index)
-        #         col_indices.append(col_index)
-        #         data.append(1)
-
-    feature_matrix = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(len(facts), len(rules)), dtype=np.float32)
-
-    if isinstance(feature_matrix, np.ndarray) and feature_matrix.ndim == 0:
-        feature_matrix = feature_matrix.item()    
+    feature_matrix, labels = _build_fact_rule_matrix(facts, rules, desc="Building rule learning dataset")
 
     data = {
         'feature_matrix': feature_matrix,
@@ -107,48 +128,16 @@ def build_rule_learning_test_dataset(facts, rules, output_dir, test_indices):
             "test_matrix": _unwrap_cached_npz_value(npz["test_matrix"]),
             "test_labels": np.asarray(npz["test_labels"], dtype=np.int64),
         }
-    normalized_rules = [_normalize_rule(rule) for rule in rules]
-    row_indices = []
-    col_indices = []
-    data = []
-    examples = []
-    labels = []
 
-    for row_index, fact in tqdm(enumerate(facts), total=len(facts), desc="Building rule learning test dataset"):
-        label = int(fact.get("av_action_id", -1))
-        labels.append(label)
-        examples.append(
-            {
-                "example_id": row_index,
-                "av_action_id": label,
-                "start_frame": int(fact.get("start_frame", -1)),
-                "end_frame": None if fact.get("end_frame", None) in {None, float("inf")} else int(fact.get("end_frame", -1)),
-                "num_agents": len(fact.get("agents", [])),
-            }
-        )
-
-        for col_index, rule in enumerate(normalized_rules):
-            if _rule_fires_on_fact(rule, fact):
-                row_indices.append(row_index)
-                col_indices.append(col_index)
-                data.append(1)
-
-    feature_matrix = sparse.csr_matrix(
-        (data, (row_indices, col_indices)),
-        shape=(len(facts), len(normalized_rules)),
-        dtype=np.float32,
-    )
-    if isinstance(feature_matrix, np.ndarray) and feature_matrix.ndim == 0:
-        feature_matrix = feature_matrix.item()    
+    feature_matrix, labels = _build_fact_rule_matrix(facts, rules, desc="Building rule learning test dataset")
 
     test_matrix = feature_matrix[test_indices]
-    labels = np.array(labels)
     test_labels = labels[test_indices]
 
     data = {
         'test_matrix': test_matrix,
         'test_labels': test_labels,
-        'rules': normalized_rules,
+        'rules': rules,
     }
     save_dataset(data, dataset_file)
 

@@ -233,7 +233,7 @@ def main(input_data):
     fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
     all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts,train_ids, language_model, output_dir)
 
-    if input_data["skip_lr"]:
+    if input_data["skip_lr"] == 'True':
         return
 
     
