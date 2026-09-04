@@ -1,5 +1,6 @@
-from collections import Counter
 
+import torch 
+from collections import Counter
 from src.exp_roadpp import utils_data 
 
 
@@ -62,8 +63,8 @@ class Rule:
 
 
 class Language:
-    def __init__(self, ):
-        pass
+    def __init__(self, device):
+        self.device= device
 
     @staticmethod
     def _flatten_ids(values):
@@ -181,9 +182,10 @@ class Language:
     def facts2rules(self, facts):
         rule_supports = Counter()
         head_supports = Counter()
-        for fact in facts:
+        for f_i, fact in enumerate(facts):
             if 'av_action_id' not in fact:
                 continue
+
             head = fact['av_action_id']
             for agent in fact['agents']:
                 frame_action_location = agent.get('frame-action-location', []) or []
@@ -206,12 +208,12 @@ class Language:
 
                 unique_pairs = list(dict.fromkeys(zip(action_options, loc_options)))
                 for action_ids, loc_ids in unique_pairs:
-                    signature = self._body_signature(agent_class, action_ids, loc_ids)
-                    if signature not in rule_supports:
-                        rule_supports[signature] = {}
-                    if head not in rule_supports[signature]:
-                        rule_supports[signature][head] = 0
-                    rule_supports[signature][head] += 1
+                    body_signature = self._body_signature(agent_class, action_ids, loc_ids)
+                    if body_signature not in rule_supports:
+                        rule_supports[body_signature] = {}
+                    if head not in rule_supports[body_signature]:
+                        rule_supports[body_signature][head] = 0
+                    rule_supports[body_signature][head] += 1
 
                     if head not in head_supports:
                         head_supports[head] = 0
@@ -219,8 +221,8 @@ class Language:
 
 
         rules = []
-        for signature, support in rule_supports.items():
-            agent_class, action_ids, loc_ids = signature
+        for body_signature, support in rule_supports.items():
+            agent_class, action_ids, loc_ids = body_signature
             for head, count in support.items():
                 rule = self.evaluate_rule(
                     (head, agent_class, action_ids, loc_ids),
@@ -231,6 +233,6 @@ class Language:
                 rules.append(rule)
 
         rules.sort(key=lambda row: tuple(row['rank_key']))
-        return rules
+        return rules, rule_supports, head_supports
 
 

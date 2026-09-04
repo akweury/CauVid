@@ -7,42 +7,11 @@ from pathlib import Path
 from tqdm import tqdm
 from scipy import sparse
 import random
+import torch
 
 
 
 
-def _normalize_rule(rule):
-    normalized = dict(rule)
-    head = dict(normalized.get("head", {}))
-    body = dict(normalized.get("body", {}))
-    support = int(normalized.get("support", getattr(rule, "support", 0)) or 0)
-    total_support = int(normalized.get("total_support", getattr(rule, "total_support", 1)) or 1)
-    confidence = float(normalized.get("confidence", getattr(rule, "confidence", 0.0)) or 0.0)
-    coverage = float(normalized.get("coverage", support / max(1, total_support)))
-    rank_key = list(normalized.get("rank_key", []))
-    if not rank_key:
-        rank_key = [
-            -support,
-            -round(coverage, 12),
-            -round(confidence, 12),
-            int(head.get("av_action_id", -1)),
-            int(body.get("agent_class", -1)),
-            list(body.get("action", [])),
-            list(body.get("location", [])),
-        ]
-    return {
-        "head": {"av_action_id": int(head.get("av_action_id", -1))},
-        "body": {
-            "agent_class": int(body.get("agent_class", -1)),
-            "action": list(body.get("action", [])),
-            "location": list(body.get("location", [])),
-        },
-        "support": support,
-        "total_support": max(1, total_support),
-        "coverage": coverage,
-        "confidence": confidence,
-        "rank_key": rank_key,
-    }
 
 def save_dataset(data, dataset_file):
     np.savez(dataset_file, **data)
@@ -57,14 +26,14 @@ def _unwrap_cached_npz_value(value):
 
 
 def _rule_fires_on_fact(rule, fact):
-    if int(fact.get("av_action_id", -1)) != int(rule["head"]["av_action_id"]):
+    if int(fact["av_action_id"]) != int(rule["head"]["av_action_id"]):
         return False
 
     agent_class = int(rule["body"]["agent_class"])
     action_ids = tuple(rule["body"].get("action", []))
     location_ids = tuple(rule["body"].get("location", []))
     for agent in fact.get("agents", []):
-        if int(agent.get("class", -1)) != agent_class:
+        if int(agent["class"]) != agent_class:
             continue
         for pair in agent.get("frame-action-location", []) or []:
             if tuple(pair.get("action_ids", [])) == action_ids and tuple(pair.get("loc_ids", [])) == location_ids:
@@ -72,9 +41,9 @@ def _rule_fires_on_fact(rule, fact):
     return False
 
 
-def build_rule_learning_dataset(facts, rules, output_dir, train_indices):
-
+def build_rule_learning_dataset(facts, rules, output_dir,  all_rule_supports, all_head_supports):
     dataset_file = Path(output_dir) / "rule_learning_dataset.npz"
+
     if dataset_file.exists():
         npz =  np.load(dataset_file, allow_pickle=True)
         return {
@@ -82,54 +51,46 @@ def build_rule_learning_dataset(facts, rules, output_dir, train_indices):
             "feature_matrix": _unwrap_cached_npz_value(npz["feature_matrix"]),
             "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
-
-    if sparse is None:
-        raise RuntimeError(
-            "Rule aggregation baseline requires scipy and scikit-learn in the runtime environment."
-        )
-
-    normalized_rules = [_normalize_rule(rule) for rule in rules]
+    
     row_indices = []
     col_indices = []
     data = []
-    examples = []
     labels = []
+    matrix = torch.zeros((len(all_rule_supports), len(rules)), dtype=torch.float32)
 
-    for row_index, fact in tqdm(enumerate(facts), total=len(facts), desc="Building rule learning dataset"):
-        label = int(fact.get("av_action_id", -1))
-        labels.append(label)
-        examples.append(
-            {
-                "example_id": row_index,
-                "av_action_id": label,
-                "start_frame": int(fact.get("start_frame", -1)),
-                "end_frame": None if fact.get("end_frame", None) in {None, float("inf")} else int(fact.get("end_frame", -1)),
-                "num_agents": len(fact.get("agents", [])),
-            }
-        )
+    rules_dict = {}
+    for rule_index, rule in enumerate(rules):
+        body_signature = (rule['body']['agent_class'], 
+                          tuple(rule["body"]["action"]), 
+                          tuple(rule["body"]["location"]))
+        action_label = int(rule["head"]["av_action_id"])
+        rules_dict[(action_label, body_signature)] = rule_index
 
-        for col_index, rule in enumerate(normalized_rules):
-            if _rule_fires_on_fact(rule, fact):
-                row_indices.append(row_index)
-                col_indices.append(col_index)
-                data.append(1)
+    for row_index, body_signature in tqdm(enumerate(all_rule_supports), total=len(all_rule_supports), desc="Building rule learning dataset"):
+        for action_label in all_rule_supports[body_signature]:
+            labels.append(action_label)
+            rule_signature = (int(action_label),body_signature)
+            rule_index = rules_dict[rule_signature]
+            matrix[row_index, rule_index] = all_rule_supports[body_signature][action_label]
+            
 
-    feature_matrix = sparse.csr_matrix(
-        (data, (row_indices, col_indices)),
-        shape=(len(facts), len(normalized_rules)),
-        dtype=np.float32,
-    )
+
+        # labels.append(fact["av_action_id"])
+        # for col_index, rule in enumerate(rules):
+        #     if _rule_fires_on_fact(rule, fact):
+        #         row_indices.append(row_index)
+        #         col_indices.append(col_index)
+        #         data.append(1)
+
+    feature_matrix = sparse.csr_matrix((data, (row_indices, col_indices)), shape=(len(facts), len(rules)), dtype=np.float32)
+
     if isinstance(feature_matrix, np.ndarray) and feature_matrix.ndim == 0:
         feature_matrix = feature_matrix.item()    
 
-    train_matrix = feature_matrix[train_indices]
-    labels = np.array(labels)
-    train_labels = labels[train_indices]
-
     data = {
-        'feature_matrix': train_matrix,
-        'labels': train_labels,
-        'rules': normalized_rules,
+        'feature_matrix': feature_matrix,
+        'labels': labels,
+        'rules': rules,
     }
     save_dataset(data, dataset_file)
 

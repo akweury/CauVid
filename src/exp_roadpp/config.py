@@ -208,6 +208,8 @@ def get_step_03_input(args):
     output_dir = args.output_dir / "step03_output"
     os.makedirs(output_dir, exist_ok=True)        
     input_data = {
+        'skip_lr': args.skip_lr,
+        'data_num': args.data_num,
         "use_gt": args.use_gt,
         "dataset_path": args.dataset_path,
         "output_dir": output_dir,
