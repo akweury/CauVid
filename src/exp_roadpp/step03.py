@@ -94,6 +94,7 @@ def test_global_rules(model, rules, facts, output_dir, track_dir, test_indices):
     
     dataset = build_rule_learning_test_dataset(facts, rules, output_dir, test_indices)
     os.makedirs(output_dir, exist_ok=True)
+
     test_matrix = dataset["feature_matrix"]
     test_labels = dataset["labels"]
 

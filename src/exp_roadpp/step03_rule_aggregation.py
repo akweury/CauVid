@@ -78,9 +78,13 @@ def _build_fact_rule_matrix(facts, rules, desc):
     col_indices = []
     data = []
     labels = []
-
+    valid_fact_count = 0
     for row_index, fact in enumerate(tqdm(facts, total=len(facts), desc=desc)):
-        labels.append(int(fact.get("av_action_id", -1)))
+        if "av_action_id" not in fact:
+            raise ValueError(f"Fact at row_index {row_index} is missing 'av_action_id'")    
+        else:
+            valid_fact_count += 1
+            labels.append(int(fact["av_action_id"]))
         rule_indices = _fact_matching_rule_indices(fact, body_signature_index)
         if rule_indices:
             row_indices.extend([row_index] * len(rule_indices))
@@ -89,9 +93,9 @@ def _build_fact_rule_matrix(facts, rules, desc):
 
     feature_matrix = sparse.csr_matrix(
         (data, (row_indices, col_indices)),
-        shape=(len(facts), len(rules)),
+        shape=(valid_fact_count, len(rules)),
         dtype=np.float32,
-    )
+    )   
     return feature_matrix, np.asarray(labels, dtype=np.int64)
 
 
@@ -125,18 +129,15 @@ def build_rule_learning_test_dataset(facts, rules, output_dir, test_indices):
         npz =  np.load(dataset_file, allow_pickle=True)
         return {
             "rules": _unwrap_cached_npz_value(npz["rules"]),
-            "test_matrix": _unwrap_cached_npz_value(npz["test_matrix"]),
-            "test_labels": np.asarray(npz["test_labels"], dtype=np.int64),
+            "feature_matrix": _unwrap_cached_npz_value(npz["feature_matrix"]),
+            "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
 
     feature_matrix, labels = _build_fact_rule_matrix(facts, rules, desc="Building rule learning test dataset")
 
-    test_matrix = feature_matrix[test_indices]
-    test_labels = labels[test_indices]
-
     data = {
-        'test_matrix': test_matrix,
-        'test_labels': test_labels,
+        'feature_matrix': feature_matrix,
+        'labels': labels,
         'rules': rules,
     }
     save_dataset(data, dataset_file)
@@ -173,7 +174,7 @@ def _fit_rule_aggregation_lr(train_matrix, train_labels, val_matrix, val_labels,
     # Evaluated C=1.0: {'c_value': 1.0, 'validation_accuracy': 0.9671052631578947, 'validation_f1_macro': 0.9346958647854106, 'nonzero_rule_count': 1295}
     # Evaluated C=5.0: {'c_value': 5.0, 'validation_accuracy': 0.975328947368421, 'validation_f1_macro': 0.9437663887993266, 'nonzero_rule_count': 1812}
     # Evaluated C=10.0: {'c_value': 10.0, 'validation_accuracy': 0.9819078947368421, 'validation_f1_macro': 0.951205349022739, 'nonzero_rule_count': 2193}
-    c_values = [0.05,0.1,0.5,1.0,5.0,10.0]
+    c_values = [1.0,5.0,10.0]
     best_model = None
     best_key = None
     best_summary = None
@@ -259,6 +260,11 @@ def learn_rule_aggregation(train_dataset, val_dataset):
 
     model, selection_summary = _fit_rule_aggregation_lr(train_matrix, labels, val_matrix, val_labels, seed=7)
     ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
+    # save model and ranked rules
+    np.save("ranked_rules.npy", ranked_rules)
+    model_file = "model.npy"
+    np.save(model_file, model)
+
     return ranked_rules, model
 
 

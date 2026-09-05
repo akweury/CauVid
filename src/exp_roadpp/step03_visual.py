@@ -17,10 +17,11 @@ def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir
         return
 
     labels = utils_data.load_json(Path(dataset_path)/ "gt" / "label.json")
+    av_action_labels = labels["all_av_action_labels"]
     class_ids = list(test_accuracy_per_class.keys())
-    classes = [labels[int(cid)] for cid in class_ids]
+    classes = [av_action_labels[int(cid)] for cid in class_ids if cid != -1]
 
-    accuracies = list(test_accuracy_per_class.values())
+    accuracies = [test_accuracy_per_class[cid] for cid in class_ids if cid != -1]
 
     plt.figure(figsize=(10, 6))
     sns.barplot(x=classes, y=accuracies)

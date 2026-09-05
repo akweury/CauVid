@@ -150,8 +150,7 @@ class Language:
             if end_frame is not None:
                 end_frame = int(end_frame)
             else:
-                end_frame = float('inf')
-
+                continue
             fact = {
                 'start_frame': start_frame,
                 'end_frame': end_frame,
@@ -176,6 +175,8 @@ class Language:
                         'frame-action-location': frame_action_location,
                     }
                     fact['agents'].append(agent_behavior)
+            if 'av_action_id' not in fact:
+                raise ValueError(f"Fact at index {f_i} is missing 'av_action_id'")
             facts.append(fact)
         return facts
 
