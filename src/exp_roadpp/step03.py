@@ -174,16 +174,16 @@ def _facts_to_rules(facts, train_ids, lang, output_dir):
         return all_rules, all_rule_supports, all_head_supports
 
     for vid in tqdm(train_ids, desc="Facts to Rules"):
-        output_file = Path(rules_dir) / f"{vid}_rules.json"
-        if output_file.exists():
-            rules, rule_supports, head_supports = load_rule_files(output_file)
+        rule_file = Path(rules_dir) / f"{vid}_rules.json"
+        if rule_file.exists():
+            rules, rule_supports, head_supports = load_rule_files(rule_file)
             all_rules.extend(rules)
             all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
             all_head_supports = merge_head_supports(all_head_supports, head_supports)
         else:
             fact_data = utils_data.load_json(Path(facts_dir) / f"{vid}_facts.json")
             r_0, rule_supports, head_supports = lang.facts2rules(fact_data)
-            save_rule_files(r_0, rule_supports, head_supports, output_file)
+            save_rule_files(r_0, rule_supports, head_supports, rule_file)
 
             all_rules.extend(r_0)
             all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
@@ -231,8 +231,9 @@ def main(input_data):
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
+
     fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
-    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts,train_ids, language_model, output_dir)
+    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
 
     if input_data["skip_lr"] == 'True':
         return
