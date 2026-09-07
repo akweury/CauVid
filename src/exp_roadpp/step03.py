@@ -228,7 +228,6 @@ def main(input_data):
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-
     fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
     all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
 
@@ -267,10 +266,11 @@ def baselines(input_data):
     if input_data["skip_baselines_03"] == 'True':
         return
     
-    output_dir = input_data["baseline_output_dir"]
+    output_dir = input_data["output_dir"]
     test_output_dir = input_data["test_output_dir"]
     track_dir = input_data["dataset_path"] / "gt"
     dataset_path = input_data["dataset_path"]
+    language_model = Language(input_data["device"])
 
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     if input_data['data_num'] != 'full':
@@ -279,18 +279,24 @@ def baselines(input_data):
     
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
+    _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
+    fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
+    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
+
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
+    _, val_facts = _atoms_to_facts(val_ids, language_model, output_dir)
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-    
+    _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
+    test_fact_files, test_facts = _atoms_to_facts(test_ids, language_model, output_dir)
+
     # train and test baselines
     result_summary = {}
-    transformer_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    transformer_baseline.run(train_facts, val_facts, test_facts, track_dir, output_dir, result_summary)
     ilp_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
     gnn_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
     lstm_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
-
     utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
     visualize_baseline_results(result_summary, test_output_dir)
     
