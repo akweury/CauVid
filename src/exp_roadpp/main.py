@@ -23,7 +23,8 @@ def main():
     # step 3: take trajectories as input, output symbolic facts
     step03_input = config.get_step_03_input(args)
     step03.main(step03_input)
-
+    step03.baselines(step03_input)  # run baselines for comparison
+    
     # step 4: causal reasoning
     step_04_input = config.get_step_04_input(args)
     step04.main(step_04_input)

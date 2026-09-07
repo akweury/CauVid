@@ -16,7 +16,7 @@ def parse_args():
     )
 
     # Add arguments for the pipeline
-    parser.add_argument("--data_num", type=str, default="all", help="Number of data to process, default is all")
+    parser.add_argument("--data_num", type=str, default="full", help="Number of data to process, default is full")
 
     parser.add_argument("--dataset", type=str, default="roadpp", choices=["bdd100k", "roadpp"])
 
@@ -27,6 +27,9 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cpu", help="Device to use, default is cpu")
     
     parser.add_argument("--skip_lr", type=str, default="True", help="Whether to skip rule learning, default is True")
+
+    parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
+
 
     args = parser.parse_args()
 

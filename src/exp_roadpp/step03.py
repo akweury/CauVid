@@ -11,9 +11,9 @@ from collections import Counter
 from src.exp_roadpp import utils_data
 from src.exp_roadpp.step03_language import Language
 from src.exp_roadpp.step03_beam_search import BeamSearch
-from src.exp_roadpp.step03_visual import visualize_rule_aggregation_results
+from src.exp_roadpp.step03_visual import visualize_rule_aggregation_results, visualize_baseline_results
 from src.exp_roadpp.step03_rule_aggregation import build_rule_learning_test_dataset, learn_rule_aggregation, build_rule_learning_dataset
-
+from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
 def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
     indices = list(range(num_examples))
@@ -211,7 +211,7 @@ def merge_rule_supports(target, source):
     return target
 
 def main(input_data):
-    print("\n------- Step 03 -------\n")
+    print("\n--------- Step 03 ----------------------\n")
     output_dir = input_data["output_dir"]
     test_output_dir = output_dir / "test"
     os.makedirs(test_output_dir, exist_ok=True)
@@ -260,3 +260,38 @@ def main(input_data):
     visualize_rule_aggregation_results(dataset_path, dataset_summary, test_output_dir)
     
     print("\n--------- Step 03 Done ---------------\n")
+
+
+def baselines(input_data):
+    print("\n--------- Step 03 Baselines ----------------------\n")
+    if input_data["skip_baselines_03"] == 'True':
+        return
+    
+    output_dir = input_data["baseline_output_dir"]
+    test_output_dir = input_data["test_output_dir"]
+    track_dir = input_data["dataset_path"] / "gt"
+    dataset_path = input_data["dataset_path"]
+
+    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
+    if input_data['data_num'] != 'full':
+        all_track_files = all_track_files[:int(input_data['data_num'])]
+    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
+    
+    # train data
+    train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
+    # val data
+    val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
+    # test data
+    test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
+    
+    # train and test baselines
+    result_summary = {}
+    transformer_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    ilp_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    gnn_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    lstm_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+
+    utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
+    visualize_baseline_results(result_summary, test_output_dir)
+    
+    print("\n--------- Step 03 Baseline Done! ---------------\n")
