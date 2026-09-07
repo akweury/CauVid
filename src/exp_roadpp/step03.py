@@ -88,10 +88,7 @@ def _atoms_to_facts(train_ids, lang, output_dir):
 def test_global_rules(model, rules, facts, output_dir, track_dir, test_indices):
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-
-    # _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    # fact_files, facts = _atoms_to_facts(test_ids, language_model, output_dir)
-    
+ 
     dataset = build_rule_learning_test_dataset(facts, rules, output_dir, test_indices)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -251,7 +248,7 @@ def main(input_data):
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
     test_fact_files, test_facts = _atoms_to_facts(test_ids, language_model, output_dir)
-
+    
     
     # learn rule aggregation
     ranked_rules, model = learn_rule_aggregation(train_dataset,val_dataset)
