@@ -63,25 +63,24 @@ def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
     return atom_files
 
 
-def _atoms_to_facts(train_ids, lang, output_dir):
+def _atoms_to_facts(train_ids, lang, output_dir, split):
     facts_dir = Path(output_dir) / "facts"
     os.makedirs(facts_dir, exist_ok=True)
-    fact_files = []
+
+    all_fact_file = facts_dir / f"all_facts_{split}.json"
+    if all_fact_file.exists():
+        return utils_data.load_json(all_fact_file)
+    
     all_facts = []
     for vid in tqdm(train_ids, desc="Atoms to Facts"):
-        output_file = facts_dir / f"{vid}_facts.json"
-        if output_file.exists():
-            facts = utils_data.load_json(output_file)
-            all_facts.extend(facts)
-        else:
-            atom_file = Path(output_dir) / "atoms" / f"{vid}_atoms.json"
-            atom_data = utils_data.load_json(atom_file)
-            vid = Path(atom_file).stem.replace("_atoms", "")
-            fact_files.append(output_file)
-            facts = lang.atoms2facts(atom_data)
-            all_facts.extend(facts)
-            utils_data.save_json(facts, output_file)
-    return fact_files, all_facts
+        atom_file = Path(output_dir) / "atoms" / f"{vid}_atoms.json"
+        atom_data = utils_data.load_json(atom_file)
+        vid = Path(atom_file).stem.replace("_atoms", "")
+        facts = lang.atoms2facts(atom_data)
+        all_facts.extend(facts)
+    utils_data.save_json(all_facts, all_fact_file)
+
+    return all_facts
 
 
 
@@ -217,6 +216,8 @@ def main(input_data):
     os.makedirs(test_output_dir, exist_ok=True)
     track_dir = input_data["dataset_path"] / "gt"
     dataset_path = input_data["dataset_path"]
+    
+
     language_model = Language(input_data["device"])
     beam_search_model = BeamSearch()
 
@@ -228,7 +229,7 @@ def main(input_data):
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
+    train_facts = _atoms_to_facts(train_ids, language_model, output_dir, 'train')
     all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
 
     if input_data["skip_lr"] == 'True':
@@ -240,13 +241,13 @@ def main(input_data):
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
     _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
-    _, val_facts = _atoms_to_facts(val_ids, language_model, output_dir)
+    val_facts = _atoms_to_facts(val_ids, language_model, output_dir, 'val')
     val_dataset = build_rule_learning_dataset(val_facts, all_rules, output_dir, all_rule_supports, all_head_supports)
 
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    test_fact_files, test_facts = _atoms_to_facts(test_ids, language_model, output_dir)
+    test_facts = _atoms_to_facts(test_ids, language_model, output_dir, 'test')
     
     
     # learn rule aggregation
@@ -270,8 +271,9 @@ def baselines(input_data):
     test_output_dir = input_data["test_output_dir"]
     track_dir = input_data["dataset_path"] / "gt"
     dataset_path = input_data["dataset_path"]
+    dataset_labels = input_data["dataset_labels"]
     language_model = Language(input_data["device"])
-
+    device = input_data["device"]
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     if input_data['data_num'] != 'full':
         all_track_files = all_track_files[:int(input_data['data_num'])]
@@ -280,23 +282,24 @@ def baselines(input_data):
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    fact_files, train_facts = _atoms_to_facts(train_ids, language_model, output_dir)
+    train_facts = _atoms_to_facts(train_ids, language_model, output_dir, 'train')
     all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
 
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    _, val_facts = _atoms_to_facts(val_ids, language_model, output_dir)
+    val_facts = _atoms_to_facts(val_ids, language_model, output_dir, 'val')
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    test_fact_files, test_facts = _atoms_to_facts(test_ids, language_model, output_dir)
+    test_facts = _atoms_to_facts(test_ids, language_model, output_dir, 'test')
 
     # train and test baselines
     result_summary = {}
-    transformer_baseline.run(train_facts, val_facts, test_facts, track_dir, output_dir, result_summary)
-    ilp_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
-    gnn_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    all_facts = {"train": train_facts, "val": val_facts, "test": test_facts}
+    transformer_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
     lstm_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    gnn_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    ilp_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
     utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
     visualize_baseline_results(result_summary, test_output_dir)
     

@@ -1,9 +1,6 @@
-
+import json 
 import os
-import cv2 as cv
 from pathlib import Path
-import shutil
-from dataclasses import dataclass
 
 # -------------- Settings --------------
 ALLOW_MODEL_DOWNLOAD = True
@@ -211,7 +208,11 @@ def get_step_03_input(args):
     os.makedirs(baseline_output_dir, exist_ok=True)
     test_output_dir = output_dir / "test"
     os.makedirs(test_output_dir, exist_ok=True)
+    with open(args.dataset_path/"gt"/"label.json", 'r') as f:
+        dataset_labels = json.load(f)
+    
     input_data = {
+        "dataset_labels": dataset_labels,
         'skip_lr': args.skip_lr,
         'skip_baselines_03': args.skip_baselines_03,
         'data_num': args.data_num,
@@ -236,3 +237,5 @@ def get_step_04_input(args):
         "device": args.device,
     }
     return input_data
+
+

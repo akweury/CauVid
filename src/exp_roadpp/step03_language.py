@@ -176,7 +176,7 @@ class Language:
                     }
                     fact['agents'].append(agent_behavior)
             if 'av_action_id' not in fact:
-                raise ValueError(f"Fact at index {f_i} is missing 'av_action_id'")
+                continue
             facts.append(fact)
         return facts
 
