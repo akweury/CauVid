@@ -52,12 +52,23 @@ def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
         if not track_file.exists():
             continue
         track_data = utils_data.load_json(track_file)       
+
         agent_tubes = track_data["data"]["agent_tubes"]
+        action_tubes = track_data["data"].get("action_tubes", {})
+        loc_tubes = track_data["data"].get("loc_tubes", {})
+        duplex_tubes = track_data["data"].get("duplex_tubes", {})
+        triplet_tubes = track_data["data"].get("triplet_tubes", {})
         segments_by_ego_actions = track_data["data"]["av_action_tubes"]
         frames = track_data["data"]["frames"]
+
         atoms = []
         atoms.extend(lang.segs2atoms("av", segments_by_ego_actions))
         atoms.extend(lang.segs2atoms("agents", agent_tubes, frames))
+        atoms.extend(lang.segs2atoms("action", action_tubes, frames))
+        atoms.extend(lang.segs2atoms("location", loc_tubes, frames))
+        atoms.extend(lang.segs2atoms("duplex", duplex_tubes, frames))
+        atoms.extend(lang.segs2atoms("triplet", triplet_tubes, frames))
+        
         utils_data.save_json(atoms, output_file)
         atom_files.append(output_file)
     return atom_files
@@ -296,10 +307,10 @@ def baselines(input_data):
     # train and test baselines
     result_summary = {}
     all_facts = {"train": train_facts, "val": val_facts, "test": test_facts}
+    ilp_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
+    gnn_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
     transformer_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
-    lstm_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
-    gnn_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
-    ilp_baseline.run(train_ids, val_ids, test_ids, track_dir, output_dir, result_summary)
+    lstm_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
     utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
     visualize_baseline_results(result_summary, test_output_dir)
     

@@ -82,7 +82,14 @@ class Language:
     @staticmethod
     def _body_signature(agent_class, action_ids, loc_ids):
         return (agent_class, tuple(action_ids), tuple(loc_ids))
-        
+    @staticmethod
+    def _lookup_tube_uid(segment, frames):
+        for frame_id, box_id in segment["annos"].items():
+            box = (frames or {}).get(str(frame_id), {}).get("annos", {}).get(box_id, {})
+            if box.get("tube_uid"):
+                return box["tube_uid"]
+        return None
+    
     def evaluate_rule(self, rule, support, total_support, evidence_count):
         return Rule(rule, support=support, total_support=total_support, evidence_count=evidence_count).to_dict()
 
@@ -91,14 +98,14 @@ class Language:
         if target == "av":
             for seg_id, segment in segments.items():
                 label_id = segment["label_id"]
-                frames = segment["frames"]
-                start_frame = frames[0]
-                end_frame = frames[-1]
+                seg_frames = segment["frames"]
+                start_frame = seg_frames[0]
+                end_frame = seg_frames[-1]
                 atoms.append({
                     "target": target,
                     "seg_id": seg_id,
                     "label_id": label_id,
-                    "frames": frames,
+                    "frames": seg_frames,
                     "start_frame": start_frame,
                     "end_frame": end_frame
                 })
@@ -106,18 +113,35 @@ class Language:
             action_loc_pairs = utils_data.build_agent_frame_action_loc_pairs(segments, frames)
             for seg_id, segment in segments.items():
                 label_id = segment["label_id"]
-                frames = list(segment["annos"].keys())
-                start_frame = frames[0]
-                end_frame = frames[-1]
+                seg_frames = sorted(segment["annos"].keys(), key=int)
+                tube_uid = self._lookup_tube_uid(segment, frames)
+                start_frame = seg_frames[0]
+                end_frame = seg_frames[-1]
                 atoms.append({
                     "target": target,
                     "seg_id": seg_id,
                     "label_id": label_id,
-                    "frames": frames,
+                    "frames": seg_frames,
                     'frame-action-location': action_loc_pairs.get(seg_id, None),
                     "start_frame": start_frame,
                     "end_frame": end_frame,
+                    "tube_uid": tube_uid,
                 })
+        elif target in ("action", "location", "duplex", "triplet"):
+            for seg_id, segment in segments.items():
+                label_id = segment['label_id']
+                seg_frames = sorted(segment["annos"].keys(), key=int)
+                tube_uid = self._lookup_tube_uid(segment, frames)
+                atoms.append({
+                    "target":target,
+                    "seg_id": seg_id,
+                    "label_id": label_id,
+                    "frames": seg_frames,
+                    "tube_uid": tube_uid,
+                    "start_frame": seg_frames[0],
+                    "end_frame": seg_frames[-1],
+                })
+
         else:
             raise ValueError(f"Unknown target: {target}")
         
@@ -154,7 +178,7 @@ class Language:
             fact = {
                 'start_frame': start_frame,
                 'end_frame': end_frame,
-                'agents': [],
+                'agents': {},
 
             }
             for atom in atoms_at_time['atoms']:
@@ -163,20 +187,38 @@ class Language:
                 if atom['target']=='av':
                     fact['av_action_id'] = atom['label_id']
 
-                elif atom['target']=='agents':
+                tube_uid = atom.get("tube_uid")
+                if tube_uid is None:
+                    if atom["target"] != "av":
+                        print(f"Warning: tube_uid is None for atom {atom}, skipping this atom.")
+                    continue
+                agent_record = fact["agents"].setdefault(tube_uid, {})
+
+                if atom['target']=='agents':
                     agent_class = atom['label_id']
                     frame_action_location = [pair for pair in atom['frame-action-location'] 
                                              if pair["frame"] >= start_frame 
                                              and pair["frame"] <= end_frame]
-                    
+                    agent_record["class"] = agent_class
+                    agent_record["frame-action-location"] = frame_action_location
+                    # agent_behavior = {
+                    #     'class': agent_class,
+                    #     'frame-action-location': frame_action_location,
+                    # }
+                    # fact['agents'].append(agent_behavior)
+                elif atom["target"] == "action":
+                    agent_record["action_id"] = atom['label_id']
+                elif atom['target'] == 'location':
+                    agent_record["loc_id"] = atom['label_id']
+                elif atom['target'] == 'duplex':
+                    agent_record["duplex_id"] = atom['label_id']
+                elif atom['target'] == 'triplet':
+                    agent_record["triplet_id"] = atom['label_id']
 
-                    agent_behavior = {
-                        'class': agent_class,
-                        'frame-action-location': frame_action_location,
-                    }
-                    fact['agents'].append(agent_behavior)
+
             if 'av_action_id' not in fact:
                 continue
+            fact['agents'] = list(fact['agents'].values())
             facts.append(fact)
         return facts
 
