@@ -148,7 +148,7 @@ def _decode_rule_supports(supports):
 
 
 def _decode_head_supports(supports):
-    return Counter({int(key): value for key, value in supports.items()})
+    return Counter({json.loads(key): value for key, value in supports.items()})
 
 
 
@@ -166,7 +166,7 @@ def save_rule_files(rules, rule_supports, head_supports, rule_file):
          'head_supports': _encode_supports(head_supports)
          }, rule_file)
 
-def _facts_to_rules(facts, train_ids, lang, output_dir):
+def _facts_to_rules(facts, lang, output_dir):
     rules_dir = output_dir/ 'rules'
     facts_dir = output_dir / 'facts'
     os.makedirs(rules_dir, exist_ok=True)
@@ -180,24 +180,13 @@ def _facts_to_rules(facts, train_ids, lang, output_dir):
         all_rules, all_rule_supports, all_head_supports = load_rule_files(all_rule_file)
         return all_rules, all_rule_supports, all_head_supports
 
-    for vid in tqdm(train_ids, desc="Facts to Rules"):
-        rule_file = Path(rules_dir) / f"{vid}_rules.json"
-        if rule_file.exists():
-            rules, rule_supports, head_supports = load_rule_files(rule_file)
-            all_rules.extend(rules)
-            all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
-            all_head_supports = merge_head_supports(all_head_supports, head_supports)
-        else:
-            fact_data = utils_data.load_json(Path(facts_dir) / f"{vid}_facts.json")
-            r_0, rule_supports, head_supports = lang.facts2rules(fact_data)
-            save_rule_files(r_0, rule_supports, head_supports, rule_file)
-
-            all_rules.extend(r_0)
-            all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
-            all_head_supports = merge_head_supports(all_head_supports, head_supports)
-            
+    for fact in tqdm(facts, desc="Facts to Rules"):
+        r_0, rule_supports, head_supports = lang.facts2rules(fact)
+        all_rules.extend(r_0)
+        all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
+        all_head_supports = merge_head_supports(all_head_supports, head_supports)
+        
     save_rule_files(all_rules, all_rule_supports, all_head_supports, all_rule_file)
-    
     return all_rules, all_rule_supports, all_head_supports
 
 def merge_head_supports(target, source):
@@ -241,12 +230,11 @@ def main(input_data):
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
     train_facts = _atoms_to_facts(train_ids, language_model, output_dir, 'train')
-    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
+    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, language_model, output_dir)
 
     if input_data["skip_lr"] == 'True':
         return
 
-    
     train_dataset = build_rule_learning_dataset(train_facts, all_rules, output_dir, all_rule_supports, all_head_supports)
 
     # val data

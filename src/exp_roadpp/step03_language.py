@@ -15,11 +15,12 @@ class Rule:
     head: None
     body: None
     def __init__(self, fact_tuple, support=1, total_support=1, evidence_count=1):
-        self.head = {'av_action_id': fact_tuple[0]}
+        head_key, head_value, agent_class, action_ids, loc_ids = fact_tuple
+        self.head = {head_key: head_value}
         self.body = {
-            'agent_class': fact_tuple[1],
-            'action': tuple(fact_tuple[2]) if isinstance(fact_tuple[2], (list, tuple)) else (fact_tuple[2],),
-            'location': tuple(fact_tuple[3]) if isinstance(fact_tuple[3], (list, tuple)) else (fact_tuple[3],),
+            'agent_class': agent_class,
+            'action': tuple(action_ids) if isinstance(action_ids, (list, tuple)) else (action_ids,),
+            'location': tuple(loc_ids) if isinstance(loc_ids, (list, tuple)) else (loc_ids,),
         }
         self.support = int(support)
         self.total_support = max(1, int(total_support))
@@ -35,11 +36,13 @@ class Rule:
 
     @property
     def rank_key(self):
+        head_key, head_value = next(iter(self.head.items()))
         return [
             -int(self.support),
             -round(self.coverage, 12),
             -round(self.confidence, 12),
-            int(self.head['av_action_id']),
+            str(head_key),
+            int(head_value),
             int(self.body['agent_class']),
             list(self.body['action']),
             list(self.body['location']),
@@ -222,55 +225,82 @@ class Language:
             facts.append(fact)
         return facts
 
-    def facts2rules(self, facts):
+    @staticmethod
+    def _fact_head_candidates(fact):
+        """Every scalar predicate in a fact that can serve as a rule head, paired
+        with the agent index it was derived from (None for fact-level predicates
+        such as av_action_id) so that agent can be excluded from the rule body."""
+        candidates = []
+        if fact.get('av_action_id') is not None:
+            candidates.append(('av_action_id', fact['av_action_id'], None))
+        for agent_index, agent in enumerate(fact.get('agents', []) or []):
+            for agent_key, head_key in (
+                ('class', 'agent_class'),
+                ('action_id', 'action_id'),
+                ('loc_id', 'loc_id'),
+                ('duplex_id', 'duplex_id'),
+                ('triplet_id', 'triplet_id'),
+            ):
+                value = agent.get(agent_key)
+                if value is not None:
+                    candidates.append((head_key, value, agent_index))
+        return candidates
+
+    def _agent_body_candidates(self, agent):
+        frame_action_location = agent.get('frame-action-location', []) or []
+        agent_class = agent.get('class')
+        if not frame_action_location or agent_class is None:
+            return agent_class, []
+
+        action_options = []
+        loc_options = []
+        for pair in frame_action_location:
+            action_ids = self._flatten_ids(pair["action_ids"])
+            loc_ids = self._flatten_ids(pair['loc_ids'])
+            if not action_ids or not loc_ids:
+                continue
+            action_options.append(action_ids)
+            loc_options.append(loc_ids)
+
+        unique_pairs = list(dict.fromkeys(zip(action_options, loc_options)))
+        return agent_class, unique_pairs
+
+    def facts2rules(self, fact):
         rule_supports = Counter()
         head_supports = Counter()
-        for f_i, fact in enumerate(facts):
-            if 'av_action_id' not in fact:
-                continue
+        rules = []
+        head_lookup = {}
 
-            head = fact['av_action_id']
-            for agent in fact['agents']:
-                frame_action_location = agent.get('frame-action-location', []) or []
-                if not frame_action_location:
+        agent_bodies = [self._agent_body_candidates(agent) for agent in fact.get('agents', []) or []]
+
+        for head_key, head_value, source_agent_index in self._fact_head_candidates(fact):
+            head_id = f"{head_key}:{head_value}"
+            head_lookup[head_id] = (head_key, head_value)
+            for agent_index, (agent_class, unique_pairs) in enumerate(agent_bodies):
+                if agent_index == source_agent_index or agent_class is None:
                     continue
-                agent_class = agent['class']
-
-                action_options = []
-                loc_options = []
-                for pair in frame_action_location:
-                    action_ids = self._flatten_ids(pair["action_ids"])
-                    loc_ids = self._flatten_ids(pair['loc_ids'])
-                    if not action_ids or not loc_ids:
-                        continue
-                    action_options.append(action_ids)
-                    loc_options.append(loc_ids)
-
-                if not action_options or not loc_options:
-                    continue
-
-                unique_pairs = list(dict.fromkeys(zip(action_options, loc_options)))
                 for action_ids, loc_ids in unique_pairs:
                     body_signature = self._body_signature(agent_class, action_ids, loc_ids)
                     if body_signature not in rule_supports:
                         rule_supports[body_signature] = {}
-                    if head not in rule_supports[body_signature]:
-                        rule_supports[body_signature][head] = 0
-                    rule_supports[body_signature][head] += 1
+                    if head_id not in rule_supports[body_signature]:
+                        rule_supports[body_signature][head_id] = 0
+                    rule_supports[body_signature][head_id] += 1
 
-                    if head not in head_supports:
-                        head_supports[head] = 0
-                    head_supports[head] += 1
+                    if head_id not in head_supports:
+                        head_supports[head_id] = 0
+                    head_supports[head_id] += 1
 
 
-        rules = []
+
         for body_signature, support in rule_supports.items():
             agent_class, action_ids, loc_ids = body_signature
-            for head, count in support.items():
+            for head_id, count in support.items():
+                head_key, head_value = head_lookup[head_id]
                 rule = self.evaluate_rule(
-                    (head, agent_class, action_ids, loc_ids),
+                    (head_key, head_value, agent_class, action_ids, loc_ids),
                     support=count,
-                    total_support=head_supports[head],
+                    total_support=head_supports[head_id],
                     evidence_count=sum(support.values()),
                 )
                 rules.append(rule)
