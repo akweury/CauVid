@@ -2,13 +2,14 @@
 import torch 
 from collections import Counter
 from src.exp_roadpp import utils_data 
-
+from src.exp_roadpp.logic import Clause, Atom, Predicate 
 
 
 def time_overlap(start1, end1, start2, end2):
     if end2 is None:
         return start1 >= start2
     return max(start1, start2) <= min(end1, end2)
+
 
 
 class Rule:
@@ -68,6 +69,14 @@ class Rule:
 class Language:
     def __init__(self, device):
         self.device= device
+        self.predicates = {
+            'action': Predicate(
+                'action', arity=5, dtypes=[str, str, int, int, str],
+                field_names = ("action_id", "agent_class", "start_frame", "end_frame", "tube_uid")),
+            'location': Predicate(
+                'location', arity=5, dtypes=[str, str, int, int, str],
+                field_names = ("location_name", "agent_class", "start_frame", "end_frame", "tube_uid")),
+        }
 
     @staticmethod
     def _flatten_ids(values):
@@ -92,53 +101,106 @@ class Language:
             if box.get("tube_uid"):
                 return box["tube_uid"]
         return None
+    @staticmethod
+    def _rle_intervals(frame_pairs, key):
+        """Collapse consecutive frames sharing the same value under `key`
+    ('action_ids' or 'loc_ids') into (value_tuple, start_frame, end_frame)."""
+        intervals = []
+        current_value = None 
+        current_start = None 
+        current_end = None 
+        for pair in frame_pairs:
+            value = tuple(sorted(pair[key]))
+            frame = pair["frame"]
+            if value != current_value:
+                if current_value is not None:
+                    intervals.append((current_value, current_start, current_end))
+                current_value = value
+                current_start = frame
+            current_end = frame 
+        if current_value is not None:
+            intervals.append((current_value, current_start, current_end))
+        return intervals
     
     def evaluate_rule(self, rule, support, total_support, evidence_count):
         return Rule(rule, support=support, total_support=total_support, evidence_count=evidence_count).to_dict()
 
-    def segs2atoms(self,target, segments, frames=None):
+    def video2atoms(self, target, segments, frames=None):
         atoms = []
         if target == "av":
             for seg_id, segment in segments.items():
-                label_id = segment["label_id"]
-                seg_frames = segment["frames"]
+                # av from start to end of the segment, with action
+                av_action_id = segment["label_id"]
+                seg_frames = sorted(segment["frames"], key=int)
                 start_frame = seg_frames[0]
                 end_frame = seg_frames[-1]
-                atoms.append({
-                    "target": target,
-                    "seg_id": seg_id,
-                    "label_id": label_id,
-                    "frames": seg_frames,
-                    "start_frame": start_frame,
-                    "end_frame": end_frame
-                })
+                atom = self.predicates['action'].make_atom(
+                    action_id=av_action_id, 
+                    agent_class="av", 
+                    start_frame=start_frame, 
+                    end_frame=end_frame, 
+                    tube_uid=None)
+                atoms.append(atom)
         elif target == "agents":
             action_loc_pairs = utils_data.build_agent_frame_action_loc_pairs(segments, frames)
             for seg_id, segment in segments.items():
-                label_id = segment["label_id"]
-                seg_frames = sorted(segment["annos"].keys(), key=int)
-                tube_uid = self._lookup_tube_uid(segment, frames)
-                start_frame = seg_frames[0]
-                end_frame = seg_frames[-1]
-                atoms.append({
-                    "target": target,
-                    "seg_id": seg_id,
-                    "label_id": label_id,
-                    "frames": seg_frames,
-                    'frame-action-location': action_loc_pairs.get(seg_id, None),
-                    "start_frame": start_frame,
-                    "end_frame": end_frame,
-                    "tube_uid": tube_uid,
-                })
+                agent_class = segment["label_id"]
+                start_frame, end_frame, tube_uid = utils_data.get_start_end_frame(segment, frames)
+                action_intervals = self._rle_intervals(action_loc_pairs.get(seg_id, []), "action_ids")
+
+action_intervals = _rle_intervals(frame_pairs, "action_ids")
+location_intervals = _rle_intervals(frame_pairs, "loc_ids")
+
+for action_ids, seg_start, seg_end in action_intervals:
+    for action_id in action_ids:
+        atoms.append(self.predicates['action'].make_atom(
+            action_id=action_id,
+            agent_class=agent_class,
+            start_frame=seg_start,
+            end_frame=seg_end,
+            tube_uid=tube_uid,
+        ))
+
+for loc_ids, seg_start, seg_end in location_intervals:
+    for loc_id in loc_ids:
+        atoms.append(self.predicates['location'].make_atom(
+            location_name=loc_id,
+            agent_class=agent_class,
+            start_frame=seg_start,
+            end_frame=seg_end,
+            tube_uid=tube_uid,
+        ))
+
+
+
+                agent_actions_per_frame = None 
+                agent_locations_per_frame = None
+                
+                action_atom = self.predicates['action'].make_atom(
+                    action_id=agent_action, 
+                    agent_class=agent_class, 
+                    start_frame=start_frame, 
+                    end_frame=end_frame, 
+                    tube_uid=tube_uid
+                )
+                location_atom = self.predicates['location'].make_atom(
+                    location_name=agent_location, 
+                    agent_class=agent_class, 
+                    start_frame=start_frame, 
+                    end_frame=end_frame, 
+                    tube_uid=tube_uid
+                )
+                atoms.append(action_atom)
+                atoms.append(location_atom)
         elif target in ("action", "location", "duplex", "triplet"):
             for seg_id, segment in segments.items():
-                label_id = segment['label_id']
+                av_action_id = segment['label_id']
                 seg_frames = sorted(segment["annos"].keys(), key=int)
                 tube_uid = self._lookup_tube_uid(segment, frames)
                 atoms.append({
                     "target":target,
                     "seg_id": seg_id,
-                    "label_id": label_id,
+                    "label_id": av_action_id,
                     "frames": seg_frames,
                     "tube_uid": tube_uid,
                     "start_frame": seg_frames[0],
@@ -265,13 +327,14 @@ class Language:
         unique_pairs = list(dict.fromkeys(zip(action_options, loc_options)))
         return agent_class, unique_pairs
 
-    def facts2rules(self, fact):
+    def fact2rules(self, fact):
         rule_supports = Counter()
         head_supports = Counter()
         rules = []
         head_lookup = {}
 
-        agent_bodies = [self._agent_body_candidates(agent) for agent in fact.get('agents', []) or []]
+
+        agent_bodies = [self._agent_body_candidates(agent) for agent in fact['agents'] or []]
 
         for head_key, head_value, source_agent_index in self._fact_head_candidates(fact):
             head_id = f"{head_key}:{head_value}"
@@ -307,5 +370,4 @@ class Language:
 
         rules.sort(key=lambda row: tuple(row['rank_key']))
         return rules, rule_supports, head_supports
-
 

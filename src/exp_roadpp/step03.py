@@ -40,17 +40,29 @@ def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, 
 
 
 def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
-    atom_files = []
+    all_atoms = []
     atom_dir = Path(output_dir) / "atoms"
     os.makedirs(atom_dir, exist_ok=True)
+    atom_file = atom_dir / "all_atoms.json"
+    if atom_file.exists():
+        all_atoms = utils_data.load_json(atom_file)
+    
+
+    all_predicates = []
+    predicate_file = atom_dir / "all_predicates.json"
+    if predicate_file.exists():
+        all_predicates = utils_data.load_json(predicate_file)
+
+    if all_atoms and all_predicates:
+        return all_atoms, all_predicates
+    
+
+
     for vid in tqdm(video_ids, desc="Tracks to Atoms"):
-        output_file = atom_dir / f"{vid}_atoms.json"
-        if output_file.exists():
-            atom_files.append(output_file)
-            continue
         track_file = Path(track_dir) / f"{vid}_gt.json"
         if not track_file.exists():
             continue
+
         track_data = utils_data.load_json(track_file)       
 
         agent_tubes = track_data["data"]["agent_tubes"]
@@ -62,16 +74,19 @@ def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
         frames = track_data["data"]["frames"]
 
         atoms = []
-        atoms.extend(lang.segs2atoms("av", segments_by_ego_actions))
-        atoms.extend(lang.segs2atoms("agents", agent_tubes, frames))
-        atoms.extend(lang.segs2atoms("action", action_tubes, frames))
-        atoms.extend(lang.segs2atoms("location", loc_tubes, frames))
-        atoms.extend(lang.segs2atoms("duplex", duplex_tubes, frames))
-        atoms.extend(lang.segs2atoms("triplet", triplet_tubes, frames))
-        
-        utils_data.save_json(atoms, output_file)
-        atom_files.append(output_file)
-    return atom_files
+        atoms.extend(lang.video2atoms("av", segments_by_ego_actions))
+        atoms.extend(lang.video2atoms("agents", agent_tubes, frames))
+        atoms.extend(lang.video2atoms("action", action_tubes, frames))
+        atoms.extend(lang.video2atoms("location", loc_tubes, frames))
+        atoms.extend(lang.video2atoms("duplex", duplex_tubes, frames))
+        atoms.extend(lang.video2atoms("triplet", triplet_tubes, frames))
+        all_atoms.extend(atoms)
+
+    utils_data.save_json(all_atoms, atom_file)
+    utils_data.save_json(all_predicates, predicate_file)
+    return all_atoms, all_predicates        
+
+
 
 
 def _atoms_to_facts(train_ids, lang, output_dir, split):
@@ -179,10 +194,10 @@ def _facts_to_rules(facts, lang, output_dir):
     if all_rule_file.exists():
         all_rules, all_rule_supports, all_head_supports = load_rule_files(all_rule_file)
         return all_rules, all_rule_supports, all_head_supports
-
+    
     for fact in tqdm(facts, desc="Facts to Rules"):
         r_0, rule_supports, head_supports = lang.facts2rules(fact)
-        all_rules.extend(r_0)
+        all_rules = merge_rules(all_rules, r_0)
         all_rule_supports = merge_rule_supports(all_rule_supports, rule_supports)
         all_head_supports = merge_head_supports(all_head_supports, head_supports)
         
@@ -195,6 +210,13 @@ def merge_head_supports(target, source):
             target[key] += source[key]
         else:
             target[key] = value
+    return target
+
+
+def merge_rules(target, source):
+    for rule in source:
+        if rule not in target:
+            target.append(rule)
     return target
 
 def merge_rule_supports(target, source):

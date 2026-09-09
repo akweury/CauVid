@@ -76,3 +76,15 @@ def build_agent_frame_action_loc_pairs(agent_tubes, frames):
         result[agent_tube_id] = pairs
     return result
 
+def get_start_end_frame(segment, frames):
+    seg_frames = sorted(segment["annos"].keys(), key=int)
+
+    tube_uid = None
+    for frame_id, box_id in segment["annos"].items():
+        box = (frames or {}).get(str(frame_id), {}).get("annos", {}).get(box_id, {})
+        if box.get("tube_uid"):
+            tube_uid = box["tube_uid"]
+            break 
+    start_frame = seg_frames[0]
+    end_frame = seg_frames[-1]
+    return start_frame, end_frame, tube_uid
