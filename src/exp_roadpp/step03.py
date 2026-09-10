@@ -40,81 +40,55 @@ def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, 
 
 
 def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
-    all_atoms = []
     atom_dir = Path(output_dir) / "atoms"
     os.makedirs(atom_dir, exist_ok=True)
     atom_file = atom_dir / "all_atoms.json"
-    if atom_file.exists():
-        all_atoms = utils_data.load_json(atom_file)
-    
 
-    all_predicates = []
-    predicate_file = atom_dir / "all_predicates.json"
-    if predicate_file.exists():
-        all_predicates = utils_data.load_json(predicate_file)
+    atoms_by_video = utils_data.load_json(atom_file) if atom_file.exists() else {}
 
-    if all_atoms and all_predicates:
-        return all_atoms, all_predicates
-    
+    missing_ids = [vid for vid in video_ids if vid not in atoms_by_video]
+    if missing_ids:
+        for vid in tqdm(missing_ids, desc="Tracks to Atoms"):
+            track_file = Path(track_dir) / f"{vid}_gt.json"
+            if not track_file.exists():
+                continue
 
+            track_data = utils_data.load_json(track_file)       
 
-    for vid in tqdm(video_ids, desc="Tracks to Atoms"):
-        track_file = Path(track_dir) / f"{vid}_gt.json"
-        if not track_file.exists():
-            continue
+            agent_tubes = track_data["data"]["agent_tubes"]
+            segments_by_ego_actions = track_data["data"]["av_action_tubes"]
+            frames = track_data["data"]["frames"]
 
-        track_data = utils_data.load_json(track_file)       
+            atoms = []
+            atoms.extend(lang.video2atoms("av", segments_by_ego_actions))
+            atoms.extend(lang.video2atoms("agents", agent_tubes, frames))
 
-        agent_tubes = track_data["data"]["agent_tubes"]
-        action_tubes = track_data["data"].get("action_tubes", {})
-        loc_tubes = track_data["data"].get("loc_tubes", {})
-        duplex_tubes = track_data["data"].get("duplex_tubes", {})
-        triplet_tubes = track_data["data"].get("triplet_tubes", {})
-        segments_by_ego_actions = track_data["data"]["av_action_tubes"]
-        frames = track_data["data"]["frames"]
+            atoms_by_video[vid] = atoms
 
-        atoms = []
-        atoms.extend(lang.video2atoms("av", segments_by_ego_actions))
-        atoms.extend(lang.video2atoms("agents", agent_tubes, frames))
-        atoms.extend(lang.video2atoms("action", action_tubes, frames))
-        atoms.extend(lang.video2atoms("location", loc_tubes, frames))
-        atoms.extend(lang.video2atoms("duplex", duplex_tubes, frames))
-        atoms.extend(lang.video2atoms("triplet", triplet_tubes, frames))
-        all_atoms.extend(atoms)
+        utils_data.save_json(atoms_by_video, atom_file)
 
-    utils_data.save_json(all_atoms, atom_file)
-    utils_data.save_json(all_predicates, predicate_file)
-    return all_atoms, all_predicates        
+    return {vid: atoms_by_video[vid] for vid in video_ids if vid in atoms_by_video}
 
 
 
 
-def _atoms_to_facts(train_ids, lang, output_dir, split):
-    facts_dir = Path(output_dir) / "facts"
+def _atoms_to_init_clauses(train_ids, lang, output_dir, split):
+    facts_dir = Path(output_dir) / "clauses"
     os.makedirs(facts_dir, exist_ok=True)
-
-    all_fact_file = facts_dir / f"all_facts_{split}.json"
-    if all_fact_file.exists():
-        return utils_data.load_json(all_fact_file)
-    
-    all_facts = []
-    for vid in tqdm(train_ids, desc="Atoms to Facts"):
-        atom_file = Path(output_dir) / "atoms" / f"{vid}_atoms.json"
-        atom_data = utils_data.load_json(atom_file)
-        vid = Path(atom_file).stem.replace("_atoms", "")
-        facts = lang.atoms2facts(atom_data)
-        all_facts.extend(facts)
-    utils_data.save_json(all_facts, all_fact_file)
-
-    return all_facts
+    all_init_clauses_file = facts_dir / f"all_init_clauses_{split}.json"
+    if all_init_clauses_file.exists():
+        return utils_data.load_json(all_init_clauses_file)
+    all_atoms = utils_data.load_json(Path(output_dir) / "atoms" / "all_atoms.json")
+    all_init_clauses = lang.atoms2atom_clauses(all_atoms, head_ungrounded_atoms=[])
+    utils_data.save_json(all_init_clauses, all_init_clauses_file)
+    return all_init_clauses
 
 
 
-def test_global_rules(model, rules, facts, output_dir, track_dir, test_indices):
+def test_global_rules(model, init_clauses, atoms_by_video, output_dir, track_dir, test_indices):
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
- 
-    dataset = build_rule_learning_test_dataset(facts, rules, output_dir, test_indices)
+    dataset = build_rule_learning_dataset(atoms_by_video, init_clauses, output_dir, split="test")
     os.makedirs(output_dir, exist_ok=True)
 
     test_matrix = dataset["feature_matrix"]
@@ -250,31 +224,28 @@ def main(input_data):
     
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
-    _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    train_facts = _atoms_to_facts(train_ids, language_model, output_dir, 'train')
-    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, language_model, output_dir)
+    atoms_by_train_video = _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
+    init_clauses = _atoms_to_init_clauses(train_ids, language_model, output_dir, 'train')
 
     if input_data["skip_lr"] == 'True':
         return
 
-    train_dataset = build_rule_learning_dataset(train_facts, all_rules, output_dir, all_rule_supports, all_head_supports)
+    train_dataset = build_rule_learning_dataset(atoms_by_train_video, init_clauses, output_dir, "train")
 
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
-    val_facts = _atoms_to_facts(val_ids, language_model, output_dir, 'val')
-    val_dataset = build_rule_learning_dataset(val_facts, all_rules, output_dir, all_rule_supports, all_head_supports)
+    atoms_by_val_video = _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
+    val_dataset = build_rule_learning_dataset(atoms_by_val_video, init_clauses, output_dir, "val")
 
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-    _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    test_facts = _atoms_to_facts(test_ids, language_model, output_dir, 'test')
-    
+    atoms_by_test_video = _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)   
+
     
     # learn rule aggregation
     ranked_rules, model = learn_rule_aggregation(train_dataset,val_dataset)
     # test data
-    dataset_summary = test_global_rules(model, ranked_rules, test_facts, test_output_dir, track_dir, test_indices)
+    dataset_summary = test_global_rules(model, init_clauses, atoms_by_test_video, test_output_dir, track_dir, test_indices)
     
     utils_data.save_json(dataset_summary, test_output_dir / "rule_aggregation_summary.json")
     
@@ -303,16 +274,16 @@ def baselines(input_data):
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    train_facts = _atoms_to_facts(train_ids, language_model, output_dir, 'train')
-    all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
+    train_facts = _atoms_to_init_clauses(train_ids, language_model, output_dir, 'train')
+    # all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
 
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    val_facts = _atoms_to_facts(val_ids, language_model, output_dir, 'val')
+    val_facts = _atoms_to_init_clauses(val_ids, language_model, output_dir, 'val')
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    test_facts = _atoms_to_facts(test_ids, language_model, output_dir, 'test')
+    test_facts = _atoms_to_init_clauses(test_ids, language_model, output_dir, 'test')
 
     # train and test baselines
     result_summary = {}

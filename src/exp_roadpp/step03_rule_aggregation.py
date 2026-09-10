@@ -71,52 +71,72 @@ def _fact_matching_rule_indices(fact, body_signature_index):
     return matches
 
 
-def _build_fact_rule_matrix(facts, rules, desc):
-    body_signature_index = _build_body_signature_index(rules)
 
-    row_indices = []
-    col_indices = []
-    data = []
-    labels = []
-    valid_fact_count = 0
-    for row_index, fact in enumerate(tqdm(facts, total=len(facts), desc=desc)):
-        if "av_action_id" not in fact:
-            raise ValueError(f"Fact at row_index {row_index} is missing 'av_action_id'")    
-        else:
-            valid_fact_count += 1
-            labels.append(int(fact["av_action_id"]))
-        rule_indices = _fact_matching_rule_indices(fact, body_signature_index)
-        if rule_indices:
-            row_indices.extend([row_index] * len(rule_indices))
-            col_indices.extend(rule_indices)
-            data.extend([1] * len(rule_indices))
+def _atom_body_signature(atom):
+    if "action_id" in atom:
+        return (atom["pred"], atom["agent_class"], "action_id", atom["action_id"])
+    elif "location_name" in atom:
+        return (atom["pred"], atom["agent_class"], "location_name", atom["location_name"])
+    else:
+        raise ValueError(f"Unsupported atom format: {atom}")
 
+def _clause_body_signature(clause):
+    return _atom_body_signature(clause["body"][0])
+
+def _build_body_index(init_clauses):
+    signatures = sorted({_clause_body_signature(c) for c in init_clauses})
+    return {sig: i for i, sig in enumerate(signatures)}, signatures
+
+HEAD_PRED, HEAD_AGENT_CLASS = "action", "av"
+def _head_examples(atoms):
+    head_atoms = [a for a in atoms if a["pred"] == HEAD_PRED and a["agent_class"] == HEAD_AGENT_CLASS]
+    body_atoms = [a for a in atoms if not (a["pred"] == HEAD_PRED and a["agent_class"] == HEAD_AGENT_CLASS)]
+    examples = []
+    for head in head_atoms:
+        present = {
+            _atom_body_signature(a) for a in body_atoms
+            if int(a["end_frame"]) <= int(head["start_frame"]) 
+        }
+        examples.append((int(head["action_id"]),present))
+    return examples 
+
+
+def _build_clause_feature_matrix(atoms_by_video, body_index, desc):
+    row_indices, col_indices, data, labels = [], [], [], []
+    row = 0
+    for vid, atoms in tqdm(atoms_by_video.items(), desc=desc):
+        for label, present in _head_examples(atoms):
+            labels.append(label)
+            for sig in present:
+                col = body_index.get(sig)
+                if col is not None:
+                    row_indices.append(row)
+                    col_indices.append(col)
+                    data.append(1)
+            row += 1
     feature_matrix = sparse.csr_matrix(
         (data, (row_indices, col_indices)),
-        shape=(valid_fact_count, len(rules)),
+        shape=(row, len(body_index)),
         dtype=np.float32,
-    )   
+    )
     return feature_matrix, np.asarray(labels, dtype=np.int64)
 
 
-def build_rule_learning_dataset(facts, rules, output_dir, all_rule_supports, all_head_supports):
-    dataset_file = Path(output_dir) / "rule_learning_dataset.npz"
-
+def build_rule_learning_dataset(atoms_by_video, init_clauses, output_dir, split):
+    dataset_file = Path(output_dir) / f"rule_learning_dataset_{split}.npz"
     if dataset_file.exists():
         npz =  np.load(dataset_file, allow_pickle=True)
         return {
-            "rules": _unwrap_cached_npz_value(npz["rules"]),
+            "body_signatures": _unwrap_cached_npz_value(npz["body_signatures"]),
             "feature_matrix": _unwrap_cached_npz_value(npz["feature_matrix"]),
             "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
 
-    feature_matrix, labels = _build_fact_rule_matrix(facts, rules, desc="Building rule learning dataset")
-
-    data = {
-        'feature_matrix': feature_matrix,
-        'labels': labels,
-        'rules': rules,
-    }
+    body_index, body_signatures = _build_body_index(init_clauses)
+    feature_matrix, labels = _build_clause_feature_matrix(atoms_by_video, 
+                                                          body_index,
+                                                          desc=f"Building {split} dataset")
+    data = {"feature_matrix": feature_matrix, "labels": labels, "body_signatures": body_signatures}
     save_dataset(data, dataset_file)
 
     return data
@@ -133,7 +153,7 @@ def build_rule_learning_test_dataset(facts, rules, output_dir, test_indices):
             "labels": np.asarray(npz["labels"], dtype=np.int64),
         }
 
-    feature_matrix, labels = _build_fact_rule_matrix(facts, rules, desc="Building rule learning test dataset")
+    feature_matrix, labels = _build_clause_feature_matrix(atoms_by_video, body_index, desc="Building rule learning test dataset")
 
     data = {
         'feature_matrix': feature_matrix,

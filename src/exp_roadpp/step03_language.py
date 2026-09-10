@@ -1,5 +1,7 @@
 
 import torch 
+from tqdm import tqdm 
+
 from collections import Counter
 from src.exp_roadpp import utils_data 
 from src.exp_roadpp.logic import Clause, Atom, Predicate 
@@ -139,74 +141,34 @@ class Language:
                     agent_class="av", 
                     start_frame=start_frame, 
                     end_frame=end_frame, 
-                    tube_uid=None)
+                    tube_uid=None).to_dict()
                 atoms.append(atom)
         elif target == "agents":
             action_loc_pairs = utils_data.build_agent_frame_action_loc_pairs(segments, frames)
             for seg_id, segment in segments.items():
                 agent_class = segment["label_id"]
                 start_frame, end_frame, tube_uid = utils_data.get_start_end_frame(segment, frames)
-                action_intervals = self._rle_intervals(action_loc_pairs.get(seg_id, []), "action_ids")
+                action_intervals = self._rle_intervals(action_loc_pairs[seg_id], "action_ids")
+                location_intervals = self._rle_intervals(action_loc_pairs[seg_id], "loc_ids")
 
-action_intervals = _rle_intervals(frame_pairs, "action_ids")
-location_intervals = _rle_intervals(frame_pairs, "loc_ids")
-
-for action_ids, seg_start, seg_end in action_intervals:
-    for action_id in action_ids:
-        atoms.append(self.predicates['action'].make_atom(
-            action_id=action_id,
-            agent_class=agent_class,
-            start_frame=seg_start,
-            end_frame=seg_end,
-            tube_uid=tube_uid,
-        ))
-
-for loc_ids, seg_start, seg_end in location_intervals:
-    for loc_id in loc_ids:
-        atoms.append(self.predicates['location'].make_atom(
-            location_name=loc_id,
-            agent_class=agent_class,
-            start_frame=seg_start,
-            end_frame=seg_end,
-            tube_uid=tube_uid,
-        ))
-
-
-
-                agent_actions_per_frame = None 
-                agent_locations_per_frame = None
-                
-                action_atom = self.predicates['action'].make_atom(
-                    action_id=agent_action, 
-                    agent_class=agent_class, 
-                    start_frame=start_frame, 
-                    end_frame=end_frame, 
-                    tube_uid=tube_uid
-                )
-                location_atom = self.predicates['location'].make_atom(
-                    location_name=agent_location, 
-                    agent_class=agent_class, 
-                    start_frame=start_frame, 
-                    end_frame=end_frame, 
-                    tube_uid=tube_uid
-                )
-                atoms.append(action_atom)
-                atoms.append(location_atom)
-        elif target in ("action", "location", "duplex", "triplet"):
-            for seg_id, segment in segments.items():
-                av_action_id = segment['label_id']
-                seg_frames = sorted(segment["annos"].keys(), key=int)
-                tube_uid = self._lookup_tube_uid(segment, frames)
-                atoms.append({
-                    "target":target,
-                    "seg_id": seg_id,
-                    "label_id": av_action_id,
-                    "frames": seg_frames,
-                    "tube_uid": tube_uid,
-                    "start_frame": seg_frames[0],
-                    "end_frame": seg_frames[-1],
-                })
-
+                for action_ids, seg_start, seg_end in action_intervals:
+                    for action_id in action_ids:
+                        atoms.append(self.predicates['action'].make_atom(
+                            action_id=action_id,
+                            agent_class=agent_class,
+                            start_frame=seg_start,
+                            end_frame=seg_end,
+                            tube_uid=tube_uid,
+                        ).to_dict())
+                for loc_ids, seg_start, seg_end in location_intervals:
+                    for loc_id in loc_ids:
+                        atoms.append(self.predicates['location'].make_atom(
+                            location_name=loc_id,
+                            agent_class=agent_class,
+                            start_frame=seg_start,
+                            end_frame=seg_end,
+                            tube_uid=tube_uid,
+                        ).to_dict())
         else:
             raise ValueError(f"Unknown target: {target}")
         
@@ -229,63 +191,103 @@ for loc_ids, seg_start, seg_end in location_intervals:
                     atoms_by_time[t]['atoms'].append(atom)
         return atoms_by_time
 
+    def _to_ungrounded_atom(self, atom):
+        if "action_id" in atom:
+            ungrounded_atom = self.predicates.get(atom['pred']).make_atom(
+                action_id=atom["action_id"],
+                agent_class=atom["agent_class"],
+                start_frame=None,
+                end_frame=None,
+                tube_uid=None,
+            )
+        elif "location_name" in atom:
+            ungrounded_atom = self.predicates.get(atom['pred']).make_atom(
+                location_name=atom["location_name"],
+                agent_class=atom["agent_class"],
+                start_frame=None,
+                end_frame=None,
+                tube_uid=None,
+            )
+        else:
+            raise ValueError(f"Cannot convert atom to ungrounded form: {atom}")
+        return ungrounded_atom
+
+
     
-    def atoms2facts(self, atoms):
-        atoms_by_time = self._atoms_by_time(atoms)
-        facts = []
-        for t, atoms_at_time in atoms_by_time.items():
-            start_frame = int(atoms_at_time['start_frame'])
-            end_frame = atoms_at_time['end_frame']
-            if end_frame is not None:
-                end_frame = int(end_frame)
-            else:
-                continue
-            fact = {
-                'start_frame': start_frame,
-                'end_frame': end_frame,
-                'agents': {},
+    def atoms2atom_clauses(self, atoms_by_videos, head_ungrounded_atoms):
+        clauses = set()
+        for video_id, atoms in tqdm(atoms_by_videos.items()):
+            atoms_by_time = {}
+            for atom in atoms:
+                start_frame = int(atom["start_frame"])
+                ungrounded_atom = self._to_ungrounded_atom(atom)
+                if start_frame not in atoms_by_time:
+                    atoms_by_time[start_frame] = []
+                atoms_by_time[start_frame].append(ungrounded_atom)
+            sorted_times = sorted(atoms_by_time)
+            for i, body_time in enumerate(sorted_times):
+                body_atoms = atoms_by_time[body_time]
+                for head_time in sorted_times[i:]:
+                    head_atoms = atoms_by_time[head_time]
+                    for head_atom in head_atoms:
+                        for body_atom in body_atoms:
+                            clause = Clause(head_atom,[body_atom])
+                            if clause.is_tautology():
+                                continue
+                            clauses.add(clause)
+        return [clause.to_dict() for clause in clauses]
+            # start_frame = int(atoms_at_time['start_frame'])
+            # end_frame = atoms_at_time['end_frame']
+            # if end_frame is not None:
+            #     end_frame = int(end_frame)
+            # else:
+            #     continue
+            # fact = {
+            #     'start_frame': start_frame,
+            #     'end_frame': end_frame,
+            #     'agents': {},
 
-            }
-            for atom in atoms_at_time['atoms']:
+            # }
+            # for atom in atoms_at_time['atoms']:
                 
-                # Process each atom as needed
-                if atom['target']=='av':
-                    fact['av_action_id'] = atom['label_id']
+            #     # Process each atom as needed
+            #     if atom['target']=='av':
+            #         fact['av_action_id'] = atom['label_id']
 
-                tube_uid = atom.get("tube_uid")
-                if tube_uid is None:
-                    if atom["target"] != "av":
-                        print(f"Warning: tube_uid is None for atom {atom}, skipping this atom.")
-                    continue
-                agent_record = fact["agents"].setdefault(tube_uid, {})
+            #     tube_uid = atom.get("tube_uid")
+            #     if tube_uid is None:
+            #         if atom["target"] != "av":
+            #             print(f"Warning: tube_uid is None for atom {atom}, skipping this atom.")
+            #         continue
+            #     agent_record = fact["agents"].setdefault(tube_uid, {})
 
-                if atom['target']=='agents':
-                    agent_class = atom['label_id']
-                    frame_action_location = [pair for pair in atom['frame-action-location'] 
-                                             if pair["frame"] >= start_frame 
-                                             and pair["frame"] <= end_frame]
-                    agent_record["class"] = agent_class
-                    agent_record["frame-action-location"] = frame_action_location
-                    # agent_behavior = {
-                    #     'class': agent_class,
-                    #     'frame-action-location': frame_action_location,
-                    # }
-                    # fact['agents'].append(agent_behavior)
-                elif atom["target"] == "action":
-                    agent_record["action_id"] = atom['label_id']
-                elif atom['target'] == 'location':
-                    agent_record["loc_id"] = atom['label_id']
-                elif atom['target'] == 'duplex':
-                    agent_record["duplex_id"] = atom['label_id']
-                elif atom['target'] == 'triplet':
-                    agent_record["triplet_id"] = atom['label_id']
+            #     if atom['target']=='agents':
+            #         agent_class = atom['label_id']
+            #         frame_action_location = [pair for pair in atom['frame-action-location'] 
+            #                                  if pair["frame"] >= start_frame 
+            #                                  and pair["frame"] <= end_frame]
+            #         agent_record["class"] = agent_class
+            #         agent_record["frame-action-location"] = frame_action_location
+            #         # agent_behavior = {
+            #         #     'class': agent_class,
+            #         #     'frame-action-location': frame_action_location,
+            #         # }
+            #         # fact['agents'].append(agent_behavior)
+            #     elif atom["target"] == "action":
+            #         agent_record["action_id"] = atom['label_id']
+            #     elif atom['target'] == 'location':
+            #         agent_record["loc_id"] = atom['label_id']
+            #     elif atom['target'] == 'duplex':
+            #         agent_record["duplex_id"] = atom['label_id']
+            #     elif atom['target'] == 'triplet':
+            #         agent_record["triplet_id"] = atom['label_id']
 
 
-            if 'av_action_id' not in fact:
-                continue
-            fact['agents'] = list(fact['agents'].values())
-            facts.append(fact)
-        return facts
+            # if 'av_action_id' not in fact:
+            #     continue
+            # fact['agents'] = list(fact['agents'].values())
+            # facts.append(fact)
+        return clauses
 
     @staticmethod
     def _fact_head_candidates(fact):

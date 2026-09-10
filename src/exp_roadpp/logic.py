@@ -290,6 +290,14 @@ class Atom(object):
                 result.append(term)
 
         return result
+    
+    def to_dict(self):
+        field_names = getattr(self.pred, "field_names", None)
+        if field_names:
+            payload = dict(zip(field_names, self.terms))
+        else:
+            payload = {"terms": list(self.terms)}
+        return {"pred": self.pred.name, **payload}
 
 
     
@@ -485,6 +493,12 @@ class Clause(object):
         for bi in self.body:
             size += bi.size()
         return size
+    
+    def to_dict(self):
+        return {
+            "head": self.head.to_dict(),
+            "body": [atom.to_dict() for atom in self.body],
+        }
 
 class Predicate():
     """Predicats in first-order logic.
