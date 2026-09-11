@@ -243,7 +243,7 @@ def main(input_data):
 
     
     # learn rule aggregation
-    ranked_rules, model = learn_rule_aggregation(train_dataset,val_dataset)
+    model = learn_rule_aggregation(train_dataset,val_dataset)
     # test data
     dataset_summary = test_global_rules(model, init_clauses, atoms_by_test_video, test_output_dir, track_dir, test_indices)
     

@@ -84,7 +84,7 @@ def _clause_body_signature(clause):
     return _atom_body_signature(clause["body"][0])
 
 def _build_body_index(init_clauses):
-    signatures = sorted({_clause_body_signature(c) for c in init_clauses})
+    signatures = {_clause_body_signature(c) for c in init_clauses}
     return {sig: i for i, sig in enumerate(signatures)}, signatures
 
 HEAD_PRED, HEAD_AGENT_CLASS = "action", "av"
@@ -279,13 +279,13 @@ def learn_rule_aggregation(train_dataset, val_dataset):
     
 
     model, selection_summary = _fit_rule_aggregation_lr(train_matrix, labels, val_matrix, val_labels, seed=7)
-    ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
+    # ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
     # save model and ranked rules
-    np.save("ranked_rules.npy", ranked_rules)
+    # np.save("ranked_rules.npy", ranked_rules)
     model_file = "model.npy"
     np.save(model_file, model)
 
-    return ranked_rules, model
+    return model
 
 
 
