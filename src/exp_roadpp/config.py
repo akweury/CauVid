@@ -213,7 +213,7 @@ def get_step_03_input(args):
     
     input_data = {
         "dataset_labels": dataset_labels,
-        'skip_lr': args.skip_lr,
+        'learning': args.learning,
         'skip_baselines_03': args.skip_baselines_03,
         'data_num': args.data_num,
         "use_gt": args.use_gt,

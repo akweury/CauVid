@@ -221,36 +221,26 @@ def main(input_data):
     if input_data['data_num'] != 'full':
         all_track_files = all_track_files[:int(input_data['data_num'])]
     train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
-    
     # train data
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     atoms_by_train_video = _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
     init_clauses = _atoms_to_init_clauses(train_ids, language_model, output_dir, 'train')
-
-    if input_data["skip_lr"] == 'True':
-        return
-
-    train_dataset = build_rule_learning_dataset(atoms_by_train_video, init_clauses, output_dir, "train")
-
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
     atoms_by_val_video = _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
-    val_dataset = build_rule_learning_dataset(atoms_by_val_video, init_clauses, output_dir, "val")
-
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     atoms_by_test_video = _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)   
 
-    
-    # learn rule aggregation
-    model = learn_rule_aggregation(train_dataset,val_dataset)
-    # test data
-    dataset_summary = test_global_rules(model, init_clauses, atoms_by_test_video, test_output_dir, track_dir, test_indices)
-    
-    utils_data.save_json(dataset_summary, test_output_dir / "rule_aggregation_summary.json")
-    
-    visualize_rule_aggregation_results(dataset_path, dataset_summary, test_output_dir)
-    
+
+
+    if input_data["learning"] == 'True':
+        train_dataset = build_rule_learning_dataset(atoms_by_train_video, init_clauses, output_dir, "train")
+        val_dataset = build_rule_learning_dataset(atoms_by_val_video, init_clauses, output_dir, "val")    
+        model = learn_rule_aggregation(train_dataset,val_dataset)
+        dataset_summary = test_global_rules(model, init_clauses, atoms_by_test_video, test_output_dir, track_dir, test_indices)
+        utils_data.save_json(dataset_summary, test_output_dir / "rule_aggregation_summary.json")
+        visualize_rule_aggregation_results(dataset_path, dataset_summary, test_output_dir)
     print("\n--------- Step 03 Done ---------------\n")
 
 
