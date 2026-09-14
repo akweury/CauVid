@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-
+import numpy as np
 from src.exp_roadpp import utils_data
 
 def visualize_baseline_results(baseline_results, output_dir):
@@ -55,4 +55,46 @@ def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir
     plt.title("Test Accuracy per Class")
     plt.tight_layout()
     plt.savefig(Path(output_dir) / "test_accuracy_per_class.png")
+    plt.close()
+
+
+
+def visual_bar(clauses, output_dir, filename):
+    if not clauses:
+        print("No clauses to visualize.")
+        return
+    # use bar charts to show
+    # visualize the number of clauses by their frequency, 
+    # x axis represents the frequencies, y axis represents the number of clauses, 
+    # use 10 bins to group the frequencies
+    # use log y ticks
+    # the bin range should be increasing by frequency increasing, so it start from 1, then 2, 4, 8, 16,...
+    # each bin width should be the same, and has its own tick label
+
+    frequencies = [clauses[key]["count"] for key in clauses]
+    bins = [2**i for i in range(int(np.log2(max(frequencies))) + 2)] if frequencies else [1, 2] 
+
+    bin_labels = [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins) - 1)]
+    counts, _ = np.histogram(frequencies, bins=bins)
+    positions = np.arange(len(counts))  # equal-width, evenly spaced bars
+
+    plt.figure(figsize=(12,6))
+    plt.bar(positions, counts, width=0.8, color="wheat")
+    
+    for x, count in zip(positions, counts):
+        if count > 0:
+            plt.text(x, count, f"{int(count)}", ha="center", va="bottom", fontsize=20)
+    plt.xlabel("Clause Frequency", fontdict={"size": 26})
+    plt.xticks(positions, bin_labels, rotation=45, ha="right")
+    plt.ylabel("Number of Clauses", fontdict={"size": 26})
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.yscale("log")
+    ax = plt.gca()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.title("Clause Frequency Histogram", fontdict={"size": 30})
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"{filename}.png")
     plt.close()

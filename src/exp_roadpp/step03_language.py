@@ -171,7 +171,6 @@ class Language:
                         ).to_dict())
         else:
             raise ValueError(f"Unknown target: {target}")
-        
         return atoms 
 
     def _atoms_by_time(self, atoms):
@@ -215,7 +214,7 @@ class Language:
 
     
     def atoms2atom_clauses(self, atoms_by_videos, head_ungrounded_atoms):
-        clauses = set()
+        clauses = {}
         for video_id, atoms in tqdm(atoms_by_videos.items()):
             atoms_by_time = {}
             for atom in atoms:
@@ -234,8 +233,19 @@ class Language:
                             clause = Clause(head_atom,[body_atom])
                             if clause.is_tautology():
                                 continue
-                            clauses.add(clause)
-        return [clause.to_dict() for clause in clauses]
+                            if clause not in clauses:
+                                clauses[clause] = 0
+                            clauses[clause] += 1
+
+        _clauses = {}
+        clause_id = 0
+        for clause, count in clauses.items():
+            _clauses[clause_id] = {
+                "clause": clause.to_dict(),
+                "count": count
+            }
+            clause_id += 1
+        return _clauses
             # start_frame = int(atoms_at_time['start_frame'])
             # end_frame = atoms_at_time['end_frame']
             # if end_frame is not None:
