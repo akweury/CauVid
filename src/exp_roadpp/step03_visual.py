@@ -63,6 +63,8 @@ def visual_bar(clauses, output_dir, filename):
     if not clauses:
         print("No clauses to visualize.")
         return
+
+    # two subplots, left side shows the support frequencies, and right side shows the coverage frequencies
     # use bar charts to show
     # visualize the number of clauses by their frequency, 
     # x axis represents the frequencies, y axis represents the number of clauses, 
@@ -71,11 +73,20 @@ def visual_bar(clauses, output_dir, filename):
     # the bin range should be increasing by frequency increasing, so it start from 1, then 2, 4, 8, 16,...
     # each bin width should be the same, and has its own tick label
 
-    frequencies = [clauses[key]["count"] for key in clauses]
-    bins = [2**i for i in range(int(np.log2(max(frequencies))) + 2)] if frequencies else [1, 2] 
+    support_frequencies = [] 
+    coverage_frequencies = [] 
+    for _, clause_data in clauses.items():
+        total_support = sum(clause_data["support_coverage"][vid]["support"] for vid in clause_data["support_coverage"])
+        total_coverage = sum(clause_data["support_coverage"][vid]["coverage"] for vid in clause_data["support_coverage"])
+        support_frequencies.append(total_support)
+        coverage_frequencies.append(total_coverage)
+    
+    bins = [2**i for i in range(int(np.log2(max(support_frequencies))) + 2)] if support_frequencies else [1, 2] 
+
+    coverage_bins = [2**i for i in range(int(np.log2(max(coverage_frequencies))) + 2)] if coverage_frequencies else [1, 2] 
 
     bin_labels = [f"{bins[i]}-{bins[i+1]}" for i in range(len(bins) - 1)]
-    counts, _ = np.histogram(frequencies, bins=bins)
+    counts, _ = np.histogram(support_frequencies, bins=bins)
     positions = np.arange(len(counts))  # equal-width, evenly spaced bars
 
     plt.figure(figsize=(12,6))
@@ -94,7 +105,33 @@ def visual_bar(clauses, output_dir, filename):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
-    plt.title("Clause Frequency Histogram", fontdict={"size": 30})
+    plt.title("Clause Support Frequency Histogram", fontdict={"size": 30})
     plt.tight_layout()
-    plt.savefig(Path(output_dir) / f"{filename}.png")
+    plt.savefig(Path(output_dir) / f"{filename}_support.png")
+    plt.close()
+
+    # Coverage frequency histogram
+    bin_labels = [f"{coverage_bins[i]}-{coverage_bins[i+1]}" for i in range(len(coverage_bins) - 1)]
+    counts, _ = np.histogram(coverage_frequencies, bins=coverage_bins)
+    positions = np.arange(len(counts))
+
+    plt.figure(figsize=(12,6))
+    plt.bar(positions, counts, width=0.8, color="lightblue")
+    
+    for x, count in zip(positions, counts):
+        if count > 0:
+            plt.text(x, count, f"{int(count)}", ha="center", va="bottom", fontsize=20)
+    plt.xlabel("Clause Frequency", fontdict={"size": 26})
+    plt.xticks(positions, bin_labels, rotation=45, ha="right")
+    plt.ylabel("Number of Clauses", fontdict={"size": 26})
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.yscale("log")
+    ax = plt.gca()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    plt.title("Clause Coverage Frequency Histogram", fontdict={"size": 30})
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"{filename}_coverage.png")
     plt.close()

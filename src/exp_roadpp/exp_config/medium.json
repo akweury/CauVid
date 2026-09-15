@@ -19,5 +19,8 @@
     "depth_process_resolution": 504,
     "flow_consistency_threshold_px":1.5,
     "tracker_top_k": 5,
-    "tracker_window_size": 5
+    "tracker_window_size": 5,
+    "prune_args": {
+        "frequency_threshold": 10
+    }
 }

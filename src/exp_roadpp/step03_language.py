@@ -212,14 +212,18 @@ class Language:
         return ungrounded_atom
 
 
-    
     def atoms2atom_clauses(self, atoms_by_videos, head_ungrounded_atoms):
         clauses = {}
+    
+        ungrounded_atoms_by_videos = {}
         for video_id, atoms in tqdm(atoms_by_videos.items()):
+            ungrounded_atoms_by_videos[video_id] = []
             atoms_by_time = {}
             for atom in atoms:
                 start_frame = int(atom["start_frame"])
                 ungrounded_atom = self._to_ungrounded_atom(atom)
+                if ungrounded_atom not in ungrounded_atoms_by_videos[video_id]:
+                    ungrounded_atoms_by_videos[video_id].append(ungrounded_atom)
                 if start_frame not in atoms_by_time:
                     atoms_by_time[start_frame] = []
                 atoms_by_time[start_frame].append(ungrounded_atom)
@@ -234,71 +238,37 @@ class Language:
                             if clause.is_tautology():
                                 continue
                             if clause not in clauses:
-                                clauses[clause] = 0
-                            clauses[clause] += 1
+                                clauses[clause] = {}
+                            if video_id not in clauses[clause]:
+                                clauses[clause][video_id]= {"support": len(sorted_times)-i, "coverage": len(sorted_times)-i}
+
+
+        for clause in clauses:
+            for vid in tqdm(ungrounded_atoms_by_videos):
+                ungrounded_atoms = ungrounded_atoms_by_videos[vid]
+                if clause.body[0] in ungrounded_atoms:
+                    if vid not in clauses[clause]:
+                        clauses[clause][vid] = {"support": 0, "coverage": 0}
+                    if clauses[clause][vid]["coverage"]  !=0:
+                        clauses[clause][vid]["coverage"] = len(ungrounded_atoms)
+                    if clauses[clause][vid]["coverage"]< clauses[clause][vid]["support"]:
+                        raise ValueError(f"Coverage cannot be less than support for clause {clause} in video {vid}")
+        
 
         _clauses = {}
         clause_id = 0
-        for clause, count in clauses.items():
+        for clause, c_dict in clauses.items():
             _clauses[clause_id] = {
                 "clause": clause.to_dict(),
-                "count": count
+                "support_coverage": c_dict
             }
             clause_id += 1
+
+        
         return _clauses
-            # start_frame = int(atoms_at_time['start_frame'])
-            # end_frame = atoms_at_time['end_frame']
-            # if end_frame is not None:
-            #     end_frame = int(end_frame)
-            # else:
-            #     continue
-            # fact = {
-            #     'start_frame': start_frame,
-            #     'end_frame': end_frame,
-            #     'agents': {},
-
-            # }
-            # for atom in atoms_at_time['atoms']:
-                
-            #     # Process each atom as needed
-            #     if atom['target']=='av':
-            #         fact['av_action_id'] = atom['label_id']
-
-            #     tube_uid = atom.get("tube_uid")
-            #     if tube_uid is None:
-            #         if atom["target"] != "av":
-            #             print(f"Warning: tube_uid is None for atom {atom}, skipping this atom.")
-            #         continue
-            #     agent_record = fact["agents"].setdefault(tube_uid, {})
-
-            #     if atom['target']=='agents':
-            #         agent_class = atom['label_id']
-            #         frame_action_location = [pair for pair in atom['frame-action-location'] 
-            #                                  if pair["frame"] >= start_frame 
-            #                                  and pair["frame"] <= end_frame]
-            #         agent_record["class"] = agent_class
-            #         agent_record["frame-action-location"] = frame_action_location
-            #         # agent_behavior = {
-            #         #     'class': agent_class,
-            #         #     'frame-action-location': frame_action_location,
-            #         # }
-            #         # fact['agents'].append(agent_behavior)
-            #     elif atom["target"] == "action":
-            #         agent_record["action_id"] = atom['label_id']
-            #     elif atom['target'] == 'location':
-            #         agent_record["loc_id"] = atom['label_id']
-            #     elif atom['target'] == 'duplex':
-            #         agent_record["duplex_id"] = atom['label_id']
-            #     elif atom['target'] == 'triplet':
-            #         agent_record["triplet_id"] = atom['label_id']
 
 
-            # if 'av_action_id' not in fact:
-            #     continue
-            # fact['agents'] = list(fact['agents'].values())
-            # facts.append(fact)
-        return clauses
-
+    
     @staticmethod
     def _fact_head_candidates(fact):
         """Every scalar predicate in a fact that can serve as a rule head, paired

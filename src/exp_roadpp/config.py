@@ -221,6 +221,7 @@ def get_step_03_input(args):
         "output_dir": output_dir,
         "test_output_dir": test_output_dir,
         "baseline_output_dir": baseline_output_dir,
+        "prune_args": args.prune_args,
         "step01_output_dir": args.output_dir / "step01_output",
         "step02_output_dir": args.output_dir / "step02_output",
         "device": args.device,

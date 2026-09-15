@@ -82,6 +82,7 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
         return utils_data.load_json(all_init_clauses_file)
     
     all_init_clauses = lang.atoms2atom_clauses(all_atoms, head_ungrounded_atoms=[])
+    # init_clauses = lang.atoms2clauses(all_atoms, head_ungrounded_atoms=[])
     utils_data.save_json(all_init_clauses, all_init_clauses_file)
     return all_init_clauses
 
@@ -89,6 +90,7 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
 def _coarse_prune(init_clauses, pruner):
     # Implement the coarse pruning logic here
     # For now, just return the input clauses as-is
+
     return pruner.coarse_prune(init_clauses)
 
 
@@ -239,7 +241,7 @@ def main(input_data):
     # Prepare language model and beam search model
     language_model = Language(input_data["device"])
     beam_search_model = BeamSearch()
-    pruner = Pruner()
+    pruner = Pruner(input_data["prune_args"])
     
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     atoms_by_train_video, atoms_by_val_video, atoms_by_test_video = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
