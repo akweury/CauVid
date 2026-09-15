@@ -243,13 +243,13 @@ class Language:
                                 clauses[clause][video_id]= {"support": len(sorted_times)-i, "coverage": len(sorted_times)-i}
 
 
-        for clause in clauses:
-            for vid in tqdm(ungrounded_atoms_by_videos):
+        for clause in tqdm(clauses):
+            for vid in ungrounded_atoms_by_videos:
                 ungrounded_atoms = ungrounded_atoms_by_videos[vid]
                 if clause.body[0] in ungrounded_atoms:
                     if vid not in clauses[clause]:
                         clauses[clause][vid] = {"support": 0, "coverage": 0}
-                    if clauses[clause][vid]["coverage"]  !=0:
+                    if clauses[clause][vid]["coverage"]  == 0:
                         clauses[clause][vid]["coverage"] = len(ungrounded_atoms)
                     if clauses[clause][vid]["coverage"]< clauses[clause][vid]["support"]:
                         raise ValueError(f"Coverage cannot be less than support for clause {clause} in video {vid}")
