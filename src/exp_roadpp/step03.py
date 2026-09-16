@@ -88,9 +88,6 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
 
 
 def _coarse_prune(init_clauses, pruner):
-    # Implement the coarse pruning logic here
-    # For now, just return the input clauses as-is
-
     return pruner.coarse_prune(init_clauses)
 
 
