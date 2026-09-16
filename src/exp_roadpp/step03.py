@@ -91,37 +91,6 @@ def _coarse_prune(init_clauses, pruner):
     return pruner.coarse_prune(init_clauses)
 
 
-def test_global_rules(model, init_clauses, atoms_by_video, output_dir):
-    dataset = build_rule_learning_dataset(atoms_by_video, init_clauses, output_dir, split="test")
-    os.makedirs(output_dir, exist_ok=True)
-
-    test_matrix = dataset["feature_matrix"]
-    test_labels = dataset["labels"]
-
-    if isinstance(test_matrix, np.ndarray) and test_matrix.ndim == 0:
-        test_matrix = test_matrix.item()    
-
-    test_pred = model.predict(test_matrix)
-
-    test_accuracy = float(accuracy_score(test_labels, test_pred)) if len(test_labels) else 0.0
-    test_f1_macro = float(f1_score(test_labels, test_pred, average="macro")) if len(test_labels) else 0.0
-
-    # accuracy on each class
-    test_accuracy_per_class = {}
-    if len(test_labels):
-        for class_label in set(test_labels):
-            class_indices = [i for i, label in enumerate(test_labels) if label == class_label]
-            class_correct = sum(1 for i in class_indices if test_pred[i] == class_label)
-            test_accuracy_per_class[int(class_label)] = float(class_correct) / len(class_indices) if class_indices else 0.0
-
-    dataset_summary = {
-        "test_label_count": len(set(test_labels)),
-        "test_accuracy": test_accuracy,
-        "test_f1_macro": test_f1_macro,
-        "test_accuracy_per_class": test_accuracy_per_class,
-    }
-
-    return dataset_summary
 
 
 def _to_hashable(value):
@@ -223,7 +192,9 @@ def prepare_dataset(data_num, track_dir, language_model, output_dir):
     # test data
     test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
     atoms_by_test_video = _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)   
-    return atoms_by_train_video, atoms_by_val_video, atoms_by_test_video
+
+    return {"train": atoms_by_train_video, "val": atoms_by_val_video, "test": atoms_by_test_video}
+
 
 def main(input_data):
     print("\n--------- Step 03 ----------------------\n")
@@ -234,29 +205,39 @@ def main(input_data):
     os.makedirs(test_output_dir, exist_ok=True)
     track_dir = input_data["dataset_path"] / "gt"
     dataset_path = input_data["dataset_path"]
-    
+    device = input_data["device"]
+    dataset_labels = input_data["dataset_labels"]
     # Prepare language model and beam search model
     language_model = Language(input_data["device"])
     beam_search_model = BeamSearch()
     pruner = Pruner(input_data["prune_args"])
     
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
-    atoms_by_train_video, atoms_by_val_video, atoms_by_test_video = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
+    atoms = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
 
     # C_0: Convert atoms to initial clauses
-    init_clauses = _atoms_to_init_clauses(atoms_by_train_video, language_model, output_dir, 'train')
+    init_clauses = _atoms_to_init_clauses(atoms["train"], language_model, output_dir, 'train')
     visual_bar(init_clauses, output_dir, "init_clauses_distribution")
     # C_1: Coarse Prune, filter out the low frequent clauses
     coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
 
+    
+
 
     if input_data["learning"] == 'True':
-        train_dataset = build_rule_learning_dataset(atoms_by_train_video, init_clauses, output_dir, "train")
-        val_dataset = build_rule_learning_dataset(atoms_by_val_video, init_clauses, output_dir, "val")    
-        model = learn_rule_aggregation(train_dataset,val_dataset)
-        dataset_summary = test_global_rules(model, init_clauses, atoms_by_test_video, test_output_dir)
-        utils_data.save_json(dataset_summary, test_output_dir / "rule_aggregation_summary.json")
-        visualize_rule_aggregation_results(dataset_path, dataset_summary, test_output_dir)
+        learn_rule_aggregation(atoms, init_clauses, output_dir, dataset_path, "vanilla")
+        learn_rule_aggregation(atoms, coarse_pruned_clauses, output_dir,dataset_path, "coarse_prune")
+    if input_data["baselines"] == 'True':
+        # train and test baselines
+        result_summary = {}
+        
+        transformer_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
+        ilp_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
+        gnn_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
+        lstm_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
+        utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
+        visualize_baseline_results(result_summary, test_output_dir)
+    
     print("\n--------- Step 03 Done ---------------\n")
 
 

@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cpu", help="Device to use, default is cpu")
     
     parser.add_argument("--learning", type=str, default="False", help="Whether to perform rule learning, default is False")
+    parser.add_argument("--baselines", type=str, default="False", help="Whether to run baselines, default is False")
 
     parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
 

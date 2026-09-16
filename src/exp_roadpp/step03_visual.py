@@ -30,7 +30,7 @@ def visualize_baseline_results(baseline_results, output_dir):
     plt.tight_layout()
     plt.savefig(Path(output_dir) / "baseline_test_accuracy_per_class.png")
     plt.close()
-def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir):
+def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir, suffix):
     if not dataset_summary:
         print("No dataset summary to visualize.")
         return
@@ -54,7 +54,7 @@ def visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir
     plt.ylabel("Test Accuracy")
     plt.title("Test Accuracy per Class")
     plt.tight_layout()
-    plt.savefig(Path(output_dir) / "test_accuracy_per_class.png")
+    plt.savefig(Path(output_dir) / f"test_accuracy_per_class_{suffix}.png")
     plt.close()
 
 

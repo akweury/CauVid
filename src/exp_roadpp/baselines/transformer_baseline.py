@@ -60,106 +60,103 @@ def _agent_action_loc_ids(agent):
     return action_ids, loc_ids
 
 
-def _scan_vocab_sizes(*fact_lists):
+def _scan_vocab_sizes(*atom_lists):
     max_agent_class = -1
-    max_action_id = -1
     max_loc_id = -1
-    max_av_action_id = -1
-    for facts in fact_lists:
-        for fact in facts or []:
-            if "av_action_id" in fact:
-                max_av_action_id = max(max_av_action_id, int(fact["av_action_id"]))
-            for agent in fact.get("agents", []) or []:
-                if agent.get("class") is not None:
-                    max_agent_class = max(max_agent_class, int(agent["class"]))
-                action_ids, loc_ids = _agent_action_loc_ids(agent)
-                if action_ids:
-                    max_action_id = max(max_action_id, max(int(a) for a in action_ids))
-                if loc_ids:
-                    max_loc_id = max(max_loc_id, max(int(l) for l in loc_ids))
+    max_action_id = -1
+    for atom_split in atom_lists:
+        for atom_video in atom_split.values() or []:
+            for atom in atom_video:
+                if "action_id" in atom:
+                    max_action_id = max(max_action_id, int(atom["action_id"]))
+                if "agent_class" in atom and atom["agent_class"]!= "av":
+                    max_agent_class = max(max_agent_class, int(atom["agent_class"]))        
+                if "location_name" in atom:
+                    max_loc_id = max(max_loc_id, int(atom["location_name"]))
     return {
         "num_agent_classes": max(1, max_agent_class + 1),
         "num_action_classes": max(1, max_action_id + 1),
         "num_loc_classes": max(1, max_loc_id + 1),
-        "num_av_actions": max(1, max_av_action_id + 1),
+        "num_av_actions": max(1, max_action_id + 1),
     }
 
 
-def _encode_fact(fact, vocab):
-    agent_classes = []
-    action_ids_list = []
-    loc_ids_list = []
-    for agent in fact.get("agents", []) or []:
-        agent_class = agent.get("class")
-        if agent_class is None:
-            continue
-        agent_class = min(max(0, int(agent_class)), vocab["num_agent_classes"] - 1)
-        action_ids, loc_ids = _agent_action_loc_ids(agent)
-        agent_classes.append(agent_class)
-        action_ids_list.append(action_ids)
-        loc_ids_list.append(loc_ids)
 
-    num_agents = len(agent_classes)
-    agent_class_tensor = torch.tensor(agent_classes, dtype=torch.long) if num_agents else torch.zeros(0, dtype=torch.long)
+def _encode_fact(video_atoms, vocab):
+    num_agent_classes = vocab["num_agent_classes"]
+    num_action_classes = vocab["num_action_classes"]
+    num_loc_classes = vocab["num_loc_classes"]
+    av_atoms = [atom for atom in video_atoms if atom["agent_class"]== "av"]    
+    features = []
+    labels = []
+    for av_atom in av_atoms:
+        av_atom_start = av_atom["start_frame"]
+        av_atom_end = av_atom["end_frame"]
+        related_atoms = [
+            atom for atom in video_atoms
+            if atom["agent_class"] != "av" and (atom["start_frame"] <= int(av_atom_end) and atom["end_frame"] >= int(av_atom_start))
+        ]
+        feature = torch.zeros((len(related_atoms), num_agent_classes + num_action_classes + num_loc_classes), dtype=torch.float32)
+        for i, related_atom in enumerate(related_atoms):
+            agent_class = int(related_atom["agent_class"])
+            if 0 <= agent_class < num_agent_classes:
+                feature[i, agent_class] = 1.0
+            if "action_id" in related_atom:
+                action_id = int(related_atom["action_id"])
+                if 0 <= action_id < num_action_classes:
+                    feature[i, num_agent_classes + action_id] = 1.0
+            if "location_name" in related_atom:
+                loc_id = int(related_atom["location_name"])
+                if 0 <= loc_id < num_loc_classes:
+                    feature[i, num_agent_classes + num_action_classes + loc_id] = 1.0
+        features.append(feature)
+        labels.append(av_atom["action_id"])
+    if len(features) > 1:
+        print(f"Multiple features for AV atom: {len(features)}")
+    labels = torch.tensor(labels, dtype=torch.long)
 
-    action_multihot = torch.zeros(num_agents, vocab["num_action_classes"])
-    loc_multihot = torch.zeros(num_agents, vocab["num_loc_classes"])
-    for i, ids in enumerate(action_ids_list):
-        for action_id in ids:
-            action_id = int(action_id)
-            if 0 <= action_id < vocab["num_action_classes"]:
-                action_multihot[i, action_id] = 1.0
-    for i, ids in enumerate(loc_ids_list):
-        for loc_id in ids:
-            loc_id = int(loc_id)
-            if 0 <= loc_id < vocab["num_loc_classes"]:
-                loc_multihot[i, loc_id] = 1.0
-
-    label = int(fact["av_action_id"])
-    return agent_class_tensor, action_multihot, loc_multihot, label
-
+    return features, labels
 
 class _SegmentDataset(Dataset):
-    def __init__(self, facts, vocab):
-        self.examples = [_encode_fact(fact, vocab) for fact in facts]
+    def __init__(self, atoms, vocab):
+        examples = []
+        labels = []
+        for video_atoms in atoms.values():
+            features, lbls = _encode_fact(video_atoms, vocab)
+            examples.extend(features)
+            labels.extend(lbls)
+        self.examples = examples
+        self.labels = labels
 
     def __len__(self):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        return self.examples[idx]
+        return self.examples[idx], self.labels[idx]
 
 
 def _collate_batch(batch):
     batch_size = len(batch)
-    action_dim = batch[0][1].shape[1]
-    loc_dim = batch[0][2].shape[1]
     max_agents = max(item[0].shape[0] for item in batch)
-
-    agent_class_ids = torch.zeros(batch_size, max_agents, dtype=torch.long)
-    action_multihot = torch.zeros(batch_size, max_agents, action_dim)
-    loc_multihot = torch.zeros(batch_size, max_agents, loc_dim)
+    feature_dim = batch[0][0].shape[1] if max_agents else batch[0][0].shape[1]
     padding_mask = torch.ones(batch_size, max_agents, dtype=torch.bool)  # True marks padded positions
     labels = torch.zeros(batch_size, dtype=torch.long)
-
-    for i, (agent_classes, action_mh, loc_mh, label) in enumerate(batch):
-        num_agents = agent_classes.shape[0]
+    batch_features = torch.zeros(batch_size, max_agents, feature_dim)
+    for i, (example, label) in enumerate(batch):
+        num_agents = example.shape[0]
         if num_agents:
-            agent_class_ids[i, :num_agents] = agent_classes
-            action_multihot[i, :num_agents] = action_mh
-            loc_multihot[i, :num_agents] = loc_mh
+            batch_features[i, :num_agents, :] = example
             padding_mask[i, :num_agents] = False
         labels[i] = label
 
-    return agent_class_ids, action_multihot, loc_multihot, padding_mask, labels
+    return batch_features, padding_mask, labels
 
 
 class _TransformerNet(nn.Module):
     def __init__(self, vocab, embed_dim=32, num_heads=4, num_layers=1, ff_dim=64, dropout=0.3):
         super().__init__()
-        self.agent_class_embedding = nn.Embedding(vocab["num_agent_classes"], embed_dim)
-        self.action_proj = nn.Linear(vocab["num_action_classes"], embed_dim, bias=False)
-        self.loc_proj = nn.Linear(vocab["num_loc_classes"], embed_dim, bias=False)
+        feature_dim = vocab["num_agent_classes"] + vocab["num_action_classes"] + vocab["num_loc_classes"]
+        self.feature_proj = nn.Linear(feature_dim, embed_dim)
         self.token_norm = nn.LayerNorm(embed_dim)
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -176,14 +173,9 @@ class _TransformerNet(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(embed_dim, vocab["num_av_actions"])
 
-    def forward(self, agent_class_ids, action_multihot, loc_multihot, padding_mask):
-        batch_size = agent_class_ids.shape[0]
-        agent_tokens = (
-            self.agent_class_embedding(agent_class_ids)
-            + self.action_proj(action_multihot)
-            + self.loc_proj(loc_multihot)
-        )
-        agent_tokens = self.token_norm(agent_tokens)
+    def forward(self, features, padding_mask):
+        batch_size = features.shape[0]
+        agent_tokens = self.token_norm(self.feature_proj(features.float()))
 
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         tokens = torch.cat([cls_tokens, agent_tokens], dim=1)
@@ -216,8 +208,8 @@ class TransformerModel:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
         self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
-    def _make_loader(self, facts, shuffle):
-        dataset = _SegmentDataset(facts, self.vocab)
+    def _make_loader(self, atoms, shuffle):
+        dataset = _SegmentDataset(atoms, self.vocab)
         return DataLoader(dataset, batch_size=self.batch_size, shuffle=shuffle, collate_fn=_collate_batch)
 
     def _run_epoch(self, loader, train_mode):
@@ -227,14 +219,13 @@ class TransformerModel:
         all_preds = []
         all_labels = []
         with torch.enable_grad() if train_mode else torch.no_grad():
-            for agent_class_ids, action_mh, loc_mh, padding_mask, labels in loader:
-                agent_class_ids = agent_class_ids.to(self.device)
-                action_mh = action_mh.to(self.device)
-                loc_mh = loc_mh.to(self.device)
+            for batch_features, padding_mask, labels in loader:
+
+                batch_features = batch_features.to(self.device)
                 padding_mask = padding_mask.to(self.device)
                 labels = labels.to(self.device)
 
-                logits = self.model(agent_class_ids, action_mh, loc_mh, padding_mask)
+                logits = self.model(batch_features, padding_mask)
                 loss = self.criterion(logits, labels)
 
                 if train_mode:
@@ -253,20 +244,20 @@ class TransformerModel:
         accuracy = accuracy_score(all_labels, all_preds) if total_examples else 0.0
         return avg_loss, accuracy
 
-    def train(self, train_facts, val_facts):
+    def train(self, train_atoms, val_atoms):
         """
         Train the Transformer model on the training facts and validate on the validation facts.
 
         Args:
-            train_facts (list): List of training facts.
-            val_facts (list): List of validation facts.
+            train_atoms (list): List of training atoms.
+            val_atoms (list): List of validation atoms.
         """
-        if not train_facts:
+        if not train_atoms:
             print("No training facts provided; skipping Transformer training.")
             return
 
-        train_loader = self._make_loader(train_facts, shuffle=True)
-        val_loader = self._make_loader(val_facts, shuffle=False) if val_facts else None
+        train_loader = self._make_loader(train_atoms, shuffle=True)
+        val_loader = self._make_loader(val_atoms, shuffle=False) if val_atoms else None
 
         best_val_loss = math.inf
         best_state = copy.deepcopy(self.model.state_dict())
@@ -312,13 +303,11 @@ class TransformerModel:
         all_label_ids = []
         
         with torch.no_grad():
-            for agent_class_ids, action_mh, loc_mh, padding_mask, labels in loader:
-                agent_class_ids = agent_class_ids.to(self.device)
-                action_mh = action_mh.to(self.device)
-                loc_mh = loc_mh.to(self.device)
+            for batch_features, padding_mask, labels in loader:
+                batch_features = batch_features.to(self.device)
                 padding_mask = padding_mask.to(self.device)
 
-                logits = self.model(agent_class_ids, action_mh, loc_mh, padding_mask)
+                logits = self.model(batch_features, padding_mask)
                 all_preds.extend(logits.argmax(dim=-1).cpu().tolist())
                 all_label_ids.extend(labels.tolist())
 
@@ -349,7 +338,7 @@ class TransformerModel:
         torch.save({"model_state": self.model.state_dict(), "vocab": self.vocab}, model_path)
 
 
-def prepare_dataset(train_facts, val_facts, test_facts):
+def prepare_dataset(all_atoms):
     """
     Prepare the dataset for the Transformer model, i.e. compute the vocabulary sizes
     (agent classes, action ids, location ids and av_action ids) shared across the
@@ -363,15 +352,15 @@ def prepare_dataset(train_facts, val_facts, test_facts):
     Returns:
         dict: Vocabulary sizes (num_agent_classes, num_action_classes, num_loc_classes, num_av_actions).
     """
-    return _scan_vocab_sizes(train_facts, val_facts, test_facts)
+    return _scan_vocab_sizes(all_atoms["train"], all_atoms["val"], all_atoms["test"])
 
 
-def run(all_facts, dataset_labels, output_dir, result_summary, device):
+def run(all_atoms, dataset_labels, output_dir, result_summary, device):
     """
     Run the Transformer baseline on the given train, validation, and test sets.
 
     Args:
-        all_facts (dict): Dictionary containing 'train', 'val', and 'test' facts.
+        all_atoms (dict): Dictionary containing 'train', 'val', and 'test' atoms.
         dataset_labels (dict): Dictionary containing dataset labels.
         output_dir (Path): Directory to save the results.
         result_summary (dict): Dictionary to store the results summary.
@@ -381,7 +370,7 @@ def run(all_facts, dataset_labels, output_dir, result_summary, device):
     model_output_dir = output_dir / "transformer"
     os.makedirs(model_output_dir, exist_ok=True)
 
-    train_facts, val_facts, test_facts = all_facts["train"], all_facts["val"], all_facts["test"]
+    
     transformer_results = {}
     transformer_model_file = model_output_dir / "transformer_model.pth"  # Path to save the trained model
     transformer_result_file = model_output_dir / "transformer_results.json"  # Path to save the results
@@ -390,11 +379,11 @@ def run(all_facts, dataset_labels, output_dir, result_summary, device):
         # Load the model and results if they already exist
         transformer_results = utils_data.load_json(transformer_result_file)
     else:
-        vocab = prepare_dataset(train_facts, val_facts, test_facts)
+        vocab = prepare_dataset(all_atoms)
         transformer_model = TransformerModel(vocab, device=device)  # Initialize the Transformer model
-        transformer_model.train(train_facts, val_facts)  # Train the model
+        transformer_model.train(all_atoms["train"], all_atoms["val"])  # Train the model
         transformer_model.save(transformer_model_file)  # Save the trained model weights
-        transformer_results = transformer_model.evaluate(test_facts, dataset_labels)  # Evaluate on test set
+        transformer_results = transformer_model.evaluate(all_atoms["test"], dataset_labels)  # Evaluate on test set
         utils_data.save_json(transformer_results, transformer_result_file)  # Save the results
     result_summary["transformer"] = transformer_results
     print("\n--------- Transformer Baseline Done! ------------------------\n")

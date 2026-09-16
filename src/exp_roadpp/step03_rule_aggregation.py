@@ -1,6 +1,8 @@
 import os
+import warnings
 
 from sklearn.linear_model import LogisticRegression
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
 from pathlib import Path
@@ -8,8 +10,8 @@ from tqdm import tqdm
 from scipy import sparse
 import random
 
-
-
+from src.exp_roadpp import utils_data
+from src.exp_roadpp.step03_visual import visualize_rule_aggregation_results, visualize_baseline_results, visual_bar
 
 
 def save_dataset(data, dataset_file):
@@ -84,7 +86,7 @@ def _clause_body_signature(clause):
     return _atom_body_signature(clause["body"][0])
 
 def _build_body_index(init_clauses):
-    signatures = {_clause_body_signature(c) for c in init_clauses}
+    signatures = {_clause_body_signature(c['clause']) for c in init_clauses.values()}
     return {sig: i for i, sig in enumerate(signatures)}, signatures
 
 HEAD_PRED, HEAD_AGENT_CLASS = "action", "av"
@@ -122,8 +124,8 @@ def _build_clause_feature_matrix(atoms_by_video, body_index, desc):
     return feature_matrix, np.asarray(labels, dtype=np.int64)
 
 
-def build_rule_learning_dataset(atoms_by_video, init_clauses, output_dir, split):
-    dataset_file = Path(output_dir) / f"rule_learning_dataset_{split}.npz"
+def build_rule_learning_dataset(atoms_by_video, init_clauses, output_dir, split, model_type):
+    dataset_file = Path(output_dir) / f"rule_learning_dataset_{model_type}_{split}.npz"
     if dataset_file.exists():
         npz =  np.load(dataset_file, allow_pickle=True)
         return {
@@ -194,7 +196,7 @@ def _fit_rule_aggregation_lr(train_matrix, train_labels, val_matrix, val_labels,
     # Evaluated C=1.0: {'c_value': 1.0, 'validation_accuracy': 0.9671052631578947, 'validation_f1_macro': 0.9346958647854106, 'nonzero_rule_count': 1295}
     # Evaluated C=5.0: {'c_value': 5.0, 'validation_accuracy': 0.975328947368421, 'validation_f1_macro': 0.9437663887993266, 'nonzero_rule_count': 1812}
     # Evaluated C=10.0: {'c_value': 10.0, 'validation_accuracy': 0.9819078947368421, 'validation_f1_macro': 0.951205349022739, 'nonzero_rule_count': 2193}
-    c_values = [1.0,5.0,10.0]
+    c_values = [0.05, 0.1,0.5,1.0,5.0,10.0]
     best_model = None
     best_key = None
     best_summary = None
@@ -204,11 +206,20 @@ def _fit_rule_aggregation_lr(train_matrix, train_labels, val_matrix, val_labels,
             penalty="l1",
             solver="saga",
             C=float(c_value),
-            max_iter=3000,
+            max_iter=5000,
+            tol=1e-3,
             class_weight="balanced",
             random_state=int(seed),
         )
-        model.fit(train_matrix, train_labels)
+        # With very few training examples relative to the number of candidate
+        # rule features, weakly-regularized (large C) fits are close to
+        # separable and saga will not fully converge no matter how large
+        # max_iter is. That non-convergence is already reflected in the
+        # validation metrics below, so we silence the noisy per-fit warning
+        # instead of chasing convergence with ever more iterations.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            model.fit(train_matrix, train_labels)
 
         val_pred = model.predict(val_matrix)
         val_accuracy = float(accuracy_score(val_labels, val_pred))
@@ -222,7 +233,7 @@ def _fit_rule_aggregation_lr(train_matrix, train_labels, val_matrix, val_labels,
             "validation_f1_macro": val_f1,
             "nonzero_rule_count": nonzero_rule_count,
         }
-        print(f"Evaluated C={c_value}: {summary}")
+        print(f"[Val] c_value={c_value}, acc: {val_accuracy}, f1: {val_f1}, nonzero_rule_count: {nonzero_rule_count}")
         if best_key is None or candidate_key > best_key:
             best_key = candidate_key
             best_model = model
@@ -270,9 +281,46 @@ def _rank_rules_with_model(rules, model):
     )
     return ranked_rules
 
-def learn_rule_aggregation(train_dataset, val_dataset):
+def test_global_rules(model,dataset, output_dir, suffix):
+    
+    os.makedirs(output_dir, exist_ok=True)
+
+    test_matrix = dataset["feature_matrix"]
+    test_labels = dataset["labels"]
+
+    if isinstance(test_matrix, np.ndarray) and test_matrix.ndim == 0:
+        test_matrix = test_matrix.item()    
+
+    test_pred = model.predict(test_matrix)
+
+    test_accuracy = float(accuracy_score(test_labels, test_pred)) if len(test_labels) else 0.0
+    test_f1_macro = float(f1_score(test_labels, test_pred, average="macro")) if len(test_labels) else 0.0
+
+    # accuracy on each class
+    test_accuracy_per_class = {}
+    if len(test_labels):
+        for class_label in set(test_labels):
+            class_indices = [i for i, label in enumerate(test_labels) if label == class_label]
+            class_correct = sum(1 for i in class_indices if test_pred[i] == class_label)
+            test_accuracy_per_class[int(class_label)] = float(class_correct) / len(class_indices) if class_indices else 0.0
+
+    dataset_summary = {
+        "test_label_count": len(set(test_labels)),
+        "test_accuracy": test_accuracy,
+        "test_f1_macro": test_f1_macro,
+        "test_accuracy_per_class": test_accuracy_per_class,
+    }
+    utils_data.save_json(dataset_summary, output_dir / f"rule_aggregation_summary_{suffix}.json")
+    print(f"[Test] Acc: {test_accuracy}, F1 Macro: {test_f1_macro}")
+    return dataset_summary
 
 
+
+def learn_rule_aggregation(atoms, clauses, output_dir, dataset_path, model_type):
+    print(f"\n[Learn Rule Aggregation] Model type: {model_type}, Clause count: {len(clauses)}")
+    train_dataset = build_rule_learning_dataset(atoms["train"], clauses, output_dir, "train", model_type)
+    val_dataset = build_rule_learning_dataset(atoms["val"], clauses, output_dir, "val", model_type)
+    test_dataset = build_rule_learning_dataset(atoms["test"], clauses, output_dir, "test", model_type)
 
     train_matrix = train_dataset["feature_matrix"]
     val_matrix = val_dataset["feature_matrix"]
@@ -284,10 +332,12 @@ def learn_rule_aggregation(train_dataset, val_dataset):
     # ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
     # save model and ranked rules
     # np.save("ranked_rules.npy", ranked_rules)
-    model_file = "model.npy"
+    model_file = f"model_{model_type}.npy"
     np.save(model_file, model)
 
-    return model
+    dataset_summary = test_global_rules(model, test_dataset, output_dir, model_type)
+    visualize_rule_aggregation_results(dataset_path, dataset_summary, output_dir, model_type)    
+    
 
 
 

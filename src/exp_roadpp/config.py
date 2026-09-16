@@ -212,6 +212,7 @@ def get_step_03_input(args):
         dataset_labels = json.load(f)
     
     input_data = {
+        "baselines": args.baselines,
         "dataset_labels": dataset_labels,
         'learning': args.learning,
         'skip_baselines_03': args.skip_baselines_03,
