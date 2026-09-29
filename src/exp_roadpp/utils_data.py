@@ -88,3 +88,10 @@ def get_start_end_frame(segment, frames):
     start_frame = seg_frames[0]
     end_frame = seg_frames[-1]
     return start_frame, end_frame, tube_uid
+
+
+def support_coverage_ratio(clause):
+    if not clause:
+        return 0.0
+    sc_ratios = [sc["support"] / sc["coverage"] for sc in clause['support_coverage'].values()]
+    return sum(sc_ratios) / len(sc_ratios) if sc_ratios else 0.0

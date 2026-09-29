@@ -12,7 +12,7 @@ from src.exp_roadpp import utils_data
 from src.exp_roadpp.step03_language import Language
 from src.exp_roadpp.step03_beam_search import BeamSearch
 from src.exp_roadpp.step03_pruner import Pruner
-from src.exp_roadpp.step03_visual import visualize_rule_aggregation_results, visualize_baseline_results, visual_bar
+from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
 from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation, build_rule_learning_dataset
 from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
@@ -87,8 +87,14 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
     return all_init_clauses
 
 
-def _coarse_prune(init_clauses, pruner):
-    return pruner.coarse_prune(init_clauses)
+def _coarse_prune(init_clauses, pruner, rank=False):
+    pruned_clauses = pruner.coarse_prune(init_clauses)
+    # rank clauses with their support coverage ratio
+    if rank:
+        rank_sc_ratio = [(clause, utils_data.support_coverage_ratio(clause)) for clause in pruned_clauses.values()]
+        rank_sc_ratio.sort(key=lambda x: x[1], reverse=True)
+        pruned_clauses = [clause for clause, _ in rank_sc_ratio]
+    return pruned_clauses
 
 
 
@@ -219,7 +225,8 @@ def main(input_data):
     init_clauses = _atoms_to_init_clauses(atoms["train"], language_model, output_dir, 'train')
     visual_bar(init_clauses, output_dir, "init_clauses_distribution")
     # C_1: Coarse Prune, filter out the low frequent clauses
-    coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
+    coarse_pruned_clauses = _coarse_prune(init_clauses, pruner, rank=True)
+
 
     
 
