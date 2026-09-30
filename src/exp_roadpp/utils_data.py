@@ -95,3 +95,32 @@ def support_coverage_ratio(clause):
         return 0.0
     sc_ratios = [sc["support"] / sc["coverage"] for sc in clause['support_coverage'].values()]
     return sum(sc_ratios) / len(sc_ratios) if sc_ratios else 0.0
+
+
+def body_to_signature(body):
+    signature = []
+    for atom in body:
+        if "location_name" in atom:
+            signature.append(["pred", atom["pred"], 
+                            "location_name", atom["location_name"], 
+                            "agent_class", atom["agent_class"]])
+        elif "action_id" in atom:
+            signature.append(["pred", atom["pred"], 
+                            "action_id", atom["action_id"], 
+                            "agent_class", atom["agent_class"]])
+    signature = tuple(tuple(item) for item in signature)
+    return signature
+
+def replace_ids_with_labels(clauses, dataset_labels):
+    def _replace_ids_with_labels(atom):
+        if "action_id" in atom:
+            atom["action_id_label"] = dataset_labels["action_labels"][atom["action_id"]]
+        if "location_name" in atom:
+            atom["location_name_label"] = dataset_labels["loc_labels"][atom["location_name"]]
+        if "agent_class" in atom and atom["agent_class"] != "av":
+            atom["agent_class_label"] = dataset_labels["agent_labels"][atom["agent_class"]]
+    for clause in clauses:
+        _replace_ids_with_labels(clause['clause']["head"])
+        for atom in clause['clause']["body"]:
+            _replace_ids_with_labels(atom)
+    return clauses

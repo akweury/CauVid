@@ -13,7 +13,9 @@ from src.exp_roadpp.step03_language import Language
 from src.exp_roadpp.step03_beam_search import BeamSearch
 from src.exp_roadpp.step03_pruner import Pruner
 from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
-from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation, build_rule_learning_dataset
+from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation
+from src.exp_roadpp.step03_pred_eval import predict_next_n_steps
+from src.exp_roadpp.step03_action_predictor import ActionPredictor
 from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
 def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
@@ -96,6 +98,17 @@ def _coarse_prune(init_clauses, pruner, rank=False):
         pruned_clauses = [clause for clause, _ in rank_sc_ratio]
     return pruned_clauses
 
+
+def _clause_extension(clauses):
+    extended_clauses = {}
+    for c in clauses:
+        body_signature = utils_data.body_to_signature(c["clause"]["body"])
+
+        if body_signature not in extended_clauses:
+            extended_clauses[body_signature] = []
+        extended_clauses[body_signature].append(c)
+
+    return extended_clauses
 
 
 
@@ -226,7 +239,19 @@ def main(input_data):
     visual_bar(init_clauses, output_dir, "init_clauses_distribution")
     # C_1: Coarse Prune, filter out the low frequent clauses
     coarse_pruned_clauses = _coarse_prune(init_clauses, pruner, rank=True)
+    # replace id with label names
+    coarse_pruned_clauses = utils_data.replace_ids_with_labels(coarse_pruned_clauses, dataset_labels)
 
+    
+    # predict and evaluation
+    model = ActionPredictor(coarse_pruned_clauses)
+    predict_next_n_steps(model, atoms["val"], output_dir, step=1)
+
+
+
+    # C_2
+    extended_clauses = _clause_extension(coarse_pruned_clauses)
+    
 
     
 
