@@ -97,30 +97,39 @@ def support_coverage_ratio(clause):
     return sum(sc_ratios) / len(sc_ratios) if sc_ratios else 0.0
 
 
+
+def atom_to_signature(atom):
+    if "location_name" in atom:
+        return ("pred", atom["pred"], "location_name", atom["location_name"], "agent_class", atom["agent_class"])
+    elif "action_id" in atom:
+        return ("pred", atom["pred"], "action_id", atom["action_id"], "agent_class", atom["agent_class"])
+    return None
+
 def body_to_signature(body):
     signature = []
     for atom in body:
-        if "location_name" in atom:
-            signature.append(["pred", atom["pred"], 
-                            "location_name", atom["location_name"], 
-                            "agent_class", atom["agent_class"]])
-        elif "action_id" in atom:
-            signature.append(["pred", atom["pred"], 
-                            "action_id", atom["action_id"], 
-                            "agent_class", atom["agent_class"]])
+        atom_signature = atom_to_signature(atom)
+        if atom_signature:
+            signature.append(list(atom_signature))
     signature = tuple(tuple(item) for item in signature)
     return signature
 
+
+def add_labels_to_atom(atom, dataset_labels):
+    if "action_id" in atom:
+        atom["action_id_label"] = dataset_labels["action_labels"][atom["action_id"]]
+    if "location_name" in atom:
+        atom["location_name_label"] = dataset_labels["loc_labels"][atom["location_name"]]
+    if "agent_class" in atom and atom["agent_class"] != "av":
+        atom["agent_class_label"] = dataset_labels["agent_labels"][atom["agent_class"]]
+    if "agent_class" in atom and atom["agent_class"] == "av":
+        atom["agent_class_label"] = atom["agent_class"]
+    return atom 
+
+
 def replace_ids_with_labels(clauses, dataset_labels):
-    def _replace_ids_with_labels(atom):
-        if "action_id" in atom:
-            atom["action_id_label"] = dataset_labels["action_labels"][atom["action_id"]]
-        if "location_name" in atom:
-            atom["location_name_label"] = dataset_labels["loc_labels"][atom["location_name"]]
-        if "agent_class" in atom and atom["agent_class"] != "av":
-            atom["agent_class_label"] = dataset_labels["agent_labels"][atom["agent_class"]]
-    for clause in clauses:
-        _replace_ids_with_labels(clause['clause']["head"])
+    for clause,score in clauses:
+        add_labels_to_atom(clause['clause']["head"], dataset_labels)
         for atom in clause['clause']["body"]:
-            _replace_ids_with_labels(atom)
+            add_labels_to_atom(atom, dataset_labels)
     return clauses
