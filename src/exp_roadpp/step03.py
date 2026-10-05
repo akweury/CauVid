@@ -244,7 +244,7 @@ def main(input_data):
     # predict and evaluation
     model = ActionPredictor(coarse_pruned_clauses, dataset_labels)
     
-    predict_next_n_steps(model, atoms["val"], output_dir, step=1)
+    predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)
 
 
 

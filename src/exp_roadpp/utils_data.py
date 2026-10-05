@@ -97,14 +97,49 @@ def support_coverage_ratio(clause):
     return sum(sc_ratios) / len(sc_ratios) if sc_ratios else 0.0
 
 
-
+def build_signature(predicate, label, label_id, agent_class, agent_class_label, tube_uid):
+    if predicate == "action":
+        return (
+            "pred", predicate,
+            "action_id", label_id,
+            "action_id_label", label,
+            "agent_class", agent_class,
+            "agent_class_label", agent_class_label,
+            "tube_uid", tube_uid
+        )
+    elif predicate == "location":
+        return (
+            "pred", predicate,
+            "location_name", label_id,
+            "location_name_label", label,
+            "agent_class", agent_class,
+            "agent_class_label", agent_class_label,
+            "tube_uid", tube_uid
+        )
+    else:
+        raise ValueError("Unknown predicate type in build_signature")
 def atom_to_signature(atom):
     if "location_name" in atom:
-        return ("pred", atom["pred"], "location_name", atom["location_name"], "agent_class", atom["agent_class"])
+        return ("pred", atom["pred"], 
+                "location_name", atom["location_name"], 
+                "location_name_label", atom["location_name_label"],
+                "agent_class", atom["agent_class"], 
+                "agent_class_label", atom["agent_class_label"],
+                "tube_uid", atom.get("tube_uid"))
     elif "action_id" in atom:
-        return ("pred", atom["pred"], "action_id", atom["action_id"], "agent_class", atom["agent_class"])
-    return None
+        return ("pred", atom["pred"], 
+                "action_id", atom["action_id"], 
+                "action_id_label", atom["action_id_label"],
+                "agent_class", atom["agent_class"], 
+                "agent_class_label", atom["agent_class_label"],
+                "tube_uid", atom.get("tube_uid"))
+    else:
+        raise ValueError("Unknown atom type in atom_to_signature")
 
+def same_signature_no_tube_uid(sig1, sig2):
+    if not sig1 or not sig2:
+        return False
+    return sig1[:-2] == sig2[:-2]  # Compare all elements except the last two ("tube_uid")
 def body_to_signature(body):
     signature = []
     for atom in body:
