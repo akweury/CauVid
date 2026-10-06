@@ -135,3 +135,14 @@ def visual_bar(clauses, output_dir, filename):
     plt.tight_layout()
     plt.savefig(Path(output_dir) / f"{filename}_coverage.png")
     plt.close()
+
+
+
+def visual_2d_heatmap(matrix, output_dir=".", filename="heatmap"):
+    plt.figure(figsize=(12, 8))
+    plt.imshow(matrix, cmap="viridis", aspect="auto")
+    plt.colorbar()
+    plt.title("2D Heatmap", fontdict={"size": 30})
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"{filename}.png")
+    plt.close()

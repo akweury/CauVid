@@ -243,7 +243,8 @@ def main(input_data):
     
     # predict and evaluation
     model = ActionPredictor(coarse_pruned_clauses, dataset_labels)
-    
+
+    # predict the next action/position of each atom
     predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)
 
 

@@ -118,7 +118,12 @@ def build_signature(predicate, label, label_id, agent_class, agent_class_label, 
         )
     else:
         raise ValueError("Unknown predicate type in build_signature")
-def atom_to_signature(atom):
+
+
+def atom_to_signature(atom, dataset_labels=None):
+    if dataset_labels is not None:
+        atom = add_labels_to_atom(atom, dataset_labels)
+        
     if "location_name" in atom:
         return ("pred", atom["pred"], 
                 "location_name", atom["location_name"], 
@@ -140,6 +145,7 @@ def same_signature_no_tube_uid(sig1, sig2):
     if not sig1 or not sig2:
         return False
     return sig1[:-2] == sig2[:-2]  # Compare all elements except the last two ("tube_uid")
+
 def body_to_signature(body):
     signature = []
     for atom in body:
