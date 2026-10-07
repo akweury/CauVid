@@ -63,7 +63,7 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
         # draw performance over time for the current video
         visual_line_plot(
             [recalls, precisions, f1s, unchanged_as_percents, changed_as_percents],
-            ["Recall", "Precision", "F1", "Unchanged AS Percent", "Changed AS Percent"],
+            ["Recall", "Precision", "F1", "Unchanged AS Percent", "Removed AS Percent"],
             output_dir=output_dir,
             title=f"Video {vid} Prediction Scores",
             filename=f"{vid}_prediction_scores"

@@ -193,9 +193,11 @@ class ActionPredictor:
             for k in range(len(matched_fhs)):
                 iv, label_index = self.calc_influence_vector(siss, matched_fhs[k])
                 fim[sis_index, :, label_index] += iv.squeeze()
-        
+
+        # TODO: also consider to add and remove atoms in the prediction
         soss = self.connect_pred_to_tube_uid(siss, fim)
         print(f"FIM SUM: {fim.sum().item()}")
+        
         if meta_data is not None:
             visual_2d_heatmap(fim.mean(dim=0), 
                         output_dir=meta_data["output_dir"], 
