@@ -43,6 +43,8 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
         recalls = []
         precisions = []
         f1s = []
+        unchanged_as_percents = [] 
+        changed_as_percents = [] 
         for frame_id, (siss, soss_gt) in data["two_frames_data"].items():
             if frame_id < start_frame_id:
                 continue
@@ -50,16 +52,18 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
             meta_data = {"video_id": vid, "frame_id": frame_id, "output_dir": output_dir}
             soss = model.predict(siss, meta_data=None)
             # evaluate the prediction against the ground truth labels
-            frame_recall, frame_precision, frame_f1 = model.eval(soss, soss_gt, meta_data=None)
-            recalls.append(frame_recall)
-            precisions.append(frame_precision)
-            f1s.append(frame_f1)
+            res = model.eval(soss, soss_gt, meta_data=None)
+            recalls.append(res["recall"])
+            precisions.append(res["precision"])
+            f1s.append(res["f1"]) 
+            unchanged_as_percents.append(res["frame_atom_unchanged_as_percent"])
+            changed_as_percents.append(res["frame_atom_removed_as_percent"])
         
-        all_video_scores.append({ "video_id": vid, "recalls": recalls, "precisions": precisions, "f1s": f1s })
+        all_video_scores.append({ "video_id": vid, "recalls": recalls, "precisions": precisions, "f1s": f1s, "unchanged_as_percents": unchanged_as_percents, "changed_as_percents": changed_as_percents })
         # draw performance over time for the current video
         visual_line_plot(
-            [recalls, precisions, f1s],
-            ["Recall", "Precision", "F1"],
+            [recalls, precisions, f1s, unchanged_as_percents, changed_as_percents],
+            ["Recall", "Precision", "F1", "Unchanged AS Percent", "Changed AS Percent"],
             output_dir=output_dir,
             title=f"Video {vid} Prediction Scores",
             filename=f"{vid}_prediction_scores"

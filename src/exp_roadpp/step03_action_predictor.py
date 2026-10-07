@@ -217,29 +217,33 @@ class ActionPredictor:
 
     
     def eval(self, soss, soss_gt, meta_data=None):
-
         # convert soss_gt to FAM (Frame Action Matrix).
         fam_gt = self.soss_to_fam(soss_gt)
         fam = self.soss_to_fam(soss)
         fam_hits = torch.zeros(fam.shape[0])
         fam_gt_hits = torch.zeros(fam_gt.shape[0])
+        frame_atom_unchanged = 0
+        frame_atom_removed = 0
         for as_in_index in range(fam.shape[0]):
             as_tube_uid = soss[as_in_index][-1]
-            as_in_next = fam[as_in_index,:].max()>0
-            if as_in_next:
+            as_in_next_pred = fam[as_in_index,:].max()>0
+            if as_in_next_pred:
                 matched_gt_indices = [j for j, sos_gt in enumerate(soss_gt) if sos_gt[-1] == as_tube_uid]
-                if not matched_gt_indices:
-                    continue
-                # atom is present in the next frame
-                
-                for matched_gt_index in matched_gt_indices:
-                    if torch.equal(fam_gt[matched_gt_index],fam[as_in_index]):
-                        fam_hits[as_in_index] += 1
-                        fam_gt_hits[matched_gt_index] += 1
+                if matched_gt_indices:
+                    frame_atom_unchanged += 1
+                    # atom is present in the next frame
+                    for matched_gt_index in matched_gt_indices:
+                        if torch.equal(fam_gt[matched_gt_index],fam[as_in_index]):
+                            fam_hits[as_in_index] += 1
+                            fam_gt_hits[matched_gt_index] += 1
+                else:
+                    frame_atom_removed += 1
+
         frame_recall = fam_gt_hits.sum().item() / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
         frame_precision = fam_hits.sum().item() / fam.shape[0] if fam.shape[0] > 0 else 0
         frame_f1 = 2 * frame_precision * frame_recall / (frame_precision + frame_recall) if (frame_precision + frame_recall) > 0 else 0
-        
+        frame_atom_unchanged_as_percent = frame_atom_unchanged / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
+        frame_atom_removed_as_percent = frame_atom_removed / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
         if meta_data is not None:
             fam_with_hits = torch.cat([fam, fam_hits.unsqueeze(1)], dim=1)
             visual_2d_heatmap(fam_with_hits, 
@@ -255,7 +259,13 @@ class ActionPredictor:
                         y_label="Atoms",
                         title=f"Frame {meta_data['frame_id']} Recall: {frame_recall:.2f}",
                         filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_recall")
-            
-        return frame_recall, frame_precision, frame_f1
+        res = {
+            "recall": frame_recall,
+            "precision": frame_precision,
+            "f1": frame_f1,
+            "frame_atom_unchanged_as_percent": frame_atom_unchanged_as_percent,
+            "frame_atom_removed_as_percent": frame_atom_removed_as_percent
+        }
+        return res
         
         
