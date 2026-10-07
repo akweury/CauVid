@@ -1,5 +1,7 @@
+import os
+
 from src.exp_roadpp.utils_data import atom_to_signature
-from src.exp_roadpp.step03_visual import visual_2d_heatmap
+from src.exp_roadpp.step03_visual import visual_line_plot
 
 def get_video_data(video_id, video_atoms, dataset_labels):
     data = {}
@@ -12,7 +14,7 @@ def get_video_data(video_id, video_atoms, dataset_labels):
 
     end_frame = max([int(atom["end_frame"]) for atom in video_atoms]) if video_atoms else 0
     # for each frame, we need a list to include the atoms that occur in that frame
-    frame_data = {frame_id: [] for frame_id in range(end_frame)}
+    frame_data = {i: [] for i in range(end_frame)}
     for start_frame, atoms in atoms_per_start_frame.items():
         for atom in atoms:
             for frame_id in range(start_frame, int(atom["end_frame"])):
@@ -22,13 +24,14 @@ def get_video_data(video_id, video_atoms, dataset_labels):
     data["frame_data"] = frame_data
     data["video_length"] = end_frame
     # connect the neighboring frames with the atoms that occur in them
-    two_frames_data = {frame_id: {"current_frame": frame_data[frame_id], 
-                                  "next_frame": frame_data[frame_id + 1]} for frame_id in frame_data.keys() if frame_id + 1 in frame_data}    
+    two_frames_data = {i: (frame_data[i], frame_data[i + 1]) for i in frame_data.keys() if i + 1 in frame_data}    
     data["two_frames_data"] = two_frames_data
     return data
 
 
 def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
+    output_dir = output_dir/"predictions"
+    os.makedirs(output_dir, exist_ok=True)
     # start predicting the next steps for each video in the test set
     print(f"Predicting next {step} steps for {len(test_atoms)} videos")
     start_frame_id = step
@@ -37,19 +40,32 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
         print(f"Predicting for video: {vid}")
         # predict the actions frame by frame
         data = get_video_data(vid, video_atoms, dataset_labels)
-        video_scores = []
-        for frame_id, two_frames in data["two_frames_data"].items():
+        recalls = []
+        precisions = []
+        f1s = []
+        for frame_id, (siss, soss_gt) in data["two_frames_data"].items():
             if frame_id < start_frame_id:
                 continue
             # given the current frame, predict the action/location of the atoms in the next frame
-            soss, fim = model.predict(two_frames["current_frame"])
-            visual_2d_heatmap(fim.mean(dim=0), output_dir=output_dir, filename=f"{vid}_frame_{frame_id}_fim_sum_{fim.sum().item()}")
-
+            meta_data = {"video_id": vid, "frame_id": frame_id, "output_dir": output_dir}
+            soss = model.predict(siss, meta_data=None)
             # evaluate the prediction against the ground truth labels
-            as_out_gt = two_frames["next_frame"]
-            frame_scores = model.eval(soss, as_out_gt)
-            video_scores.append(frame_scores)
-        all_video_scores.append({ "video_id": vid, "video_scores": video_scores })
+            frame_recall, frame_precision, frame_f1 = model.eval(soss, soss_gt, meta_data=None)
+            recalls.append(frame_recall)
+            precisions.append(frame_precision)
+            f1s.append(frame_f1)
+        
+        all_video_scores.append({ "video_id": vid, "recalls": recalls, "precisions": precisions, "f1s": f1s })
+        # draw performance over time for the current video
+        visual_line_plot(
+            [recalls, precisions, f1s],
+            ["Recall", "Precision", "F1"],
+            output_dir=output_dir,
+            title=f"Video {vid} Prediction Scores",
+            filename=f"{vid}_prediction_scores"
+        )
+        print(f"Scores for video {vid}: Recalls={recalls}, Precisions={precisions}, F1s={f1s}")
+        
 
     print(f"Prediction data for video {vid}: {data}")
     return all_video_scores

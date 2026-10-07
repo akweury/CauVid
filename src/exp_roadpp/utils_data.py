@@ -157,8 +157,11 @@ def body_to_signature(body):
 
 
 def add_labels_to_atom(atom, dataset_labels):
-    if "action_id" in atom:
+    if "action_id" in atom and atom["agent_class"] != "av":
         atom["action_id_label"] = dataset_labels["action_labels"][atom["action_id"]]
+    if "action_id" in atom and atom["agent_class"] == "av":
+        atom["action_id_label"] = dataset_labels["all_av_action_labels"][atom["action_id"]]
+
     if "location_name" in atom:
         atom["location_name_label"] = dataset_labels["loc_labels"][atom["location_name"]]
     if "agent_class" in atom and atom["agent_class"] != "av":

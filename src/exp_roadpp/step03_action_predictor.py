@@ -3,7 +3,7 @@ import torch
 
 
 from src.exp_roadpp.utils_data import atom_to_signature, add_labels_to_atom, same_signature_no_tube_uid, build_signature
-
+from src.exp_roadpp.step03_visual import visual_2d_heatmap
 
 class ActionPredictor:
     def __init__(self, coarse_pruned_clauses,dataset_labels):
@@ -134,10 +134,11 @@ class ActionPredictor:
         return iv, label_index
 
     
-    def predict(self, siss):
+    def predict(self, siss, meta_data=None):
         """
         AIM:    Atom Influence Matrix, a NxM matrix representing the influence of a single atom on all atoms in the next frame.
         FIM:    Frame Influence Matrix, a NxNxM matrix representing the influence of all atoms in the current frame on all atoms in the next frame.
+        FAM:    Frame Action Matrix, a NxM matrix representing the predicted actions/locations for all atoms in the next frame.
         IV:     Influence Vector, a Nx1 vector representing the influence of a single frozen head signature on all atoms in the next frame.
         FHS:    Frozen Head Signature, a representation of a frozen head that can influence the next frame.
         FBS:    Frozen Body Signature, a representation of a frozen body that can match with frozen head signatures to influence the next frame.
@@ -195,12 +196,66 @@ class ActionPredictor:
         
         soss = self.connect_pred_to_tube_uid(siss, fim)
         print(f"FIM SUM: {fim.sum().item()}")
-        return soss,fim
+        if meta_data is not None:
+            visual_2d_heatmap(fim.mean(dim=0), 
+                        output_dir=meta_data["output_dir"], 
+                        title=f"Frame {meta_data['frame_id']} FIM, Sum: {fim.sum().item()}", 
+                        x_label="Action", 
+                        y_label="Atoms",
+                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fim_sum_{fim.sum().item()}")
+        return soss
 
+    def soss_to_fam(self, soss):
+        # Convert the soss (predicted actions/locations) to a Frame Action Matrix (FAM)
+        # soss: List of predicted actions/locations for the next frame
+        # fam: Initialized Frame Action Matrix to be filled
+        fam = torch.zeros(len(soss), self.action_num)
+        for i, sos in enumerate(soss):
+            action_index = self.atom_signature_to_index(sos)
+            fam[i, action_index] = 1
+        return fam
 
+    
+    def eval(self, soss, soss_gt, meta_data=None):
 
-
-
-    def eval(self, pred, labels):
-        # Implement the evaluation logic for the predictions
-        pass
+        # convert soss_gt to FAM (Frame Action Matrix).
+        fam_gt = self.soss_to_fam(soss_gt)
+        fam = self.soss_to_fam(soss)
+        fam_hits = torch.zeros(fam.shape[0])
+        fam_gt_hits = torch.zeros(fam_gt.shape[0])
+        for as_in_index in range(fam.shape[0]):
+            as_tube_uid = soss[as_in_index][-1]
+            as_in_next = fam[as_in_index,:].max()>0
+            if as_in_next:
+                matched_gt_indices = [j for j, sos_gt in enumerate(soss_gt) if sos_gt[-1] == as_tube_uid]
+                if not matched_gt_indices:
+                    continue
+                # atom is present in the next frame
+                
+                for matched_gt_index in matched_gt_indices:
+                    if torch.equal(fam_gt[matched_gt_index],fam[as_in_index]):
+                        fam_hits[as_in_index] += 1
+                        fam_gt_hits[matched_gt_index] += 1
+        frame_recall = fam_gt_hits.sum().item() / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
+        frame_precision = fam_hits.sum().item() / fam.shape[0] if fam.shape[0] > 0 else 0
+        frame_f1 = 2 * frame_precision * frame_recall / (frame_precision + frame_recall) if (frame_precision + frame_recall) > 0 else 0
+        
+        if meta_data is not None:
+            fam_with_hits = torch.cat([fam, fam_hits.unsqueeze(1)], dim=1)
+            visual_2d_heatmap(fam_with_hits, 
+                        output_dir=meta_data["output_dir"], 
+                        x_label="Action", 
+                        y_label="Atoms",
+                        title=f"Frame {meta_data['frame_id']} Precision: {frame_precision:.2f}",
+                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_precision")
+            fam_gt_with_hits = torch.cat([fam_gt, fam_gt_hits.unsqueeze(1)], dim=1)
+            visual_2d_heatmap(fam_gt_with_hits, 
+                        output_dir=meta_data["output_dir"], 
+                        x_label="Action", 
+                        y_label="Atoms",
+                        title=f"Frame {meta_data['frame_id']} Recall: {frame_recall:.2f}",
+                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_recall")
+            
+        return frame_recall, frame_precision, frame_f1
+        
+        
