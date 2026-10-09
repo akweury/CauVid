@@ -43,8 +43,12 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
         recalls = []
         precisions = []
         f1s = []
-        unchanged_as_percents = [] 
-        changed_as_percents = [] 
+        unchanged_as_nums = [] 
+        pred_unchanged_as_percents = [] 
+        removed_as_nums = [] 
+        pred_removed_as_percents = [] 
+        new_as_nums = []
+
         for frame_id, (siss, soss_gt) in data["two_frames_data"].items():
             if frame_id < start_frame_id:
                 continue
@@ -52,21 +56,43 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
             meta_data = {"video_id": vid, "frame_id": frame_id, "output_dir": output_dir}
             soss = model.predict(siss, meta_data=None)
             # evaluate the prediction against the ground truth labels
-            res = model.eval(soss, soss_gt, meta_data=None)
+            res = model.eval(siss, soss, soss_gt, meta_data=None)
             recalls.append(res["recall"])
-            precisions.append(res["precision"])
-            f1s.append(res["f1"]) 
-            unchanged_as_percents.append(res["frame_atom_unchanged_as_percent"])
-            changed_as_percents.append(res["frame_atom_removed_as_percent"])
+            removed_as_nums.append(res["removed_atom_num"])
+            pred_removed_as_percents.append(res["pred_removed_atom_num"])
+            pred_unchanged_as_percents.append(res["pred_unchanged_atom_num"])
+            unchanged_as_nums.append(res["unchanged_atom_num"])
+            new_as_nums.append(res["new_atom_num"])
         
-        all_video_scores.append({ "video_id": vid, "recalls": recalls, "precisions": precisions, "f1s": f1s, "unchanged_as_percents": unchanged_as_percents, "changed_as_percents": changed_as_percents })
+        all_video_scores.append({ "video_id": vid, "recalls": recalls})
         # draw performance over time for the current video
         visual_line_plot(
-            [recalls, precisions, f1s, unchanged_as_percents, changed_as_percents],
-            ["Recall", "Precision", "F1", "Unchanged AS Percent", "Removed AS Percent"],
+            [new_as_nums],
+            ["New AS Num"],
+            output_dir=output_dir,
+            title=f"Video {vid} New Atoms in Next Frame",
+            filename=f"{vid}_new_atoms_next_frame"
+        )
+        visual_line_plot(
+            [recalls],
+            ["Recall"],
             output_dir=output_dir,
             title=f"Video {vid} Prediction Scores",
             filename=f"{vid}_prediction_scores"
+        )
+        visual_line_plot(
+            [unchanged_as_nums, pred_unchanged_as_percents],
+            ["Unchanged AS Num", "Predicted Unchanged AS Num"],
+            output_dir=output_dir,
+            title=f"Video {vid} Atoms in Current Frame",
+            filename=f"{vid}_atom_change_percentages_current_frame"
+        )
+        visual_line_plot(
+            [removed_as_nums, pred_removed_as_percents],
+            ["Removed AS Num", "Predicted Removed AS Num"],
+            output_dir=output_dir,
+            title=f"Video {vid} Atoms in Current Frame",
+            filename=f"{vid}_removed_atom_change_percentages_current_frame"
         )
         print(f"Scores for video {vid}: Recalls={recalls}, Precisions={precisions}, F1s={f1s}")
         

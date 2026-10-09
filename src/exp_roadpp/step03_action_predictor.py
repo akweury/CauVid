@@ -121,18 +121,55 @@ class ActionPredictor:
         next_frame_atoms: List of atoms in the next frame
         Returns a Nx1 vector representing the influence of the FHS on each atom in the next frame.
         """
-
         def calculate_influence(fhs, sis):
             remain_label = fhs[:10] == sis[:10]
             return int(remain_label)
-
-
+        
         iv = torch.zeros(len(siss))
         label_index = self.atom_signature_to_index(fhs[0])
         for i, sis in enumerate(siss):
             iv[i] = calculate_influence(fhs[0], sis)
         return iv, label_index
+    def create_new_atom(self, fhs):
+        """
+        Create a new atom based on the given Frozen Head Signature (FHS).
+        """
+        # Implementation for creating a new atom goes here
+        return fhs[0]
+    def build_fim(self, siss):
+        """
+        # how to determine whether the atom will persist to the next frame?
+        # A should either disappear, or persist, or change its action in the next frame.
+        # change because of rules
+        # disappear because it position is out of the frame
+        # persist if it remains in the frame without changing its action
+        """
+        fbs = self.body_signatures
+        fhs = self.head_signatures
+        # frame influence matrix (FIM) initialization
+        fim = torch.zeros(len(siss),len(siss), self.action_num)
+        # frame added atoms
+        added_atoms = []
 
+        for sis_index, sis in enumerate(siss):
+            matched_fbs_indices = self.find_matching_bodies(sis, fbs)
+            matched_fhs = self.find_matching_head_signatures(matched_fbs_indices, fhs)
+            if len(matched_fhs) == 0:
+                # the atom is unchanged in the next frame
+                label_index = self.atom_signature_to_index(sis)
+                fim[sis_index, sis_index, label_index] = 1                
+            else:
+                for k in range(len(matched_fhs)):
+                    iv, label_index = self.calc_influence_vector(siss, matched_fhs[k])
+                    # found matching sis
+                    if iv.sum() > 0:
+                        fim[sis_index, :, label_index] += iv.squeeze()
+                    else:
+                        # no matching sis found for this frozen head signature, create it as a new atom
+                        new_atom = self.create_new_atom(matched_fhs[k])
+                        added_atoms.append(new_atom) 
+        return fim, added_atoms
+    
     
     def predict(self, siss, meta_data=None):
         """
@@ -180,31 +217,18 @@ class ActionPredictor:
         Returns:
             as_out: List of predicted actions/locations for the next frame based on the current frame's atoms.
         """
-
-        # frame influence matrix (FIM) initialization
-        fim = torch.zeros(len(siss),len(siss), self.action_num)
-        fbs = self.body_signatures
-        fhs = self.head_signatures
-        
-        # calculate the AIM iteratively for each atom in the current frame
-        for sis_index, sis in enumerate(siss):
-            matched_fbs_indices = self.find_matching_bodies(sis, fbs)
-            matched_fhs = self.find_matching_head_signatures(matched_fbs_indices, fhs)
-            for k in range(len(matched_fhs)):
-                iv, label_index = self.calc_influence_vector(siss, matched_fhs[k])
-                fim[sis_index, :, label_index] += iv.squeeze()
-
-        # TODO: also consider to add and remove atoms in the prediction
-        soss = self.connect_pred_to_tube_uid(siss, fim)
+        # FIM: calculate the AIM iteratively for each atom in the current frame
+        fim, added_atoms = self.build_fim(siss)
         print(f"FIM SUM: {fim.sum().item()}")
+        soss = self.connect_pred_to_tube_uid(siss, fim)
         
         if meta_data is not None:
             visual_2d_heatmap(fim.mean(dim=0), 
-                        output_dir=meta_data["output_dir"], 
-                        title=f"Frame {meta_data['frame_id']} FIM, Sum: {fim.sum().item()}", 
-                        x_label="Action", 
-                        y_label="Atoms",
-                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fim_sum_{fim.sum().item()}")
+                              output_dir=meta_data["output_dir"], 
+                              title=f"Frame {meta_data['frame_id']} FIM, Sum: {fim.sum().item()}", 
+                              x_label="Action", 
+                              y_label="Atoms",
+                              filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fim_sum_{fim.sum().item()}")
         return soss
 
     def soss_to_fam(self, soss):
@@ -217,56 +241,88 @@ class ActionPredictor:
             fam[i, action_index] = 1
         return fam
 
+    def get_same_id_atoms(self,atom_signatures, tube_uid):
+        indices = []
+        for i, atom_signature in enumerate(atom_signatures):
+            if atom_signature[-1]==tube_uid:
+                indices.append(i)
+        return indices
+
+    def stat_two_frames_atoms(self, siss, soss_gt):
+        new_atom_num = 0
+        removed_atom_num = 0
+        unchanged_atom_num = 0
+        # Implement the logic to calculate removed, and unchanged atoms between two frames
+        for sis in siss:
+            tube_uid = sis[-1]
+            same_id_atom_indices = self.get_same_id_atoms(soss_gt, tube_uid)
+            if len(same_id_atom_indices) > 0:
+                found_unchanged = False
+                for index in same_id_atom_indices:
+                    if sis == soss_gt[index]:
+                        unchanged_atom_num += 1
+                        found_unchanged = True
+                        break 
+                if not found_unchanged:
+                    removed_atom_num += 1
+            else:
+                removed_atom_num += 1
+        new_atom_num = len(soss_gt) - unchanged_atom_num
+
+        return new_atom_num, removed_atom_num, unchanged_atom_num
+
+    def stat_pred_frames_atoms(self, soss, soss_gt):
+        pred_removed_atom_num = 0
+        pred_unchanged_atom_num = 0
+        for sos in soss:
+            tube_uid = sos[-1]
+            same_id_atom_indices = self.get_same_id_atoms(soss_gt, tube_uid)
+            if len(same_id_atom_indices) > 0:
+                found_unchanged = False
+                for index in same_id_atom_indices:
+                    if sos == soss_gt[index]:
+                        pred_unchanged_atom_num += 1
+                        found_unchanged = True
+                        break
+                if not found_unchanged:
+                    pred_removed_atom_num += 1
+            else:
+                pred_removed_atom_num += 1
+        return pred_removed_atom_num, pred_unchanged_atom_num
     
-    def eval(self, soss, soss_gt, meta_data=None):
+    def eval(self, siss, soss, soss_gt, meta_data=None):
         # convert soss_gt to FAM (Frame Action Matrix).
         fam_gt = self.soss_to_fam(soss_gt)
-        fam = self.soss_to_fam(soss)
-        fam_hits = torch.zeros(fam.shape[0])
+        fam_pred = self.soss_to_fam(soss)
+        fam_hits = torch.zeros(fam_pred.shape[0])
         fam_gt_hits = torch.zeros(fam_gt.shape[0])
-        frame_atom_unchanged = 0
-        frame_atom_removed = 0
-        for as_in_index in range(fam.shape[0]):
-            as_tube_uid = soss[as_in_index][-1]
-            as_in_next_pred = fam[as_in_index,:].max()>0
-            if as_in_next_pred:
-                matched_gt_indices = [j for j, sos_gt in enumerate(soss_gt) if sos_gt[-1] == as_tube_uid]
-                if matched_gt_indices:
-                    frame_atom_unchanged += 1
-                    # atom is present in the next frame
-                    for matched_gt_index in matched_gt_indices:
-                        if torch.equal(fam_gt[matched_gt_index],fam[as_in_index]):
-                            fam_hits[as_in_index] += 1
-                            fam_gt_hits[matched_gt_index] += 1
-                else:
-                    frame_atom_removed += 1
+        new_atom_num, removed_atom_num, unchanged_atom_num = self.stat_two_frames_atoms(siss, soss_gt)
+        pred_removed_atom_num, pred_unchanged_atom_num = self.stat_pred_frames_atoms(soss, soss_gt)
+        pred_recall = pred_unchanged_atom_num / (new_atom_num + unchanged_atom_num)
 
-        frame_recall = fam_gt_hits.sum().item() / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
-        frame_precision = fam_hits.sum().item() / fam.shape[0] if fam.shape[0] > 0 else 0
-        frame_f1 = 2 * frame_precision * frame_recall / (frame_precision + frame_recall) if (frame_precision + frame_recall) > 0 else 0
-        frame_atom_unchanged_as_percent = frame_atom_unchanged / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
-        frame_atom_removed_as_percent = frame_atom_removed / fam_gt.shape[0] if fam_gt.shape[0] > 0 else 0
+        
         if meta_data is not None:
-            fam_with_hits = torch.cat([fam, fam_hits.unsqueeze(1)], dim=1)
+            fam_with_hits = torch.cat([fam_pred, fam_hits.unsqueeze(1)], dim=1)
             visual_2d_heatmap(fam_with_hits, 
                         output_dir=meta_data["output_dir"], 
                         x_label="Action", 
                         y_label="Atoms",
-                        title=f"Frame {meta_data['frame_id']} Precision: {frame_precision:.2f}",
+                        title=f"Frame {meta_data['frame_id']}",
                         filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_precision")
             fam_gt_with_hits = torch.cat([fam_gt, fam_gt_hits.unsqueeze(1)], dim=1)
             visual_2d_heatmap(fam_gt_with_hits, 
                         output_dir=meta_data["output_dir"], 
                         x_label="Action", 
                         y_label="Atoms",
-                        title=f"Frame {meta_data['frame_id']} Recall: {frame_recall:.2f}",
+                        title=f"Frame {meta_data['frame_id']}",
                         filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_recall")
         res = {
-            "recall": frame_recall,
-            "precision": frame_precision,
-            "f1": frame_f1,
-            "frame_atom_unchanged_as_percent": frame_atom_unchanged_as_percent,
-            "frame_atom_removed_as_percent": frame_atom_removed_as_percent
+            "recall": pred_recall,
+            "pred_removed_atom_num": pred_removed_atom_num,
+            "pred_unchanged_atom_num": pred_unchanged_atom_num,
+            "new_atom_num": new_atom_num,
+            "removed_atom_num": removed_atom_num,
+            "unchanged_atom_num": unchanged_atom_num,
         }
         return res
         
