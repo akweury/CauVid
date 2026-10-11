@@ -35,7 +35,10 @@ def step_0_setup(args):
     elif args.machine == "macbook-pro":
         print("\n##### Running on MacBook Pro #####\n")
         args.device = "cpu"
-        raise NotImplementedError("Not implemented yet...")
+        args.dataset_path = root / 'data' / 'roadpp'
+        args.output_dir = root / 'output' / 'roadpp' / args.exp
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(args.dataset_path, exist_ok=True)
 
     # JST
     elif args.machine == "jst":
