@@ -95,14 +95,14 @@ class ActionPredictor:
 
         return build_signature(predicate, label, label_id, agent_class, agent_class_label, tube_uid)
     
-    def connect_pred_to_tube_uid(self, siss, fim):
+    def connect_pred_to_tube_uid(self, siss, fim, added_atoms):
         """
         For each sis, only its action id and action label is changing.
         The action is determined by the highest scoring prediction in the frame influence matrix for that atom.
 
         LV: label vector, representing the predicted labels for the atom based on the frame influence matrix.
         """
-    
+        
         soss = []
         fim_mean = fim.mean(dim=0)
         
@@ -112,6 +112,9 @@ class ActionPredictor:
             if lv.sum()>0:
                 label_index = (lv.argmax().item())
                 soss.append(sis)
+
+        for atom in added_atoms:
+            soss.append(atom)
         return soss
 
     def calc_influence_vector(self, siss, fhs):
@@ -219,8 +222,9 @@ class ActionPredictor:
         """
         # FIM: calculate the AIM iteratively for each atom in the current frame
         fim, added_atoms = self.build_fim(siss)
+        
         print(f"FIM SUM: {fim.sum().item()}")
-        soss = self.connect_pred_to_tube_uid(siss, fim)
+        soss = self.connect_pred_to_tube_uid(siss, fim, added_atoms)
         
         if meta_data is not None:
             visual_2d_heatmap(fim.mean(dim=0), 
