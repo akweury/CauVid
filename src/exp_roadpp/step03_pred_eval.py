@@ -40,15 +40,16 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
         print(f"Predicting for video: {vid}")
         # predict the actions frame by frame
         data = get_video_data(vid, video_atoms, dataset_labels)
-        recalls = []
-        precisions = []
-        f1s = []
-        unchanged_as_nums = [] 
-        pred_unchanged_as_percents = [] 
-        removed_as_nums = [] 
-        pred_removed_as_percents = [] 
-        new_as_nums = []
-
+        frame_results = []
+        summary_counts = {
+            event_type: {"tp": 0, "fp": 0, "fn": 0}
+            for event_type in ("added", "removed", "unchanged")
+        }
+        rule_summary = {
+            "target_rule_count": 0,
+            "covered_rule_count": 0,
+            "uncovered_rule_count": 0,
+        }
         for frame_id, (siss, soss_gt) in data["two_frames_data"].items():
             if frame_id < start_frame_id:
                 continue
@@ -57,44 +58,96 @@ def predict_next_n_steps(model, test_atoms, output_dir, dataset_labels, step=1):
             soss = model.predict(siss, meta_data=None)
             # evaluate the prediction against the ground truth labels
             res = model.eval(siss, soss, soss_gt, meta_data=None)
-            recalls.append(res["recall"])
-            removed_as_nums.append(res["removed_atom_num"])
-            pred_removed_as_percents.append(res["pred_removed_atom_num"])
-            pred_unchanged_as_percents.append(res["pred_unchanged_atom_num"])
-            unchanged_as_nums.append(res["unchanged_atom_num"])
-            new_as_nums.append(res["new_atom_num"])
-        
-        all_video_scores.append({ "video_id": vid, "recalls": recalls})
-        # draw performance over time for the current video
-        visual_line_plot(
-            [new_as_nums],
-            ["New AS Num"],
-            output_dir=output_dir,
-            title=f"Video {vid} New Atoms in Next Frame",
-            filename=f"{vid}_new_atoms_next_frame"
+
+            frame_results.append({
+                "frame_id": frame_id,
+                **res["events"],
+                "rule_matches": res["rule_matches"],
+            })
+            for event_type, counts in res["events"].items():
+                for count_name in ("tp", "fp", "fn"):
+                    summary_counts[event_type][count_name] += counts[count_name]
+            for count_name in rule_summary:
+                rule_summary[count_name] += res["rule_matches"][count_name]
+
+        summary = {}
+        for event_type, counts in summary_counts.items():
+            tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+            precision = tp / (tp + fp) if tp + fp else None
+            recall = tp / (tp + fn) if tp + fn else None
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if precision is not None and recall is not None and precision + recall
+                else None
+            )
+            summary[event_type] = {
+                **counts,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+            }
+        rule_summary["coverage"] = (
+            rule_summary["covered_rule_count"] / rule_summary["target_rule_count"]
+            if rule_summary["target_rule_count"]
+            else None
         )
+
+        all_video_scores.append({
+            "video_id": vid,
+            "frames": frame_results,
+            "summary": summary,
+            "rule_matches": rule_summary,
+        })
+        # draw performance over time for the current video
+
+        # visual added tp, fp, fn counts
         visual_line_plot(
-            [recalls],
-            ["Recall"],
+            [
+                [
+                    frame["added"]["recall"]
+                    if frame["added"]["recall"] is not None
+                    else 1
+                    for frame in frame_results
+                ]
+            ],
+            ["Added Recall"],
             output_dir=output_dir,
-            title=f"Video {vid} Prediction Scores",
+            title=f"Video {vid} Added Event Counts",
+            filename=f"{vid}_prediction_added_counts"
+        )
+
+        visual_line_plot(
+            [
+                [
+                    frame[event_type]["f1"]
+                    if frame[event_type]["f1"] is not None
+                    else float("nan")
+                    for frame in frame_results
+                ]
+                for event_type in ("added", "removed", "unchanged")
+            ],
+            ["Added F1", "Removed F1", "Unchanged F1"],
+            output_dir=output_dir,
+            title=f"Video {vid} Event F1 Scores",
             filename=f"{vid}_prediction_scores"
         )
         visual_line_plot(
-            [unchanged_as_nums, pred_unchanged_as_percents],
-            ["Unchanged AS Num", "Predicted Unchanged AS Num"],
+            [[
+                frame["rule_matches"]["coverage"]
+                if frame["rule_matches"]["coverage"] is not None
+                else float("nan")
+                for frame in frame_results
+            ]],
+            ["Target Rule Coverage"],
             output_dir=output_dir,
-            title=f"Video {vid} Atoms in Current Frame",
-            filename=f"{vid}_atom_change_percentages_current_frame"
+            title=f"Video {vid} Target Rule Coverage",
+            filename=f"{vid}_target_rule_coverage"
         )
-        visual_line_plot(
-            [removed_as_nums, pred_removed_as_percents],
-            ["Removed AS Num", "Predicted Removed AS Num"],
-            output_dir=output_dir,
-            title=f"Video {vid} Atoms in Current Frame",
-            filename=f"{vid}_removed_atom_change_percentages_current_frame"
+
+        print(
+            f"Scores for video {vid}: Events={summary}, "
+            f"Target rule coverage={rule_summary}"
         )
-        print(f"Scores for video {vid}: Recalls={recalls}, Precisions={precisions}, F1s={f1s}")
         
 
     print(f"Prediction data for video {vid}: {data}")

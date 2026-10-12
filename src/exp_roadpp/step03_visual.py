@@ -150,7 +150,7 @@ def visual_2d_heatmap(matrix, output_dir=".", title="", filename="heatmap", x_la
     plt.close()
     
 def visual_line_plot(data_series, labels, output_dir=".", title="", filename="line_plot"):
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(18, 6))
     colors = ["b", "g", "r", "c", "m", "y", "k"]
     for series, label in zip(data_series, labels):
         plt.plot(series, label=label, marker='o', color=colors.pop(0))

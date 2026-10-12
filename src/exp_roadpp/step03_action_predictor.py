@@ -1,8 +1,7 @@
 
 import torch 
 
-
-from src.exp_roadpp.utils_data import atom_to_signature, add_labels_to_atom, same_signature_no_tube_uid, build_signature
+from src.exp_roadpp.utils_data import atom_to_signature, same_signature_no_tube_uid, build_signature
 from src.exp_roadpp.step03_visual import visual_2d_heatmap
 
 class ActionPredictor:
@@ -154,6 +153,8 @@ class ActionPredictor:
         # frame added atoms
         added_atoms = []
 
+
+        # issue: added FP is too high, which means predicted new atoms are ofter incorrect.
         for sis_index, sis in enumerate(siss):
             matched_fbs_indices = self.find_matching_bodies(sis, fbs)
             matched_fhs = self.find_matching_head_signatures(matched_fbs_indices, fhs)
@@ -252,82 +253,142 @@ class ActionPredictor:
                 indices.append(i)
         return indices
 
-    def stat_two_frames_atoms(self, siss, soss_gt):
-        new_atom_num = 0
-        removed_atom_num = 0
-        unchanged_atom_num = 0
-        # Implement the logic to calculate removed, and unchanged atoms between two frames
-        for sis in siss:
-            tube_uid = sis[-1]
-            same_id_atom_indices = self.get_same_id_atoms(soss_gt, tube_uid)
-            if len(same_id_atom_indices) > 0:
-                found_unchanged = False
-                for index in same_id_atom_indices:
-                    if sis == soss_gt[index]:
-                        unchanged_atom_num += 1
-                        found_unchanged = True
-                        break 
-                if not found_unchanged:
-                    removed_atom_num += 1
-            else:
-                removed_atom_num += 1
-        new_atom_num = len(soss_gt) - unchanged_atom_num
+    def classify_transition(self, current_atoms, next_atoms):
+        """Match exact fact occurrences and classify them as added/removed/unchanged."""
+        current_matched = [False] * len(current_atoms)
+        next_matched = [False] * len(next_atoms)
+        unchanged = []
 
-        return new_atom_num, removed_atom_num, unchanged_atom_num
+        for next_index, next_atom in enumerate(next_atoms):
+            for current_index, current_atom in enumerate(current_atoms):
+                if not current_matched[current_index] and current_atom == next_atom:
+                    current_matched[current_index] = True
+                    next_matched[next_index] = True
+                    unchanged.append(next_atom)
+                    break
 
-    def stat_pred_frames_atoms(self, soss, soss_gt):
-        pred_removed_atom_num = 0
-        pred_unchanged_atom_num = 0
-        for sos in soss:
-            tube_uid = sos[-1]
-            same_id_atom_indices = self.get_same_id_atoms(soss_gt, tube_uid)
-            if len(same_id_atom_indices) > 0:
-                found_unchanged = False
-                for index in same_id_atom_indices:
-                    if sos == soss_gt[index]:
-                        pred_unchanged_atom_num += 1
-                        found_unchanged = True
-                        break
-                if not found_unchanged:
-                    pred_removed_atom_num += 1
-            else:
-                pred_removed_atom_num += 1
-        return pred_removed_atom_num, pred_unchanged_atom_num
-    
-    def eval(self, siss, soss, soss_gt, meta_data=None):
-        # convert soss_gt to FAM (Frame Action Matrix).
-        fam_gt = self.soss_to_fam(soss_gt)
-        fam_pred = self.soss_to_fam(soss)
-        fam_hits = torch.zeros(fam_pred.shape[0])
-        fam_gt_hits = torch.zeros(fam_gt.shape[0])
-        new_atom_num, removed_atom_num, unchanged_atom_num = self.stat_two_frames_atoms(siss, soss_gt)
-        pred_removed_atom_num, pred_unchanged_atom_num = self.stat_pred_frames_atoms(soss, soss_gt)
-        pred_recall = pred_unchanged_atom_num / (new_atom_num + unchanged_atom_num)
-
-        
-        if meta_data is not None:
-            fam_with_hits = torch.cat([fam_pred, fam_hits.unsqueeze(1)], dim=1)
-            visual_2d_heatmap(fam_with_hits, 
-                        output_dir=meta_data["output_dir"], 
-                        x_label="Action", 
-                        y_label="Atoms",
-                        title=f"Frame {meta_data['frame_id']}",
-                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_precision")
-            fam_gt_with_hits = torch.cat([fam_gt, fam_gt_hits.unsqueeze(1)], dim=1)
-            visual_2d_heatmap(fam_gt_with_hits, 
-                        output_dir=meta_data["output_dir"], 
-                        x_label="Action", 
-                        y_label="Atoms",
-                        title=f"Frame {meta_data['frame_id']}",
-                        filename=f"{meta_data['video_id']}_frame_{meta_data['frame_id']}_fam_recall")
-        res = {
-            "recall": pred_recall,
-            "pred_removed_atom_num": pred_removed_atom_num,
-            "pred_unchanged_atom_num": pred_unchanged_atom_num,
-            "new_atom_num": new_atom_num,
-            "removed_atom_num": removed_atom_num,
-            "unchanged_atom_num": unchanged_atom_num,
+        return {
+            "added": [
+                atom for index, atom in enumerate(next_atoms)
+                if not next_matched[index]
+            ],
+            "removed": [
+                atom for index, atom in enumerate(current_atoms)
+                if not current_matched[index]
+            ],
+            "unchanged": unchanged,
         }
-        return res
+
+    @staticmethod
+    def _count_event_matches(predicted_events, ground_truth_events, event_type):
+        """Count one-to-one exact fact matches, including duplicate occurrences."""
+        ground_truth_matched = [False] * len(ground_truth_events)
+        true_positive = 0
+        for predicted_event in predicted_events:
+            for index, ground_truth_event in enumerate(ground_truth_events):
+                if (
+                    not ground_truth_matched[index]
+                    and predicted_event == ground_truth_event 
+                    and event_type in ("unchanged", "removed")
+                ):
+                    ground_truth_matched[index] = True
+                    true_positive += 1
+                    break
+                if (
+                    not ground_truth_matched[index]
+                    and predicted_event[:-1]==ground_truth_event[:-1]
+                    and event_type == "added"
+                ):
+                    ground_truth_matched[index] = True
+                    true_positive += 1
+                    break
+
+        return {
+            "tp": true_positive,
+            "fp": len(predicted_events) - true_positive,
+            "fn": len(ground_truth_events) - true_positive,
+        }
+
+    def stat_pred_frames_atoms(self, siss, soss, soss_gt):
+        predicted_events = self.classify_transition(siss, soss)
+        ground_truth_events = self.classify_transition(siss, soss_gt)
+
+        return {
+            event_type: self._count_event_matches(
+                predicted_events[event_type], ground_truth_events[event_type], event_type
+            )
+            for event_type in ("added", "removed", "unchanged")
+        }
+
+    @staticmethod
+    def _scores_from_counts(counts):
+        tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+        precision = tp / (tp + fp) if tp + fp else None
+        recall = tp / (tp + fn) if tp + fn else None
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision is not None and recall is not None and precision + recall
+            else None
+        )
+        return {**counts, "precision": precision, "recall": recall, "f1": f1}
+    def _rule_matches(self, siss, soss_gt):
+        """Measure coverage of unique ground-truth body-to-head transition rules.
+        Target rules are generated only when body and head refer to the same agent entity (same tube_uid)
+        with different attributes.
+        """
+        generated_rules = {
+            (body_signature[:-2], head_signature[:-2])
+            for (body_signature, _), (head_signature, _) in zip(
+                self.body_signatures, self.head_signatures
+            )
+        }
+
+        target_rules = set()
+        for body_atom in siss:
+            body_tube_uid = body_atom[-1]
+            body_signature = body_atom[:-2]
+            for head_atom in soss_gt:
+                head_tube_uid = head_atom[-1]
+                head_signature = head_atom[:-2]
+                # Same entity (non-None matching tube_uid or both AVs) but with different attributes/predicates
+                same_entity = (
+                    (body_tube_uid is not None and body_tube_uid == head_tube_uid)
+                    or (body_atom[7] == "av" and head_atom[7] == "av")
+                )
+                if same_entity and body_signature != head_signature:
+                    target_rules.add((body_signature, head_signature))
+
+        covered_rules = target_rules & generated_rules
+        uncovered_rules = target_rules - covered_rules
+        # random print 10 uncovered rules for debugging
+        import random
+        for rule in random.sample(uncovered_rules, min(10, len(uncovered_rules))):
+            print("Uncovered rule (same entity):", rule)
+        # random print 10 covered rules for debugging
+        for rule in random.sample(covered_rules, min(10, len(covered_rules))):
+            print("Covered rule (same entity):", rule)
+
+        target_rule_count = len(target_rules)
+        covered_rule_count = len(covered_rules)
+        return {
+            "target_rule_count": target_rule_count,
+            "covered_rule_count": covered_rule_count,
+            "uncovered_rule_count": target_rule_count - covered_rule_count,
+            "coverage": (
+                covered_rule_count / target_rule_count
+                if target_rule_count
+                else None
+            ),
+        }
+    def eval(self, siss, soss, soss_gt, meta_data=None):
+        counts = self.stat_pred_frames_atoms(siss, soss, soss_gt)
+        rule_matches = self._rule_matches(siss, soss_gt)
+        return {
+            "events": {
+                event_type: self._scores_from_counts(event_counts)
+                for event_type, event_counts in counts.items()
+            },
+            "rule_matches": rule_matches,
+        }
         
         
