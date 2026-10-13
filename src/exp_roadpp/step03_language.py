@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm 
 
 from collections import Counter
+from collections import defaultdict
 from src.exp_roadpp import utils_data 
 from src.exp_roadpp.logic import Clause, Atom, Predicate 
 
@@ -214,46 +215,58 @@ class Language:
 
     def atoms2atom_clauses(self, atoms_by_videos, head_ungrounded_atoms):
         clauses = {}
-    
-        ungrounded_atoms_by_videos = {}
+
+        body_opportunities_by_video = defaultdict(Counter)
+        rule_support_by_video = defaultdict(Counter)
+
         for video_id, atoms in tqdm(atoms_by_videos.items()):
-            ungrounded_atoms_by_videos[video_id] = []
-            atoms_by_time = {}
+            atoms_by_time = defaultdict(lambda: defaultdict(set))
             for atom in atoms:
                 start_frame = int(atom["start_frame"])
+                end_frame = int(atom["end_frame"])
+                tube_uid = atom.get("tube_uid")
+                agent_class = atom.get("agent_class")
+
+                if tube_uid is not None:
+                    tube_key = ("tube_uid", tube_uid)
+                elif agent_class == "av":
+                    tube_key = ("agent_class", "av")
+                else:
+                    continue
+
                 ungrounded_atom = self._to_ungrounded_atom(atom)
-                if ungrounded_atom not in ungrounded_atoms_by_videos[video_id]:
-                    ungrounded_atoms_by_videos[video_id].append(ungrounded_atom)
-                if start_frame not in atoms_by_time:
-                    atoms_by_time[start_frame] = []
-                atoms_by_time[start_frame].append(ungrounded_atom)
-            sorted_times = sorted(atoms_by_time)
-            for i, body_time in enumerate(sorted_times):
-                body_atoms = atoms_by_time[body_time]
-                for head_time in sorted_times[i:]:
-                    head_atoms = atoms_by_time[head_time]
-                    for head_atom in head_atoms:
-                        for body_atom in body_atoms:
-                            clause = Clause(head_atom,[body_atom])
-                            if clause.is_tautology():
+                for frame_id in range(start_frame, end_frame):
+                    atoms_by_time[frame_id][tube_key].add(ungrounded_atom)
+
+            for frame_id, current_by_tube in atoms_by_time.items():
+                next_by_tube = atoms_by_time.get(frame_id + 1)
+                if not next_by_tube:
+                    continue
+
+                for tube_key, current_atoms in current_by_tube.items():
+                    next_atoms = next_by_tube.get(tube_key)
+                    if not next_atoms:
+                        continue
+
+                    for body_atom in current_atoms:
+                        body_opportunities_by_video[video_id][body_atom] += 1
+                        for head_atom in next_atoms:
+                            if body_atom == head_atom:
                                 continue
-                            if clause not in clauses:
-                                clauses[clause] = {}
-                            if video_id not in clauses[clause]:
-                                clauses[clause][video_id]= {"support": len(sorted_times)-i, "coverage": len(sorted_times)-i}
 
+                            clause = Clause(head_atom, [body_atom])
+                            clauses.setdefault(clause, {})
+                            rule_support_by_video[video_id][clause] += 1
 
-        for clause in tqdm(clauses):
-            for vid in ungrounded_atoms_by_videos:
-                ungrounded_atoms = ungrounded_atoms_by_videos[vid]
-                if clause.body[0] in ungrounded_atoms:
-                    if vid not in clauses[clause]:
-                        clauses[clause][vid] = {"support": 0, "coverage": 0}
-                    if clauses[clause][vid]["coverage"]  == 0:
-                        clauses[clause][vid]["coverage"] = len(ungrounded_atoms)
-                    if clauses[clause][vid]["coverage"]< clauses[clause][vid]["support"]:
-                        raise ValueError(f"Coverage cannot be less than support for clause {clause} in video {vid}")
-        
+        for clause in clauses:
+            body_atom = clause.body[0]
+            for video_id, body_opportunities in body_opportunities_by_video.items():
+                coverage = body_opportunities[body_atom]
+                if coverage:
+                    clauses[clause][video_id] = {
+                        "support": rule_support_by_video[video_id][clause],
+                        "coverage": coverage,
+                    }
 
         _clauses = {}
         clause_id = 0
@@ -352,4 +365,3 @@ class Language:
 
         rules.sort(key=lambda row: tuple(row['rank_key']))
         return rules, rule_supports, head_supports
-

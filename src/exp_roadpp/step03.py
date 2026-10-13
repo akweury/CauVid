@@ -14,7 +14,7 @@ from src.exp_roadpp.step03_beam_search import BeamSearch
 from src.exp_roadpp.step03_pruner import Pruner
 from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
 from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation
-from src.exp_roadpp.step03_pred_eval import predict_next_n_steps
+from src.exp_roadpp.step03_pred_eval import get_video_data, predict_next_n_steps
 from src.exp_roadpp.step03_action_predictor import ActionPredictor
 from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
@@ -79,7 +79,7 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
 
     facts_dir = Path(output_dir) / "clauses"
     os.makedirs(facts_dir, exist_ok=True)
-    all_init_clauses_file = facts_dir / f"all_init_clauses_{split}.json"
+    all_init_clauses_file = facts_dir / f"all_init_clauses_adjacent_transitions_{split}.json"
     if all_init_clauses_file.exists():
         return utils_data.load_json(all_init_clauses_file)
     
@@ -97,16 +97,239 @@ def _coarse_prune(init_clauses, pruner):
     return rank_sc_ratio
 
 
-def _clause_extension(clauses):
-    extended_clauses = {}
+
+def group_clauses_by_body(clauses, dataset_labels):
+    clauses_by_body = {}
     for c in clauses:
-        body_signature = utils_data.body_to_signature(c["clause"]["body"])
+        clause = c[0]["clause"]
+        if len(clause["body"]) != 1:
+            raise ValueError("Body grouping currently supports single-body clauses only.")
+        body_signature = utils_data.atom_to_signature(
+            clause["body"][0], dataset_labels
+        )[:-2]
+        head_signature = utils_data.atom_to_signature(
+            clause["head"], dataset_labels
+        )[:-2]
+        body_group = clauses_by_body.setdefault(
+            body_signature, {"candidate_heads": set(), "clauses": []}
+        )
+        body_group["candidate_heads"].add(head_signature)
+        body_group["clauses"].append(c)
 
-        if body_signature not in extended_clauses:
-            extended_clauses[body_signature] = []
-        extended_clauses[body_signature].append(c)
+    for body_group in clauses_by_body.values():
+        body_group["candidate_heads"] = tuple(
+            sorted(body_group["candidate_heads"], key=repr)
+        )
 
-    return extended_clauses
+    print(f"[Grouping] Clauses grouped by body: {len(clauses)} -> {len(clauses_by_body)}")
+    return clauses_by_body
+
+
+def _build_body_conditioned_training_examples(
+    atoms, clauses, dataset_labels, output_dir
+):
+    """Load or build sparse feature and target matrices for each body group."""
+    body_groups = group_clauses_by_body(clauses, dataset_labels)
+    cache_dir = Path(output_dir) / "training_data"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    metadata_file = cache_dir / "body_conditioned_examples_v2_train.json"
+    features_file = cache_dir / "body_conditioned_features_v2_train.npz"
+    targets_file = cache_dir / "body_conditioned_targets_v2_train.npz"
+    group_ids_file = cache_dir / "body_conditioned_group_ids_v2_train.npz"
+
+    body_signatures = tuple(body_groups)
+    body_ids = {
+        body_signature: index
+        for index, body_signature in enumerate(body_signatures)
+    }
+    metadata_groups = [
+        {
+            "body_signature": list(body_signature),
+            "candidate_heads": [
+                list(head_signature)
+                for head_signature in body_groups[body_signature]["candidate_heads"]
+            ],
+        }
+        for body_signature in body_signatures
+    ]
+
+    if all(path.exists() for path in (
+        metadata_file, features_file, targets_file, group_ids_file
+    )):
+        print(f"[Training data] Loading sparse training cache from {metadata_file}")
+        cache_metadata = utils_data.load_json(metadata_file)
+        if cache_metadata.get("schema_version") != 2:
+            raise ValueError("Unsupported sparse training cache version.")
+        cached_groups = cache_metadata["groups"]
+        if cached_groups != metadata_groups:
+            raise ValueError(
+                "Cached body groups or candidate heads do not match current rules."
+            )
+        features = sparse.load_npz(features_file).tocsr()
+        targets = sparse.load_npz(targets_file).tocsr()
+        with np.load(group_ids_file) as group_data:
+            group_ids = group_data["group_ids"]
+        if features.shape[0] != targets.shape[0] or features.shape[0] != len(group_ids):
+            raise ValueError("Cached training matrices have inconsistent row counts.")
+        return {
+            "body_groups": body_groups,
+            "features": features,
+            "targets": targets,
+            "group_ids": group_ids,
+            "feature_vocab": tuple(
+                (int(item["group_id"]), item["scope"], tuple(item["signature"]))
+                for item in cache_metadata["feature_vocab"]
+            ),
+            "head_vocab": tuple(
+                (int(item["group_id"]), tuple(item["signature"]))
+                for item in cache_metadata["head_vocab"]
+            ),
+        }
+
+    feature_ids = {}
+    head_ids = {}
+    feature_vocab = []
+    head_vocab = []
+    feature_rows = []
+    feature_columns = []
+    target_rows = []
+    target_columns = []
+    group_ids = []
+    row_count = 0
+
+    for body_signature, body_group in body_groups.items():
+        group_id = body_ids[body_signature]
+        head_ids[body_signature] = {}
+        for head_signature in body_group["candidate_heads"]:
+            head_ids[body_signature][head_signature] = len(head_vocab)
+            head_vocab.append((group_id, head_signature))
+
+    for video_id, video_atoms in tqdm(atoms.items(), desc="Processing videos"):
+        video_data = get_video_data(video_id, video_atoms, dataset_labels)
+        frame_data = video_data["frame_data"]
+
+        for frame_id, current_atoms in frame_data.items():
+            # Skip the last frame since it has no next frame to predict.
+            next_atoms = frame_data.get(frame_id + 1)
+            if next_atoms is None:
+                continue
+            # Organize next frame atoms by their entity key for efficient lookup.
+            next_atoms_by_entity = {}
+            for atom_signature in next_atoms:
+                entity_key = _atom_entity_key(atom_signature)
+                if entity_key is not None:
+                    next_atoms_by_entity.setdefault(entity_key, set()).add(
+                        atom_signature[:-2]
+                    )
+
+            for body_atom in current_atoms:
+                body_signature = body_atom[:-2]
+                if body_signature not in body_groups:
+                    continue
+                entity_key = _atom_entity_key(body_atom)
+                next_entity_facts = next_atoms_by_entity.get(entity_key)
+                if not next_entity_facts:
+                    continue
+
+                group_id = body_ids[body_signature]
+                active_features = set()
+                for atom in current_atoms:
+                    atom_fact = atom[:-2]
+                    if atom_fact == body_signature:
+                        continue
+                    scope = (
+                        "entity"
+                        if _atom_entity_key(atom) == entity_key
+                        else "scene"
+                    )
+                    feature_key = (group_id, scope, atom_fact)
+                    feature_id = feature_ids.get(feature_key)
+                    if feature_id is None:
+                        feature_id = len(feature_vocab)
+                        feature_ids[feature_key] = feature_id
+                        feature_vocab.append(feature_key)
+                    active_features.add(feature_id)
+
+                for feature_id in active_features:
+                    feature_rows.append(row_count)
+                    feature_columns.append(feature_id)
+
+                for head_signature, target_id in head_ids[body_signature].items():
+                    if head_signature in next_entity_facts:
+                        target_rows.append(row_count)
+                        target_columns.append(target_id)
+
+                group_ids.append(group_id)
+                row_count += 1
+
+    features = sparse.csr_matrix(
+        (
+            np.ones(len(feature_rows), dtype=np.uint8),
+            (feature_rows, feature_columns),
+        ),
+        shape=(row_count, len(feature_vocab)),
+        dtype=np.uint8,
+    )
+    targets = sparse.csr_matrix(
+        (
+            np.ones(len(target_rows), dtype=np.uint8),
+            (target_rows, target_columns),
+        ),
+        shape=(row_count, len(head_vocab)),
+        dtype=np.uint8,
+    )
+    group_ids_array = np.asarray(group_ids, dtype=np.int32)
+
+    utils_data.save_json(
+        {
+            "schema_version": 2,
+            "groups": metadata_groups,
+            "feature_vocab": [
+                {
+                    "group_id": group_id,
+                    "scope": scope,
+                    "signature": list(signature),
+                }
+                for group_id, scope, signature in feature_vocab
+            ],
+            "head_vocab": [
+                {
+                    "group_id": group_id,
+                    "signature": list(signature),
+                }
+                for group_id, signature in head_vocab
+            ],
+        },
+        metadata_file,
+    )
+    sparse.save_npz(features_file, features, compressed=True)
+    sparse.save_npz(targets_file, targets, compressed=True)
+    np.savez_compressed(group_ids_file, group_ids=group_ids_array)
+
+    print(
+        f"[Training data] Prepared sparse matrices: "
+        f"{features.shape[0]} examples, {features.shape[1]} features, "
+        f"{targets.shape[1]} candidate heads"
+    )
+    print(f"[Training data] Cached sparse examples under {cache_dir}")
+    return {
+        "body_groups": body_groups,
+        "features": features,
+        "targets": targets,
+        "group_ids": group_ids_array,
+        "feature_vocab": tuple(feature_vocab),
+        "head_vocab": tuple(head_vocab),
+    }
+
+
+def _atom_entity_key(atom_signature):
+    tube_uid = atom_signature[-1]
+    agent_class = atom_signature[7]
+    if tube_uid is not None:
+        return ("tube_uid", tube_uid)
+    if agent_class == "av":
+        return ("agent_class", "av")
+    return None
 
 
 
@@ -227,7 +450,7 @@ def main(input_data):
     # Prepare language model and beam search model
     language_model = Language(input_data["device"])
     beam_search_model = BeamSearch()
-    pruner = Pruner(input_data["prune_args"])
+    pruner = Pruner(input_data["prune_args"], dataset_labels)
     
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     atoms = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
@@ -239,19 +462,15 @@ def main(input_data):
     coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
     # replace id with label names
     coarse_pruned_clauses = utils_data.replace_ids_with_labels(coarse_pruned_clauses, dataset_labels)
-
-    
     # predict and evaluation
     model = ActionPredictor(coarse_pruned_clauses, dataset_labels)
+    # C_2
+    training_examples_by_body = _build_body_conditioned_training_examples(
+        atoms["train"], coarse_pruned_clauses, dataset_labels, output_dir
+    )
 
     # predict the next action/position of each atom
-    predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)
-
-
-
-    # C_2
-    extended_clauses = _clause_extension(coarse_pruned_clauses)
-    
+    predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)    
 
     
 
