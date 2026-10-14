@@ -15,7 +15,8 @@ class ActionPredictor:
         self.av_action_num = len(self.dataset_labels["av_action_labels"])
         self.location_name_num = len(self.dataset_labels["loc_labels"])
         self.action_num = self.agent_action_num + self.av_action_num + self.location_name_num
-        
+
+
 
     def _atom_to_signature(self, atom):
         if "action_id" in atom:
