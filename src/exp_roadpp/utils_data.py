@@ -121,6 +121,9 @@ def build_signature(predicate, label, label_id, agent_class, agent_class_label, 
 
 
 def atom_to_signature(atom, dataset_labels=None):
+    # the atom is a dict, if it is a tuple already return it as is
+    if isinstance(atom, tuple):
+        return atom
     if dataset_labels is not None:
         atom = add_labels_to_atom(atom, dataset_labels)
         

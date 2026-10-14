@@ -5,11 +5,11 @@ from src.exp_roadpp.utils_data import atom_to_signature, same_signature_no_tube_
 from src.exp_roadpp.step03_visual import visual_2d_heatmap
 
 class ActionPredictor:
-    def __init__(self, coarse_pruned_clauses,dataset_labels):
+    def __init__(self, clauses,dataset_labels, device):
         self.device = "cpu"
-        self.coarse_pruned_clauses = coarse_pruned_clauses
-        self.head_signatures = [(atom_to_signature(clause[0]["clause"]["head"]), clause[1]) for clause in coarse_pruned_clauses]
-        self.body_signatures = [(atom_to_signature(clause[0]["clause"]["body"][0]), clause[1]) for clause in coarse_pruned_clauses]
+        self.coarse_pruned_clauses = clauses
+        self.head_signatures = [atom_to_signature(clause["head"]) for clause in clauses]
+        self.body_signatures = [atom_to_signature(clause["bodies"]) for clause in clauses]
         self.dataset_labels = dataset_labels
         self.agent_action_num = len(self.dataset_labels["action_labels"])
         self.av_action_num = len(self.dataset_labels["av_action_labels"])

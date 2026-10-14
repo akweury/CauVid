@@ -353,6 +353,30 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
         "f1": f1,
     }
 
+def _to_extended_clauses(extended_data, training_examples_by_body):
+    body_groups = training_examples_by_body["body_groups"]
+    extended_clauses = []
+    for item in extended_data:
+        bodies = []
+        group_body = list(body_groups.keys())[item['group_id']]
+        bodies.append(group_body)
+        for atom in item['extra_atoms']:
+            body = tuple(atom[-1])
+            bodies.append(body)
+        head = tuple(item['head'][1])
+        extended_clause = {
+            "bodies": bodies,
+            "head": head,
+            "support": item["metrics"]["support"],
+            "coverage": item["metrics"]["coverage"],
+            "confidence": item["metrics"]["confidence"],
+            "recall": item["metrics"]["recall"],
+            "confidence_gain": item["metrics"]["confidence_gain"],
+            "f1": item["metrics"]["f1"],
+        }
+        extended_clauses.append(extended_clause)
+    return extended_clauses
+
 
 def extend_clauses(
     coarse_pruned_clauses,
@@ -366,72 +390,83 @@ def extend_clauses(
     l0_lambda=0.01,
     device="cpu",
 ):
-    training_examples_by_body = _build_body_conditioned_training_examples(
-        atoms, coarse_pruned_clauses, dataset_labels, output_dir
-    )
-    features = training_examples_by_body["features"].tocsc()
-    targets = training_examples_by_body["targets"].tocsc()
-    feature_vocab = training_examples_by_body["feature_vocab"]
-    head_vocab = training_examples_by_body["head_vocab"]
-
-    rows_by_group, feature_cols_by_group, head_cols_by_group = _build_group_indices(
-        training_examples_by_body
-    )
-
-    extended_clauses = []
-
-    # extension in one shot: differentiable conjunctive rule learning, group by group
-    for gid in tqdm(rows_by_group, desc="Learning rule extensions"):
-        rows = rows_by_group.get(gid)
-        feature_cols = feature_cols_by_group.get(gid, [])
-        head_cols = head_cols_by_group.get(gid, [])
-        if rows is None or len(rows) == 0 or len(feature_cols) == 0 or len(head_cols) == 0:
-            continue
-
-        # Dense slice of this group's features: (N, M) -- cheap since both N and M
-        # are restricted to a single body-group.
-        feature_block = np.asarray(
-            features[rows][:, feature_cols].todense()
-        ).astype(np.float32)
-        X = torch.from_numpy(feature_block).to(device)
-
-        for head_col in head_cols:
-            target_col = np.asarray(
-                targets[rows][:, head_col].todense()
-            ).ravel().astype(np.float32)
-
-            # Skip degenerate targets: nothing to learn if the head never fires
-            # or always fires for this body-group.
-            if target_col.sum() == 0 or target_col.sum() == len(target_col):
-                continue
-
-            y = torch.from_numpy(target_col).to(device)
-
-            final_mask, log_alpha = learn_extension_mask(
-                X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
-            )
-            selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
-            if not selected_positions:
-                continue
-
-            metrics = _evaluate_extension(feature_block, target_col, selected_positions)
-            if metrics["support"] < min_support:
-                continue
-            if metrics["confidence_gain"] < min_confidence_gain:
-                continue
-
-            selected_atoms = [
-                feature_vocab[feature_cols[pos]] for pos in selected_positions
-            ]
-            print(f"Extra Atom Num: {len(selected_atoms)}")
-            extended_clauses.append({
-                "group_id": gid,
-                "head": head_vocab[head_col],
-                "extra_atoms": selected_atoms,
-                "metrics": metrics,
-            })
-    # save extended clauses to a file
+    # load the extended clauses if they exist, otherwise extend from coarse pruned clauses
     output_file = output_dir / "extended_clauses.json"
-    utils_data.save_json(extended_clauses, output_file)
-    print(f"[Rule extension] Learned {len(extended_clauses)} extended clauses")
+    if output_file.exists():
+        with open(output_file, "r") as f:
+            extended_data = json.load(f)
+    else:
+
+        training_examples_by_body = _build_body_conditioned_training_examples(
+            atoms, coarse_pruned_clauses, dataset_labels, output_dir
+        )
+        features = training_examples_by_body["features"].tocsc()
+        targets = training_examples_by_body["targets"].tocsc()
+        feature_vocab = training_examples_by_body["feature_vocab"]
+        head_vocab = training_examples_by_body["head_vocab"]
+
+        rows_by_group, feature_cols_by_group, head_cols_by_group = _build_group_indices(
+            training_examples_by_body
+        )
+
+        extended_data = []
+
+        # extension in one shot: differentiable conjunctive rule learning, group by group
+        for gid in tqdm(rows_by_group, desc="Learning rule extensions"):
+            rows = rows_by_group.get(gid)
+            feature_cols = feature_cols_by_group.get(gid, [])
+            head_cols = head_cols_by_group.get(gid, [])
+            if rows is None or len(rows) == 0 or len(feature_cols) == 0 or len(head_cols) == 0:
+                continue
+
+            # Dense slice of this group's features: (N, M) -- cheap since both N and M
+            # are restricted to a single body-group.
+            feature_block = np.asarray(
+                features[rows][:, feature_cols].todense()
+            ).astype(np.float32)
+            X = torch.from_numpy(feature_block).to(device)
+
+            for head_col in head_cols:
+                target_col = np.asarray(
+                    targets[rows][:, head_col].todense()
+                ).ravel().astype(np.float32)
+
+                # Skip degenerate targets: nothing to learn if the head never fires
+                # or always fires for this body-group.
+                if target_col.sum() == 0 or target_col.sum() == len(target_col):
+                    continue
+
+                y = torch.from_numpy(target_col).to(device)
+
+                final_mask, log_alpha = learn_extension_mask(
+                    X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
+                )
+                selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
+                if not selected_positions:
+                    continue
+
+                metrics = _evaluate_extension(feature_block, target_col, selected_positions)
+                if metrics["support"] < min_support:
+                    continue
+                if metrics["confidence_gain"] < min_confidence_gain:
+                    continue
+
+                selected_atoms = [
+                    feature_vocab[feature_cols[pos]] for pos in selected_positions
+                ]
+                print(f"Extra Atom Num: {len(selected_atoms)}")
+                extended_data.append({
+                    "group_id": gid,
+                    "head": head_vocab[head_col],
+                    "extra_atoms": selected_atoms,
+                    "metrics": metrics,
+                })
+        # save extended clauses to a file
+        output_file = output_dir / "extended_clauses.json"
+        utils_data.save_json(extended_data, output_file)
+        print(f"[Rule extension] Learned {len(extended_data)} extended clauses")
+    training_examples_by_body = _build_body_conditioned_training_examples(
+            atoms, coarse_pruned_clauses, dataset_labels, output_dir)
+    extended_clauses = _to_extended_clauses(extended_data, training_examples_by_body)
+
     return extended_clauses

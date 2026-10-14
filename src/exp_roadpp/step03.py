@@ -247,9 +247,9 @@ def main(input_data):
     # clause extension
     extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, output_dir, atoms['train'],device=device)
 
+    model = ActionPredictor(extended_clauses, dataset_labels, device)
     # predict the next action/position of each atom
-    predict_next_n_steps(extended_clauses, atoms["val"], 
-                         output_dir, dataset_labels, step=1)    
+    predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)    
 
     
 
