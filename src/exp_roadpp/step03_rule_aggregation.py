@@ -332,7 +332,7 @@ def learn_rule_aggregation(atoms, clauses, output_dir, dataset_path, model_type)
     # ranked_rules = _rank_rules_with_model(train_dataset["rules"], model)
     # save model and ranked rules
     # np.save("ranked_rules.npy", ranked_rules)
-    model_file = f"model_{model_type}.npy"
+    model_file = output_dir / f"model_{model_type}.npy"
     np.save(model_file, model)
 
     dataset_summary = test_global_rules(model, test_dataset, output_dir, model_type)

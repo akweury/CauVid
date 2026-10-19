@@ -135,3 +135,31 @@ def visual_bar(clauses, output_dir, filename):
     plt.tight_layout()
     plt.savefig(Path(output_dir) / f"{filename}_coverage.png")
     plt.close()
+
+
+
+def visual_2d_heatmap(matrix, output_dir=".", title="", filename="heatmap", x_label="X", y_label="Y"):
+    plt.figure(figsize=(12, 8))
+    plt.imshow(matrix, cmap="viridis", aspect="auto")
+    plt.colorbar()
+    plt.xlabel(x_label, fontdict={"size": 26})
+    plt.ylabel(y_label, fontdict={"size": 26})
+    plt.title(title, fontdict={"size": 30})
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"{filename}.png")
+    plt.close()
+    
+def visual_line_plot(data_series, labels, output_dir=".", title="", filename="line_plot"):
+    plt.figure(figsize=(18, 6))
+    colors = ["b", "g", "r", "c", "m", "y", "k"]
+    for series, label in zip(data_series, labels):
+        plt.plot(series, label=label, marker='o', color=colors.pop(0))
+    plt.xlabel("Frame", fontdict={"size": 26})
+    plt.ylabel("Score", fontdict={"size": 26})
+    plt.title(title, fontdict={"size": 30})
+    plt.legend(fontsize=18)
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) / f"{filename}.png")
+    plt.close()

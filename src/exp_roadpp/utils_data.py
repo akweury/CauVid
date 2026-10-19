@@ -88,3 +88,95 @@ def get_start_end_frame(segment, frames):
     start_frame = seg_frames[0]
     end_frame = seg_frames[-1]
     return start_frame, end_frame, tube_uid
+
+
+def support_coverage_ratio(clause):
+    if not clause:
+        return 0.0
+    sc_ratios = [sc["support"] / sc["coverage"] for sc in clause['support_coverage'].values()]
+    return sum(sc_ratios) / len(sc_ratios) if sc_ratios else 0.0
+
+
+def build_signature(predicate, label, label_id, agent_class, agent_class_label, tube_uid):
+    if predicate == "action":
+        return (
+            "pred", predicate,
+            "action_id", label_id,
+            "action_id_label", label,
+            "agent_class", agent_class,
+            "agent_class_label", agent_class_label,
+            "tube_uid", tube_uid
+        )
+    elif predicate == "location":
+        return (
+            "pred", predicate,
+            "location_name", label_id,
+            "location_name_label", label,
+            "agent_class", agent_class,
+            "agent_class_label", agent_class_label,
+            "tube_uid", tube_uid
+        )
+    else:
+        raise ValueError("Unknown predicate type in build_signature")
+
+
+def atom_to_signature(atom, dataset_labels=None):
+    # the atom is a dict, if it is a tuple already return it as is
+    if isinstance(atom, tuple):
+        return atom
+    if dataset_labels is not None:
+        atom = add_labels_to_atom(atom, dataset_labels)
+        
+    if "location_name" in atom:
+        return ("pred", atom["pred"], 
+                "location_name", atom["location_name"], 
+                "location_name_label", atom["location_name_label"],
+                "agent_class", atom["agent_class"], 
+                "agent_class_label", atom["agent_class_label"],
+                "tube_uid", atom.get("tube_uid"))
+    elif "action_id" in atom:
+        return ("pred", atom["pred"], 
+                "action_id", atom["action_id"], 
+                "action_id_label", atom["action_id_label"],
+                "agent_class", atom["agent_class"], 
+                "agent_class_label", atom["agent_class_label"],
+                "tube_uid", atom.get("tube_uid"))
+    else:
+        raise ValueError("Unknown atom type in atom_to_signature")
+
+def same_signature_no_tube_uid(sig1, sig2):
+    if not sig1 or not sig2:
+        return False
+    return sig1[:-2] == sig2[:-2]  # Compare all elements except the last two ("tube_uid")
+
+def body_to_signature(body):
+    signature = []
+    for atom in body:
+        atom_signature = atom_to_signature(atom)
+        if atom_signature:
+            signature.append(list(atom_signature))
+    signature = tuple(tuple(item) for item in signature)
+    return signature
+
+
+def add_labels_to_atom(atom, dataset_labels):
+    if "action_id" in atom and atom["agent_class"] != "av":
+        atom["action_id_label"] = dataset_labels["action_labels"][atom["action_id"]]
+    if "action_id" in atom and atom["agent_class"] == "av":
+        atom["action_id_label"] = dataset_labels["all_av_action_labels"][atom["action_id"]]
+
+    if "location_name" in atom:
+        atom["location_name_label"] = dataset_labels["loc_labels"][atom["location_name"]]
+    if "agent_class" in atom and atom["agent_class"] != "av":
+        atom["agent_class_label"] = dataset_labels["agent_labels"][atom["agent_class"]]
+    if "agent_class" in atom and atom["agent_class"] == "av":
+        atom["agent_class_label"] = atom["agent_class"]
+    return atom 
+
+
+def replace_ids_with_labels(clauses, dataset_labels):
+    for clause,score in clauses:
+        add_labels_to_atom(clause['clause']["head"], dataset_labels)
+        for atom in clause['clause']["body"]:
+            add_labels_to_atom(atom, dataset_labels)
+    return clauses

@@ -10,10 +10,13 @@ from collections import Counter
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp.step03_language import Language
-from src.exp_roadpp.step03_beam_search import BeamSearch
+
 from src.exp_roadpp.step03_pruner import Pruner
-from src.exp_roadpp.step03_visual import visualize_rule_aggregation_results, visualize_baseline_results, visual_bar
-from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation, build_rule_learning_dataset
+from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
+from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation
+from src.exp_roadpp.step03_pred_eval import get_video_data, predict_next_n_steps
+from src.exp_roadpp.step03_action_predictor import ActionPredictor
+from src.exp_roadpp.step03_rule_learner import extend_clauses
 from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
 def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
@@ -77,7 +80,7 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
 
     facts_dir = Path(output_dir) / "clauses"
     os.makedirs(facts_dir, exist_ok=True)
-    all_init_clauses_file = facts_dir / f"all_init_clauses_{split}.json"
+    all_init_clauses_file = facts_dir / f"all_init_clauses_adjacent_transitions_{split}.json"
     if all_init_clauses_file.exists():
         return utils_data.load_json(all_init_clauses_file)
     
@@ -88,7 +91,19 @@ def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
 
 
 def _coarse_prune(init_clauses, pruner):
-    return pruner.coarse_prune(init_clauses)
+    pruned_clauses = pruner.coarse_prune(init_clauses)
+    # rank clauses with their support coverage ratio
+    rank_sc_ratio = [(clause, utils_data.support_coverage_ratio(clause)) for clause in pruned_clauses.values()]
+    rank_sc_ratio.sort(key=lambda x: x[1], reverse=True)
+    return rank_sc_ratio
+
+
+
+
+
+
+
+
 
 
 
@@ -196,6 +211,12 @@ def prepare_dataset(data_num, track_dir, language_model, output_dir):
     return {"train": atoms_by_train_video, "val": atoms_by_val_video, "test": atoms_by_test_video}
 
 
+
+
+
+
+    
+
 def main(input_data):
     print("\n--------- Step 03 ----------------------\n")
 
@@ -209,8 +230,8 @@ def main(input_data):
     dataset_labels = input_data["dataset_labels"]
     # Prepare language model and beam search model
     language_model = Language(input_data["device"])
-    beam_search_model = BeamSearch()
-    pruner = Pruner(input_data["prune_args"])
+
+    pruner = Pruner(input_data["prune_args"], dataset_labels)
     
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     atoms = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
@@ -220,6 +241,15 @@ def main(input_data):
     visual_bar(init_clauses, output_dir, "init_clauses_distribution")
     # C_1: Coarse Prune, filter out the low frequent clauses
     coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
+    # replace id with label names
+    coarse_pruned_clauses = utils_data.replace_ids_with_labels(coarse_pruned_clauses, dataset_labels)
+    
+    # clause extension
+    extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, output_dir, atoms['train'],device=device)
+
+    model = ActionPredictor(extended_clauses, dataset_labels, device)
+    # predict the next action/position of each atom
+    predict_next_n_steps(model, atoms["val"], output_dir, dataset_labels, step=1)    
 
     
 

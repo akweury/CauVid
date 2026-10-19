@@ -81,3 +81,6 @@ that `src/exp_roadpp/output/roadpp/` is populated.
 
 
 
+### Discussion
+1. MovTow (Moving Towards) → → IncatLft (Indicating Left)
+"If a Car is moving towards the ego-vehicle/camera (MovTow), it will turn on its left blinker/turn indicator (IncatLft) in the next frame."

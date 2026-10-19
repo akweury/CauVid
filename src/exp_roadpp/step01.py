@@ -144,8 +144,138 @@ def _frames_to_records(video_id, frame_rate, frame_paths, depth_path, flow_path,
 
 
 
+def visual_annotations(track_dir, output_dir):
+    # Implement the visualization logic for annotations
+    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
+    gt_labels = utils_data.load_json(track_dir / "label.json") 
+    av_action_visual_file = output_dir / "av_action_visualization.png"
+    agent_class_visual_file = output_dir / "agent_class_visualization.png"
+    agent_action_visual_file = output_dir / "agent_action_visualization.png"
+    agent_location_visual_file = output_dir / "agent_location_visualization.png"
+    all_av_actions = []
+    video_av_action_nums = []
+    action_percentage = {}
+    action_average_length = {}
+    agent_class_counts = {}
+    agent_action_counts = {}
+    agent_location_counts = {}
+    for track_file in all_track_files:
+        track_data = utils_data.load_json(track_file)
+        agent_tubes = track_data["data"]["agent_tubes"]
+        agent_action_tubes = track_data["data"]["action_tubes"]
+        agent_location_tubes = track_data["data"]["loc_tubes"]
+        for agent_id, agent_data in agent_tubes.items():
+            class_id = agent_data["label_id"]
+            if class_id not in agent_class_counts:
+                agent_class_counts[class_id] = 0
+            agent_class_counts[class_id] += 1
+
+        for agent_id, location_data in agent_location_tubes.items():
+            location_id = location_data["label_id"]
+            if location_id not in agent_location_counts:
+                agent_location_counts[location_id] = 0
+            agent_location_counts[location_id] += 1
+
+        for agent_id, action_data in agent_action_tubes.items():
+            action_id = action_data["label_id"]
+            if action_id not in agent_action_counts:
+                agent_action_counts[action_id] = 0
+            agent_action_counts[action_id] += 1
+
+        av_action_tubes = track_data["data"]["av_action_tubes"]
+        video_av_action_nums.append(len(av_action_tubes))
+        for data in av_action_tubes.values():
+            all_av_actions.append(
+                {"label_id": data["label_id"],
+                 "length": len(data["frames"])}
+            )
+    average_av_action_num = sum(video_av_action_nums) / len(video_av_action_nums) if video_av_action_nums else 0
+
+    for item in all_av_actions:
+        label_id = item["label_id"]
+        length = item["length"]
+        if label_id not in action_percentage:
+            action_percentage[label_id] = 0
+            action_average_length[label_id] = []
+        action_percentage[label_id] += 1
+        action_average_length[label_id].append(length)
+    for label_id in action_percentage:
+        action_percentage[label_id] = action_percentage[label_id] / len(video_av_action_nums) if video_av_action_nums else 0
+        action_average_length[label_id] = sum(action_average_length[label_id]) / len(action_average_length[label_id]) if action_average_length[label_id] else 0
+
+    # visual agent class counts, 
+    if agent_class_counts:
+        import matplotlib.pyplot as plt
+        class_label_ids = sorted(list(agent_class_counts.keys()))
+        class_labels = [gt_labels["agent_labels"][int(label)] for label in class_label_ids]
+        counts = [agent_class_counts[label] for label in class_label_ids]
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(class_labels, counts, color='tab:blue', alpha=0.6)
+        plt.xlabel('Agent Class')
+        plt.ylabel('Counts')
+        plt.title('Agent Class Counts')
+        plt.savefig(agent_class_visual_file)
+        plt.close()
 
 
+    # visual agent action counts
+    if agent_action_counts:
+        import matplotlib.pyplot as plt
+        action_label_ids = sorted(list(agent_action_counts.keys()))
+        action_labels = [gt_labels["action_labels"][int(label)] for label in action_label_ids]
+        counts = [agent_action_counts[label] for label in action_label_ids]
+
+        plt.figure(figsize=(22,5))
+        plt.bar(action_labels, counts, color='tab:green', alpha=0.6)
+        plt.xlabel('Agent Action')
+        plt.ylabel('Counts')
+        plt.title('Agent Action Counts')
+        plt.savefig(agent_action_visual_file)
+        plt.close()
+    # visual agent location counts
+    if agent_location_counts:
+        import matplotlib.pyplot as plt
+        location_label_ids = sorted(list(agent_location_counts.keys()))
+        location_labels = [gt_labels["loc_labels"][int(label)] for label in location_label_ids]
+        counts = [agent_location_counts[label] for label in location_label_ids]
+
+        plt.figure(figsize=(15, 10))
+        plt.bar(location_labels, counts, color='tab:orange', alpha=0.6)
+        plt.xticks(rotation=30)
+        plt.xlabel('Agent Location')
+        plt.ylabel('Counts')
+        plt.title('Agent Location Counts')
+        plt.savefig(agent_location_visual_file)
+        plt.close()
+    # visual action percentage and action average length
+    if action_percentage:
+        import matplotlib.pyplot as plt
+        action_label_ids = sorted(list(action_percentage.keys()))
+        action_labels = [gt_labels["av_action_labels"][int(label)] for label in action_label_ids]
+        percentages = [action_percentage[label] for label in action_label_ids]
+        avg_lengths = [action_average_length[label] for label in action_label_ids]
+
+        fig, ax1 = plt.subplots(figsize=(10,5))
+
+        color = 'tab:blue'
+        ax1.set_xlabel('Action Label')
+        ax1.set_ylabel('Action Percentage', color=color)
+        ax1.bar(action_labels, percentages, color=color, alpha=0.6)
+        ax1.tick_params(axis='y', labelcolor=color)
+
+        ax2 = ax1.twinx()
+        color = 'tab:red'
+        ax2.set_ylabel('Average Action Length', color=color)
+        ax2.plot(action_labels, avg_lengths, color=color, marker='o')
+        ax2.tick_params(axis='y', labelcolor=color)
+
+        fig.tight_layout()
+        plt.title('Action Percentage and Average Action Length')
+        plt.savefig(av_action_visual_file)
+        plt.close()
+
+    
 def main(input_data):
     print("\n------- Step 01 -------\n")
     od_model = load_od_model(input_data)
@@ -200,7 +330,8 @@ def main(input_data):
             _frames_to_flows(frame_rate, low_fps_frame_paths, flow_path, flow_model)
             _frames_to_records(vid, frame_rate, low_fps_frame_paths, d_path, flow_path, obj_dir, mask_dir, record_dir, packing_model)
 
+    # visual_annotations(gt_dir, output_dir)
 
     print("\n--------- Step 01 Done ---------------\n")
 
-    
+
