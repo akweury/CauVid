@@ -10,7 +10,21 @@ from pathlib import Path
 from src.exp_roadpp import config 
 from src.exp_roadpp import utils_data
 
-def parse_args():
+def parse_args(parser=None):
+    if parser is None:
+        parser = get_parser()
+
+    args = parser.parse_args()
+
+    # load experiment configuration
+    exp_config_path = config.exp_config_path / f"{args.exp}.json"
+    for key, value in utils_data.load_json(exp_config_path).items():
+        setattr(args, key, value)
+
+
+    return args
+
+def get_parser():
     parser = argparse.ArgumentParser(
         description="Run the VWSR pipeline"
     )
@@ -31,13 +45,4 @@ def parse_args():
 
     parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
 
-
-    args = parser.parse_args()
-
-    # load experiment configuration
-    exp_config_path = config.exp_config_path / f"{args.exp}.json"
-    for key, value in utils_data.load_json(exp_config_path).items():
-        setattr(args, key, value)
-
-
-    return args
+    return parser

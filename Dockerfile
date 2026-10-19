@@ -36,6 +36,8 @@ RUN apt-get update && apt-get install -y \
     git \
     # ffprobe/ffmpeg for video metadata and media writing
     ffmpeg \
+    # graphviz for rendering the step 04 causal graphs as PDF
+    graphviz \
     # Cleanup
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

@@ -235,3 +235,6 @@ cython_debug/
 # Local debugging artifacts
 /debug/
 /tmp/
+
+
+/data/
