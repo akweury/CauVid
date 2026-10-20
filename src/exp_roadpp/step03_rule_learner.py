@@ -358,14 +358,17 @@ def _to_extended_clauses(extended_data, training_examples_by_body):
     extended_clauses = []
     for item in extended_data:
         bodies = []
+        body_scopes = ["entity"]
         group_body = list(body_groups.keys())[item['group_id']]
         bodies.append(group_body)
         for atom in item['extra_atoms']:
             body = tuple(atom[-1])
             bodies.append(body)
+            body_scopes.append(atom[1])
         head = tuple(item['head'][1])
         extended_clause = {
             "bodies": bodies,
+            "body_scopes": body_scopes,
             "head": head,
             "support": item["metrics"]["support"],
             "coverage": item["metrics"]["coverage"],
@@ -376,7 +379,6 @@ def _to_extended_clauses(extended_data, training_examples_by_body):
         }
         extended_clauses.append(extended_clause)
     return extended_clauses
-
 
 def extend_clauses(
     coarse_pruned_clauses,
