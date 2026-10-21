@@ -30,7 +30,7 @@ def step_0_setup(args):
     elif args.machine == "dgx":
         args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
-        args.device = int(args.device)
+        args.device = f'cuda:{args.device}'
     
     # macbook pro
     elif args.machine == "macbook-pro":
