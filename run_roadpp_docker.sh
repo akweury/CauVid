@@ -42,13 +42,12 @@ while [[ $# -gt 0 ]]; do
             ;;
         --)
             shift
-            EXTRA_ARGS=("$@")
+            EXTRA_ARGS+=("$@")
             break
             ;;
         *)
-            echo "Unknown argument: $1"
-            echo "Usage: $0 [--gpu 0|all|none] [-- <extra args for main.py>]"
-            exit 1
+            EXTRA_ARGS+=("$1")
+            shift
             ;;
     esac
 done
