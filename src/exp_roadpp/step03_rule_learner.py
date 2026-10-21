@@ -195,16 +195,23 @@ def _to_sparse_rows(rows, columns, shape):
     are col[crow[i]:crow[i + 1]]. This replaces a dense (N, M) matrix, which
     for sparse features costs one byte per cell, mostly False.
     """
-    num_rows, num_cols = shape
-    row_counts = torch.bincount(
-        torch.tensor(rows, dtype=torch.long), minlength=num_rows
+    return _csr_from_cells(
+        torch.tensor(rows, dtype=torch.long),
+        torch.tensor(columns, dtype=torch.long),
+        shape,
     )
+
+
+def _csr_from_cells(rows, columns, shape):
+    """Tensor version of `_to_sparse_rows`; `rows`/`columns` are long tensors."""
+    num_rows, num_cols = shape
+    row_counts = torch.bincount(rows, minlength=num_rows)
     crow = torch.zeros(num_rows + 1, dtype=torch.long)
     torch.cumsum(row_counts, dim=0, out=crow[1:])
     index_dtype = torch.int32 if len(columns) < 2**31 else torch.long
     return {
         "crow": crow.to(index_dtype),
-        "col": torch.tensor(columns, dtype=torch.int32),
+        "col": columns.to(torch.int32),
         "shape": (num_rows, num_cols),
     }
 
@@ -333,6 +340,124 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab):
     }
 
 
+def _prune_group_features(sparse, num_head_positives, min_support):
+    """Choose which feature columns of one group to keep.
+
+    Any extension requires all of its selected features, so its support is at
+    most the row count of its rarest feature. The following can therefore
+    never yield an extension that passes `min_support`, or never change one:
+      - the whole group, if it has fewer than `min_support` rows or every head
+        is degenerate (fires in no row or in every row);
+      - features True in fewer than `min_support` rows;
+      - features True in every row (adding them changes nothing).
+    Columns True in exactly the same rows are merged: the first is kept and
+    the rest are returned as its aliases.
+
+    Returns (kept, aliases): `kept` is a list of old column ids in their new
+    order, `aliases[i]` lists the old column ids that duplicate `kept[i]`.
+    """
+    num_rows, num_cols = sparse["shape"]
+    head_learnable = (num_head_positives > 0) & (num_head_positives < num_rows)
+    if num_rows < min_support or not bool(head_learnable.any()):
+        return [], []
+
+    crow = sparse["crow"].long()
+    col = sparse["col"].long()
+    rows = torch.repeat_interleave(torch.arange(num_rows), crow[1:] - crow[:-1])
+    counts = torch.bincount(col, minlength=num_cols)
+    candidates = torch.nonzero(
+        (counts >= min_support) & (counts < num_rows), as_tuple=True
+    )[0]
+    if len(candidates) == 0:
+        return [], []
+
+    # Bucket columns by (count, two random row-hashes); equal row sets always
+    # share a bucket. Hash values stay below 2**31, so sums cannot overflow.
+    generator = torch.Generator().manual_seed(0)
+    row_hashes = torch.randint(0, 2**31, (2, num_rows), generator=generator)
+    column_hashes = torch.zeros((2, num_cols), dtype=torch.long)
+    column_hashes[0].index_add_(0, col, row_hashes[0][rows])
+    column_hashes[1].index_add_(0, col, row_hashes[1][rows])
+    keys = torch.stack(
+        [counts[candidates], column_hashes[0][candidates], column_hashes[1][candidates]],
+        dim=1,
+    )
+    _unique_keys, bucket_ids = torch.unique(keys, dim=0, return_inverse=True)
+
+    # Row ids of each column (CSC view) to confirm duplicates exactly.
+    order = torch.argsort(col, stable=True)
+    rows_by_column = rows[order]
+    column_start = torch.zeros(num_cols + 1, dtype=torch.long)
+    torch.cumsum(counts, dim=0, out=column_start[1:])
+
+    def column_rows(j):
+        return rows_by_column[column_start[j]:column_start[j + 1]]
+
+    kept = []
+    aliases = []
+    # bucket id -> list of (position in kept, row ids) of that bucket's columns.
+    representatives = {}
+    for j, bucket in zip(candidates.tolist(), bucket_ids.tolist()):
+        j_rows = column_rows(j)
+        for kept_pos, rep_rows in representatives.get(bucket, []):
+            if torch.equal(j_rows, rep_rows):
+                aliases[kept_pos].append(j)
+                break
+        else:
+            representatives.setdefault(bucket, []).append((len(kept), j_rows))
+            kept.append(j)
+            aliases.append([])
+    return kept, aliases
+
+
+def prune_examples(examples, min_support):
+    """Drop feature columns that cannot affect any accepted extension.
+
+    See `_prune_group_features` for the rules. Rows and groups are kept so
+    group ids stay stable; a pruned group just ends up with zero features and
+    is skipped by `extend_clauses`. Adds `feature_aliases[g][j]`: the vocab
+    entries that duplicate `feature_vocab[g][j]`.
+    """
+    features = []
+    feature_vocab = []
+    feature_aliases = []
+    num_before = sum(X["shape"][1] for X in examples["features"])
+    for gid, sparse in enumerate(examples["features"]):
+        num_rows, num_cols = sparse["shape"]
+        target = examples["targets"][gid]
+        num_head_positives = torch.bincount(
+            target["col"].long(), minlength=target["shape"][1]
+        )
+        kept, aliases = _prune_group_features(sparse, num_head_positives, min_support)
+
+        old_to_new = torch.full((num_cols,), -1, dtype=torch.long)
+        old_to_new[torch.tensor(kept, dtype=torch.long)] = torch.arange(len(kept))
+        crow = sparse["crow"].long()
+        rows = torch.repeat_interleave(torch.arange(num_rows), crow[1:] - crow[:-1])
+        new_col = old_to_new[sparse["col"].long()]
+        keep_cell = new_col >= 0
+        features.append(_csr_from_cells(
+            rows[keep_cell], new_col[keep_cell], (num_rows, len(kept))
+        ))
+
+        vocab = examples["feature_vocab"][gid]
+        feature_vocab.append([vocab[j] for j in kept])
+        feature_aliases.append([[vocab[j] for j in dup] for dup in aliases])
+
+    num_after = sum(X["shape"][1] for X in features)
+    num_empty = sum(X["shape"][1] == 0 for X in features)
+    print(
+        f"[Pruning] min_support={min_support}: features {num_before} -> {num_after}, "
+        f"{num_empty}/{len(features)} groups left with no features"
+    )
+    return {
+        **examples,
+        "features": features,
+        "feature_vocab": feature_vocab,
+        "feature_aliases": feature_aliases,
+    }
+
+
 def _encode_examples(examples):
     """Replace every atom signature in `examples` with an integer id.
 
@@ -374,6 +499,25 @@ def _encode_examples(examples):
         "body_ids": torch.tensor(body_ids, dtype=torch.long),
         "candidate_head_ids": candidate_head_ids,
     }
+    # Pruned examples only: feature_aliases[g][j] is a list of vocab entries.
+    # Flatten each group to (K_g, 2) (object_slot, atom_id) rows; column j's
+    # aliases are rows alias_offsets[g][j]:alias_offsets[g][j + 1].
+    if "feature_aliases" in examples:
+        compact["alias_atoms"] = []
+        compact["alias_offsets"] = []
+        for group_aliases in examples["feature_aliases"]:
+            flat = [
+                (object_slot, to_id(atom_fact))
+                for aliases in group_aliases
+                for _gid, object_slot, atom_fact in aliases
+            ]
+            offsets = [0]
+            for aliases in group_aliases:
+                offsets.append(offsets[-1] + len(aliases))
+            compact["alias_atoms"].append(
+                torch.tensor(flat, dtype=torch.long).reshape(-1, 2)
+            )
+            compact["alias_offsets"].append(torch.tensor(offsets, dtype=torch.long))
     return compact, signatures
 
 
@@ -392,45 +536,78 @@ def _decode_examples(compact, signatures):
         [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in vocab.tolist()]
         for gid, vocab in enumerate(compact["feature_vocab"])
     ]
-    return {
+    examples = {
         "features": compact["features"],
         "targets": compact["targets"],
         "feature_vocab": feature_vocab,
         "head_vocab": group_head_vocab,
         "body_groups": body_groups,
     }
+    if "alias_atoms" in compact:
+        examples["feature_aliases"] = []
+        for gid, (flat, offsets) in enumerate(
+            zip(compact["alias_atoms"], compact["alias_offsets"])
+        ):
+            flat = [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in flat.tolist()]
+            offsets = offsets.tolist()
+            examples["feature_aliases"].append(
+                [flat[start:end] for start, end in zip(offsets[:-1], offsets[1:])]
+            )
+    return examples
+
+
+def _save_examples(examples, cache_file, signature_file):
+    # Features/targets/vocab ids live in the .pt file; the id -> atom signature
+    # mapping lives in a separate JSON file so signatures are stored only once.
+    compact, signatures = _encode_examples(examples)
+    torch.save(compact, cache_file)
+    utils_data.save_json(signatures, signature_file)
+    print(f"[Cache] Saved {cache_file} and {signature_file}")
+
+
+def _load_examples(cache_file, signature_file):
+    """Return the examples cached by `_save_examples`, or None if unavailable."""
+    if not (cache_file.exists() and signature_file.exists()):
+        return None
+    compact = torch.load(cache_file, weights_only=False)
+    # Older caches stored dense bool tensors; rebuild them in sparse form.
+    if any(torch.is_tensor(X) for X in compact["features"]):
+        print(f"[Cache] {cache_file} uses the old dense format, rebuilding")
+        return None
+    with open(signature_file, "r") as f:
+        signatures = [tuple(s) for s in json.load(f)]
+    print(f"[Cache] Loaded {cache_file} and {signature_file}")
+    return _decode_examples(compact, signatures)
 
 
 def _build_body_conditioned_training_examples(
-    atoms, clauses, dataset_labels, output_dir
+    atoms, clauses, dataset_labels, output_dir, min_support=None
 ):
-    """Load or build per-group boolean feature and target tensors."""
-    # Features/targets/vocab ids live in the .pt file; the id -> atom signature
-    # mapping lives in a separate JSON file so signatures are stored only once.
-    cache_file = output_dir / "body_conditioned_examples.pt"
-    signature_file = output_dir / "atom_signatures.json"
-    compact = None
-    if cache_file.exists() and signature_file.exists():
-        compact = torch.load(cache_file, weights_only=False)
-        # Older caches stored dense bool tensors; rebuild them in sparse form.
-        if any(torch.is_tensor(X) for X in compact["features"]):
-            print(f"[Cache] {cache_file} uses the old dense format, rebuilding")
-            compact = None
-    if compact is not None:
-        with open(signature_file, "r") as f:
-            signatures = [tuple(s) for s in json.load(f)]
-        examples = _decode_examples(compact, signatures)
-        print(f"[Cache] Loaded {cache_file} and {signature_file}")
-    else:
-        body_groups = group_clauses_by_body(clauses, dataset_labels)
-        head_vocab = build_head_vocab(body_groups)
-        examples = build_features(atoms, dataset_labels, body_groups, head_vocab)
-        examples["body_groups"] = body_groups
-        compact, signatures = _encode_examples(examples)
-        torch.save(compact, cache_file)
-        utils_data.save_json(signatures, signature_file)
-        print(f"[Cache] Saved {cache_file} and {signature_file}")
-    raise NotImplementedError()
+    """Load or build per-group feature and target matrices.
+
+    With `min_support`, return the `prune_examples` result; it is cached in
+    its own files per min_support value, next to the unpruned cache.
+    """
+    examples = None
+    if min_support is not None:
+        pruned_cache_file = output_dir / f"body_conditioned_examples_pruned_ms{min_support}.pt"
+        pruned_signature_file = output_dir / f"atom_signatures_pruned_ms{min_support}.json"
+        examples = _load_examples(pruned_cache_file, pruned_signature_file)
+
+    if examples is None:
+        cache_file = output_dir / "body_conditioned_examples.pt"
+        signature_file = output_dir / "atom_signatures.json"
+        examples = _load_examples(cache_file, signature_file)
+        if examples is None:
+            body_groups = group_clauses_by_body(clauses, dataset_labels)
+            head_vocab = build_head_vocab(body_groups)
+            examples = build_features(atoms, dataset_labels, body_groups, head_vocab)
+            examples["body_groups"] = body_groups
+            _save_examples(examples, cache_file, signature_file)
+        if min_support is not None:
+            examples = prune_examples(examples, min_support)
+            _save_examples(examples, pruned_cache_file, pruned_signature_file)
+
     num_rows = sum(X["shape"][0] for X in examples["features"])
     num_features = sum(X["shape"][1] for X in examples["features"])
     num_heads = sum(Y["shape"][1] for Y in examples["targets"])
@@ -533,11 +710,12 @@ def extend_clauses(
             extended_data = json.load(f)
     else:
         training_examples_by_body = _build_body_conditioned_training_examples(
-            atoms, coarse_pruned_clauses, dataset_labels, output_dir
+            atoms, coarse_pruned_clauses, dataset_labels, output_dir, min_support
         )
         features = training_examples_by_body["features"]
         targets = training_examples_by_body["targets"]
         feature_vocab = training_examples_by_body["feature_vocab"]
+        feature_aliases = training_examples_by_body["feature_aliases"]
         head_vocab = training_examples_by_body["head_vocab"]
 
         extended_data = []
@@ -578,18 +756,9 @@ def extend_clauses(
                     continue
 
                 y = torch.from_numpy(target_col)
-
-                try:
-                    final_mask, log_alpha = learn_extension_mask(
-                        X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    print(
-                        f"[Rule extension] CUDA OOM for group {gid}, head {head_col} "
-                        f"on device={device}. Re-run with a smaller --batch_size, "
-                        "a smaller --num_epochs, or pass --device cpu."
-                    )
-                    raise
+                final_mask, log_alpha = learn_extension_mask(
+                    X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
+                )
                 selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
                 del final_mask, log_alpha
                 if not selected_positions:
@@ -620,6 +789,8 @@ def extend_clauses(
                     "group_id": gid,
                     "head": head_vocab[gid][head_col],
                     "extra_atoms": selected_atoms,
+                    # Atoms true in exactly the same rows as each extra atom.
+                    "extra_atom_aliases": [feature_aliases[gid][pos] for pos in selected_positions],
                     "metrics": metrics,
                 })
 
@@ -630,8 +801,9 @@ def extend_clauses(
         output_file = output_dir / "extended_clauses.json"
         utils_data.save_json(extended_data, output_file)
         print(f"[Rule extension] Learned {len(extended_data)} extended clauses")
+        raise NotImplementedError()
     training_examples_by_body = _build_body_conditioned_training_examples(
-            atoms, coarse_pruned_clauses, dataset_labels, output_dir)
+            atoms, coarse_pruned_clauses, dataset_labels, output_dir, min_support)
     extended_clauses = _to_extended_clauses(extended_data, training_examples_by_body)
 
     return extended_clauses
