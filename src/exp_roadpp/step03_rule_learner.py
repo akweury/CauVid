@@ -187,15 +187,49 @@ def build_head_vocab(body_groups):
     return head_vocab
     
     
+def _to_sparse_rows(rows, columns, shape):
+    """Pack the True cells of a 0/1 (N, M) matrix in CSR form.
+
+    `rows` must be non-decreasing (cells are appended row by row). Only the
+    True cells are stored: `col` holds their column ids and row i's columns
+    are col[crow[i]:crow[i + 1]]. This replaces a dense (N, M) matrix, which
+    for sparse features costs one byte per cell, mostly False.
+    """
+    num_rows, num_cols = shape
+    row_counts = torch.bincount(
+        torch.tensor(rows, dtype=torch.long), minlength=num_rows
+    )
+    crow = torch.zeros(num_rows + 1, dtype=torch.long)
+    torch.cumsum(row_counts, dim=0, out=crow[1:])
+    index_dtype = torch.int32 if len(columns) < 2**31 else torch.long
+    return {
+        "crow": crow.to(index_dtype),
+        "col": torch.tensor(columns, dtype=torch.int32),
+        "shape": (num_rows, num_cols),
+    }
+
+
+def sparse_rows_to_dense(sparse, dtype=torch.bool):
+    """Inverse of `_to_sparse_rows`: return the dense (N, M) tensor."""
+    num_rows, num_cols = sparse["shape"]
+    crow = sparse["crow"].long()
+    rows = torch.repeat_interleave(torch.arange(num_rows), crow[1:] - crow[:-1])
+    dense = torch.zeros((num_rows, num_cols), dtype=dtype)
+    dense[rows, sparse["col"].long()] = 1
+    return dense
+
+
 def build_features(atoms, dataset_labels, body_groups, head_vocab):
-    """Build dense boolean feature/target tensors, one pair per body group.
+    """Build sparse 0/1 feature/target matrices, one pair per body group.
 
     For group g, one row = one occurrence of g's body atom in frame t.
-      features[g]: bool (N_g, M_g); column j = feature_vocab[g][j], a
+      features[g]: (N_g, M_g); column j = feature_vocab[g][j], a
           co-occurring atom (group_id, object_slot, fact) in frame t.
-      targets[g]:  bool (N_g, H_g); column k = head_vocab[g][k], True if that
+      targets[g]:  (N_g, H_g); column k = head_vocab[g][k], True if that
           head fact holds for the same entity in frame t+1.
-    Columns are local to each group, so no tensor carries other groups' zeros.
+    Both are stored in the compact CSR form of `_to_sparse_rows`; use
+    `sparse_rows_to_dense` to get a dense tensor for one group.
+    Columns are local to each group, so no matrix carries other groups' zeros.
     """
     # body_signature -> group_id, same order as build_head_vocab's enumerate.
     body_ids = {body_signature: gid for gid, body_signature in enumerate(body_groups)}
@@ -279,20 +313,17 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab):
                         target_columns[group_id].append(head_col)
                 row_counts[group_id] += 1
 
-    def _to_index(values):
-        # Explicit long dtype: an empty Python list would otherwise become a
-        # float tensor, which torch rejects as an index.
-        return torch.tensor(values, dtype=torch.long)
-
     features = []
     targets = []
     for gid in range(num_groups):
-        X = torch.zeros((row_counts[gid], len(group_feature_vocab[gid])), dtype=torch.bool)
-        X[_to_index(feature_rows[gid]), _to_index(feature_columns[gid])] = True
-        Y = torch.zeros((row_counts[gid], len(group_head_vocab[gid])), dtype=torch.bool)
-        Y[_to_index(target_rows[gid]), _to_index(target_columns[gid])] = True
-        features.append(X)
-        targets.append(Y)
+        features.append(_to_sparse_rows(
+            feature_rows[gid], feature_columns[gid],
+            (row_counts[gid], len(group_feature_vocab[gid])),
+        ))
+        targets.append(_to_sparse_rows(
+            target_rows[gid], target_columns[gid],
+            (row_counts[gid], len(group_head_vocab[gid])),
+        ))
 
     return {
         "features": features,
@@ -378,8 +409,14 @@ def _build_body_conditioned_training_examples(
     # mapping lives in a separate JSON file so signatures are stored only once.
     cache_file = output_dir / "body_conditioned_examples.pt"
     signature_file = output_dir / "atom_signatures.json"
+    compact = None
     if cache_file.exists() and signature_file.exists():
         compact = torch.load(cache_file, weights_only=False)
+        # Older caches stored dense bool tensors; rebuild them in sparse form.
+        if any(torch.is_tensor(X) for X in compact["features"]):
+            print(f"[Cache] {cache_file} uses the old dense format, rebuilding")
+            compact = None
+    if compact is not None:
         with open(signature_file, "r") as f:
             signatures = [tuple(s) for s in json.load(f)]
         examples = _decode_examples(compact, signatures)
@@ -394,9 +431,9 @@ def _build_body_conditioned_training_examples(
         utils_data.save_json(signatures, signature_file)
         print(f"[Cache] Saved {cache_file} and {signature_file}")
     raise NotImplementedError()
-    num_rows = sum(X.shape[0] for X in examples["features"])
-    num_features = sum(X.shape[1] for X in examples["features"])
-    num_heads = sum(Y.shape[1] for Y in examples["targets"])
+    num_rows = sum(X["shape"][0] for X in examples["features"])
+    num_features = sum(X["shape"][1] for X in examples["features"])
+    num_heads = sum(Y["shape"][1] for Y in examples["targets"])
     print(
         f"[Training data] {len(examples['body_groups'])} groups, {num_rows} examples, "
         f"{num_features} features, {num_heads} candidate heads"
@@ -507,8 +544,8 @@ def extend_clauses(
 
         # extension in one shot: differentiable conjunctive rule learning, group by group
         for gid in tqdm(range(len(features)), desc="Learning rule extensions"):
-            num_rows, num_feature_cols = features[gid].shape
-            num_head_cols = targets[gid].shape[1]
+            num_rows, num_feature_cols = features[gid]["shape"]
+            num_head_cols = targets[gid]["shape"][1]
             if num_rows == 0 or num_feature_cols == 0 or num_head_cols == 0:
                 print(
                     f"[Rule extension] Skipping group {gid}: "
@@ -518,14 +555,17 @@ def extend_clauses(
                 )
                 continue
 
-            # This group's (N, M) block, kept on CPU; only row-batches are moved
-            # to the GPU inside `learn_extension_mask`. Float copy for training,
-            # numpy view of the bool block for hard evaluation.
-            X = features[gid].float()
-            feature_block = features[gid].numpy()
+            # Densify only this group's (N, M) block, kept on CPU; only
+            # row-batches are moved to the GPU inside `learn_extension_mask`.
+            # Float copy for training, numpy view of the bool block for hard
+            # evaluation.
+            dense_features = sparse_rows_to_dense(features[gid])
+            X = dense_features.float()
+            feature_block = dense_features.numpy()
+            dense_targets = sparse_rows_to_dense(targets[gid])
 
             for head_col in range(num_head_cols):
-                target_col = targets[gid][:, head_col].numpy().astype(np.float32)
+                target_col = dense_targets[:, head_col].numpy().astype(np.float32)
 
                 # Skip degenerate targets: nothing to learn if the head never fires
                 # or always fires for this body-group.
@@ -583,7 +623,7 @@ def extend_clauses(
                     "metrics": metrics,
                 })
 
-            del X
+            del X, dense_features, feature_block, dense_targets
             if device != 'cpu' and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         # save extended clauses to a file
