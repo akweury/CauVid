@@ -28,7 +28,7 @@ def step_0_setup(args):
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
     # dgx
     elif args.machine == "dgx":
-        args.dataset_path = Path('/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp')
+        args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
     
     # macbook pro

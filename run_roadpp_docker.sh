@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp}"
+ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/storage-01/ml-jsha/CauVid_Data/roadpp}"
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
 MACHINE="${CAUVID_ROADPP_MACHINE:-dgx}"
 
