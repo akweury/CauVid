@@ -32,6 +32,7 @@ def step_0_setup(args):
         args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
         args.device = f'{args.device}'
         print(f"\n##### Output directory: {args.output_dir} #####\n")
+        os.makedirs(args.output_dir, exist_ok=True)
     
     # macbook pro
     elif args.machine == "macbook-pro":
