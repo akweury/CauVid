@@ -163,22 +163,36 @@ def predict_next_n_steps(test_atoms, output_dir, dataset_labels, step=1):
     return all_video_scores
 
 
-def collect_clause_proposals(vm,ocm_present,atom_matrix, clause_matrix):
+def build_frame_proposals(frame_atoms, clause_matrix, unique_bodies, obj_num, label_num):
+    proposals = torch.zeros((obj_num, label_num))
+    
+    body_matrix = torch.zeros(len(unique_bodies))
+    for atom in frame_atoms:
+        if atom[:-2] in unique_bodies:
+            body_matrix[unique_bodies.index(atom[:-2])] = True 
+    proposals = (~clause_matrix | body_matrix).all(dim=1)
+    
+    return proposals
+            
+
+def build_video_matrix(apf, vm, ocm_mask, tube_ids, bk):
     # vm: video matrix of shape (num_objects, num_frames, num_labels)
     # clause_matrix: matrix of shape (num_clauses, num_features)
     # ocm_present: matrix of shape (num_objects, num_frames)
     # calculate vm
-
     for frame_i in range(vm.shape[1]):
+        if apf[frame_i] is None or len(apf[frame_i]) == 0:
+            continue
         # objs in this frame
-        objs_in_frame = ocm_present[:, frame_i]
         # estimate active clauses for this frame based on object presence
-        facts_per_obj = atom_matrix[frame_i, objs_in_frame]
-        clause_per_obj = None 
-        labels_per_obj = None
-        vm[objs_in_frame, frame_i] = labels_per_obj
+        frame_proposals = build_frame_proposals(apf[frame_i],bk["clause_matrix"], 
+                                                bk["unique_bodies"], 
+                                                vm.shape[0], vm.shape[2])
+        for atom in apf[frame_i]:
+            id = tube_ids.index(atom["tube_uid"])
+        vm[:, frame_i] = frame_proposals
 
-    proposals = (~clause_matrix.unsqueeze(0) | vm.unsqueeze(1)).all(dim=2)
+    
     if proposals.sum() == 0:
         print("No clause proposals were made.")
     return proposals
@@ -191,14 +205,18 @@ def apply_clause_proposals(proposals, heads):
     return events
 
 
-def detect_events(vm, ocm, ocm_presents, atoms_per_frame, clause_matrix,clause_heads, output_dir):
+def detect_events(bk,atoms, cfg):
+    output_dir = cfg["output_dir"]
+    clause_matrix = bk["clause_matrix"]
+    clause_heads = bk["clause_heads"]
+    feature_num = bk["feature_num"]
+    dataset_labels = bk["dataset_labels"]
+    # 
     
-    
-    proposals = collect_clause_proposals(clause_matrix)
-    events = apply_clause_proposals(proposals, clause_heads)
+    ocm = apply_clause_proposals(vm, clause_heads)
 
     visual_2d_heatmap(
-        proposals.cpu().numpy(),
+        vm.cpu().numpy(),
         output_dir=output_dir,
         title="Clause Proposals",
         filename="clause_proposals",
@@ -206,40 +224,15 @@ def detect_events(vm, ocm, ocm_presents, atoms_per_frame, clause_matrix,clause_h
         y_label = "Frames"
         
     )
-    
-    
     return events
 
-def build_video_data(video_atoms, clauses, dataset_labels):
-    # build object centric matrix (ocm) for each frame and object
-    feature_num = len(dataset_labels["av_action_labels"]) + len(dataset_labels["action_labels"]) + len(dataset_labels["loc_labels"])
-    all_tube_uids = list(set([atom["tube_uid"] for atom in video_atoms]))
-    obj_num= len(all_tube_uids)
-    atoms_per_start_frame = {}
-    clause_num = len(clauses)
-    end_frame = max([int(atom["end_frame"]) for atom in video_atoms]) if video_atoms else 0
-    ocm_gt = torch.zeros((obj_num, end_frame, feature_num), dtype=torch.bool)
-    ocm_presents = torch.zeros((obj_num, end_frame), dtype=torch.bool)
-    vm = torch.zeros((obj_num, end_frame, feature_num), dtype=torch.bool)
-    for atom in video_atoms:
-        if int(atom["start_frame"]) not in atoms_per_start_frame:
-            atoms_per_start_frame[int(atom["start_frame"])] = []
-        atoms_per_start_frame[int(atom["start_frame"])].append(atom)
-
+def build_ocm_gt(all_tube_uids, apsf, frame_num,obj_num, feature_num, dataset_labels):
+    ocm_gt = torch.zeros((obj_num, frame_num, feature_num), dtype=torch.bool)
+    ocm_presents = torch.zeros((obj_num, frame_num), dtype=torch.bool)
     
-    # for each frame, we need a list to include the atoms that occur in that frame
-    atoms_per_frame = {i: [] for i in range(end_frame)}
-    for start_frame, atoms in atoms_per_start_frame.items():
-        for atom in atoms:
-            for frame_id in range(start_frame, int(atom["end_frame"])):
-                frame_as = atom_to_signature(atom, dataset_labels)
-                atoms_per_frame[frame_id].append(frame_as)
-
-    
-    for frame_id, atoms_in_frame in atoms_per_start_frame.items():
+    for frame_id, atoms_in_frame in apsf.items():
         for atom in atoms_in_frame:
             tube_uid = atom["tube_uid"]
-            
             obj_id = all_tube_uids.index(tube_uid)
             start_frame = int(atom["start_frame"])
             end_frame = int(atom["end_frame"])
@@ -252,7 +245,26 @@ def build_video_data(video_atoms, clauses, dataset_labels):
             ocm_gt[obj_id, start_frame:end_frame+1, feature_index] = True
             ocm_presents[obj_id, start_frame:end_frame+1] = True
 
-    return vm, ocm_gt, ocm_presents, atoms_per_frame
+    return ocm_gt, ocm_presents
+
+def extract_atoms_per_frame(interval_atoms, dataset_labels, frame_num):
+    atoms_per_start_frame = {}
+    
+    for atom in interval_atoms:
+        if int(atom["start_frame"]) not in atoms_per_start_frame:
+            atoms_per_start_frame[int(atom["start_frame"])] = []
+        atoms_per_start_frame[int(atom["start_frame"])].append(atom)
+    # for each frame, we need a list to include the atoms that occur in that frame
+    atoms_per_frame = {i: [] for i in range(frame_num)}
+    for start_frame, atoms in atoms_per_start_frame.items():
+        for atom in atoms:
+            for frame_id in range(start_frame, int(atom["end_frame"])):
+                frame_as = atom_to_signature(atom, dataset_labels)
+                atoms_per_frame[frame_id].append(frame_as)
+    return atoms_per_frame, atoms_per_start_frame
+
+
+
 
 def evaluate_video_events(events, events_gt):
     # Implement the logic to evaluate the detected events for a video
@@ -261,44 +273,37 @@ def evaluate_video_events(events, events_gt):
     evaluation = {}
     return evaluation
 
-def build_clause_matrix(clauses):
-    # get all unique bodies
-    unique_bodies = []
-    for clause in clauses:
-        bodies = clause["bodies"]
-        for body in bodies:
-            if body not in unique_bodies:
-                unique_bodies.append(body)
-
-    clause_matrix = torch.zeros((len(clauses), len(unique_bodies)), dtype=torch.bool) 
-    clause_heads = []
-    for i, clause in enumerate(clauses):
-        bodies = clause["bodies"]
-        clause_heads.append(clause["head"])
-        for j, body in enumerate(unique_bodies):
-            if body in bodies:
-                clause_matrix[i, j] = True
-    print(f"[Clause Matrix]: {clause_matrix.shape}")
-    return unique_bodies, clause_matrix, clause_heads
 
 
-def clauses_evaluation(clauses, dataset_labels, device, output_dir, atoms):
-    unique_bodies, clause_matrix, clause_heads = build_clause_matrix(clauses)
+
+def clauses_evaluation(bk, atoms, cfg):
     summary = {}
-    for vid, video_atoms in atoms.items():
-        video_summary = {}
-        vm, ocm_gt, ocm_presents, atoms_per_frame = build_video_data(video_atoms, clauses, dataset_labels)
-        ocm = torch.zeros_like(ocm_gt)
-        events = detect_events(vm, ocm, ocm_presents, atoms_per_frame, clause_matrix, clause_heads, output_dir)
-        video_summary["events"] = events
-        video_summary["evaluation"] = evaluate_video_events()
+    label_num = bk["label_num"]
+    labels = bk["dataset_labels"]
+    for vid, interval_atoms in atoms.items():
+        tube_uids = list(set([atom["tube_uid"] for atom in interval_atoms]))
+        frame_num = max([int(atom["end_frame"]) for atom in interval_atoms]) if interval_atoms else 0
+        obj_num = len(tube_uids)
+        vm = torch.zeros((obj_num, frame_num, label_num), dtype=torch.bool)
         
-        
-        
-        
-        
-
-        summary[vid] = video_summary
+        apf, apsf = extract_atoms_per_frame(interval_atoms,labels, frame_num)
+        ocm_gt, ocm_mask = build_ocm_gt(tube_uids, 
+                                            apsf, 
+                                            frame_num, 
+                                            obj_num, 
+                                            label_num, 
+                                            labels)
+        vm = build_video_matrix(apf, vm, ocm_mask, tube_uids, bk)
+        ocm = detect_events(bk, apf, cfg) 
+        summary[vid] = {
+            "ocm": ocm,
+            "ocm_gt": ocm_gt,
+            "vm": vm,
+            "recall": None,
+            "precision": None,
+            "iou":None,
+            "f1": None,
+        }
     return summary
 
 

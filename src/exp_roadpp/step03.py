@@ -16,7 +16,7 @@ from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
 from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation
 from src.exp_roadpp.step03_pred_eval import clauses_evaluation
 from src.exp_roadpp.step03_action_predictor import ActionPredictor
-from src.exp_roadpp.step03_rule_learner import extend_clauses
+from src.exp_roadpp.step03_rule_learner import extend_clauses, build_clause_matrix
 from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
 
 def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
@@ -193,7 +193,9 @@ def merge_rule_supports(target, source):
             target[key] = value
     return target
 
-def prepare_dataset(data_num, track_dir, language_model, output_dir):
+def prepare_dataset(data_num, language_model, cfg):
+    track_dir = cfg["track_dir"]
+    output_dir = cfg["output_dir"]
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     if data_num != 'full':
         all_track_files = all_track_files[:int(data_num)]
@@ -213,42 +215,49 @@ def prepare_dataset(data_num, track_dir, language_model, output_dir):
 
 
 
-
-
+def build_background_knowledge(clauses, dataset_labels):
+    cm, heads, bodies = build_clause_matrix(clauses)
+    label_num = len(dataset_labels["av_action_labels"]) + len(dataset_labels["action_labels"]) + len(dataset_labels["loc_labels"])
+    bk = {
+        "clause_matrix": cm,
+        "clause_heads": heads,
+        "unique_bodies": bodies,
+        "label_num": label_num,
+        "dataset_labels": dataset_labels
+    }
+    return bk
     
 
 def main(input_data):
     print("\n--------- Step 03 ----------------------\n")
-
-    # Prepare output directories and dataset paths
-    output_dir = input_data["output_dir"]
-    test_output_dir = output_dir / "test"
-    os.makedirs(test_output_dir, exist_ok=True)
-    track_dir = input_data["dataset_path"] / "gt"
-    dataset_path = input_data["dataset_path"]
-    device = input_data["device"]
+    cfg = {
+        "device": input_data["device"], 
+        "output_dir": input_data["output_dir"],
+        "test_output_dir": input_data["output_dir"] / "test",
+        "track_dir": input_data["dataset_path"] / "gt",
+        "dataset_path": input_data["dataset_path"]
+    }
+    os.makedirs(cfg["test_output_dir"], exist_ok=True)
+    
     dataset_labels = input_data["dataset_labels"]
     # Prepare language model and beam search model
     language_model = Language(input_data["device"])
-
     pruner = Pruner(input_data["prune_args"], dataset_labels)
-    
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
-    atoms = prepare_dataset(input_data['data_num'], track_dir, language_model, output_dir)
+    atoms = prepare_dataset(input_data['data_num'], language_model, cfg)
     
-
     # C_0: Convert atoms to initial clauses
-    init_clauses = _atoms_to_init_clauses(atoms["train"], language_model, output_dir, 'train')
-    visual_bar(init_clauses, output_dir, "init_clauses_distribution")
+    init_clauses = _atoms_to_init_clauses(atoms["train"], language_model, cfg["output_dir"], 'train')
+    visual_bar(init_clauses, cfg["output_dir"], "init_clauses_distribution")
     # C_1: Coarse Prune, filter out the low frequent clauses
     coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
     # replace id with label names
     coarse_pruned_clauses = utils_data.replace_ids_with_labels(coarse_pruned_clauses, dataset_labels)
     # clause extension
-    extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, output_dir, atoms['train'],device=device)
-
+    extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, atoms['train'], cfg)
+    bk = build_background_knowledge(extended_clauses, dataset_labels)
     # clause evaluation
-    summary = clauses_evaluation(extended_clauses, dataset_labels, device, output_dir, atoms['val'])
+    summary = clauses_evaluation(bk, atoms['val'], cfg)
 
 
     

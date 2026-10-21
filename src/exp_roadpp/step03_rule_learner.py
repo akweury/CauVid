@@ -383,15 +383,16 @@ def _to_extended_clauses(extended_data, training_examples_by_body):
 def extend_clauses(
     coarse_pruned_clauses,
     dataset_labels,
-    output_dir,
     atoms,
+    cfg,
     min_support=10,
     min_confidence_gain=0.05,
     num_epochs=200,
     lr=0.1,
     l0_lambda=0.01,
-    device="cpu",
 ):
+    output_dir = cfg["output_dir"]
+    device = cfg["device"]
     # load the extended clauses if they exist, otherwise extend from coarse pruned clauses
     output_file = output_dir / "extended_clauses.json"
     if output_file.exists():
@@ -472,3 +473,25 @@ def extend_clauses(
     extended_clauses = _to_extended_clauses(extended_data, training_examples_by_body)
 
     return extended_clauses
+
+
+def build_clause_matrix(clauses):
+    # get all unique bodies
+    unique_bodies = []
+    for clause in clauses:
+        bodies = clause["bodies"]
+        for body in bodies:
+            if body not in unique_bodies:
+                unique_bodies.append(body)
+
+    clause_matrix = torch.zeros((len(clauses), len(unique_bodies)), dtype=torch.bool) 
+    clause_heads = []
+    for i, clause in enumerate(clauses):
+        bodies = clause["bodies"]
+        clause_heads.append(clause["head"])
+        for j, body in enumerate(unique_bodies):
+            if body in bodies:
+                clause_matrix[i, j] = True
+    print(f"[Clause Matrix]: {clause_matrix.shape}")
+    
+    return clause_matrix, clause_heads, unique_bodies
