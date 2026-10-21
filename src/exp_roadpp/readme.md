@@ -85,6 +85,54 @@ The repository root includes a `Dockerfile` and `docker-compose.yml` that can
 also be used to run this pipeline, instead of setting up a local Python
 environment.
 
+### Quick start: `run_roadpp_docker.sh`
+
+The repository root ships a helper script that builds the `cauvid-pipeline`
+image if it does not exist yet and then runs `main.py` inside a container.
+Run it from the repository root:
+
+```bash
+chmod +x run_roadpp_docker.sh   # first time only
+
+# default: GPU 0, --machine dgx, debug experiment
+./run_roadpp_docker.sh
+
+# pick a GPU and pass extra arguments to main.py after `--`
+./run_roadpp_docker.sh --gpu 0 -- --exp medium --learning True
+
+# use all GPUs
+./run_roadpp_docker.sh --gpu all
+
+# CPU only, with the local dataset configuration
+./run_roadpp_docker.sh --gpu none -- --device cpu --machine jst
+```
+
+`--gpu` accepts a GPU index (`0`, `1`, ...), `all`, or `none`. When a single
+GPU index is given, it appears as `cuda:0` inside the container.
+
+The host paths can be overridden with environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CAUVID_ROADPP_DATA_HOST` | `/storage-01/ml-jsha/CauVid_Data/roadpp` | ROAD-Waymo dataset on the host |
+| `CAUVID_ROADPP_OUTPUT_HOST` | `/storage-01/ml-jsha/CauVid_output` | Pipeline outputs |
+| `CAUVID_TORCH_CACHE_HOST` | `/storage-02/ml-jsha/.cache/torch` | Cache for downloaded model weights |
+| `CAUVID_ROADPP_DEVICE` | `cuda:0` (`cpu` with `--gpu none`) | `--device` passed to `main.py` |
+| `CAUVID_ROADPP_MACHINE` | `dgx` | `--machine` passed to `main.py` |
+
+Example with custom paths:
+
+```bash
+CAUVID_ROADPP_DATA_HOST=/data/roadpp \
+CAUVID_ROADPP_OUTPUT_HOST=/data/CauVid_output \
+./run_roadpp_docker.sh --gpu 1 -- --exp debug
+```
+
+The dataset and output folders are mounted at the same absolute paths inside
+the container, so the `dgx` paths in `config.py` work without changes. When
+the run finishes, the script prints the output folder
+(`$CAUVID_ROADPP_OUTPUT_HOST/roadpp/<exp>`).
+
 ### Build the image
 
 From the repository root:

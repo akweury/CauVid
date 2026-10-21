@@ -166,10 +166,10 @@ def group_clauses_by_body(clauses, dataset_labels):
             clause["head"], dataset_labels
         )[:-2]
         body_group = clauses_by_body.setdefault(
-            body_signature, {"candidate_heads": set(), "clauses": []}
+            body_signature, {"candidate_heads": set()}
         )
         body_group["candidate_heads"].add(head_signature)
-        body_group["clauses"].append(c)
+        
 
     for body_group in clauses_by_body.values():
         body_group["candidate_heads"] = tuple(
@@ -302,32 +302,97 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab):
     }
 
 
-def _load_or_build_cache(cache_file, build_fn):
-    """Return the dict cached in `cache_file`, or call `build_fn()` and cache it."""
-    if cache_file.exists():
-        data = torch.load(cache_file, weights_only=False)
-        print(f"[Cache] Loaded {cache_file}")
-        return data
-    data = build_fn()
-    torch.save(data, cache_file)
-    print(f"[Cache] Saved {cache_file}")
-    return data
+def _encode_examples(examples):
+    """Replace every atom signature in `examples` with an integer id.
+
+    Returns (compact, signatures): `compact` holds only ids and tensors,
+    `signatures[i]` is the atom signature with id i.
+    """
+    signature_ids = {}
+    signatures = []
+
+    def to_id(signature):
+        signature_id = signature_ids.get(signature)
+        if signature_id is None:
+            signature_id = len(signatures)
+            signature_ids[signature] = signature_id
+            signatures.append(signature)
+        return signature_id
+
+    body_ids = []
+    candidate_head_ids = []
+    for body_signature, body_group in examples["body_groups"].items():
+        body_ids.append(to_id(body_signature))
+        candidate_head_ids.append(torch.tensor(
+            [to_id(h) for h in body_group["candidate_heads"]], dtype=torch.long
+        ))
+    # feature_vocab[g][j] = (g, object_slot, atom_fact); g is implied by the
+    # list position, so store only (object_slot, atom_id) as an (M_g, 2) tensor.
+    feature_vocab = [
+        torch.tensor(
+            [(object_slot, to_id(atom_fact)) for _gid, object_slot, atom_fact in vocab],
+            dtype=torch.long,
+        ).reshape(-1, 2)
+        for vocab in examples["feature_vocab"]
+    ]
+    # head_vocab is rebuilt from body_groups on load (see build_head_vocab).
+    compact = {
+        "features": examples["features"],
+        "targets": examples["targets"],
+        "feature_vocab": feature_vocab,
+        "body_ids": torch.tensor(body_ids, dtype=torch.long),
+        "candidate_head_ids": candidate_head_ids,
+    }
+    return compact, signatures
+
+
+def _decode_examples(compact, signatures):
+    """Inverse of `_encode_examples`."""
+    body_groups = {}
+    for body_id, head_ids in zip(compact["body_ids"].tolist(), compact["candidate_head_ids"]):
+        body_groups[signatures[body_id]] = {
+            "candidate_heads": tuple(signatures[h] for h in head_ids.tolist())
+        }
+    head_vocab = build_head_vocab(body_groups)
+    group_head_vocab = [[] for _ in range(len(body_groups))]
+    for gid, head_signature in head_vocab:
+        group_head_vocab[gid].append((gid, head_signature))
+    feature_vocab = [
+        [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in vocab.tolist()]
+        for gid, vocab in enumerate(compact["feature_vocab"])
+    ]
+    return {
+        "features": compact["features"],
+        "targets": compact["targets"],
+        "feature_vocab": feature_vocab,
+        "head_vocab": group_head_vocab,
+        "body_groups": body_groups,
+    }
 
 
 def _build_body_conditioned_training_examples(
     atoms, clauses, dataset_labels, output_dir
 ):
     """Load or build per-group boolean feature and target tensors."""
-
-    def build():
+    # Features/targets/vocab ids live in the .pt file; the id -> atom signature
+    # mapping lives in a separate JSON file so signatures are stored only once.
+    cache_file = output_dir / "body_conditioned_examples.pt"
+    signature_file = output_dir / "atom_signatures.json"
+    if cache_file.exists() and signature_file.exists():
+        compact = torch.load(cache_file, weights_only=False)
+        with open(signature_file, "r") as f:
+            signatures = [tuple(s) for s in json.load(f)]
+        examples = _decode_examples(compact, signatures)
+        print(f"[Cache] Loaded {cache_file} and {signature_file}")
+    else:
         body_groups = group_clauses_by_body(clauses, dataset_labels)
         head_vocab = build_head_vocab(body_groups)
         examples = build_features(atoms, dataset_labels, body_groups, head_vocab)
         examples["body_groups"] = body_groups
-        return examples
-
-    # body_groups, vocabs, features and targets all live in this one file.
-    examples = _load_or_build_cache(output_dir / "body_conditioned_examples.pt", build)
+        compact, signatures = _encode_examples(examples)
+        torch.save(compact, cache_file)
+        utils_data.save_json(signatures, signature_file)
+        print(f"[Cache] Saved {cache_file} and {signature_file}")
     raise NotImplementedError()
     num_rows = sum(X.shape[0] for X in examples["features"])
     num_features = sum(X.shape[1] for X in examples["features"])
