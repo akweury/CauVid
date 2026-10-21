@@ -53,10 +53,21 @@ def _auto_batch_size(num_features, device, safety_factor=0.25, max_batch_size=1 
 
 
 def learn_extension_mask(
-    X, y, num_epochs=200, lr=0.1, l0_lambda=0.01, device='cpu', batch_size=None,
-    early_stop_tol=1e-4, early_stop_patience=10,
+    X, y, num_epochs=200, lr=0.1, l0_lambda=1e-3, device='cpu', batch_size=None,
+    early_stop_tol=1e-4, early_stop_patience=30, init_log_alpha=-5.0,
 ):
     # X: (N, M) float tensor (0/1), y: (N,) float tensor (0/1)
+    # The rule fires with s = prod_j (1 - w_j (1 - x_j)), w = sigmoid(log_alpha).
+    # Training avoids the ways all gates collapse to "off":
+    #   - gates are deterministic and start nearly off (`init_log_alpha`), so
+    #     the empty rule gives s ~= 1 and each feature is switched on only if
+    #     it helps. With w ~= 0.5, or with stochastic hard-concrete gates (which
+    #     randomly turn on ~20% of M gates per step), the product over hundreds
+    #     of absent features underflows to 0 for every row;
+    #   - the loss is computed from log s, never clamping s, so the gradient
+    #     survives even when s is tiny.
+    # Positives are up-weighted to balance rare heads, and `l0_lambda` is the
+    # cost of each selected atom (penalty = sum of w), independent of M.
     # X/y are kept on CPU and moved to `device` in row batches so that only one
     # (batch_size, M) slice lives on the GPU at a time -- the full (N, M) dense
     # block plus its `torch.prod` intermediate can otherwise exceed GPU memory
@@ -70,9 +81,10 @@ def learn_extension_mask(
     N, M = X_cpu.shape
     if batch_size is None:
         batch_size = _auto_batch_size(M, device)
-    log_alpha = torch.zeros(M, requires_grad=True, device=device)
+    log_alpha = torch.full((M,), init_log_alpha, requires_grad=True, device=device)
     optimizer = torch.optim.Adam([log_alpha], lr=lr)
-    const_term = _beta_const_log_term()
+    num_positives = float(y_cpu.sum())
+    pos_weight = (N - num_positives) / num_positives if num_positives > 0 else 1.0
     best_loss = float("inf")
     epochs_without_improvement = 0
 
@@ -105,10 +117,17 @@ def learn_extension_mask(
                     y_batch = y_cpu[start:end].to(device)
 
                 optimizer.zero_grad()
-                w = hard_concrete_mask(log_alpha, training=True)
-                s = torch.prod(1 - w.unsqueeze(0) * (1 - X_batch), dim=1)  # (batch,)
-                bce = torch.nn.functional.binary_cross_entropy(s.clamp(1e-6, 1 - 1e-6), y_batch)
-                l0_penalty = torch.sigmoid(log_alpha - const_term).sum()  # expected L0 norm
+                w = torch.sigmoid(log_alpha)
+                # log s = sum_j log(1 - w_j (1 - x_j)); the factor is capped
+                # below 1 so a fully-on gate on an absent feature stays finite.
+                off_factor = (w.unsqueeze(0) * (1 - X_batch)).clamp(max=1 - 1e-6)
+                log_s = torch.log1p(-off_factor).sum(dim=1)  # (batch,)
+                # log(1 - s); the epsilon keeps it finite (and its gradient
+                # alive) at s = 1, which is where training starts.
+                log_not_s = torch.log(-torch.expm1(log_s) + 1e-6)
+                weights = 1 + (pos_weight - 1) * y_batch
+                bce = -(weights * (y_batch * log_s + (1 - y_batch) * log_not_s)).sum() / weights.sum()
+                l0_penalty = w.sum()  # soft count of selected atoms
                 loss = bce + l0_lambda * l0_penalty
                 loss.backward()
                 optimizer.step()
@@ -116,9 +135,9 @@ def learn_extension_mask(
                 epoch_loss += loss.item()
 
                 if whole_dataset_fits:
-                    del w, s, bce, loss
+                    del w, off_factor, log_s, log_not_s, weights, bce, loss
                 else:
-                    del X_batch, y_batch, w, s, bce, loss
+                    del X_batch, y_batch, w, off_factor, log_s, log_not_s, weights, bce, loss
             except torch.cuda.OutOfMemoryError:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -142,7 +161,7 @@ def learn_extension_mask(
             if epochs_without_improvement >= early_stop_patience:
                 break
 
-    final_mask = (hard_concrete_mask(log_alpha, training=False) > 0.5)
+    final_mask = (torch.sigmoid(log_alpha) > 0.5)
     final_mask = final_mask.detach().to('cpu')
     final_log_alpha = log_alpha.detach().to('cpu')
     del log_alpha, X_cpu, y_cpu
@@ -699,7 +718,7 @@ def extend_clauses(
     min_confidence_gain=0.05,
     num_epochs=200,
     lr=0.1,
-    l0_lambda=0.01,
+    l0_lambda=1e-3,
 ):
     output_dir = cfg["output_dir"]
     device = cfg["device"]
