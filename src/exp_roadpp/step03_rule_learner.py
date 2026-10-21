@@ -1,21 +1,13 @@
 
-
-
 import torch
-from pathlib import Path
+
 import json 
 from tqdm import tqdm
-import os
-import random
+
 import numpy as np
-from scipy import sparse
-from sklearn.metrics import accuracy_score, f1_score
-from collections import Counter
 
 from src.exp_roadpp import utils_data
-from src.exp_roadpp.step03_pred_eval import get_video_data, predict_next_n_steps
-
-
+from src.exp_roadpp.step03_pred_eval import get_video_data
 
 def _atom_entity_key(atom_signature):
     tube_uid = atom_signature[-1]
@@ -24,7 +16,7 @@ def _atom_entity_key(atom_signature):
         return ("tube_uid", tube_uid)
     if agent_class == "av":
         return ("agent_class", "av")
-    return None
+    raise ValueError()
 
 
 def hard_concrete_mask(log_alpha, beta=2 / 3, gamma=-0.1, zeta=1.1, training=True):
@@ -187,239 +179,164 @@ def group_clauses_by_body(clauses, dataset_labels):
     print(f"[Grouping] Clauses grouped by body: {len(clauses)} -> {len(clauses_by_body)}")
     return clauses_by_body
 
-def _build_body_conditioned_training_examples(
-    atoms, clauses, dataset_labels, output_dir
-):
-    """Load or build sparse feature and target matrices for each body group."""
-    body_groups = group_clauses_by_body(clauses, dataset_labels)
-    cache_dir = Path(output_dir) / "training_data"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    metadata_file = cache_dir / "body_conditioned_examples_v3_train.json"
-    features_file = cache_dir / "body_conditioned_features_v3_train.npz"
-    targets_file = cache_dir / "body_conditioned_targets_v3_train.npz"
-    group_ids_file = cache_dir / "body_conditioned_group_ids_v3_train.npz"
-
-    body_signatures = tuple(body_groups)
-    body_ids = {
-        body_signature: index
-        for index, body_signature in enumerate(body_signatures)
-    }
-    metadata_groups = [
-        {
-            "body_signature": list(body_signature),
-            "candidate_heads": [
-                list(head_signature)
-                for head_signature in body_groups[body_signature]["candidate_heads"]
-            ],
-        }
-        for body_signature in body_signatures
-    ]
-
-    if all(path.exists() for path in (
-        metadata_file, features_file, targets_file, group_ids_file
-    )):
-        print(f"[Training data] Loading sparse training cache from {metadata_file}")
-        cache_metadata = utils_data.load_json(metadata_file)
-        if cache_metadata.get("schema_version") != 3:
-            raise ValueError("Unsupported sparse training cache version.")
-        cached_groups = cache_metadata["groups"]
-        if cached_groups != metadata_groups:
-            raise ValueError(
-                "Cached body groups or candidate heads do not match current rules."
-            )
-        features = sparse.load_npz(features_file).tocsr()
-        targets = sparse.load_npz(targets_file).tocsr()
-        with np.load(group_ids_file) as group_data:
-            group_ids = group_data["group_ids"]
-        if features.shape[0] != targets.shape[0] or features.shape[0] != len(group_ids):
-            raise ValueError("Cached training matrices have inconsistent row counts.")
-        return {
-            "body_groups": body_groups,
-            "features": features,
-            "targets": targets,
-            "group_ids": group_ids,
-            "feature_vocab": tuple(
-                (
-                    int(item["group_id"]),
-                    item["object_slot"] if item["object_slot"] is None else int(item["object_slot"]),
-                    tuple(item["signature"]),
-                )
-                for item in cache_metadata["feature_vocab"]
-            ),
-            "head_vocab": tuple(
-                (int(item["group_id"]), tuple(item["signature"]))
-                for item in cache_metadata["head_vocab"]
-            ),
-        }
-
-    feature_ids = {}
-    head_ids = {}
-    feature_vocab = []
+def build_head_vocab(body_groups):
     head_vocab = []
-    feature_rows = []
-    feature_columns = []
-    target_rows = []
-    target_columns = []
-    group_ids = []
-    row_count = 0
-
-    for body_signature, body_group in body_groups.items():
-        group_id = body_ids[body_signature]
-        head_ids[body_signature] = {}
+    for group_id, (body_signature, body_group) in enumerate(body_groups.items()):
         for head_signature in body_group["candidate_heads"]:
-            head_ids[body_signature][head_signature] = len(head_vocab)
             head_vocab.append((group_id, head_signature))
+    return head_vocab
+    
+    
+def build_features(atoms, dataset_labels, body_groups, head_vocab):
+    """Build dense boolean feature/target tensors, one pair per body group.
+
+    For group g, one row = one occurrence of g's body atom in frame t.
+      features[g]: bool (N_g, M_g); column j = feature_vocab[g][j], a
+          co-occurring atom (group_id, object_slot, fact) in frame t.
+      targets[g]:  bool (N_g, H_g); column k = head_vocab[g][k], True if that
+          head fact holds for the same entity in frame t+1.
+    Columns are local to each group, so no tensor carries other groups' zeros.
+    """
+    # body_signature -> group_id, same order as build_head_vocab's enumerate.
+    body_ids = {body_signature: gid for gid, body_signature in enumerate(body_groups)}
+    num_groups = len(body_groups)
+
+    # Split the global head_vocab into per-group local columns.
+    group_head_vocab = [[] for _ in range(num_groups)]
+    for gid, head_signature in head_vocab:
+        group_head_vocab[gid].append((gid, head_signature))
+
+    # Per-group accumulators; vocab grows while scanning, so collect (row, col)
+    # pairs first and allocate the dense tensors once sizes are known.
+    feature_ids = [{} for _ in range(num_groups)]
+    group_feature_vocab = [[] for _ in range(num_groups)]
+    feature_rows = [[] for _ in range(num_groups)]
+    feature_columns = [[] for _ in range(num_groups)]
+    target_rows = [[] for _ in range(num_groups)]
+    target_columns = [[] for _ in range(num_groups)]
+    row_counts = [0] * num_groups
 
     for video_id, video_atoms in tqdm(atoms.items(), desc="Processing videos"):
-        video_data = get_video_data(video_id, video_atoms, dataset_labels)
-        frame_data = video_data["frame_data"]
-
-        for frame_id, current_atoms in frame_data.items():
-            # Skip the last frame since it has no next frame to predict.
-            next_atoms = frame_data.get(frame_id + 1)
-            if next_atoms is None:
-                continue
-            # Organize next frame atoms by their entity key for efficient lookup.
+        video_data = get_video_data(video_atoms, dataset_labels)
+        for current_frame, next_frame in video_data:
+            # Index next-frame facts by entity so a body atom can look up what
+            # happens to *its own* entity at t+1.
             next_atoms_by_entity = {}
-            for atom_signature in next_atoms:
-                entity_key = _atom_entity_key(atom_signature)
-                if entity_key is not None:
-                    next_atoms_by_entity.setdefault(entity_key, set()).add(
-                        atom_signature[:-2]
-                    )
+            for atom_signature in next_frame:
+                next_atoms_by_entity.setdefault(
+                    _atom_entity_key(atom_signature), set()
+                ).add(atom_signature[:-2])
 
-            for body_atom in current_atoms:
+            for body_atom in current_frame:
                 body_signature = body_atom[:-2]
-                if body_signature not in body_groups:
+                group_id = body_ids.get(body_signature)
+                # Only atoms that are the body of some candidate clause become rows.
+                if group_id is None:
                     continue
                 entity_key = _atom_entity_key(body_atom)
                 next_entity_facts = next_atoms_by_entity.get(entity_key)
+                # Entity disappears in t+1: no supervision for this row.
                 if not next_entity_facts:
                     continue
 
-                group_id = body_ids[body_signature]
+                row = row_counts[group_id]
+                ids = feature_ids[group_id]
+                vocab = group_feature_vocab[group_id]
+
+                # object_slot: 0 = the body's own entity; other entities get
+                # 1, 2, ... in order of first appearance, so atoms sharing a slot
+                # refer to the same other object (variable co-reference).
                 active_features = set()
-                # object_slot distinguishes which concrete object a co-occurring atom
-                # refers to: 0 is always the body's own (anchor) object; atoms about
-                # other objects get their own increasing slot number so that two
-                # atoms sharing a slot are known to refer to the *same* other object
-                # (variable co-reference); atoms with no object binding (e.g. purely
-                # scene-level facts) get slot None.
                 other_entity_slots = {}
-                for atom in current_atoms:
+                for atom in current_frame:
                     atom_fact = atom[:-2]
+                    # Skip the body itself; it is implied by the group.
                     if atom_fact == body_signature:
                         continue
                     atom_entity_key = _atom_entity_key(atom)
                     if atom_entity_key == entity_key:
                         object_slot = 0
-                    elif atom_entity_key is None:
-                        object_slot = None
                     else:
                         object_slot = other_entity_slots.setdefault(
                             atom_entity_key, len(other_entity_slots) + 1
                         )
                     feature_key = (group_id, object_slot, atom_fact)
-                    feature_id = feature_ids.get(feature_key)
+                    feature_id = ids.get(feature_key)
                     if feature_id is None:
-                        feature_id = len(feature_vocab)
-                        feature_ids[feature_key] = feature_id
-                        feature_vocab.append(feature_key)
+                        feature_id = len(vocab)
+                        ids[feature_key] = feature_id
+                        vocab.append(feature_key)
                     active_features.add(feature_id)
 
                 for feature_id in active_features:
-                    feature_rows.append(row_count)
-                    feature_columns.append(feature_id)
-
-                for head_signature, target_id in head_ids[body_signature].items():
+                    feature_rows[group_id].append(row)
+                    feature_columns[group_id].append(feature_id)
+                # Positive target for each candidate head of this group that
+                # holds for the same entity in the next frame.
+                for head_col, (_gid, head_signature) in enumerate(group_head_vocab[group_id]):
                     if head_signature in next_entity_facts:
-                        target_rows.append(row_count)
-                        target_columns.append(target_id)
+                        target_rows[group_id].append(row)
+                        target_columns[group_id].append(head_col)
+                row_counts[group_id] += 1
 
-                group_ids.append(group_id)
-                row_count += 1
+    def _to_index(values):
+        # Explicit long dtype: an empty Python list would otherwise become a
+        # float tensor, which torch rejects as an index.
+        return torch.tensor(values, dtype=torch.long)
 
-    features = sparse.csr_matrix(
-        (
-            np.ones(len(feature_rows), dtype=np.uint8),
-            (feature_rows, feature_columns),
-        ),
-        shape=(row_count, len(feature_vocab)),
-        dtype=np.uint8,
-    )
-    targets = sparse.csr_matrix(
-        (
-            np.ones(len(target_rows), dtype=np.uint8),
-            (target_rows, target_columns),
-        ),
-        shape=(row_count, len(head_vocab)),
-        dtype=np.uint8,
-    )
-    group_ids_array = np.asarray(group_ids, dtype=np.int32)
+    features = []
+    targets = []
+    for gid in range(num_groups):
+        X = torch.zeros((row_counts[gid], len(group_feature_vocab[gid])), dtype=torch.bool)
+        X[_to_index(feature_rows[gid]), _to_index(feature_columns[gid])] = True
+        Y = torch.zeros((row_counts[gid], len(group_head_vocab[gid])), dtype=torch.bool)
+        Y[_to_index(target_rows[gid]), _to_index(target_columns[gid])] = True
+        features.append(X)
+        targets.append(Y)
 
-    utils_data.save_json(
-        {
-            "schema_version": 3,
-            "groups": metadata_groups,
-            "feature_vocab": [
-                {
-                    "group_id": group_id,
-                    "object_slot": object_slot,
-                    "signature": list(signature),
-                }
-                for group_id, object_slot, signature in feature_vocab
-            ],
-            "head_vocab": [
-                {
-                    "group_id": group_id,
-                    "signature": list(signature),
-                }
-                for group_id, signature in head_vocab
-            ],
-        },
-        metadata_file,
-    )
-    sparse.save_npz(features_file, features, compressed=True)
-    sparse.save_npz(targets_file, targets, compressed=True)
-    np.savez_compressed(group_ids_file, group_ids=group_ids_array)
-
-    print(
-        f"[Training data] Prepared sparse matrices: "
-        f"{features.shape[0]} examples, {features.shape[1]} features, "
-        f"{targets.shape[1]} candidate heads"
-    )
-    print(f"[Training data] Cached sparse examples under {cache_dir}")
     return {
-        "body_groups": body_groups,
         "features": features,
         "targets": targets,
-        "group_ids": group_ids_array,
-        "feature_vocab": tuple(feature_vocab),
-        "head_vocab": tuple(head_vocab),
+        "feature_vocab": group_feature_vocab,
+        "head_vocab": group_head_vocab,
     }
 
 
-def _build_group_indices(training_examples_by_body):
-    # Implement the logic to build group indices based on the training examples by body
-    group_ids = training_examples_by_body["group_ids"]
-    feature_vocab = training_examples_by_body["feature_vocab"]
-    head_vocab = training_examples_by_body["head_vocab"]
-
-    rows_by_group = {}
-    for gid in np.unique(group_ids):
-        rows_by_group[int(gid)] = np.where(group_ids == gid)[0]
-
-    feature_cols_by_group = {}
-    for idx, (gid, _object_slot, _sig) in enumerate(feature_vocab):
-        feature_cols_by_group.setdefault(gid, []).append(idx)
-
-    head_cols_by_group = {}
-    for idx, (gid, _sig) in enumerate(head_vocab):
-        head_cols_by_group.setdefault(gid, []).append(idx)
+def _load_or_build_cache(cache_file, build_fn):
+    """Return the dict cached in `cache_file`, or call `build_fn()` and cache it."""
+    if cache_file.exists():
+        data = torch.load(cache_file, weights_only=False)
+        print(f"[Cache] Loaded {cache_file}")
+        return data
+    data = build_fn()
+    torch.save(data, cache_file)
+    print(f"[Cache] Saved {cache_file}")
+    return data
 
 
-    return rows_by_group, feature_cols_by_group, head_cols_by_group
+def _build_body_conditioned_training_examples(
+    atoms, clauses, dataset_labels, output_dir
+):
+    """Load or build per-group boolean feature and target tensors."""
 
+    def build():
+        body_groups = group_clauses_by_body(clauses, dataset_labels)
+        head_vocab = build_head_vocab(body_groups)
+        examples = build_features(atoms, dataset_labels, body_groups, head_vocab)
+        examples["body_groups"] = body_groups
+        return examples
+
+    # body_groups, vocabs, features and targets all live in this one file.
+    examples = _load_or_build_cache(output_dir / "body_conditioned_examples.pt", build)
+    raise NotImplementedError()
+    num_rows = sum(X.shape[0] for X in examples["features"])
+    num_features = sum(X.shape[1] for X in examples["features"])
+    num_heads = sum(Y.shape[1] for Y in examples["targets"])
+    print(
+        f"[Training data] {len(examples['body_groups'])} groups, {num_rows} examples, "
+        f"{num_features} features, {num_heads} candidate heads"
+    )
+    return examples
 
 
 def _evaluate_extension(feature_block, target_col, selected_feature_positions):
@@ -513,48 +430,37 @@ def extend_clauses(
         with open(output_file, "r") as f:
             extended_data = json.load(f)
     else:
-
         training_examples_by_body = _build_body_conditioned_training_examples(
             atoms, coarse_pruned_clauses, dataset_labels, output_dir
         )
-        features = training_examples_by_body["features"].tocsc()
-        targets = training_examples_by_body["targets"].tocsc()
+        features = training_examples_by_body["features"]
+        targets = training_examples_by_body["targets"]
         feature_vocab = training_examples_by_body["feature_vocab"]
         head_vocab = training_examples_by_body["head_vocab"]
-
-        rows_by_group, feature_cols_by_group, head_cols_by_group = _build_group_indices(
-            training_examples_by_body
-        )
 
         extended_data = []
 
         # extension in one shot: differentiable conjunctive rule learning, group by group
-        for gid in tqdm(rows_by_group, desc="Learning rule extensions"):
-            rows = rows_by_group.get(gid)
-            feature_cols = feature_cols_by_group.get(gid, [])
-            head_cols = head_cols_by_group.get(gid, [])
-            if rows is None or len(rows) == 0 or len(feature_cols) == 0 or len(head_cols) == 0:
+        for gid in tqdm(range(len(features)), desc="Learning rule extensions"):
+            num_rows, num_feature_cols = features[gid].shape
+            num_head_cols = targets[gid].shape[1]
+            if num_rows == 0 or num_feature_cols == 0 or num_head_cols == 0:
                 print(
                     f"[Rule extension] Skipping group {gid}: "
-                    f"rows={0 if rows is None else len(rows)}, "
-                    f"feature_cols={len(feature_cols)}, head_cols={len(head_cols)} "
+                    f"rows={num_rows}, feature_cols={num_feature_cols}, "
+                    f"head_cols={num_head_cols} "
                     "(nothing to learn for this body-group)."
                 )
                 continue
 
-            # Dense slice of this group's features: (N, M) -- kept on CPU; only
-            # row-batches are moved to the GPU inside `learn_extension_mask` to
-            # avoid holding the full (N, M) block (plus its forward/backward
-            # intermediates) in GPU memory at once.
-            feature_block = np.asarray(
-                features[rows][:, feature_cols].todense()
-            ).astype(np.float32)
-            X = torch.from_numpy(feature_block)
+            # This group's (N, M) block, kept on CPU; only row-batches are moved
+            # to the GPU inside `learn_extension_mask`. Float copy for training,
+            # numpy view of the bool block for hard evaluation.
+            X = features[gid].float()
+            feature_block = features[gid].numpy()
 
-            for head_col in head_cols:
-                target_col = np.asarray(
-                    targets[rows][:, head_col].todense()
-                ).ravel().astype(np.float32)
+            for head_col in range(num_head_cols):
+                target_col = targets[gid][:, head_col].numpy().astype(np.float32)
 
                 # Skip degenerate targets: nothing to learn if the head never fires
                 # or always fires for this body-group.
@@ -603,13 +509,11 @@ def extend_clauses(
                     )
                     continue
 
-                selected_atoms = [
-                    feature_vocab[feature_cols[pos]] for pos in selected_positions
-                ]
+                selected_atoms = [feature_vocab[gid][pos] for pos in selected_positions]
                 print(f"Extra Atom Num: {len(selected_atoms)}")
                 extended_data.append({
                     "group_id": gid,
-                    "head": head_vocab[head_col],
+                    "head": head_vocab[gid][head_col],
                     "extra_atoms": selected_atoms,
                     "metrics": metrics,
                 })
