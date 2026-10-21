@@ -62,6 +62,7 @@ def _auto_batch_size(num_features, device, safety_factor=0.25, max_batch_size=1 
 
 def learn_extension_mask(
     X, y, num_epochs=200, lr=0.1, l0_lambda=0.01, device='cpu', batch_size=None,
+    early_stop_tol=1e-4, early_stop_patience=10,
 ):
     # X: (N, M) float tensor (0/1), y: (N,) float tensor (0/1)
     # X/y are kept on CPU and moved to `device` in row batches so that only one
@@ -80,6 +81,8 @@ def learn_extension_mask(
     log_alpha = torch.zeros(M, requires_grad=True, device=device)
     optimizer = torch.optim.Adam([log_alpha], lr=lr)
     const_term = _beta_const_log_term()
+    best_loss = float("inf")
+    epochs_without_improvement = 0
 
     whole_dataset_fits = batch_size >= N
     if whole_dataset_fits:
@@ -98,6 +101,7 @@ def learn_extension_mask(
             raise
 
     for _ in range(num_epochs):
+        epoch_loss = 0.0
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             try:
@@ -117,6 +121,8 @@ def learn_extension_mask(
                 loss.backward()
                 optimizer.step()
 
+                epoch_loss += loss.item()
+
                 if whole_dataset_fits:
                     del w, s, bce, loss
                 else:
@@ -131,6 +137,18 @@ def learn_extension_mask(
                     "smaller --num_epochs, or pass --device cpu."
                 )
                 raise
+
+        # Early stopping: stop once the per-epoch loss stops improving by more
+        # than `early_stop_tol` for `early_stop_patience` consecutive epochs.
+        # This avoids wasting epochs after convergence, which otherwise
+        # dominates runtime now that the whole dataset can live on the GPU.
+        if best_loss - epoch_loss > early_stop_tol:
+            best_loss = epoch_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stop_patience:
+                break
 
     final_mask = (hard_concrete_mask(log_alpha, training=False) > 0.5)
     final_mask = final_mask.detach().to('cpu')
@@ -516,6 +534,12 @@ def extend_clauses(
             feature_cols = feature_cols_by_group.get(gid, [])
             head_cols = head_cols_by_group.get(gid, [])
             if rows is None or len(rows) == 0 or len(feature_cols) == 0 or len(head_cols) == 0:
+                print(
+                    f"[Rule extension] Skipping group {gid}: "
+                    f"rows={0 if rows is None else len(rows)}, "
+                    f"feature_cols={len(feature_cols)}, head_cols={len(head_cols)} "
+                    "(nothing to learn for this body-group)."
+                )
                 continue
 
             # Dense slice of this group's features: (N, M) -- kept on CPU; only
@@ -535,6 +559,11 @@ def extend_clauses(
                 # Skip degenerate targets: nothing to learn if the head never fires
                 # or always fires for this body-group.
                 if target_col.sum() == 0 or target_col.sum() == len(target_col):
+                    print(
+                        f"[Rule extension] Skipping group {gid}, head {head_col}: "
+                        f"degenerate target (head fires in {int(target_col.sum())}/"
+                        f"{len(target_col)} rows)."
+                    )
                     continue
 
                 y = torch.from_numpy(target_col)
@@ -553,12 +582,25 @@ def extend_clauses(
                 selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
                 del final_mask, log_alpha
                 if not selected_positions:
+                    print(
+                        f"[Rule extension] Skipping group {gid}, head {head_col}: "
+                        "learned mask selected no extra atoms."
+                    )
                     continue
 
                 metrics = _evaluate_extension(feature_block, target_col, selected_positions)
                 if metrics["support"] < min_support:
+                    print(
+                        f"[Rule extension] Skipping group {gid}, head {head_col}: "
+                        f"support {metrics['support']} < min_support {min_support}."
+                    )
                     continue
                 if metrics["confidence_gain"] < min_confidence_gain:
+                    print(
+                        f"[Rule extension] Skipping group {gid}, head {head_col}: "
+                        f"confidence_gain {metrics['confidence_gain']:.4f} < "
+                        f"min_confidence_gain {min_confidence_gain}."
+                    )
                     continue
 
                 selected_atoms = [
