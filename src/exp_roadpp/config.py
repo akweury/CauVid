@@ -29,8 +29,9 @@ def step_0_setup(args):
     # dgx
     elif args.machine == "dgx":
         args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
-        args.output_dir = root / 'output'/ 'roadpp' / args.exp
+        args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
         args.device = f'{args.device}'
+        print(f"\n##### Output directory: {args.output_dir} #####\n")
     
     # macbook pro
     elif args.machine == "macbook-pro":
