@@ -97,3 +97,13 @@ docker run --rm -it \
     -e TORCH_HOME=/.cache/torch \
     "$IMAGE_NAME" \
     python -m src.exp_roadpp.main --device "$DEVICE" --machine "$MACHINE" "${EXTRA_ARGS[@]}"
+
+# --- Report where the outputs were written ---
+EXP_NAME="debug"
+for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
+    if [[ "${EXTRA_ARGS[$i]}" == "--exp" ]]; then
+        EXP_NAME="${EXTRA_ARGS[$((i + 1))]}"
+        break
+    fi
+done
+echo "[run_roadpp_docker] Output folder:   $SCRIPT_DIR/src/exp_roadpp/output/roadpp/$EXP_NAME"
