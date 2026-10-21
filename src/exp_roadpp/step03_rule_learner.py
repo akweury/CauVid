@@ -43,7 +43,7 @@ def _beta_const_log_term(beta=2 / 3, gamma=-0.1, zeta=1.1):
     return beta * np.log(-gamma / zeta)
 
 
-def _auto_batch_size(num_features, device, safety_factor=0.25, max_batch_size=65536):
+def _auto_batch_size(num_features, device, safety_factor=0.25, max_batch_size=1 << 20):
     """Pick a row batch size that should fit in the current GPU's free memory.
 
     Scales with whatever card is attached at runtime (e.g. 8GB GTX 1080 vs an
@@ -69,7 +69,9 @@ def learn_extension_mask(
     # block plus its `torch.prod` intermediate can otherwise exceed GPU memory
     # (e.g. on an 8GB GTX 1080) when N or M is large. `batch_size=None` auto-sizes
     # the batch from the currently attached GPU's free memory, so the same code
-    # adapts whether it runs on a GTX 1080 or an A100.
+    # adapts whether it runs on a GTX 1080 or an A100. If the whole dataset fits
+    # in one batch (common on an A100), it is uploaded to the GPU once instead of
+    # being re-copied from CPU every epoch, which otherwise dominates runtime.
     X_cpu = X.detach().to('cpu')
     y_cpu = y.detach().to('cpu')
     N, M = X_cpu.shape
@@ -79,12 +81,32 @@ def learn_extension_mask(
     optimizer = torch.optim.Adam([log_alpha], lr=lr)
     const_term = _beta_const_log_term()
 
+    whole_dataset_fits = batch_size >= N
+    if whole_dataset_fits:
+        try:
+            X_resident = X_cpu.to(device)
+            y_resident = y_cpu.to(device)
+        except torch.cuda.OutOfMemoryError:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(
+                "[Rule extension] CUDA out of memory while uploading training "
+                f"data to device={device} (N={N}, M={M}). Re-run with a "
+                "smaller --batch_size, a smaller --num_epochs, or pass "
+                "--device cpu."
+            )
+            raise
+
     for _ in range(num_epochs):
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
             try:
-                X_batch = X_cpu[start:end].to(device)
-                y_batch = y_cpu[start:end].to(device)
+                if whole_dataset_fits:
+                    X_batch = X_resident
+                    y_batch = y_resident
+                else:
+                    X_batch = X_cpu[start:end].to(device)
+                    y_batch = y_cpu[start:end].to(device)
 
                 optimizer.zero_grad()
                 w = hard_concrete_mask(log_alpha, training=True)
@@ -95,7 +117,10 @@ def learn_extension_mask(
                 loss.backward()
                 optimizer.step()
 
-                del X_batch, y_batch, w, s, bce, loss
+                if whole_dataset_fits:
+                    del w, s, bce, loss
+                else:
+                    del X_batch, y_batch, w, s, bce, loss
             except torch.cuda.OutOfMemoryError:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -111,6 +136,8 @@ def learn_extension_mask(
     final_mask = final_mask.detach().to('cpu')
     final_log_alpha = log_alpha.detach().to('cpu')
     del log_alpha, X_cpu, y_cpu
+    if whole_dataset_fits:
+        del X_resident, y_resident
     if device != 'cpu' and torch.cuda.is_available():
         torch.cuda.empty_cache()
     return final_mask, final_log_alpha
