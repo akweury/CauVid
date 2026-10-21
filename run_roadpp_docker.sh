@@ -61,9 +61,15 @@ mkdir -p "$TORCH_CACHE_HOST"
 if [[ "$GPU_ARG" == "none" ]]; then
     GPU_DOCKER_ARGS=()
     DEVICE="${CAUVID_ROADPP_DEVICE:-cpu}"
+elif [[ "$GPU_ARG" == "all" ]]; then
+    GPU_DOCKER_ARGS=(--gpus all)
+    DEVICE="${CAUVID_ROADPP_DEVICE:-cuda:0}"
 else
-    GPU_DOCKER_ARGS=(--gpus "$GPU_ARG")
-    DEVICE="${CAUVID_ROADPP_DEVICE:-$GPU_ARG}"
+    # Pin to a specific physical GPU index. Docker then exposes only that
+    # GPU inside the container, where it always shows up as cuda:0 (NOT
+    # cuda:$GPU_ARG) -- so the --device passed to main.py must be cuda:0.
+    GPU_DOCKER_ARGS=(--gpus "device=$GPU_ARG")
+    DEVICE="${CAUVID_ROADPP_DEVICE:-cuda:0}"
 fi
 
 echo "[run_roadpp_docker] Image:           $IMAGE_NAME"
