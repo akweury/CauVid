@@ -64,7 +64,7 @@ if [[ "$GPU_ARG" == "none" ]]; then
     DEVICE="${CAUVID_ROADPP_DEVICE:-cpu}"
 else
     GPU_DOCKER_ARGS=(--gpus "$GPU_ARG")
-    DEVICE="${CAUVID_ROADPP_DEVICE:-cuda:0}"
+    DEVICE="${CAUVID_ROADPP_DEVICE:-$GPU_ARG}"
 fi
 
 echo "[run_roadpp_docker] Image:           $IMAGE_NAME"
