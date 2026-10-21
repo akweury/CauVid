@@ -64,13 +64,13 @@ class ActionPredictorTest(unittest.TestCase):
             [{
                 "group_id": 0,
                 "head": (0, head[:-2]),
-                "extra_atoms": [(0, "scene", extra_body[:-2])],
+                "extra_atoms": [(0, 1, extra_body[:-2])],
                 "metrics": metrics,
             }],
             {"body_groups": {body[:-2]: {}}},
         )
 
-        self.assertEqual(clauses[0]["body_scopes"], ["entity", "scene"])
+        self.assertEqual(clauses[0]["body_scopes"], [0, 1])
 
     def test_predict_requires_all_extended_clause_bodies(self) -> None:
         body = build_signature("action", "walking", 0, "pedestrian", "pedestrian", "tube-1")
@@ -122,7 +122,7 @@ class ActionPredictorTest(unittest.TestCase):
         entity_scoped_model = ActionPredictor(
             [{
                 "bodies": [body[:-2], context[:-2]],
-                "body_scopes": ["entity", "entity"],
+                "body_scopes": [0, 0],
                 "head": head[:-2],
                 "confidence": 0.9,
             }],

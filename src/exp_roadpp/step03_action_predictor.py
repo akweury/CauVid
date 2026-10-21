@@ -204,27 +204,36 @@ class ActionPredictor:
     
     
     def _body_conditions_match(self, body_signatures, body_scopes, entity_key, siss):
-        """Return whether every learned condition matches the current scene."""
+        """Return whether every learned condition matches the current scene.
+
+        `body_scopes` entries are integer object-slot variables (or None):
+          - 0: the condition atom must refer to the same object as the clause
+            anchor (`entity_key`).
+          - None: the condition atom is not tied to any particular object.
+          - any other integer: the condition atom must refer to some object
+            other than the anchor; atoms that share the same slot number must
+            resolve to the very same concrete object (variable co-reference).
+        """
+        slot_bindings = {0: entity_key}
         for body_index, body_signature in enumerate(body_signatures[1:], start=1):
             required_fact = self._fact_signature(body_signature)
-            scope = (
-                body_scopes[body_index]
-                if body_index < len(body_scopes)
-                else "scene"
-            )
-            if scope not in ("entity", "scene"):
-                raise ValueError(f"Unknown extended-clause body scope: {scope}")
+            slot = body_scopes[body_index] if body_index < len(body_scopes) else None
 
             for atom_index, atom in enumerate(siss):
                 if self._fact_signature(atom) != required_fact:
                     continue
-                condition_entity = self._entity_key(atom, atom_index)
-                if (
-                    scope == "entity" and condition_entity == entity_key
-                ) or (
-                    scope == "scene" and condition_entity != entity_key
-                ):
+                if slot is None:
                     break
+                condition_entity = self._entity_key(atom, atom_index)
+                bound_entity = slot_bindings.get(slot)
+                if bound_entity is not None:
+                    if condition_entity == bound_entity:
+                        break
+                    continue
+                if condition_entity == entity_key:
+                    continue
+                slot_bindings[slot] = condition_entity
+                break
             else:
                 return False
 

@@ -164,14 +164,13 @@ def predict_next_n_steps(test_atoms, output_dir, dataset_labels, step=1):
 
 
 def build_frame_proposals(frame_atoms, clause_matrix, unique_bodies, obj_num, label_num):
-    proposals = torch.zeros((obj_num, label_num))
-    
-    body_matrix = torch.zeros(len(unique_bodies))
+    proposals = torch.zeros((obj_num, label_num), dtype=torch.bool)
+    body_matrix = torch.zeros(len(unique_bodies), dtype=torch.bool)
     for atom in frame_atoms:
         if atom[:-2] in unique_bodies:
             body_matrix[unique_bodies.index(atom[:-2])] = True 
-    proposals = (~clause_matrix | body_matrix).all(dim=1)
-    
+    proposals = (~clause_matrix | body_matrix).all(dim=1).nonzero(as_tuple=False).squeeze(-1)
+
     return proposals
             
 
@@ -185,17 +184,35 @@ def build_video_matrix(apf, vm, ocm_mask, tube_ids, bk):
             continue
         # objs in this frame
         # estimate active clauses for this frame based on object presence
-        frame_proposals = build_frame_proposals(apf[frame_i],bk["clause_matrix"], 
-                                                bk["unique_bodies"], 
-                                                vm.shape[0], vm.shape[2])
-        for atom in apf[frame_i]:
-            id = tube_ids.index(atom["tube_uid"])
-        vm[:, frame_i] = frame_proposals
+        frame_clause_proposals = build_frame_proposals(apf[frame_i],bk["clause_matrix"], 
+                                                       bk["unique_bodies"], 
+                                                       vm.shape[0], vm.shape[2])
+        
+        obj_matrix = torch.zeros((len(apf[frame_i]), 2))
+        for i, atom in enumerate(apf[frame_i]):
+            obj_matrix[i, 0] = tube_ids.index(atom[-1])
+            obj_matrix[i, 1] = bk["unique_bodies"].index(atom[:-2])
 
+        if frame_clause_proposals.sum() == 0:
+            print("No clause proposals were made.")
+
+        # now we need to determine the labels of each objects, either iterate over the atoms or the clause proposals   
+        for c_index in frame_clause_proposals:
+            c_bodies = bk["clause_matrix"][c_index].nonzero(as_tuple=False).squeeze(-1)
+            c_heads = bk["clause_heads"][c_index]
+            # for each body, determine which objects satisfy it
+            obj_proposals = obj_matrix[[i for i, body_id in enumerate(obj_matrix[:, 1]) if body_id in c_bodies],:]
+            # filter out the not possible objects
+            
+            # get the objects labels 
+            labels = None 
+            for obj in c_objs:
+                vm[obj, frame_i, labels] = True
+
+
+        vm[:, frame_i] = frame_clause_proposals
     
-    if proposals.sum() == 0:
-        print("No clause proposals were made.")
-    return proposals
+    return vm 
 
 def apply_clause_proposals(proposals, heads):
     # proposals includes active clauses for each frame

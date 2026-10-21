@@ -79,6 +79,58 @@ The default debug configuration is stored in `src/exp_roadpp/exp_config/debug.js
 For a quick local test, you can start with a small `data_num` value and verify
 that `src/exp_roadpp/output/roadpp/` is populated.
 
+## Run with Docker
+
+The repository root includes a `Dockerfile` and `docker-compose.yml` that can
+also be used to run this pipeline, instead of setting up a local Python
+environment.
+
+### Build the image
+
+From the repository root:
+
+```bash
+docker compose build cauvid-dev
+```
+
+### Run the pipeline in a container
+
+Mount your local ROAD-Waymo dataset folder to the path the container expects
+(`/app/src/exp_roadpp/data/roadpp`), then run `main.py` the same way as above:
+
+```bash
+docker run --rm -it \
+	--gpus all \
+	-v "$(pwd)/src:/app/src" \
+	-v "/path/to/your/roadpp:/app/src/exp_roadpp/data/roadpp" \
+	-v "$(pwd)/configs:/app/configs" \
+	-e PYTHONPATH=/app \
+	-e MPLBACKEND=Agg \
+	cauvid-pipeline \
+	python -m src.exp_roadpp.main --device cuda:0
+```
+
+Notes:
+
+- `--gpus all` requires the NVIDIA Container Toolkit on the host; drop this
+  flag (and use `--device cpu`) to run on CPU only.
+- Replace `/path/to/your/roadpp` with wherever you keep the dataset on the
+  host machine; it gets mounted read/write at the path `config.py` expects.
+- Any output written under `src/exp_roadpp/output/roadpp/` will appear in your
+  local `src/` folder since it is bind-mounted.
+
+### Interactive development container
+
+Alternatively, use the `cauvid-dev` service from `docker-compose.yml` to get
+an interactive shell with the source tree mounted, then run the pipeline
+manually:
+
+```bash
+docker compose run --rm cauvid-dev
+# inside the container:
+python -m src.exp_roadpp.main --device cuda:0
+```
+
 
 
 ### Discussion

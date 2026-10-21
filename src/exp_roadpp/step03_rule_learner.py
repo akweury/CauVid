@@ -43,25 +43,77 @@ def _beta_const_log_term(beta=2 / 3, gamma=-0.1, zeta=1.1):
     return beta * np.log(-gamma / zeta)
 
 
-def learn_extension_mask(X, y, num_epochs=200, lr=0.1, l0_lambda=0.01, device='cpu'):
+def _auto_batch_size(num_features, device, safety_factor=0.25, max_batch_size=65536):
+    """Pick a row batch size that should fit in the current GPU's free memory.
+
+    Scales with whatever card is attached at runtime (e.g. 8GB GTX 1080 vs an
+    80GB A100) instead of assuming a fixed size.
+    """
+    if device is None or str(device) == 'cpu' or not torch.cuda.is_available():
+        return max_batch_size
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    usable_bytes = free_bytes * safety_factor
+    # Heuristic: forward/backward intermediates for `hard_concrete_mask` and the
+    # `torch.prod` term need a handful of (batch, M) float32 buffers per row.
+    bytes_per_row = max(num_features, 1) * 4 * 6
+    batch_size = max(1, int(usable_bytes // bytes_per_row))
+    return min(batch_size, max_batch_size)
+
+
+def learn_extension_mask(
+    X, y, num_epochs=200, lr=0.1, l0_lambda=0.01, device='cpu', batch_size=None,
+):
     # X: (N, M) float tensor (0/1), y: (N,) float tensor (0/1)
-    M = X.shape[1]
+    # X/y are kept on CPU and moved to `device` in row batches so that only one
+    # (batch_size, M) slice lives on the GPU at a time -- the full (N, M) dense
+    # block plus its `torch.prod` intermediate can otherwise exceed GPU memory
+    # (e.g. on an 8GB GTX 1080) when N or M is large. `batch_size=None` auto-sizes
+    # the batch from the currently attached GPU's free memory, so the same code
+    # adapts whether it runs on a GTX 1080 or an A100.
+    X_cpu = X.detach().to('cpu')
+    y_cpu = y.detach().to('cpu')
+    N, M = X_cpu.shape
+    if batch_size is None:
+        batch_size = _auto_batch_size(M, device)
     log_alpha = torch.zeros(M, requires_grad=True, device=device)
     optimizer = torch.optim.Adam([log_alpha], lr=lr)
     const_term = _beta_const_log_term()
 
     for _ in range(num_epochs):
-        optimizer.zero_grad()
-        w = hard_concrete_mask(log_alpha, training=True)
-        s = torch.prod(1 - w.unsqueeze(0) * (1 - X), dim=1)  # (N,)
-        bce = torch.nn.functional.binary_cross_entropy(s.clamp(1e-6, 1 - 1e-6), y)
-        l0_penalty = torch.sigmoid(log_alpha - const_term).sum()  # expected L0 norm
-        loss = bce + l0_lambda * l0_penalty
-        loss.backward()
-        optimizer.step()
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            try:
+                X_batch = X_cpu[start:end].to(device)
+                y_batch = y_cpu[start:end].to(device)
+
+                optimizer.zero_grad()
+                w = hard_concrete_mask(log_alpha, training=True)
+                s = torch.prod(1 - w.unsqueeze(0) * (1 - X_batch), dim=1)  # (batch,)
+                bce = torch.nn.functional.binary_cross_entropy(s.clamp(1e-6, 1 - 1e-6), y_batch)
+                l0_penalty = torch.sigmoid(log_alpha - const_term).sum()  # expected L0 norm
+                loss = bce + l0_lambda * l0_penalty
+                loss.backward()
+                optimizer.step()
+
+                del X_batch, y_batch, w, s, bce, loss
+            except torch.cuda.OutOfMemoryError:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(
+                    "[Rule extension] CUDA out of memory while training on "
+                    f"device={device} with batch_size={batch_size} "
+                    f"(N={N}, M={M}). Re-run with a smaller --batch_size, a "
+                    "smaller --num_epochs, or pass --device cpu."
+                )
+                raise
 
     final_mask = (hard_concrete_mask(log_alpha, training=False) > 0.5)
-    return final_mask, log_alpha.detach()
+    final_mask = final_mask.detach().to('cpu')
+    final_log_alpha = log_alpha.detach().to('cpu')
+    del log_alpha, X_cpu, y_cpu
+    if device != 'cpu' and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return final_mask, final_log_alpha
 
 
 def group_clauses_by_body(clauses, dataset_labels):
@@ -97,10 +149,10 @@ def _build_body_conditioned_training_examples(
     body_groups = group_clauses_by_body(clauses, dataset_labels)
     cache_dir = Path(output_dir) / "training_data"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    metadata_file = cache_dir / "body_conditioned_examples_v2_train.json"
-    features_file = cache_dir / "body_conditioned_features_v2_train.npz"
-    targets_file = cache_dir / "body_conditioned_targets_v2_train.npz"
-    group_ids_file = cache_dir / "body_conditioned_group_ids_v2_train.npz"
+    metadata_file = cache_dir / "body_conditioned_examples_v3_train.json"
+    features_file = cache_dir / "body_conditioned_features_v3_train.npz"
+    targets_file = cache_dir / "body_conditioned_targets_v3_train.npz"
+    group_ids_file = cache_dir / "body_conditioned_group_ids_v3_train.npz"
 
     body_signatures = tuple(body_groups)
     body_ids = {
@@ -123,7 +175,7 @@ def _build_body_conditioned_training_examples(
     )):
         print(f"[Training data] Loading sparse training cache from {metadata_file}")
         cache_metadata = utils_data.load_json(metadata_file)
-        if cache_metadata.get("schema_version") != 2:
+        if cache_metadata.get("schema_version") != 3:
             raise ValueError("Unsupported sparse training cache version.")
         cached_groups = cache_metadata["groups"]
         if cached_groups != metadata_groups:
@@ -142,7 +194,11 @@ def _build_body_conditioned_training_examples(
             "targets": targets,
             "group_ids": group_ids,
             "feature_vocab": tuple(
-                (int(item["group_id"]), item["scope"], tuple(item["signature"]))
+                (
+                    int(item["group_id"]),
+                    item["object_slot"] if item["object_slot"] is None else int(item["object_slot"]),
+                    tuple(item["signature"]),
+                )
                 for item in cache_metadata["feature_vocab"]
             ),
             "head_vocab": tuple(
@@ -198,16 +254,27 @@ def _build_body_conditioned_training_examples(
 
                 group_id = body_ids[body_signature]
                 active_features = set()
+                # object_slot distinguishes which concrete object a co-occurring atom
+                # refers to: 0 is always the body's own (anchor) object; atoms about
+                # other objects get their own increasing slot number so that two
+                # atoms sharing a slot are known to refer to the *same* other object
+                # (variable co-reference); atoms with no object binding (e.g. purely
+                # scene-level facts) get slot None.
+                other_entity_slots = {}
                 for atom in current_atoms:
                     atom_fact = atom[:-2]
                     if atom_fact == body_signature:
                         continue
-                    scope = (
-                        "entity"
-                        if _atom_entity_key(atom) == entity_key
-                        else "scene"
-                    )
-                    feature_key = (group_id, scope, atom_fact)
+                    atom_entity_key = _atom_entity_key(atom)
+                    if atom_entity_key == entity_key:
+                        object_slot = 0
+                    elif atom_entity_key is None:
+                        object_slot = None
+                    else:
+                        object_slot = other_entity_slots.setdefault(
+                            atom_entity_key, len(other_entity_slots) + 1
+                        )
+                    feature_key = (group_id, object_slot, atom_fact)
                     feature_id = feature_ids.get(feature_key)
                     if feature_id is None:
                         feature_id = len(feature_vocab)
@@ -247,15 +314,15 @@ def _build_body_conditioned_training_examples(
 
     utils_data.save_json(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "groups": metadata_groups,
             "feature_vocab": [
                 {
                     "group_id": group_id,
-                    "scope": scope,
+                    "object_slot": object_slot,
                     "signature": list(signature),
                 }
-                for group_id, scope, signature in feature_vocab
+                for group_id, object_slot, signature in feature_vocab
             ],
             "head_vocab": [
                 {
@@ -298,7 +365,7 @@ def _build_group_indices(training_examples_by_body):
         rows_by_group[int(gid)] = np.where(group_ids == gid)[0]
 
     feature_cols_by_group = {}
-    for idx, (gid, _scope, _sig) in enumerate(feature_vocab):
+    for idx, (gid, _object_slot, _sig) in enumerate(feature_vocab):
         feature_cols_by_group.setdefault(gid, []).append(idx)
 
     head_cols_by_group = {}
@@ -358,7 +425,9 @@ def _to_extended_clauses(extended_data, training_examples_by_body):
     extended_clauses = []
     for item in extended_data:
         bodies = []
-        body_scopes = ["entity"]
+        # Slot 0 marks the clause's own (anchor) object; see object_slot comment
+        # in `_build_body_conditioned_training_examples`.
+        body_scopes = [0]
         group_body = list(body_groups.keys())[item['group_id']]
         bodies.append(group_body)
         for atom in item['extra_atoms']:
@@ -422,12 +491,14 @@ def extend_clauses(
             if rows is None or len(rows) == 0 or len(feature_cols) == 0 or len(head_cols) == 0:
                 continue
 
-            # Dense slice of this group's features: (N, M) -- cheap since both N and M
-            # are restricted to a single body-group.
+            # Dense slice of this group's features: (N, M) -- kept on CPU; only
+            # row-batches are moved to the GPU inside `learn_extension_mask` to
+            # avoid holding the full (N, M) block (plus its forward/backward
+            # intermediates) in GPU memory at once.
             feature_block = np.asarray(
                 features[rows][:, feature_cols].todense()
             ).astype(np.float32)
-            X = torch.from_numpy(feature_block).to(device)
+            X = torch.from_numpy(feature_block)
 
             for head_col in head_cols:
                 target_col = np.asarray(
@@ -439,12 +510,21 @@ def extend_clauses(
                 if target_col.sum() == 0 or target_col.sum() == len(target_col):
                     continue
 
-                y = torch.from_numpy(target_col).to(device)
+                y = torch.from_numpy(target_col)
 
-                final_mask, log_alpha = learn_extension_mask(
-                    X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
-                )
+                try:
+                    final_mask, log_alpha = learn_extension_mask(
+                        X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    print(
+                        f"[Rule extension] CUDA OOM for group {gid}, head {head_col} "
+                        f"on device={device}. Re-run with a smaller --batch_size, "
+                        "a smaller --num_epochs, or pass --device cpu."
+                    )
+                    raise
                 selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
+                del final_mask, log_alpha
                 if not selected_positions:
                     continue
 
@@ -464,6 +544,10 @@ def extend_clauses(
                     "extra_atoms": selected_atoms,
                     "metrics": metrics,
                 })
+
+            del X
+            if device != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         # save extended clauses to a file
         output_file = output_dir / "extended_clauses.json"
         utils_data.save_json(extended_data, output_file)
