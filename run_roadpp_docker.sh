@@ -16,8 +16,11 @@
 #
 # Environment variables (set before running, or export in your shell profile):
 #   CAUVID_ROADPP_DATA_HOST   Host path to the ROAD-Waymo dataset on dgx
-#                             (default: /home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp,
+#                             (default: /storage-01/ml-jsha/CauVid_Data/roadpp,
 #                             matching config.py's "dgx" dataset_path)
+#   CAUVID_ROADPP_OUTPUT_HOST Host path for pipeline outputs on dgx
+#                             (default: /storage-01/ml-jsha/CauVid_output,
+#                             matching config.py's "dgx" output_dir)
 #   CAUVID_TORCH_CACHE_HOST   Host path to cache downloaded model weights
 #                             (default: /storage-02/ml-jsha/.cache/torch)
 #   CAUVID_ROADPP_DEVICE      Device string passed to main.py
@@ -53,10 +56,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/storage-01/ml-jsha/CauVid_Data/roadpp}"
+ROADPP_OUTPUT_HOST="${CAUVID_ROADPP_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output}"
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
 MACHINE="${CAUVID_ROADPP_MACHINE:-dgx}"
 
-mkdir -p "$TORCH_CACHE_HOST"
+mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST"
 
 if [[ "$GPU_ARG" == "none" ]]; then
     GPU_DOCKER_ARGS=()
@@ -74,6 +78,7 @@ fi
 
 echo "[run_roadpp_docker] Image:           $IMAGE_NAME"
 echo "[run_roadpp_docker] Dataset path:    $ROADPP_DATA_HOST"
+echo "[run_roadpp_docker] Output host path:$ROADPP_OUTPUT_HOST"
 echo "[run_roadpp_docker] Torch cache:     $TORCH_CACHE_HOST"
 echo "[run_roadpp_docker] Machine:         $MACHINE"
 echo "[run_roadpp_docker] GPU:             $GPU_ARG"
@@ -87,16 +92,15 @@ if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
 fi
 
 # --- Run the pipeline ---
-# The dataset is mounted at the *same* absolute path as on the dgx host so
-# config.py's hardcoded "dgx" dataset_path resolves correctly inside the
-# container without any code changes. Output is written under
-# src/exp_roadpp/output/roadpp/<exp>, which lives inside the bind-mounted
-# $SCRIPT_DIR/src, so results land back on the host automatically.
+# The dataset and output dirs are mounted at the *same* absolute paths as on
+# the dgx host so config.py's hardcoded "dgx" dataset_path/output_dir resolve
+# correctly inside the container without any code changes.
 docker run --rm -it \
     "${GPU_DOCKER_ARGS[@]}" \
     -v "$SCRIPT_DIR/src:/app/src" \
     -v "$SCRIPT_DIR/configs:/app/configs" \
     -v "$ROADPP_DATA_HOST:$ROADPP_DATA_HOST" \
+    -v "$ROADPP_OUTPUT_HOST:$ROADPP_OUTPUT_HOST" \
     -v "$TORCH_CACHE_HOST:/.cache/torch" \
     -e PYTHONPATH=/app \
     -e MPLBACKEND=Agg \
@@ -112,4 +116,4 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
         break
     fi
 done
-echo "[run_roadpp_docker] Output folder:   $SCRIPT_DIR/src/exp_roadpp/output/roadpp/$EXP_NAME"
+echo "[run_roadpp_docker] Output folder:   $ROADPP_OUTPUT_HOST/roadpp/$EXP_NAME"
