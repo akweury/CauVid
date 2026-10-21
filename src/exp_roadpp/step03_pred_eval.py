@@ -52,8 +52,11 @@ def build_ocm(apf, ocm_mask, tube_ids, bk):
                                                        bk["unique_bodies"], 
                                                        ocm.shape[0], ocm.shape[2])
         
-        obj_matrix = torch.zeros((len(apf[frame_i]), 2))
-        for i, atom in enumerate(apf[frame_i]):
+        # Only atoms that are the body of some clause can trigger a clause;
+        # the rest of the frame's atoms are not in unique_bodies.
+        body_atoms = [atom for atom in apf[frame_i] if atom[:-2] in bk["unique_bodies"]]
+        obj_matrix = torch.zeros((len(body_atoms), 2))
+        for i, atom in enumerate(body_atoms):
             obj_matrix[i, 0] = tube_ids.index(atom[-1])
             obj_matrix[i, 1] = bk["unique_bodies"].index(atom[:-2])
 
