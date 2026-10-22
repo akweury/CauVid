@@ -39,6 +39,7 @@ def main():
     step06_input = config.get_step_06_input(args)
     step06.main(step06_input)
 
+    raise NotImplementedError()
     # run baseline methods
     step_baselines_input = config.get_step_baselines_input(args)
     step_baselines.main(step_baselines_input)

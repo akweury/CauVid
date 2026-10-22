@@ -89,13 +89,15 @@ def clauses_evaluation(bk, atoms, cfg):
 
 
 def main(input_data):
-    print("\n--------- Step 06 Evaluation ----------------------\n")
-    
-    atoms = input_data["atoms"]
+    print("\n--------- Step 06 Evaluation ----------------------\n")    
     cfg = {
-
+        "output_dir": Path(input_data["output_dir"]),
+        "device": input_data.get("device", "cpu")
     }
-    
+    atoms = utils_data.load_json(input_data["val_atoms_file"])
+    dataset_labels = utils_data.load_json(input_data["dataset_labels_file"])
+    extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
+
     bk = build_background_knowledge(extended_clauses, dataset_labels)
     # clause evaluation
     summary = clauses_evaluation(bk, atoms, cfg)    
