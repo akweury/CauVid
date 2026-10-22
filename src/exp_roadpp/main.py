@@ -26,7 +26,7 @@ def main():
     # step 3: use a language model to generate anchor clauses
     step03_input = config.get_step_03_input(args)
     step03.main(step03_input)
-    
+    raise NotImplementedError("Step 3 output handling not implemented yet.")
     # anchor clauses pruning (step 4)
     step04_input = config.get_step_04_input(args)
     step04.main_v2(step04_input)
