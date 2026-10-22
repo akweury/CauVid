@@ -268,6 +268,7 @@ def clauses_evaluation(bk, atoms, cfg):
             "iou": iou,
             "f1": f1,
         }
+        print(f"Evaluation for video {vid}: recall={recall}, precision={precision}, iou={iou}, f1={f1}")
     # Save the evaluation summary to a JSON file for future reference
     utils_data.save_json(summary, summary_file)
 
