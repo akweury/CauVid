@@ -14,6 +14,7 @@ from causallearn.search.PermutationBased.BOSS import boss
 from causallearn.search.PermutationBased.GRaSP import grasp
 from causallearn.utils.GraphUtils import GraphUtils
 from types import SimpleNamespace
+from tqdm import tqdm
 
 
 from src.exp_roadpp import utils_data
@@ -96,7 +97,7 @@ def to_tabular_dataset(atoms, labels, prune_args=None):
     all_data = []
     row_video = []
     row_slice = []
-    for id, info in atoms.items():
+    for id, info in tqdm(atoms.items(), desc="Atoms to table"):
         all_seps = []
         for entry in info:
             count_atom(agent_counts, av_counts, entry)
@@ -197,18 +198,18 @@ def apply_causal_discovery(full_dataset, node_names, args):
     X = full_dataset
 
     if method == "pc":
-        return pc(X, args.cd_alpha, stat, show_progress=False, node_names=node_names,
+        return pc(X, args.cd_alpha, stat, show_progress=True, node_names=node_names,
                   max_k=args.cd_depth).G
     if method == "fci":
         graph, _ = fci(X, stat, args.cd_alpha, depth=-1 if args.cd_depth is None else args.cd_depth,
-                       show_progress=False, node_names=node_names)
+                       show_progress=True, node_names=node_names)
         return graph
     if method == "ges":
         return ges(X, score_func=scores[stat], node_names=node_names)["G"]
     if method == "boss":
-        return boss(X, score_func=scores[stat], verbose=False, node_names=node_names)
+        return boss(X, score_func=scores[stat], verbose=True, node_names=node_names)
     if method == "grasp":
-        return grasp(X, score_func=scores[stat], verbose=False, node_names=node_names)
+        return grasp(X, score_func=scores[stat], verbose=True, node_names=node_names)
     raise ValueError(f"unknown causal discovery method {method!r}")
 
 
@@ -400,7 +401,7 @@ def save_clause_results(kept, removed, clauses, relations, source, args, out_dir
         "kept_by_relation": dict(Counter(relations[clause_id][0] for clause_id in kept)),
         "all_by_relation": dict(Counter(relation for relation, _ in relations.values())),
         "n_av_head_kept": sum(entry["clause"]["head"]["agent_class"] == "av" for entry in kept.values()),
-        "settings": {key: getattr(args, key) for key in settings},
+        "settings": {key: getattr(args, key, None) for key in settings},  # main_v2's args has no prune_* settings
     }
     (out_dir / f"summary_{source}_{strategy}.json").write_text(json.dumps(summary, indent=2))
     return clause_file
@@ -511,10 +512,14 @@ def _causal_filter_clauses(pruned_clauses, atoms_train, dataset_labels, cfg):
         min_support_features=cfg["min_support_features"], exp=cfg["exp"],
     )
 
+    print(f"[Causal filter] Building the tabular dataset from {len(atoms_train)} videos ...")
     full_dataset, row_video, row_slice, columns, aliases, av_values, separator = to_tabular_dataset(
         atoms_train, dataset_labels, prune_args={"min_support_features": args.min_support_features}
     )
+    print(f"[Causal filter] Table: {full_dataset.shape[0]} rows x {full_dataset.shape[1]} columns "
+          f"({len(aliases)} merged column groups)")
     node_names = node_names_from_columns(columns, dataset_labels)
+    print(f"[Causal filter] Running {args.cd_method}/{args.cd_stat} causal discovery ...")
     start = time.time()
     graph = apply_causal_discovery(full_dataset, node_names, args)
     runtime_s = time.time() - start
@@ -522,10 +527,12 @@ def _causal_filter_clauses(pruned_clauses, atoms_train, dataset_labels, cfg):
         graph, columns, node_names, aliases, av_values, len(full_dataset), args,
         runtime_s, cfg["output_dir"] / "graphs",
     )
+    print("[Causal filter] Rendering graph PDFs ...")
     save_graph_pdf(graph, prefix)
     print(f"[Causal filter] {args.cd_method}/{args.cd_stat}: {len(graph.get_graph_edges())} edges "
           f"in {runtime_s:.0f}s, saved to {prefix}.npz / .json / .pdf / _av.pdf")
 
+    print(f"[Causal filter] Filtering {len(pruned_clauses)} clauses with the {args.graph_strategy} strategy ...")
     node_of = clause_node_mapper(columns, aliases)
     kept_clauses, removed = apply_graph_strategy(pruned_clauses, graph, node_of, args)
     relations = clause_graph_relations(pruned_clauses, graph, node_of)
@@ -533,6 +540,27 @@ def _causal_filter_clauses(pruned_clauses, atoms_train, dataset_labels, cfg):
         kept_clauses, removed, pruned_clauses, relations, prefix.name, args, cfg["output_dir"] / "causal"
     )
     return kept_clauses
+
+
+def anchors_to_filter_input(anchor_clauses, atoms):
+    """Convert step 03's anchor clauses and the compressed train atoms to the formats
+    `_causal_filter_clauses` expects.
+
+    Anchor atoms are [unique_atom_index, "oid", obj_id]; each is resolved through
+    unique_atoms (a flat (key, value, ...) tuple) to an atom dict. The original anchor
+    clause is kept under "anchor" so the kept clauses can be mapped back.
+    Returns ({clause_id: {"clause": {"head", "body"}, "anchor"}}, {video_id: interval_atoms}).
+    """
+    unique_atoms = [dict(zip(atom[::2], atom[1::2])) for atom in anchor_clauses["unique_atoms"]]
+    clauses = {}
+    for clause_id, clause in enumerate(anchor_clauses["anchor_clauses"]):
+        clauses[str(clause_id)] = {
+            "clause": {"head": unique_atoms[clause["head"][0]],
+                       "body": [unique_atoms[atom[0]] for atom in clause["body"]]},
+            "anchor": clause,
+        }
+    atoms_by_video = {vid: info["interval_atoms"] for vid, info in atoms.items() if vid != "unique_atoms"}
+    return clauses, atoms_by_video
 
 
 def main_v2(input_data):
@@ -554,6 +582,7 @@ def main_v2(input_data):
     dataset_labels = utils_data.load_json(input_data["dataset_labels_file"])
     print(f"[Causal filter] Loaded {len(anchor_clauses['anchor_clauses'])} anchor clauses, atoms in {len(atoms)} videos.")
 
-    causal_clauses = _causal_filter_clauses(anchor_clauses, atoms, dataset_labels, cfg)
+    clauses, atoms_by_video = anchors_to_filter_input(anchor_clauses, atoms)
+    causal_clauses = _causal_filter_clauses(clauses, atoms_by_video, dataset_labels, cfg)
     utils_data.save_json(causal_clauses, causal_clause_file)
     return causal_clauses 
