@@ -537,16 +537,21 @@ def _causal_filter_clauses(pruned_clauses, atoms_train, dataset_labels, cfg):
 
 def main_v2(input_data):
     cfg = {
-        
+        "cd_method": input_data["cd_method"],
+        "cd_stat": input_data["cd_stat"],
+        "cd_alpha": input_data["cd_alpha"],
+        "cd_depth": input_data["cd_depth"],
+        "graph_strategy": input_data["graph_strategy"],
+        "min_support_features": input_data["min_support_features"],
+        "exp": input_data["exp"],
+        "output_dir": input_data["output_dir"],
     }
+    causal_clause_file = input_data["output_dir"] / "causal_clauses.json"
+    if causal_clause_file.exists():
+        return utils_data.load_json(causal_clause_file)
+    anchor_clauses = utils_data.load_json(input_data["anchor_clause_file"])
+    atoms = utils_data.load_json(input_data["train_atom_file"])
     dataset_labels = input_data["dataset_labels"]
-    pruner = Pruner(input_data["prune_args"], dataset_labels)
-    # C_1: Coarse Prune, filter out the low frequent clauses
-    pruned_clauses = pruner.coarse_prune(anchor_clauses)
-    # Causal filter (former step 04): keep only clauses whose body/head atoms
-    # are adjacent in a causal graph discovered from the train-set atoms.
-    if input_data["use_causal_filter"] == 'True':
-        pruned_clauses = _causal_filter_clauses(pruned_clauses, atoms["train"], dataset_labels, cfg)
-    rank_sc_ratio = [(clause, utils_data.support_coverage_ratio(clause)) for clause in pruned_clauses.values()]
-    rank_sc_ratio.sort(key=lambda x: x[1], reverse=True)
-    coarse_pruned_clauses = rank_sc_ratio
+    causal_clauses = _causal_filter_clauses(anchor_clauses, atoms, dataset_labels, cfg)
+    utils_data.save_json(causal_clauses, causal_clause_file)
+    return causal_clauses 

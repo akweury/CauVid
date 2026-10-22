@@ -253,8 +253,16 @@ def get_step_04_input(args):
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
-        "step03_output_dir": args.output_dir / "step03_output",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
+        "train_atom_file": args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
         "device": args.device,
+        "cd_method": args.cd_method,
+        "cd_stat": args.cd_stat,
+        "cd_alpha": args.cd_alpha,
+        "cd_depth": args.cd_depth,
+        "graph_strategy": args.graph_strategy,
+        "min_support_features": args.min_support_features,
+        "exp": args.exp,
     }
     return input_data
 

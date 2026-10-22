@@ -285,6 +285,9 @@ def extend_clauses(
 
 
 def main(input_data):
+
+
+    causal_anchor_clauses = utils_data.load_json(input_data['causal_anchor_clause_file'])
     # replace id with label names
     # clause extension
     extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, atoms['train'], cfg)

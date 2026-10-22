@@ -203,6 +203,8 @@ def build_anchor_clauses(all_atoms, output_dir, split):
     seen_clauses = set()
     unique_atoms = all_atoms["unique_atoms"]
     for vid, atoms in all_atoms.items():
+        if vid == "unique_atoms":
+            continue
         per_frame_atoms = atoms["per_frame_atoms"]
         for current_frame, next_frame in tqdm(per_frame_atoms):
             if not (len(current_frame) > 0 and len(next_frame) > 0):
@@ -262,6 +264,6 @@ def main(input_data):
     atoms = load_atoms(cfg["train_atom_file"])
     # Convert atoms to anchor clauses
     anchor_data = build_anchor_clauses(atoms, cfg["output_dir"], 'train')
-    
+    raise NotImplementedError("Step 3 output handling not implemented yet.")    
     return anchor_data
 
