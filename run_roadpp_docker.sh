@@ -7,7 +7,11 @@
 # same absolute path inside the container as on the dgx host.
 #
 # Usage:
-#   ./run_roadpp_docker.sh [--gpu 0|all|none] [-- <extra args for main.py>]
+#   ./run_roadpp_docker.sh [--gpu 0|all|none] [--rebuild] [-- <extra args for main.py>]
+#
+# The image is rebuilt automatically whenever requirements.txt or the
+# Dockerfile changes (tracked via a content-hash label on the image).
+# Use --rebuild to force a rebuild regardless.
 #
 # Examples:
 #   ./run_roadpp_docker.sh
@@ -34,6 +38,7 @@ cd "$SCRIPT_DIR"
 
 IMAGE_NAME="cauvid-pipeline"
 GPU_ARG="0"
+FORCE_REBUILD=0
 EXTRA_ARGS=()
 
 # --- Parse arguments ---
@@ -42,6 +47,10 @@ while [[ $# -gt 0 ]]; do
         --gpu)
             GPU_ARG="$2"
             shift 2
+            ;;
+        --rebuild)
+            FORCE_REBUILD=1
+            shift
             ;;
         --)
             shift
@@ -85,10 +94,28 @@ echo "[run_roadpp_docker] GPU:             $GPU_ARG"
 echo "[run_roadpp_docker] Device arg:      $DEVICE"
 echo "[run_roadpp_docker] Extra args:      ${EXTRA_ARGS[*]:-<none>}"
 
-# --- Build image if it doesn't exist yet ---
-if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-    echo "[run_roadpp_docker] Image '$IMAGE_NAME' not found, building..."
-    docker build -t "$IMAGE_NAME" -f Dockerfile .
+# --- Build image if missing or if its dependencies changed ---
+# Hash requirements.txt + Dockerfile and store it as an image label; rebuild
+# when the hash differs so newly added packages get installed. Docker's layer
+# cache keeps the apt layer, so only the pip install and later layers rerun.
+DEPS_HASH="$(cat requirements.txt Dockerfile | sha256sum | cut -d' ' -f1)"
+IMAGE_DEPS_HASH="$(docker image inspect -f '{{ index .Config.Labels "cauvid.deps_hash" }}' "$IMAGE_NAME" 2>/dev/null || true)"
+
+if [[ "$FORCE_REBUILD" == "1" ]]; then
+    echo "[run_roadpp_docker] --rebuild given, rebuilding image..."
+    NEED_BUILD=1
+elif [[ -z "$IMAGE_DEPS_HASH" ]]; then
+    echo "[run_roadpp_docker] Image '$IMAGE_NAME' not found (or unlabeled), building..."
+    NEED_BUILD=1
+elif [[ "$IMAGE_DEPS_HASH" != "$DEPS_HASH" ]]; then
+    echo "[run_roadpp_docker] requirements.txt/Dockerfile changed, rebuilding image..."
+    NEED_BUILD=1
+else
+    NEED_BUILD=0
+fi
+
+if [[ "$NEED_BUILD" == "1" ]]; then
+    docker build -t "$IMAGE_NAME" --label "cauvid.deps_hash=$DEPS_HASH" -f Dockerfile .
 fi
 
 # --- Run the pipeline ---
