@@ -1,0 +1,19 @@
+{
+	"name": "CauVid Dev",
+	"dockerComposeFile": "../docker-compose.yml",
+	"service": "cauvid-dev",
+	"workspaceFolder": "/app",
+	"shutdownAction": "stopCompose",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"ms-python.python",
+				"ms-python.vscode-pylance"
+			],
+			"settings": {
+				"python.defaultInterpreterPath": "/usr/local/bin/python"
+			}
+		}
+	},
+	"remoteUser": "root"
+}

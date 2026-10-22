@@ -32,6 +32,11 @@ def step_0_setup(args):
         args.device = "cuda:0"
         args.dataset_path = Path('/workspaces/CauVid/data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
+        # args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
+        # args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
+        # args.device = f'{args.device}'
+        # print(f"\n##### Output directory: {args.output_dir} #####\n")
+        # os.makedirs(args.output_dir, exist_ok=True)
     
     # macbook pro
     elif args.machine == "macbook-pro":
@@ -145,7 +150,7 @@ def get_step_01_input(args):
         os.makedirs(frame_dir, exist_ok=True)
         os.makedirs(depth_dir, exist_ok=True)
         os.makedirs(flow_dir, exist_ok=True)
-
+        
         all_video_paths = [os.path.join(video_dir, f) for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
         all_test_video_paths = [os.path.join(test_video_dir, f) for f in os.listdir(test_video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
         all_frame_paths = [os.path.join(frame_dir, os.path.splitext(os.path.basename(f))[0]) for f in all_video_paths]
