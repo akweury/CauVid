@@ -13,6 +13,9 @@ from causallearn.search.ScoreBased.GES import ges
 from causallearn.search.PermutationBased.BOSS import boss
 from causallearn.search.PermutationBased.GRaSP import grasp
 from causallearn.utils.GraphUtils import GraphUtils
+from types import SimpleNamespace
+
+
 from src.exp_roadpp import utils_data
 from src.exp_roadpp import config, utils_pipe
 from src.exp_roadpp.step03_pruner import Pruner
@@ -459,12 +462,9 @@ def args_and_init(input_data):
     parser = utils_pipe.get_parser()
     parser.add_argument("--prune_frequency_threshold", type=int, default=10, help="Minimum frequency for a clause to be kept")
     parser.add_argument("--prune_support_coverage_ratio_threshold", type=float, default=0.5, help="Minimum support/coverage ratio for a clause to be kept")
-    parser.add_argument("--min_support_features", type=int, default=1, help="Minimum number occurences for a feature to be kept in the dataset")
-    parser.add_argument("--cd_method", type=str, default="boss", choices=["pc", "fci", "ges", "boss", "grasp"], help="Causal discovery method")
-    parser.add_argument("--cd_stat", type=str, default="bic", choices=["fisherz", "chisq", "gsq", "bic", "bdeu"], help="CI test for pc / fci, score for ges / boss / grasp")
-    parser.add_argument("--cd_alpha", type=float, default=0.01, help="Significance level of the CI tests (pc / fci only)")
-    parser.add_argument("--cd_depth", type=int, default=None, help="Maximum conditioning-set size (pc / fci only), default unlimited")
-    parser.add_argument("--graph_strategy", type=str, default="adjacent", choices=["adjacent"], help="How the causal graph filters the clauses")
+    # --min_support_features, --cd_method, --cd_stat, --cd_alpha, --cd_depth, --graph_strategy
+    # are now defined on the shared parser (utils_pipe.get_parser) since the causal-discovery
+    # logic they configure also runs as a substep of step03.
     args = utils_pipe.parse_args(parser)
 
     if input_data is not None:
@@ -494,3 +494,59 @@ if __name__ == "__main__":
 # Notes:
 # - Prune args might differ from the previous steps
 # - AV is constant within every video, this might cause problem down the line
+
+
+def _causal_filter_clauses(pruned_clauses, atoms_train, dataset_labels, cfg):
+    """Former step 04, now a substep of step 03: discover a causal graph over the
+    atom vocabulary from the train-set atoms, then keep only the coarse-pruned
+    clauses whose body/head atoms are adjacent in that graph (see
+    `step04.apply_graph_strategy`). `pruned_clauses` is the {clause_id: entry}
+    dict straight out of `Pruner.coarse_prune` (i.e. before ranking by support
+    coverage), since that's the {id: {"clause": {"head", "body"}, ...}} format
+    `step04`'s graph-filtering functions expect.
+    """
+    args = SimpleNamespace(
+        cd_method=cfg["cd_method"], cd_stat=cfg["cd_stat"], cd_alpha=cfg["cd_alpha"],
+        cd_depth=cfg["cd_depth"], graph_strategy=cfg["graph_strategy"],
+        min_support_features=cfg["min_support_features"], exp=cfg["exp"],
+    )
+
+    full_dataset, row_video, row_slice, columns, aliases, av_values, separator = to_tabular_dataset(
+        atoms_train, dataset_labels, prune_args={"min_support_features": args.min_support_features}
+    )
+    node_names = node_names_from_columns(columns, dataset_labels)
+    start = time.time()
+    graph = apply_causal_discovery(full_dataset, node_names, args)
+    runtime_s = time.time() - start
+    prefix = save_graph(
+        graph, columns, node_names, aliases, av_values, len(full_dataset), args,
+        runtime_s, cfg["output_dir"] / "graphs",
+    )
+    save_graph_pdf(graph, prefix)
+    print(f"[Causal filter] {args.cd_method}/{args.cd_stat}: {len(graph.get_graph_edges())} edges "
+          f"in {runtime_s:.0f}s, saved to {prefix}.npz / .json / .pdf / _av.pdf")
+
+    node_of = clause_node_mapper(columns, aliases)
+    kept_clauses, removed = apply_graph_strategy(pruned_clauses, graph, node_of, args)
+    relations = clause_graph_relations(pruned_clauses, graph, node_of)
+    save_clause_results(
+        kept_clauses, removed, pruned_clauses, relations, prefix.name, args, cfg["output_dir"] / "causal"
+    )
+    return kept_clauses
+
+
+def main_v2(input_data):
+    cfg = {
+        
+    }
+    dataset_labels = input_data["dataset_labels"]
+    pruner = Pruner(input_data["prune_args"], dataset_labels)
+    # C_1: Coarse Prune, filter out the low frequent clauses
+    pruned_clauses = pruner.coarse_prune(anchor_clauses)
+    # Causal filter (former step 04): keep only clauses whose body/head atoms
+    # are adjacent in a causal graph discovered from the train-set atoms.
+    if input_data["use_causal_filter"] == 'True':
+        pruned_clauses = _causal_filter_clauses(pruned_clauses, atoms["train"], dataset_labels, cfg)
+    rank_sc_ratio = [(clause, utils_data.support_coverage_ratio(clause)) for clause in pruned_clauses.values()]
+    rank_sc_ratio.sort(key=lambda x: x[1], reverse=True)
+    coarse_pruned_clauses = rank_sc_ratio

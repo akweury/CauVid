@@ -45,4 +45,19 @@ def get_parser():
 
     parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
 
+    # Causal-discovery substep (formerly step 04), now run inside step 03 to filter
+    # coarse-pruned clauses with a causal graph before the extension loop.
+    parser.add_argument("--use_causal_filter", type=str, default="True",
+                         help="Whether to filter coarse-pruned clauses with a causal graph (former step 04), default is True")
+    parser.add_argument("--min_support_features", type=int, default=1,
+                         help="Minimum number of occurrences for a feature to be kept in the causal-discovery dataset")
+    parser.add_argument("--cd_method", type=str, default="boss", choices=["pc", "fci", "ges", "boss", "grasp"],
+                         help="Causal discovery method")
+    parser.add_argument("--cd_stat", type=str, default="bic", choices=["fisherz", "chisq", "gsq", "bic", "bdeu"],
+                         help="CI test for pc / fci, score for ges / boss / grasp")
+    parser.add_argument("--cd_alpha", type=float, default=0.01, help="Significance level of the CI tests (pc / fci only)")
+    parser.add_argument("--cd_depth", type=int, default=None, help="Maximum conditioning-set size (pc / fci only), default unlimited")
+    parser.add_argument("--graph_strategy", type=str, default="adjacent", choices=["adjacent"],
+                         help="How the causal graph filters the clauses")
+
     return parser

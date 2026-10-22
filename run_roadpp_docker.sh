@@ -58,7 +58,7 @@ done
 ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/storage-01/ml-jsha/CauVid_Data/roadpp}"
 ROADPP_OUTPUT_HOST="${CAUVID_ROADPP_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output}"
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
-MACHINE="${CAUVID_ROADPP_MACHINE:-dgx}"
+MACHINE="${CAUVID_ROADPP_MACHINE:-dgx-jing}"
 
 mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST"
 

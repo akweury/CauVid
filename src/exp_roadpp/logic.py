@@ -309,16 +309,26 @@ class Clause(object):
     Attributes:
         head (Atom): The head atom.
         body (List[Atom]): The atoms for the body.
+        obj_ids (List[int]): The object IDs associated with the clause.
+        Head obj has object ID 0 by default.
+        Body objs have object IDs as specified in obj_ids.
     """
 
-    def __init__(self, head, body):
-        self.head = head
-        self.body = sorted(body)
+    def __init__(self, head, body, obj_ids):
+        self.head = (head[0], 'oid', 0)
+        self.body = self.build_body(body, obj_ids)
         # self.body = body
         # print(self)
         ###self._rename()
         # print(self)
 
+    def build_body(self, body, obj_ids):
+        assert len(body) == len(obj_ids), "Length of body must match the length of obj_ids."
+        built_body = []
+        for i, atom in enumerate(body):
+            built_body.append((atom[0], 'oid', obj_ids[i]))
+        return built_body
+    
     def __str__(self):
 
         head_str = self.head.__str__()

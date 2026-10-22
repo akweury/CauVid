@@ -2,29 +2,7 @@ import os
 import torch 
 
 from src.exp_roadpp.utils_data import atom_to_signature
-from src.exp_roadpp.step03_visual import visual_2d_heatmap
-from src.exp_roadpp import utils_data
 
-
-def get_video_data(video_atoms, dataset_labels):
-    data = []
-    atoms_per_start_frame = {}
-    for atom in video_atoms:
-        if int(atom["start_frame"]) not in atoms_per_start_frame:
-            atoms_per_start_frame[int(atom["start_frame"])] = []
-        atoms_per_start_frame[int(atom["start_frame"])].append(atom)
-
-    end_frame = max([int(atom["end_frame"]) for atom in video_atoms]) if video_atoms else 0
-    # for each frame, we need a list to include the atoms that occur in that frame
-    frame_data = {i: [] for i in range(end_frame)}
-    for start_frame, atoms in atoms_per_start_frame.items():
-        for atom in atoms:
-            for frame_id in range(start_frame, int(atom["end_frame"])):
-                frame_as = atom_to_signature(atom, dataset_labels)
-                frame_data[frame_id].append(frame_as)
-
-    data = [(frame_data[i], frame_data[i + 1]) for i in frame_data.keys() if i + 1 in frame_data]
-    return data
 
 
 
@@ -239,40 +217,6 @@ def evaluate_ocm(ocm, ocm_gt, ocm_mask):
     return recall, precision, iou, f1
 
 
-def clauses_evaluation(bk, atoms, cfg):
-    summary = {}
-    label_num = bk["label_num"]
-    labels = bk["dataset_labels"]
-    summary_file = cfg["output_dir"] / "clauses_evaluation_summary.json"
-    if summary_file.exists():
-        summary = utils_data.load_json(summary_file)
-        return summary
-    
-    for vid, interval_atoms in atoms.items():
-        tube_uids = list(set([atom["tube_uid"] for atom in interval_atoms]))
-        frame_num = max([int(atom["end_frame"]) for atom in interval_atoms]) if interval_atoms else 0
-        obj_num = len(tube_uids)        
-        apf, apsf = extract_atoms_per_frame(interval_atoms,labels, frame_num)
-        ocm_gt, ocm_mask = build_ocm_gt(tube_uids, 
-                                        apsf, 
-                                        frame_num, 
-                                        label_num, 
-                                        labels)
-        ocm = build_ocm(apf, ocm_mask, tube_uids, bk)
-        recall, precision, iou, f1 = evaluate_ocm(ocm, ocm_gt, ocm_mask)
-        summary[vid] = {
-            "recall": recall,
-            "precision": precision,
-            "iou": iou,
-            "f1": f1,
-        }
-        print(f"Evaluation for video {vid}: recall={recall}, precision={precision}, iou={iou}, f1={f1}")
-    # Save the evaluation summary to a JSON file for future reference. The
-    # per-video ocm/ocm_gt tensors are intentionally excluded (JSON can't
-    # serialize torch.Tensor); only the scalar metrics are persisted.
-    utils_data.save_json(summary, summary_file)
-
-    return summary
 
 
     

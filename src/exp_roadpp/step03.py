@@ -2,100 +2,89 @@ from pathlib import Path
 import json 
 from tqdm import tqdm
 import os
-import random
-import numpy as np
-from scipy import sparse
-from sklearn.metrics import accuracy_score, f1_score
+import time
+
 from collections import Counter
+from collections import defaultdict
 
+from src.exp_roadpp.logic import Clause
 from src.exp_roadpp import utils_data
-from src.exp_roadpp.step03_language import Language
-
-from src.exp_roadpp.step03_pruner import Pruner
-from src.exp_roadpp.step03_visual import visualize_baseline_results, visual_bar
-from src.exp_roadpp.step03_rule_aggregation import learn_rule_aggregation
-from src.exp_roadpp.step03_pred_eval import clauses_evaluation
-from src.exp_roadpp.step03_action_predictor import ActionPredictor
-from src.exp_roadpp.step03_rule_learner import extend_clauses, build_clause_matrix
-from src.exp_roadpp.baselines import transformer_baseline, ilp_baseline, gnn_baseline, lstm_baseline
-
-def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, seed=7):
-    indices = list(range(num_examples))
-    if num_examples <= 2:
-        return indices, indices, indices
-
-    rng = random.Random(int(seed))
-    rng.shuffle(indices)
-
-    train_end = max(1, int(round(num_examples * float(train_fraction))))
-    val_end = max(train_end + 1, int(round(num_examples * float(train_fraction + val_fraction))))
-    val_end = min(num_examples - 1, val_end)
-
-    train_indices = indices[:train_end]
-    val_indices = indices[train_end:val_end]
-    test_indices = indices[val_end:]
-
-    if not val_indices:
-        val_indices = indices[-1:]
-    if not test_indices:
-        test_indices = indices[-1:]
-
-    return train_indices, val_indices, test_indices
+from src.exp_roadpp.step_dataset_language import Language
+from src.exp_roadpp.step03_visual import visual_bar
 
 
-def _tracks_to_atoms(track_dir, video_ids, lang, output_dir):
-    atom_dir = Path(output_dir) / "atoms"
-    os.makedirs(atom_dir, exist_ok=True)
-    atom_file = atom_dir / "all_atoms.json"
 
-    atoms_by_video = utils_data.load_json(atom_file) if atom_file.exists() else {}
 
-    missing_ids = [vid for vid in video_ids if vid not in atoms_by_video]
-    if missing_ids:
-        for vid in tqdm(missing_ids, desc="Tracks to Atoms"):
-            track_file = Path(track_dir) / f"{vid}_gt.json"
-            if not track_file.exists():
+def atoms2atom_clauses(self, atoms_by_videos, head_ungrounded_atoms):
+    clauses = {}
+
+    body_opportunities_by_video = defaultdict(Counter)
+    rule_support_by_video = defaultdict(Counter)
+
+    for video_id, atoms in tqdm(atoms_by_videos.items()):
+        atoms_by_time = defaultdict(lambda: defaultdict(set))
+        for atom in atoms:
+            start_frame = int(atom["start_frame"])
+            end_frame = int(atom["end_frame"])
+            tube_uid = atom.get("tube_uid")
+            agent_class = atom.get("agent_class")
+
+            if tube_uid is not None:
+                tube_key = ("tube_uid", tube_uid)
+            elif agent_class == "av":
+                tube_key = ("agent_class", "av")
+            else:
                 continue
 
-            track_data = utils_data.load_json(track_file)       
+            ungrounded_atom = self._to_ungrounded_atom(atom)
+            for frame_id in range(start_frame, end_frame):
+                atoms_by_time[frame_id][tube_key].add(ungrounded_atom)
 
-            agent_tubes = track_data["data"]["agent_tubes"]
-            segments_by_ego_actions = track_data["data"]["av_action_tubes"]
-            frames = track_data["data"]["frames"]
+        for frame_id, current_by_tube in atoms_by_time.items():
+            next_by_tube = atoms_by_time.get(frame_id + 1)
+            if not next_by_tube:
+                continue
 
-            atoms = []
-            atoms.extend(lang.video2atoms("av", segments_by_ego_actions))
-            atoms.extend(lang.video2atoms("agents", agent_tubes, frames))
+            for tube_key, current_atoms in current_by_tube.items():
+                next_atoms = next_by_tube.get(tube_key)
+                if not next_atoms:
+                    continue
 
-            atoms_by_video[vid] = atoms
+                for body_atom in current_atoms:
+                    body_opportunities_by_video[video_id][body_atom] += 1
+                    for head_atom in next_atoms:
+                        if body_atom == head_atom:
+                            continue
 
-        utils_data.save_json(atoms_by_video, atom_file)
+                        clause = Clause(head_atom, [body_atom])
+                        clauses.setdefault(clause, {})
+                        rule_support_by_video[video_id][clause] += 1
 
-    return {vid: atoms_by_video[vid] for vid in video_ids if vid in atoms_by_video}
+    for clause in clauses:
+        body_atom = clause.body[0]
+        for video_id, body_opportunities in body_opportunities_by_video.items():
+            coverage = body_opportunities[body_atom]
+            if coverage:
+                clauses[clause][video_id] = {
+                    "support": rule_support_by_video[video_id][clause],
+                    "coverage": coverage,
+                }
 
+    _clauses = {}
+    clause_id = 0
+    for clause, c_dict in clauses.items():
+        _clauses[clause_id] = {
+            "clause": clause.to_dict(),
+            "support_coverage": c_dict
+        }
+        clause_id += 1
 
-
-
-def _atoms_to_init_clauses(all_atoms, lang, output_dir, split):
-
-    facts_dir = Path(output_dir) / "clauses"
-    os.makedirs(facts_dir, exist_ok=True)
-    all_init_clauses_file = facts_dir / f"all_init_clauses_adjacent_transitions_{split}.json"
-    if all_init_clauses_file.exists():
-        return utils_data.load_json(all_init_clauses_file)
     
-    all_init_clauses = lang.atoms2atom_clauses(all_atoms, head_ungrounded_atoms=[])
-    # init_clauses = lang.atoms2clauses(all_atoms, head_ungrounded_atoms=[])
-    utils_data.save_json(all_init_clauses, all_init_clauses_file)
-    return all_init_clauses
+    return _clauses
 
 
-def _coarse_prune(init_clauses, pruner):
-    pruned_clauses = pruner.coarse_prune(init_clauses)
-    # rank clauses with their support coverage ratio
-    rank_sc_ratio = [(clause, utils_data.support_coverage_ratio(clause)) for clause in pruned_clauses.values()]
-    rank_sc_ratio.sort(key=lambda x: x[1], reverse=True)
-    return rank_sc_ratio
+
+
 
 
 
@@ -193,130 +182,86 @@ def merge_rule_supports(target, source):
             target[key] = value
     return target
 
-def prepare_dataset(data_num, language_model, cfg):
-    track_dir = cfg["track_dir"]
-    output_dir = cfg["output_dir"]
-    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
-    if data_num != 'full':
-        all_track_files = all_track_files[:int(data_num)]
-    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
-    # train data
-    train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
-    atoms_by_train_video = _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    # val data
-    val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    atoms_by_val_video = _tracks_to_atoms(track_dir, val_ids, language_model, output_dir)
-    # test data
-    test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-    atoms_by_test_video = _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)   
-
-    return {"train": atoms_by_train_video, "val": atoms_by_val_video, "test": atoms_by_test_video}
 
 
 
+def load_atoms(atom_file):
+    if not atom_file.exists():
+        raise FileNotFoundError(f"Atom file {atom_file} does not exist.")
+    atoms = utils_data.load_json(atom_file)
+    print(f"[Load Atoms] Loaded atoms from {len(atoms)} videos from {atom_file}")
+    return atoms
 
-def build_background_knowledge(clauses, dataset_labels):
-    cm, heads, bodies, scopes = build_clause_matrix(clauses)
-    label_num = len(dataset_labels["av_action_labels"]) + len(dataset_labels["action_labels"]) + len(dataset_labels["loc_labels"])
-    bk = {
-        "clause_matrix": cm,
-        "clause_heads": heads,
-        "unique_bodies": bodies,
-        "clause_scopes": scopes,
-        "label_num": label_num,
-        "dataset_labels": dataset_labels
-    }
-    return bk
+
+
+def build_anchor_clauses(all_atoms, output_dir, split):
+    anchor_clause_file = output_dir / f"anchor_clauses_{split}.json"
+    if anchor_clause_file.exists():
+        return utils_data.load_json(anchor_clause_file)
     
+    anchor_clauses = []
+    seen_clauses = set()
+    unique_atoms = all_atoms["unique_atoms"]
+    for vid, atoms in all_atoms.items():
+        per_frame_atoms = atoms["per_frame_atoms"]
+        for current_frame, next_frame in tqdm(per_frame_atoms):
+            if not (len(current_frame) > 0 and len(next_frame) > 0):
+                continue
+            current_signatures = list(set([tuple(atom) for atom in current_frame]))
+            next_signatures = list(set([tuple(atom) for atom in next_frame]))            
+            for body in current_signatures:
+                for head in next_signatures:
+                    if body[-1] != head[-1]:
+                        clause = Clause(head, [body], [1])
+                        if clause not in seen_clauses:
+                            seen_clauses.add(clause)
+                            anchor_clauses.append(clause)
+    
+    # add self-loop clauses for each unique atom
+    for i in range(len(unique_atoms)):
+        anchor_clauses.append(
+            Clause([i], [[i]], [0])
+        )
+    data = {
+        "anchor_clauses": anchor_clauses,
+        "unique_atoms": unique_atoms
+    }
+    utils_data.save_json(data, anchor_clause_file)
+    return data
+
+
 
 def main(input_data):
     print("\n--------- Step 03 ----------------------\n")
-    cfg = {
+    cfg_legacy = {
         "device": input_data["device"], 
         "output_dir": input_data["output_dir"],
         "test_output_dir": input_data["output_dir"] / "test",
         "track_dir": input_data["dataset_path"] / "gt",
-        "dataset_path": input_data["dataset_path"]
+        "dataset_path": input_data["dataset_path"],
+        "cd_method": input_data["cd_method"],
+        "cd_stat": input_data["cd_stat"],
+        "cd_alpha": input_data["cd_alpha"],
+        "cd_depth": input_data["cd_depth"],
+        "graph_strategy": input_data["graph_strategy"],
+        "min_support_features": input_data["min_support_features"],
+        "exp": input_data["exp"],
     }
-    os.makedirs(cfg["test_output_dir"], exist_ok=True)
     
-    dataset_labels = input_data["dataset_labels"]
-    # Prepare language model and beam search model
-    language_model = Language(input_data["device"])
-    pruner = Pruner(input_data["prune_args"], dataset_labels)
-    # Prepare dataset by converting tracks to atoms for train, val, and test splits
-    atoms = prepare_dataset(input_data['data_num'], language_model, cfg)
-    
-    # C_0: Convert atoms to initial clauses
-    init_clauses = _atoms_to_init_clauses(atoms["train"], language_model, cfg["output_dir"], 'train')
-    visual_bar(init_clauses, cfg["output_dir"], "init_clauses_distribution")
-    # C_1: Coarse Prune, filter out the low frequent clauses
-    coarse_pruned_clauses = _coarse_prune(init_clauses, pruner)
-    # replace id with label names
-    coarse_pruned_clauses = utils_data.replace_ids_with_labels(coarse_pruned_clauses, dataset_labels)
-    # clause extension
-    extended_clauses = extend_clauses(coarse_pruned_clauses, dataset_labels, atoms['train'], cfg)
-    bk = build_background_knowledge(extended_clauses, dataset_labels)
-    # clause evaluation
-    summary = clauses_evaluation(bk, atoms['val'], cfg)
-
-
-    if input_data["learning"] == 'True':
-        learn_rule_aggregation(atoms, init_clauses, cfg["output_dir"], cfg["dataset_path"], "vanilla")
-        learn_rule_aggregation(atoms, coarse_pruned_clauses, cfg["output_dir"], cfg["dataset_path"], "coarse_prune")
-    if input_data["baselines"] == 'True':
-        # train and test baselines
-        result_summary = {}
+    cfg = {
+        "train_atom_file": input_data["train_atom_file"],
+        "output_dir": input_data["output_dir"]
         
-        transformer_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
-        ilp_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
-        gnn_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
-        lstm_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
-        utils_data.save_json(result_summary, cfg["test_output_dir"] / "baselines_summary.json")
-        visualize_baseline_results(result_summary, cfg["test_output_dir"])
-    
-    print("\n--------- Step 03 Done ---------------\n")
+    }
+    anchor_clause_file = cfg["output_dir"] / "anchor_clauses_train.json"
 
+    if anchor_clause_file.exists():
+        return utils_data.load_json(anchor_clause_file)
 
-def baselines(input_data):
-    print("\n--------- Step 03 Baselines ----------------------\n")
-    if input_data["skip_baselines_03"] == 'True':
-        return
+    # Prepare dataset by converting tracks to atoms for train, val, and test splits
+    atoms = load_atoms(cfg["train_atom_file"])
+    # Convert atoms to anchor clauses
+    anchor_data = build_anchor_clauses(atoms, cfg["output_dir"], 'train')
     
-    output_dir = input_data["output_dir"]
-    test_output_dir = input_data["test_output_dir"]
-    track_dir = input_data["dataset_path"] / "gt"
-    dataset_path = input_data["dataset_path"]
-    dataset_labels = input_data["dataset_labels"]
-    language_model = Language(input_data["device"])
-    device = input_data["device"]
-    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
-    if input_data['data_num'] != 'full':
-        all_track_files = all_track_files[:int(input_data['data_num'])]
-    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
-    
-    # train data
-    train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
-    _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
-    train_facts = _atoms_to_init_clauses(language_model, output_dir, 'train')
-    val_facts = _atoms_to_init_clauses(language_model, output_dir, 'val')
-    test_facts = _atoms_to_init_clauses(language_model, output_dir, 'test')
-    # all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
-    # val data
-    val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    # test data
-    test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-    _tracks_to_atoms(track_dir, test_ids, language_model, output_dir)
-    
+    return anchor_data
 
-    # train and test baselines
-    result_summary = {}
-    all_facts = {"train": train_facts, "val": val_facts, "test": test_facts}
-    ilp_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
-    gnn_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
-    transformer_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
-    lstm_baseline.run(all_facts, dataset_labels, output_dir, result_summary, device)
-    utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
-    visualize_baseline_results(result_summary, test_output_dir)
-    
-    print("\n--------- Step 03 Baseline Done! ---------------\n")

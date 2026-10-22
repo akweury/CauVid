@@ -22,6 +22,7 @@ PyYAML
 # Causal discovery dependencies
 tigramite
 numba
+causal-learn
 
 # Utilities
 tqdm

@@ -27,16 +27,17 @@ def step_0_setup(args):
         args.dataset_path = Path('/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
     # dgx
-    elif args.machine == "dgx":
-        print("\n##### Running on DGX #####\n")
+    elif args.machine == "dgx-flo":
         args.device = "cuda:0"
         args.dataset_path = Path('/workspaces/CauVid/data/roadpp')
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
-        # args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
-        # args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
-        # args.device = f'{args.device}'
-        # print(f"\n##### Output directory: {args.output_dir} #####\n")
-        # os.makedirs(args.output_dir, exist_ok=True)
+    elif args.machine == "dgx-jing":
+        print("\n##### Running on DGX #####\n")
+        args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
+        args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
+        args.device = f'{args.device}'
+        print(f"\n##### Output directory: {args.output_dir} #####\n")
+        os.makedirs(args.output_dir, exist_ok=True)
     
     # macbook pro
     elif args.machine == "macbook-pro":
@@ -214,14 +215,15 @@ def get_step_02_input(args):
 def get_step_03_input(args):
     output_dir = args.output_dir / "step03_output"
     os.makedirs(output_dir, exist_ok=True)        
-    baseline_output_dir = args.output_dir / "step03_baseline_output"
-    os.makedirs(baseline_output_dir, exist_ok=True)
-    test_output_dir = output_dir / "test"
-    os.makedirs(test_output_dir, exist_ok=True)
     with open(args.dataset_path/"gt"/"label.json", 'r') as f:
         dataset_labels = json.load(f)
+
+    train_atom_file = args.output_dir / 'step_dataset_output' / "atoms" / "train_atoms_compressed.json"
+    if not train_atom_file.exists():
+        raise FileNotFoundError(f"Train atom file {train_atom_file} does not exist.")
     
     input_data = {
+        "train_atom_file": train_atom_file,
         "baselines": args.baselines,
         "dataset_labels": dataset_labels,
         'learning': args.learning,
@@ -230,12 +232,18 @@ def get_step_03_input(args):
         "use_gt": args.use_gt,
         "dataset_path": args.dataset_path,
         "output_dir": output_dir,
-        "test_output_dir": test_output_dir,
-        "baseline_output_dir": baseline_output_dir,
         "prune_args": args.prune_args,
         "step01_output_dir": args.output_dir / "step01_output",
         "step02_output_dir": args.output_dir / "step02_output",
         "device": args.device,
+        "use_causal_filter": args.use_causal_filter,
+        "min_support_features": args.min_support_features,
+        "cd_method": args.cd_method,
+        "cd_stat": args.cd_stat,
+        "cd_alpha": args.cd_alpha,
+        "cd_depth": args.cd_depth,
+        "graph_strategy": args.graph_strategy,
+        "exp": args.exp,
     }
     return input_data
 
@@ -251,3 +259,24 @@ def get_step_04_input(args):
     return input_data
 
 
+def get_step_05_input(args):
+    output_dir = args.output_dir / "step05_output"
+    os.makedirs(output_dir, exist_ok=True)
+    input_data = {
+        "output_dir": output_dir,
+        "step04_output_dir": args.output_dir / "step04_output",
+        "device": args.device,
+    }
+    return input_data
+
+def get_step_dataset_input(args):
+    output_dir = args.output_dir / "step_dataset_output"
+    os.makedirs(output_dir, exist_ok=True)
+    input_data = {
+        "output_dir": output_dir,
+        "dataset_path": args.dataset_path,
+        "device": args.device,
+        "data_num": args.data_num,
+        
+    }
+    return input_data
