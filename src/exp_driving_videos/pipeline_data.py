@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
 from src.exp_driving_videos import pipeline_config
+from src.exp_driving_videos.modules import rule_constraints
 
 _MERGED_INITIAL_RULES_VERSION = 3
 _PRUNED_INITIAL_RULES_VERSION = 1
@@ -176,6 +177,14 @@ def _rule_body_length(rule: Dict[str, Any]) -> int:
     if str(rule.get("body_atom_template", "")):
         return 1
     return int(rule.get("body_length", 0))
+
+
+def _rule_body_atom_templates(rule: Dict[str, Any]) -> List[str]:
+    body_atom_templates = rule.get("body_atom_templates")
+    if isinstance(body_atom_templates, list):
+        return [str(atom) for atom in body_atom_templates if str(atom).strip()]
+    body_atom_template = str(rule.get("body_atom_template", "")).strip()
+    return [body_atom_template] if body_atom_template else []
 
 
 def _as_sorted_str_tuple(values: Any) -> Tuple[str, ...]:
@@ -516,6 +525,30 @@ def prune_initial_rules(
 
     input_counts = _initial_pruning_counts(annotated_rules)
 
+    # Background knowledge drops seed rules before they reach dedup, budgeting, or
+    # step-16 extension. Seed rules are unary, so derived exclusions cannot fire
+    # here (a single atom cannot contradict itself); in practice only the authored
+    # constraints remove anything at this stage.
+    constraints = rule_constraints.normalize_constraints_cfg(cfg.get("rule_constraints"))
+    constraint_pruned_counts = empty_rule_category_counts()
+    constraint_pruned_reasons: Dict[str, int] = {}
+    if rule_constraints.is_enabled(constraints):
+        permitted_rules: List[Dict[str, Any]] = []
+        for rule in annotated_rules:
+            reason = rule_constraints.body_conflict(_rule_body_atom_templates(rule), constraints)
+            if not reason:
+                permitted_rules.append(rule)
+                continue
+            _increment_initial_pruning_count(
+                constraint_pruned_counts,
+                _initial_pruning_category(rule),
+            )
+            reason_kind = rule_constraints.conflict_kind(reason)
+            constraint_pruned_reasons[reason_kind] = constraint_pruned_reasons.get(reason_kind, 0) + 1
+        annotated_rules = permitted_rules
+
+    constraint_kept_counts = _initial_pruning_counts(annotated_rules)
+
     signature_best: Dict[Tuple[str, Tuple[str, ...], Tuple[str, ...]], Dict[str, Any]] = {}
     signature_pruned_counts = empty_rule_category_counts()
     for rule in annotated_rules:
@@ -655,12 +688,17 @@ def prune_initial_rules(
             "max_total_initial_rules": max_total_rules,
             "category_budgets": category_budgets,
             "diversity_key": diversity_key,
+            "rule_constraints": constraints,
         },
-        "input_num_rules": len(annotated_rules),
+        "input_num_rules": input_counts["all_rules"],
         "input_rule_counts": input_counts,
+        "background_knowledge_pruned_num_rules": input_counts["all_rules"] - constraint_kept_counts["all_rules"],
+        "background_knowledge_pruned_rule_counts": constraint_pruned_counts,
+        "background_knowledge_pruned_reasons": dict(sorted(constraint_pruned_reasons.items())),
+        "background_knowledge_kept_num_rules": constraint_kept_counts["all_rules"],
         "deduplicated_num_rules": len(deduplicated_rules),
         "deduplicated_rule_counts": deduplicated_counts,
-        "firing_signature_deduplicated_num_rules": input_counts["all_rules"] - deduplicated_counts["all_rules"],
+        "firing_signature_deduplicated_num_rules": constraint_kept_counts["all_rules"] - deduplicated_counts["all_rules"],
         "firing_signature_deduplicated_rule_counts": signature_pruned_counts,
         "dominance_pruned_num_rules": deduplicated_counts["all_rules"] - dominance_counts["all_rules"],
         "dominance_pruned_rule_counts": dominance_pruned_counts,
@@ -682,7 +720,8 @@ def prune_initial_rules(
     flow_summary = dict(pruned_result.get("candidate_rule_flow_summary", {}))
     flow_summary["pruning"] = {
         "initial_rule_pruning_pruned_rule_counts": {
-            key: int(signature_pruned_counts.get(key, 0))
+            key: int(constraint_pruned_counts.get(key, 0))
+            + int(signature_pruned_counts.get(key, 0))
             + int(dominance_pruned_counts.get(key, 0))
             + int(budget_pruned_counts.get(key, 0))
             for key in empty_rule_category_counts()

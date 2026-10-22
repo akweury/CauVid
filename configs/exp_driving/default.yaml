@@ -203,6 +203,49 @@ candidate_rules:
     - object_in_segment
     - object_track
 
+# Background knowledge that keeps impossible rules out of the step-16 search
+# instead of building them and discarding them after evidence evaluation.
+#
+#   off                  naive baseline; every combination is built and evaluated
+#   derived              functional-predicate exclusions only (default)
+#   derived_and_authored also apply the asserted constraints below
+#
+# `derived` produces the same rule set as `off` - those rules were already being
+# dropped for having no evidence - so it is a compute and audit change only.
+# The authored lists below can change which rules survive, so they are opt-in.
+#
+# Related: candidate_rules.ignored_body_predicates drops atoms at *predicate*
+# granularity during step 14. These constraints work at predicate+value
+# granularity and apply to whole rule bodies; the two are complementary.
+rule_constraints:
+  mode: derived
+  # predicate -> number of leading args identifying the entity. The next arg is
+  # that entity's single value. Merged onto the built-in defaults, so only
+  # additions or overrides need listing here.
+  functional_predicates:
+    object_class: 2
+    object_vz_state: 2
+    object_vx_state: 2
+    object_speed_state: 2
+    object_distance_state: 2
+    object_visibility_state: 2
+    object_x_position_state: 2
+    traffic_light_state: 2
+    traffic_control_type: 2
+    segment_forward_state: 1
+    segment_lateral_state: 1
+    segment_motion_state: 1
+    object_candidate_score_state: 1
+    object_prior_relevance_state: 1
+    object_source_type: 1
+  # Asserted knowledge; only consulted when mode is derived_and_authored.
+  # Atom templates that may never appear in a rule body, e.g.
+  #   - "object_distance_state(S,O,far)."
+  forbidden_atoms: []
+  # Atom template sets that may not co-occur in one body, e.g.
+  #   - ["object_distance_state(S,O,far).", "object_vz_state(S,O,vz_awaying)."]
+  forbidden_combinations: []
+
 initial_rule_pruning:
   enabled: true
   max_total_initial_rules: 300
