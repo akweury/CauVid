@@ -225,7 +225,7 @@ def build_anchor_clauses(all_atoms, output_dir, split):
             Clause([i], [[i]], [0])
         )
     data = {
-        "anchor_clauses": anchor_clauses,
+        "anchor_clauses": [clause.to_dict() for clause in anchor_clauses],
         "unique_atoms": unique_atoms
     }
     utils_data.save_json(data, anchor_clause_file)

@@ -505,10 +505,16 @@ class Clause(object):
         return size
     
     def to_dict(self):
+        # head/body atoms are (atom_index, 'oid', obj_id) tuples
         return {
-            "head": self.head.to_dict(),
-            "body": [atom.to_dict() for atom in self.body],
+            "head": list(self.head),
+            "body": [list(atom) for atom in self.body],
         }
+
+    @classmethod
+    def from_dict(cls, data):
+        body = data["body"]
+        return cls(data["head"], body, [atom[2] for atom in body])
 
 class Predicate():
     """Predicats in first-order logic.
