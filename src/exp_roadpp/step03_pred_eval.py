@@ -261,15 +261,15 @@ def clauses_evaluation(bk, atoms, cfg):
         ocm = build_ocm(apf, ocm_mask, tube_uids, bk)
         recall, precision, iou, f1 = evaluate_ocm(ocm, ocm_gt, ocm_mask)
         summary[vid] = {
-            "ocm_gt": ocm_gt,
-            "ocm": ocm,
             "recall": recall,
             "precision": precision,
             "iou": iou,
             "f1": f1,
         }
         print(f"Evaluation for video {vid}: recall={recall}, precision={precision}, iou={iou}, f1={f1}")
-    # Save the evaluation summary to a JSON file for future reference
+    # Save the evaluation summary to a JSON file for future reference. The
+    # per-video ocm/ocm_gt tensors are intentionally excluded (JSON can't
+    # serialize torch.Tensor); only the scalar metrics are persisted.
     utils_data.save_json(summary, summary_file)
 
     return summary
