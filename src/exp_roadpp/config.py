@@ -255,6 +255,7 @@ def get_step_04_input(args):
         "output_dir": output_dir,
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
         "train_atom_file": args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
+        "dataset_labels_file": args.dataset_path / "gt" / "label.json",
         "device": args.device,
         "cd_method": args.cd_method,
         "cd_stat": args.cd_stat,
