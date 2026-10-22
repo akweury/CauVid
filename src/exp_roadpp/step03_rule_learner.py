@@ -837,14 +837,21 @@ def build_clause_matrix(clauses):
             if body not in unique_bodies:
                 unique_bodies.append(body)
 
-    clause_matrix = torch.zeros((len(clauses), len(unique_bodies)), dtype=torch.bool) 
+    clause_matrix = torch.zeros((len(clauses), len(unique_bodies)), dtype=torch.bool)
+    # clause_scopes[i, j] = the object_slot that body j binds to in clause i's
+    # body_scopes (0 = anchor object; equal nonzero values = co-referenced to
+    # the same other object; -1 = body j is not part of clause i).
+    clause_scopes = torch.full((len(clauses), len(unique_bodies)), -1, dtype=torch.long)
     clause_heads = []
     for i, clause in enumerate(clauses):
         bodies = clause["bodies"]
+        body_scopes = clause.get("body_scopes")
         clause_heads.append(clause["head"])
         for j, body in enumerate(unique_bodies):
             if body in bodies:
                 clause_matrix[i, j] = True
+                if body_scopes is not None:
+                    clause_scopes[i, j] = body_scopes[bodies.index(body)]
     print(f"[Clause Matrix]: {clause_matrix.shape}")
-    
-    return clause_matrix, clause_heads, unique_bodies
+
+    return clause_matrix, clause_heads, unique_bodies, clause_scopes

@@ -216,12 +216,13 @@ def prepare_dataset(data_num, language_model, cfg):
 
 
 def build_background_knowledge(clauses, dataset_labels):
-    cm, heads, bodies = build_clause_matrix(clauses)
+    cm, heads, bodies, scopes = build_clause_matrix(clauses)
     label_num = len(dataset_labels["av_action_labels"]) + len(dataset_labels["action_labels"]) + len(dataset_labels["loc_labels"])
     bk = {
         "clause_matrix": cm,
         "clause_heads": heads,
         "unique_bodies": bodies,
+        "clause_scopes": scopes,
         "label_num": label_num,
         "dataset_labels": dataset_labels
     }
@@ -260,22 +261,19 @@ def main(input_data):
     summary = clauses_evaluation(bk, atoms['val'], cfg)
 
 
-    
-
-
     if input_data["learning"] == 'True':
-        learn_rule_aggregation(atoms, init_clauses, output_dir, dataset_path, "vanilla")
-        learn_rule_aggregation(atoms, coarse_pruned_clauses, output_dir,dataset_path, "coarse_prune")
+        learn_rule_aggregation(atoms, init_clauses, cfg["output_dir"], cfg["dataset_path"], "vanilla")
+        learn_rule_aggregation(atoms, coarse_pruned_clauses, cfg["output_dir"], cfg["dataset_path"], "coarse_prune")
     if input_data["baselines"] == 'True':
         # train and test baselines
         result_summary = {}
         
-        transformer_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
-        ilp_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
-        gnn_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
-        lstm_baseline.run(atoms, dataset_labels, output_dir, result_summary, device)
-        utils_data.save_json(result_summary, test_output_dir / "baselines_summary.json")
-        visualize_baseline_results(result_summary, test_output_dir)
+        transformer_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
+        ilp_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
+        gnn_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
+        lstm_baseline.run(atoms, dataset_labels, cfg["output_dir"], result_summary, cfg["device"])
+        utils_data.save_json(result_summary, cfg["test_output_dir"] / "baselines_summary.json")
+        visualize_baseline_results(result_summary, cfg["test_output_dir"])
     
     print("\n--------- Step 03 Done ---------------\n")
 
@@ -301,6 +299,8 @@ def baselines(input_data):
     train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
     _tracks_to_atoms(track_dir, train_ids, language_model, output_dir)
     train_facts = _atoms_to_init_clauses(language_model, output_dir, 'train')
+    val_facts = _atoms_to_init_clauses(language_model, output_dir, 'val')
+    test_facts = _atoms_to_init_clauses(language_model, output_dir, 'test')
     # all_rules, all_rule_supports, all_head_supports = _facts_to_rules(train_facts, train_ids, language_model, output_dir)
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]

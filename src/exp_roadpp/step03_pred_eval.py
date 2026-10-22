@@ -3,6 +3,8 @@ import torch
 
 from src.exp_roadpp.utils_data import atom_to_signature
 from src.exp_roadpp.step03_visual import visual_2d_heatmap
+from src.exp_roadpp import utils_data
+
 
 def get_video_data(video_atoms, dataset_labels):
     data = []
@@ -24,6 +26,30 @@ def get_video_data(video_atoms, dataset_labels):
     data = [(frame_data[i], frame_data[i + 1]) for i in frame_data.keys() if i + 1 in frame_data]
     return data
 
+
+
+def head_signature_to_label_index(head_signature, dataset_labels):
+    """Map a clause head signature (see `atom_to_signature`/body form, i.e.
+    the atom tuple without its trailing `tube_uid` pair) to the flat label
+    index used by `ocm`'s last dimension, matching the scheme in
+    `build_ocm_gt`: av actions first, then non-av actions, then locations.
+    """
+    predicate = head_signature[1]
+    if predicate == "action":
+        action_id = head_signature[3]
+        agent_class = head_signature[7]
+        if agent_class == "av":
+            return action_id
+        return len(dataset_labels["av_action_labels"]) + action_id
+    elif predicate == "location":
+        location_name = head_signature[3]
+        return (
+            len(dataset_labels["av_action_labels"])
+            + len(dataset_labels["action_labels"])
+            + location_name
+        )
+    else:
+        raise ValueError(f"Unknown predicate type in head signature: {head_signature}")
 
 
 def build_frame_proposals(frame_atoms, clause_matrix, unique_bodies, obj_num, label_num):
@@ -55,7 +81,7 @@ def build_ocm(apf, ocm_mask, tube_ids, bk):
         # Only atoms that are the body of some clause can trigger a clause;
         # the rest of the frame's atoms are not in unique_bodies.
         body_atoms = [atom for atom in apf[frame_i] if atom[:-2] in bk["unique_bodies"]]
-        obj_matrix = torch.zeros((len(body_atoms), 2))
+        obj_matrix = torch.zeros((len(body_atoms), 2), dtype=torch.long)
         for i, atom in enumerate(body_atoms):
             obj_matrix[i, 0] = tube_ids.index(atom[-1])
             obj_matrix[i, 1] = bk["unique_bodies"].index(atom[:-2])
@@ -70,16 +96,55 @@ def build_ocm(apf, ocm_mask, tube_ids, bk):
             # for each body, determine which objects satisfy it
             obj_proposals = obj_matrix[[i for i, body_id in enumerate(obj_matrix[:, 1]) if body_id in c_bodies],:]
             # filter out the not possible objects
-            
-            # get the objects labels 
-            labels = None 
-            for obj in c_objs:
-                ocm[obj, frame_i, labels] = True
 
+            # bk["clause_scopes"][c_index, body_id] tells us which object_slot
+            # each body is bound to for this clause (0 = anchor object; equal
+            # nonzero slots = the same other object; different slots = distinct
+            # objects). Bodies that share a slot must all be satisfied by the
+            # *same* object, so the candidates for a slot are the intersection
+            # of the per-body candidate sets, not their union.
+            bodies_by_slot = {}
+            objs_by_body = {}
+            for body_id in c_bodies.tolist():
+                slot = int(bk["clause_scopes"][c_index, body_id].item())
+                objs_for_body = set(obj_proposals[obj_proposals[:, 1] == body_id, 0].tolist())
+                objs_by_body[body_id] = objs_for_body
+                bodies_by_slot.setdefault(slot, []).append(body_id)
 
-        ocm[:, frame_i] = frame_clause_proposals
-    
-    return ocm 
+            slot_candidates = {
+                slot: set.intersection(*(objs_by_body[b] for b in body_ids))
+                for slot, body_ids in bodies_by_slot.items()
+            }
+
+            # body_to_objs[body_id] = sorted list of objects that could fill
+            # this body's slot (shared by every body bound to the same slot),
+            # i.e. a body -> possible-object(s) mapping consistent with
+            # clause_scopes.
+            body_to_objs = {
+                body_id: sorted(slot_candidates[slot])
+                for slot, body_ids in bodies_by_slot.items()
+                for body_id in body_ids
+            }
+            # Candidate anchor objects (slot 0) for this clause.
+            c_objs = slot_candidates.get(0, set())
+
+            # The head is always evaluated against the clause's own (anchor)
+            # entity (see `build_features`'s `next_entity_facts` lookup, keyed
+            # by the body atom's own entity_key) -- i.e. the head is implicitly
+            # bound to slot 0, the same object as the anchor body. So the
+            # objects that should receive the head's label are exactly the
+            # anchor-slot candidates.
+            head_objs = c_objs
+            if not head_objs:
+                continue
+
+            label = head_signature_to_label_index(c_heads, bk["dataset_labels"])
+            for obj in head_objs:
+                # Estimated label of `obj` in the next frame, based on this
+                # active clause's head.
+                ocm[obj, frame_i, label] = True
+
+    return ocm
 
 def apply_clause_proposals(proposals, heads):
     # proposals includes active clauses for each frame
@@ -89,26 +154,6 @@ def apply_clause_proposals(proposals, heads):
     return events
 
 
-def detect_events(bk, atoms, cfg):
-    output_dir = cfg["output_dir"]
-    clause_matrix = bk["clause_matrix"]
-    clause_heads = bk["clause_heads"]
-    feature_num = bk["feature_num"]
-    dataset_labels = bk["dataset_labels"]
-    # 
-    
-    ocm = apply_clause_proposals(vm, clause_heads)
-
-    visual_2d_heatmap(
-        vm.cpu().numpy(),
-        output_dir=output_dir,
-        title="Clause Proposals",
-        filename="clause_proposals",
-        x_label = "Clauses",
-        y_label = "Frames"
-        
-    )
-    return events
 
 def build_ocm_gt(all_tube_uids, apsf, frame_num, label_num, dataset_labels):
     obj_num = len(all_tube_uids)
@@ -161,10 +206,48 @@ def evaluate_video_events(events, events_gt):
 
 
 
+def evaluate_ocm(ocm, ocm_gt, ocm_mask):
+    """Compare predicted object-label estimates `ocm` against ground truth
+    `ocm_gt`, restricted to the (object, frame) positions where `ocm_mask`
+    is True (i.e. where the object actually exists in the ground truth).
+
+    ocm, ocm_gt: (obj_num, frame_num, label_num) bool tensors.
+    ocm_mask: (obj_num, frame_num) bool tensor.
+
+    Returns (recall, precision, iou, f1) as plain floats, computed by
+    micro-averaging True Positives/False Positives/False Negatives over all
+    masked (object, frame, label) entries.
+    """
+    mask = ocm_mask.unsqueeze(-1).expand_as(ocm_gt)
+    pred = ocm & mask
+    gt = ocm_gt & mask
+
+    tp = (pred & gt).sum().item()
+    fp = (pred & ~gt).sum().item()
+    fn = (~pred & gt).sum().item()
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    union = tp + fp + fn
+    iou = tp / union if union > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    return recall, precision, iou, f1
+
+
 def clauses_evaluation(bk, atoms, cfg):
     summary = {}
     label_num = bk["label_num"]
     labels = bk["dataset_labels"]
+    summary_file = cfg["output_dir"] / "clauses_evaluation_summary.json"
+    if summary_file.exists():
+        summary = utils_data.load_json(summary_file)
+        return summary
+    
     for vid, interval_atoms in atoms.items():
         tube_uids = list(set([atom["tube_uid"] for atom in interval_atoms]))
         frame_num = max([int(atom["end_frame"]) for atom in interval_atoms]) if interval_atoms else 0
@@ -176,14 +259,18 @@ def clauses_evaluation(bk, atoms, cfg):
                                         label_num, 
                                         labels)
         ocm = build_ocm(apf, ocm_mask, tube_uids, bk)
+        recall, precision, iou, f1 = evaluate_ocm(ocm, ocm_gt, ocm_mask)
         summary[vid] = {
             "ocm_gt": ocm_gt,
             "ocm": ocm,
-            "recall": None,
-            "precision": None,
-            "iou":None,
-            "f1": None,
+            "recall": recall,
+            "precision": precision,
+            "iou": iou,
+            "f1": f1,
         }
+    # Save the evaluation summary to a JSON file for future reference
+    utils_data.save_json(summary, summary_file)
+
     return summary
 
 
