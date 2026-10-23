@@ -264,6 +264,5 @@ def main(input_data):
     atoms = load_atoms(cfg["train_atom_file"])
     # Convert atoms to anchor clauses
     anchor_data = build_anchor_clauses(atoms, cfg["output_dir"], 'train')
-    raise NotImplementedError("Step 3 output handling not implemented yet.")    
     return anchor_data
 
