@@ -578,12 +578,16 @@ def build_training_examples(atoms, clauses, labels,cfg):
 
     return examples
 
-def learn_extension_mask(
-    X, y, num_epochs=200, lr=0.1, l0_lambda=1e-3, device='cpu', batch_size=None,
-    early_stop_tol=1e-4, early_stop_patience=30, init_log_alpha=-5.0,
+def learn_extension_masks(
+    X, Y, num_epochs=200, lr=0.1, l0_lambda=1e-3, device='cpu', batch_size=None,
+    mask_patience=20, check_every=5, gate_tol=1e-3, init_log_alpha=-5.0,
 ):
-    # X: (N, M) float tensor (0/1), y: (N,) float tensor (0/1)
+    # X: (N, M) 0/1 tensor, Y: (N, H) 0/1 tensor; one rule (gate vector) per
+    # head column of Y, all trained together. Heads are independent: the loss
+    # is a sum over heads, so each head's gradient is the same as alone.
     # The rule fires with s = prod_j (1 - w_j (1 - x_j)), w = sigmoid(log_alpha).
+    # Since x_j is 0/1, log(1 - w_j (1 - x_j)) = (1 - x_j) log(1 - w_j), so
+    # log s = (1 - X) @ log(1 - w): one (N, M) x (M, H) matmul for all heads.
     # Training avoids the ways all gates collapse to "off":
     #   - gates are deterministic and start nearly off (`init_log_alpha`), so
     #     the empty rule gives s ~= 1 and each feature is switched on only if
@@ -592,107 +596,77 @@ def learn_extension_mask(
     #     of absent features underflows to 0 for every row;
     #   - the loss is computed from log s, never clamping s, so the gradient
     #     survives even when s is tiny.
-    # Positives are up-weighted to balance rare heads, and `l0_lambda` is the
-    # cost of each selected atom (penalty = sum of w), independent of M.
-    # X/y are kept on CPU and moved to `device` in row batches so that only one
-    # (batch_size, M) slice lives on the GPU at a time -- the full (N, M) dense
-    # block plus its `torch.prod` intermediate can otherwise exceed GPU memory
-    # (e.g. on an 8GB GTX 1080) when N or M is large. `batch_size=None` auto-sizes
-    # the batch from the currently attached GPU's free memory, so the same code
-    # adapts whether it runs on a GTX 1080 or an A100. If the whole dataset fits
-    # in one batch (common on an A100), it is uploaded to the GPU once instead of
-    # being re-copied from CPU every epoch, which otherwise dominates runtime.
-    X_cpu = X.detach().to('cpu')
-    y_cpu = y.detach().to('cpu')
-    N, M = X_cpu.shape
+    # Positives are up-weighted per head to balance rare heads, and `l0_lambda`
+    # is the cost of each selected atom (penalty = sum of w), independent of M.
+    # (1 - X) is uploaded to `device` once if it fits (`batch_size=None`
+    # auto-sizes from free GPU memory), otherwise moved in row batches.
+    # The output is the hard mask w > 0.5, so training stops once that mask has
+    # not changed for `mask_patience` epochs and no gate moved by more than
+    # `gate_tol` since the last check (gates start off and rise slowly, so an
+    # unchanged mask alone would stop too early). Checked every `check_every`
+    # epochs to avoid a GPU sync per step.
+    N, M = X.shape
+    H = Y.shape[1]
     if batch_size is None:
-        batch_size = _auto_batch_size(M, device)
-    log_alpha = torch.full((M,), init_log_alpha, requires_grad=True, device=device)
-    optimizer = torch.optim.Adam([log_alpha], lr=lr)
-    num_positives = float(y_cpu.sum())
-    pos_weight = (N - num_positives) / num_positives if num_positives > 0 else 1.0
-    best_loss = float("inf")
-    epochs_without_improvement = 0
+        batch_size = _auto_batch_size(M + H, device)
+    X_off = 1 - X.detach().to('cpu', torch.float32)
+    Y = Y.detach().to('cpu', torch.float32)
+    num_positives = Y.sum(dim=0)
+    pos_weight = torch.where(
+        num_positives > 0, (N - num_positives) / num_positives.clamp(min=1), torch.ones_like(num_positives)
+    )
+    weights = 1 + (pos_weight - 1) * Y
 
     whole_dataset_fits = batch_size >= N
     if whole_dataset_fits:
-        try:
-            X_resident = X_cpu.to(device)
-            y_resident = y_cpu.to(device)
-        except torch.cuda.OutOfMemoryError:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print(
-                "[Rule extension] CUDA out of memory while uploading training "
-                f"data to device={device} (N={N}, M={M}). Re-run with a "
-                "smaller --batch_size, a smaller --num_epochs, or pass "
-                "--device cpu."
-            )
-            raise
+        X_off = X_off.to(device)
+        Y = Y.to(device)
+        weights = weights.to(device)
 
-    for _ in range(num_epochs):
-        epoch_loss = 0.0
+    log_alpha = torch.full((M, H), init_log_alpha, requires_grad=True, device=device)
+    optimizer = torch.optim.Adam([log_alpha], lr=lr)
+    previous_w = None
+    epochs_unchanged = 0
+    for epoch in range(num_epochs):
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            try:
-                if whole_dataset_fits:
-                    X_batch = X_resident
-                    y_batch = y_resident
-                else:
-                    X_batch = X_cpu[start:end].to(device)
-                    y_batch = y_cpu[start:end].to(device)
+            if whole_dataset_fits:
+                X_batch, Y_batch, W_batch = X_off, Y, weights
+            else:
+                X_batch = X_off[start:end].to(device, non_blocking=True)
+                Y_batch = Y[start:end].to(device, non_blocking=True)
+                W_batch = weights[start:end].to(device, non_blocking=True)
 
-                optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            w = torch.sigmoid(log_alpha)
+            # The factor is capped below 1 so a fully-on gate stays finite.
+            log_s = X_batch @ torch.log1p(-w.clamp(max=1 - 1e-6))  # (batch, H)
+            # log(1 - s); the epsilon keeps it finite (and its gradient
+            # alive) at s = 1, which is where training starts.
+            log_not_s = torch.log(-torch.expm1(log_s) + 1e-6)
+            bce = -(W_batch * (Y_batch * log_s + (1 - Y_batch) * log_not_s)).sum(dim=0) / W_batch.sum(dim=0)
+            loss = bce.sum() + l0_lambda * w.sum()
+            loss.backward()
+            optimizer.step()
+
+        if (epoch + 1) % check_every == 0:
+            with torch.no_grad():
                 w = torch.sigmoid(log_alpha)
-                # log s = sum_j log(1 - w_j (1 - x_j)); the factor is capped
-                # below 1 so a fully-on gate on an absent feature stays finite.
-                off_factor = (w.unsqueeze(0) * (1 - X_batch)).clamp(max=1 - 1e-6)
-                log_s = torch.log1p(-off_factor).sum(dim=1)  # (batch,)
-                # log(1 - s); the epsilon keeps it finite (and its gradient
-                # alive) at s = 1, which is where training starts.
-                log_not_s = torch.log(-torch.expm1(log_s) + 1e-6)
-                weights = 1 + (pos_weight - 1) * y_batch
-                bce = -(weights * (y_batch * log_s + (1 - y_batch) * log_not_s)).sum() / weights.sum()
-                l0_penalty = w.sum()  # soft count of selected atoms
-                loss = bce + l0_lambda * l0_penalty
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item()
-
-                if whole_dataset_fits:
-                    del w, off_factor, log_s, log_not_s, weights, bce, loss
-                else:
-                    del X_batch, y_batch, w, off_factor, log_s, log_not_s, weights, bce, loss
-            except torch.cuda.OutOfMemoryError:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(
-                    "[Rule extension] CUDA out of memory while training on "
-                    f"device={device} with batch_size={batch_size} "
-                    f"(N={N}, M={M}). Re-run with a smaller --batch_size, a "
-                    "smaller --num_epochs, or pass --device cpu."
+                settled = previous_w is not None and bool(
+                    torch.equal(w > 0.5, previous_w > 0.5)
+                    and (w - previous_w).abs().max() < gate_tol
                 )
-                raise
+            if settled:
+                epochs_unchanged += check_every
+                if epochs_unchanged >= mask_patience:
+                    break
+            else:
+                epochs_unchanged = 0
+            previous_w = w
 
-        # Early stopping: stop once the per-epoch loss stops improving by more
-        # than `early_stop_tol` for `early_stop_patience` consecutive epochs.
-        # This avoids wasting epochs after convergence, which otherwise
-        # dominates runtime now that the whole dataset can live on the GPU.
-        if best_loss - epoch_loss > early_stop_tol:
-            best_loss = epoch_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stop_patience:
-                break
-
-    final_mask = (torch.sigmoid(log_alpha) > 0.5)
-    final_mask = final_mask.detach().to('cpu')
     final_log_alpha = log_alpha.detach().to('cpu')
-    del log_alpha, X_cpu, y_cpu
-    if whole_dataset_fits:
-        del X_resident, y_resident
+    final_mask = torch.sigmoid(final_log_alpha) > 0.5
+    del log_alpha, optimizer, X_off, Y, weights
     if device != 'cpu' and torch.cuda.is_available():
         torch.cuda.empty_cache()
     return final_mask, final_log_alpha
@@ -814,34 +788,38 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
             )
             continue
 
-        # Densify only this group's (N, M) block, kept on CPU; only
-        # row-batches are moved to the GPU inside `learn_extension_mask`.
-        # Float copy for training, numpy view of the bool block for hard
-        # evaluation.
+        # Densify only this group's (N, M) block, kept on CPU; it is moved to
+        # the GPU once inside `learn_extension_masks`. Numpy view of the bool
+        # block for hard evaluation.
         dense_features = sparse_rows_to_dense(features[gid])
-        X = dense_features.float()
         feature_block = dense_features.numpy()
         dense_targets = sparse_rows_to_dense(targets[gid])
 
-        for head_col in range(num_head_cols):
-            target_col = dense_targets[:, head_col].numpy().astype(np.float32)
-
-            # Skip degenerate targets: nothing to learn if the head never fires
-            # or always fires for this body-group.
-            if target_col.sum() == 0 or target_col.sum() == len(target_col):
-                print(
-                    f"[Rule extension] Skipping group {gid}, head {head_col}: "
-                    f"degenerate target (head fires in {int(target_col.sum())}/"
-                    f"{len(target_col)} rows)."
-                )
-                continue
-
-            y = torch.from_numpy(target_col)
-            final_mask, log_alpha = learn_extension_mask(
-                X, y, num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
+        # Skip degenerate targets: nothing to learn if the head never fires
+        # or always fires for this body-group.
+        head_positives = dense_targets.sum(dim=0)
+        learnable_heads = torch.nonzero(
+            (head_positives > 0) & (head_positives < num_rows), as_tuple=True
+        )[0].tolist()
+        num_degenerate = num_head_cols - len(learnable_heads)
+        if num_degenerate:
+            print(
+                f"[Rule extension] Skipping {num_degenerate}/{num_head_cols} heads of "
+                f"group {gid}: degenerate target (head fires in no row or every row)."
             )
-            selected_positions = torch.nonzero(final_mask, as_tuple=True)[0].tolist()
-            del final_mask, log_alpha
+        if not learnable_heads:
+            del dense_features, feature_block, dense_targets
+            continue
+
+        # All learnable heads of the group are trained together.
+        final_masks, _log_alpha = learn_extension_masks(
+            dense_features, dense_targets[:, learnable_heads],
+            num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
+        )
+
+        for mask_col, head_col in enumerate(learnable_heads):
+            target_col = dense_targets[:, head_col].numpy().astype(np.float32)
+            selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
             if not selected_positions:
                 print(
                     f"[Rule extension] Skipping group {gid}, head {head_col}: "
@@ -875,7 +853,7 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
                 "metrics": metrics,
             })
 
-        del X, dense_features, feature_block, dense_targets
+        del dense_features, feature_block, dense_targets, final_masks
         if device != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
     extended_clauses = _to_extended_clauses(extended_data, examples)
