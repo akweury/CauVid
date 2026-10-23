@@ -96,47 +96,77 @@ def _to_sparse_rows(rows, columns, shape):
         shape,
     )
 
-def _index_frame_entities(atoms):
-    """Give every (frame pair, entity) a node id and list its atoms.
+def _index_frame_entities(atoms, horizon):
+    """Give every (frame, entity) observed in frame t a node id and list its atoms.
 
-    Node ids are contiguous per frame pair, so nodes of one frame pair form a
-    consecutive range. Returns long tensors:
-      node_frame[n]: frame pair of node n;
-      current_cells / next_cells: (node, atom_index) of every atom in frame
-          t / t+1.
+    Node ids are contiguous per frame, so nodes of one frame form a
+    consecutive range. Entities not observed in frame t get no node.
+    Returns long tensors:
+      node_frame[n]: frame of node n;
+      current_cells: (node, atom_index) of every atom in frame t;
+      onset_cells: (node, atom_index, delta_t) of the first onset of each atom
+          of the node's entity within frames (t, t + horizon].
     """
+    atom_vocab = {tuple(atom): i for i, atom in enumerate(atoms["unique_atoms"])}
     node_frame = []
     current_nodes, current_atom_ids = [], []
-    next_nodes, next_atom_ids = [], []
+    onset_nodes, onset_atom_ids, onset_delays = [], [], []
     frame_id = 0
     for video_id, video_atoms in tqdm(atoms.items(), desc="Indexing frames"):
         if video_id == "unique_atoms":
             continue
-        for current_frame, next_frame in video_atoms["per_frame_atoms"]:
-            if len(current_frame) == 0 or len(next_frame) == 0:
+        entity_onsets = utils_data.build_entity_onset_index(video_atoms["interval_atoms"], atom_vocab)
+        for t, (current_frame, _next_frame) in enumerate(video_atoms["per_frame_atoms"]):
+            if len(current_frame) == 0:
                 continue
             base = len(node_frame)
             entity_nodes = {}
-            for frame_atoms, nodes, atom_ids in (
-                (current_frame, current_nodes, current_atom_ids),
-                (next_frame, next_nodes, next_atom_ids),
-            ):
-                for atom in frame_atoms:
-                    node = entity_nodes.setdefault(
-                        _atom_entity_key(atom), base + len(entity_nodes)
-                    )
-                    nodes.append(node)
-                    atom_ids.append(atom[0])
+            node_tube_uids = {}
+            for atom in current_frame:
+                node = entity_nodes.setdefault(
+                    _atom_entity_key(atom), base + len(entity_nodes)
+                )
+                node_tube_uids[node] = atom[-1]
+                current_nodes.append(node)
+                current_atom_ids.append(atom[0])
+            for node, tube_uid in node_tube_uids.items():
+                for atom_index, delta_t in utils_data.future_onsets(
+                    entity_onsets.get(tube_uid, []), t, horizon
+                ):
+                    onset_nodes.append(node)
+                    onset_atom_ids.append(atom_index)
+                    onset_delays.append(delta_t)
             node_frame.extend([frame_id] * len(entity_nodes))
             frame_id += 1
     return (
         torch.tensor(node_frame, dtype=torch.long),
         torch.tensor([current_nodes, current_atom_ids], dtype=torch.long),
-        torch.tensor([next_nodes, next_atom_ids], dtype=torch.long),
+        torch.tensor([onset_nodes, onset_atom_ids, onset_delays], dtype=torch.long),
     )
 
 
-def build_features(atoms, dataset_labels, body_groups, head_vocab,
+def _node_tables(atoms, horizon, device):
+    """Dense per-node tables of `_index_frame_entities`. Returns
+      node_frame[n]: frame of node n;
+      current[n, a]: atom a holds for node n in frame t;
+      delay[n, a]: frames until atom a next starts for node n (0: not within
+          horizon, or already active in frame t).
+    """
+    num_atoms = len(atoms["unique_atoms"])
+    node_frame, current_cells, onset_cells = _index_frame_entities(atoms, horizon)
+    num_nodes = len(node_frame)
+    node_frame = node_frame.to(device)
+    current = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
+    current[current_cells[0].to(device), current_cells[1].to(device)] = True
+    delay = torch.zeros((num_nodes, num_atoms), dtype=torch.int16, device=device)
+    delay[onset_cells[0].to(device), onset_cells[1].to(device)] = onset_cells[2].to(
+        device=device, dtype=torch.int16
+    )
+    delay[current] = 0
+    return node_frame, current, delay
+
+
+def build_features(atoms, dataset_labels, body_groups, head_vocab, delay_windows,
                    device="cpu", chunk_rows=1 << 18):
     """Build sparse 0/1 feature/target matrices, one pair per body group.
 
@@ -145,15 +175,18 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
     grounding of the clause's oids to entities in frame t:
       - the body oid is bound to the entity of a matching atom in frame t;
       - oid 0 (the head object) is that same entity if the body oid is 0,
-        otherwise each other entity present in frame t+1 (distinct oids bind
+        otherwise each other entity present in frame t (distinct oids bind
         distinct objects, as in step03's anchor clauses).
       features[g]: (N_g, M_g); column j = feature_vocab[g][j], a
           co-occurring atom (group_id, object_slot, atom_index) in frame t.
           object_slot is 0 for the head object, the body oid for the body
           object, and body oid + 1 for "some other object in the frame"
           (all unbound entities share this one existential slot).
-      targets[g]:  (N_g, H_g); column k = head_vocab[g][k], True if that
-          head atom holds for the oid-0 entity in frame t+1.
+      targets[g]:  (N_g, H_g); column k = head_vocab[g][k] = (gid, head, w),
+          True if the head atom is not active for the oid-0 entity in frame t
+          and starts for it within frames (t, t + w]. Columns are ordered
+          head-major, one per window of `delay_windows`, so the targets of
+          one head are cumulative in w.
     Both are stored in the compact CSR form of `_to_sparse_rows`; use
     `sparse_rows_to_dense` to get a dense tensor for one group.
     Columns are local to each group (only columns True in some row are kept),
@@ -167,21 +200,15 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
     num_groups = len(body_groups)
     group_ids = {body_signature: gid for gid, body_signature in enumerate(body_groups)}
     group_head_vocab = [[] for _ in range(num_groups)]
-    for body_signature, head_signature in head_vocab:
+    for body_signature, head_signature, window in head_vocab:
         gid = group_ids[body_signature]
-        group_head_vocab[gid].append((gid, head_signature))
+        group_head_vocab[gid].append((gid, head_signature, window))
 
     num_atoms = len(atoms["unique_atoms"])
-    node_frame, current_cells, next_cells = _index_frame_entities(atoms)
+    node_frame, current, delay = _node_tables(atoms, max(delay_windows), device)
     num_nodes = len(node_frame)
     num_frames = int(node_frame[-1]) + 1 if num_nodes else 0
-
-    # current[n, a] / upcoming[n, a]: atom a holds for node n in frame t / t+1.
-    node_frame = node_frame.to(device)
-    current = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
-    current[current_cells[0].to(device), current_cells[1].to(device)] = True
-    upcoming = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
-    upcoming[next_cells[0].to(device), next_cells[1].to(device)] = True
+    windows = torch.tensor(delay_windows, dtype=torch.int16, device=device)
     # frame_counts[f, a]: number of entities in frame pair f with atom a at t.
     cell_nodes, cell_atoms = torch.nonzero(current, as_tuple=True)
     frame_counts = torch.zeros((num_frames, num_atoms), dtype=torch.int32, device=device)
@@ -191,42 +218,41 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
         accumulate=True,
     )
     del cell_nodes, cell_atoms
-    # Candidate head objects: nodes with some atom at t+1, grouped by frame.
-    has_next = upcoming.any(dim=1)
-    next_nodes = torch.nonzero(has_next, as_tuple=True)[0]
-    next_counts = torch.bincount(node_frame[next_nodes], minlength=num_frames)
-    next_starts = torch.cumsum(next_counts, dim=0) - next_counts
+    # Candidate head objects: all nodes of the frame (contiguous per frame).
+    frame_node_counts = torch.bincount(node_frame, minlength=num_frames)
+    frame_node_starts = torch.cumsum(frame_node_counts, dim=0) - frame_node_counts
 
     features = []
     targets = []
     group_feature_vocab = []
+    group_row_heads = []
     for body_signature, group_id in tqdm(group_ids.items(), desc="Building features"):
         body_index, _oid_tag, body_oid = body_signature
         other_slot = body_oid + 1
         num_columns = (other_slot + 1) * num_atoms
+        # One atom per head; its len(delay_windows) columns are consecutive.
         head_atoms = torch.tensor(
-            [head_signature[0] for _gid, head_signature in group_head_vocab[group_id]],
+            [head_signature[0] for _gid, head_signature, _window
+             in group_head_vocab[group_id][::len(delay_windows)]],
             dtype=torch.long, device=device,
         )
 
         # Rows: (body node, head node) groundings of this group.
         body_nodes = torch.nonzero(current[:, body_index], as_tuple=True)[0]
         if body_oid == 0:
-            body_nodes = body_nodes[has_next[body_nodes]]
             row_body = row_head = body_nodes
         else:
             body_frames = node_frame[body_nodes]
-            counts = next_counts[body_frames]
+            counts = frame_node_counts[body_frames]
             row_body = torch.repeat_interleave(body_nodes, counts)
             within = torch.arange(len(row_body), device=device) - torch.repeat_interleave(
                 torch.cumsum(counts, dim=0) - counts, counts
             )
-            row_head = next_nodes[
-                torch.repeat_interleave(next_starts[body_frames], counts) + within
-            ]
+            row_head = torch.repeat_interleave(frame_node_starts[body_frames], counts) + within
             keep = row_head != row_body
             row_body, row_head = row_body[keep], row_head[keep]
         num_rows = len(row_body)
+        group_row_heads.append(row_head.cpu())
 
         feature_rows, feature_columns = [], []
         target_rows, target_columns = [], []
@@ -250,7 +276,9 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
             feature_rows.append((rows + start).cpu())
             feature_columns.append(columns.cpu())
 
-            rows, columns = torch.nonzero(upcoming[head][:, head_atoms], as_tuple=True)
+            head_delay = delay[head][:, head_atoms].unsqueeze(-1)
+            starts_within = (head_delay > 0) & (head_delay <= windows)
+            rows, columns = torch.nonzero(starts_within.reshape(len(head), -1), as_tuple=True)
             target_rows.append((rows + start).cpu())
             target_columns.append(columns.cpu())
 
@@ -274,7 +302,7 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
             target_rows, target_columns, (num_rows, len(group_head_vocab[group_id])),
         ))
 
-    del current, upcoming, frame_counts
+    del current, delay, frame_counts
     if str(device) != "cpu" and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -283,6 +311,8 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab,
         "targets": targets,
         "feature_vocab": group_feature_vocab,
         "head_vocab": group_head_vocab,
+        # row_heads[g][i]: node of the head object of row i.
+        "row_heads": group_row_heads,
     }
 
 
@@ -327,6 +357,7 @@ def _encode_examples(examples):
         "feature_vocab": feature_vocab,
         "body_ids": torch.tensor(body_ids, dtype=torch.long),
         "candidate_head_ids": candidate_head_ids,
+        "delay_windows": torch.tensor(examples["delay_windows"], dtype=torch.long),
     }
     # Pruned examples only: feature_aliases[g][j] is a list of vocab entries.
     # Flatten each group to (K_g, 2) (object_slot, atom_id) rows; column j's
@@ -350,11 +381,13 @@ def _encode_examples(examples):
     return compact, signatures
 
 
-def build_head_vocab(body_groups):
+def build_head_vocab(body_groups, delay_windows):
+    # One cumulative head "starts within w" per (candidate head, window).
     head_vocab = []
     for body_id, (body_signature, body_group) in enumerate(body_groups.items()):
         for head_signature in body_group["candidate_heads"]:
-            head_vocab.append((body_signature, head_signature))
+            for window in delay_windows:
+                head_vocab.append((body_signature, head_signature, window))
     return head_vocab
 
     
@@ -365,10 +398,13 @@ def _decode_examples(compact, signatures):
         body_groups[signatures[body_id]] = {
             "candidate_heads": tuple(signatures[h] for h in head_ids.tolist())
         }
-    head_vocab = build_head_vocab(body_groups)
+    delay_windows = compact["delay_windows"].tolist()
+    head_vocab = build_head_vocab(body_groups, delay_windows)
+    group_ids = {body_signature: gid for gid, body_signature in enumerate(body_groups)}
     group_head_vocab = [[] for _ in range(len(body_groups))]
-    for gid, head_signature in head_vocab:
-        group_head_vocab[gid].append((gid, head_signature))
+    for body_signature, head_signature, window in head_vocab:
+        gid = group_ids[body_signature]
+        group_head_vocab[gid].append((gid, head_signature, window))
     feature_vocab = [
         [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in vocab.tolist()]
         for gid, vocab in enumerate(compact["feature_vocab"])
@@ -379,6 +415,7 @@ def _decode_examples(compact, signatures):
         "feature_vocab": feature_vocab,
         "head_vocab": group_head_vocab,
         "body_groups": body_groups,
+        "delay_windows": delay_windows,
     }
     if "alias_atoms" in compact:
         examples["feature_aliases"] = []
@@ -562,9 +599,11 @@ def prune_examples(examples, min_support):
 
 def build_training_examples(atoms, clauses, labels,cfg):   
     body_groups = group_clauses_by_body(clauses, labels)
-    head_vocab = build_head_vocab(body_groups)
-    examples = build_features(atoms, labels, body_groups, head_vocab, device=cfg["device"])
+    head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
+    examples = build_features(atoms, labels, body_groups, head_vocab, cfg["delay_windows"],
+                              device=cfg["device"])
     examples["body_groups"] = body_groups
+    examples["delay_windows"] = list(cfg["delay_windows"])
     # examples = prune_examples(examples, cfg["min_support"])
     
     # print summary of the training data
@@ -717,7 +756,7 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
         "f1": f1,
     }
 
-def _to_extended_clauses(extended_data, training_examples_by_body):
+def _to_extended_clauses(extended_data, training_examples_by_body, delay_windows):
     body_groups = training_examples_by_body["body_groups"]
     extended_clauses = []
     group_bodies = list(body_groups.keys())
@@ -736,6 +775,10 @@ def _to_extended_clauses(extended_data, training_examples_by_body):
             "bodies": bodies,
             "body_scopes": body_scopes,
             "head": head,
+            # The head starts within delay_window frames; delay_windows are all
+            # windows learned, needed to decode the cumulative heads.
+            "delay_window": item['head'][2],
+            "delay_windows": list(delay_windows),
             "support": item["metrics"]["support"],
             "coverage": item["metrics"]["coverage"],
             "confidence": item["metrics"]["confidence"],
@@ -753,9 +796,11 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
     
     # prepare the training examples for rule extension
     training_file = cfg["output_dir"] / "training_examples.pt"
-    if training_file.exists():
-        examples = torch.load(training_file)
-    else:
+    examples = torch.load(training_file) if training_file.exists() else None
+    if examples is not None and examples.get("delay_windows") != list(cfg["delay_windows"]):
+        print(f"[Cache] {training_file} was built for other delay windows, rebuilding")
+        examples = None
+    if examples is None:
         examples = build_training_examples(atoms, anchor_clauses, labels, cfg)
         torch.save(examples, training_file)
 
@@ -856,12 +901,92 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
         del dense_features, feature_block, dense_targets, final_masks
         if device != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
-    extended_clauses = _to_extended_clauses(extended_data, examples)
+    extended_clauses = _to_extended_clauses(extended_data, examples, cfg["delay_windows"])
     return extended_clauses
 
 
 
-def main(input_data):
+def evaluate_clauses(extended_clauses, train_unique_atoms, eval_atoms, head_atoms,
+                     delay_windows, device="cpu"):
+    """Score timed clauses on another split per (frame, agent, head atom).
+
+    A clause predicts that its head starts for the head agent within its
+    delay_window, hence also within every larger window. For window w, an
+    (agent, head) is predicted if some clause with delay_window <= w fires on
+    it, and is positive if the head starts for that agent within (t, t + w]
+    (the targets of `build_features`).
+    head_atoms: train atom ids of the scored heads; keep it fixed across runs
+    so that recall is comparable.
+    Returns per-window precision/recall/f1 and bin_accuracy: among events that
+    are predicted and start within the largest window, the share whose
+    smallest predicted window is the smallest window containing the onset.
+    """
+    eval_vocab = {tuple(atom): i for i, atom in enumerate(eval_atoms["unique_atoms"])}
+    to_eval = [eval_vocab.get(tuple(atom), -1) for atom in train_unique_atoms]
+
+    # Group the clauses by anchor body in eval atom ids; a clause with an atom
+    # unseen in the eval split never fires there.
+    body_groups, group_clauses = {}, {}
+    for clause in extended_clauses:
+        if min(to_eval[atom[0]] for atom in [*clause["bodies"], clause["head"]]) < 0:
+            continue
+        anchor = clause["bodies"][0]
+        body = (to_eval[anchor[0]], "oid", anchor[2])
+        head = (to_eval[clause["head"][0]], "oid", 0)
+        body_groups.setdefault(body, {"candidate_heads": set()})["candidate_heads"].add(head)
+        extras = [(atom[2], to_eval[atom[0]]) for atom in clause["bodies"][1:]]
+        group_clauses.setdefault(body, []).append((extras, head[0], clause["delay_window"]))
+    for body_group in body_groups.values():
+        body_group["candidate_heads"] = tuple(sorted(body_group["candidate_heads"], key=repr))
+
+    examples = build_features(eval_atoms, None, body_groups,
+                              build_head_vocab(body_groups, delay_windows), delay_windows,
+                              device=device)
+    _node_frame, _current, delay = _node_tables(eval_atoms, max(delay_windows), device)
+    # pred[n, a]: smallest window of a clause predicting atom a for node n.
+    no_prediction = max(delay_windows) + 1
+    pred = torch.full(delay.shape, no_prediction, dtype=torch.int16, device=device)
+    for gid, body in enumerate(body_groups):
+        column_ids = {
+            (object_slot, atom_index): j
+            for j, (_gid, object_slot, atom_index) in enumerate(examples["feature_vocab"][gid])
+        }
+        dense_features = sparse_rows_to_dense(examples["features"][gid]).to(device)
+        row_heads = examples["row_heads"][gid].to(device)
+        for extras, head, window in group_clauses[body]:
+            columns = [column_ids.get(extra) for extra in extras]
+            if None in columns:
+                continue
+            nodes = row_heads[dense_features[:, columns].all(dim=1)]
+            pred[nodes, head] = torch.clamp(pred[nodes, head], max=window)
+        del dense_features
+
+    heads = sorted({to_eval[atom] for atom in head_atoms if to_eval[atom] >= 0})
+    heads = torch.tensor(heads, dtype=torch.long, device=device)
+    pred, delay = pred[:, heads], delay[:, heads]
+    result = {"windows": list(delay_windows), "num_clauses": len(extended_clauses),
+              "precision": [], "recall": [], "f1": []}
+    for window in delay_windows:
+        predicted = pred <= window
+        positive = (delay > 0) & (delay <= window)
+        tp = int((predicted & positive).sum())
+        fp = int((predicted & ~positive).sum())
+        fn = int((~predicted & positive).sum())
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        result["precision"].append(precision)
+        result["recall"].append(recall)
+        result["f1"].append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
+
+    windows = torch.tensor(delay_windows, dtype=torch.long, device=device)
+    hit = (pred < no_prediction) & (delay > 0)
+    pred_bin = torch.bucketize(pred[hit].long(), windows)
+    true_bin = torch.bucketize(delay[hit].long(), windows)
+    result["bin_accuracy"] = float((pred_bin == true_bin).float().mean()) if hit.any() else 0.0
+    return result
+
+
+def get_cfg(input_data):
     cfg = {
         'output_dir': input_data['output_dir'],
         'device': input_data['device'],
@@ -869,14 +994,25 @@ def main(input_data):
         'min_confidence_gain': 0.05,
         'num_epochs': 200,
         'lr': 0.1,
-        'l0_lambda': 1e-3
+        'l0_lambda': 1e-3,
+        'delay_windows': list(input_data['delay_windows']),
     }
+    if not cfg['delay_windows'] or cfg['delay_windows'] != sorted(set(cfg['delay_windows'])) \
+            or cfg['delay_windows'][0] < 1:
+        raise ValueError(f"delay_windows must be increasing positive ints, got {cfg['delay_windows']}")
+    return cfg
+
+
+def main(input_data):
+    cfg = get_cfg(input_data)
     print(f"----------------- Step 05: Rule Extension -----------------")
     extend_clause_file = cfg['output_dir'] / "extended_clauses.json"
     if extend_clause_file.exists():
         extended_clauses = utils_data.load_json(extend_clause_file)
-        print(f"Loaded extended clauses: {len(extended_clauses)}")
-        return extended_clauses
+        if extended_clauses and extended_clauses[0].get("delay_windows") == cfg['delay_windows']:
+            print(f"Loaded extended clauses: {len(extended_clauses)}")
+            return extended_clauses
+        print(f"[Cache] {extend_clause_file} was learned for other delay windows, relearning")
     
     dataset_labels = utils_data.load_json(input_data['dataset_label_file'])
     atoms = utils_data.load_json(input_data['train_atom_file'])

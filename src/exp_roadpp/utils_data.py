@@ -1,3 +1,4 @@
+import bisect
 import json
 import numpy as np
 from pathlib import Path
@@ -143,6 +144,47 @@ def atom_to_signature(atom, dataset_labels=None):
                 "tube_uid", atom.get("tube_uid"))
     else:
         raise ValueError("Unknown atom type in atom_to_signature")
+
+def build_onset_index(interval_atoms, atom_vocab, dataset_labels=None):
+    """Sorted [(start_frame, atom_idx)] of a video's interval atoms.
+    atom_vocab maps an atom signature without tube_uid (sig[:-2]) to its index in unique_atoms,
+    i.e. the same key used in the compressed atom file. Atoms not in the vocab are skipped."""
+    onsets = []
+    for atom in interval_atoms:
+        if int(atom["end_frame"]) <= int(atom["start_frame"]):
+            continue
+        key = tuple(atom_to_signature(atom, dataset_labels)[:-2])
+        if key in atom_vocab:
+            onsets.append((int(atom["start_frame"]), atom_vocab[key]))
+    onsets.sort()
+    return onsets
+
+
+def build_entity_onset_index(interval_atoms, atom_vocab, dataset_labels=None):
+    """{tube_uid: sorted [(start_frame, atom_idx)]}, as `build_onset_index` but per entity
+    (tube_uid is None for the ego vehicle)."""
+    onsets = {}
+    for atom in interval_atoms:
+        if int(atom["end_frame"]) <= int(atom["start_frame"]):
+            continue
+        signature = atom_to_signature(atom, dataset_labels)
+        key = tuple(signature[:-2])
+        if key in atom_vocab:
+            onsets.setdefault(signature[-1], []).append((int(atom["start_frame"]), atom_vocab[key]))
+    for entity_onsets in onsets.values():
+        entity_onsets.sort()
+    return onsets
+
+
+def future_onsets(onsets, t, horizon):
+    """[(atom_idx, delta_t)] for the first onset of each atom index within frames (t, t + horizon]."""
+    first = {}
+    for start_frame, atom_idx in onsets[bisect.bisect_right(onsets, (t, float("inf"))):]:
+        if start_frame > t + horizon:
+            break
+        first.setdefault(atom_idx, start_frame - t)
+    return list(first.items())
+
 
 def same_signature_no_tube_uid(sig1, sig2):
     if not sig1 or not sig2:

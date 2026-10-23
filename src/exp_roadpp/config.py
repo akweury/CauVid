@@ -277,7 +277,8 @@ def get_step_05_input(args):
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
-        'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json"
+        'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
+        "delay_windows": args.delay_windows,
     }
     return input_data
 
@@ -302,6 +303,6 @@ def get_step_dataset_input(args):
         "dataset_path": args.dataset_path,
         "device": args.device,
         "data_num": args.data_num,
-        
+        "onset_horizon": args.onset_horizon,
     }
     return input_data

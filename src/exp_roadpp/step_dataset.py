@@ -3,6 +3,7 @@ from pathlib import Path
 import random
 from tqdm import tqdm
 import json
+import numpy as np
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp.step_dataset_language import Language
@@ -115,6 +116,80 @@ def _compress_atom_file(atom_file, compressed_file):
     utils_data.save_json(compressed_atoms, compressed_file)
 
 
+def _onset_statistics(compressed_file, stats_dir, horizon):
+    """Histogram of delta_t (frames until an atom's next onset) over all anchor frames, per atom."""
+    stats_file = stats_dir / "onset_stats.json"
+    if stats_file.exists():
+        print(f"[Onset Stats] {stats_file} already exists.")
+        return
+    os.makedirs(stats_dir, exist_ok=True)
+
+    atoms = utils_data.load_json(compressed_file)
+    unique_atoms = atoms["unique_atoms"]
+    atom_vocab = {tuple(atom): i for i, atom in enumerate(unique_atoms)}
+    # counts[i, dt - 1]: number of anchor frames whose next onset of atom i is dt frames ahead
+    counts = np.zeros((len(unique_atoms), horizon), dtype=np.int64)
+    num_anchor_frames = 0
+    for vid, vid_atoms in tqdm(atoms.items(), desc="Onset Stats"):
+        if vid == "unique_atoms":
+            continue
+        onsets = utils_data.build_onset_index(vid_atoms["interval_atoms"], atom_vocab)
+        num_frames = len(vid_atoms["per_frame_atoms"])
+        for t in range(num_frames):
+            for atom_idx, delta_t in utils_data.future_onsets(onsets, t, horizon):
+                counts[atom_idx, delta_t - 1] += 1
+        num_anchor_frames += num_frames
+
+    per_atom = []
+    for i, atom in enumerate(unique_atoms):
+        total = int(counts[i].sum())
+        per_atom.append({
+            "atom_idx": i,
+            "atom": atom,
+            "num_onsets": total,
+            "num_no_onset": num_anchor_frames - total,
+            "mean_delta_t": float((counts[i] * np.arange(1, horizon + 1)).sum() / total) if total else None,
+            "counts": counts[i].tolist(),
+        })
+    utils_data.save_json({
+        "horizon": horizon,
+        "num_anchor_frames": num_anchor_frames,
+        "overall_counts": counts.sum(axis=0).tolist(),
+        "per_atom": per_atom,
+    }, stats_file)
+    _plot_onset_statistics(counts, unique_atoms, stats_dir / "onset_hist.png")
+    print(f"[Onset Stats] saved to {stats_file}")
+
+
+def _plot_onset_statistics(counts, unique_atoms, plot_file, top_k=15):
+    import matplotlib.pyplot as plt
+    horizon = counts.shape[1]
+    delta_ts = np.arange(1, horizon + 1)
+    top = np.argsort(-counts.sum(axis=1))[:top_k]
+    num_cols = 4
+    num_rows = 1 + int(np.ceil(len(top) / num_cols))
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(4 * num_cols, 3 * num_rows), squeeze=False)
+    for ax in axes.flat:
+        ax.axis("off")
+
+    overall = fig.add_subplot(num_rows, 1, 1)
+    overall.bar(delta_ts, counts.sum(axis=0), width=1.0)
+    overall.set_title("All atoms")
+    overall.set_xlabel("delta_t (frames)")
+    overall.set_ylabel("count")
+
+    for ax, atom_idx in zip(axes.flat[num_cols:], top):
+        atom = dict(zip(unique_atoms[atom_idx][::2], unique_atoms[atom_idx][1::2]))
+        label = atom.get("action_id_label", atom.get("location_name_label"))
+        ax.axis("on")
+        ax.bar(delta_ts, counts[atom_idx], width=1.0)
+        ax.set_title(f"[{atom_idx}] {atom['agent_class_label']} {label}", fontsize=9)
+        ax.set_xlabel("delta_t (frames)", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(plot_file, dpi=120)
+    plt.close(fig)
+
+
 def prepare_dataset(language_model, cfg):
     data_num = cfg["data_num"]
     track_dir = cfg["track_dir"]
@@ -138,6 +213,8 @@ def prepare_dataset(language_model, cfg):
         _compress_atom_file(train_file, train_compressed_file)
     else:
         print(f"[Train Atoms Compressed] {train_compressed_file} already exists.")
+    # delta_t statistics on train only, used to choose the time bins of the later steps
+    _onset_statistics(train_compressed_file, Path(output_dir) / "stats", cfg["onset_horizon"])
 
     # val data
     val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
@@ -176,6 +253,7 @@ def main(input_data):
         "output_dir": input_data["output_dir"],
         "data_num": input_data["data_num"],
         "device": input_data["device"],
+        "onset_horizon": input_data["onset_horizon"],
     }
     cfg["dataset_labels"] = json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
     
