@@ -273,9 +273,9 @@ def get_step_05_input(args):
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
-        "step04_output_dir": args.output_dir / "step04_output",
         "device": args.device,
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
         'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json"
     }
