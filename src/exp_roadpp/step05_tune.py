@@ -1,13 +1,13 @@
 """Tune step 05: sweep its hyperparameters one at a time around the base
 setting of `step05.get_cfg`, score every run on the val split with
-`step05.evaluate_clauses`, and plot all sweeps on one chart (PDF).
+`step06.evaluate_clauses`, and plot all sweeps on one chart (PDF).
 
 Usage: python -m src.exp_roadpp.step05_tune --exp debug --machine ml-pulsar
 """
 import json
 import copy
 
-from src.exp_roadpp import config, step05, utils_data, utils_pipe
+from src.exp_roadpp import config, step05, step06, utils_data, utils_pipe
 
 
 SWEEPS = {
@@ -41,10 +41,17 @@ def run_sweeps(base_cfg, tune_dir, atoms, val_atoms, anchor_clauses, labels):
             # Shared cache of the training examples; rebuilt when the windows change.
             cfg["output_dir"] = tune_dir
             clauses = step05.extend_clauses(anchor_clauses, labels, atoms, cfg)
-            results[key] = step05.evaluate_clauses(
+            summary = step06.evaluate_clauses(
                 clauses, atoms["unique_atoms"], val_atoms, head_atoms,
                 cfg["delay_windows"], device=cfg["device"],
             )
+            results[key] = {
+                "f1": [m["f1"] for m in summary["overall"]],
+                "precision": [m["precision"] for m in summary["overall"]],
+                "recall": [m["recall"] for m in summary["overall"]],
+                "bin_accuracy": summary["bin_accuracy"],
+                "num_clauses": summary["num_clauses"],
+            }
             print(f"[Tune] {key}: f1={[round(f, 3) for f in results[key]['f1']]}, "
                   f"bin_accuracy={results[key]['bin_accuracy']:.3f}")
             utils_data.save_json(results, results_file)

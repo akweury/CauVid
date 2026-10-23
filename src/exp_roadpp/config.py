@@ -291,6 +291,7 @@ def get_step_06_input(args):
         "dataset_labels_file": args.dataset_path / "gt" / "label.json",
         "extended_clauses_file": args.output_dir / "step05_output" / "extended_clauses.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
+        "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "device": args.device,
     }
     return input_data
