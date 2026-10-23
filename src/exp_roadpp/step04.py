@@ -574,6 +574,7 @@ def main_v2(input_data):
         "exp": input_data["exp"],
         "output_dir": input_data["output_dir"],
     }
+    print(f"----------------- Step 04: Causal Filtering -----------------")
     causal_clause_file = input_data["output_dir"] / "causal_clauses.json"
     if causal_clause_file.exists():
         return utils_data.load_json(causal_clause_file)

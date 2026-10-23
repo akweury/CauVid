@@ -96,7 +96,48 @@ def _to_sparse_rows(rows, columns, shape):
         shape,
     )
 
-def build_features(atoms, dataset_labels, body_groups, head_vocab):
+def _index_frame_entities(atoms):
+    """Give every (frame pair, entity) a node id and list its atoms.
+
+    Node ids are contiguous per frame pair, so nodes of one frame pair form a
+    consecutive range. Returns long tensors:
+      node_frame[n]: frame pair of node n;
+      current_cells / next_cells: (node, atom_index) of every atom in frame
+          t / t+1.
+    """
+    node_frame = []
+    current_nodes, current_atom_ids = [], []
+    next_nodes, next_atom_ids = [], []
+    frame_id = 0
+    for video_id, video_atoms in tqdm(atoms.items(), desc="Indexing frames"):
+        if video_id == "unique_atoms":
+            continue
+        for current_frame, next_frame in video_atoms["per_frame_atoms"]:
+            if len(current_frame) == 0 or len(next_frame) == 0:
+                continue
+            base = len(node_frame)
+            entity_nodes = {}
+            for frame_atoms, nodes, atom_ids in (
+                (current_frame, current_nodes, current_atom_ids),
+                (next_frame, next_nodes, next_atom_ids),
+            ):
+                for atom in frame_atoms:
+                    node = entity_nodes.setdefault(
+                        _atom_entity_key(atom), base + len(entity_nodes)
+                    )
+                    nodes.append(node)
+                    atom_ids.append(atom[0])
+            node_frame.extend([frame_id] * len(entity_nodes))
+            frame_id += 1
+    return (
+        torch.tensor(node_frame, dtype=torch.long),
+        torch.tensor([current_nodes, current_atom_ids], dtype=torch.long),
+        torch.tensor([next_nodes, next_atom_ids], dtype=torch.long),
+    )
+
+
+def build_features(atoms, dataset_labels, body_groups, head_vocab,
+                   device="cpu", chunk_rows=1 << 18):
     """Build sparse 0/1 feature/target matrices, one pair per body group.
 
     A group is keyed by its ungrounded anchor body (atom_index, "oid", oid);
@@ -107,14 +148,20 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab):
         otherwise each other entity present in frame t+1 (distinct oids bind
         distinct objects, as in step03's anchor clauses).
       features[g]: (N_g, M_g); column j = feature_vocab[g][j], a
-          co-occurring atom (group_id, object_slot, atom_index) in frame t,
-          where object_slot is the oid its entity is bound to; entities not
-          bound by the clause get fresh oids in order of first appearance.
+          co-occurring atom (group_id, object_slot, atom_index) in frame t.
+          object_slot is 0 for the head object, the body oid for the body
+          object, and body oid + 1 for "some other object in the frame"
+          (all unbound entities share this one existential slot).
       targets[g]:  (N_g, H_g); column k = head_vocab[g][k], True if that
           head atom holds for the oid-0 entity in frame t+1.
     Both are stored in the compact CSR form of `_to_sparse_rows`; use
     `sparse_rows_to_dense` to get a dense tensor for one group.
-    Columns are local to each group, so no matrix carries other groups' zeros.
+    Columns are local to each group (only columns True in some row are kept),
+    so no matrix carries other groups' zeros.
+
+    Every entity's atoms are held as one dense bool row of a (nodes, atoms)
+    table on `device`, so each group's rows are built with tensor indexing in
+    chunks of `chunk_rows`.
     """
     # body_signature -> group_id, same order as build_head_vocab's enumerate.
     num_groups = len(body_groups)
@@ -124,103 +171,112 @@ def build_features(atoms, dataset_labels, body_groups, head_vocab):
         gid = group_ids[body_signature]
         group_head_vocab[gid].append((gid, head_signature))
 
-    # Frame atoms are grounded (atom_index, "tube_uid", tube_uid), so match them
-    # to groups by atom_index; the group's oid decides how they are bound.
-    groups_by_atom_index = {}
-    for body_signature, gid in group_ids.items():
-        atom_index, _oid_tag, body_oid = body_signature
-        groups_by_atom_index.setdefault(atom_index, []).append((gid, body_oid))
+    num_atoms = len(atoms["unique_atoms"])
+    node_frame, current_cells, next_cells = _index_frame_entities(atoms)
+    num_nodes = len(node_frame)
+    num_frames = int(node_frame[-1]) + 1 if num_nodes else 0
 
-    # Per-group accumulators; vocab grows while scanning, so collect (row, col)
-    # pairs first and allocate the dense tensors once sizes are known.
-    feature_ids = [{} for _ in range(num_groups)]
-    group_feature_vocab = [[] for _ in range(num_groups)]
-    feature_rows = [[] for _ in range(num_groups)]
-    feature_columns = [[] for _ in range(num_groups)]
-    target_rows = [[] for _ in range(num_groups)]
-    target_columns = [[] for _ in range(num_groups)]
-    row_counts = [0] * num_groups
-    for video_id, video_atoms in tqdm(atoms.items(), desc="Processing videos"):
-        if video_id  == "unique_atoms":
-            continue
-        for current_frame, next_frame in video_atoms["per_frame_atoms"]:
-            if len(current_frame) == 0 or len(next_frame) == 0:
-                continue
-            # (atom_index, entity_key) of each distinct grounded atom in frame t.
-            current_atoms = list(dict.fromkeys(
-                (atom[0], _atom_entity_key(atom)) for atom in current_frame
-            ))
-            # Index next-frame facts by entity so the head object can look up
-            # what holds for it at t+1.
-            next_atoms_by_entity = {}
-            for atom_signature in next_frame:
-                next_atoms_by_entity.setdefault(
-                    _atom_entity_key(atom_signature), set()
-                ).add(atom_signature[0])
-
-            for body_index, body_entity in current_atoms:
-                for group_id, body_oid in groups_by_atom_index.get(body_index, ()):
-                    # Candidate entities for the head object (oid 0).
-                    if body_oid == 0:
-                        head_entities = [body_entity]
-                    else:
-                        head_entities = [
-                            entity for entity in next_atoms_by_entity
-                            if entity != body_entity
-                        ]
-                    for head_entity in head_entities:
-                        next_entity_facts = next_atoms_by_entity.get(head_entity)
-                        # Head object absent in t+1: no supervision for this row.
-                        if not next_entity_facts:
-                            continue
-                        row = row_counts[group_id]
-                        ids = feature_ids[group_id]
-                        vocab = group_feature_vocab[group_id]
-
-                        # object_slot = oid of the atom's entity under this
-                        # grounding; atoms sharing a slot refer to the same object.
-                        entity_oids = {head_entity: 0, body_entity: body_oid}
-                        next_free_oid = max(entity_oids.values()) + 1
-                        active_features = set()
-                        for atom_index, atom_entity in current_atoms:
-                            object_slot = entity_oids.get(atom_entity)
-                            if object_slot is None:
-                                object_slot = next_free_oid
-                                entity_oids[atom_entity] = object_slot
-                                next_free_oid += 1
-                            # Skip the grounded body itself; it is implied by the group.
-                            if atom_index == body_index and object_slot == body_oid:
-                                continue
-                            feature_key = (group_id, object_slot, atom_index)
-                            feature_id = ids.get(feature_key)
-                            if feature_id is None:
-                                feature_id = len(vocab)
-                                ids[feature_key] = feature_id
-                                vocab.append(feature_key)
-                            active_features.add(feature_id)
-
-                        for feature_id in sorted(active_features):
-                            feature_rows[group_id].append(row)
-                            feature_columns[group_id].append(feature_id)
-                        # Positive target for each candidate head of this group
-                        # that holds for the head object in the next frame.
-                        for head_col, (_gid, head_signature) in enumerate(group_head_vocab[group_id]):
-                            if head_signature[0] in next_entity_facts:
-                                target_rows[group_id].append(row)
-                                target_columns[group_id].append(head_col)
-                        row_counts[group_id] += 1
+    # current[n, a] / upcoming[n, a]: atom a holds for node n in frame t / t+1.
+    node_frame = node_frame.to(device)
+    current = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
+    current[current_cells[0].to(device), current_cells[1].to(device)] = True
+    upcoming = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
+    upcoming[next_cells[0].to(device), next_cells[1].to(device)] = True
+    # frame_counts[f, a]: number of entities in frame pair f with atom a at t.
+    cell_nodes, cell_atoms = torch.nonzero(current, as_tuple=True)
+    frame_counts = torch.zeros((num_frames, num_atoms), dtype=torch.int32, device=device)
+    frame_counts.index_put_(
+        (node_frame[cell_nodes], cell_atoms),
+        torch.ones(len(cell_nodes), dtype=torch.int32, device=device),
+        accumulate=True,
+    )
+    del cell_nodes, cell_atoms
+    # Candidate head objects: nodes with some atom at t+1, grouped by frame.
+    has_next = upcoming.any(dim=1)
+    next_nodes = torch.nonzero(has_next, as_tuple=True)[0]
+    next_counts = torch.bincount(node_frame[next_nodes], minlength=num_frames)
+    next_starts = torch.cumsum(next_counts, dim=0) - next_counts
 
     features = []
     targets = []
-    for gid in range(num_groups):
-        features.append(_to_sparse_rows(
-            feature_rows[gid], feature_columns[gid],
-            (row_counts[gid], len(group_feature_vocab[gid])),
+    group_feature_vocab = []
+    for body_signature, group_id in tqdm(group_ids.items(), desc="Building features"):
+        body_index, _oid_tag, body_oid = body_signature
+        other_slot = body_oid + 1
+        num_columns = (other_slot + 1) * num_atoms
+        head_atoms = torch.tensor(
+            [head_signature[0] for _gid, head_signature in group_head_vocab[group_id]],
+            dtype=torch.long, device=device,
+        )
+
+        # Rows: (body node, head node) groundings of this group.
+        body_nodes = torch.nonzero(current[:, body_index], as_tuple=True)[0]
+        if body_oid == 0:
+            body_nodes = body_nodes[has_next[body_nodes]]
+            row_body = row_head = body_nodes
+        else:
+            body_frames = node_frame[body_nodes]
+            counts = next_counts[body_frames]
+            row_body = torch.repeat_interleave(body_nodes, counts)
+            within = torch.arange(len(row_body), device=device) - torch.repeat_interleave(
+                torch.cumsum(counts, dim=0) - counts, counts
+            )
+            row_head = next_nodes[
+                torch.repeat_interleave(next_starts[body_frames], counts) + within
+            ]
+            keep = row_head != row_body
+            row_body, row_head = row_body[keep], row_head[keep]
+        num_rows = len(row_body)
+
+        feature_rows, feature_columns = [], []
+        target_rows, target_columns = [], []
+        for start in range(0, num_rows, chunk_rows):
+            body = row_body[start:start + chunk_rows]
+            head = row_head[start:start + chunk_rows]
+            body_atoms = current[body]
+            head_atoms_t = current[head]
+            others = frame_counts[node_frame[body]] - body_atoms.int()
+            if body_oid != 0:
+                others -= head_atoms_t.int()
+            block = torch.zeros(
+                (len(body), other_slot + 1, num_atoms), dtype=torch.bool, device=device
+            )
+            block[:, 0] = head_atoms_t
+            block[:, body_oid] |= body_atoms
+            # Skip the grounded body itself; it is implied by the group.
+            block[:, body_oid, body_index] = False
+            block[:, other_slot] = others > 0
+            rows, columns = torch.nonzero(block.reshape(len(body), -1), as_tuple=True)
+            feature_rows.append((rows + start).cpu())
+            feature_columns.append(columns.cpu())
+
+            rows, columns = torch.nonzero(upcoming[head][:, head_atoms], as_tuple=True)
+            target_rows.append((rows + start).cpu())
+            target_columns.append(columns.cpu())
+
+        feature_rows = torch.cat(feature_rows) if feature_rows else torch.zeros(0, dtype=torch.long)
+        feature_columns = torch.cat(feature_columns) if feature_columns else torch.zeros(0, dtype=torch.long)
+        target_rows = torch.cat(target_rows) if target_rows else torch.zeros(0, dtype=torch.long)
+        target_columns = torch.cat(target_columns) if target_columns else torch.zeros(0, dtype=torch.long)
+
+        # Keep only columns True in some row, renumbered in (slot, atom) order.
+        used_columns = torch.unique(feature_columns)
+        local_ids = torch.full((num_columns,), -1, dtype=torch.long)
+        local_ids[used_columns] = torch.arange(len(used_columns))
+        group_feature_vocab.append([
+            (group_id, column // num_atoms, column % num_atoms)
+            for column in used_columns.tolist()
+        ])
+        features.append(_csr_from_cells(
+            feature_rows, local_ids[feature_columns], (num_rows, len(used_columns)),
         ))
-        targets.append(_to_sparse_rows(
-            target_rows[gid], target_columns[gid],
-            (row_counts[gid], len(group_head_vocab[gid])),
+        targets.append(_csr_from_cells(
+            target_rows, target_columns, (num_rows, len(group_head_vocab[group_id])),
         ))
+
+    del current, upcoming, frame_counts
+    if str(device) != "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return {
         "features": features,
@@ -507,7 +563,7 @@ def prune_examples(examples, min_support):
 def build_training_examples(atoms, clauses, labels,cfg):   
     body_groups = group_clauses_by_body(clauses, labels)
     head_vocab = build_head_vocab(body_groups)
-    examples = build_features(atoms, labels, body_groups, head_vocab)
+    examples = build_features(atoms, labels, body_groups, head_vocab, device=cfg["device"])
     examples["body_groups"] = body_groups
     # examples = prune_examples(examples, cfg["min_support"])
     
@@ -690,17 +746,17 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
 def _to_extended_clauses(extended_data, training_examples_by_body):
     body_groups = training_examples_by_body["body_groups"]
     extended_clauses = []
+    group_bodies = list(body_groups.keys())
     for item in extended_data:
-        bodies = []
-        # Slot 0 marks the clause's own (anchor) object; see object_slot comment
-        # in `_build_body_conditioned_training_examples`.
-        body_scopes = [0]
-        group_body = list(body_groups.keys())[item['group_id']]
-        bodies.append(group_body)
-        for atom in item['extra_atoms']:
-            body = tuple(atom[-1])
-            bodies.append(body)
-            body_scopes.append(atom[1])
+        # Bodies are ungrounded (atom_index, "oid", oid) atoms; a feature
+        # (gid, object_slot, atom_index) is the body atom on oid object_slot
+        # (see `build_features`). body_scopes lists each body's oid.
+        group_body = tuple(group_bodies[item['group_id']])
+        bodies = [group_body]
+        body_scopes = [group_body[2]]
+        for _gid, object_slot, atom_index in item['extra_atoms']:
+            bodies.append((atom_index, "oid", object_slot))
+            body_scopes.append(object_slot)
         head = tuple(item['head'][1])
         extended_clause = {
             "bodies": bodies,
@@ -728,7 +784,22 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
     else:
         examples = build_training_examples(atoms, anchor_clauses, labels, cfg)
         torch.save(examples, training_file)
-    raise NotImplementedError("Rule extension not fully implemented yet.")
+
+    features = examples["features"]
+    targets = examples["targets"]
+    feature_vocab = examples["feature_vocab"]
+    head_vocab = examples["head_vocab"]
+    # Only pruned examples carry aliases; otherwise each column is its own.
+    feature_aliases = examples.get(
+        "feature_aliases", [[[entry] for entry in vocab] for vocab in feature_vocab]
+    )
+    device = cfg["device"]
+    num_epochs = cfg["num_epochs"]
+    lr = cfg["lr"]
+    l0_lambda = cfg["l0_lambda"]
+    min_support = cfg["min_support"]
+    min_confidence_gain = cfg["min_confidence_gain"]
+
     extended_data = []
     # extension in one shot: differentiable conjunctive rule learning, group by group
     for gid in tqdm(range(len(examples["features"])), desc="Learning rule extensions"):
@@ -807,13 +878,7 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
         del X, dense_features, feature_block, dense_targets
         if device != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
-    # save extended clauses to a file
-    examples = build_training_examples(
-            atoms, anchor_clauses, labels, output_dir, min_support)
     extended_clauses = _to_extended_clauses(extended_data, examples)
-
-
-    
     return extended_clauses
 
 
@@ -828,6 +893,7 @@ def main(input_data):
         'lr': 0.1,
         'l0_lambda': 1e-3
     }
+    print(f"----------------- Step 05: Rule Extension -----------------")
     extend_clause_file = cfg['output_dir'] / "extended_clauses.json"
     if extend_clause_file.exists():
         extended_clauses = utils_data.load_json(extend_clause_file)
