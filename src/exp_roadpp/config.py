@@ -288,7 +288,8 @@ def get_step_06_input(args):
         "output_dir": output_dir,
         "val_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
         "dataset_labels_file": args.dataset_path / "gt" / "label.json",
-        "extended_clauses_file": args.output_dir / "step03_output" / "extended_clauses.json",
+        "extended_clauses_file": args.output_dir / "step05_output" / "extended_clauses.json",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
         "device": args.device,
     }
     return input_data
