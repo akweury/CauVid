@@ -8,6 +8,8 @@
 #
 # Usage:
 #   ./run_roadpp_docker.sh [--gpu 0|all|none] [--rebuild] [-- <extra args for main.py>]
+#   Add --tune_05 to the extra args to run step05_tune.py (step 05
+#   hyperparameter sweep, needs the step 04 outputs) instead of main.py.
 #
 # The image is rebuilt automatically whenever requirements.txt or the
 # Dockerfile changes (tracked via a content-hash label on the image).
@@ -17,6 +19,7 @@
 #   ./run_roadpp_docker.sh
 #   ./run_roadpp_docker.sh --gpu 0 -- --exp medium --learning True
 #   ./run_roadpp_docker.sh --gpu none -- --device cpu --machine jst
+#   ./run_roadpp_docker.sh --gpu 4 -- --exp medium --tune_05
 #
 # Environment variables (set before running, or export in your shell profile):
 #   CAUVID_ROADPP_DATA_HOST   Host path to the ROAD-Waymo dataset on dgx
@@ -64,6 +67,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --tune_05 (allowed before or after --) runs the step 05 hyperparameter sweep
+# instead of the pipeline; it is not an argument of main.py, so strip it.
+ENTRY_MODULE="src.exp_roadpp.main"
+PY_ARGS=()
+for arg in "${EXTRA_ARGS[@]}"; do
+    if [[ "$arg" == "--tune_05" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.step05_tune"
+    else
+        PY_ARGS+=("$arg")
+    fi
+done
+EXTRA_ARGS=("${PY_ARGS[@]}")
+
 ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/storage-01/ml-jsha/CauVid_Data/roadpp}"
 ROADPP_OUTPUT_HOST="${CAUVID_ROADPP_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output}"
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
@@ -92,6 +108,7 @@ echo "[run_roadpp_docker] Torch cache:     $TORCH_CACHE_HOST"
 echo "[run_roadpp_docker] Machine:         $MACHINE"
 echo "[run_roadpp_docker] GPU:             $GPU_ARG"
 echo "[run_roadpp_docker] Device arg:      $DEVICE"
+echo "[run_roadpp_docker] Entry module:    $ENTRY_MODULE"
 echo "[run_roadpp_docker] Extra args:      ${EXTRA_ARGS[*]:-<none>}"
 
 # --- Build image if missing or if its dependencies changed ---
@@ -133,7 +150,7 @@ docker run --rm -it \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \
     "$IMAGE_NAME" \
-    python -m src.exp_roadpp.main --device "$DEVICE" --machine "$MACHINE" "${EXTRA_ARGS[@]}"
+    python -m "$ENTRY_MODULE" --device "$DEVICE" --machine "$MACHINE" "${EXTRA_ARGS[@]}"
 
 # --- Report where the outputs were written ---
 EXP_NAME="debug"
