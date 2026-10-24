@@ -4,7 +4,7 @@ import random
 from tqdm import tqdm
 import json
 import numpy as np
-
+import torch
 from src.exp_roadpp import utils_data
 from src.exp_roadpp.step_dataset_language import Language
 
@@ -189,58 +189,84 @@ def _plot_onset_statistics(counts, unique_atoms, plot_file, top_k=15):
     fig.savefig(plot_file, dpi=120)
     plt.close(fig)
 
+def prepare_per_frame_events(cfg):
 
-def prepare_dataset(language_model, cfg):
+    def _prepare_per_split(split_name):
+        output_file = cfg["output_dir"] / f"{split_name}_events.pt"
+        if output_file.exists():
+            return
+        
+        atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
+        interval_atoms = [data["interval_atoms"] for data in atoms.values() if isinstance(data, dict) and "interval_atoms" in data]
+        events = []
+        count_downs = [] 
+        unique_atoms = [tuple(atom) for atom in atoms["unique_atoms"]]
+
+        for video_intervals in tqdm(interval_atoms, desc="Events Preparing"):
+            min_start = min(int(interval["start_frame"]) for interval in video_intervals) if video_intervals else None
+            max_end = max(int(interval["end_frame"]) for interval in video_intervals) if video_intervals else None
+            video_event_matrix = torch.zeros((max_end, len(unique_atoms)),dtype = torch.bool)
+            for interval in video_intervals:
+                start, end = int(interval["start_frame"]), int(interval["end_frame"])
+                atom = utils_data.atom_to_signature(interval, cfg["dataset_labels"])
+                atom_idx = unique_atoms.index(atom[:-2])
+                video_event_matrix[start:end, atom_idx] = True
+            events.append(video_event_matrix)
+            video_count_down_matrix = torch.zeros_like(video_event_matrix, dtype=torch.int) - 1
+            for frame_idx in range(max_end-1):
+                for atom_idx in range(len(unique_atoms)):
+                    # the frame left until the sign change for this atom
+                    counts = (video_event_matrix[frame_idx:, atom_idx] != video_event_matrix[frame_idx, atom_idx]).nonzero(as_tuple=True)[0]
+                    if len(counts)>0:
+                        video_count_down_matrix[frame_idx, atom_idx] = counts[0]
+            count_downs.append(video_count_down_matrix)
+            # Ensure the last frame has a countdown of 0 for all atoms
+            video_count_down_matrix[max_end-1, :] = 0
+        torch.save({
+            "events": events,
+            "count_downs": count_downs
+        }, output_file)
+
+    _prepare_per_split("train")
+    _prepare_per_split("val")
+    _prepare_per_split("test")
+    
+    return
+            
+    
+
+
+
+
+def prepare_per_frame_atoms(language_model, cfg):
     data_num = cfg["data_num"]
     track_dir = cfg["track_dir"]
     output_dir = cfg["output_dir"]
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
     if data_num != 'full':
         all_track_files = all_track_files[:int(data_num)]
-    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
 
+    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
     atoms_folder= Path(output_dir) / "atoms" 
     os.makedirs(atoms_folder, exist_ok=True)
-    # train data
-    train_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in train_indices]
-    train_file = atoms_folder / "train_atoms.json"
-    if not os.path.exists(train_file):
-        _tracks_to_atoms(track_dir, train_ids, language_model, train_file, cfg["dataset_labels"])
-    else:
-        print(f"[Train Atoms] {train_file} already exists.")
-    train_compressed_file = atoms_folder / "train_atoms_compressed.json"
-    if not os.path.exists(train_compressed_file):
-        _compress_atom_file(train_file, train_compressed_file)
-    else:
-        print(f"[Train Atoms Compressed] {train_compressed_file} already exists.")
-    # delta_t statistics on train only, used to choose the time bins of the later steps
-    _onset_statistics(train_compressed_file, Path(output_dir) / "stats", cfg["onset_horizon"])
 
-    # val data
-    val_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in val_indices]
-    val_file = atoms_folder / "val_atoms.json"
-    if not os.path.exists(val_file):
-        _tracks_to_atoms(track_dir, val_ids, language_model, val_file, cfg["dataset_labels"])
-    else:
-        print(f"[Val Atoms] {val_file} already exists.")
-    val_compressed_file = atoms_folder / "val_atoms_compressed.json"
-    if not os.path.exists(val_compressed_file):
-        _compress_atom_file(val_file, val_compressed_file)
-    else:
-        print(f"[Val Atoms Compressed] {val_compressed_file} already exists.")
+    def _prepare_split(split_name, indices):
+        # train data
+        split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
+        split_file = atoms_folder / f"{split_name}_atoms.json"
+        if not os.path.exists(split_file):
+            _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
+        else:
+            print(f"[Per Frame Atoms] {split_file} already exists.")
+        compressed_file = atoms_folder / f"{split_name}_atoms_compressed.json"
+        if not os.path.exists(compressed_file):
+            _compress_atom_file(split_file, compressed_file)
+        else:
+            print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
 
-    # test data
-    test_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in test_indices]
-    test_file = atoms_folder / "test_atoms.json"
-    if not os.path.exists(test_file):
-        _tracks_to_atoms(track_dir, test_ids, language_model, test_file, cfg["dataset_labels"])
-    else:
-        print(f"[Test Atoms] {test_file} already exists.")
-    test_compressed_file = atoms_folder / "test_atoms_compressed.json"
-    if not os.path.exists(test_compressed_file):
-        _compress_atom_file(test_file, test_compressed_file)
-    else:
-        print(f"[Test Atoms Compressed] {test_compressed_file} already exists.")
+    _prepare_split("train", train_indices)
+    _prepare_split("val", val_indices)
+    _prepare_split("test", test_indices)
 
 
 
@@ -254,14 +280,13 @@ def main(input_data):
         "data_num": input_data["data_num"],
         "device": input_data["device"],
         "onset_horizon": input_data["onset_horizon"],
+        "dataset_labels": json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
     }
-    cfg["dataset_labels"] = json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
-    
     print(f"[Data Num] {cfg['data_num']}")
 
     # Prepare language model and beam search model
     language_model = Language(cfg["device"])
-
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
-    prepare_dataset(language_model, cfg)
+    prepare_per_frame_atoms(language_model, cfg)
+    prepare_per_frame_events(cfg)
     print("\n--------- Step Dataset Done------------------\n")
