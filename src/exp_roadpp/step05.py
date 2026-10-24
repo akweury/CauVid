@@ -797,9 +797,8 @@ def _to_extended_clauses(extended_data, training_examples_by_body, delay_windows
 
 
 
-def extend_clauses(anchor_clauses, labels, atoms, cfg):
-    
-    # prepare the training examples for rule extension
+def _load_or_build_training_examples(anchor_clauses, labels, atoms, cfg):
+    # Cached in output_dir; rebuilt if it was built for other delay windows.
     training_file = cfg["output_dir"] / "training_examples.pt"
     examples = torch.load(training_file) if training_file.exists() else None
     if examples is not None and examples.get("delay_windows") != list(cfg["delay_windows"]):
@@ -808,104 +807,125 @@ def extend_clauses(anchor_clauses, labels, atoms, cfg):
     if examples is None:
         examples = build_training_examples(atoms, anchor_clauses, labels, cfg)
         torch.save(examples, training_file)
+    return examples
 
-    features = examples["features"]
-    targets = examples["targets"]
-    feature_vocab = examples["feature_vocab"]
-    head_vocab = examples["head_vocab"]
+
+def _learnable_heads(dense_targets, gid):
+    # Skip degenerate targets: nothing to learn if the head never fires
+    # or always fires for this body-group.
+    num_rows, num_head_cols = dense_targets.shape
+    head_positives = dense_targets.sum(dim=0)
+    learnable_heads = torch.nonzero(
+        (head_positives > 0) & (head_positives < num_rows), as_tuple=True
+    )[0].tolist()
+    num_degenerate = num_head_cols - len(learnable_heads)
+    if num_degenerate:
+        print(
+            f"[Rule extension] Skipping {num_degenerate}/{num_head_cols} heads of "
+            f"group {gid}: degenerate target (head fires in no row or every row)."
+        )
+    return learnable_heads
+
+
+def _accepted_metrics(feature_block, target_col, selected_positions, gid, head_col, cfg):
+    # Hard metrics of the learned extension, or None if it is rejected.
+    if not selected_positions:
+        print(
+            f"[Rule extension] Skipping group {gid}, head {head_col}: "
+            "learned mask selected no extra atoms."
+        )
+        return None
+
+    metrics = _evaluate_extension(feature_block, target_col, selected_positions)
+    if metrics["support"] < cfg["min_support"]:
+        print(
+            f"[Rule extension] Skipping group {gid}, head {head_col}: "
+            f"support {metrics['support']} < min_support {cfg['min_support']}."
+        )
+        return None
+    if metrics["confidence_gain"] < cfg["min_confidence_gain"]:
+        print(
+            f"[Rule extension] Skipping group {gid}, head {head_col}: "
+            f"confidence_gain {metrics['confidence_gain']:.4f} < "
+            f"min_confidence_gain {cfg['min_confidence_gain']}."
+        )
+        return None
+    return metrics
+
+
+def _extend_group(gid, examples, feature_aliases, cfg):
+    # Differentiable conjunctive rule learning for one body-group; returns
+    # the accepted extensions of its heads.
+    num_rows, num_feature_cols = examples["features"][gid]["shape"]
+    num_head_cols = examples["targets"][gid]["shape"][1]
+    if num_rows == 0 or num_feature_cols == 0 or num_head_cols == 0:
+        print(
+            f"[Rule extension] Skipping group {gid}: "
+            f"rows={num_rows}, feature_cols={num_feature_cols}, "
+            f"head_cols={num_head_cols} "
+            "(nothing to learn for this body-group)."
+        )
+        return []
+
+    # Densify only this group's (N, M) block, kept on CPU; it is moved to
+    # the GPU once inside `learn_extension_masks`. Numpy view of the bool
+    # block for hard evaluation.
+    dense_features = sparse_rows_to_dense(examples["features"][gid])
+    feature_block = dense_features.numpy()
+    dense_targets = sparse_rows_to_dense(examples["targets"][gid])
+
+    learnable_heads = _learnable_heads(dense_targets, gid)
+    if not learnable_heads:
+        return []
+
+    # All learnable heads of the group are trained together.
+    final_masks, _log_alpha = learn_extension_masks(
+        dense_features, dense_targets[:, learnable_heads],
+        num_epochs=cfg["num_epochs"], lr=cfg["lr"], l0_lambda=cfg["l0_lambda"],
+        device=cfg["device"],
+    )
+
+    group_data = []
+    for mask_col, head_col in enumerate(learnable_heads):
+        target_col = dense_targets[:, head_col].numpy().astype(np.float32)
+        selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
+        metrics = _accepted_metrics(
+            feature_block, target_col, selected_positions, gid, head_col, cfg
+        )
+        if metrics is None:
+            continue
+
+        selected_atoms = [examples["feature_vocab"][gid][pos] for pos in selected_positions]
+        print(f"Extra Atom Num: {len(selected_atoms)}")
+        group_data.append({
+            "group_id": gid,
+            "head": examples["head_vocab"][gid][head_col],
+            "extra_atoms": selected_atoms,
+            # Atoms true in exactly the same rows as each extra atom.
+            "extra_atom_aliases": [feature_aliases[gid][pos] for pos in selected_positions],
+            "metrics": metrics,
+        })
+    return group_data
+
+
+def _learn_extensions(examples, cfg):
     # Only pruned examples carry aliases; otherwise each column is its own.
     feature_aliases = examples.get(
-        "feature_aliases", [[[entry] for entry in vocab] for vocab in feature_vocab]
+        "feature_aliases", [[[entry] for entry in vocab] for vocab in examples["feature_vocab"]]
     )
-    device = cfg["device"]
-    num_epochs = cfg["num_epochs"]
-    lr = cfg["lr"]
-    l0_lambda = cfg["l0_lambda"]
-    min_support = cfg["min_support"]
-    min_confidence_gain = cfg["min_confidence_gain"]
-
     extended_data = []
     # extension in one shot: differentiable conjunctive rule learning, group by group
     for gid in tqdm(range(len(examples["features"])), desc="Learning rule extensions"):
-        num_rows, num_feature_cols = examples["features"][gid]["shape"]
-        num_head_cols = examples["targets"][gid]["shape"][1]
-        if num_rows == 0 or num_feature_cols == 0 or num_head_cols == 0:
-            print(
-                f"[Rule extension] Skipping group {gid}: "
-                f"rows={num_rows}, feature_cols={num_feature_cols}, "
-                f"head_cols={num_head_cols} "
-                "(nothing to learn for this body-group)."
-            )
-            continue
-
-        # Densify only this group's (N, M) block, kept on CPU; it is moved to
-        # the GPU once inside `learn_extension_masks`. Numpy view of the bool
-        # block for hard evaluation.
-        dense_features = sparse_rows_to_dense(features[gid])
-        feature_block = dense_features.numpy()
-        dense_targets = sparse_rows_to_dense(targets[gid])
-
-        # Skip degenerate targets: nothing to learn if the head never fires
-        # or always fires for this body-group.
-        head_positives = dense_targets.sum(dim=0)
-        learnable_heads = torch.nonzero(
-            (head_positives > 0) & (head_positives < num_rows), as_tuple=True
-        )[0].tolist()
-        num_degenerate = num_head_cols - len(learnable_heads)
-        if num_degenerate:
-            print(
-                f"[Rule extension] Skipping {num_degenerate}/{num_head_cols} heads of "
-                f"group {gid}: degenerate target (head fires in no row or every row)."
-            )
-        if not learnable_heads:
-            del dense_features, feature_block, dense_targets
-            continue
-
-        # All learnable heads of the group are trained together.
-        final_masks, _log_alpha = learn_extension_masks(
-            dense_features, dense_targets[:, learnable_heads],
-            num_epochs=num_epochs, lr=lr, l0_lambda=l0_lambda, device=device,
-        )
-
-        for mask_col, head_col in enumerate(learnable_heads):
-            target_col = dense_targets[:, head_col].numpy().astype(np.float32)
-            selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
-            if not selected_positions:
-                print(
-                    f"[Rule extension] Skipping group {gid}, head {head_col}: "
-                    "learned mask selected no extra atoms."
-                )
-                continue
-
-            metrics = _evaluate_extension(feature_block, target_col, selected_positions)
-            if metrics["support"] < min_support:
-                print(
-                    f"[Rule extension] Skipping group {gid}, head {head_col}: "
-                    f"support {metrics['support']} < min_support {min_support}."
-                )
-                continue
-            if metrics["confidence_gain"] < min_confidence_gain:
-                print(
-                    f"[Rule extension] Skipping group {gid}, head {head_col}: "
-                    f"confidence_gain {metrics['confidence_gain']:.4f} < "
-                    f"min_confidence_gain {min_confidence_gain}."
-                )
-                continue
-
-            selected_atoms = [feature_vocab[gid][pos] for pos in selected_positions]
-            print(f"Extra Atom Num: {len(selected_atoms)}")
-            extended_data.append({
-                "group_id": gid,
-                "head": head_vocab[gid][head_col],
-                "extra_atoms": selected_atoms,
-                # Atoms true in exactly the same rows as each extra atom.
-                "extra_atom_aliases": [feature_aliases[gid][pos] for pos in selected_positions],
-                "metrics": metrics,
-            })
-
-        del dense_features, feature_block, dense_targets, final_masks
-        if device != 'cpu' and torch.cuda.is_available():
+        extended_data.extend(_extend_group(gid, examples, feature_aliases, cfg))
+        # The group's dense blocks are freed on return.
+        if cfg["device"] != 'cpu' and torch.cuda.is_available():
             torch.cuda.empty_cache()
+    return extended_data
+
+
+def extend_clauses(anchor_clauses, labels, atoms, cfg):
+    examples = _load_or_build_training_examples(anchor_clauses, labels, atoms, cfg)
+    extended_data = _learn_extensions(examples, cfg)
     extended_clauses = _to_extended_clauses(extended_data, examples, cfg["delay_windows"])
     return extended_clauses
 
