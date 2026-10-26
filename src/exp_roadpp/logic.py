@@ -315,7 +315,7 @@ class Clause(object):
     """
 
     def __init__(self, head, body, obj_ids):
-        self.head = (head[0], 'oid', 0)
+        self.head = (head, 0)
         self.body = self.build_body(body, obj_ids)
         # self.body = body
         # print(self)
@@ -326,7 +326,7 @@ class Clause(object):
         assert len(body) == len(obj_ids), "Length of body must match the length of obj_ids."
         built_body = []
         for i, atom in enumerate(body):
-            built_body.append((atom[0], 'oid', obj_ids[i]))
+            built_body.append((atom, obj_ids[i]))
         return built_body
     
     def __str__(self):
@@ -505,7 +505,7 @@ class Clause(object):
         return size
     
     def to_dict(self):
-        # head/body atoms are (atom_index, 'oid', obj_id) tuples
+        # head/body atoms are (atom_index, obj_id) tuples
         return {
             "head": list(self.head),
             "body": [list(atom) for atom in self.body],
@@ -514,7 +514,7 @@ class Clause(object):
     @classmethod
     def from_dict(cls, data):
         body = data["body"]
-        return cls(data["head"], body, [atom[2] for atom in body])
+        return cls(data["head"][0], [atom[0] for atom in body], [atom[1] for atom in body])
 
 class Predicate():
     """Predicats in first-order logic.

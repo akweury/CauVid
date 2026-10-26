@@ -197,6 +197,7 @@ def load_atoms(atom_file):
 def build_anchor_clauses(cfg):
     atoms = utils_data.load_json(cfg["train_atom_file"])
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    unique_atoms = [tuple(atom) for atom in unique_atoms]
     anchor_clauses = []
     seen_clauses = set()
     for vid, video_atoms in atoms.items():
@@ -209,16 +210,15 @@ def build_anchor_clauses(cfg):
             for body in current_signatures:
                 for head in next_signatures:
                     if body[-1] != head[-1]:
-                        clause = Clause(head, [body], [1])
+                        clause = Clause(head[0], [body[0]], [1])
                         if clause not in seen_clauses:
                             seen_clauses.add(clause)
                             anchor_clauses.append(clause)
     
     # add self-loop clauses for each unique atom
     for i in range(len(unique_atoms)):
-        anchor_clauses.append(
-            Clause([i], [[i]], [0])
-        )
+        clause = Clause(i, [i], [0])
+        anchor_clauses.append(clause)
     anchor_clauses = [clause.to_dict() for clause in anchor_clauses]
     return anchor_clauses
 

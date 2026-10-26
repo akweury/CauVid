@@ -3,6 +3,7 @@
 import os
 import sys
 import json
+import shutil
 import time
 from collections import Counter
 import numpy as np
@@ -252,7 +253,14 @@ def save_graph_pdf(graph, prefix):
 
     The full graph uses sfdp (force-directed; dot's layered layout is slow and unreadable at this
     density), the AV neighbourhood uses dot and includes the edges among the neighbours.
+    Skipped with a warning if the Graphviz binaries are not installed (the graph is still
+    saved as .npz/.json by `save_graph`).
     """
+    missing = [prog for prog in ("sfdp", "dot") if shutil.which(prog) is None]
+    if missing:
+        print(f"[Causal filter] WARNING: Graphviz program(s) {missing} not found, skipping the graph "
+              f"PDFs (install with `conda install -c conda-forge graphviz` or `apt install graphviz`).")
+        return
     colors = {"AV": "lightcoral"}
     full = GraphUtils.to_pydot(graph, colors=colors, title=Path(prefix).name)
     full.set("overlap", "false")  # spread nodes apart instead of stacking them
@@ -546,14 +554,15 @@ def anchors_to_filter_input(anchor_clauses, atoms):
     """Convert step 03's anchor clauses and the compressed train atoms to the formats
     `_causal_filter_clauses` expects.
 
-    Anchor atoms are [unique_atom_index, "oid", obj_id]; each is resolved through
-    unique_atoms (a flat (key, value, ...) tuple) to an atom dict. The original anchor
-    clause is kept under "anchor" so the kept clauses can be mapped back.
+    `anchor_clauses` is step 03's list of {"head", "body"} clauses whose atoms are
+    [unique_atom_index, obj_id]; each is resolved through atoms["unique_atoms"] (the
+    shared vocabulary of flat (key, value, ...) tuples) to an atom dict. The original
+    anchor clause is kept under "anchor" so the kept clauses can be mapped back.
     Returns ({clause_id: {"clause": {"head", "body"}, "anchor"}}, {video_id: interval_atoms}).
     """
-    unique_atoms = [dict(zip(atom[::2], atom[1::2])) for atom in anchor_clauses["unique_atoms"]]
+    unique_atoms = [dict(zip(atom[::2], atom[1::2])) for atom in atoms["unique_atoms"]]
     clauses = {}
-    for clause_id, clause in enumerate(anchor_clauses["anchor_clauses"]):
+    for clause_id, clause in enumerate(anchor_clauses):
         clauses[str(clause_id)] = {
             "clause": {"head": unique_atoms[clause["head"][0]],
                        "body": [unique_atoms[atom[0]] for atom in clause["body"]]},
@@ -577,11 +586,15 @@ def main_v2(input_data):
     print(f"----------------- Step 04: Causal Filtering -----------------")
     causal_clause_file = input_data["output_dir"] / "causal_clauses.json"
     if causal_clause_file.exists():
-        return utils_data.load_json(causal_clause_file)
+        causal_clauses = utils_data.load_json(causal_clause_file)
+        # Rebuild if the anchors are in the old [atom_index, "oid", obj_id] format.
+        if all(len(c["anchor"]["head"]) == 2 for c in causal_clauses.values()):
+            return causal_clauses
+        print(f"[Cache] {causal_clause_file} uses the old anchor atom format, rebuilding")
     anchor_clauses = utils_data.load_json(input_data["anchor_clause_file"])
     atoms = utils_data.load_atoms(input_data["train_atom_file"])
     dataset_labels = utils_data.load_json(input_data["dataset_labels_file"])
-    print(f"[Causal filter] Loaded {len(anchor_clauses['anchor_clauses'])} anchor clauses, atoms in {len(atoms)} videos.")
+    print(f"[Causal filter] Loaded {len(anchor_clauses)} anchor clauses, atoms in {len(atoms) - 1} videos.")
 
     clauses, atoms_by_video = anchors_to_filter_input(anchor_clauses, atoms)
     causal_clauses = _causal_filter_clauses(clauses, atoms_by_video, dataset_labels, cfg)

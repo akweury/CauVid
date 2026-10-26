@@ -20,7 +20,7 @@ def _clause_text(clause, train_unique_atoms):
     other object)."""
     bodies = " & ".join(
         f"{_atom_label(train_unique_atoms[atom_index])}[{slot}]"
-        for atom_index, _tag, slot in clause["bodies"]
+        for atom_index, slot in clause["bodies"]
     )
     head = _atom_label(train_unique_atoms[clause["head"][0]])
     return f"{head}[0] within {clause['delay_window']} <- {bodies}"
@@ -56,10 +56,10 @@ def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, devic
         if min(to_eval[atom[0]] for atom in [*clause["bodies"], clause["head"]]) < 0:
             continue
         anchor = clause["bodies"][0]
-        body = (to_eval[anchor[0]], "oid", anchor[2])
-        head = (to_eval[clause["head"][0]], "oid", 0)
+        body = (to_eval[anchor[0]], anchor[1])
+        head = (to_eval[clause["head"][0]], 0)
         body_groups.setdefault(body, {"candidate_heads": set()})["candidate_heads"].add(head)
-        extras = [(atom[2], to_eval[atom[0]]) for atom in clause["bodies"][1:]]
+        extras = [(atom[1], to_eval[atom[0]]) for atom in clause["bodies"][1:]]
         group_clauses.setdefault(body, []).append(
             (clause["delay_window"], clause["confidence"], clause_id, extras, head[0])
         )
@@ -284,8 +284,9 @@ def main(input_data):
     }
     atoms = utils_data.load_atoms(input_data["val_atoms_file"])
     extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
-    # Clause atom ids index the train split's unique atoms (saved by step03).
-    train_unique_atoms = utils_data.load_json(input_data["anchor_clause_file"])["unique_atoms"]
+    # All splits share one atom vocabulary (step_dataset's unique_atoms.json),
+    # which the clause atom ids index.
+    train_unique_atoms = atoms["unique_atoms"]
     causal_anchor_clauses = utils_data.load_json(input_data["causal_anchor_clause_file"])
     head_atoms = sorted({c["anchor"]["head"][0] for c in causal_anchor_clauses.values()})
     print(f"Extended Clauses Num: {len(extended_clauses)}")

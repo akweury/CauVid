@@ -253,7 +253,7 @@ def get_step_04_input(args):
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
-        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         "train_atom_file": args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
         "dataset_labels_file": args.dataset_path / "gt" / "label.json",
         "device": args.device,
@@ -275,10 +275,13 @@ def get_step_05_input(args):
         "output_dir": output_dir,
         "device": args.device,
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
-        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
         'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
         "delay_windows": args.delay_windows,
+        "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
+        "events_file": args.output_dir / "step_dataset_output" / "train_events.pt"
+        
     }
     return input_data
 
@@ -290,7 +293,7 @@ def get_step_06_input(args):
         "val_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
         "dataset_labels_file": args.dataset_path / "gt" / "label.json",
         "extended_clauses_file": args.output_dir / "step05_output" / "extended_clauses.json",
-        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses_train.json",
+        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "device": args.device,
     }
