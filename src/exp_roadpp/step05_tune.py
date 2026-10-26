@@ -101,8 +101,8 @@ def main():
     tune_dir.mkdir(parents=True, exist_ok=True)
 
     labels = utils_data.load_json(step05_input["dataset_label_file"])
-    atoms = utils_data.load_json(step05_input["train_atom_file"])
-    val_atoms = utils_data.load_json(val_atoms_file)
+    atoms = utils_data.load_atoms(step05_input["train_atom_file"])
+    val_atoms = utils_data.load_atoms(val_atoms_file)
     anchor_clauses = utils_data.load_json(step05_input["causal_anchor_clause_file"])
 
     results = run_sweeps(base_cfg, tune_dir, atoms, val_atoms, anchor_clauses, labels)

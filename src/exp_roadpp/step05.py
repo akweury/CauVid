@@ -960,7 +960,7 @@ def main(input_data):
         print(f"[Cache] {extend_clause_file} was learned for other delay windows, relearning")
     
     dataset_labels = utils_data.load_json(input_data['dataset_label_file'])
-    atoms = utils_data.load_json(input_data['train_atom_file'])
+    atoms = utils_data.load_atoms(input_data['train_atom_file'])
     causal_anchor_clauses = utils_data.load_json(input_data['causal_anchor_clause_file'])
     anchor_clauses = utils_data.load_json(input_data['anchor_clause_file'])
     print(f"Loaded anchor clauses: {len(anchor_clauses['anchor_clauses'])}")

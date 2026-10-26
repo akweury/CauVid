@@ -13,6 +13,15 @@ def save_json(data, file_path):
         json.dump(data, f, indent=2)
 
 
+def load_atoms(compressed_file):
+    """Load a compressed atom file and attach the shared vocabulary saved next to it
+    (unique_atoms.json) under the "unique_atoms" key."""
+    compressed_file = Path(compressed_file)
+    atoms = load_json(compressed_file)
+    atoms["unique_atoms"] = load_json(compressed_file.parent / "unique_atoms.json")
+    return atoms
+
+
 def load_npz_dict(npz_path):
     npz_path = Path(npz_path)
     if not npz_path.exists():

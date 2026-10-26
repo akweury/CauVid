@@ -188,24 +188,19 @@ def merge_rule_supports(target, source):
 def load_atoms(atom_file):
     if not atom_file.exists():
         raise FileNotFoundError(f"Atom file {atom_file} does not exist.")
-    atoms = utils_data.load_json(atom_file)
+    atoms = utils_data.load_atoms(atom_file)
     print(f"[Load Atoms] Loaded atoms from {len(atoms)} videos from {atom_file}")
     return atoms
 
 
 
-def build_anchor_clauses(all_atoms, output_dir, split):
-    anchor_clause_file = output_dir / f"anchor_clauses_{split}.json"
-    if anchor_clause_file.exists():
-        return utils_data.load_json(anchor_clause_file)
-    
+def build_anchor_clauses(cfg):
+    atoms = utils_data.load_json(cfg["train_atom_file"])
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     anchor_clauses = []
     seen_clauses = set()
-    unique_atoms = all_atoms["unique_atoms"]
-    for vid, atoms in all_atoms.items():
-        if vid == "unique_atoms":
-            continue
-        per_frame_atoms = atoms["per_frame_atoms"]
+    for vid, video_atoms in atoms.items():
+        per_frame_atoms = video_atoms["per_frame_atoms"]
         for current_frame, next_frame in tqdm(per_frame_atoms):
             if not (len(current_frame) > 0 and len(next_frame) > 0):
                 continue
@@ -224,45 +219,22 @@ def build_anchor_clauses(all_atoms, output_dir, split):
         anchor_clauses.append(
             Clause([i], [[i]], [0])
         )
-    data = {
-        "anchor_clauses": [clause.to_dict() for clause in anchor_clauses],
-        "unique_atoms": unique_atoms
-    }
-    utils_data.save_json(data, anchor_clause_file)
-    return data
+    anchor_clauses = [clause.to_dict() for clause in anchor_clauses]
+    return anchor_clauses
 
 
 
 def main(input_data):
     print("\n--------- Step 03 ----------------------\n")
-    cfg_legacy = {
-        "device": input_data["device"], 
-        "output_dir": input_data["output_dir"],
-        "test_output_dir": input_data["output_dir"] / "test",
-        "track_dir": input_data["dataset_path"] / "gt",
-        "dataset_path": input_data["dataset_path"],
-        "cd_method": input_data["cd_method"],
-        "cd_stat": input_data["cd_stat"],
-        "cd_alpha": input_data["cd_alpha"],
-        "cd_depth": input_data["cd_depth"],
-        "graph_strategy": input_data["graph_strategy"],
-        "min_support_features": input_data["min_support_features"],
-        "exp": input_data["exp"],
-    }
-    
     cfg = {
         "train_atom_file": input_data["train_atom_file"],
+        "unique_atoms_file": input_data["unique_atoms_file"],
         "output_dir": input_data["output_dir"]
-        
     }
-    anchor_clause_file = cfg["output_dir"] / "anchor_clauses_train.json"
+    anchor_clause_file = cfg["output_dir"] / "anchor_clauses.json"
+    if not anchor_clause_file.exists():
+        # Convert atoms to anchor clauses
+        anchor_data = build_anchor_clauses(cfg)
+        utils_data.save_json(anchor_data, anchor_clause_file)
 
-    if anchor_clause_file.exists():
-        return utils_data.load_json(anchor_clause_file)
-
-    # Prepare dataset by converting tracks to atoms for train, val, and test splits
-    atoms = load_atoms(cfg["train_atom_file"])
-    # Convert atoms to anchor clauses
-    anchor_data = build_anchor_clauses(atoms, cfg["output_dir"], 'train')
-    return anchor_data
 

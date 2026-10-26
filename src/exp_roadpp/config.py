@@ -219,22 +219,21 @@ def get_step_03_input(args):
         dataset_labels = json.load(f)
 
     train_atom_file = args.output_dir / 'step_dataset_output' / "atoms" / "train_atoms_compressed.json"
+    unique_atoms_file = args.output_dir / 'step_dataset_output' / "atoms" / "unique_atoms.json"
+    if not unique_atoms_file.exists():
+        raise FileNotFoundError(f"Unique atoms file {unique_atoms_file} does not exist.")
     if not train_atom_file.exists():
         raise FileNotFoundError(f"Train atom file {train_atom_file} does not exist.")
     
     input_data = {
         "train_atom_file": train_atom_file,
-        "baselines": args.baselines,
         "dataset_labels": dataset_labels,
         'learning': args.learning,
-        'skip_baselines_03': args.skip_baselines_03,
         'data_num': args.data_num,
         "use_gt": args.use_gt,
         "dataset_path": args.dataset_path,
         "output_dir": output_dir,
         "prune_args": args.prune_args,
-        "step01_output_dir": args.output_dir / "step01_output",
-        "step02_output_dir": args.output_dir / "step02_output",
         "device": args.device,
         "use_causal_filter": args.use_causal_filter,
         "min_support_features": args.min_support_features,
@@ -244,6 +243,7 @@ def get_step_03_input(args):
         "cd_depth": args.cd_depth,
         "graph_strategy": args.graph_strategy,
         "exp": args.exp,
+        "unique_atoms_file": unique_atoms_file,
     }
     return input_data
 

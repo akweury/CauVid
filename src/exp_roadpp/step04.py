@@ -579,7 +579,7 @@ def main_v2(input_data):
     if causal_clause_file.exists():
         return utils_data.load_json(causal_clause_file)
     anchor_clauses = utils_data.load_json(input_data["anchor_clause_file"])
-    atoms = utils_data.load_json(input_data["train_atom_file"])
+    atoms = utils_data.load_atoms(input_data["train_atom_file"])
     dataset_labels = utils_data.load_json(input_data["dataset_labels_file"])
     print(f"[Causal filter] Loaded {len(anchor_clauses['anchor_clauses'])} anchor clauses, atoms in {len(atoms)} videos.")
 

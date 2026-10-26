@@ -282,7 +282,7 @@ def main(input_data):
         "device": input_data.get("device", "cpu"),
         "num_explanations": 200,
     }
-    atoms = utils_data.load_json(input_data["val_atoms_file"])
+    atoms = utils_data.load_atoms(input_data["val_atoms_file"])
     extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
     # Clause atom ids index the train split's unique atoms (saved by step03).
     train_unique_atoms = utils_data.load_json(input_data["anchor_clause_file"])["unique_atoms"]

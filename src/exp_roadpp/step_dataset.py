@@ -88,31 +88,32 @@ def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels):
 
     return video_atoms
 
-def _compress_atom_file(atom_file, compressed_file):
+def _build_unique_atoms(atom_files, unique_atoms_file):
+    """Vocabulary of atom signatures without tube_uid, shared by all splits.
+    Built from the interval atoms, since per_frame_atoms miss atoms whose intervals
+    are all zero-length (end_frame <= start_frame)."""
+    unique_atoms = {}
+    for atom_file in atom_files:
+        for vid_atoms in tqdm(utils_data.load_json(atom_file).values(), desc="Unique Atoms"):
+            for interval in vid_atoms["interval_atoms"]:
+                unique_atoms.setdefault(utils_data.atom_to_signature(interval)[:-2], len(unique_atoms))
+    utils_data.save_json(list(unique_atoms), unique_atoms_file)
+    print(f"[Unique Atoms] {len(unique_atoms)} atoms saved to {unique_atoms_file}")
+
+
+def _compress_atom_file(atom_file, compressed_file, atom_vocab):
     atoms = utils_data.load_json(atom_file)
     compressed_atoms = {}
-    unique_atoms = []
     for vid, vid_atoms in tqdm(atoms.items(), desc="Compressing Atoms"):
         compressed_atoms[vid] = {}
         compressed_atoms[vid]["interval_atoms"] = vid_atoms["interval_atoms"]
-        
+
         compressed_per_frame_atoms = []
         for current_frame, next_frame in vid_atoms["per_frame_atoms"]:
-            cf_compressed = []
-            nf_compressed = []
-            for atom in current_frame:
-                if tuple(atom[:-2]) not in unique_atoms:
-                    unique_atoms.append(tuple(atom[:-2]))
-                index = unique_atoms.index(tuple(atom[:-2]))
-                cf_compressed.append((index,atom[-2],atom[-1]))
-            for atom in next_frame:
-                if tuple(atom[:-2]) not in unique_atoms:
-                    unique_atoms.append(tuple(atom[:-2]))
-                index = unique_atoms.index(tuple(atom[:-2]))
-                nf_compressed.append((index,atom[-2],atom[-1]))
+            cf_compressed = [(atom_vocab[tuple(atom[:-2])], atom[-2], atom[-1]) for atom in current_frame]
+            nf_compressed = [(atom_vocab[tuple(atom[:-2])], atom[-2], atom[-1]) for atom in next_frame]
             compressed_per_frame_atoms.append((cf_compressed, nf_compressed))
         compressed_atoms[vid]["per_frame_atoms"] = compressed_per_frame_atoms
-    compressed_atoms["unique_atoms"] = unique_atoms
     utils_data.save_json(compressed_atoms, compressed_file)
 
 
@@ -124,7 +125,7 @@ def _onset_statistics(compressed_file, stats_dir, horizon):
         return
     os.makedirs(stats_dir, exist_ok=True)
 
-    atoms = utils_data.load_json(compressed_file)
+    atoms = utils_data.load_atoms(compressed_file)
     unique_atoms = atoms["unique_atoms"]
     atom_vocab = {tuple(atom): i for i, atom in enumerate(unique_atoms)}
     # counts[i, dt - 1]: number of anchor frames whose next onset of atom i is dt frames ahead
@@ -197,10 +198,11 @@ def prepare_per_frame_events(cfg):
             return
         
         atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
-        interval_atoms = [data["interval_atoms"] for data in atoms.values() if isinstance(data, dict) and "interval_atoms" in data]
+        interval_atoms = [data["interval_atoms"] for data in atoms.values()]
         events = []
-        count_downs = [] 
-        unique_atoms = [tuple(atom) for atom in atoms["unique_atoms"]]
+        count_downs = []
+        unique_atoms = utils_data.load_json(cfg["output_dir"] / "atoms" / "unique_atoms.json")
+        atom_vocab = {tuple(atom): i for i, atom in enumerate(unique_atoms)}
 
         for video_intervals in tqdm(interval_atoms, desc="Events Preparing"):
             min_start = min(int(interval["start_frame"]) for interval in video_intervals) if video_intervals else None
@@ -209,7 +211,7 @@ def prepare_per_frame_events(cfg):
             for interval in video_intervals:
                 start, end = int(interval["start_frame"]), int(interval["end_frame"])
                 atom = utils_data.atom_to_signature(interval, cfg["dataset_labels"])
-                atom_idx = unique_atoms.index(atom[:-2])
+                atom_idx = atom_vocab[atom[:-2]]
                 video_event_matrix[start:end, atom_idx] = True
             events.append(video_event_matrix)
             video_count_down_matrix = torch.zeros_like(video_event_matrix, dtype=torch.int) - 1
@@ -250,23 +252,30 @@ def prepare_per_frame_atoms(language_model, cfg):
     atoms_folder= Path(output_dir) / "atoms" 
     os.makedirs(atoms_folder, exist_ok=True)
 
-    def _prepare_split(split_name, indices):
-        # train data
+    splits = {"train": train_indices, "val": val_indices, "test": test_indices}
+    for split_name, indices in splits.items():
         split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
         split_file = atoms_folder / f"{split_name}_atoms.json"
         if not os.path.exists(split_file):
             _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
         else:
             print(f"[Per Frame Atoms] {split_file} already exists.")
+
+    # One vocabulary for all splits; compressed files index into it, so rebuild them with it.
+    unique_atoms_file = atoms_folder / "unique_atoms.json"
+    rebuild_compressed = not unique_atoms_file.exists()
+    if rebuild_compressed:
+        _build_unique_atoms([atoms_folder / f"{split_name}_atoms.json" for split_name in splits], unique_atoms_file)
+    else:
+        print(f"[Unique Atoms] {unique_atoms_file} already exists.")
+    atom_vocab = {tuple(atom): i for i, atom in enumerate(utils_data.load_json(unique_atoms_file))}
+
+    for split_name in splits:
         compressed_file = atoms_folder / f"{split_name}_atoms_compressed.json"
-        if not os.path.exists(compressed_file):
-            _compress_atom_file(split_file, compressed_file)
+        if rebuild_compressed or not os.path.exists(compressed_file):
+            _compress_atom_file(atoms_folder / f"{split_name}_atoms.json", compressed_file, atom_vocab)
         else:
             print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
-
-    _prepare_split("train", train_indices)
-    _prepare_split("val", val_indices)
-    _prepare_split("test", test_indices)
 
 
 
