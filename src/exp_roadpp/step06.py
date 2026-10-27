@@ -350,11 +350,6 @@ def main(input_data):
     extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
     # All splits share one atom vocabulary, which the clause atom ids index.
     unique_atoms = utils_data.load_json(input_data["unique_atoms_file"])
-    causal_anchor_clauses = utils_data.load_json(input_data["causal_anchor_clause_file"])
-    head_atoms = sorted({c["anchor"]["head"][0] for c in causal_anchor_clauses.values()})
-    print(f"Extended Clauses Num: {len(extended_clauses)}")
-    if not extended_clauses:
-        raise ValueError(f"No extended clauses in {input_data['extended_clauses_file']}")
     delay_windows = extended_clauses[0]["delay_windows"]
 
     # The summary is reused only if it scored exactly these clauses.
