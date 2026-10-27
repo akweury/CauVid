@@ -2,7 +2,10 @@
 
 from pathlib import Path
 import os
+import sys
+import getpass
 import json
+import time
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -237,6 +240,8 @@ def build_body_features(X, D, body, head_atoms, windows):
       rows: (R, 3) long, (t, n_body, n_head) of each row.
     """
     b, s = body
+    # t is the frame indices where the body atom b is held by some agent.
+    # n_body is the agent indices holding the body atom b in those frames.
     t, n_body = torch.nonzero(X[:, :, b], as_tuple=True)
     if s == 0:
         n_head = n_body
@@ -262,135 +267,42 @@ def build_body_features(X, D, body, head_atoms, windows):
     targets = (delay > 0) & (delay <= windows)              # (R, H, K)
     rows = torch.stack([t, n_body, n_head], dim=1)
     return features, targets, rows
-def build_features(atoms, events, caw_clauses, unique_atoms, device):
+
+
+def build_features(atoms, caw_clauses, unique_atoms, device):
     bodies = list(set([c[0] for c in caw_clauses]))
-    delay_windows = list(set([c[-1] for c in caw_clauses]))
-    num_body_type = len(bodies)
+    # Sorted so the window axis K of the targets has a fixed order.
+    delay_windows = sorted(set([c[-1] for c in caw_clauses]))
     num_atom_type = len(unique_atoms)
-
     windows = torch.tensor(delay_windows, dtype=torch.int16, device=device)
-    # node_frame, current, delay, _node_keys = _node_tables(atoms, max(delay_windows), device)
-    # num_nodes = len(node_frame)
-    # num_frames = int(node_frame[-1]) + 1 if num_nodes else 0
-    
-    # frame_counts[f, a]: number of entities in frame pair f with atom a at t.
-    # cell_nodes, cell_atoms = torch.nonzero(current, as_tuple=True)
-    # frame_counts = torch.zeros((num_frames, num_atom_type), dtype=torch.int32, device=device)
-    # frame_counts.index_put_(
-    #     (node_frame[cell_nodes], cell_atoms),
-    #     torch.ones(len(cell_nodes), dtype=torch.int32, device=device),
-    #     accumulate=True,
-    # )
-    # del cell_nodes, cell_atoms
-    # # Candidate head objects: all nodes of the frame (contiguous per frame).
-    # frame_node_counts = torch.bincount(node_frame, minlength=num_frames)
-    # frame_node_starts = torch.cumsum(frame_node_counts, dim=0) - frame_node_counts
-
     features = []
     targets = []
-    group_feature_vocab = []
-    group_row_heads = []
     features = {body:[] for body in bodies}
     targets = {body:[] for body in bodies}
-    for video_id, video_atoms in enumerate(atoms):
+    rows = {body:[] for body in bodies}
+    heads_by_body = {}
+    for body, head, _window in caw_clauses:
+        heads_by_body.setdefault(body, {})[head] = None
+    head_atoms = {
+        body: torch.tensor([head[0] for head in heads], dtype=torch.long, device=device)
+        for body, heads in heads_by_body.items()
+    }
+    for video_atoms in atoms.values():
         X = build_video_tensor(video_atoms, num_atom_type, device=device)
         D = build_video_delay_tensor(X, max(delay_windows))
+        # print X and D memory usage
+        print(f"X memory usage: {X.element_size() * X.nelement() / 1024 ** 2:.2f} MB")
+        print(f"D memory usage: {D.element_size() * D.nelement() / 1024 ** 2:.2f} MB")
         for body in bodies:
-            F = build_body_features(X,D, body, windows)
-            features[body].append(F)
-    return 
+            F, T, R = build_body_features(X,D, body,head_atoms[body], windows)
+            if len(F)>0:
+                features[body].append(F)
+                targets[body].append(T)
+                rows[body].append(R)
+            
+    return features, targets, rows
         
 
-
-    # for body in bodies:
-
-    #     body_index, body_oid = body_signature
-    #     other_slot = body_oid + 1
-    #     num_columns = (other_slot + 1) * num_atom_type
-    #     # One atom per head; its len(delay_windows) columns are consecutive.
-    #     head_atoms = torch.tensor(
-    #         [head_signature[0] for _gid, head_signature, _window
-    #          in group_head_vocab[group_id][::len(delay_windows)]],
-    #         dtype=torch.long, device=device,
-    #     )
-
-    #     # Rows: (body node, head node) groundings of this group.
-    #     body_nodes = torch.nonzero(current[:, body_index], as_tuple=True)[0]
-    #     if body_oid == 0:
-    #         row_body = row_head = body_nodes
-    #     else:
-    #         body_frames = node_frame[body_nodes]
-    #         counts = frame_node_counts[body_frames]
-    #         row_body = torch.repeat_interleave(body_nodes, counts)
-    #         within = torch.arange(len(row_body), device=device) - torch.repeat_interleave(
-    #             torch.cumsum(counts, dim=0) - counts, counts
-    #         )
-    #         row_head = torch.repeat_interleave(frame_node_starts[body_frames], counts) + within
-    #         keep = row_head != row_body
-    #         row_body, row_head = row_body[keep], row_head[keep]
-    #     num_rows = len(row_body)
-    #     group_row_heads.append(row_head.cpu())
-
-    #     feature_rows, feature_columns = [], []
-    #     target_rows, target_columns = [], []
-    #     for start in range(0, num_rows, chunk_rows):
-    #         body = row_body[start:start + chunk_rows]
-    #         head = row_head[start:start + chunk_rows]
-    #         body_atoms = current[body]
-    #         head_atoms_t = current[head]
-    #         others = frame_counts[node_frame[body]] - body_atoms.int()
-    #         if body_oid != 0:
-    #             others -= head_atoms_t.int()
-    #         block = torch.zeros(
-    #             (len(body), other_slot + 1, num_atom_type), dtype=torch.bool, device=device
-    #         )
-    #         block[:, 0] = head_atoms_t
-    #         block[:, body_oid] |= body_atoms
-    #         # Skip the grounded body itself; it is implied by the group.
-    #         block[:, body_oid, body_index] = False
-    #         block[:, other_slot] = others > 0
-    #         rows, columns = torch.nonzero(block.reshape(len(body), -1), as_tuple=True)
-    #         feature_rows.append((rows + start).cpu())
-    #         feature_columns.append(columns.cpu())
-
-    #         head_delay = delay[head][:, head_atoms].unsqueeze(-1)
-    #         starts_within = (head_delay > 0) & (head_delay <= windows)
-    #         rows, columns = torch.nonzero(starts_within.reshape(len(head), -1), as_tuple=True)
-    #         target_rows.append((rows + start).cpu())
-    #         target_columns.append(columns.cpu())
-
-    #     feature_rows = torch.cat(feature_rows) if feature_rows else torch.zeros(0, dtype=torch.long)
-    #     feature_columns = torch.cat(feature_columns) if feature_columns else torch.zeros(0, dtype=torch.long)
-    #     target_rows = torch.cat(target_rows) if target_rows else torch.zeros(0, dtype=torch.long)
-    #     target_columns = torch.cat(target_columns) if target_columns else torch.zeros(0, dtype=torch.long)
-
-    #     # Keep only columns True in some row, renumbered in (slot, atom) order.
-    #     used_columns = torch.unique(feature_columns)
-    #     local_ids = torch.full((num_columns,), -1, dtype=torch.long)
-    #     local_ids[used_columns] = torch.arange(len(used_columns))
-    #     group_feature_vocab.append([
-    #         (group_id, column // num_atom_type, column % num_atom_type)
-    #         for column in used_columns.tolist()
-    #     ])
-    #     features.append(_csr_from_cells(
-    #         feature_rows, local_ids[feature_columns], (num_rows, len(used_columns)),
-    #     ))
-    #     targets.append(_csr_from_cells(
-    #         target_rows, target_columns, (num_rows, len(group_head_vocab[group_id])),
-    #     ))
-
-    # del current, delay, frame_counts
-    # if str(device) != "cpu" and torch.cuda.is_available():
-    #     torch.cuda.empty_cache()
-
-    return {
-        "features": features,
-        "targets": targets,
-        "feature_vocab": group_feature_vocab,
-        "head_vocab": group_head_vocab,
-        # row_heads[g][i]: node of the head object of row i.
-        "row_heads": group_row_heads,
-    }
 
 
 
@@ -669,22 +581,35 @@ def prune_examples(examples, min_support):
         "feature_aliases": feature_aliases,
     }
 
-def build_training_examples(atoms, events, clauses, labels, unique_atoms, cfg):
+def build_training_examples(atoms, clauses, labels, unique_atoms, cfg):
     body_groups = group_clauses_by_body(clauses)
     head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
-    examples = build_features(atoms, events, head_vocab , unique_atoms, cfg["device"])
-    examples["body_groups"] = body_groups
-    examples["delay_windows"] = list(cfg["delay_windows"])
+    features, targets, rows = build_features(atoms, head_vocab , unique_atoms, cfg["device"])
+    examples = {
+        "body_groups": body_groups,
+        "delay_windows": list(cfg["delay_windows"]),
+        # Axes H and K of targets[body]: the body's distinct heads in clause
+        # order and the sorted windows, as in `build_features`.
+        "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
+        "windows": sorted(set(cfg["delay_windows"])),
+        "features": features,
+        "targets": targets,
+        "rows": rows,
+    }
     # examples = prune_examples(examples, cfg["min_support"])
     
     # print summary of the training data
-    num_rows = sum(X["shape"][0] for X in examples["features"])
-    num_features = sum(X["shape"][1] for X in examples["features"])
-    num_heads = sum(Y["shape"][1] for Y in examples["targets"])
-    print(
-        f"[Training data] {len(examples['body_groups'])} groups, {num_rows} examples, "
-        f"{num_features} features, {num_heads} candidate heads"
-    )
+    # features[body] / targets[body]: per-video lists of (R, s + 2, A) / (R, H, K) tensors.
+    num_bodies = sum(1 for F in features.values() if F)
+    num_rows = sum(len(F) for Fs in features.values() for F in Fs)
+    num_features = sum(Fs[0][0].numel() for Fs in features.values() if Fs)
+    num_heads = sum(Ts[0][0].numel() for Ts in targets.values() if Ts)
+
+    print(f"[Videos] \t {len(atoms)}")
+    print(f"[Bodies]\t {num_bodies}")
+    print(f"[Heads]\t\t {num_heads}")
+    print(f"[Examples]\t {num_rows}")
+    print(f"[Features]\t {num_features}")
 
     return examples
 
@@ -827,150 +752,298 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
         "f1": f1,
     }
 
-def _to_extended_clauses(extended_data, training_examples_by_body, delay_windows):
-    body_groups = training_examples_by_body["body_groups"]
+def _atom_name(signature):
+    # ["pred", "action", "action_id", 3, "action_id_label", "MovAway",
+    #  "agent_class", 1, "agent_class_label", "Car"] -> "Car:MovAway"
+    fields = dict(zip(signature[2::2], signature[3::2]))
+    labels = [str(v) for k, v in fields.items() if k.endswith("_label") and k != "agent_class_label"]
+    return f"{fields.get('agent_class_label', '?')}:{'/'.join(labels) or signature[1]}"
+
+
+def _clause_text(clause, unique_atoms):
+    # Object slot s is the variable X{s}; slot 0 is the head object.
+    def atom(atom_index, slot):
+        name = _atom_name(unique_atoms[atom_index]) if unique_atoms else f"a{atom_index}"
+        return f"{name}(X{slot})"
+    body = " ∧ ".join(atom(a, s) for a, s in clause["bodies"])
+    return f"{body} ⇒ starts {atom(*clause['head'])} within {clause['delay_window']}f"
+
+
+def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_examples=15):
+    """Print statistics of the extended clauses and save them as a PDF figure."""
+    print(f"[Extended clauses] {len(extended_clauses)} clauses")
+    if not extended_clauses:
+        return
+    body_lengths = np.array([len(c["bodies"]) for c in extended_clauses])
+    windows = np.array([c["delay_window"] for c in extended_clauses])
+    metrics = {k: np.array([c[k] for c in extended_clauses]) for k in ("support", "confidence", "recall", "confidence_gain", "f1")}
+    num_bodies = len({tuple(c["bodies"][0]) for c in extended_clauses})
+    num_heads = len({tuple(c["head"]) for c in extended_clauses})
+    print(f"[Extended clauses] {num_bodies} anchor bodies, {num_heads} heads")
+    lengths, length_counts = np.unique(body_lengths, return_counts=True)
+    print("[Extended clauses] body length: " + ", ".join(f"{l}: {n}" for l, n in zip(lengths, length_counts)))
+    window_values, window_counts = np.unique(windows, return_counts=True)
+    print("[Extended clauses] delay window: " + ", ".join(f"{w}: {n}" for w, n in zip(window_values, window_counts)))
+    for k, v in metrics.items():
+        print(f"[Extended clauses] {k}: mean {v.mean():.3f}, median {np.median(v):.3f}, max {v.max():.3f}")
+    top = sorted(extended_clauses, key=lambda c: c["f1"], reverse=True)[:num_examples]
+    print(f"[Extended clauses] top {len(top)} by f1:")
+    for c in top:
+        print(f"  f1={c['f1']:.3f} conf={c['confidence']:.3f} sup={c['support']}  {_clause_text(c, unique_atoms)}")
+
+    import textwrap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    pdf_file = Path(output_dir) / "extended_clauses_summary.pdf"
+    with PdfPages(pdf_file) as pdf:
+        # Page 1: distributions.
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        fig.suptitle(f"{len(extended_clauses)} extended clauses ({num_bodies} anchor bodies, {num_heads} heads)")
+        axes[0, 0].bar(lengths, length_counts)
+        axes[0, 0].set(title="Body length (anchor + extra atoms)", xlabel="atoms", ylabel="clauses", xticks=lengths)
+        axes[0, 1].bar([str(w) for w in window_values], window_counts)
+        axes[0, 1].set(title="Delay window", xlabel="frames", ylabel="clauses")
+        axes[0, 2].hist(metrics["support"], bins=30, log=True)
+        axes[0, 2].set(title="Support", xlabel="rows", ylabel="clauses (log)")
+        for ax, k in zip(axes[1], ("confidence", "confidence_gain", "f1")):
+            ax.hist(metrics[k], bins=30)
+            ax.set(title=k.replace("_", " ").capitalize(), ylabel="clauses")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 2: confidence vs. recall, coloured by body length.
+        fig, ax = plt.subplots(figsize=(8, 6))
+        points = ax.scatter(metrics["recall"], metrics["confidence"], c=body_lengths, s=12, cmap="viridis")
+        fig.colorbar(points, ax=ax, label="body length")
+        ax.set(title="Confidence vs. recall", xlabel="recall", ylabel="confidence")
+        fig.tight_layout()
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Page 3: example clauses.
+        fig, ax = plt.subplots(figsize=(11.7, 8.3))
+        ax.axis("off")
+        ax.set_title(f"Top {len(top)} clauses by f1", loc="left")
+        lines = []
+        for i, c in enumerate(top, 1):
+            header = f"{i:>2}. f1={c['f1']:.2f} conf={c['confidence']:.2f} recall={c['recall']:.2f} gain={c['confidence_gain']:+.2f} support={c['support']}"
+            lines.append(header)
+            lines.extend("      " + line for line in textwrap.wrap(_clause_text(c, unique_atoms), 120))
+        ax.text(0, 1, "\n".join(lines), va="top", ha="left", family="monospace", fontsize=7, transform=ax.transAxes)
+        pdf.savefig(fig)
+        plt.close(fig)
+    print(f"[Extended clauses] Summary figure saved to {pdf_file}")
+
+
+def _to_extended_clauses(extended_data, delay_windows, unique_atoms=None, output_dir=None):
     extended_clauses = []
-    group_bodies = list(body_groups.keys())
     for item in extended_data:
-        # Bodies are ungrounded (atom_index, oid) atoms; a feature
-        # (gid, object_slot, atom_index) is the body atom on oid object_slot
-        # (see `build_features`). body_scopes lists each body's oid.
-        group_body = tuple(group_bodies[item['group_id']])
-        bodies = [group_body]
-        body_scopes = [group_body[1]]
-        for _gid, object_slot, atom_index in item['extra_atoms']:
-            bodies.append((atom_index, object_slot))
-            body_scopes.append(object_slot)
-        head = tuple(item['head'][1])
-        extended_clause = {
+        # Bodies are ungrounded (atom_index, object_slot) atoms, the anchor
+        # body first; body_scopes lists each body's object slot.
+        bodies = [tuple(item["body"])] + [(atom, slot) for slot, atom in item["extra_atoms"]]
+        extended_clauses.append({
             "bodies": bodies,
-            "body_scopes": body_scopes,
-            "head": head,
+            "body_scopes": [slot for _atom, slot in bodies],
+            "head": tuple(item["head"]),
             # The head starts within delay_window frames; delay_windows are all
             # windows learned, needed to decode the cumulative heads.
-            "delay_window": item['head'][2],
+            "delay_window": item["delay_window"],
             "delay_windows": list(delay_windows),
-            "support": item["metrics"]["support"],
-            "coverage": item["metrics"]["coverage"],
-            "confidence": item["metrics"]["confidence"],
-            "recall": item["metrics"]["recall"],
-            "confidence_gain": item["metrics"]["confidence_gain"],
-            "f1": item["metrics"]["f1"],
-        }
-        extended_clauses.append(extended_clause)
+            **item["metrics"],
+        })
+    if output_dir is not None:
+        _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir)
     return extended_clauses
 
 
-def _learnable_heads(dense_targets, gid):
+def _learnable_heads(targets, body):
     # Skip degenerate targets: nothing to learn if the head never fires
-    # or always fires for this body-group.
-    num_rows, num_head_cols = dense_targets.shape
-    head_positives = dense_targets.sum(dim=0)
+    # or always fires for this body.
+    num_rows, num_head_cols = targets.shape
+    head_positives = targets.sum(dim=0)
     learnable_heads = torch.nonzero(
         (head_positives > 0) & (head_positives < num_rows), as_tuple=True
     )[0].tolist()
-    num_degenerate = num_head_cols - len(learnable_heads)
-    if num_degenerate:
-        print(
-            f"[Rule extension] Skipping {num_degenerate}/{num_head_cols} heads of "
-            f"group {gid}: degenerate target (head fires in no row or every row)."
-        )
     return learnable_heads
 
 
-def _accepted_metrics(feature_block, target_col, selected_positions, gid, head_col, cfg):
+def _accepted_metrics(feature_block, target_col, selected_positions, body, head_col, cfg):
     # Hard metrics of the learned extension, or None if it is rejected.
     if not selected_positions:
-        print(
-            f"[Rule extension] Skipping group {gid}, head {head_col}: "
-            "learned mask selected no extra atoms."
-        )
         return None
 
     metrics = _evaluate_extension(feature_block, target_col, selected_positions)
     if metrics["support"] < cfg["min_support"]:
-        print(
-            f"[Rule extension] Skipping group {gid}, head {head_col}: "
-            f"support {metrics['support']} < min_support {cfg['min_support']}."
-        )
         return None
     if metrics["confidence_gain"] < cfg["min_confidence_gain"]:
-        print(
-            f"[Rule extension] Skipping group {gid}, head {head_col}: "
-            f"confidence_gain {metrics['confidence_gain']:.4f} < "
-            f"min_confidence_gain {cfg['min_confidence_gain']}."
-        )
         return None
     return metrics
 
 
-def _extend_group(gid, examples, feature_aliases, cfg):
-    # Differentiable conjunctive rule learning for one body-group; returns
-    # the accepted extensions of its heads.
-    num_rows, num_feature_cols = examples["features"][gid]["shape"]
-    num_head_cols = examples["targets"][gid]["shape"][1]
-    if num_rows == 0 or num_feature_cols == 0 or num_head_cols == 0:
-        print(
-            f"[Rule extension] Skipping group {gid}: "
-            f"rows={num_rows}, feature_cols={num_feature_cols}, "
-            f"head_cols={num_head_cols} "
-            "(nothing to learn for this body-group)."
-        )
+def _extend_body(body, features, targets, heads, windows, cfg):
+    """Differentiable conjunctive rule learning for one body; returns the
+    accepted extensions of its (head, window) pairs.
+
+    features, targets: per-video lists of (R, s + 2, A) / (R, H, K) bool tensors
+    (`build_body_features`); heads, windows: the H heads and K windows.
+    """
+    if not features:
         return []
 
-    # Densify only this group's (N, M) block, kept on CPU; it is moved to
-    # the GPU once inside `learn_extension_masks`. Numpy view of the bool
-    # block for hard evaluation.
-    dense_features = sparse_rows_to_dense(examples["features"][gid])
-    feature_block = dense_features.numpy()
-    dense_targets = sparse_rows_to_dense(examples["targets"][gid])
+    # Flatten the role slots and the (head, window) pairs into columns, on CPU;
+    # `learn_extension_masks` moves them to the device. Feature column
+    # slot * A + atom is "agent in role slot holds atom"; target column
+    # h * K + k is "heads[h] starts within windows[k] frames".
+    F = torch.cat(features).cpu()
+    num_rows, num_slots, num_atoms = F.shape
+    X = F.reshape(num_rows, num_slots * num_atoms)
+    Y = torch.cat(targets).cpu().reshape(num_rows, -1)
+    feature_block = X.numpy()
 
-    learnable_heads = _learnable_heads(dense_targets, gid)
+    learnable_heads = _learnable_heads(Y, body)
     if not learnable_heads:
         return []
 
-    # All learnable heads of the group are trained together.
+    # All learnable heads of the body are trained together.
     final_masks, _log_alpha = learn_extension_masks(
-        dense_features, dense_targets[:, learnable_heads],
+        X, Y[:, learnable_heads],
         num_epochs=cfg["num_epochs"], lr=cfg["lr"], l0_lambda=cfg["l0_lambda"],
         device=cfg["device"],
     )
 
-    group_data = []
+    body_data = []
     for mask_col, head_col in enumerate(learnable_heads):
-        target_col = dense_targets[:, head_col].numpy().astype(np.float32)
+        target_col = Y[:, head_col].numpy().astype(np.float32)
         selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
         metrics = _accepted_metrics(
-            feature_block, target_col, selected_positions, gid, head_col, cfg
+            feature_block, target_col, selected_positions, body, head_col, cfg
         )
         if metrics is None:
             continue
 
-        selected_atoms = [examples["feature_vocab"][gid][pos] for pos in selected_positions]
-        print(f"Extra Atom Num: {len(selected_atoms)}")
-        group_data.append({
-            "group_id": gid,
-            "head": examples["head_vocab"][gid][head_col],
-            "extra_atoms": selected_atoms,
-            # Atoms true in exactly the same rows as each extra atom.
-            "extra_atom_aliases": [feature_aliases[gid][pos] for pos in selected_positions],
+        h, k = divmod(head_col, len(windows))
+        body_data.append({
+            "body": body,
+            "head": heads[h],
+            "delay_window": windows[k],
+            # (object_slot, atom_index) of each extra atom.
+            "extra_atoms": [divmod(pos, num_atoms) for pos in selected_positions],
             "metrics": metrics,
         })
-    return group_data
+    return body_data
+
+
+_WANDB_CLOUD_HOST = "https://api.wandb.ai"
+
+
+def _wandb_login(wandb):
+    """Log in to the hosted W&B cloud; returns False if the user skips tracking.
+
+    Asks the user to pick a login method: the saved credentials (~/.netrc or
+    WANDB_API_KEY) or an API key typed in (hidden), from
+    https://wandb.ai/authorize. Without a terminal, only saved credentials are tried.
+    """
+    if not sys.stdin.isatty():
+        return wandb.login(host=_WANDB_CLOUD_HOST)
+    print(
+        "[wandb] Choose a login method for https://wandb.ai:\n"
+        "  1) use saved credentials (~/.netrc or WANDB_API_KEY)\n"
+        "  2) enter an API key (from https://wandb.ai/authorize)\n"
+        "  3) skip wandb tracking"
+    )
+    choice = input("[wandb] Select 1/2/3 [1]: ").strip() or "1"
+    if choice == "3":
+        return False
+    if choice == "1" and wandb.login(host=_WANDB_CLOUD_HOST, relogin=False, verify=True):
+        return True
+    if choice == "1":
+        print("[wandb] No valid saved credentials, enter an API key instead.")
+    key = getpass.getpass("[wandb] API key (input hidden): ").strip()
+    if not key:
+        return False
+    # The key is verified against the server and saved to ~/.netrc for later runs.
+    return wandb.login(key=key, host=_WANDB_CLOUD_HOST, relogin=True, verify=True)
+
+
+def _init_wandb(cfg, num_bodies):
+    """Online run on the hosted W&B cloud, or None if tracking is off or fails.
+
+    Tracking is fail-open: a missing package, skipped or failed login, or
+    network error only prints a warning.
+    """
+    if not cfg.get("wandb", True):
+        return None
+    try:
+        import wandb
+        # Always the hosted cloud, never a stale WANDB_BASE_URL of a local server.
+        os.environ["WANDB_BASE_URL"] = _WANDB_CLOUD_HOST
+        if not _wandb_login(wandb):
+            print("[wandb] Tracking disabled: not logged in.")
+            return None
+        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_confidence_gain", "delay_windows", "device")
+        run = wandb.init(
+            project=cfg.get("wandb_project", "cauvid-roadpp"),
+            name=cfg.get("wandb_run_name"),
+            job_type="step05_extension",
+            mode="online",
+            config={**{k: cfg[k] for k in hparams if k in cfg}, "num_bodies": num_bodies},
+        )
+        print(f"[wandb] Run: {run.url}")
+        return run
+    except Exception as exc:
+        print(f"[wandb] Tracking disabled: {type(exc).__name__}: {exc}")
+        return None
 
 
 def _learn_extensions(examples, cfg):
-    # Only pruned examples carry aliases; otherwise each column is its own.
-    feature_aliases = examples.get(
-        "feature_aliases", [[[entry] for entry in vocab] for vocab in examples["feature_vocab"]]
-    )
+    num_bodies = len(examples["features"])
+    run = _init_wandb(cfg, num_bodies)
     extended_data = []
-    # extension in one shot: differentiable conjunctive rule learning, group by group
-    for gid in tqdm(range(len(examples["features"])), desc="Learning rule extensions"):
-        extended_data.extend(_extend_group(gid, examples, feature_aliases, cfg))
-        # The group's dense blocks are freed on return.
-        if cfg["device"] != 'cpu' and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    start_time = time.perf_counter()
+    try:
+        for i, (body, features) in enumerate(tqdm(examples["features"].items(), desc="Learning rule extensions")):
+            body_start = time.perf_counter()
+            body_data = _extend_body(
+                body, features, examples["targets"][body],
+                examples["heads"][body], examples["windows"], cfg,
+            )
+            extended_data.extend(body_data)
+            # The body's dense blocks are freed on return.
+            if cfg["device"] != 'cpu' and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if run is not None:
+                run.log({
+                    "progress/bodies_done": i + 1,
+                    "progress/fraction": (i + 1) / num_bodies,
+                    "progress/elapsed_s": time.perf_counter() - start_time,
+                    "body/rows": sum(len(F) for F in features),
+                    "body/head_cols": len(examples["heads"][body]) * len(examples["windows"]),
+                    "body/accepted": len(body_data),
+                    "body/seconds": time.perf_counter() - body_start,
+                    "total/accepted": len(extended_data),
+                }, step=i)
+        if run is not None:
+            import wandb
+            table = wandb.Table(columns=[
+                "body", "head", "delay_window", "extra_atoms",
+                "support", "confidence", "recall", "confidence_gain", "f1",
+            ])
+            for item in extended_data:
+                m = item["metrics"]
+                table.add_data(
+                    str(item["body"]), str(item["head"]), item["delay_window"], str(item["extra_atoms"]),
+                    m["support"], m["confidence"], m["recall"], m["confidence_gain"], m["f1"],
+                )
+            run.log({"extensions": table})
+            run.summary["total/accepted"] = len(extended_data)
+            run.summary["total/seconds"] = time.perf_counter() - start_time
+    finally:
+        if run is not None:
+            run.finish()
     return extended_data
 
 
@@ -985,12 +1058,13 @@ def extend_clauses(cfg):
     
     # Build training examples from the loaded anchor clauses, labels, and atoms.
     if not os.path.exists(cfg["extension_training_example_file"]):
-        examples = build_training_examples(atoms, events, causal_anchor_clauses, labels, unique_atoms, cfg)
+        examples = build_training_examples(atoms, causal_anchor_clauses, labels, unique_atoms, cfg)
+        torch.save(examples, cfg["extension_training_example_file"])
     else:
         examples = torch.load(cfg["extension_training_example_file"])
 
     extended_data = _learn_extensions(examples, cfg)
-    extended_clauses = _to_extended_clauses(extended_data, examples, cfg["delay_windows"])
+    extended_clauses = _to_extended_clauses(extended_data, cfg["delay_windows"], unique_atoms, cfg["output_dir"])
     return extended_clauses
 
 
