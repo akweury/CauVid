@@ -237,24 +237,85 @@ def build_video_delay_tensor(X, horizon):
     return D
 
 
-def build_body_features(X, D, body, head_atoms, windows):
+TEMPORAL_KINDS = ("held", "started", "ended")
+
+
+def past_bins(past_windows):
+    """Disjoint past time bins (lo, hi) from the sorted window edges, e.g.
+    [3, 5, 10] -> (0, 3), (3, 5), (5, 10). Bin (lo, hi) covers the frames
+    lo..hi-1 frames before t, i.e. (t - hi, t - lo]."""
+    edges = [0] + sorted(set(past_windows))
+    return list(zip(edges[:-1], edges[1:]))
+
+
+def temporal_predicates(past_windows):
+    """Names of the P predicates of `build_video_temporal_tensor`: "now", then
+    "held_lo_hi", "started_lo_hi", "ended_lo_hi" for each bin of `past_bins`."""
+    return ["now"] + [f"{kind}_{lo}_{hi}" for lo, hi in past_bins(past_windows) for kind in TEMPORAL_KINDS]
+
+
+def build_video_temporal_tensor(X, past_windows):
+    """(T, N, P, A) bool tensor of one video: Xt[t, n, p, a] is temporal predicate p
+    (`temporal_predicates`) of atom a for agent n in frame t, over the past frames.
+
+    p = 0 ("now") is X itself. For each disjoint bin (lo, hi) of `past_bins`, over
+    the frames (t - hi, t - lo]:
+      held: n holds a in every one of them (False if the bin starts before the video);
+      started: a starts for n in one of them (n holds a, but not in the frame before);
+      ended: a ends for n in one of them (n held a in the frame before, but not anymore).
+    Bins are time ranges, not exact frame shifts, so rules can order events
+    (A started 5-10 frames ago, B started within 3 frames) and stay robust to jitter.
+    The first frame of the video has no starts or ends.
+    """
+    previous = torch.zeros_like(X)
+    previous[1:] = X[:-1]
+    events = {"held": X, "started": X & ~previous, "ended": ~X & previous}
+    events["started"][0] = False
+    # counts[kind][j] - counts[kind][i]: frames i..j-1 with the event.
+    zero = torch.zeros_like(X[:1], dtype=torch.int32)
+    counts = {kind: torch.cat([zero, event.int().cumsum(dim=0, dtype=torch.int32)]) for kind, event in events.items()}
+    end = torch.arange(1, X.shape[0] + 1, device=X.device)
+    predicates = [X]
+    for lo, hi in past_bins(past_windows):
+        stop = (end - lo).clamp(min=0)
+        start = (end - hi).clamp(min=0)
+        for kind in TEMPORAL_KINDS:
+            num_frames = counts[kind][stop] - counts[kind][start]
+            predicates.append(num_frames == hi - lo if kind == "held" else num_frames > 0)
+    return torch.stack(predicates, dim=2)
+
+
+def _pack_features(F):
+    # (R, ...) bool features -> (R, ceil(M / 8)) uint8 bits on CPU, M = F[0].numel().
+    return torch.from_numpy(np.packbits(F.reshape(len(F), -1).cpu().numpy(), axis=1))
+
+
+def _unpack_features(packed, num_columns):
+    # Inverse of `_pack_features`, concatenated over a list of packed blocks: (R, M) bool.
+    bits = np.concatenate([p.numpy() for p in packed])
+    return torch.from_numpy(np.unpackbits(bits, axis=1, count=num_columns).astype(bool))
+
+
+def build_body_features(Xt, D, body, head_atoms, windows):
     """Training rows of one body (b, s) in one video.
 
-    X, D: (T, N, A) atom and delay tensors of the video (`build_video_tensor`,
-    `build_video_delay_tensor`). body = (b, s): agent slot s holds atom b.
+    Xt: (T, N, P, A) temporal atom tensor of the video (`build_video_temporal_tensor`;
+    Xt[:, :, 0] is the atom tensor of `build_video_tensor`), D: (T, N, A) delay
+    tensor (`build_video_delay_tensor`). body = (b, s): agent slot s holds atom b.
     head_atoms: (H,) atom ids of the body's candidate heads; windows: (K,).
 
     A row is one grounding in a frame t where some agent n_body holds b: the
     head agent n_head is n_body itself if s == 0, otherwise every other agent
     visible in frame t. Returns
-      features: (R, s + 2, A) bool, the atoms in frame t of each role:
-          slot 0 the head agent, slot s the body agent (without b itself, which
+      features: (R, s + 2, P, A) bool, the temporal atoms in frame t of each role:
+          slot 0 the head agent, slot s the body agent (without b "now", which
           every row has) and slot s + 1 "some other agent" (any agent but those two);
       targets: (R, H, K) bool, head h starts for the head agent within windows[k]
           frames after t (and is not already held by it in frame t);
       rows: (R, 3) long, (t, n_body, n_head) of each row.
     """
     b, s = body
+    X = Xt[:, :, 0]
     # t is the frame indices where the body atom b is held by some agent.
     # n_body is the agent indices holding the body atom b in those frames.
     t, n_body = torch.nonzero(X[:, :, b], as_tuple=True)
@@ -267,15 +328,15 @@ def build_body_features(X, D, body, head_atoms, windows):
         pair, n_head = torch.nonzero(candidates, as_tuple=True)
         t, n_body = t[pair], n_body[pair]
 
-    head = X[t, n_head]                                     # (R, A)
-    body_agent = X[t, n_body]                               # (R, A)
-    others = X.sum(dim=1)[t] - body_agent.int()             # (R, A) agents holding a, minus the roles
+    head = Xt[t, n_head]                                    # (R, P, A)
+    body_agent = Xt[t, n_body]                              # (R, P, A)
+    others = Xt.sum(dim=1)[t] - body_agent.int()            # (R, P, A) agents with (p, a), minus the roles
     if s != 0:
         others -= head.int()
-    features = torch.zeros((len(t), s + 2, X.shape[2]), dtype=torch.bool, device=X.device)
+    features = torch.zeros((len(t), s + 2, *Xt.shape[2:]), dtype=torch.bool, device=Xt.device)
     features[:, 0] = head
     features[:, s] |= body_agent
-    features[:, s, b] = False
+    features[:, s, 0, b] = False
     features[:, s + 1] = others > 0
 
     delay = D[t, n_head][:, head_atoms].unsqueeze(-1)       # (R, H, 1)
@@ -284,7 +345,10 @@ def build_body_features(X, D, body, head_atoms, windows):
     return features, targets, rows
 
 
-def build_features(atoms, caw_clauses, unique_atoms, device):
+def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
+    """Per-body, per-video lists of the `build_body_features` outputs; features
+    are bit-packed (`_pack_features`) on CPU, as they grow with the P temporal
+    predicates of `past_windows`."""
     bodies = list(set([c[0] for c in caw_clauses]))
     # Sorted so the window axis K of the targets has a fixed order.
     delay_windows = sorted(set([c[-1] for c in caw_clauses]))
@@ -305,15 +369,16 @@ def build_features(atoms, caw_clauses, unique_atoms, device):
     for video_atoms in atoms.values():
         X = build_video_tensor(video_atoms, num_atom_type, device=device)
         D = build_video_delay_tensor(X, max(delay_windows))
+        Xt = build_video_temporal_tensor(X, past_windows)
         # print X and D memory usage
-        print(f"X memory usage: {X.element_size() * X.nelement() / 1024 ** 2:.2f} MB")
+        print(f"Xt memory usage: {Xt.element_size() * Xt.nelement() / 1024 ** 2:.2f} MB")
         print(f"D memory usage: {D.element_size() * D.nelement() / 1024 ** 2:.2f} MB")
         for body in bodies:
-            F, T, R = build_body_features(X,D, body,head_atoms[body], windows)
+            F, T, R = build_body_features(Xt, D, body, head_atoms[body], windows)
             if len(F)>0:
-                features[body].append(F)
-                targets[body].append(T)
-                rows[body].append(R)
+                features[body].append(_pack_features(F))
+                targets[body].append(T.cpu())
+                rows[body].append(R.cpu())
             
     return features, targets, rows
         
@@ -599,25 +664,32 @@ def prune_examples(examples, min_support):
 def build_training_examples(atoms, clauses, labels, unique_atoms, cfg):
     body_groups = group_clauses_by_body(clauses)
     head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
-    features, targets, rows = build_features(atoms, head_vocab , unique_atoms, cfg["device"])
+    features, targets, rows = build_features(
+        atoms, head_vocab, unique_atoms, cfg["device"], cfg["past_windows"]
+    )
+    predicates = temporal_predicates(cfg["past_windows"])
     examples = {
         "body_groups": body_groups,
         "delay_windows": list(cfg["delay_windows"]),
+        "past_windows": list(cfg["past_windows"]),
         # Axes H and K of targets[body]: the body's distinct heads in clause
         # order and the sorted windows, as in `build_features`.
         "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
         "windows": sorted(set(cfg["delay_windows"])),
+        # Axes P and A of the (s + 2, P, A) features of a body (b, s).
+        "predicates": predicates,
+        "num_atoms": len(unique_atoms),
         "features": features,
         "targets": targets,
         "rows": rows,
     }
     # examples = prune_examples(examples, cfg["min_support"])
-    
+
     # print summary of the training data
-    # features[body] / targets[body]: per-video lists of (R, s + 2, A) / (R, H, K) tensors.
+    # features[body] / targets[body]: per-video lists of packed (s + 2, P, A) / (R, H, K) tensors.
     num_bodies = sum(1 for F in features.values() if F)
     num_rows = sum(len(F) for Fs in features.values() for F in Fs)
-    num_features = sum(Fs[0][0].numel() for Fs in features.values() if Fs)
+    num_features = sum((body[1] + 2) * len(predicates) * len(unique_atoms) for body, Fs in features.items() if Fs)
     num_heads = sum(Ts[0][0].numel() for Ts in targets.values() if Ts)
 
     print(f"[Videos] \t {len(atoms)}")
@@ -775,12 +847,23 @@ def _atom_name(signature):
     return f"{fields.get('agent_class_label', '?')}:{'/'.join(labels) or signature[1]}"
 
 
+def predicate_text(predicate):
+    # "now" -> "", "held_0_3" -> "[held last 3f]", "started_0_3" -> "[started ≤3f ago]",
+    # "ended_5_10" -> "[ended 5-10f ago]", "held_5_10" -> "[held 5-10f ago]".
+    if predicate == "now":
+        return ""
+    kind, lo, hi = predicate.split("_")
+    if lo == "0":
+        return f"[held last {hi}f]" if kind == "held" else f"[{kind} ≤{hi}f ago]"
+    return f"[{kind} {lo}-{hi}f ago]"
+
+
 def _clause_text(clause, unique_atoms):
     # Object slot s is the variable X{s}; slot 0 is the head object.
-    def atom(atom_index, slot):
+    def atom(atom_index, slot, predicate="now"):
         name = _atom_name(unique_atoms[atom_index]) if unique_atoms else f"a{atom_index}"
-        return f"{name}(X{slot})"
-    body = " ∧ ".join(atom(a, s) for a, s in clause["bodies"])
+        return f"{name}(X{slot}){predicate_text(predicate)}"
+    body = " ∧ ".join(atom(*a) for a in clause["bodies"])
     return f"{body} ⇒ starts {atom(*clause['head'])} within {clause['delay_window']}f"
 
 
@@ -799,6 +882,17 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
     print("[Extended clauses] body length: " + ", ".join(f"{l}: {n}" for l, n in zip(lengths, length_counts)))
     window_values, window_counts = np.unique(windows, return_counts=True)
     print("[Extended clauses] delay window: " + ", ".join(f"{w}: {n}" for w, n in zip(window_values, window_counts)))
+    # Extra atoms by temporal predicate kind ("now", "held", "started", "ended").
+    kind_counts = {}
+    for c in extended_clauses:
+        for _atom, _slot, predicate in c["bodies"][1:]:
+            kind = predicate.split("_")[0]
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+    num_temporal = sum(any(p != "now" for _a, _s, p in c["bodies"][1:]) for c in extended_clauses)
+    print(f"[Extended clauses] {num_temporal}/{len(extended_clauses)} clauses with temporal atoms; extra atoms: "
+          + ", ".join(f"{k}: {n}" for k, n in kind_counts.items()))
+    videos = np.array([c.get("videos", 0) for c in extended_clauses])
+    print(f"[Extended clauses] training videos a clause is correct in: mean {videos.mean():.1f}, min {videos.min()}")
     for k, v in metrics.items():
         print(f"[Extended clauses] {k}: mean {v.mean():.3f}, median {np.median(v):.3f}, max {v.max():.3f}")
     top = sorted(extended_clauses, key=lambda c: c["f1"], reverse=True)[:num_examples]
@@ -815,14 +909,19 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
     pdf_file = Path(output_dir) / "extended_clauses_summary.pdf"
     with PdfPages(pdf_file) as pdf:
         # Page 1: distributions.
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
         fig.suptitle(f"{len(extended_clauses)} extended clauses ({num_bodies} anchor bodies, {num_heads} heads)")
         axes[0, 0].bar(lengths, length_counts)
         axes[0, 0].set(title="Body length (anchor + extra atoms)", xlabel="atoms", ylabel="clauses", xticks=lengths)
         axes[0, 1].bar([str(w) for w in window_values], window_counts)
         axes[0, 1].set(title="Delay window", xlabel="frames", ylabel="clauses")
-        axes[0, 2].hist(metrics["support"], bins=30, log=True)
-        axes[0, 2].set(title="Support", xlabel="rows", ylabel="clauses (log)")
+        axes[0, 2].bar(list(kind_counts), list(kind_counts.values()))
+        axes[0, 2].set(title="Extra atoms by temporal predicate", ylabel="atoms")
+        axes[0, 3].hist(metrics["support"], bins=30, log=True)
+        axes[0, 3].set(title="Support", xlabel="rows", ylabel="clauses (log)")
+        video_values, video_counts = np.unique(videos, return_counts=True)
+        axes[1, 3].bar([str(v) for v in video_values], video_counts)
+        axes[1, 3].set(title="Training videos the clause is correct in", xlabel="videos", ylabel="clauses")
         for ax, k in zip(axes[1], ("confidence", "confidence_gain", "f1")):
             ax.hist(metrics[k], bins=30)
             ax.set(title=k.replace("_", " ").capitalize(), ylabel="clauses")
@@ -854,20 +953,23 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
     print(f"[Extended clauses] Summary figure saved to {pdf_file}")
 
 
-def _to_extended_clauses(extended_data, delay_windows, unique_atoms=None, output_dir=None):
+def _to_extended_clauses(extended_data, delay_windows, past_windows=(), unique_atoms=None, output_dir=None):
     extended_clauses = []
     for item in extended_data:
-        # Bodies are ungrounded (atom_index, object_slot) atoms, the anchor
-        # body first; body_scopes lists each body's object slot.
-        bodies = [tuple(item["body"])] + [(atom, slot) for slot, atom in item["extra_atoms"]]
+        # Bodies are ungrounded (atom_index, object_slot, temporal_predicate)
+        # atoms, the anchor body ("now") first; body_scopes lists each body's
+        # object slot. Predicates are named as in `temporal_predicates`.
+        bodies = [(*item["body"], "now")] + [tuple(extra) for extra in item["extra_atoms"]]
         extended_clauses.append({
             "bodies": bodies,
-            "body_scopes": [slot for _atom, slot in bodies],
+            "body_scopes": [slot for _atom, slot, _predicate in bodies],
             "head": tuple(item["head"]),
             # The head starts within delay_window frames; delay_windows are all
             # windows learned, needed to decode the cumulative heads.
             "delay_window": item["delay_window"],
             "delay_windows": list(delay_windows),
+            # Edges of the past bins of the temporal predicates, needed to ground them.
+            "past_windows": list(past_windows),
             **item["metrics"],
         })
     if output_dir is not None:
@@ -875,18 +977,24 @@ def _to_extended_clauses(extended_data, delay_windows, unique_atoms=None, output
     return extended_clauses
 
 
-def _learnable_heads(targets, body):
-    # Skip degenerate targets: nothing to learn if the head never fires
-    # or always fires for this body.
+def _learnable_heads(targets, video_of_row, min_videos):
+    # Skip degenerate targets: nothing to learn if the head never fires or
+    # always fires for this body, and nothing general if all its positives
+    # come from fewer than min_videos videos.
     num_rows, num_head_cols = targets.shape
     head_positives = targets.sum(dim=0)
+    num_videos = int(video_of_row.max()) + 1
+    positives_per_video = torch.zeros((num_videos, num_head_cols), dtype=torch.long)
+    positives_per_video.index_add_(0, video_of_row, targets.long())
     learnable_heads = torch.nonzero(
-        (head_positives > 0) & (head_positives < num_rows), as_tuple=True
+        (head_positives > 0) & (head_positives < num_rows)
+        & ((positives_per_video > 0).sum(dim=0) >= min_videos),
+        as_tuple=True,
     )[0].tolist()
     return learnable_heads
 
 
-def _accepted_metrics(feature_block, target_col, selected_positions, body, head_col, cfg):
+def _accepted_metrics(feature_block, target_col, selected_positions, video_of_row, cfg):
     # Hard metrics of the learned extension, or None if it is rejected.
     if not selected_positions:
         return None
@@ -896,32 +1004,43 @@ def _accepted_metrics(feature_block, target_col, selected_positions, body, head_
         return None
     if metrics["confidence_gain"] < cfg["min_confidence_gain"]:
         return None
+    # A rule correct in a single video only memorizes that video.
+    hits = feature_block[:, selected_positions].all(axis=1) & (target_col > 0)
+    metrics["videos"] = len(np.unique(video_of_row[hits]))
+    if metrics["videos"] < cfg["min_videos"]:
+        return None
     return metrics
 
 
-def _extend_body(body, features, targets, heads, windows, cfg):
+def _extend_body(body, features, targets, heads, windows, predicates, num_atoms, cfg):
     """Differentiable conjunctive rule learning for one body; returns the
     accepted extensions of its (head, window) pairs.
 
-    features, targets: per-video lists of (R, s + 2, A) / (R, H, K) bool tensors
-    (`build_body_features`); heads, windows: the H heads and K windows.
+    features, targets: per-video lists of packed (s + 2, P, A) features
+    (`_pack_features`) and (R, H, K) bool targets (`build_body_features`);
+    heads, windows: the H heads and K windows; predicates: the P temporal predicates.
     """
     if not features:
         return []
 
-    # Flatten the role slots and the (head, window) pairs into columns, on CPU;
-    # `learn_extension_masks` moves them to the device. Feature column
-    # slot * A + atom is "agent in role slot holds atom"; target column
-    # h * K + k is "heads[h] starts within windows[k] frames".
-    F = torch.cat(features).cpu()
-    num_rows, num_slots, num_atoms = F.shape
-    X = F.reshape(num_rows, num_slots * num_atoms)
+    # Flatten the role slots, temporal predicates and atoms, and the (head,
+    # window) pairs into columns, on CPU; `learn_extension_masks` moves them to
+    # the device. Feature column (slot * P + p) * A + atom is "agent in role
+    # slot satisfies predicate p of atom"; target column h * K + k is
+    # "heads[h] starts within windows[k] frames".
+    num_slots, num_predicates = body[1] + 2, len(predicates)
+    X = _unpack_features(features, num_slots * num_predicates * num_atoms)
+    num_rows = len(X)
     Y = torch.cat(targets).cpu().reshape(num_rows, -1)
     feature_block = X.numpy()
+    video_of_row = torch.repeat_interleave(
+        torch.arange(len(features)), torch.tensor([len(F) for F in features])
+    )
 
-    learnable_heads = _learnable_heads(Y, body)
+    learnable_heads = _learnable_heads(Y, video_of_row, cfg["min_videos"])
     if not learnable_heads:
         return []
+    video_of_row = video_of_row.numpy()
 
     # All learnable heads of the body are trained together.
     final_masks, _log_alpha = learn_extension_masks(
@@ -935,18 +1054,23 @@ def _extend_body(body, features, targets, heads, windows, cfg):
         target_col = Y[:, head_col].numpy().astype(np.float32)
         selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
         metrics = _accepted_metrics(
-            feature_block, target_col, selected_positions, body, head_col, cfg
+            feature_block, target_col, selected_positions, video_of_row, cfg
         )
         if metrics is None:
             continue
 
         h, k = divmod(head_col, len(windows))
+        extra_atoms = []
+        for pos in selected_positions:
+            slot_predicate, atom = divmod(pos, num_atoms)
+            slot, p = divmod(slot_predicate, num_predicates)
+            extra_atoms.append((atom, slot, predicates[p]))
         body_data.append({
             "body": body,
             "head": heads[h],
             "delay_window": windows[k],
-            # (object_slot, atom_index) of each extra atom.
-            "extra_atoms": [divmod(pos, num_atoms) for pos in selected_positions],
+            # (atom_index, object_slot, temporal_predicate) of each extra atom.
+            "extra_atoms": extra_atoms,
             "metrics": metrics,
         })
     return body_data
@@ -999,7 +1123,8 @@ def _init_wandb(cfg, num_bodies):
         if not _wandb_login(wandb):
             print("[wandb] Tracking disabled: not logged in.")
             return None
-        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_confidence_gain", "delay_windows", "device")
+        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_confidence_gain", "min_videos",
+                   "delay_windows", "past_windows", "device")
         run = wandb.init(
             project=cfg.get("wandb_project", "cauvid-roadpp"),
             name=cfg.get("wandb_run_name"),
@@ -1024,7 +1149,8 @@ def _learn_extensions(examples, cfg):
             body_start = time.perf_counter()
             body_data = _extend_body(
                 body, features, examples["targets"][body],
-                examples["heads"][body], examples["windows"], cfg,
+                examples["heads"][body], examples["windows"],
+                examples["predicates"], examples["num_atoms"], cfg,
             )
             extended_data.extend(body_data)
             # The body's dense blocks are freed on return.
@@ -1045,13 +1171,13 @@ def _learn_extensions(examples, cfg):
             import wandb
             table = wandb.Table(columns=[
                 "body", "head", "delay_window", "extra_atoms",
-                "support", "confidence", "recall", "confidence_gain", "f1",
+                "support", "videos", "confidence", "recall", "confidence_gain", "f1",
             ])
             for item in extended_data:
                 m = item["metrics"]
                 table.add_data(
                     str(item["body"]), str(item["head"]), item["delay_window"], str(item["extra_atoms"]),
-                    m["support"], m["confidence"], m["recall"], m["confidence_gain"], m["f1"],
+                    m["support"], m["videos"], m["confidence"], m["recall"], m["confidence_gain"], m["f1"],
                 )
             run.log({"extensions": table})
             run.summary["total/accepted"] = len(extended_data)
@@ -1072,14 +1198,21 @@ def extend_clauses(cfg):
     print(f"Loaded causal anchor clauses: {len(causal_anchor_clauses)}")
     
     # Build training examples from the loaded anchor clauses, labels, and atoms.
-    if not os.path.exists(cfg["extension_training_example_file"]):
+    # The cache is reused only if it was built with the same temporal predicates.
+    examples = None
+    if os.path.exists(cfg["extension_training_example_file"]):
+        examples = torch.load(cfg["extension_training_example_file"], map_location="cpu")
+        if examples.get("predicates") != temporal_predicates(cfg["past_windows"]):
+            print("[Rule extension] Cached training examples have other temporal predicates; rebuilding.")
+            examples = None
+    if examples is None:
         examples = build_training_examples(atoms, causal_anchor_clauses, labels, unique_atoms, cfg)
         torch.save(examples, cfg["extension_training_example_file"])
-    else:
-        examples = torch.load(cfg["extension_training_example_file"])
 
     extended_data = _learn_extensions(examples, cfg)
-    extended_clauses = _to_extended_clauses(extended_data, cfg["delay_windows"], unique_atoms, cfg["output_dir"])
+    extended_clauses = _to_extended_clauses(
+        extended_data, cfg["delay_windows"], cfg["past_windows"], unique_atoms, cfg["output_dir"]
+    )
     return extended_clauses
 
 
@@ -1093,10 +1226,15 @@ def main(input_data):
             'device': input_data['device'],
             'min_support': 10,
             'min_confidence_gain': 0.05,
+            # Training videos a clause must be correct in (1 disables the filter).
+            'min_videos': 2,
             'num_epochs': 200,
             'lr': 0.1,
             'l0_lambda': 1e-3,
             'delay_windows': list(input_data['delay_windows']),
+            # Edges (frames) of the disjoint past bins of the temporal atoms
+            # held / started / ended, e.g. [3, 5, 10] -> 0-3, 3-5, 5-10 frames ago.
+            'past_windows': list(input_data['past_windows']),
             'dataset_label_file': input_data['dataset_label_file'],
             'train_atom_file': input_data['train_atom_file'],
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],

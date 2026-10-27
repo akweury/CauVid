@@ -5,6 +5,7 @@
     "frame_rate": 10,
     "onset_horizon": 50,
     "delay_windows": [1, 5, 15, 50],
+    "past_windows": [3, 5, 10],
     "primary_confidence": 0.3,
     "candidate_confidence": 0.05,
     "nms_iou": 0.5,

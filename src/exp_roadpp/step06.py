@@ -15,15 +15,15 @@ def _atom_label(atom):
     return f"{atom['agent_class_label']} {atom.get('action_id_label', atom.get('location_name_label'))}"
 
 
-def _clause_text(clause, train_unique_atoms):
-    """e.g. "Car MovAway[0] within 5 <- Car Stop[0] & Ped MovTow[1]"; [slot] is the object slot
-    of step05's `build_features` (0: head object, body slot: body object, body slot + 1: some
-    other object)."""
+def _clause_text(clause, unique_atoms):
+    """e.g. "Car MovAway[0] within 5 <- Car Stop[0] & Ped MovTow[1][started ≤3f ago]"; [slot] is
+    the object slot of step05's `build_features` (0: head object, body slot: body object, body
+    slot + 1: some other object), followed by the temporal predicate unless it is "now"."""
     bodies = " & ".join(
-        f"{_atom_label(train_unique_atoms[atom_index])}[{slot}]"
-        for atom_index, slot in clause["bodies"]
+        f"{_atom_label(unique_atoms[atom_index])}[{slot}]{step05.predicate_text(predicate)}"
+        for atom_index, slot, predicate in clause["bodies"]
     )
-    head = _atom_label(train_unique_atoms[clause["head"][0]])
+    head = _atom_label(unique_atoms[clause["head"][0]])
     return f"{head}[0] within {clause['delay_window']} <- {bodies}"
 
 
@@ -37,36 +37,35 @@ def compute_metrics(tp, fp, fn):
             "tp": tp, "fp": fp, "fn": fn}
 
 
-def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, device):
+def predict_delays(clauses, unique_atoms, eval_atoms, delay_windows, device):
     """Ground the timed clauses on the eval split, as step05 grounds them for training.
 
     A node is an (agent, frame t) with the agent observed in frame t
-    (`step05.build_video_tensor`). Returns (pred, clause_of, delay, node_keys, to_eval):
+    (`step05.build_video_tensor`). unique_atoms is the shared atom vocabulary
+    (step_dataset's unique_atoms.json) that the clause and eval atom ids index.
+    Returns (pred, clause_of, delay, node_keys):
       pred[n, a]: smallest delay_window of a clause firing on node n with head
           atom a (max(delay_windows) + 1 if none fires);
       clause_of[n, a]: index in `clauses` of that clause (-1 if none);
       delay[n, a]: frames until atom a next starts for node n (0: not within
           max(delay_windows), or already active in frame t), as the step05 targets;
-      node_keys[n]: (video_id, t, tube_uid) of node n;
-      to_eval[i]: eval atom id of train atom i (-1 if unseen in eval).
+      node_keys[n]: (video_id, t, tube_uid) of node n.
     """
-    eval_vocab = {tuple(atom): i for i, atom in enumerate(eval_atoms["unique_atoms"])}
-    to_eval = [eval_vocab.get(tuple(atom), -1) for atom in train_unique_atoms]
-    num_atoms = len(eval_atoms["unique_atoms"])
+    num_atoms = len(unique_atoms)
     horizon = max(delay_windows)
+    # All clauses of a run share the past windows of their temporal predicates.
+    past_windows = clauses[0]["past_windows"] if clauses else []
+    predicate_index = {p: i for i, p in enumerate(step05.temporal_predicates(past_windows))}
 
-    # Group the clauses by anchor body (b, s) in eval atom ids; a clause with
-    # an atom unseen in the eval split never fires there. Extras are
-    # (object_slot, atom) cells of the `step05.build_body_features` features.
+    # Group the clauses by anchor body (b, s). Extras are (object_slot,
+    # predicate, atom) cells of the `step05.build_body_features` features.
     group_clauses = {}
     for clause_id, clause in enumerate(clauses):
-        if min(to_eval[atom[0]] for atom in [*clause["bodies"], clause["head"]]) < 0:
-            continue
         anchor = clause["bodies"][0]
-        body = (to_eval[anchor[0]], anchor[1])
-        extras = [(slot, to_eval[atom]) for atom, slot in clause["bodies"][1:]]
+        body = (anchor[0], anchor[1])
+        extras = [(slot, predicate_index[predicate], atom) for atom, slot, predicate in clause["bodies"][1:]]
         group_clauses.setdefault(body, []).append(
-            (clause["delay_window"], clause["confidence"], clause_id, extras, to_eval[clause["head"][0]])
+            (clause["delay_window"], clause["confidence"], clause_id, extras, clause["head"][0])
         )
 
     # Targets are not needed here: no head atoms, so build_body_features skips them.
@@ -74,10 +73,9 @@ def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, devic
     windows = torch.tensor(sorted(delay_windows), dtype=torch.int16, device=device)
     preds, clause_ofs, delays, node_keys = [], [], [], []
     for video_id, video_atoms in tqdm(eval_atoms.items(), desc="Grounding clauses"):
-        if video_id == "unique_atoms":
-            continue
         X = step05.build_video_tensor(video_atoms, num_atoms, device=device)
         D = step05.build_video_delay_tensor(X, horizon)
+        Xt = step05.build_video_temporal_tensor(X, past_windows)
         node_t, node_n = torch.nonzero(X.any(dim=2), as_tuple=True)
         node_of = torch.full(X.shape[:2], -1, dtype=torch.long, device=device)
         node_of[node_t, node_n] = torch.arange(len(node_t), device=device)
@@ -86,18 +84,19 @@ def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, devic
         # row (t, n_body, n_head) is the node the head is predicted for.
         fired = []
         for body, body_clauses in group_clauses.items():
-            features, _targets, rows = step05.build_body_features(X, D, body, no_heads, windows)
+            features, _targets, rows = step05.build_body_features(Xt, D, body, no_heads, windows)
             if len(rows) == 0:
                 continue
             head_nodes = node_of[rows[:, 0], rows[:, 2]]
             for window, confidence, clause_id, extras, head in body_clauses:
                 if extras:
-                    slots, atoms = torch.tensor(extras, dtype=torch.long, device=device).T
-                    holds = features[:, slots, atoms].all(dim=1)
+                    slots, predicates, atoms = torch.tensor(extras, dtype=torch.long, device=device).T
+                    holds = features[:, slots, predicates, atoms].all(dim=1)
                 else:
                     holds = torch.ones(len(rows), dtype=torch.bool, device=device)
                 fired.append((-window, confidence, clause_id, head, torch.unique(head_nodes[holds])))
             del features
+        del Xt
 
         # Clauses ordered by decreasing window, then increasing confidence: later
         # writes win, so each cell keeps the smallest window and, among those,
@@ -113,10 +112,56 @@ def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, devic
         tube_uids = list(step05.video_agent_ids(video_atoms))
         node_keys.extend((video_id, t, tube_uids[n]) for t, n in zip(node_t.tolist(), node_n.tolist()))
 
-    return torch.cat(preds), torch.cat(clause_ofs), torch.cat(delays), node_keys, to_eval
+    return torch.cat(preds), torch.cat(clause_ofs), torch.cat(delays), node_keys
 
 
-def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_windows,
+def event_metrics(pred, delay, node_keys, delay_windows):
+    """Score per ground-truth event instead of per frame.
+
+    An event is an onset: head atom a starts for agent n at frame s. For window w
+    its lead frames are the frames t in [s - w, s - 1] where n is observed and s is
+    the next onset of a (delay[t] == s - t), e.g. frames 90-99 for a stop starting
+    at frame 100 and w = 10. A lead frame recalls the event if a clause predicts a
+    within w there (pred[t] <= w).
+    Returns per window: num_events (events with at least one lead frame),
+    recalled_events and event_recall (events recalled by at least one lead frame),
+    frame_coverage (mean over events of recalled / lead frames),
+    frame_coverage_recalled (the same mean over the recalled events only), and the
+    total lead_frames and recalled_frames.
+    """
+    device = delay.device
+    agent_index = {}
+    node_agent = torch.tensor([agent_index.setdefault((video_id, tube_uid), len(agent_index))
+                               for video_id, _t, tube_uid in node_keys], dtype=torch.long, device=device)
+    node_t = torch.tensor([t for _video_id, t, _tube_uid in node_keys], dtype=torch.long, device=device)
+
+    results = []
+    for window in delay_windows:
+        node, column = torch.nonzero((delay > 0) & (delay <= window), as_tuple=True)
+        recalled = (pred[node, column] <= window).long()
+        onset = node_t[node] + delay[node, column].long()
+        keys, event = torch.unique(torch.stack([node_agent[node], column, onset]), dim=1,
+                                   return_inverse=True)
+        num_events = keys.shape[1]
+        lead_frames = torch.bincount(event, minlength=num_events)
+        recalled_frames = torch.bincount(event, weights=recalled.double(), minlength=num_events)
+        coverage = recalled_frames / lead_frames.clamp(min=1)
+        is_recalled = recalled_frames > 0
+        num_recalled = int(is_recalled.sum())
+        results.append({
+            "window": window,
+            "num_events": num_events,
+            "recalled_events": num_recalled,
+            "event_recall": num_recalled / num_events if num_events else 0.0,
+            "frame_coverage": float(coverage.mean()) if num_events else 0.0,
+            "frame_coverage_recalled": float(coverage[is_recalled].mean()) if num_recalled else 0.0,
+            "lead_frames": int(lead_frames.sum()),
+            "recalled_frames": int(recalled_frames.sum()),
+        })
+    return results
+
+
+def evaluate_clauses(clauses, unique_atoms, eval_atoms, head_atoms, delay_windows,
                      device="cpu", num_explanations=0):
     """Score timed clauses per (frame t, agent observed at t, head atom).
 
@@ -125,7 +170,7 @@ def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_
     is predicted if some clause with delay_window <= w fires on it, and is
     positive if the head is not active at t and starts within (t, t + w]
     (the targets of step05's `build_features`).
-    head_atoms: train atom ids of the scored heads; keep it fixed across runs
+    head_atoms: atom ids of the scored heads; keep it fixed across runs
     so that recall is comparable.
     Returns per-window metrics (overall and per video), bin_accuracy (among
     events predicted and starting within the largest window, the share whose
@@ -136,11 +181,10 @@ def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_
     if any("delay_window" not in clause for clause in clauses):
         raise ValueError("Clauses have no delay_window: they come from a step05 run "
                          "before timed heads; rerun step05.")
-    pred, clause_of, delay, node_keys, to_eval = predict_delays(
-        clauses, train_unique_atoms, eval_atoms, delay_windows, device
+    pred, clause_of, delay, node_keys = predict_delays(
+        clauses, unique_atoms, eval_atoms, delay_windows, device
     )
-    heads = sorted({to_eval[atom] for atom in head_atoms if to_eval[atom] >= 0})
-    heads = torch.tensor(heads, dtype=torch.long, device=device)
+    heads = torch.tensor(sorted(set(head_atoms)), dtype=torch.long, device=device)
     pred, clause_of, delay = pred[:, heads], clause_of[:, heads], delay[:, heads]
 
     videos = sorted({video_id for video_id, _t, _tube in node_keys})
@@ -162,6 +206,8 @@ def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_
         overall.append({"window": window, **compute_metrics(sum(tp), sum(fp), sum(fn))})
         for i, video_id in enumerate(videos):
             per_video[video_id].append({"window": window, **compute_metrics(tp[i], fp[i], fn[i])})
+
+    events = event_metrics(pred, delay, node_keys, delay_windows)
 
     # Bins 0..K-1: smallest window containing the (predicted) onset; K: none.
     num_bins = len(delay_windows)
@@ -190,7 +236,7 @@ def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_
             "video": video_id, "frame": t, "tube_uid": tube_uid,
             "true_delay": int(delay[node, column]),
             "predicted_window": clause["delay_window"],
-            "clause": _clause_text(clause, train_unique_atoms),
+            "clause": _clause_text(clause, unique_atoms),
             "clause_confidence": clause["confidence"],
         })
 
@@ -199,6 +245,7 @@ def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_
         "num_clauses": len(clauses),
         "num_scored_heads": len(heads),
         "overall": overall,
+        "events": events,
         "bin_accuracy": bin_accuracy,
         # rows: true bin, columns: predicted bin; the last label is "none".
         "bin_confusion": {"labels": [f"<={w}" for w in delay_windows] + ["none"],
@@ -299,11 +346,10 @@ def main(input_data):
         "device": input_data.get("device", "cpu"),
         "num_explanations": 200,
     }
-    atoms = utils_data.load_atoms(input_data["val_atoms_file"])
+    atoms = utils_data.load_json(input_data["val_atoms_file"])
     extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
-    # All splits share one atom vocabulary (step_dataset's unique_atoms.json),
-    # which the clause atom ids index.
-    train_unique_atoms = atoms["unique_atoms"]
+    # All splits share one atom vocabulary, which the clause atom ids index.
+    unique_atoms = utils_data.load_json(input_data["unique_atoms_file"])
     causal_anchor_clauses = utils_data.load_json(input_data["causal_anchor_clause_file"])
     head_atoms = sorted({c["anchor"]["head"][0] for c in causal_anchor_clauses.values()})
     print(f"Extended Clauses Num: {len(extended_clauses)}")
@@ -317,9 +363,9 @@ def main(input_data):
     ).hexdigest()
     summary_file = cfg["output_dir"] / "extended_clauses_evaluation.json"
     summary = utils_data.load_json(summary_file) if summary_file.exists() else None
-    if summary is None or summary.get("clauses_hash") != clauses_hash:
+    if summary is None or summary.get("clauses_hash") != clauses_hash or "events" not in summary:
         summary = evaluate_clauses(
-            extended_clauses, train_unique_atoms, atoms, head_atoms, delay_windows,
+            extended_clauses, unique_atoms, atoms, head_atoms, delay_windows,
             device=cfg["device"], num_explanations=cfg["num_explanations"],
         )
         summary["clauses_hash"] = clauses_hash
@@ -330,6 +376,11 @@ def main(input_data):
         print(f"[Overall] within {m['window']:>3} frames: recall={m['recall']:.4f}, "
               f"precision={m['precision']:.4f}, iou={m['iou']:.4f}, f1={m['f1']:.4f}")
     print(f"[Overall] bin accuracy={summary['bin_accuracy']:.4f}")
+    for m in summary["events"]:
+        print(f"[Events] within {m['window']:>3} frames: recalled {m['recalled_events']}/{m['num_events']} "
+              f"events ({m['event_recall']:.4f}), frame coverage={m['frame_coverage']:.4f} "
+              f"(recalled events only: {m['frame_coverage_recalled']:.4f}), "
+              f"{m['recalled_frames']}/{m['lead_frames']} lead frames")
     for explanation in summary["explanations"][:5]:
         print(f"[Explanation] {explanation['video']} frame {explanation['frame']}: "
               f"{explanation['clause']} (true delay {explanation['true_delay']})")

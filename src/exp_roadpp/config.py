@@ -279,6 +279,7 @@ def get_step_05_input(args):
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
         'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
         "delay_windows": args.delay_windows,
+        "past_windows": getattr(args, "past_windows", [3, 5, 10]),
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "events_file": args.output_dir / "step_dataset_output" / "train_events.pt"
         
@@ -293,6 +294,7 @@ def get_step_06_input(args):
         "val_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
         "dataset_labels_file": args.dataset_path / "gt" / "label.json",
         "extended_clauses_file": args.output_dir / "step05_output" / "extended_clauses.json",
+        "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "device": args.device,
