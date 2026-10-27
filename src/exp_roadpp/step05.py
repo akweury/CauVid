@@ -183,13 +183,10 @@ def build_video_tensor(video_atoms, num_atoms, device="cpu"):
     vehicle has tube_uid None), numbered 0..N-1 in order of first appearance.
     num_atoms is A, the size of the shared atom vocabulary.
     """
-    per_frame_atoms = video_atoms["per_frame_atoms"]
-    frames = [current_frame for current_frame, _next_frame in per_frame_atoms]
-    if per_frame_atoms:
-        frames.append(per_frame_atoms[-1][1])
-    agent_ids = {}
+    frames = _video_frames(video_atoms)
+    agent_ids = video_agent_ids(video_atoms)
     cells = [
-        (t, agent_ids.setdefault(tube_uid, len(agent_ids)), atom_index)
+        (t, agent_ids[tube_uid], atom_index)
         for t, frame_atoms in enumerate(frames)
         for atom_index, _tag, tube_uid in frame_atoms
     ]
@@ -198,6 +195,24 @@ def build_video_tensor(video_atoms, num_atoms, device="cpu"):
         t, n, a = torch.tensor(cells, dtype=torch.long, device=device).T
         X[t, n, a] = True
     return X
+
+
+def _video_frames(video_atoms):
+    # The T frames of `build_video_tensor`: every current frame and the last next frame.
+    per_frame_atoms = video_atoms["per_frame_atoms"]
+    frames = [current_frame for current_frame, _next_frame in per_frame_atoms]
+    if per_frame_atoms:
+        frames.append(per_frame_atoms[-1][1])
+    return frames
+
+
+def video_agent_ids(video_atoms):
+    """{tube_uid: agent index n} of `build_video_tensor`, in order of first appearance."""
+    agent_ids = {}
+    for frame_atoms in _video_frames(video_atoms):
+        for _atom_index, _tag, tube_uid in frame_atoms:
+            agent_ids.setdefault(tube_uid, len(agent_ids))
+    return agent_ids
 
 def build_video_delay_tensor(X, horizon):
     """(T, N, A) int16 tensor of one video: D[t, n, a] is the number of frames until

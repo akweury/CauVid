@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import json
 import torch
+from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp import step05
@@ -39,64 +40,80 @@ def compute_metrics(tp, fp, fn):
 def predict_delays(clauses, train_unique_atoms, eval_atoms, delay_windows, device):
     """Ground the timed clauses on the eval split, as step05 grounds them for training.
 
-    Returns (pred, clause_of, delay, node_keys, to_eval):
+    A node is an (agent, frame t) with the agent observed in frame t
+    (`step05.build_video_tensor`). Returns (pred, clause_of, delay, node_keys, to_eval):
       pred[n, a]: smallest delay_window of a clause firing on node n with head
           atom a (max(delay_windows) + 1 if none fires);
       clause_of[n, a]: index in `clauses` of that clause (-1 if none);
-      delay, node_keys: ground truth tables of `step05._node_tables`;
+      delay[n, a]: frames until atom a next starts for node n (0: not within
+          max(delay_windows), or already active in frame t), as the step05 targets;
+      node_keys[n]: (video_id, t, tube_uid) of node n;
       to_eval[i]: eval atom id of train atom i (-1 if unseen in eval).
     """
     eval_vocab = {tuple(atom): i for i, atom in enumerate(eval_atoms["unique_atoms"])}
     to_eval = [eval_vocab.get(tuple(atom), -1) for atom in train_unique_atoms]
+    num_atoms = len(eval_atoms["unique_atoms"])
+    horizon = max(delay_windows)
 
-    # Group the clauses by anchor body in eval atom ids; a clause with an atom
-    # unseen in the eval split never fires there.
-    body_groups, group_clauses = {}, {}
+    # Group the clauses by anchor body (b, s) in eval atom ids; a clause with
+    # an atom unseen in the eval split never fires there. Extras are
+    # (object_slot, atom) cells of the `step05.build_body_features` features.
+    group_clauses = {}
     for clause_id, clause in enumerate(clauses):
         if min(to_eval[atom[0]] for atom in [*clause["bodies"], clause["head"]]) < 0:
             continue
         anchor = clause["bodies"][0]
         body = (to_eval[anchor[0]], anchor[1])
-        head = (to_eval[clause["head"][0]], 0)
-        body_groups.setdefault(body, {"candidate_heads": set()})["candidate_heads"].add(head)
-        extras = [(atom[1], to_eval[atom[0]]) for atom in clause["bodies"][1:]]
+        extras = [(slot, to_eval[atom]) for atom, slot in clause["bodies"][1:]]
         group_clauses.setdefault(body, []).append(
-            (clause["delay_window"], clause["confidence"], clause_id, extras, head[0])
+            (clause["delay_window"], clause["confidence"], clause_id, extras, to_eval[clause["head"][0]])
         )
-    for body_group in body_groups.values():
-        body_group["candidate_heads"] = tuple(sorted(body_group["candidate_heads"], key=repr))
 
-    examples = step05.build_features(
-        eval_atoms, None, body_groups, step05.build_head_vocab(body_groups, delay_windows),
-        delay_windows, device=device,
-    )
-    _node_frame, _current, delay, node_keys = step05._node_tables(
-        eval_atoms, max(delay_windows), device
-    )
-    pred = torch.full(delay.shape, max(delay_windows) + 1, dtype=torch.int16, device=device)
-    clause_of = torch.full(delay.shape, -1, dtype=torch.long, device=device)
-    # Clauses ordered by decreasing window, then increasing confidence: later
-    # writes win, so each cell keeps the smallest window and, among those,
-    # the most confident clause.
-    fired = []
-    for gid, body in enumerate(body_groups):
-        column_ids = {
-            (object_slot, atom_index): j
-            for j, (_gid, object_slot, atom_index) in enumerate(examples["feature_vocab"][gid])
-        }
-        dense_features = step05.sparse_rows_to_dense(examples["features"][gid]).to(device)
-        row_heads = examples["row_heads"][gid].to(device)
-        for window, confidence, clause_id, extras, head in group_clauses[body]:
-            columns = [column_ids.get(extra) for extra in extras]
-            if None in columns:
+    # Targets are not needed here: no head atoms, so build_body_features skips them.
+    no_heads = torch.empty(0, dtype=torch.long, device=device)
+    windows = torch.tensor(sorted(delay_windows), dtype=torch.int16, device=device)
+    preds, clause_ofs, delays, node_keys = [], [], [], []
+    for video_id, video_atoms in tqdm(eval_atoms.items(), desc="Grounding clauses"):
+        if video_id == "unique_atoms":
+            continue
+        X = step05.build_video_tensor(video_atoms, num_atoms, device=device)
+        D = step05.build_video_delay_tensor(X, horizon)
+        node_t, node_n = torch.nonzero(X.any(dim=2), as_tuple=True)
+        node_of = torch.full(X.shape[:2], -1, dtype=torch.long, device=device)
+        node_of[node_t, node_n] = torch.arange(len(node_t), device=device)
+
+        # Nodes each clause fires on in this video; the head agent n_head of a
+        # row (t, n_body, n_head) is the node the head is predicted for.
+        fired = []
+        for body, body_clauses in group_clauses.items():
+            features, _targets, rows = step05.build_body_features(X, D, body, no_heads, windows)
+            if len(rows) == 0:
                 continue
-            nodes = torch.unique(row_heads[dense_features[:, columns].all(dim=1)])
-            fired.append((-window, confidence, clause_id, head, nodes))
-        del dense_features
-    for _neg_window, _confidence, clause_id, head, nodes in sorted(fired, key=lambda f: f[:3]):
-        pred[nodes, head] = clauses[clause_id]["delay_window"]
-        clause_of[nodes, head] = clause_id
-    return pred, clause_of, delay, node_keys, to_eval
+            head_nodes = node_of[rows[:, 0], rows[:, 2]]
+            for window, confidence, clause_id, extras, head in body_clauses:
+                if extras:
+                    slots, atoms = torch.tensor(extras, dtype=torch.long, device=device).T
+                    holds = features[:, slots, atoms].all(dim=1)
+                else:
+                    holds = torch.ones(len(rows), dtype=torch.bool, device=device)
+                fired.append((-window, confidence, clause_id, head, torch.unique(head_nodes[holds])))
+            del features
+
+        # Clauses ordered by decreasing window, then increasing confidence: later
+        # writes win, so each cell keeps the smallest window and, among those,
+        # the most confident clause.
+        pred = torch.full((len(node_t), num_atoms), horizon + 1, dtype=torch.int16, device=device)
+        clause_of = torch.full((len(node_t), num_atoms), -1, dtype=torch.long, device=device)
+        for neg_window, _confidence, clause_id, head, nodes in sorted(fired, key=lambda f: f[:3]):
+            pred[nodes, head] = -neg_window
+            clause_of[nodes, head] = clause_id
+        preds.append(pred)
+        clause_ofs.append(clause_of)
+        delays.append(D[node_t, node_n])
+        tube_uids = list(step05.video_agent_ids(video_atoms))
+        node_keys.extend((video_id, t, tube_uids[n]) for t, n in zip(node_t.tolist(), node_n.tolist()))
+
+    return torch.cat(preds), torch.cat(clause_ofs), torch.cat(delays), node_keys, to_eval
 
 
 def evaluate_clauses(clauses, train_unique_atoms, eval_atoms, head_atoms, delay_windows,
