@@ -819,7 +819,7 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
     if support == 0:
         return {
             "support": 0, "coverage": 0.0, "confidence": 0.0,
-            "recall": 0.0, "confidence_gain": -base_confidence, "f1": 0.0,
+            "recall": 0.0, "confidence_gain": -base_confidence, "lift": 0.0, "f1": 0.0,
         }
 
     head_hits = int(target_col[extended_mask].sum())
@@ -836,6 +836,8 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
         "confidence": confidence,
         "recall": recall,
         "confidence_gain": confidence - base_confidence,
+        # confidence relative to the body alone; base_confidence > 0 for learnable heads.
+        "lift": confidence / base_confidence if base_confidence else 0.0,
         "f1": f1,
     }
 
@@ -874,7 +876,7 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
         return
     body_lengths = np.array([len(c["bodies"]) for c in extended_clauses])
     windows = np.array([c["delay_window"] for c in extended_clauses])
-    metrics = {k: np.array([c[k] for c in extended_clauses]) for k in ("support", "confidence", "recall", "confidence_gain", "f1")}
+    metrics = {k: np.array([c[k] for c in extended_clauses]) for k in ("support", "confidence", "recall", "lift", "f1")}
     num_bodies = len({tuple(c["bodies"][0]) for c in extended_clauses})
     num_heads = len({tuple(c["head"]) for c in extended_clauses})
     print(f"[Extended clauses] {num_bodies} anchor bodies, {num_heads} heads")
@@ -922,7 +924,7 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
         video_values, video_counts = np.unique(videos, return_counts=True)
         axes[1, 3].bar([str(v) for v in video_values], video_counts)
         axes[1, 3].set(title="Training videos the clause is correct in", xlabel="videos", ylabel="clauses")
-        for ax, k in zip(axes[1], ("confidence", "confidence_gain", "f1")):
+        for ax, k in zip(axes[1], ("confidence", "lift", "f1")):
             ax.hist(metrics[k], bins=30)
             ax.set(title=k.replace("_", " ").capitalize(), ylabel="clauses")
         fig.tight_layout()
@@ -944,7 +946,7 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
         ax.set_title(f"Top {len(top)} clauses by f1", loc="left")
         lines = []
         for i, c in enumerate(top, 1):
-            header = f"{i:>2}. f1={c['f1']:.2f} conf={c['confidence']:.2f} recall={c['recall']:.2f} gain={c['confidence_gain']:+.2f} support={c['support']}"
+            header = f"{i:>2}. f1={c['f1']:.2f} conf={c['confidence']:.2f} recall={c['recall']:.2f} lift={c['lift']:.1f} support={c['support']}"
             lines.append(header)
             lines.extend("      " + line for line in textwrap.wrap(_clause_text(c, unique_atoms), 120))
         ax.text(0, 1, "\n".join(lines), va="top", ha="left", family="monospace", fontsize=7, transform=ax.transAxes)
@@ -1002,7 +1004,9 @@ def _accepted_metrics(feature_block, target_col, selected_positions, video_of_ro
     metrics = _evaluate_extension(feature_block, target_col, selected_positions)
     if metrics["support"] < cfg["min_support"]:
         return None
-    if metrics["confidence_gain"] < cfg["min_confidence_gain"]:
+    # Relative, not absolute: head onsets are rare (base confidence ~0.5%), so a
+    # rule 10x above the body alone still gains far less than 0.05 in absolute terms.
+    if metrics["lift"] < cfg["min_lift"]:
         return None
     # A rule correct in a single video only memorizes that video.
     hits = feature_block[:, selected_positions].all(axis=1) & (target_col > 0)
@@ -1123,7 +1127,7 @@ def _init_wandb(cfg, num_bodies):
         if not _wandb_login(wandb):
             print("[wandb] Tracking disabled: not logged in.")
             return None
-        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_confidence_gain", "min_videos",
+        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_lift", "min_videos",
                    "delay_windows", "past_windows", "device")
         run = wandb.init(
             project=cfg.get("wandb_project", "cauvid-roadpp"),
@@ -1171,13 +1175,13 @@ def _learn_extensions(examples, cfg):
             import wandb
             table = wandb.Table(columns=[
                 "body", "head", "delay_window", "extra_atoms",
-                "support", "videos", "confidence", "recall", "confidence_gain", "f1",
+                "support", "videos", "confidence", "recall", "confidence_gain", "lift", "f1",
             ])
             for item in extended_data:
                 m = item["metrics"]
                 table.add_data(
                     str(item["body"]), str(item["head"]), item["delay_window"], str(item["extra_atoms"]),
-                    m["support"], m["videos"], m["confidence"], m["recall"], m["confidence_gain"], m["f1"],
+                    m["support"], m["videos"], m["confidence"], m["recall"], m["confidence_gain"], m["lift"], m["f1"],
                 )
             run.log({"extensions": table})
             run.summary["total/accepted"] = len(extended_data)
@@ -1225,7 +1229,8 @@ def main(input_data):
             'output_dir': input_data['output_dir'],
             'device': input_data['device'],
             'min_support': 10,
-            'min_confidence_gain': 0.05,
+            # Confidence of the clause / confidence of its anchor body alone.
+            'min_lift': 2.0,
             # Training videos a clause must be correct in (1 disables the filter).
             'min_videos': 2,
             'num_epochs': 200,
