@@ -321,6 +321,56 @@ def plot_summary(summary, plot_file):
     print(f"[Plot] Saved {plot_file}")
 
 
+
+def tasks_evaluation(model, tasks, cfg):
+
+    # -------------- Evaluation Helper Function --------------
+    def _eval(predictions, target):    
+        correct_predictions = 0
+        match_details = []
+        for prediction in predictions:
+            if prediction["pred"] == target["pred"]:
+                if prediction["pred"] == 'location':
+                    agent_class_match = prediction["agent_class"] == target["agent_class"]
+                    location_match = prediction["location"] == target["location"]
+                    window_match = prediction["delay_windows"] == target["delay_windows"]
+                elif prediction["pred"] == 'action':
+                    agent_class_match = prediction["agent_class"] == target["agent_class"]
+                    action_match = prediction["action"] == target["action"]
+                    window_match = prediction["delay_windows"] == target["delay_windows"]
+                else:
+                    raise ValueError(f"Unknown prediction type: {prediction['pred']}")
+                
+                match_details.append({
+                    "prediction": prediction,
+                    "target": target,
+                    "match": agent_class_match and (location_match if prediction["pred"] == 'location' else action_match) and window_match
+                })
+            else:
+                correct_predictions += 0
+                match_details.append({
+                    "prediction": prediction,
+                    "target": target,
+                    "match": False
+                })
+        summary = {
+            "total_predictions": len(predictions),
+            "correct_predictions": correct_predictions,
+            "details": match_details
+        }
+        return summary
+
+    # -------------- Task Evaluation --------------
+    raw_results = []
+    for task in tasks:
+        task_input = task["input"]
+        task_target = task["target"]
+        preds = model.predict(task_input)
+        raw_results.append(_eval(preds, task_target))
+        
+    return raw_results
+
+
 def main(input_data):
     print("\n--------- Step 06 Evaluation ----------------------\n")
     cfg = {
@@ -330,8 +380,8 @@ def main(input_data):
     summary_file = cfg["output_dir"] / "extended_clauses_evaluation.json"
     if not summary_file.exists():
         model = CauVid(cfg)
-        atoms = utils_data.load_json(input_data["val_atoms_file"])
-        summary = evaluate_clauses(model, atoms, cfg)
+        tasks = utils_data.load_json(input_data["val_tasks_file"])
+        summary = tasks_evaluation(model, tasks, cfg)
         utils_data.save_json(summary, summary_file)
         
     print("\n--------- Step 06 Done ---------------\n")

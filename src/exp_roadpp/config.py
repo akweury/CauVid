@@ -297,6 +297,7 @@ def get_step_06_input(args):
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
+        "val_tasks_file": args.output_dir / "step_dataset_output" / "tasks_val.pt",
         "device": args.device,
     }
     return input_data
@@ -309,6 +310,6 @@ def get_step_dataset_input(args):
         "dataset_path": args.dataset_path,
         "device": args.device,
         "data_num": args.data_num,
-        "onset_horizon": args.onset_horizon,
+        "delay_windows": args.delay_windows,
     }
     return input_data
