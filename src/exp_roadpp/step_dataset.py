@@ -307,6 +307,7 @@ def prepare_per_video_tasks(cfg):
     def _prepare_task_input(interval_atom, per_frame_atoms, min_window):
         start_frame = interval_atom["start_frame"]
         task_input = per_frame_atoms[:start_frame-min_window]
+        task_input = [i[0] for i in task_input if len(i[0])>0]
         return task_input
 
     def _prepare_per_split(split_name):

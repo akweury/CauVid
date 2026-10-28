@@ -361,27 +361,34 @@ def tasks_evaluation(model, tasks, cfg):
         return summary
 
     # -------------- Task Evaluation --------------
-    raw_results = []
-    for task in tasks:
-        task_input = task["input"]
-        task_target = task["target"]
-        preds = model.predict(task_input)
-        raw_results.append(_eval(preds, task_target))
-        
+    raw_results = {}
+    for video_id, video_tasks in tasks.items():
+        raw_results[video_id] = []
+        for task in video_tasks:
+            task_input = task["input"]
+            task_target = task["target"]
+            preds = model.predict(task_input)
+            raw_results[video_id].append(_eval(preds, task_target))
+
     return raw_results
 
 
 def main(input_data):
+    
     print("\n--------- Step 06 Evaluation ----------------------\n")
     cfg = {
         "output_dir": input_data["output_dir"],
         "device": input_data["device"],
+        "delay_windows": input_data["delay_windows"],
+        'extended_clauses_file': input_data["extended_clauses_file"],
+        "unique_atoms_file": input_data["unique_atoms_file"],
+        "val_tasks_file": input_data["val_tasks_file"]
     }
     summary_file = cfg["output_dir"] / "extended_clauses_evaluation.json"
     if not summary_file.exists():
         model = CauVid(cfg)
-        tasks = utils_data.load_json(input_data["val_tasks_file"])
-        summary = tasks_evaluation(model, tasks, cfg)
+        tasks = torch.load(cfg["val_tasks_file"])
+        summary = tasks_evaluation(model, tasks["tasks"], cfg)
         utils_data.save_json(summary, summary_file)
         
     print("\n--------- Step 06 Done ---------------\n")

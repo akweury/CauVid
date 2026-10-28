@@ -299,6 +299,7 @@ def get_step_06_input(args):
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "val_tasks_file": args.output_dir / "step_dataset_output" / "tasks_val.pt",
         "device": args.device,
+        "delay_windows": args.delay_windows,
     }
     return input_data
 
