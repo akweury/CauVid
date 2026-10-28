@@ -190,6 +190,49 @@ def _plot_onset_statistics(counts, unique_atoms, plot_file, top_k=15):
     fig.savefig(plot_file, dpi=120)
     plt.close(fig)
 
+
+            
+
+
+
+
+def prepare_per_frame_atoms(language_model, cfg):
+    data_num = cfg["data_num"]
+    track_dir = cfg["track_dir"]
+    output_dir = cfg["output_dir"]
+    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
+    if data_num != 'full':
+        all_track_files = all_track_files[:int(data_num)]
+
+    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
+    atoms_folder= Path(output_dir) / "atoms" 
+    os.makedirs(atoms_folder, exist_ok=True)
+
+    splits = {"train": train_indices, "val": val_indices, "test": test_indices}
+    for split_name, indices in splits.items():
+        split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
+        split_file = atoms_folder / f"{split_name}_atoms.json"
+        if not os.path.exists(split_file):
+            _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
+        else:
+            print(f"[Per Frame Atoms] {split_file} already exists.")
+
+    # One vocabulary for all splits; compressed files index into it, so rebuild them with it.
+    unique_atoms_file = atoms_folder / "unique_atoms.json"
+    rebuild_compressed = not unique_atoms_file.exists()
+    if rebuild_compressed:
+        _build_unique_atoms([atoms_folder / f"{split_name}_atoms.json" for split_name in splits], unique_atoms_file)
+    else:
+        print(f"[Unique Atoms] {unique_atoms_file} already exists.")
+    atom_vocab = {tuple(atom): i for i, atom in enumerate(utils_data.load_json(unique_atoms_file))}
+
+    for split_name in splits:
+        compressed_file = atoms_folder / f"{split_name}_atoms_compressed.json"
+        if rebuild_compressed or not os.path.exists(compressed_file):
+            _compress_atom_file(atoms_folder / f"{split_name}_atoms.json", compressed_file, atom_vocab)
+        else:
+            print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
+
 def prepare_per_frame_events(cfg):
 
     def _prepare_per_split(split_name):
@@ -234,50 +277,54 @@ def prepare_per_frame_events(cfg):
     _prepare_per_split("test")
     
     return
-            
-    
 
-
-
-
-def prepare_per_frame_atoms(language_model, cfg):
-    data_num = cfg["data_num"]
-    track_dir = cfg["track_dir"]
-    output_dir = cfg["output_dir"]
-    all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
-    if data_num != 'full':
-        all_track_files = all_track_files[:int(data_num)]
-
-    train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
-    atoms_folder= Path(output_dir) / "atoms" 
-    os.makedirs(atoms_folder, exist_ok=True)
-
-    splits = {"train": train_indices, "val": val_indices, "test": test_indices}
-    for split_name, indices in splits.items():
-        split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
-        split_file = atoms_folder / f"{split_name}_atoms.json"
-        if not os.path.exists(split_file):
-            _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
-        else:
-            print(f"[Per Frame Atoms] {split_file} already exists.")
-
-    # One vocabulary for all splits; compressed files index into it, so rebuild them with it.
-    unique_atoms_file = atoms_folder / "unique_atoms.json"
-    rebuild_compressed = not unique_atoms_file.exists()
-    if rebuild_compressed:
-        _build_unique_atoms([atoms_folder / f"{split_name}_atoms.json" for split_name in splits], unique_atoms_file)
-    else:
-        print(f"[Unique Atoms] {unique_atoms_file} already exists.")
-    atom_vocab = {tuple(atom): i for i, atom in enumerate(utils_data.load_json(unique_atoms_file))}
-
-    for split_name in splits:
-        compressed_file = atoms_folder / f"{split_name}_atoms_compressed.json"
-        if rebuild_compressed or not os.path.exists(compressed_file):
-            _compress_atom_file(atoms_folder / f"{split_name}_atoms.json", compressed_file, atom_vocab)
-        else:
-            print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
-
-
+def prepare_per_video_tasks(cfg):
+    def _prepare_per_split(split_name):
+        output_file = cfg["output_dir"] / f"tasks_{split_name}.pt"
+        if output_file.exists():
+            print(f"[Tasks Training] already exists.")
+            return
+        atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
+        events = torch.load(cfg["output_dir"] / f"{split_name}_events.pt")
+        interval_atoms = [data["interval_atoms"] for data in atoms.values()]
+        unique_atoms = utils_data.load_json(cfg["output_dir"] / "atoms" / "unique_atoms.json")
+        atom_vocab = {tuple(atom): i for i, atom in enumerate(unique_atoms)}      
+        tasks = {}
+        for vid, video_atoms in atoms.items():
+            video_tasks = []
+            interval_atoms = video_atoms["interval_atoms"]
+            per_frame_atoms = video_atoms["per_frame_atoms"]
+            for interval_atom in interval_atoms:
+                start_frame=interval_atom["start_frame"]
+                end_frame=interval_atom["end_frame"]
+                if int(start_frame)==1:
+                    continue
+                if "location_name" in interval_atom:
+                    task = {
+                        "start_frame": start_frame,
+                        "end_frame": end_frame,
+                        "pred": interval_atom["pred"],
+                        "location_name": interval_atom["location_name"],
+                        "agent_class": interval_atom["agent_class"],
+                    }
+                elif "action_id" in interval_atom:
+                    task = {
+                        "start_frame": start_frame,
+                        "end_frame": end_frame,
+                        "pred": interval_atom["pred"],
+                        "action_id": interval_atom["action_id"],
+                        "agent_class": interval_atom["agent_class"],
+                    }
+                else:
+                    raise ValueError(f"Unknown interval atom type: {interval_atom}")
+                video_tasks.append(task)
+            tasks[vid] = video_tasks
+        torch.save({
+            "tasks": tasks
+        }, output_file)
+    _prepare_per_split("train")
+    _prepare_per_split("val")
+    _prepare_per_split("test")
 
 
 def main(input_data):
@@ -298,4 +345,5 @@ def main(input_data):
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     prepare_per_frame_atoms(language_model, cfg)
     prepare_per_frame_events(cfg)
+    prepare_per_video_tasks(cfg)
     print("\n--------- Step Dataset Done------------------\n")

@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp import step05
-
+from src.exp_roadpp.cauvid import CauVid
 
 
 def _atom_label(atom):
@@ -161,26 +161,8 @@ def event_metrics(pred, delay, node_keys, delay_windows):
     return results
 
 
-def evaluate_clauses(clauses, unique_atoms, eval_atoms, head_atoms, delay_windows,
-                     device="cpu", num_explanations=0):
-    """Score timed clauses per (frame t, agent observed at t, head atom).
-
-    A clause predicts that its head starts for the head agent within its
-    delay_window, hence also within every larger window. For window w, a cell
-    is predicted if some clause with delay_window <= w fires on it, and is
-    positive if the head is not active at t and starts within (t, t + w]
-    (the targets of step05's `build_features`).
-    head_atoms: atom ids of the scored heads; keep it fixed across runs
-    so that recall is comparable.
-    Returns per-window metrics (overall and per video), bin_accuracy (among
-    events predicted and starting within the largest window, the share whose
-    predicted window is the smallest window containing the onset), the bin
-    confusion matrix and up to num_explanations correct predictions with the
-    clause that made them.
-    """
-    if any("delay_window" not in clause for clause in clauses):
-        raise ValueError("Clauses have no delay_window: they come from a step05 run "
-                         "before timed heads; rerun step05.")
+def evaluate_clauses(model, eval_atoms,cfg):
+    
     pred, clause_of, delay, node_keys = predict_delays(
         clauses, unique_atoms, eval_atoms, delay_windows, device
     )
@@ -342,43 +324,14 @@ def plot_summary(summary, plot_file):
 def main(input_data):
     print("\n--------- Step 06 Evaluation ----------------------\n")
     cfg = {
-        "output_dir": Path(input_data["output_dir"]),
-        "device": input_data.get("device", "cpu"),
-        "num_explanations": 200,
+        "output_dir": input_data["output_dir"],
+        "device": input_data["device"],
     }
-    atoms = utils_data.load_json(input_data["val_atoms_file"])
-    extended_clauses = utils_data.load_json(input_data["extended_clauses_file"])
-    # All splits share one atom vocabulary, which the clause atom ids index.
-    unique_atoms = utils_data.load_json(input_data["unique_atoms_file"])
-    delay_windows = extended_clauses[0]["delay_windows"]
-
-    # The summary is reused only if it scored exactly these clauses.
-    clauses_hash = hashlib.sha256(
-        json.dumps(extended_clauses, sort_keys=True).encode()
-    ).hexdigest()
     summary_file = cfg["output_dir"] / "extended_clauses_evaluation.json"
-    summary = utils_data.load_json(summary_file) if summary_file.exists() else None
-    if summary is None or summary.get("clauses_hash") != clauses_hash or "events" not in summary:
-        summary = evaluate_clauses(
-            extended_clauses, unique_atoms, atoms, head_atoms, delay_windows,
-            device=cfg["device"], num_explanations=cfg["num_explanations"],
-        )
-        summary["clauses_hash"] = clauses_hash
+    if not summary_file.exists():
+        model = CauVid(cfg)
+        atoms = utils_data.load_json(input_data["val_atoms_file"])
+        summary = evaluate_clauses(model, atoms, cfg)
         utils_data.save_json(summary, summary_file)
-    plot_summary(summary, cfg["output_dir"] / "step06_result.pdf")
-
-    for m in summary["overall"]:
-        print(f"[Overall] within {m['window']:>3} frames: recall={m['recall']:.4f}, "
-              f"precision={m['precision']:.4f}, iou={m['iou']:.4f}, f1={m['f1']:.4f}")
-    print(f"[Overall] bin accuracy={summary['bin_accuracy']:.4f}")
-    for m in summary["events"]:
-        print(f"[Events] within {m['window']:>3} frames: recalled {m['recalled_events']}/{m['num_events']} "
-              f"events ({m['event_recall']:.4f}), frame coverage={m['frame_coverage']:.4f} "
-              f"(recalled events only: {m['frame_coverage_recalled']:.4f}), "
-              f"{m['recalled_frames']}/{m['lead_frames']} lead frames")
-    for explanation in summary["explanations"][:5]:
-        print(f"[Explanation] {explanation['video']} frame {explanation['frame']}: "
-              f"{explanation['clause']} (true delay {explanation['true_delay']})")
-
+        
     print("\n--------- Step 06 Done ---------------\n")
-    return summary
