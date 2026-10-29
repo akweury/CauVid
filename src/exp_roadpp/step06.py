@@ -323,7 +323,6 @@ def plot_summary(summary, plot_file):
 
 
 def tasks_evaluation(model, tasks):
-
     # -------------- Evaluation Helper Function --------------
     def prediction_eval(predictions, target):    
         correct_predictions = 0
@@ -460,13 +459,25 @@ def result_analysis(raw_results, labels):
     summary["total_videos"] = total_videos
     summary["total_tasks"] = total_tasks
     summary["total_correct_predictions"] = total_correct_predictions
+    summary["correct_count"] = correct_count
+    summary["total_predictions"] = total_predictions
     summary["recall"] = correct_count / total_tasks if total_tasks > 0 else 0.0
     summary["precision"] = total_correct_predictions / total_predictions if total_predictions > 0 else 0.0
 
+
+    return summary
+
+def _log_parameters(cfg):
+    print("[Configuration Parameters]")
+    print(f"[Threshold] \t {cfg['threshold']}")
+    print()
+
+def print_summary(summary, labels):
+
     print("[Evaluation Summary]")
-    print(f"[Videos] \t {total_videos}")
-    print(f"[Tasks] \t {correct_count}/{total_tasks}")
-    print(f"[Predictions] \t {total_correct_predictions}/{total_predictions}")
+    print(f"[Videos] \t {summary["total_videos"]}")
+    print(f"[Tasks] \t {summary["correct_count"]}/{summary["total_tasks"]}")
+    print(f"[Predictions] \t {summary["total_correct_predictions"]}/{summary["total_predictions"]}")
     print(f"[Recall] \t {summary['recall']:.2f}")
     print(f"[Precision] \t {summary['precision']:.2f}")
     print()
@@ -501,14 +512,8 @@ def result_analysis(raw_results, labels):
     for action_id, matches in summary["action"]["recall"].items():
         print(f"{sum(matches)} / {len(matches)} \t [{labels['action_labels'][action_id]}]")
     print()
-
-    return summary
-
-def _log_parameters(cfg):
-    print("[Configuration Parameters]")
-    print(f"[Threshold] \t {cfg['threshold']}")
-    print()
-
+    
+    
 def main(input_data):
 
     print("\n--------- Step 06 Evaluation ----------------------\n")
@@ -533,8 +538,9 @@ def main(input_data):
         raw_results = tasks_evaluation(model, tasks["tasks"])
         summary = result_analysis(raw_results, labels)
         utils_data.save_json(summary, summary_file)
-    else:
-        print(f"Summary file already exists at {summary_file}")
+    
+    summary = utils_data.load_json(summary_file)
+    print_summary(summary, labels)
 
     print("\n--------- Step 06 Done ---------------\n")
 
