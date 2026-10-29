@@ -322,7 +322,8 @@ def plot_summary(summary, plot_file):
 
 
 
-def tasks_evaluation(model, tasks):
+def tasks_evaluation(model, cfg):
+    tasks = torch.load(cfg["val_tasks_file"])
     # -------------- Evaluation Helper Function --------------
     def prediction_eval(predictions, target):    
         correct_predictions = 0
@@ -528,13 +529,18 @@ def main(input_data):
 
     }
     summary_file = cfg["output_dir"] / f"extended_clauses_evaluation_{cfg['threshold']}.json"
+    raw_result_file = cfg["output_dir"] / f"val_raw_results_{cfg['threshold']}.json"
     labels = utils_data.load_json(cfg["label_file"])
     
     if not summary_file.exists():
         _log_parameters(cfg)
         model = CauVid(cfg)
-        tasks = torch.load(cfg["val_tasks_file"])
-        raw_results = tasks_evaluation(model, tasks["tasks"])
+        if raw_result_file.exists():
+            raw_results = utils_data.load_json(raw_result_file)
+        else:
+            raw_results = tasks_evaluation(model, cfg)
+            utils_data.save_json(raw_results, raw_result_file)
+            
         summary = result_analysis(raw_results, labels)
         utils_data.save_json(summary, summary_file)
     
