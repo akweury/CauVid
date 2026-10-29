@@ -473,11 +473,10 @@ def _log_parameters(cfg):
     print()
 
 def print_summary(summary, labels):
-
     print("[Evaluation Summary]")
-    print(f"[Videos] \t {summary["total_videos"]}")
-    print(f"[Tasks] \t {summary["correct_count"]}/{summary["total_tasks"]}")
-    print(f"[Predictions] \t {summary["total_correct_predictions"]}/{summary["total_predictions"]}")
+    print(f"[Videos] \t {summary['total_videos']}")
+    print(f"[Tasks] \t {summary['correct_count']}/{summary['total_tasks']}")
+    print(f"[Predictions] \t {summary['total_correct_predictions']}/{summary['total_predictions']}")
     print(f"[Recall] \t {summary['recall']:.2f}")
     print(f"[Precision] \t {summary['precision']:.2f}")
     print()
