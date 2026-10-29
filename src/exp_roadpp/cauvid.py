@@ -1,5 +1,5 @@
-import torch 
-import itertools
+import torch
+from scipy.optimize import linear_sum_assignment
 
 from src.exp_roadpp import utils_data
 
@@ -23,6 +23,10 @@ class CauVid:
                     window = 0
                 elif "held" in b[2]:
                     window = int(b[2].split("_")[1])
+                elif "ended" in b[2]:
+                    window = int(b[2].split("_")[2])
+                elif "started" in b[2]:
+                    window = int(b[2].split("_")[2])
                 else:
                     raise ValueError(f"Unknown window type: {b[2]}")
                 reordered_body.append([b[1],window,b[0]])
@@ -51,21 +55,28 @@ class CauVid:
         def _compress_task_matrix(task_matrix):
             return task_matrix.sum(dim=1)
         
-        def _ground_clause(c, obj):
-            if c.shape[0] < obj:
-                padding = torch.zeros((obj - c.shape[0], c.shape[1], c.shape[2]), dtype=c.dtype)
-                c = torch.cat([c, padding], dim=0)
-            c_groundings = []
-            # Generate all possible order of the object groundings
-            for perm in itertools.permutations(range(obj)):
-                c_perm = c[perm, :, :]
-                c_groundings.append(c_perm)
-            return c_groundings
+        def _pad_rows(m, obj):
+            if m.shape[0] < obj:
+                padding = torch.zeros((obj - m.shape[0], m.shape[1]), dtype=m.dtype)
+                m = torch.cat([m, padding], dim=0)
+            return m
 
-
+        def _fit_clause_to_task(c_compressed, task_compressed):
+            # Best object grounding = max-weight assignment between task objects and clause scopes
+            # (equivalent to trying all permutations, but O(obj^3) instead of O(obj!))
+            obj = max(c_compressed.shape[0], task_compressed.shape[0])
+            c = _pad_rows(c_compressed, obj)
+            t = _pad_rows(task_compressed, obj).to(c.dtype)
+            # match[i, j] = number of equal entries between task row i and clause row j
+            match = (t[:, None, :] == c[None, :, :]).sum(dim=-1)
+            rows, cols = linear_sum_assignment(match.numpy(), maximize=True)
+            score = match[rows, cols].sum().item()
+            return score / c.numel()
+        
         def _build_task_matrix(task_input):
             task_window = len(task_input)
             obj_ids = list(set(atom[-1] for frame in task_input for atom in frame))
+            print(f"Object Number: {len(obj_ids)}")
             task_obj_num = len(obj_ids)
             atom_num = len(self.unique_atoms)
             task_matrix = torch.zeros((task_obj_num, task_window,atom_num), dtype=torch.bool) 
@@ -78,15 +89,10 @@ class CauVid:
         
         def _compute_clause_score(clause_matrices, task_matrix):
             clause_matches = {}
+            task_compressed = _compress_task_matrix(task_matrix)
             for c_i, c_matrix in enumerate(clause_matrices):
-                obj = max(c_matrix.shape[0], task_matrix.shape[0])
-                c_groundings = _ground_clause(c_matrix, obj)
-                task_compressed = _compress_task_matrix(task_matrix)
-                raise NotImplementedError("Clause scoring logic not implemented yet.")
-                # Compute the score for this clause matrix against the task matrix
-                # Placeholder: replace with actual scoring logic
-                score = 0  # Replace with actual scoring logic
-                clause_matches[c_i] = score
+                best_score = _fit_clause_to_task(c_matrix.sum(dim=1), task_compressed)
+                clause_matches[c_i] = best_score
             return clause_matches
 
         def _select_matching_clauses(clause_matches):
