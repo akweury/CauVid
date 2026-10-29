@@ -300,6 +300,8 @@ def get_step_06_input(args):
         "val_tasks_file": args.output_dir / "step_dataset_output" / "tasks_val.pt",
         "device": args.device,
         "delay_windows": args.delay_windows,
+        "threshold": args.threshold,
+        "label_file": args.dataset_path / "gt" / "label.json"
     }
     return input_data
 

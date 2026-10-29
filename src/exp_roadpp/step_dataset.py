@@ -294,8 +294,8 @@ def prepare_per_video_tasks(cfg):
             }
         elif "action_id" in interval_atom:
             task_target = {
-                "start_frame": start_frame,
-                "end_frame": end_frame,
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
                 "pred": interval_atom["pred"],
                 "action_id": interval_atom["action_id"],
                 "agent_class": interval_atom["agent_class"],

@@ -23,5 +23,6 @@
     "tracker_window_size": 5,
     "prune_args": {
         "frequency_threshold": 10
-    }
+    },
+    "threshold": 0.01
 }

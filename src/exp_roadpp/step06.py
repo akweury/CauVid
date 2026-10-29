@@ -322,29 +322,32 @@ def plot_summary(summary, plot_file):
 
 
 
-def tasks_evaluation(model, tasks, cfg):
+def tasks_evaluation(model, tasks):
 
     # -------------- Evaluation Helper Function --------------
-    def _eval(predictions, target):    
+    def prediction_eval(predictions, target):    
         correct_predictions = 0
         match_details = []
         for prediction in predictions:
             if prediction["pred"] == target["pred"]:
                 if prediction["pred"] == 'location':
                     agent_class_match = prediction["agent_class"] == target["agent_class"]
-                    location_match = prediction["location"] == target["location"]
-                    window_match = prediction["delay_windows"] == target["delay_windows"]
+                    label_match = prediction["location_name"] == target["location_name"]
+                    # window_match = prediction["delay_windows"] == target["delay_windows"]
                 elif prediction["pred"] == 'action':
                     agent_class_match = prediction["agent_class"] == target["agent_class"]
-                    action_match = prediction["action"] == target["action"]
-                    window_match = prediction["delay_windows"] == target["delay_windows"]
+                    label_match = prediction["action_id"] == target["action_id"]
+                    # window_match = prediction["delay_windows"] == target["delay_windows"]
                 else:
                     raise ValueError(f"Unknown prediction type: {prediction['pred']}")
-                
+                matched = agent_class_match and label_match
+                if matched:
+                    correct_predictions += 1
+
                 match_details.append({
                     "prediction": prediction,
                     "target": target,
-                    "match": agent_class_match and (location_match if prediction["pred"] == 'location' else action_match) and window_match
+                    "match": matched
                 })
             else:
                 correct_predictions += 0
@@ -356,25 +359,158 @@ def tasks_evaluation(model, tasks, cfg):
         summary = {
             "total_predictions": len(predictions),
             "correct_predictions": correct_predictions,
+            "gt":target,
             "details": match_details
         }
         return summary
 
     # -------------- Task Evaluation --------------
     raw_results = {}
-    for video_id, video_tasks in tasks.items():
-        raw_results[video_id] = []
+    for video_id, video_tasks in tqdm(tasks.items(), desc="Evaluating Videos"):
+        video_summary = []
         for task in video_tasks:
             task_input = task["input"]
             task_target = task["target"]
             preds = model.predict(task_input)
-            raw_results[video_id].append(_eval(preds, task_target))
+            summary = prediction_eval(preds, task_target)
+            video_summary.append(summary)
+        raw_results[video_id] = video_summary
+    print(f"[Task Evaluation] Completed!")
+    print()
 
     return raw_results
 
+def result_analysis(raw_results, labels):
+    summary = {"location": {"recall": {}, "precision": {}}, 
+               "action": {"recall": {}, "precision": {}}, 
+               "av_action": {"recall": {}, "precision": {}}}
+    total_videos = len(raw_results)
+    total_tasks = 0
+    total_correct_predictions = 0
+    correct_count = 0
+    total_predictions = 0
+
+    def _class_precision(summary, tasks_summary):
+        for pred in tasks_summary["details"]:
+            predicate = pred["target"]["pred"]
+            if predicate == "location":
+                if pred["target"]["location_name"] not in summary["location"]["precision"]:
+                    summary["location"]["precision"][pred["target"]["location_name"]] = []
+                summary["location"]["precision"][pred["target"]["location_name"]].append(pred["match"])
+            elif predicate == "action":
+                if pred["target"]["agent_class"] == "av":
+                    if pred["target"]["action_id"] not in summary["av_action"]["precision"]:
+                        summary["av_action"]["precision"][pred["target"]["action_id"]] = []
+                    summary["av_action"]["precision"][pred["target"]["action_id"]].append(pred["match"])
+                else:
+                    if pred["target"]["action_id"] not in summary["action"]["precision"]:
+                        summary["action"]["precision"][pred["target"]["action_id"]] = []
+                    summary["action"]["precision"][pred["target"]["action_id"]].append(pred["match"])
+            else:
+                raise ValueError(f"Unknown predicate: {predicate}")
+
+    def _class_recall(summary, tasks_summary):
+        if tasks_summary["gt"]["pred"] == "action":
+            agent_class = tasks_summary["gt"]["agent_class"]
+            if agent_class == "av":
+                if agent_class not in summary["av_action"]["recall"]:
+                    summary["av_action"]["recall"][agent_class] = []
+                summary["av_action"]["recall"][agent_class].append(tasks_summary["correct_predictions"]>0)
+            else:
+                if agent_class not in summary["action"]["recall"]:
+                    summary["action"]["recall"][agent_class] = []
+                summary["action"]["recall"][agent_class].append(tasks_summary["correct_predictions"]>0)
+        elif tasks_summary["gt"]["pred"] == "location":
+            location_name = tasks_summary["gt"]["location_name"]
+            if location_name not in summary["location"]["recall"]:
+                summary["location"]["recall"][location_name] = []
+            summary["location"]["recall"][location_name].append(tasks_summary["correct_predictions"]>0)
+        else:
+            raise ValueError(f"Unknown ground truth predicate: {tasks_summary['gt']['pred']}")
+        
+
+    for video_id, video_summary in raw_results.items():
+        total_tasks += len(video_summary)
+        total_correct_predictions += sum(item["correct_predictions"] for item in video_summary)
+        correct_count += sum(item["correct_predictions"]>0 for item in video_summary)
+        total_predictions += sum(item["total_predictions"] for item in video_summary)
+        for task_summary in video_summary:
+            _class_precision(summary, task_summary)
+            _class_recall(summary, task_summary)
+
+    for loc_id, matches in summary["location"]["precision"].items():
+        summary["location"]['precision'][loc_id] = {
+            "label_name":labels["loc_labels"][loc_id],
+            "total": len(matches),
+            "correct": sum(matches)
+        }
+    for action_id, matches in summary["av_action"]["precision"].items():
+        summary["av_action"]["precision"][action_id] = {
+            "label_name":labels["av_action_labels"][action_id],
+            "total": len(matches),
+            "correct": sum(matches)
+        }
+    for action_id, matches in summary["action"]["precision"].items():
+        summary["action"]["precision"][action_id] = {
+            "label_name":labels["action_labels"][action_id],
+            "total": len(matches),
+            "correct": sum(matches)
+        }
+    
+    summary["total_videos"] = total_videos
+    summary["total_tasks"] = total_tasks
+    summary["total_correct_predictions"] = total_correct_predictions
+    summary["recall"] = correct_count / total_tasks if total_tasks > 0 else 0.0
+    summary["precision"] = total_correct_predictions / total_predictions if total_predictions > 0 else 0.0
+
+    print("[Evaluation Summary]")
+    print(f"[Videos] \t {total_videos}")
+    print(f"[Tasks] \t {correct_count}/{total_tasks}")
+    print(f"[Predictions] \t {total_correct_predictions}/{total_predictions}")
+    print(f"[Recall] \t {summary['recall']:.2f}")
+    print(f"[Precision] \t {summary['precision']:.2f}")
+    print()
+
+    print(f"[Location Precision]")
+    for score in summary["location"]["precision"].values():
+        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+    print()
+
+    print(f"[Location Recall]")
+    for loc_id, matches in summary["location"]["recall"].items():
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['loc_labels'][loc_id]}]")
+    print()
+
+
+    print(f"[AV Action Precision]")
+    for score in summary["av_action"]["precision"].values():
+        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+    print()
+
+    print(f"[AV Action Recall]")
+    for action_id, matches in summary["av_action"]["recall"].items():
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['av_action_labels'][action_id]}]")
+    print()
+
+    print(f"[Action Precision]")
+    for score in summary["action"]["precision"].values():
+        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+    print()
+
+    print(f"[Action Recall]")
+    for action_id, matches in summary["action"]["recall"].items():
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['action_labels'][action_id]}]")
+    print()
+
+    return summary
+
+def _log_parameters(cfg):
+    print("[Configuration Parameters]")
+    print(f"[Threshold] \t {cfg['threshold']}")
+    print()
 
 def main(input_data):
-    
+
     print("\n--------- Step 06 Evaluation ----------------------\n")
     cfg = {
         "output_dir": input_data["output_dir"],
@@ -382,13 +518,23 @@ def main(input_data):
         "delay_windows": input_data["delay_windows"],
         'extended_clauses_file': input_data["extended_clauses_file"],
         "unique_atoms_file": input_data["unique_atoms_file"],
-        "val_tasks_file": input_data["val_tasks_file"]
+        "val_tasks_file": input_data["val_tasks_file"],
+        "threshold": input_data["threshold"],
+        'label_file': input_data["label_file"]
+
     }
-    summary_file = cfg["output_dir"] / "extended_clauses_evaluation.json"
+    summary_file = cfg["output_dir"] / f"extended_clauses_evaluation_{cfg['threshold']}.json"
+    labels = utils_data.load_json(cfg["label_file"])
+    
     if not summary_file.exists():
+        _log_parameters(cfg)
         model = CauVid(cfg)
         tasks = torch.load(cfg["val_tasks_file"])
-        summary = tasks_evaluation(model, tasks["tasks"], cfg)
+        raw_results = tasks_evaluation(model, tasks["tasks"])
+        summary = result_analysis(raw_results, labels)
         utils_data.save_json(summary, summary_file)
-        
+    else:
+        print(f"Summary file already exists at {summary_file}")
+
     print("\n--------- Step 06 Done ---------------\n")
+

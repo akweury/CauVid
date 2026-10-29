@@ -9,10 +9,24 @@ class CauVid:
         self.clauses = utils_data.load_json(cfg["extended_clauses_file"])
         self.unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
         self.delay_windows = cfg["delay_windows"]
+        self.clauses = self._unique_clauses()
+
         self.clause_matrices = self._build_clause_matrix()
+        self.threshold = cfg["threshold"]
+    def _unique_clauses(self):
+        unique_clauses = []
+        seen = set()
+        for c in self.clauses:
+            c_tuple = (tuple(c["head"]), tuple(c["body_scopes"]), tuple(tuple(b) for b in c["bodies"]))
+            if c_tuple not in seen:
+                seen.add(c_tuple)
+                unique_clauses.append(c)
+        print(f'(Found {len(self.clauses) - len(unique_clauses)} repeat clauses, removed them.)')
+        print()
 
+        return unique_clauses
 
-
+    
     def _reorder_clauses(self, clauses):
         reordered_clauses = []
         for c in clauses:
@@ -67,16 +81,17 @@ class CauVid:
             obj = max(c_compressed.shape[0], task_compressed.shape[0])
             c = _pad_rows(c_compressed, obj)
             t = _pad_rows(task_compressed, obj).to(c.dtype)
-            # match[i, j] = number of equal entries between task row i and clause row j
-            match = (t[:, None, :] == c[None, :, :]).sum(dim=-1)
+            # match[i, j] = number of clause-j atoms satisfied by task object i
+            # (an atom required k times is satisfied at most k times)
+            match = torch.minimum(t[:, None, :], c[None, :, :]).sum(dim=-1)
             rows, cols = linear_sum_assignment(match.numpy(), maximize=True)
-            score = match[rows, cols].sum().item()
-            return score / c.numel()
+            satisfied = match[rows, cols].sum().item()
+            total = c.sum().item()
+            return satisfied / total if total > 0 else 0.0
         
         def _build_task_matrix(task_input):
             task_window = len(task_input)
             obj_ids = list(set(atom[-1] for frame in task_input for atom in frame))
-            print(f"Object Number: {len(obj_ids)}")
             task_obj_num = len(obj_ids)
             atom_num = len(self.unique_atoms)
             task_matrix = torch.zeros((task_obj_num, task_window,atom_num), dtype=torch.bool) 
@@ -96,18 +111,35 @@ class CauVid:
             return clause_matches
 
         def _select_matching_clauses(clause_matches):
-            if len(clause_matches) == 0:
-                return None
-            max_score = max(clause_matches.values())
-            selected_clause_i = [c_i for c_i, score in clause_matches.items() if score == max_score][0]
-            selected_clause = self.clauses[selected_clause_i]
-            return selected_clause
+            selected_clauses = []
+            for c_i, score in clause_matches.items():
+                if score >= self.threshold:
+                    head_atom = self.unique_atoms[self.clauses[c_i]["head"][0]]
+                    if "action_id" in head_atom:
+                        selected_clauses.append({
+                            'score': score,
+                            "pred": head_atom[1],
+                            "action_id": head_atom[3],
+                            "action_id_label": head_atom[5],
+                            "agent_class": head_atom[7],
+                            "agent_class_label": head_atom[9]
+                        })
+                    elif "location" in head_atom:
+                        selected_clauses.append({
+                            'score': score,
+                            "pred": head_atom[1],
+                            "location_name": head_atom[3],
+                            "location_name_label": head_atom[5],
+                            "agent_class": head_atom[7],
+                            "agent_class_label": head_atom[9]
+                        })
+            return selected_clauses
         
         # -------- main prediction steps ----------------------------------
         task_matrix = _build_task_matrix(task_input)
         clause_matches = _compute_clause_score(self.clause_matrices, task_matrix)
-        selected_clause = _select_matching_clauses(clause_matches)
-        return selected_clause
+        selected_clauses = _select_matching_clauses(clause_matches)
+        return selected_clauses
 
         
     
