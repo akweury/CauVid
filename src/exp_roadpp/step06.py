@@ -473,6 +473,21 @@ def _log_parameters(cfg):
     print(f"[Threshold] \t {cfg['threshold']}")
     print()
 
+def _short_num(n):
+    """Format a number compactly, e.g. 143280 -> '143k', 1000000 -> '1M'."""
+    n = float(n)
+    for unit in ["", "k", "M", "B"]:
+        s = f"{n:.0f}" if unit == "" or abs(n) >= 99.95 else f"{n:.1f}".rstrip("0").rstrip(".")
+        if abs(float(s)) < 1000:
+            return s + unit
+        n /= 1000
+    return f"{n:.1f}T"
+
+
+def _print_row(correct, total, label):
+    print(f"{_short_num(correct):>6} / {_short_num(total):<6} [{label}]")
+
+
 def print_summary(summary, labels):
     print("[Evaluation Summary]")
     print(f"[Videos] \t {summary['total_videos']}")
@@ -484,33 +499,33 @@ def print_summary(summary, labels):
 
     print(f"[Location Precision]")
     for score in summary["location"]["precision"].values():
-        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+        _print_row(score['correct'], score['total'], score['label_name'])
     print()
 
     print(f"[Location Recall]")
     for loc_id, matches in summary["location"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['loc_labels'][int(loc_id)]}]")
+        _print_row(sum(matches), len(matches), labels['loc_labels'][int(loc_id)])
     print()
 
 
     print(f"[AV Action Precision]")
     for score in summary["av_action"]["precision"].values():
-        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+        _print_row(score['correct'], score['total'], score['label_name'])
     print()
 
     print(f"[AV Action Recall]")
     for action_id, matches in summary["av_action"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['av_action_labels'][int(action_id)]}]")
+        _print_row(sum(matches), len(matches), labels['av_action_labels'][int(action_id)])
     print()
 
     print(f"[Action Precision]")
     for score in summary["action"]["precision"].values():
-        print(f"{score['correct']} / {score['total']} \t [{score['label_name']}]")
+        _print_row(score['correct'], score['total'], score['label_name'])
     print()
 
     print(f"[Action Recall]")
     for action_id, matches in summary["action"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['action_labels'][int(action_id)]}]")
+        _print_row(sum(matches), len(matches), labels['action_labels'][int(action_id)])
     print()
     
     
