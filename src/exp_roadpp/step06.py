@@ -489,7 +489,7 @@ def print_summary(summary, labels):
 
     print(f"[Location Recall]")
     for loc_id, matches in summary["location"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['loc_labels'][loc_id]}]")
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['loc_labels'][int(loc_id)]}]")
     print()
 
 
@@ -500,7 +500,7 @@ def print_summary(summary, labels):
 
     print(f"[AV Action Recall]")
     for action_id, matches in summary["av_action"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['av_action_labels'][action_id]}]")
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['av_action_labels'][int(action_id)]}]")
     print()
 
     print(f"[Action Precision]")
@@ -510,7 +510,7 @@ def print_summary(summary, labels):
 
     print(f"[Action Recall]")
     for action_id, matches in summary["action"]["recall"].items():
-        print(f"{sum(matches)} / {len(matches)} \t [{labels['action_labels'][action_id]}]")
+        print(f"{sum(matches)} / {len(matches)} \t [{labels['action_labels'][int(action_id)]}]")
     print()
     
     
