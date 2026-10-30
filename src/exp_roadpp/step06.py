@@ -322,6 +322,17 @@ def plot_summary(summary, plot_file):
 
 
 
+def split_task_input(task_input, step):
+    """Cut a task input into its past step, 2*step, ... frames, ending with the full input.
+
+    task_input is the list of (non-empty) frames before the event, oldest first, so each cut
+    keeps the most recent frames. Returns [(past_frames, cut_input), ...], shortest first.
+    """
+    num_frames = len(task_input)
+    lengths = list(range(step, num_frames, step)) + [num_frames]
+    return [(length, task_input[num_frames - length:]) for length in lengths]
+
+
 def tasks_evaluation(model, cfg):
     tasks = torch.load(cfg["val_tasks_file"])
     # -------------- Evaluation Helper Function --------------
@@ -366,14 +377,17 @@ def tasks_evaluation(model, cfg):
 
     # -------------- Task Evaluation --------------
     raw_results = {}
-    for video_id, video_tasks in tqdm(tasks.items(), desc="Evaluating Videos"):
+    for video_id, video_tasks in tqdm(tasks["tasks"].items(), desc="Evaluating Videos"):
         video_summary = []
         for task in video_tasks:
-            task_input = task["input"]
             task_target = task["target"]
-            preds = model.predict(task_input)
-            summary = prediction_eval(preds, task_target)
-            video_summary.append(summary)
+            task_splits= split_task_input(task["input"], cfg["eval_frame_step"])
+            # Test how early the event can be predicted: predict from the past k frames only.
+            for past_frames, task_input in task_splits:
+                preds = model.predict(task_input)
+                summary = prediction_eval(preds, task_target)
+                summary["past_frames"] = past_frames
+                video_summary.append(summary)
         raw_results[video_id] = video_summary
     print(f"[Task Evaluation] Completed!")
     print()
@@ -540,6 +554,7 @@ def main(input_data):
         "unique_atoms_file": input_data["unique_atoms_file"],
         "val_tasks_file": input_data["val_tasks_file"],
         "threshold": input_data["threshold"],
+        "eval_frame_step": input_data["eval_frame_step"],
         'label_file': input_data["label_file"]
 
     }

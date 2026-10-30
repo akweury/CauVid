@@ -301,6 +301,7 @@ def get_step_06_input(args):
         "device": args.device,
         "delay_windows": args.delay_windows,
         "threshold": args.threshold,
+        "eval_frame_step": args.eval_frame_step,
         "label_file": args.dataset_path / "gt" / "label.json"
     }
     return input_data
