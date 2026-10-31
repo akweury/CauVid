@@ -358,6 +358,6 @@ def main(input_data):
     language_model = Language(cfg["device"])
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     prepare_per_frame_atoms(language_model, cfg)
-    prepare_per_frame_events(cfg)
+    # prepare_per_frame_events(cfg)
     prepare_per_video_tasks(cfg)
     print("\n--------- Step Dataset Done------------------\n")

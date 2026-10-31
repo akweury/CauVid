@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp import step05
-from src.exp_roadpp.cauvid import CauVid
 
 
 def _atom_label(atom):
@@ -16,7 +15,7 @@ def _atom_label(atom):
 
 
 def _clause_text(clause, unique_atoms):
-    """e.g. "Car MovAway[0] within 5 <- Car Stop[0] & Ped MovTow[1][started ≤3f ago]"; [slot] is
+    """e.g. "Car MovAway[0] in 1-10 <- Car Stop[0] & Ped MovTow[1][started ≤3f ago]"; [slot] is
     the object slot of step05's `build_features` (0: head object, body slot: body object, body
     slot + 1: some other object), followed by the temporal predicate unless it is "now"."""
     bodies = " & ".join(
@@ -24,7 +23,8 @@ def _clause_text(clause, unique_atoms):
         for atom_index, slot, predicate in clause["bodies"]
     )
     head = _atom_label(unique_atoms[clause["head"][0]])
-    return f"{head}[0] within {clause['delay_window']} <- {bodies}"
+    lo, hi = clause["lead_bin"]
+    return f"{head}[0] in {lo + 1}-{hi} <- {bodies}"
 
 
 def compute_metrics(tp, fp, fn):
@@ -70,7 +70,7 @@ def predict_delays(clauses, unique_atoms, eval_atoms, delay_windows, device):
 
     # Targets are not needed here: no head atoms, so build_body_features skips them.
     no_heads = torch.empty(0, dtype=torch.long, device=device)
-    windows = torch.tensor(sorted(delay_windows), dtype=torch.int16, device=device)
+    bins = torch.tensor(step05.lead_bins(delay_windows), dtype=torch.int16, device=device)
     preds, clause_ofs, delays, node_keys = [], [], [], []
     for video_id, video_atoms in tqdm(eval_atoms.items(), desc="Grounding clauses"):
         X = step05.build_video_tensor(video_atoms, num_atoms, device=device)
@@ -84,7 +84,7 @@ def predict_delays(clauses, unique_atoms, eval_atoms, delay_windows, device):
         # row (t, n_body, n_head) is the node the head is predicted for.
         fired = []
         for body, body_clauses in group_clauses.items():
-            features, _targets, rows = step05.build_body_features(Xt, D, body, no_heads, windows)
+            features, _targets, rows = step05.build_body_features(Xt, D, body, no_heads, bins)
             if len(rows) == 0:
                 continue
             head_nodes = node_of[rows[:, 0], rows[:, 2]]
@@ -322,169 +322,219 @@ def plot_summary(summary, plot_file):
 
 
 
-def split_task_input(task_input, step):
-    """Cut a task input into its past step, 2*step, ... frames, ending with the full input.
+def group_clauses_by_anchor(clauses):
+    """{anchor body (b, s): [(extras, head atom, lead bin k), ...]}; extras are the
+    (object_slot, predicate index, atom) cells of the `step05.build_body_features`
+    features that the clause requires besides its anchor body."""
+    # All clauses of a run share the past windows and the lead bins.
+    predicate_index = {p: i for i, p in enumerate(step05.temporal_predicates(clauses[0]["past_windows"]))}
+    bin_index = {tuple(b): k for k, b in enumerate(step05.lead_bins(clauses[0]["delay_windows"]))}
+    groups = {}
+    for clause in clauses:
+        anchor = clause["bodies"][0]
+        extras = [(slot, predicate_index[predicate], atom) for atom, slot, predicate in clause["bodies"][1:]]
+        groups.setdefault((anchor[0], anchor[1]), []).append(
+            (extras, clause["head"][0], bin_index[tuple(clause["lead_bin"])])
+        )
+    return groups
 
-    task_input is the list of (non-empty) frames before the event, oldest first, so each cut
-    keeps the most recent frames. Returns [(past_frames, cut_input), ...], shortest first.
-    """
-    num_frames = len(task_input)
-    lengths = list(range(step, num_frames, step)) + [num_frames]
-    return [(length, task_input[num_frames - length:]) for length in lengths]
 
-
-def tasks_evaluation(model, cfg):
-    tasks = torch.load(cfg["val_tasks_file"])
-    # -------------- Evaluation Helper Function --------------
-    def prediction_eval(predictions, target):    
-        correct_predictions = 0
-        match_details = []
-        for prediction in predictions:
-            if prediction["pred"] == target["pred"]:
-                if prediction["pred"] == 'location':
-                    agent_class_match = prediction["agent_class"] == target["agent_class"]
-                    label_match = prediction["location_name"] == target["location_name"]
-                    # window_match = prediction["delay_windows"] == target["delay_windows"]
-                elif prediction["pred"] == 'action':
-                    agent_class_match = prediction["agent_class"] == target["agent_class"]
-                    label_match = prediction["action_id"] == target["action_id"]
-                    # window_match = prediction["delay_windows"] == target["delay_windows"]
-                else:
-                    raise ValueError(f"Unknown prediction type: {prediction['pred']}")
-                matched = agent_class_match and label_match
-                if matched:
-                    correct_predictions += 1
-
-                match_details.append({
-                    "prediction": prediction,
-                    "target": target,
-                    "match": matched
-                })
+def ground_clauses(groups, Xt, D, bins):
+    """(F, 4) long tensor of the unique (t, n_head, head atom, lead bin k) of one video
+    where some clause fires: grounded exactly as step05 builds its training rows, so a
+    clause fires in frame t on the rows it was learned from."""
+    device = Xt.device
+    # No head atoms: only the features and rows are needed.
+    no_heads = torch.empty(0, dtype=torch.long, device=device)
+    fired = [torch.empty((0, 4), dtype=torch.long, device=device)]
+    for body, body_clauses in groups.items():
+        features, _targets, rows = step05.build_body_features(Xt, D, body, no_heads, bins)
+        if len(rows) == 0:
+            continue
+        for extras, head, k in body_clauses:
+            if extras:
+                slots, predicates, atoms = torch.tensor(extras, dtype=torch.long, device=device).T
+                holds = features[:, slots, predicates, atoms].all(dim=1)
             else:
-                correct_predictions += 0
-                match_details.append({
-                    "prediction": prediction,
-                    "target": target,
-                    "match": False
-                })
-        summary = {
-            "total_predictions": len(predictions),
-            "correct_predictions": correct_predictions,
-            "gt":target,
-            "details": match_details
-        }
-        return summary
+                holds = torch.ones(len(rows), dtype=torch.bool, device=device)
+            t, n_head = rows[holds, 0], rows[holds, 2]
+            fired.append(torch.stack([t, n_head, torch.full_like(t, head), torch.full_like(t, k)], dim=1))
+        del features
+    return torch.unique(torch.cat(fired), dim=0)
 
-    # -------------- Task Evaluation --------------
+
+def evaluate_video(groups, video_atoms, num_atoms, past_windows, bins, leads, device):
+    """Lead-time evaluation of one video.
+
+    An event is an onset: atom a starts for agent n in frame s. At lead L the rules
+    see the video up to frame t = s - L; the event counts at lead L if n is observed
+    in frame t and s is the next onset of a for n (D[t, n, a] == L, so a is not held
+    in frame t). It is hit at lead L if a clause with head a fires on n in frame t:
+    "timed" if the clause's lead bin contains L, "any" for any bin.
+    Returns (events, predictions):
+      events: [{"atom", "frame", "tube_uid", "leads": [[L, timed, any], ...]}];
+      predictions: [[atom, k, fired, correct], ...] per (head atom, lead bin k),
+          fired counting the (t, n) a clause predicts a in bin k on, correct those
+          where a next starts in bin k.
+    """
+    X = step05.build_video_tensor(video_atoms, num_atoms, device=device)
+    D = step05.build_video_delay_tensor(X, int(bins[-1, 1]))
+    Xt = step05.build_video_temporal_tensor(X, past_windows)
+    fired = ground_clauses(groups, Xt, D, bins)
+    del Xt
+    num_frames, num_agents, _ = X.shape
+    num_bins = len(bins)
+
+    def cell_key(t, n, a, k=None):
+        key = (t * num_agents + n) * num_atoms + a
+        return key if k is None else key * num_bins + k
+
+    t, n, a, k = fired.T
+    fired_keys = cell_key(t, n, a, k)
+    fired_any_keys = torch.unique(cell_key(t, n, a))
+
+    # Precision of the predictions per (head atom, lead bin).
+    delay = D[t, n, a].long()
+    correct = (delay > bins[k, 0]) & (delay <= bins[k, 1])
+    pair = a * num_bins + k
+    num_fired = torch.bincount(pair, minlength=num_atoms * num_bins)
+    num_correct = torch.bincount(pair, weights=correct.double(), minlength=num_atoms * num_bins).long()
+    predictions = [[p // num_bins, p % num_bins, int(num_fired[p]), int(num_correct[p])]
+                   for p in torch.nonzero(num_fired, as_tuple=True)[0].tolist()]
+
+    # Onsets, as in `step05.build_video_delay_tensor`.
+    starts = X.clone()
+    starts[1:] &= ~X[:-1]
+    starts[0] = False
+    onset_s, onset_n, onset_a = torch.nonzero(starts, as_tuple=True)
+    observed = X.any(dim=2)
+    his = bins[:, 1].long()
+    leads_of_event = [[] for _ in range(len(onset_s))]
+    for lead in leads:
+        t = onset_s - lead
+        valid = t >= 0
+        t = t.clamp(min=0)
+        valid &= observed[t, onset_n] & (D[t, onset_n, onset_a].long() == lead)
+        k_lead = torch.bucketize(torch.tensor(lead, device=device), his)
+        timed = torch.isin(cell_key(t, onset_n, onset_a, k_lead), fired_keys)
+        any_bin = torch.isin(cell_key(t, onset_n, onset_a), fired_any_keys)
+        for i in torch.nonzero(valid, as_tuple=True)[0].tolist():
+            leads_of_event[i].append([lead, bool(timed[i]), bool(any_bin[i])])
+
+    tube_uids = list(step05.video_agent_ids(video_atoms))
+    events = [
+        {"atom": a_i, "frame": s_i, "tube_uid": tube_uids[n_i], "leads": event_leads}
+        for s_i, n_i, a_i, event_leads in zip(
+            onset_s.tolist(), onset_n.tolist(), onset_a.tolist(), leads_of_event
+        )
+        if event_leads
+    ]
+    return events, predictions
+
+
+def tasks_evaluation(clauses, cfg):
+    """Raw lead-time results of the clauses on the val split: {video_id: (events,
+    predictions) of `evaluate_video`}. Leads are eval_frame_step, 2 * eval_frame_step,
+    ... up to the largest delay window."""
+    device = cfg["device"]
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    eval_atoms = utils_data.load_json(cfg["val_atoms_file"])
+    groups = group_clauses_by_anchor(clauses)
+    past_windows = clauses[0]["past_windows"]
+    bins = torch.tensor(step05.lead_bins(clauses[0]["delay_windows"]), dtype=torch.int16, device=device)
+    leads = eval_leads(cfg)
+
     raw_results = {}
-    for video_id, video_tasks in tqdm(tasks["tasks"].items(), desc="Evaluating Videos"):
-        video_summary = []
-        for task in video_tasks:
-            task_target = task["target"]
-            task_splits= split_task_input(task["input"], cfg["eval_frame_step"])
-            # Test how early the event can be predicted: predict from the past k frames only.
-            for past_frames, task_input in task_splits:
-                preds = model.predict(task_input)
-                summary = prediction_eval(preds, task_target)
-                summary["past_frames"] = past_frames
-                video_summary.append(summary)
-        raw_results[video_id] = video_summary
+    for video_id, video_atoms in tqdm(eval_atoms.items(), desc="Evaluating Videos"):
+        if video_id == "unique_atoms":
+            continue
+        events, predictions = evaluate_video(
+            groups, video_atoms, len(unique_atoms), past_windows, bins, leads, device
+        )
+        raw_results[video_id] = {"events": events, "predictions": predictions}
     print(f"[Task Evaluation] Completed!")
     print()
-
     return raw_results
 
-def result_analysis(raw_results, labels):
-    summary = {"location": {"recall": {}, "precision": {}}, 
-               "action": {"recall": {}, "precision": {}}, 
-               "av_action": {"recall": {}, "precision": {}}}
-    total_videos = len(raw_results)
-    total_tasks = 0
-    total_correct_predictions = 0
-    correct_count = 0
-    total_predictions = 0
 
-    def _class_precision(summary, tasks_summary):
-        for pred in tasks_summary["details"]:
-            predicate = pred["target"]["pred"]
-            if predicate == "location":
-                if pred["target"]["location_name"] not in summary["location"]["precision"]:
-                    summary["location"]["precision"][pred["target"]["location_name"]] = []
-                summary["location"]["precision"][pred["target"]["location_name"]].append(pred["match"])
-            elif predicate == "action":
-                if pred["target"]["agent_class"] == "av":
-                    if pred["target"]["action_id"] not in summary["av_action"]["precision"]:
-                        summary["av_action"]["precision"][pred["target"]["action_id"]] = []
-                    summary["av_action"]["precision"][pred["target"]["action_id"]].append(pred["match"])
-                else:
-                    if pred["target"]["action_id"] not in summary["action"]["precision"]:
-                        summary["action"]["precision"][pred["target"]["action_id"]] = []
-                    summary["action"]["precision"][pred["target"]["action_id"]].append(pred["match"])
-            else:
-                raise ValueError(f"Unknown predicate: {predicate}")
-
-    def _class_recall(summary, tasks_summary):
-        if tasks_summary["gt"]["pred"] == "action":
-            agent_class = tasks_summary["gt"]["agent_class"]
-            if agent_class == "av":
-                if agent_class not in summary["av_action"]["recall"]:
-                    summary["av_action"]["recall"][agent_class] = []
-                summary["av_action"]["recall"][agent_class].append(tasks_summary["correct_predictions"]>0)
-            else:
-                if agent_class not in summary["action"]["recall"]:
-                    summary["action"]["recall"][agent_class] = []
-                summary["action"]["recall"][agent_class].append(tasks_summary["correct_predictions"]>0)
-        elif tasks_summary["gt"]["pred"] == "location":
-            location_name = tasks_summary["gt"]["location_name"]
-            if location_name not in summary["location"]["recall"]:
-                summary["location"]["recall"][location_name] = []
-            summary["location"]["recall"][location_name].append(tasks_summary["correct_predictions"]>0)
-        else:
-            raise ValueError(f"Unknown ground truth predicate: {tasks_summary['gt']['pred']}")
-        
-
-    for video_id, video_summary in raw_results.items():
-        total_tasks += len(video_summary)
-        total_correct_predictions += sum(item["correct_predictions"] for item in video_summary)
-        correct_count += sum(item["correct_predictions"]>0 for item in video_summary)
-        total_predictions += sum(item["total_predictions"] for item in video_summary)
-        for task_summary in video_summary:
-            _class_precision(summary, task_summary)
-            _class_recall(summary, task_summary)
-
-    for loc_id, matches in summary["location"]["precision"].items():
-        summary["location"]['precision'][loc_id] = {
-            "label_name":labels["loc_labels"][loc_id],
-            "total": len(matches),
-            "correct": sum(matches)
-        }
-    for action_id, matches in summary["av_action"]["precision"].items():
-        summary["av_action"]["precision"][action_id] = {
-            "label_name":labels["av_action_labels"][action_id],
-            "total": len(matches),
-            "correct": sum(matches)
-        }
-    for action_id, matches in summary["action"]["precision"].items():
-        summary["action"]["precision"][action_id] = {
-            "label_name":labels["action_labels"][action_id],
-            "total": len(matches),
-            "correct": sum(matches)
-        }
-    
-    summary["total_videos"] = total_videos
-    summary["total_tasks"] = total_tasks
-    summary["total_correct_predictions"] = total_correct_predictions
-    summary["correct_count"] = correct_count
-    summary["total_predictions"] = total_predictions
-    summary["recall"] = correct_count / total_tasks if total_tasks > 0 else 0.0
-    summary["precision"] = total_correct_predictions / total_predictions if total_predictions > 0 else 0.0
+def eval_leads(cfg):
+    step = cfg["eval_frame_step"]
+    return list(range(step, max(cfg["delay_windows"]) + 1, step))
 
 
-    return summary
+def result_analysis(raw_results, unique_atoms, cfg):
+    """Recall per lead (overall and per head atom), the earliest lead each event is
+    hit at, and the precision per lead bin and per head atom."""
+    leads = eval_leads(cfg)
+    bins = step05.lead_bins(cfg["delay_windows"])
+    lead_index = {lead: i for i, lead in enumerate(leads)}
+
+    def new_counts():
+        return {"events": [0] * len(leads), "timed": [0] * len(leads), "any": [0] * len(leads)}
+
+    overall = new_counts()
+    per_atom = {}
+    earliest = []
+    num_events = 0
+    for video in raw_results.values():
+        for event in video["events"]:
+            num_events += 1
+            atom_counts = per_atom.setdefault(event["atom"], new_counts())
+            hit_leads = []
+            for lead, timed, any_bin in event["leads"]:
+                i = lead_index[lead]
+                for counts in (overall, atom_counts):
+                    counts["events"][i] += 1
+                    counts["timed"][i] += timed
+                    counts["any"][i] += any_bin
+                if timed:
+                    hit_leads.append(lead)
+            if hit_leads:
+                earliest.append(max(hit_leads))
+
+    bin_fired, bin_correct = [0] * len(bins), [0] * len(bins)
+    atom_fired, atom_correct = {}, {}
+    for video in raw_results.values():
+        for atom, k, fired, correct in video["predictions"]:
+            bin_fired[k] += fired
+            bin_correct[k] += correct
+            atom_fired[atom] = atom_fired.get(atom, 0) + fired
+            atom_correct[atom] = atom_correct.get(atom, 0) + correct
+
+    def recall(counts, kind):
+        return [h / n if n else 0.0 for h, n in zip(counts[kind], counts["events"])]
+
+    return {
+        "leads": leads,
+        "lead_bins": [list(b) for b in bins],
+        "num_videos": len(raw_results),
+        "num_events": num_events,
+        "overall": {**overall, "recall_timed": recall(overall, "timed"), "recall_any": recall(overall, "any")},
+        # Earliest lead an event is hit at (timed), over the events hit at some lead.
+        "detected_events": len(earliest),
+        "mean_earliest_lead": sum(earliest) / len(earliest) if earliest else 0.0,
+        "earliest_lead_counts": {lead: earliest.count(lead) for lead in leads},
+        "precision_per_bin": [
+            {"lead_bin": list(b), "fired": f, "correct": c, "precision": c / f if f else 0.0}
+            for b, f, c in zip(bins, bin_fired, bin_correct)
+        ],
+        "per_atom": {
+            atom: {
+                "label": _atom_label(unique_atoms[atom]),
+                **counts,
+                "fired": atom_fired.get(atom, 0),
+                "correct": atom_correct.get(atom, 0),
+            }
+            for atom, counts in sorted(per_atom.items())
+        },
+    }
+
 
 def _log_parameters(cfg):
     print("[Configuration Parameters]")
-    print(f"[Threshold] \t {cfg['threshold']}")
+    print(f"[Min clause confidence] \t {cfg['threshold']}")
+    print(f"[Lead bins] \t {step05.lead_bins(cfg['delay_windows'])}")
+    print(f"[Leads] \t {eval_leads(cfg)}")
     print()
 
 def _short_num(n):
@@ -502,47 +552,37 @@ def _print_row(correct, total, label):
     print(f"{_short_num(correct):>6} / {_short_num(total):<6} [{label}]")
 
 
-def print_summary(summary, labels):
+def print_summary(summary):
     print("[Evaluation Summary]")
-    print(f"[Videos] \t {summary['total_videos']}")
-    print(f"[Tasks] \t {summary['correct_count']}/{summary['total_tasks']}")
-    print(f"[Predictions] \t {summary['total_correct_predictions']}/{summary['total_predictions']}")
-    print(f"[Recall] \t {summary['recall']:.2f}")
-    print(f"[Precision] \t {summary['precision']:.2f}")
+    print(f"[Videos] \t {summary['num_videos']}")
+    print(f"[Events] \t {summary['num_events']}")
+    print(f"[Detected] \t {summary['detected_events']} events, mean earliest lead "
+          f"{summary['mean_earliest_lead']:.1f} frames")
     print()
 
-    print(f"[Location Precision]")
-    for score in summary["location"]["precision"].values():
-        _print_row(score['correct'], score['total'], score['label_name'])
+    # Timed: a clause whose lead bin contains L fires L frames before the onset;
+    # any: a clause with the right head fires, whatever its bin.
+    print(f"[Recall per lead]")
+    overall = summary["overall"]
+    for i, lead in enumerate(summary["leads"]):
+        print(f"{lead:>4}f  timed {overall['recall_timed'][i]:.2f}  any {overall['recall_any'][i]:.2f}  "
+              f"({_short_num(overall['timed'][i])} / {_short_num(overall['events'][i])})")
     print()
 
-    print(f"[Location Recall]")
-    for loc_id, matches in summary["location"]["recall"].items():
-        _print_row(sum(matches), len(matches), labels['loc_labels'][int(loc_id)])
+    print(f"[Precision per lead bin]")
+    for row in summary["precision_per_bin"]:
+        lo, hi = row["lead_bin"]
+        _print_row(row["correct"], row["fired"], f"{lo + 1}-{hi}f  {row['precision']:.2f}")
+    print()
+
+    print(f"[Per atom: timed hits / events at each lead {summary['leads']}; precision]")
+    for row in summary["per_atom"].values():
+        hits = "  ".join(f"{_short_num(h)}/{_short_num(n)}" for h, n in zip(row["timed"], row["events"]))
+        precision = f"{row['correct'] / row['fired']:.2f}" if row["fired"] else "-"
+        print(f"{hits}  {precision:>5}  [{row['label']}]")
     print()
 
 
-    print(f"[AV Action Precision]")
-    for score in summary["av_action"]["precision"].values():
-        _print_row(score['correct'], score['total'], score['label_name'])
-    print()
-
-    print(f"[AV Action Recall]")
-    for action_id, matches in summary["av_action"]["recall"].items():
-        _print_row(sum(matches), len(matches), labels['av_action_labels'][int(action_id)])
-    print()
-
-    print(f"[Action Precision]")
-    for score in summary["action"]["precision"].values():
-        _print_row(score['correct'], score['total'], score['label_name'])
-    print()
-
-    print(f"[Action Recall]")
-    for action_id, matches in summary["action"]["recall"].items():
-        _print_row(sum(matches), len(matches), labels['action_labels'][int(action_id)])
-    print()
-    
-    
 def main(input_data):
 
     print("\n--------- Step 06 Evaluation ----------------------\n")
@@ -552,30 +592,35 @@ def main(input_data):
         "delay_windows": input_data["delay_windows"],
         'extended_clauses_file': input_data["extended_clauses_file"],
         "unique_atoms_file": input_data["unique_atoms_file"],
-        "val_tasks_file": input_data["val_tasks_file"],
+        "val_atoms_file": input_data["val_atoms_file"],
+        # Clauses below this confidence (on train) are not used.
         "threshold": input_data["threshold"],
         "eval_frame_step": input_data["eval_frame_step"],
         'label_file': input_data["label_file"]
 
     }
-    summary_file = cfg["output_dir"] / f"extended_clauses_evaluation_{cfg['threshold']}.json"
-    raw_result_file = cfg["output_dir"] / f"val_raw_results_{cfg['threshold']}.json"
-    labels = utils_data.load_json(cfg["label_file"])
-    
+    summary_file = cfg["output_dir"] / f"lead_time_evaluation_{cfg['threshold']}.json"
+    raw_result_file = cfg["output_dir"] / f"val_lead_time_raw_results_{cfg['threshold']}.json"
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+
     if not summary_file.exists():
         _log_parameters(cfg)
-        model = CauVid(cfg)
+        clauses = [c for c in utils_data.load_json(cfg["extended_clauses_file"])
+                   if c["confidence"] >= cfg["threshold"]]
+        print(f"[Clauses] {len(clauses)} with confidence >= {cfg['threshold']}")
+        if not clauses:
+            raise ValueError(f"No clauses with confidence >= {cfg['threshold']} in {cfg['extended_clauses_file']}")
         if raw_result_file.exists():
             raw_results = utils_data.load_json(raw_result_file)
         else:
-            raw_results = tasks_evaluation(model, cfg)
+            raw_results = tasks_evaluation(clauses, cfg)
             utils_data.save_json(raw_results, raw_result_file)
-            
-        summary = result_analysis(raw_results, labels)
+
+        summary = result_analysis(raw_results, unique_atoms, cfg)
+        summary["num_clauses"] = len(clauses)
         utils_data.save_json(summary, summary_file)
-    
+
     summary = utils_data.load_json(summary_file)
-    print_summary(summary, labels)
+    print_summary(summary)
 
     print("\n--------- Step 06 Done ---------------\n")
-

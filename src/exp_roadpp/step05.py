@@ -248,6 +248,14 @@ def past_bins(past_windows):
     return list(zip(edges[:-1], edges[1:]))
 
 
+def lead_bins(delay_windows):
+    """Disjoint future bins (lo, hi) of the head targets from the sorted window edges,
+    e.g. [10, 20, 50] -> (0, 10), (10, 20), (20, 50). Bin (lo, hi) means the head
+    starts in frames (t + lo, t + hi], i.e. lo < delay <= hi frames ahead."""
+    edges = [0] + sorted(set(delay_windows))
+    return list(zip(edges[:-1], edges[1:]))
+
+
 def temporal_predicates(past_windows):
     """Names of the P predicates of `build_video_temporal_tensor`: "now", then
     "held_lo_hi", "started_lo_hi", "ended_lo_hi" for each bin of `past_bins`."""
@@ -296,13 +304,14 @@ def _unpack_features(packed, num_columns):
     return torch.from_numpy(np.unpackbits(bits, axis=1, count=num_columns).astype(bool))
 
 
-def build_body_features(Xt, D, body, head_atoms, windows):
+def build_body_features(Xt, D, body, head_atoms, bins):
     """Training rows of one body (b, s) in one video.
 
     Xt: (T, N, P, A) temporal atom tensor of the video (`build_video_temporal_tensor`;
     Xt[:, :, 0] is the atom tensor of `build_video_tensor`), D: (T, N, A) delay
     tensor (`build_video_delay_tensor`). body = (b, s): agent slot s holds atom b.
-    head_atoms: (H,) atom ids of the body's candidate heads; windows: (K,).
+    head_atoms: (H,) atom ids of the body's candidate heads; bins: (K, 2) lead bins
+    (lo, hi] of `lead_bins`.
 
     A row is one grounding in a frame t where some agent n_body holds b: the
     head agent n_head is n_body itself if s == 0, otherwise every other agent
@@ -310,8 +319,10 @@ def build_body_features(Xt, D, body, head_atoms, windows):
       features: (R, s + 2, P, A) bool, the temporal atoms in frame t of each role:
           slot 0 the head agent, slot s the body agent (without b "now", which
           every row has) and slot s + 1 "some other agent" (any agent but those two);
-      targets: (R, H, K) bool, head h starts for the head agent within windows[k]
-          frames after t (and is not already held by it in frame t);
+      targets: (R, H, K) bool, head h next starts for the head agent in lead bin k,
+          i.e. lo_k < delay <= hi_k frames after t (and is not already held by it in
+          frame t). Every frame before an onset is a row, so the bins cover every
+          lead time the evaluation asks for (step06), each learned separately;
       rows: (R, 3) long, (t, n_body, n_head) of each row.
     """
     b, s = body
@@ -340,7 +351,7 @@ def build_body_features(Xt, D, body, head_atoms, windows):
     features[:, s + 1] = others > 0
 
     delay = D[t, n_head][:, head_atoms].unsqueeze(-1)       # (R, H, 1)
-    targets = (delay > 0) & (delay <= windows)              # (R, H, K)
+    targets = (delay > bins[:, 0]) & (delay <= bins[:, 1])  # (R, H, K)
     rows = torch.stack([t, n_body, n_head], dim=1)
     return features, targets, rows
 
@@ -350,10 +361,10 @@ def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
     are bit-packed (`_pack_features`) on CPU, as they grow with the P temporal
     predicates of `past_windows`."""
     bodies = list(set([c[0] for c in caw_clauses]))
-    # Sorted so the window axis K of the targets has a fixed order.
+    # Sorted so the bin axis K of the targets has a fixed order.
     delay_windows = sorted(set([c[-1] for c in caw_clauses]))
     num_atom_type = len(unique_atoms)
-    windows = torch.tensor(delay_windows, dtype=torch.int16, device=device)
+    bins = torch.tensor(lead_bins(delay_windows), dtype=torch.int16, device=device)
     features = []
     targets = []
     features = {body:[] for body in bodies}
@@ -374,7 +385,7 @@ def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
         print(f"Xt memory usage: {Xt.element_size() * Xt.nelement() / 1024 ** 2:.2f} MB")
         print(f"D memory usage: {D.element_size() * D.nelement() / 1024 ** 2:.2f} MB")
         for body in bodies:
-            F, T, R = build_body_features(Xt, D, body, head_atoms[body], windows)
+            F, T, R = build_body_features(Xt, D, body, head_atoms[body], bins)
             if len(F)>0:
                 features[body].append(_pack_features(F))
                 targets[body].append(T.cpu())
@@ -451,7 +462,7 @@ def _encode_examples(examples):
 
 
 def build_head_vocab(body_groups, delay_windows):
-    # One cumulative head "starts within w" per (candidate head, window).
+    # One head "starts in the lead bin ending at w" per (candidate head, window).
     head_vocab = []
     for body, heads in body_groups.items():
         for head in heads:
@@ -672,8 +683,10 @@ def build_training_examples(atoms, clauses, labels, unique_atoms, cfg):
         "body_groups": body_groups,
         "delay_windows": list(cfg["delay_windows"]),
         "past_windows": list(cfg["past_windows"]),
+        # Targets are disjoint lead bins (`lead_bins`), not cumulative windows.
+        "target_kind": "lead_bins",
         # Axes H and K of targets[body]: the body's distinct heads in clause
-        # order and the sorted windows, as in `build_features`.
+        # order and the sorted windows (bin upper edges), as in `build_features`.
         "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
         "windows": sorted(set(cfg["delay_windows"])),
         # Axes P and A of the (s + 2, P, A) features of a body (b, s).
@@ -866,7 +879,8 @@ def _clause_text(clause, unique_atoms):
         name = _atom_name(unique_atoms[atom_index]) if unique_atoms else f"a{atom_index}"
         return f"{name}(X{slot}){predicate_text(predicate)}"
     body = " ∧ ".join(atom(*a) for a in clause["bodies"])
-    return f"{body} ⇒ starts {atom(*clause['head'])} within {clause['delay_window']}f"
+    lo, hi = clause["lead_bin"]
+    return f"{body} ⇒ starts {atom(*clause['head'])} in {lo + 1}-{hi}f"
 
 
 def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_examples=15):
@@ -955,7 +969,10 @@ def _summarize_extended_clauses(extended_clauses, unique_atoms, output_dir, num_
     print(f"[Extended clauses] Summary figure saved to {pdf_file}")
 
 
-def _to_extended_clauses(extended_data, delay_windows, past_windows=(), unique_atoms=None, output_dir=None):
+def _to_extended_clauses(extended_data, unique_atoms, cfg):
+    delay_windows = cfg["delay_windows"]
+    past_windows = cfg["past_windows"]
+    output_dir = cfg["output_dir"]
     extended_clauses = []
     for item in extended_data:
         # Bodies are ungrounded (atom_index, object_slot, temporal_predicate)
@@ -966,8 +983,9 @@ def _to_extended_clauses(extended_data, delay_windows, past_windows=(), unique_a
             "bodies": bodies,
             "body_scopes": [slot for _atom, slot, _predicate in bodies],
             "head": tuple(item["head"]),
-            # The head starts within delay_window frames; delay_windows are all
-            # windows learned, needed to decode the cumulative heads.
+            # The head starts lo < delay <= hi frames ahead (`lead_bins`);
+            # delay_window is hi, delay_windows the edges of all bins learned.
+            "lead_bin": list(item["lead_bin"]),
             "delay_window": item["delay_window"],
             "delay_windows": list(delay_windows),
             # Edges of the past bins of the temporal predicates, needed to ground them.
@@ -1031,7 +1049,7 @@ def _extend_body(body, features, targets, heads, windows, predicates, num_atoms,
     # window) pairs into columns, on CPU; `learn_extension_masks` moves them to
     # the device. Feature column (slot * P + p) * A + atom is "agent in role
     # slot satisfies predicate p of atom"; target column h * K + k is
-    # "heads[h] starts within windows[k] frames".
+    # "heads[h] starts in lead bin k", the bin ending at windows[k].
     num_slots, num_predicates = body[1] + 2, len(predicates)
     X = _unpack_features(features, num_slots * num_predicates * num_atoms)
     num_rows = len(X)
@@ -1072,6 +1090,7 @@ def _extend_body(body, features, targets, heads, windows, predicates, num_atoms,
         body_data.append({
             "body": body,
             "head": heads[h],
+            "lead_bin": lead_bins(windows)[k],
             "delay_window": windows[k],
             # (atom_index, object_slot, temporal_predicate) of each extra atom.
             "extra_atoms": extra_atoms,
@@ -1198,7 +1217,6 @@ def extend_clauses(cfg):
     atoms = utils_data.load_json(cfg['train_atom_file'])
     causal_anchor_clauses = utils_data.load_json(cfg['causal_anchor_clause_file'])
     unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
-    events = torch.load(cfg['events_file'])
     print(f"Loaded causal anchor clauses: {len(causal_anchor_clauses)}")
     
     # Build training examples from the loaded anchor clauses, labels, and atoms.
@@ -1206,17 +1224,15 @@ def extend_clauses(cfg):
     examples = None
     if os.path.exists(cfg["extension_training_example_file"]):
         examples = torch.load(cfg["extension_training_example_file"], map_location="cpu")
-        if examples.get("predicates") != temporal_predicates(cfg["past_windows"]):
-            print("[Rule extension] Cached training examples have other temporal predicates; rebuilding.")
+        if examples.get("target_kind") != "lead_bins":
+            print("[Rule extension] Cached training examples have cumulative window targets; rebuilding.")
             examples = None
     if examples is None:
         examples = build_training_examples(atoms, causal_anchor_clauses, labels, unique_atoms, cfg)
         torch.save(examples, cfg["extension_training_example_file"])
 
     extended_data = _learn_extensions(examples, cfg)
-    extended_clauses = _to_extended_clauses(
-        extended_data, cfg["delay_windows"], cfg["past_windows"], unique_atoms, cfg["output_dir"]
-    )
+    extended_clauses = _to_extended_clauses(extended_data, unique_atoms, cfg)
     return extended_clauses
 
 
