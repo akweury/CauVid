@@ -233,112 +233,60 @@ def prepare_per_frame_atoms(language_model, cfg):
         else:
             print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
 
-def prepare_per_frame_events(cfg):
+# -------------- Task Preparation Helper Functions --------------
+def _prepare_task_target(interval_atom):
+    start_frame=interval_atom["start_frame"]
+    end_frame=interval_atom["end_frame"]
+    if "location_name" in interval_atom:
+        task_target = {
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "pred": interval_atom["pred"],
+            "location_name": interval_atom["location_name"],
+            "agent_class": interval_atom["agent_class"],
+        }
+    elif "action_id" in interval_atom:
+        task_target = {
+            "start_frame": int(start_frame),
+            "end_frame": int(end_frame),
+            "pred": interval_atom["pred"],
+            "action_id": interval_atom["action_id"],
+            "agent_class": interval_atom["agent_class"],
+        }
+    else:
+        raise ValueError(f"Unknown interval atom type: {interval_atom}")
+    return task_target 
 
-    def _prepare_per_split(split_name):
-        output_file = cfg["output_dir"] / f"{split_name}_events.pt"
-        if output_file.exists():
-            return
-        
-        atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
-        interval_atoms = [data["interval_atoms"] for data in atoms.values()]
-        events = []
-        count_downs = []
-        unique_atoms = utils_data.load_json(cfg["output_dir"] / "atoms" / "unique_atoms.json")
-        atom_vocab = {tuple(atom): i for i, atom in enumerate(unique_atoms)}
+def _prepare_task_input(interval_atom, per_frame_atoms, min_window):
+    start_frame = int(interval_atom["start_frame"])
+    task_input = per_frame_atoms[:start_frame]
+    task_input = [i[0] for i in task_input if len(i[0])>0]
+    return task_input
 
-        for video_intervals in tqdm(interval_atoms, desc="Events Preparing"):
-            min_start = min(int(interval["start_frame"]) for interval in video_intervals) if video_intervals else None
-            max_end = max(int(interval["end_frame"]) for interval in video_intervals) if video_intervals else None
-            video_event_matrix = torch.zeros((max_end, len(unique_atoms)),dtype = torch.bool)
-            for interval in video_intervals:
-                start, end = int(interval["start_frame"]), int(interval["end_frame"])
-                atom = utils_data.atom_to_signature(interval, cfg["dataset_labels"])
-                atom_idx = atom_vocab[atom[:-2]]
-                video_event_matrix[start:end, atom_idx] = True
-            events.append(video_event_matrix)
-            video_count_down_matrix = torch.zeros_like(video_event_matrix, dtype=torch.int) - 1
-            for frame_idx in range(max_end-1):
-                for atom_idx in range(len(unique_atoms)):
-                    # the frame left until the sign change for this atom
-                    counts = (video_event_matrix[frame_idx:, atom_idx] != video_event_matrix[frame_idx, atom_idx]).nonzero(as_tuple=True)[0]
-                    if len(counts)>0:
-                        video_count_down_matrix[frame_idx, atom_idx] = counts[0]
-            count_downs.append(video_count_down_matrix)
-            # Ensure the last frame has a countdown of 0 for all atoms
-            video_count_down_matrix[max_end-1, :] = 0
-        torch.save({
-            "events": events,
-            "count_downs": count_downs
-        }, output_file)
 
-    _prepare_per_split("train")
-    _prepare_per_split("val")
-    _prepare_per_split("test")
-    
-    return
+def prepare_per_split(cfg,split_name):
+    output_file = cfg["output_dir"] / f"tasks_{split_name}.pt"
+    if output_file.exists():
+        print(f"[{split_name} Tasks] already exists.")
+        return
+    atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
+    min_window = cfg["delay_windows"][0]
+    tasks = {}
+    for vid, video_atoms in atoms.items():
+        video_tasks = []
+        interval_atoms = video_atoms["interval_atoms"]
+        per_frame_atoms = video_atoms["per_frame_atoms"]
+        for interval_atom in interval_atoms:
+            if int(interval_atom["start_frame"])<=min_window:
+                continue
+            task = {}
+            task["input"] = _prepare_task_input(interval_atom, per_frame_atoms, min_window)
+            task["target"] = _prepare_task_target(interval_atom)
+            video_tasks.append(task)
+        tasks[vid] = video_tasks
+    torch.save({"tasks": tasks}, output_file)
+    print(f"[{split_name} Tasks] saved to {output_file}")
 
-def prepare_per_video_tasks(cfg):
-
-    # -------------- Task Preparation Helper Functions --------------
-    def _prepare_task_target(interval_atom):
-        start_frame=interval_atom["start_frame"]
-        end_frame=interval_atom["end_frame"]
-        if "location_name" in interval_atom:
-            task_target = {
-                "start_frame": start_frame,
-                "end_frame": end_frame,
-                "pred": interval_atom["pred"],
-                "location_name": interval_atom["location_name"],
-                "agent_class": interval_atom["agent_class"],
-            }
-        elif "action_id" in interval_atom:
-            task_target = {
-                "start_frame": int(start_frame),
-                "end_frame": int(end_frame),
-                "pred": interval_atom["pred"],
-                "action_id": interval_atom["action_id"],
-                "agent_class": interval_atom["agent_class"],
-            }
-        else:
-            raise ValueError(f"Unknown interval atom type: {interval_atom}")
-        return task_target 
-
-    def _prepare_task_input(interval_atom, per_frame_atoms, min_window):
-        start_frame = int(interval_atom["start_frame"])
-        task_input = per_frame_atoms[:start_frame-min_window]
-        task_input = [i[0] for i in task_input if len(i[0])>0]
-        return task_input
-
-    def _prepare_per_split(split_name):
-        output_file = cfg["output_dir"] / f"tasks_{split_name}.pt"
-        if output_file.exists():
-            print(f"[{split_name} Tasks] already exists.")
-            return
-        
-        atoms = utils_data.load_json(cfg["output_dir"] / "atoms" /f"{split_name}_atoms_compressed.json")
-        min_window = cfg["delay_windows"][0]
-        tasks = {}
-        for vid, video_atoms in atoms.items():
-            video_tasks = []
-            interval_atoms = video_atoms["interval_atoms"]
-            per_frame_atoms = video_atoms["per_frame_atoms"]
-            for interval_atom in interval_atoms:
-                if int(interval_atom["start_frame"])<=min_window:
-                    continue
-                task = {}
-                task["input"] = _prepare_task_input(interval_atom, per_frame_atoms, min_window)
-                task["target"] = _prepare_task_target(interval_atom)
-                video_tasks.append(task)
-
-            tasks[vid] = video_tasks
-        torch.save({"tasks": tasks}, output_file)
-        print(f"[{split_name} Tasks] saved to {output_file}")
-
-    # ----------- main splits preparation -----------
-    _prepare_per_split("train")
-    _prepare_per_split("val")
-    _prepare_per_split("test")
 
 
 def main(input_data):
@@ -351,6 +299,7 @@ def main(input_data):
         "device": input_data["device"],
         "delay_windows": input_data["delay_windows"],
         "dataset_labels": json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
+        
     }
     print(f"[Data Num] {cfg['data_num']}")
 
@@ -359,5 +308,7 @@ def main(input_data):
     # Prepare dataset by converting tracks to atoms for train, val, and test splits
     prepare_per_frame_atoms(language_model, cfg)
     # prepare_per_frame_events(cfg)
-    prepare_per_video_tasks(cfg)
+    for split_name in ["train", "val", "test"]:
+        prepare_per_split(cfg, split_name)
+
     print("\n--------- Step Dataset Done------------------\n")

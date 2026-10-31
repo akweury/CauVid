@@ -4,7 +4,6 @@ from pathlib import Path
 import os
 import sys
 import getpass
-import json
 import time
 import torch
 import numpy as np
@@ -12,20 +11,6 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
 
-
-
-def _atom_entity_key(atom_signature):
-    tube_uid = atom_signature[-1]
-    if tube_uid is not None:
-        return ("tube_uid", tube_uid)
-    else:
-        return ("agent_class", "av")
-
-
-def _beta_const_log_term(beta=2 / 3, gamma=-0.1, zeta=1.1):
-    # Closed-form constant from Louizos et al. (2017), "Learning Sparse Neural
-    # Networks through L0 Regularization": P(gate != 0) = sigmoid(log_alpha - beta*log(-gamma/zeta)).
-    return beta * np.log(-gamma / zeta)
 
 
 def hard_concrete_mask(log_alpha, beta=2 / 3, gamma=-0.1, zeta=1.1, training=True):
@@ -84,94 +69,6 @@ def _csr_from_cells(rows, columns, shape):
 
 
 
-    
-def _to_sparse_rows(rows, columns, shape):
-    """Pack the True cells of a 0/1 (N, M) matrix in CSR form.
-
-    `rows` must be non-decreasing (cells are appended row by row). Only the
-    True cells are stored: `col` holds their column ids and row i's columns
-    are col[crow[i]:crow[i + 1]]. This replaces a dense (N, M) matrix, which
-    for sparse features costs one byte per cell, mostly False.
-    """
-    return _csr_from_cells(
-        torch.tensor(rows, dtype=torch.long),
-        torch.tensor(columns, dtype=torch.long),
-        shape,
-    )
-
-def _index_frame_entities(atoms, horizon):
-    """Give every (frame, entity) observed in frame t a node id and list its atoms.
-
-    Node ids are contiguous per frame, so nodes of one frame form a
-    consecutive range. Entities not observed in frame t get no node.
-    Returns long tensors:
-      node_frame[n]: frame of node n;
-      current_cells: (node, atom_index) of every atom in frame t;
-      onset_cells: (node, atom_index, delta_t) of the first onset of each atom
-          of the node's entity within frames (t, t + horizon].
-    and the list node_keys[n] = (video_id, t, tube_uid) of node n.
-    """
-    atom_vocab = {tuple(atom): i for i, atom in enumerate(atoms["unique_atoms"])}
-    node_frame = []
-    node_keys = []
-    current_nodes, current_atom_ids = [], []
-    onset_nodes, onset_atom_ids, onset_delays = [], [], []
-    frame_id = 0
-    for video_id, video_atoms in tqdm(atoms.items(), desc="Indexing frames"):
-        if video_id == "unique_atoms":
-            continue
-        entity_onsets = utils_data.build_entity_onset_index(video_atoms["interval_atoms"], atom_vocab)
-        for t, (current_frame, _next_frame) in enumerate(video_atoms["per_frame_atoms"]):
-            if len(current_frame) == 0:
-                continue
-            base = len(node_frame)
-            entity_nodes = {}
-            node_tube_uids = {}
-            for atom in current_frame:
-                node = entity_nodes.setdefault(
-                    _atom_entity_key(atom), base + len(entity_nodes)
-                )
-                node_tube_uids[node] = atom[-1]
-                current_nodes.append(node)
-                current_atom_ids.append(atom[0])
-            for node, tube_uid in node_tube_uids.items():
-                node_keys.append((video_id, t, tube_uid))
-                for atom_index, delta_t in utils_data.future_onsets(
-                    entity_onsets.get(tube_uid, []), t, horizon
-                ):
-                    onset_nodes.append(node)
-                    onset_atom_ids.append(atom_index)
-                    onset_delays.append(delta_t)
-            node_frame.extend([frame_id] * len(entity_nodes))
-            frame_id += 1
-    return (
-        torch.tensor(node_frame, dtype=torch.long),
-        torch.tensor([current_nodes, current_atom_ids], dtype=torch.long),
-        torch.tensor([onset_nodes, onset_atom_ids, onset_delays], dtype=torch.long),
-        node_keys,
-    )
-
-
-def _node_tables(atoms, horizon, device):
-    """Dense per-node tables of `_index_frame_entities`. Returns
-      node_frame[n]: frame of node n;
-      current[n, a]: atom a holds for node n in frame t;
-      delay[n, a]: frames until atom a next starts for node n (0: not within
-          horizon, or already active in frame t);
-      node_keys[n]: (video_id, t, tube_uid) of node n.
-    """
-    num_atoms = len(atoms["unique_atoms"])
-    node_frame, current_cells, onset_cells, node_keys = _index_frame_entities(atoms, horizon)
-    num_nodes = len(node_frame)
-    node_frame = node_frame.to(device)
-    current = torch.zeros((num_nodes, num_atoms), dtype=torch.bool, device=device)
-    current[current_cells[0].to(device), current_cells[1].to(device)] = True
-    delay = torch.zeros((num_nodes, num_atoms), dtype=torch.int16, device=device)
-    delay[onset_cells[0].to(device), onset_cells[1].to(device)] = onset_cells[2].to(
-        device=device, dtype=torch.int16
-    )
-    delay[current] = 0
-    return node_frame, current, delay, node_keys
 
 
 def build_video_tensor(video_atoms, num_atoms, device="cpu"):
@@ -237,9 +134,6 @@ def build_video_delay_tensor(X, horizon):
     return D
 
 
-TEMPORAL_KINDS = ("held", "started", "ended")
-
-
 def past_bins(past_windows):
     """Disjoint past time bins (lo, hi) from the sorted window edges, e.g.
     [3, 5, 10] -> (0, 3), (3, 5), (5, 10). Bin (lo, hi) covers the frames
@@ -258,50 +152,45 @@ def lead_bins(delay_windows):
 
 def temporal_predicates(past_windows):
     """Names of the P predicates of `build_video_temporal_tensor`: "now", then
-    "held_lo_hi", "started_lo_hi", "ended_lo_hi" for each bin of `past_bins`."""
-    return ["now"] + [f"{kind}_{lo}_{hi}" for lo, hi in past_bins(past_windows) for kind in TEMPORAL_KINDS]
+    "appeared_lo_hi" for each bin of `past_bins`."""
+    return ["now"] + [f"appeared_{lo}_{hi}" for lo, hi in past_bins(past_windows)]
 
 
 def build_video_temporal_tensor(X, past_windows):
     """(T, N, P, A) bool tensor of one video: Xt[t, n, p, a] is temporal predicate p
     (`temporal_predicates`) of atom a for agent n in frame t, over the past frames.
 
-    p = 0 ("now") is X itself. For each disjoint bin (lo, hi) of `past_bins`, over
-    the frames (t - hi, t - lo]:
-      held: n holds a in every one of them (False if the bin starts before the video);
-      started: a starts for n in one of them (n holds a, but not in the frame before);
-      ended: a ends for n in one of them (n held a in the frame before, but not anymore).
+    p = 0 ("now") is X itself. For each disjoint bin (lo, hi) of `past_bins`,
+    appeared: n holds a in at least one of the frames (t - hi, t - lo] (frames
+    before the video count as not held).
     Bins are time ranges, not exact frame shifts, so rules can order events
-    (A started 5-10 frames ago, B started within 3 frames) and stay robust to jitter.
-    The first frame of the video has no starts or ends.
+    (A appeared 5-10 frames ago, B within 3 frames) and stay robust to jitter.
     """
-    previous = torch.zeros_like(X)
-    previous[1:] = X[:-1]
-    events = {"held": X, "started": X & ~previous, "ended": ~X & previous}
-    events["started"][0] = False
-    # counts[kind][j] - counts[kind][i]: frames i..j-1 with the event.
+    # counts[j] - counts[i]: frames i..j-1 in which n holds a.
     zero = torch.zeros_like(X[:1], dtype=torch.int32)
-    counts = {kind: torch.cat([zero, event.int().cumsum(dim=0, dtype=torch.int32)]) for kind, event in events.items()}
+    counts = torch.cat([zero, X.int().cumsum(dim=0, dtype=torch.int32)])
     end = torch.arange(1, X.shape[0] + 1, device=X.device)
     predicates = [X]
     for lo, hi in past_bins(past_windows):
         stop = (end - lo).clamp(min=0)
         start = (end - hi).clamp(min=0)
-        for kind in TEMPORAL_KINDS:
-            num_frames = counts[kind][stop] - counts[kind][start]
-            predicates.append(num_frames == hi - lo if kind == "held" else num_frames > 0)
+        num_frames = counts[stop] - counts[start]
+        predicates.append(num_frames > 0)
     return torch.stack(predicates, dim=2)
 
 
-def _pack_features(F):
-    # (R, ...) bool features -> (R, ceil(M / 8)) uint8 bits on CPU, M = F[0].numel().
-    return torch.from_numpy(np.packbits(F.reshape(len(F), -1).cpu().numpy(), axis=1))
+def _video_cells(X):
+    # (T, N, A) bool tensor of `build_video_tensor` -> its compact form on CPU:
+    # the (C, 3) int32 (t, n, a) of its True cells and its (T, N) shape.
+    return {"cells": torch.nonzero(X).to(torch.int32).cpu(), "shape": tuple(X.shape[:2])}
 
 
-def _unpack_features(packed, num_columns):
-    # Inverse of `_pack_features`, concatenated over a list of packed blocks: (R, M) bool.
-    bits = np.concatenate([p.numpy() for p in packed])
-    return torch.from_numpy(np.unpackbits(bits, axis=1, count=num_columns).astype(bool))
+def _video_from_cells(video, num_atoms, device):
+    # Inverse of `_video_cells`.
+    X = torch.zeros((*video["shape"], num_atoms), dtype=torch.bool, device=device)
+    t, n, a = video["cells"].to(device).long().T
+    X[t, n, a] = True
+    return X
 
 
 def build_body_features(Xt, D, body, head_atoms, bins):
@@ -357,18 +246,27 @@ def build_body_features(Xt, D, body, head_atoms, bins):
 
 
 def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
-    """Per-body, per-video lists of the `build_body_features` outputs; features
-    are bit-packed (`_pack_features`) on CPU, as they grow with the P temporal
-    predicates of `past_windows`."""
+    """The `build_body_features` outputs without the features, compacted for
+    storage on CPU. The features grow with the bodies and the P temporal
+    predicates of `past_windows`, so they are rebuilt from the video atoms
+    while learning (`body_features`). Returns
+      videos: [`_video_cells`] of each video;
+      per body, lists over the videos it has rows in:
+      video_ids: index into videos;
+      delays: (R, H) uint8 (int16 if the largest window exceeds 255) instead of
+          the (R, H, K) targets: the frames until head h next starts for the head
+          agent of each row, 0 if not within the largest window or already held.
+          The targets (`delay_targets`) and onset frames t + delay follow from it;
+      rows: (R, 3) int32 (t, n_body, n_head)."""
     bodies = list(set([c[0] for c in caw_clauses]))
     # Sorted so the bin axis K of the targets has a fixed order.
     delay_windows = sorted(set([c[-1] for c in caw_clauses]))
     num_atom_type = len(unique_atoms)
     bins = torch.tensor(lead_bins(delay_windows), dtype=torch.int16, device=device)
-    features = []
-    targets = []
-    features = {body:[] for body in bodies}
-    targets = {body:[] for body in bodies}
+    delay_dtype = torch.uint8 if max(delay_windows) <= 255 else torch.int16
+    videos = []
+    video_ids = {body:[] for body in bodies}
+    delays = {body:[] for body in bodies}
     rows = {body:[] for body in bodies}
     heads_by_body = {}
     for body, head, _window in caw_clauses:
@@ -385,80 +283,43 @@ def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
         print(f"Xt memory usage: {Xt.element_size() * Xt.nelement() / 1024 ** 2:.2f} MB")
         print(f"D memory usage: {D.element_size() * D.nelement() / 1024 ** 2:.2f} MB")
         for body in bodies:
-            F, T, R = build_body_features(Xt, D, body, head_atoms[body], bins)
-            if len(F)>0:
-                features[body].append(_pack_features(F))
-                targets[body].append(T.cpu())
-                rows[body].append(R.cpu())
-            
-    return features, targets, rows
+            _F, _T, R = build_body_features(Xt, D, body, head_atoms[body], bins)
+            if len(R)>0:
+                video_ids[body].append(len(videos))
+                delays[body].append(D[R[:, 0], R[:, 2]][:, head_atoms[body]].to(delay_dtype).cpu())
+                rows[body].append(R.to(torch.int32).cpu())
+        videos.append(_video_cells(X))
+
+    return videos, video_ids, delays, rows
+
+
+def body_features(examples, body, device):
+    """(R, M) bool features of one body on CPU, over the rows of
+    `examples["rows"][body]`: `build_body_features` rebuilt from the atoms of
+    each of its videos, flattened to M = (s + 2) * P * A columns."""
+    blocks = []
+    for v, stored_rows in zip(examples["video_ids"][body], examples["rows"][body]):
+        X = _video_from_cells(examples["videos"][v], examples["num_atoms"], device)
+        Xt = build_video_temporal_tensor(X, examples["past_windows"])
+        # Only the features are needed: no heads, so the delays are never read.
+        no_heads = torch.empty(0, dtype=torch.long, device=device)
+        no_bins = torch.empty((0, 2), dtype=torch.int16, device=device)
+        F, _T, R = build_body_features(Xt, X[:, :, :0], body, no_heads, no_bins)
+        if not torch.equal(R.cpu().to(torch.int32), stored_rows):
+            raise RuntimeError(f"Rebuilt rows of body {body} in video {v} differ from the stored ones.")
+        blocks.append(F.reshape(len(F), -1).cpu())
+        del X, Xt, F
+    return torch.cat(blocks)
+
+
+def delay_targets(delays, windows):
+    """(R, H * K) bool targets of `build_body_features` from the (R, H) delays of
+    `build_features`: column h * K + k is "head h next starts in lead bin k"."""
+    delays = delays.long().unsqueeze(-1)
+    bins = torch.tensor(lead_bins(windows), dtype=torch.long)
+    return ((delays > bins[:, 0]) & (delays <= bins[:, 1])).reshape(len(delays), -1)
         
 
-
-
-
-def _encode_examples(examples):
-    """Replace every atom signature in `examples` with an integer id.
-
-    Returns (compact, signatures): `compact` holds only ids and tensors,
-    `signatures[i]` is the atom signature with id i.
-    """
-    signature_ids = {}
-    signatures = []
-
-    def to_id(signature):
-        signature_id = signature_ids.get(signature)
-        if signature_id is None:
-            signature_id = len(signatures)
-            signature_ids[signature] = signature_id
-            signatures.append(signature)
-        return signature_id
-
-    body_ids = []
-    candidate_head_ids = []
-    for body_signature, body_group in examples["body_groups"].items():
-        body_ids.append(to_id(body_signature))
-        candidate_head_ids.append(torch.tensor(
-            [to_id(h) for h in body_group["candidate_heads"]], dtype=torch.long
-        ))
-    # feature_vocab[g][j] = (g, object_slot, atom_fact); g is implied by the
-    # list position, so store only (object_slot, atom_id) as an (M_g, 2) tensor.
-    feature_vocab = [
-        torch.tensor(
-            [(object_slot, to_id(atom_fact)) for _gid, object_slot, atom_fact in vocab],
-            dtype=torch.long,
-        ).reshape(-1, 2)
-        for vocab in examples["feature_vocab"]
-    ]
-    # head_vocab is rebuilt from body_groups on load (see build_head_vocab).
-    compact = {
-        "features": examples["features"],
-        "targets": examples["targets"],
-        "feature_vocab": feature_vocab,
-        "body_ids": torch.tensor(body_ids, dtype=torch.long),
-        "candidate_head_ids": candidate_head_ids,
-        "delay_windows": torch.tensor(examples["delay_windows"], dtype=torch.long),
-    }
-    # Pruned examples only: feature_aliases[g][j] is a list of vocab entries.
-    # Flatten each group to (K_g, 2) (object_slot, atom_id) rows; column j's
-    # aliases are rows alias_offsets[g][j]:alias_offsets[g][j + 1].
-    if "feature_aliases" in examples:
-        compact["alias_atoms"] = []
-        compact["alias_offsets"] = []
-        for group_aliases in examples["feature_aliases"]:
-            flat = [
-                (object_slot, to_id(atom_fact))
-                for aliases in group_aliases
-                for _gid, object_slot, atom_fact in aliases
-            ]
-            offsets = [0]
-            for aliases in group_aliases:
-                offsets.append(offsets[-1] + len(aliases))
-            compact["alias_atoms"].append(
-                torch.tensor(flat, dtype=torch.long).reshape(-1, 2)
-            )
-            compact["alias_offsets"].append(torch.tensor(offsets, dtype=torch.long))
-    return compact, signatures
 
 
 def build_head_vocab(body_groups, delay_windows):
@@ -469,70 +330,6 @@ def build_head_vocab(body_groups, delay_windows):
             for window in delay_windows:
                 head_vocab.append((body, head, window))
     return head_vocab
-
-    
-def _decode_examples(compact, signatures):
-    """Inverse of `_encode_examples`."""
-    body_groups = {}
-    for body_id, head_ids in zip(compact["body_ids"].tolist(), compact["candidate_head_ids"]):
-        body_groups[signatures[body_id]] = {
-            "candidate_heads": tuple(signatures[h] for h in head_ids.tolist())
-        }
-    delay_windows = compact["delay_windows"].tolist()
-    head_vocab = build_head_vocab(body_groups, delay_windows)
-    group_ids = {body_signature: gid for gid, body_signature in enumerate(body_groups)}
-    group_head_vocab = [[] for _ in range(len(body_groups))]
-    for body_signature, head_signature, window in head_vocab:
-        gid = group_ids[body_signature]
-        group_head_vocab[gid].append((gid, head_signature, window))
-    feature_vocab = [
-        [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in vocab.tolist()]
-        for gid, vocab in enumerate(compact["feature_vocab"])
-    ]
-    examples = {
-        "features": compact["features"],
-        "targets": compact["targets"],
-        "feature_vocab": feature_vocab,
-        "head_vocab": group_head_vocab,
-        "body_groups": body_groups,
-        "delay_windows": delay_windows,
-    }
-    if "alias_atoms" in compact:
-        examples["feature_aliases"] = []
-        for gid, (flat, offsets) in enumerate(
-            zip(compact["alias_atoms"], compact["alias_offsets"])
-        ):
-            flat = [(gid, object_slot, signatures[atom_id]) for object_slot, atom_id in flat.tolist()]
-            offsets = offsets.tolist()
-            examples["feature_aliases"].append(
-                [flat[start:end] for start, end in zip(offsets[:-1], offsets[1:])]
-            )
-    return examples
-
-
-
-def _save_examples(examples, cache_file, signature_file):
-    # Features/targets/vocab ids live in the .pt file; the id -> atom signature
-    # mapping lives in a separate JSON file so signatures are stored only once.
-    compact, signatures = _encode_examples(examples)
-    torch.save(compact, cache_file)
-    utils_data.save_json(signatures, signature_file)
-    print(f"[Cache] Saved {cache_file} and {signature_file}")
-
-
-def _load_examples(cache_file, signature_file):
-    """Return the examples cached by `_save_examples`, or None if unavailable."""
-    if not (cache_file.exists() and signature_file.exists()):
-        return None
-    compact = torch.load(cache_file, weights_only=False)
-    # Older caches stored dense bool tensors; rebuild them in sparse form.
-    if any(torch.is_tensor(X) for X in compact["features"]):
-        print(f"[Cache] {cache_file} uses the old dense format, rebuilding")
-        return None
-    with open(signature_file, "r") as f:
-        signatures = [tuple(s) for s in json.load(f)]
-    print(f"[Cache] Loaded {cache_file} and {signature_file}")
-    return _decode_examples(compact, signatures)
 
 
 
@@ -672,50 +469,11 @@ def prune_examples(examples, min_support):
         "feature_aliases": feature_aliases,
     }
 
-def build_training_examples(atoms, clauses, labels, unique_atoms, cfg):
-    body_groups = group_clauses_by_body(clauses)
-    head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
-    features, targets, rows = build_features(
-        atoms, head_vocab, unique_atoms, cfg["device"], cfg["past_windows"]
-    )
-    predicates = temporal_predicates(cfg["past_windows"])
-    examples = {
-        "body_groups": body_groups,
-        "delay_windows": list(cfg["delay_windows"]),
-        "past_windows": list(cfg["past_windows"]),
-        # Targets are disjoint lead bins (`lead_bins`), not cumulative windows.
-        "target_kind": "lead_bins",
-        # Axes H and K of targets[body]: the body's distinct heads in clause
-        # order and the sorted windows (bin upper edges), as in `build_features`.
-        "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
-        "windows": sorted(set(cfg["delay_windows"])),
-        # Axes P and A of the (s + 2, P, A) features of a body (b, s).
-        "predicates": predicates,
-        "num_atoms": len(unique_atoms),
-        "features": features,
-        "targets": targets,
-        "rows": rows,
-    }
-    # examples = prune_examples(examples, cfg["min_support"])
-
-    # print summary of the training data
-    # features[body] / targets[body]: per-video lists of packed (s + 2, P, A) / (R, H, K) tensors.
-    num_bodies = sum(1 for F in features.values() if F)
-    num_rows = sum(len(F) for Fs in features.values() for F in Fs)
-    num_features = sum((body[1] + 2) * len(predicates) * len(unique_atoms) for body, Fs in features.items() if Fs)
-    num_heads = sum(Ts[0][0].numel() for Ts in targets.values() if Ts)
-
-    print(f"[Videos] \t {len(atoms)}")
-    print(f"[Bodies]\t {num_bodies}")
-    print(f"[Heads]\t\t {num_heads}")
-    print(f"[Examples]\t {num_rows}")
-    print(f"[Features]\t {num_features}")
-
-    return examples
 
 def learn_extension_masks(
     X, Y, num_epochs=200, lr=0.1, l0_lambda=1e-3, device='cpu', batch_size=None,
     mask_patience=20, check_every=5, gate_tol=1e-3, init_log_alpha=-5.0,
+    positive_weights=None,
 ):
     # X: (N, M) 0/1 tensor, Y: (N, H) 0/1 tensor; one rule (gate vector) per
     # head column of Y, all trained together. Heads are independent: the loss
@@ -733,6 +491,9 @@ def learn_extension_masks(
     #     survives even when s is tiny.
     # Positives are up-weighted per head to balance rare heads, and `l0_lambda`
     # is the cost of each selected atom (penalty = sum of w), independent of M.
+    # `positive_weights` (N, H) weights the positives relative to each other
+    # (e.g. 1 / rows of their event, so each event counts once); the positives
+    # of a head then get the same total weight as its negatives.
     # (1 - X) is uploaded to `device` once if it fits (`batch_size=None`
     # auto-sizes from free GPU memory), otherwise moved in row batches.
     # The output is the hard mask w > 0.5, so training stops once that mask has
@@ -746,11 +507,15 @@ def learn_extension_masks(
         batch_size = _auto_batch_size(M + H, device)
     X_off = 1 - X.detach().to('cpu', torch.float32)
     Y = Y.detach().to('cpu', torch.float32)
-    num_positives = Y.sum(dim=0)
-    pos_weight = torch.where(
-        num_positives > 0, (N - num_positives) / num_positives.clamp(min=1), torch.ones_like(num_positives)
+    if positive_weights is None:
+        positive_weights = torch.ones_like(Y)
+    positive_weights = positive_weights.detach().to('cpu', torch.float32) * Y
+    total_positive = positive_weights.sum(dim=0)
+    pos_scale = torch.where(
+        total_positive > 0, (N - Y.sum(dim=0)) / total_positive.clamp(min=1e-12), torch.ones_like(total_positive)
     )
-    weights = 1 + (pos_weight - 1) * Y
+    weights = (1 - Y) + positive_weights * pos_scale
+    del positive_weights
 
     whole_dataset_fits = batch_size >= N
     if whole_dataset_fits:
@@ -809,13 +574,16 @@ def learn_extension_masks(
 
 
 
-def _evaluate_extension(feature_block, target_col, selected_feature_positions):
+def _evaluate_extension(feature_block, target_col, selected_feature_positions, event_col):
     """Compute hard support/coverage/confidence/recall for a candidate extension.
 
     feature_block: dense (N, M) 0/1 array for this group's rows/features.
     target_col: dense (N,) 0/1 array for the candidate head within this group.
     selected_feature_positions: indices (into the group's local feature axis)
         selected by the learned mask.
+    event_col: (N,) event id of each positive row (`_event_ids`), -1 for negatives.
+    Support and confidence count rows (observation frames); recall counts
+    events, as the rows before one onset are many correlated views of it.
     """
     base_rows = feature_block.shape[0]
     base_head_count = int(target_col.sum())
@@ -831,14 +599,17 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
     support = int(extended_mask.sum())
     if support == 0:
         return {
-            "support": 0, "coverage": 0.0, "confidence": 0.0,
-            "recall": 0.0, "confidence_gain": -base_confidence, "lift": 0.0, "f1": 0.0,
+            "support": 0, "coverage": 0.0, "confidence": 0.0, "recall": 0.0, "row_recall": 0.0,
+            "events": 0, "confidence_gain": -base_confidence, "lift": 0.0, "f1": 0.0,
         }
 
     head_hits = int(target_col[extended_mask].sum())
     confidence = head_hits / support
     coverage = support / base_rows if base_rows else 0.0
-    recall = head_hits / base_head_count if base_head_count else 0.0
+    row_recall = head_hits / base_head_count if base_head_count else 0.0
+    num_events = len(np.unique(event_col[event_col >= 0]))
+    events_hit = len(np.unique(event_col[extended_mask & (event_col >= 0)]))
+    recall = events_hit / num_events if num_events else 0.0
     f1 = (
         2 * confidence * recall / (confidence + recall)
         if (confidence + recall) > 0 else 0.0
@@ -848,6 +619,8 @@ def _evaluate_extension(feature_block, target_col, selected_feature_positions):
         "coverage": coverage,
         "confidence": confidence,
         "recall": recall,
+        "row_recall": row_recall,
+        "events": events_hit,
         "confidence_gain": confidence - base_confidence,
         # confidence relative to the body alone; base_confidence > 0 for learnable heads.
         "lift": confidence / base_confidence if base_confidence else 0.0,
@@ -1014,12 +787,25 @@ def _learnable_heads(targets, video_of_row, min_videos):
     return learnable_heads
 
 
-def _accepted_metrics(feature_block, target_col, selected_positions, video_of_row, cfg):
+def _event_ids(Y, rows, delays, video_of_row, num_windows):
+    """(N, C) long id of the event each positive target cell belongs to, -1 for
+    negatives. An event is one onset (video, head agent, head, onset frame
+    t + delay) seen in one lead bin: target column c = h * K + k of `_extend_body`."""
+    r, c = torch.nonzero(Y, as_tuple=True)
+    onsets = rows[r, 0].long() + delays[r, c // num_windows].long()
+    keys = torch.stack([video_of_row[r], rows[r, 2].long(), onsets, c], dim=1)
+    _keys, ids = torch.unique(keys, dim=0, return_inverse=True)
+    event_id = torch.full(Y.shape, -1, dtype=torch.long)
+    event_id[r, c] = ids
+    return event_id
+
+
+def _accepted_metrics(feature_block, target_col, selected_positions, video_of_row, event_col, cfg):
     # Hard metrics of the learned extension, or None if it is rejected.
     if not selected_positions:
         return None
 
-    metrics = _evaluate_extension(feature_block, target_col, selected_positions)
+    metrics = _evaluate_extension(feature_block, target_col, selected_positions, event_col)
     if metrics["support"] < cfg["min_support"]:
         return None
     # Relative, not absolute: head onsets are rare (base confidence ~0.5%), so a
@@ -1034,49 +820,65 @@ def _accepted_metrics(feature_block, target_col, selected_positions, video_of_ro
     return metrics
 
 
-def _extend_body(body, features, targets, heads, windows, predicates, num_atoms, cfg):
+def _extend_body(body, examples, cfg):
     """Differentiable conjunctive rule learning for one body; returns the
     accepted extensions of its (head, window) pairs.
 
-    features, targets: per-video lists of packed (s + 2, P, A) features
-    (`_pack_features`) and (R, H, K) bool targets (`build_body_features`);
-    heads, windows: the H heads and K windows; predicates: the P temporal predicates.
+    examples: of `build_training_examples`; the body's (R, H) delays and (R, 3)
+    rows per video, its H heads, the K windows and P temporal predicates. The
+    features are rebuilt from the video atoms (`body_features`).
     """
-    if not features:
+    rows = examples["rows"][body]
+    if not rows:
         return []
+    heads, windows = examples["heads"][body], examples["windows"]
+    predicates, num_atoms = examples["predicates"], examples["num_atoms"]
 
     # Flatten the role slots, temporal predicates and atoms, and the (head,
     # window) pairs into columns, on CPU; `learn_extension_masks` moves them to
     # the device. Feature column (slot * P + p) * A + atom is "agent in role
     # slot satisfies predicate p of atom"; target column h * K + k is
     # "heads[h] starts in lead bin k", the bin ending at windows[k].
-    num_slots, num_predicates = body[1] + 2, len(predicates)
-    X = _unpack_features(features, num_slots * num_predicates * num_atoms)
-    num_rows = len(X)
-    Y = torch.cat(targets).cpu().reshape(num_rows, -1)
-    feature_block = X.numpy()
+    num_predicates = len(predicates)
+    delays = torch.cat(examples["delays"][body])
+    Y = delay_targets(delays, windows)
     video_of_row = torch.repeat_interleave(
-        torch.arange(len(features)), torch.tensor([len(F) for F in features])
+        torch.arange(len(rows)), torch.tensor([len(R) for R in rows])
     )
 
     learnable_heads = _learnable_heads(Y, video_of_row, cfg["min_videos"])
     if not learnable_heads:
         return []
+    event_id = _event_ids(Y, torch.cat(rows), delays, video_of_row, len(windows))
+    del delays
+    X = body_features(examples, body, cfg["device"])
+    feature_block = X.numpy()
     video_of_row = video_of_row.numpy()
+
+    # Each event's positive rows share a weight of 1, so an event observed over
+    # many frames (or body agents) counts as much as a briefly observed one.
+    event_id_learnable = event_id[:, learnable_heads]
+    positive = event_id_learnable >= 0
+    event_rows = torch.bincount(event_id_learnable[positive])
+    positive_weights = torch.zeros(event_id_learnable.shape, dtype=torch.float32)
+    positive_weights[positive] = 1.0 / event_rows[event_id_learnable[positive]]
+    del event_id_learnable, positive, event_rows
 
     # All learnable heads of the body are trained together.
     final_masks, _log_alpha = learn_extension_masks(
         X, Y[:, learnable_heads],
         num_epochs=cfg["num_epochs"], lr=cfg["lr"], l0_lambda=cfg["l0_lambda"],
-        device=cfg["device"],
+        device=cfg["device"], positive_weights=positive_weights,
     )
+    del positive_weights
 
     body_data = []
     for mask_col, head_col in enumerate(learnable_heads):
         target_col = Y[:, head_col].numpy().astype(np.float32)
         selected_positions = torch.nonzero(final_masks[:, mask_col], as_tuple=True)[0].tolist()
         metrics = _accepted_metrics(
-            feature_block, target_col, selected_positions, video_of_row, cfg
+            feature_block, target_col, selected_positions, video_of_row,
+            event_id[:, head_col].numpy(), cfg
         )
         if metrics is None:
             continue
@@ -1163,18 +965,14 @@ def _init_wandb(cfg, num_bodies):
 
 
 def _learn_extensions(examples, cfg):
-    num_bodies = len(examples["features"])
+    num_bodies = len(examples["rows"])
     run = _init_wandb(cfg, num_bodies)
     extended_data = []
     start_time = time.perf_counter()
     try:
-        for i, (body, features) in enumerate(tqdm(examples["features"].items(), desc="Learning rule extensions")):
+        for i, body in enumerate(tqdm(examples["rows"], desc="Learning rule extensions")):
             body_start = time.perf_counter()
-            body_data = _extend_body(
-                body, features, examples["targets"][body],
-                examples["heads"][body], examples["windows"],
-                examples["predicates"], examples["num_atoms"], cfg,
-            )
+            body_data = _extend_body(body, examples, cfg)
             extended_data.extend(body_data)
             # The body's dense blocks are freed on return.
             if cfg["device"] != 'cpu' and torch.cuda.is_available():
@@ -1184,7 +982,7 @@ def _learn_extensions(examples, cfg):
                     "progress/bodies_done": i + 1,
                     "progress/fraction": (i + 1) / num_bodies,
                     "progress/elapsed_s": time.perf_counter() - start_time,
-                    "body/rows": sum(len(F) for F in features),
+                    "body/rows": sum(len(R) for R in examples["rows"][body]),
                     "body/head_cols": len(examples["heads"][body]) * len(examples["windows"]),
                     "body/accepted": len(body_data),
                     "body/seconds": time.perf_counter() - body_start,
@@ -1194,13 +992,14 @@ def _learn_extensions(examples, cfg):
             import wandb
             table = wandb.Table(columns=[
                 "body", "head", "delay_window", "extra_atoms",
-                "support", "videos", "confidence", "recall", "confidence_gain", "lift", "f1",
+                "support", "events", "videos", "confidence", "recall", "row_recall", "confidence_gain", "lift", "f1",
             ])
             for item in extended_data:
                 m = item["metrics"]
                 table.add_data(
                     str(item["body"]), str(item["head"]), item["delay_window"], str(item["extra_atoms"]),
-                    m["support"], m["videos"], m["confidence"], m["recall"], m["confidence_gain"], m["lift"], m["f1"],
+                    m["support"], m["events"], m["videos"], m["confidence"], m["recall"], m["row_recall"],
+                    m["confidence_gain"], m["lift"], m["f1"],
                 )
             run.log({"extensions": table})
             run.summary["total/accepted"] = len(extended_data)
@@ -1211,31 +1010,66 @@ def _learn_extensions(examples, cfg):
     return extended_data
 
 
-def extend_clauses(cfg):
-    # load necessary data files
-    labels = utils_data.load_json(cfg['dataset_label_file'])
-    atoms = utils_data.load_json(cfg['train_atom_file'])
-    causal_anchor_clauses = utils_data.load_json(cfg['causal_anchor_clause_file'])
-    unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
-    print(f"Loaded causal anchor clauses: {len(causal_anchor_clauses)}")
+
+
+
+def build_training_examples(cfg):
     
-    # Build training examples from the loaded anchor clauses, labels, and atoms.
-    # The cache is reused only if it was built with the same temporal predicates.
-    examples = None
-    if os.path.exists(cfg["extension_training_example_file"]):
-        examples = torch.load(cfg["extension_training_example_file"], map_location="cpu")
-        if examples.get("target_kind") != "lead_bins":
-            print("[Rule extension] Cached training examples have cumulative window targets; rebuilding.")
-            examples = None
-    if examples is None:
-        examples = build_training_examples(atoms, causal_anchor_clauses, labels, unique_atoms, cfg)
-        torch.save(examples, cfg["extension_training_example_file"])
+    atoms = utils_data.load_json(cfg['train_atom_file'])
+    clauses = utils_data.load_json(cfg['causal_anchor_clause_file'])
+    unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
+    
+    body_groups = group_clauses_by_body(clauses)
+    head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
+    videos, video_ids, delays, rows = build_features(
+        atoms, head_vocab, unique_atoms, cfg["device"], cfg["past_windows"]
+    )
+
+    examples = {
+        "body_groups": body_groups,
+        "delay_windows": list(cfg["delay_windows"]),
+        "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
+        "windows": sorted(set(cfg["delay_windows"])),
+        "past_windows": list(cfg["past_windows"]),
+        "predicates": temporal_predicates(cfg["past_windows"]),
+        "num_atoms": len(unique_atoms),
+        "videos": videos,
+        "video_ids": video_ids,
+        "delays": delays,
+        "rows": rows,
+    }
+
+    num_bodies = sum(1 for Rs in rows.values() if Rs)
+    num_rows = sum(len(R) for Rs in rows.values() for R in Rs)
+    num_predicates = len(examples["predicates"])
+    num_features = sum(
+        (body[1] + 2) * num_predicates * len(unique_atoms) for body, Rs in rows.items() if Rs
+    )
+    num_heads = sum(Ds[0].shape[1] * len(examples["windows"]) for Ds in delays.values() if Ds)
+
+    print(f"[Videos] \t {len(atoms)}")
+    print(f"[Bodies]\t {num_bodies}")
+    print(f"[Heads]\t\t {num_heads}")
+    print(f"[Examples]\t {num_rows}")
+    print(f"[Features]\t {num_features}")
+
+    return examples
+
+
+
+def extend_clauses(cfg):
+    unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
+    examples = torch.load(cfg["extension_training_example_file"], map_location="cpu")
+    if "videos" not in examples:
+        raise RuntimeError(
+            f"{cfg['extension_training_example_file']} has the old format (stored features); "
+            f"delete it to rebuild the training examples."
+        )
 
     extended_data = _learn_extensions(examples, cfg)
     extended_clauses = _to_extended_clauses(extended_data, unique_atoms, cfg)
+    print(f"[Rule extension] Learned {len(extended_clauses)} extended clauses")
     return extended_clauses
-
-
 
 
 
@@ -1262,10 +1096,15 @@ def main(input_data):
             'anchor_clause_file': input_data['anchor_clause_file'],
             'extension_training_example_file': input_data["output_dir"] / "training_examples.pt",
             "unique_atoms_file": input_data["unique_atoms_file"],
-            "events_file": input_data["events_file"]
+            "events_file": input_data["events_file"],
+            "extended_clause_file": input_data["output_dir"] / "extended_clauses.json"
     }
-    extend_clause_file = cfg['output_dir'] / "extended_clauses.json"
-    if not extend_clause_file.exists():
+    
+    if not os.path.exists(cfg["extension_training_example_file"]):
+        examples = build_training_examples(cfg)
+        torch.save(examples, cfg["extension_training_example_file"])
+        
+    if not os.path.exists(cfg["extended_clause_file"]):
         extended_clauses = extend_clauses(cfg)
-        utils_data.save_json(extended_clauses, extend_clause_file)
-        print(f"[Rule extension] Learned {len(extended_clauses)} extended clauses")
+        utils_data.save_json(extended_clauses, cfg["extended_clause_file"])
+        

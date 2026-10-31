@@ -3,7 +3,7 @@
     "data_num": "10",
     "mask_iou_th": 0.1,
     "frame_rate": 10,
-    "delay_windows": [10, 20, 50],
+    "delay_windows": [20,40,60,80,100],
     "primary_confidence": 0.3,
     "candidate_confidence": 0.05,
     "nms_iou": 0.5,
