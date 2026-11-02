@@ -1302,7 +1302,7 @@ def main(input_data):
             'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
             'num_rules': 256,
             # Training: batches of target frames sampled from a few videos at a time.
-            'num_epochs': 50,
+            'num_epochs': 1000,
             'lr': 0.01,
             'videos_per_batch': 4,
             'frames_per_video': 32,
