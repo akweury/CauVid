@@ -148,19 +148,24 @@ class TemporalRuleNet(torch.nn.Module):
     """Layer-per-frame rule network: predicts which atoms switch on in frame t
     from the K frames before it.
 
-    Every agent runs the same weights. Its input layers are frames t-1..t-K, each
-    with two groups of A atom nodes: slot 0 "self" (the agent holds the atom) and
-    slot 1 "others" (some other agent visible in that frame holds it), so
-    M = 2 * K * A input nodes. R rule nodes are soft ANDs over a sparse
-    hard-concrete mask of the inputs; the lags of a rule's inputs give the order
+    Every agent runs the same weights. The frames t-1..t-K are grouped into B lag
+    bins (lo, hi], e.g. edges (1, 2, 4, 8, ..., 100) -> bins 1, 2, 3-4, 5-8, ...,
+    65-100 frames ago. Each bin is one input layer with two groups of A atom
+    nodes: slot 0 "self" (the agent holds the atom in some frame of the bin) and
+    slot 1 "others" (some other agent holds it in some frame of the bin), so
+    M = 2 * B * A input nodes. R rule nodes are soft ANDs over a sparse
+    hard-concrete mask of the inputs; the bins of a rule's inputs give the order
     of its body atoms. Each head atom is a weighted OR of the rule nodes.
     """
 
-    def __init__(self, num_atoms, num_lags=30, num_rules=256, init_log_alpha=-6.0):
+    def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), num_rules=256, init_log_alpha=-6.0):
         super().__init__()
         self.num_atoms = num_atoms
-        self.num_lags = num_lags
-        self.num_inputs = 2 * num_lags * num_atoms
+        # Bin i covers lo_i..hi_i frames ago, hi_i = lag_edges[i], lo_i = hi_{i-1} + 1.
+        self.lag_bins = [(lo + 1, hi) for lo, hi in zip((0, *lag_edges[:-1]), lag_edges)]
+        self.num_lags = lag_edges[-1]
+        self.num_bins = len(self.lag_bins)
+        self.num_inputs = 2 * self.num_bins * num_atoms
         # Very negative so only a few random inputs per rule start non-zero.
         self.log_alpha = torch.nn.Parameter(torch.full((num_rules, self.num_inputs), init_log_alpha))
         self.head_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
@@ -174,14 +179,15 @@ class TemporalRuleNet(torch.nn.Module):
         long target frames t (may be T, one past the video, to predict from it).
         Row f * N + n is agent n at frames[f]; frames before 0 are empty layers.
         """
-        K, A = self.num_lags, self.num_atoms
+        K, B, A = self.num_lags, self.num_bins, self.num_atoms
         N = X.shape[1]
         past = frames[:, None] - torch.arange(1, K + 1, device=X.device)   # (F, K) lag k = column k - 1
         own = X[past.clamp(min=0)] & (past >= 0)[..., None, None]             # (F, K, N, A)
+        own = torch.stack([own[:, lo - 1:hi].any(dim=1) for lo, hi in self.lag_bins], dim=1)  # (F, B, N, A)
         holders = own.sum(dim=2, keepdim=True)
         others = (holders - own.int()) > 0
-        inputs = torch.stack([own, others], dim=1)                            # (F, 2, K, N, A)
-        return inputs.permute(0, 3, 1, 2, 4).reshape(len(frames) * N, 2 * K * A).float()
+        inputs = torch.stack([own, others], dim=1)                            # (F, 2, B, N, A)
+        return inputs.permute(0, 3, 1, 2, 4).reshape(len(frames) * N, 2 * B * A).float()
 
     def training_rows(self, X, frames):
         """Inputs and onset targets of the agents visible at each target frame.
@@ -259,15 +265,17 @@ class TemporalRuleNet(torch.nn.Module):
         return (inputs @ body.T) / body.sum(dim=1).clamp(min=1)
 
     def decode_input(self, m):
-        """Input node m -> (atom, slot, lag): slot 0 self, 1 others; lag in frames."""
-        K, A = self.num_lags, self.num_atoms
-        return m % A, m // (K * A), (m // A) % K + 1
+        """Input node m -> (atom, slot, lo, hi): slot 0 self, 1 others; the atom
+        holds lo..hi frames before the head."""
+        B, A = self.num_bins, self.num_atoms
+        lo, hi = self.lag_bins[(m // A) % B]
+        return m % A, m // (B * A), lo, hi
 
     @torch.no_grad()
     def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1):
-        """Rules [{"rule": r, "bodies": [(atom, slot, lag)], "heads": [(atom, weight)]}].
+        """Rules [{"rule": r, "bodies": [(atom, slot, lo, hi)], "heads": [(atom, weight)]}].
 
-        Bodies are sorted earliest first (largest lag), the order the atoms happen.
+        Bodies are sorted earliest first (largest lag bin), the order the atoms happen.
         """
         body = self.rule_mask() > mask_threshold
         rules = []

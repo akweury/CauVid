@@ -1140,7 +1140,7 @@ def train_temporal_rule_net(training_data, cfg, run=None):
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["num_lags"], cfg["num_rules"]).to(device)
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], cfg["num_rules"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
     # Fixed validation frames, so the losses of the epochs are comparable.
@@ -1204,9 +1204,9 @@ def load_temporal_rule_net(training_data, cfg):
     """The trained TemporalRuleNet of cfg["model_file"], in eval mode on cfg["device"].
 
     The model is rebuilt with the same sizes it was trained with (num_atoms of
-    the training data, num_lags and num_rules of cfg) before its weights are loaded.
+    the training data, lag_edges and num_rules of cfg) before its weights are loaded.
     """
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["num_lags"], cfg["num_rules"])
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], cfg["num_rules"])
     model.load_state_dict(torch.load(cfg["model_file"], map_location="cpu"))
     return model.to(cfg["device"]).eval()
 
@@ -1234,10 +1234,10 @@ def _rule_head_counts(model, training_data, cfg):
 
 
 def _temporal_clause_text(clause, unique_atoms):
-    # Bodies earliest first: "Car:MovAway(X0)@-6f -> Ped:Wait(X1)@-2f => Car:Stop(X0)".
+    # Bodies earliest first: "Car:MovAway(X0)@-5..8f -> Ped:Wait(X1)@-2..2f => Car:Stop(X0)".
     def atom(atom_index, slot):
         return f"{_atom_name(unique_atoms[atom_index])}(X{slot})"
-    body = " -> ".join(f"{atom(a, slot)}@-{lag}f" for a, slot, lag in clause["bodies"])
+    body = " -> ".join(f"{atom(a, slot)}@-{lo}..{hi}f" for a, slot, lo, hi in clause["bodies"])
     return f"{body} => {atom(*clause['head'])}"
 
 
@@ -1246,8 +1246,8 @@ def extract_temporal_clauses(model, training_data, cfg, run=None):
     head weight, kept if the rule hits the head in at least min_support training
     frames of at least min_videos videos.
 
-    Each clause: bodies [(atom, slot, lag)] earliest first (lag = frames before
-    the head; slot 0 the head agent, 1 some other agent), body_scopes their
+    Each clause: bodies [(atom, slot, lo, hi)] earliest first (the atom holds
+    lo..hi frames before the head; slot 0 the head agent, 1 some other agent), body_scopes their
     slots, head (atom, 0), weight, and on the training videos support (hits),
     fires and confidence = support / fires, num_videos. Sorted by confidence.
     """
@@ -1264,7 +1264,7 @@ def extract_temporal_clauses(model, training_data, cfg, run=None):
                 continue
             clauses.append({
                 "bodies": [list(b) for b in rule["bodies"]],
-                "body_scopes": [slot for _atom, slot, _lag in rule["bodies"]],
+                "body_scopes": [slot for _atom, slot, _lo, _hi in rule["bodies"]],
                 "head": [h, 0],
                 "rule": r,
                 "weight": weight,
@@ -1297,8 +1297,9 @@ def main(input_data):
             'output_dir': input_data['output_dir'],
             'device': input_data['device'],
             'seed': 0,
-            # Model: K past frames (input layers) per prediction, R rule nodes.
-            'num_lags': 30,
+            # Model: lag bins (lo, hi] of the past frames, one input layer each, and
+            # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
+            'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
             'num_rules': 256,
             # Training: batches of target frames sampled from a few videos at a time.
             'num_epochs': 50,
