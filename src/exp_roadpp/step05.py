@@ -1140,7 +1140,15 @@ def train_temporal_rule_net(training_data, cfg, run=None):
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], cfg["num_rules"]).to(device)
+    # One rule node per (anchor body, lag bin), plus num_free_rules unseeded ones.
+    body_groups = group_clauses_by_body(utils_data.load_json(cfg["causal_anchor_clause_file"]))
+    anchors = [(body, [head[0] for head in heads]) for body, heads in body_groups.items()]
+    num_bins = len(cfg["lag_edges"])
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
+                            len(anchors) * num_bins + cfg["num_free_rules"])
+    num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
+    model = model.to(device)
+    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free")
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
     # Fixed validation frames, so the losses of the epochs are comparable.
@@ -1169,7 +1177,9 @@ def train_temporal_rule_net(training_data, cfg, run=None):
 
             logits, _rules = model(inputs)
             onset_loss = model.loss(logits, targets, at_risk, cfg["pos_weight"])
-            loss = onset_loss + cfg["l0_lambda"] * model.sparsity_loss()
+            # No sparsity pressure in the first epochs, so useful inputs can grow first.
+            l0_lambda = cfg["l0_lambda"] if epoch >= cfg["l0_warmup_epochs"] else 0.0
+            loss = onset_loss + l0_lambda * model.sparsity_loss()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -1204,10 +1214,12 @@ def load_temporal_rule_net(training_data, cfg):
     """The trained TemporalRuleNet of cfg["model_file"], in eval mode on cfg["device"].
 
     The model is rebuilt with the same sizes it was trained with (num_atoms of
-    the training data, lag_edges and num_rules of cfg) before its weights are loaded.
+    the training data, lag_edges of cfg, the number of rules of the saved weights)
+    before its weights, and its seeded anchor inputs, are loaded.
     """
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], cfg["num_rules"])
-    model.load_state_dict(torch.load(cfg["model_file"], map_location="cpu"))
+    state = torch.load(cfg["model_file"], map_location="cpu")
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], state["log_alpha"].shape[0])
+    model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
 
@@ -1300,7 +1312,10 @@ def main(input_data):
             # Model: lag bins (lo, hi] of the past frames, one input layer each, and
             # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
             'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
-            'num_rules': 256,
+            # Rules: one per (anchor body, lag bin) with the anchor as a fixed input
+            # and seed_head_weight to its heads, plus num_free_rules unseeded ones.
+            'num_free_rules': 0,
+            'seed_head_weight': 1.0,
             # Training: batches of target frames sampled from a few videos at a time.
             'num_epochs': 1000,
             'lr': 0.01,
@@ -1310,6 +1325,7 @@ def main(input_data):
             'positive_frame_ratio': 0.5,
             'pos_weight': 20.0,
             'l0_lambda': 1e-3,
+            'l0_warmup_epochs': 10,
             'val_video_ratio': 0.1,
             # Rule extraction thresholds of the trained model.
             'mask_threshold': 0.5,

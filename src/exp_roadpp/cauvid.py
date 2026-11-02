@@ -170,6 +170,32 @@ class TemporalRuleNet(torch.nn.Module):
         self.log_alpha = torch.nn.Parameter(torch.full((num_rules, self.num_inputs), init_log_alpha))
         self.head_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
         self.head_bias = torch.nn.Parameter(torch.full((num_atoms,), -4.0))
+        # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
+        self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
+
+    def input_index(self, atom, slot, bin_index):
+        """Input node of `decode_input`'s (atom, slot, lag bin); slots > 1 are "others"."""
+        return min(slot, 1) * self.num_bins * self.num_atoms + bin_index * self.num_atoms + atom
+
+    @torch.no_grad()
+    def seed_rules(self, anchors, head_weight=1.0):
+        """Seed one rule node per (anchor body, lag bin) from the anchor clauses.
+
+        anchors: [((atom, slot), [head atom])]. Rule i * B + k holds the body atom
+        in lag bin k as a fixed input, and starts with weight head_weight to the
+        anchor's heads and 0 to the others; training adds the extra body atoms.
+        Returns the number of seeded rules, the first ones of the R rule nodes.
+        """
+        num_seeded = len(anchors) * self.num_bins
+        if num_seeded > self.log_alpha.shape[0]:
+            raise ValueError(f"{num_seeded} seeded rules do not fit into {self.log_alpha.shape[0]} rule nodes.")
+        for i, ((atom, slot), heads) in enumerate(anchors):
+            for k in range(self.num_bins):
+                r = i * self.num_bins + k
+                self.fixed_inputs[r, self.input_index(atom, slot, k)] = True
+                self.head_weight[:, r] = 0.0
+                self.head_weight[list(heads), r] = head_weight
+        return num_seeded
 
     # -------- inputs and targets of one video ----------------------------------
     def layer_inputs(self, X, frames):
@@ -217,8 +243,10 @@ class TemporalRuleNet(torch.nn.Module):
         return s_bar.clamp(0, 1)
     # -------- forward ----------------------------------
     def rule_mask(self):
-        """(R, M) mask in [0, 1]: stochastic while training, deterministic in eval."""
-        return self.hard_concrete_mask(self.log_alpha, training=self.training)
+        """(R, M) mask in [0, 1]: stochastic while training, deterministic in eval;
+        1 for the fixed inputs."""
+        mask = self.hard_concrete_mask(self.log_alpha, training=self.training)
+        return mask.masked_fill(self.fixed_inputs, 1.0)
 
     def forward(self, inputs):
         """Head logits (B, A) and rule activations (B, R) of input layers (B, M).
@@ -239,10 +267,10 @@ class TemporalRuleNet(torch.nn.Module):
         return (bce * weight).sum() / weight.sum().clamp(min=1)
 
     def sparsity_loss(self, beta=2 / 3, gamma=-0.1, zeta=1.1):
-        """Expected number of active inputs per rule (L0 of the hard-concrete mask)
-        plus the L1 of the head weights."""
+        """Expected number of active inputs per rule (L0 of the hard-concrete mask),
+        the fixed inputs left out, plus the L1 of the head weights."""
         shift = beta * torch.log(torch.tensor(-gamma / zeta))
-        l0 = torch.sigmoid(self.log_alpha - shift).sum(dim=1).mean()
+        l0 = (torch.sigmoid(self.log_alpha - shift) * ~self.fixed_inputs).sum(dim=1).mean()
         return l0 + self.head_weight.abs().sum(dim=1).mean()
 
     # -------- use after training ----------------------------------
