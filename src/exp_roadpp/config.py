@@ -298,6 +298,7 @@ def get_step_06_input(args):
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "val_tasks_file": args.output_dir / "step_dataset_output" / "tasks_val.pt",
+        "test_task_file": args.output_dir / "step_dataset_output" / "tasks_test.pt",
         "device": args.device,
         "delay_windows": args.delay_windows,
         "threshold": args.threshold,

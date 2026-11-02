@@ -10,6 +10,7 @@ import numpy as np
 from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
+from src.exp_roadpp.cauvid import TemporalRuleNet
 
 
 
@@ -71,27 +72,7 @@ def _csr_from_cells(rows, columns, shape):
 
 
 
-def build_video_tensor(video_atoms, num_atoms, device="cpu"):
-    """(T, N, A) bool tensor of one video: X[t, n, a] is True if agent n holds atom a in frame t.
 
-    video_atoms is one video of the compressed atom file; its per_frame_atoms[t]
-    is the (frame t, frame t + 1) pair of [atom_index, "tube_uid", tube_uid]
-    atoms, so T = len(per_frame_atoms) + 1. Agents are the tube_uids (the ego
-    vehicle has tube_uid None), numbered 0..N-1 in order of first appearance.
-    num_atoms is A, the size of the shared atom vocabulary.
-    """
-    frames = _video_frames(video_atoms)
-    agent_ids = video_agent_ids(video_atoms)
-    cells = [
-        (t, agent_ids[tube_uid], atom_index)
-        for t, frame_atoms in enumerate(frames)
-        for atom_index, _tag, tube_uid in frame_atoms
-    ]
-    X = torch.zeros((len(frames), len(agent_ids), num_atoms), dtype=torch.bool, device=device)
-    if cells:
-        t, n, a = torch.tensor(cells, dtype=torch.long, device=device).T
-        X[t, n, a] = True
-    return X
 
 
 def _video_frames(video_atoms):
@@ -246,18 +227,6 @@ def build_body_features(Xt, D, body, head_atoms, bins):
 
 
 def build_features(atoms, caw_clauses, unique_atoms, device, past_windows=()):
-    """The `build_body_features` outputs without the features, compacted for
-    storage on CPU. The features grow with the bodies and the P temporal
-    predicates of `past_windows`, so they are rebuilt from the video atoms
-    while learning (`body_features`). Returns
-      videos: [`_video_cells`] of each video;
-      per body, lists over the videos it has rows in:
-      video_ids: index into videos;
-      delays: (R, H) uint8 (int16 if the largest window exceeds 255) instead of
-          the (R, H, K) targets: the frames until head h next starts for the head
-          agent of each row, 0 if not within the largest window or already held.
-          The targets (`delay_targets`) and onset frames t + delay follow from it;
-      rows: (R, 3) int32 (t, n_body, n_head)."""
     bodies = list(set([c[0] for c in caw_clauses]))
     # Sorted so the bin axis K of the targets has a fixed order.
     delay_windows = sorted(set([c[-1] for c in caw_clauses]))
@@ -933,8 +902,11 @@ def _wandb_login(wandb):
     return wandb.login(key=key, host=_WANDB_CLOUD_HOST, relogin=True, verify=True)
 
 
-def _init_wandb(cfg, num_bodies):
+def _init_wandb(cfg, extra_config=None, job_type="step05_extension"):
     """Online run on the hosted W&B cloud, or None if tracking is off or fails.
+
+    Its config holds the plain settings of cfg (numbers, strings, lists; not the
+    file paths) and extra_config.
 
     Tracking is fail-open: a missing package, skipped or failed login, or
     network error only prints a warning.
@@ -948,14 +920,13 @@ def _init_wandb(cfg, num_bodies):
         if not _wandb_login(wandb):
             print("[wandb] Tracking disabled: not logged in.")
             return None
-        hparams = ("num_epochs", "lr", "l0_lambda", "min_support", "min_lift", "min_videos",
-                   "delay_windows", "past_windows", "device")
+        settings = {k: v for k, v in cfg.items() if isinstance(v, (bool, int, float, str, list))}
         run = wandb.init(
             project=cfg.get("wandb_project", "cauvid-roadpp"),
             name=cfg.get("wandb_run_name"),
-            job_type="step05_extension",
+            job_type=job_type,
             mode="online",
-            config={**{k: cfg[k] for k in hparams if k in cfg}, "num_bodies": num_bodies},
+            config={**settings, **(extra_config or {})},
         )
         print(f"[wandb] Run: {run.url}")
         return run
@@ -966,7 +937,7 @@ def _init_wandb(cfg, num_bodies):
 
 def _learn_extensions(examples, cfg):
     num_bodies = len(examples["rows"])
-    run = _init_wandb(cfg, num_bodies)
+    run = _init_wandb(cfg, {"num_bodies": num_bodies})
     extended_data = []
     start_time = time.perf_counter()
     try:
@@ -1011,61 +982,56 @@ def _learn_extensions(examples, cfg):
 
 
 
+def build_video_tensor(video_atoms, num_atoms, device="cpu"):
+    """(T, N, A) bool tensor of one video: X[t, n, a] is True if agent n holds atom a in frame t.
+
+    video_atoms is one video of the compressed atom file; its per_frame_atoms[t]
+    is the (frame t, frame t + 1) pair of [atom_index, "tube_uid", tube_uid]
+    atoms, so T = len(per_frame_atoms) + 1. Agents are the tube_uids (the ego
+    vehicle has tube_uid None), numbered 0..N-1 in order of first appearance.
+    num_atoms is A, the size of the shared atom vocabulary.
+    """
+    frames = _video_frames(video_atoms)
+    agent_ids = video_agent_ids(video_atoms)
+    cells = [
+        (t, agent_ids[tube_uid], atom_index)
+        for t, frame_atoms in enumerate(frames)
+        for atom_index, _tag, tube_uid in frame_atoms
+    ]
+    X = torch.zeros((len(frames), len(agent_ids), num_atoms), dtype=torch.bool, device=device)
+    if cells:
+        t, n, a = torch.tensor(cells, dtype=torch.long, device=device).T
+        X[t, n, a] = True
+    return X
 
 
-def build_training_examples(cfg):
-    
-    atoms = utils_data.load_json(cfg['train_atom_file'])
-    clauses = utils_data.load_json(cfg['causal_anchor_clause_file'])
-    unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
-    
-    body_groups = group_clauses_by_body(clauses)
-    head_vocab = build_head_vocab(body_groups, cfg["delay_windows"])
-    videos, video_ids, delays, rows = build_features(
-        atoms, head_vocab, unique_atoms, cfg["device"], cfg["past_windows"]
-    )
+def atom_onsets(X):
+    """(T, N, A) bool: atom a switches on (false -> true) for agent n in frame t."""
+    previous = torch.zeros_like(X)
+    previous[1:] = X[:-1]
+    return X & ~previous
 
-    examples = {
-        "body_groups": body_groups,
-        "delay_windows": list(cfg["delay_windows"]),
-        "heads": {body: list(dict.fromkeys(heads)) for body, heads in body_groups.items()},
-        "windows": sorted(set(cfg["delay_windows"])),
-        "past_windows": list(cfg["past_windows"]),
-        "predicates": temporal_predicates(cfg["past_windows"]),
-        "num_atoms": len(unique_atoms),
-        "videos": videos,
-        "video_ids": video_ids,
-        "delays": delays,
-        "rows": rows,
-    }
 
-    num_bodies = sum(1 for Rs in rows.values() if Rs)
-    num_rows = sum(len(R) for Rs in rows.values() for R in Rs)
-    num_predicates = len(examples["predicates"])
-    num_features = sum(
-        (body[1] + 2) * num_predicates * len(unique_atoms) for body, Rs in rows.items() if Rs
-    )
-    num_heads = sum(Ds[0].shape[1] * len(examples["windows"]) for Ds in delays.values() if Ds)
+def next_true_frame(mask):
+    """(T + 1, N) long: first frame >= t where mask[:, n] is True, T if none.
 
-    print(f"[Videos] \t {len(atoms)}")
-    print(f"[Bodies]\t {num_bodies}")
-    print(f"[Heads]\t\t {num_heads}")
-    print(f"[Examples]\t {num_rows}")
-    print(f"[Features]\t {num_features}")
+    Row T is all T, so next_true_frame(mask)[t + 1] is the first frame after t."""
+    T = mask.shape[0]
+    frames = torch.arange(T, device=mask.device).unsqueeze(1).expand_as(mask)
+    first = torch.where(mask, frames, torch.full_like(frames, T))
+    first = torch.cat([first, torch.full_like(first[:1], T)])
+    return first.flip(0).cummin(dim=0).values.flip(0)
 
-    return examples
 
 
 
 def extend_clauses(cfg):
     unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
     examples = torch.load(cfg["extension_training_example_file"], map_location="cpu")
-    if "videos" not in examples:
-        raise RuntimeError(
-            f"{cfg['extension_training_example_file']} has the old format (stored features); "
-            f"delete it to rebuild the training examples."
-        )
-
+    # learn temporal clauses
+    # the anchor atom happens at a certain time, and the head atom occurs after a delay
+    # the facts those are invariant to the videos within the time window are considered as the other body of the extended clause
+    # firstly, for each anchor clause, we need to identify its occurrences in the training examples and the corresponding frames where it appears
     extended_data = _learn_extensions(examples, cfg)
     extended_clauses = _to_extended_clauses(extended_data, unique_atoms, cfg)
     print(f"[Rule extension] Learned {len(extended_clauses)} extended clauses")
@@ -1073,38 +1039,318 @@ def extend_clauses(cfg):
 
 
 
+def prepare_training_data(cfg):
+    """Everything the TemporalRuleNet training samples its batches from.
+
+    Returns {
+      "num_atoms": A,
+      "videos": {video_id: `_video_cells` of its (T, N, A) atom tensor},
+      "frames": {video_id: (F,) long, frames with some visible agent},
+      "positive_frames": {video_id: (P,) long, frames where some agent already
+                          visible in the previous frame switches an atom on},
+      "train_videos" / "val_videos": [video_id], a random split by video,
+    }.
+    An agent entering the scene switches on all of its atoms at once; those
+    are appearances, not events, so they do not make a frame positive.
+    """
+    atoms = utils_data.load_json(cfg['train_atom_file'])
+    num_atoms = len(utils_data.load_json(cfg['unique_atoms_file']))
+
+    videos, frames, positive_frames = {}, {}, {}
+    for video_id, video_atoms in tqdm(atoms.items(), desc="Preparing videos"):
+        X = build_video_tensor(video_atoms, num_atoms, device=cfg["device"])
+        if X.shape[0] < 2:
+            continue
+        visible = X.any(dim=2)                                      # (T, N)
+        stayed = torch.zeros_like(visible)
+        stayed[1:] = visible[1:] & visible[:-1]                     # visible in t and t - 1
+        has_onset = (atom_onsets(X).any(dim=2) & stayed).any(dim=1)
+
+        videos[video_id] = _video_cells(X)
+        frames[video_id] = torch.nonzero(visible.any(dim=1)).flatten().cpu()
+        positive_frames[video_id] = torch.nonzero(has_onset).flatten().cpu()
+
+    video_ids = sorted(videos)
+    order = torch.randperm(len(video_ids), generator=torch.Generator().manual_seed(cfg["seed"]))
+    num_val = max(1, round(cfg["val_video_ratio"] * len(video_ids)))
+    val_videos = sorted(video_ids[i] for i in order[:num_val].tolist())
+    train_videos = sorted(video_ids[i] for i in order[num_val:].tolist())
+
+    num_frames = sum(len(f) for f in frames.values())
+    num_positive = sum(len(f) for f in positive_frames.values())
+    print(f"[Videos]\t {len(videos)} ({len(train_videos)} train, {len(val_videos)} val)")
+    print(f"[Frames]\t {num_frames} ({num_positive} with onsets)")
+    return {
+        "num_atoms": num_atoms,
+        "videos": videos,
+        "frames": frames,
+        "positive_frames": positive_frames,
+        "train_videos": train_videos,
+        "val_videos": val_videos,
+    }
+
+
+def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator):
+    """(<= num_frames,) sorted target frames of one video, a share positive_ratio
+    of them drawn from its frames with onsets and the rest from all its frames."""
+    def pick(pool, k):
+        if len(pool) == 0 or k <= 0:
+            return pool[:0]
+        return pool[torch.randint(len(pool), (k,), generator=generator)]
+
+    positives = pick(training_data["positive_frames"][video_id], round(positive_ratio * num_frames))
+    others = pick(training_data["frames"][video_id], num_frames - len(positives))
+    return torch.unique(torch.cat([positives, others]))
+
+
+def _video_rows(model, training_data, video_id, frames, device):
+    """Inputs, targets and at-risk masks of `TemporalRuleNet.training_rows` for the
+    target frames of one video, rebuilt from its stored atoms."""
+    X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
+    inputs, targets, at_risk, rows = model.training_rows(X, frames.to(device))
+    t, n = rows.T
+    # An agent entering the scene in t switches on all of its atoms at once: not events.
+    seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
+    return inputs[seen], targets[seen], at_risk[seen]
+
+
+@torch.no_grad()
+def _validation_loss(model, training_data, val_frames, cfg):
+    """Mean onset loss over the fixed target frames of the validation videos."""
+    model.eval()
+    losses = []
+    for video_id, frames in val_frames.items():
+        inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, cfg["device"])
+        if len(inputs) == 0:
+            continue
+        logits, _rules = model(inputs)
+        losses.append(model.loss(logits, targets, at_risk, cfg["pos_weight"]).item())
+    return sum(losses) / len(losses) if losses else float("nan")
+
+
+def train_temporal_rule_net(training_data, cfg, run=None):
+    """Train a TemporalRuleNet on the training videos; returns the model with the
+    lowest validation loss.
+
+    One epoch visits every training video once, in batches of videos_per_batch
+    videos with frames_per_video sampled target frames each. The input rows are
+    rebuilt from the stored atoms per batch, never saved. run: the W&B run the
+    losses of each epoch are logged to, or None.
+    """
+    torch.manual_seed(cfg["seed"])
+    generator = torch.Generator().manual_seed(cfg["seed"])
+    device = cfg["device"]
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["num_lags"], cfg["num_rules"]).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+
+    # Fixed validation frames, so the losses of the epochs are comparable.
+    val_frames = {
+        video_id: _sample_frames(training_data, video_id, cfg["frames_per_video"],
+                                 cfg["positive_frame_ratio"], generator)
+        for video_id in training_data["val_videos"]
+    }
+    train_videos = training_data["train_videos"]
+    best_val_loss, best_state = float("inf"), None
+    for epoch in range(cfg["num_epochs"]):
+        model.train()
+        order = torch.randperm(len(train_videos), generator=generator).tolist()
+        epoch_losses = []
+        for start in range(0, len(order), cfg["videos_per_batch"]):
+            parts = [
+                _video_rows(model, training_data, train_videos[i],
+                            _sample_frames(training_data, train_videos[i], cfg["frames_per_video"],
+                                           cfg["positive_frame_ratio"], generator),
+                            device)
+                for i in order[start:start + cfg["videos_per_batch"]]
+            ]
+            inputs, targets, at_risk = (torch.cat(part) for part in zip(*parts))
+            if len(inputs) == 0:
+                continue
+
+            logits, _rules = model(inputs)
+            onset_loss = model.loss(logits, targets, at_risk, cfg["pos_weight"])
+            loss = onset_loss + cfg["l0_lambda"] * model.sparsity_loss()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(onset_loss.item())
+
+        train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
+        val_loss = _validation_loss(model, training_data, val_frames, cfg)
+        print(f"[Epoch {epoch + 1}/{cfg['num_epochs']}] train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+        if run is not None:
+            with torch.no_grad():
+                active_inputs = (model.rule_mask() > cfg["mask_threshold"]).sum(dim=1).float()
+            run.log({
+                "train/onset_loss": train_loss,
+                "val/onset_loss": val_loss,
+                "model/sparsity_loss": model.sparsity_loss().item(),
+                "model/active_inputs_per_rule": active_inputs.mean().item(),
+                "model/empty_rules": (active_inputs == 0).sum().item(),
+            }, step=epoch)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"[Training] Best val loss {best_val_loss:.4f}")
+    if run is not None:
+        run.summary["best_val_onset_loss"] = best_val_loss
+    return model
+
+
+def load_temporal_rule_net(training_data, cfg):
+    """The trained TemporalRuleNet of cfg["model_file"], in eval mode on cfg["device"].
+
+    The model is rebuilt with the same sizes it was trained with (num_atoms of
+    the training data, num_lags and num_rules of cfg) before its weights are loaded.
+    """
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["num_lags"], cfg["num_rules"])
+    model.load_state_dict(torch.load(cfg["model_file"], map_location="cpu"))
+    return model.to(cfg["device"]).eval()
+
+
+@torch.no_grad()
+def _rule_head_counts(model, training_data, cfg):
+    """(R, A) counts of every rule r and head atom h over all frames of the
+    training videos: fires, rows where every body atom of r holds and h is at
+    risk (off in the previous frame); hits, the fires where h switches on;
+    videos, the training videos with at least one hit."""
+    num_rules, num_atoms = model.log_alpha.shape[0], model.num_atoms
+    fires, hits, videos = (torch.zeros((num_rules, num_atoms), device=cfg["device"]) for _ in range(3))
+    for video_id in tqdm(training_data["train_videos"], desc="Counting rule firings"):
+        video_hits = torch.zeros_like(hits)
+        for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
+            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, cfg["device"])
+            if len(inputs) == 0:
+                continue
+            fired = (model.partial_activation(inputs, cfg["mask_threshold"]) >= 1).float()
+            fires += fired.T @ at_risk.float()
+            video_hits += fired.T @ targets.float()
+        hits += video_hits
+        videos += video_hits > 0
+    return fires.cpu(), hits.cpu(), videos.cpu()
+
+
+def _temporal_clause_text(clause, unique_atoms):
+    # Bodies earliest first: "Car:MovAway(X0)@-6f -> Ped:Wait(X1)@-2f => Car:Stop(X0)".
+    def atom(atom_index, slot):
+        return f"{_atom_name(unique_atoms[atom_index])}(X{slot})"
+    body = " -> ".join(f"{atom(a, slot)}@-{lag}f" for a, slot, lag in clause["bodies"])
+    return f"{body} => {atom(*clause['head'])}"
+
+
+def extract_temporal_clauses(model, training_data, cfg, run=None):
+    """Clauses of the trained model, one per (rule node, head) pair with a large
+    head weight, kept if the rule hits the head in at least min_support training
+    frames of at least min_videos videos.
+
+    Each clause: bodies [(atom, slot, lag)] earliest first (lag = frames before
+    the head; slot 0 the head agent, 1 some other agent), body_scopes their
+    slots, head (atom, 0), weight, and on the training videos support (hits),
+    fires and confidence = support / fires, num_videos. Sorted by confidence.
+    """
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    rules = model.extract_rules(cfg["mask_threshold"], cfg["weight_threshold"])
+    fires, hits, videos = _rule_head_counts(model, training_data, cfg)
+
+    clauses = []
+    for rule in rules:
+        r = rule["rule"]
+        for h, weight in rule["heads"]:
+            support, num_videos = int(hits[r, h]), int(videos[r, h])
+            if support < cfg["min_support"] or num_videos < cfg["min_videos"]:
+                continue
+            clauses.append({
+                "bodies": [list(b) for b in rule["bodies"]],
+                "body_scopes": [slot for _atom, slot, _lag in rule["bodies"]],
+                "head": [h, 0],
+                "rule": r,
+                "weight": weight,
+                "support": support,
+                "fires": int(fires[r, h]),
+                "confidence": support / max(int(fires[r, h]), 1),
+                "num_videos": num_videos,
+            })
+    clauses.sort(key=lambda c: (-c["confidence"], -c["support"]))
+
+    print(f"[Rules] {len(rules)} rule nodes with heads -> {len(clauses)} clauses kept")
+    for clause in clauses[:15]:
+        print(f"  conf {clause['confidence']:.2f}  support {clause['support']:>5}  "
+              f"{_temporal_clause_text(clause, unique_atoms)}")
+    if run is not None:
+        import wandb
+        table = wandb.Table(columns=["clause", "confidence", "support", "fires", "num_videos", "weight", "length"])
+        for clause in clauses:
+            table.add_data(_temporal_clause_text(clause, unique_atoms), clause["confidence"], clause["support"],
+                           clause["fires"], clause["num_videos"], clause["weight"], len(clause["bodies"]))
+        run.log({"clauses": table})
+        run.summary["num_clauses"] = len(clauses)
+        run.summary["num_rules_with_heads"] = len(rules)
+    return clauses
+
+
 def main(input_data):
-    print(f"----------------- Step 05: Rule Extension -----------------")
+    print(f"----------------- Step 05: Temporal Rule Learning -----------------")
     cfg = {
             'output_dir': input_data['output_dir'],
             'device': input_data['device'],
-            'min_support': 10,
-            # Confidence of the clause / confidence of its anchor body alone.
-            'min_lift': 2.0,
-            # Training videos a clause must be correct in (1 disables the filter).
-            'min_videos': 2,
+            'seed': 0,
+            # Model: K past frames (input layers) per prediction, R rule nodes.
+            'num_lags': 30,
+            'num_rules': 256,
+            # Training: batches of target frames sampled from a few videos at a time.
             'num_epochs': 200,
-            'lr': 0.1,
+            'lr': 0.01,
+            'videos_per_batch': 4,
+            'frames_per_video': 32,
+            # Share of sampled frames where some atom switches on (onsets are rare).
+            'positive_frame_ratio': 0.5,
+            'pos_weight': 20.0,
             'l0_lambda': 1e-3,
-            'delay_windows': list(input_data['delay_windows']),
-            # Edges (frames) of the disjoint past bins of the temporal atoms
-            # held / started / ended, e.g. [3, 5, 10] -> 0-3, 3-5, 5-10 frames ago.
-            'past_windows': list(input_data['past_windows']),
-            'dataset_label_file': input_data['dataset_label_file'],
+            'val_video_ratio': 0.1,
+            # Rule extraction thresholds of the trained model.
+            'mask_threshold': 0.5,
+            'weight_threshold': 0.1,
+            # A clause must hit its head in min_support training frames of min_videos videos.
+            'min_support': 10,
+            'min_videos': 2,
+            'wandb': True,
+            'wandb_project': 'cauvid-roadpp',
             'train_atom_file': input_data['train_atom_file'],
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
-            'anchor_clause_file': input_data['anchor_clause_file'],
-            'extension_training_example_file': input_data["output_dir"] / "training_examples.pt",
             "unique_atoms_file": input_data["unique_atoms_file"],
-            "events_file": input_data["events_file"],
+            'training_data_file': input_data["output_dir"] / "training_data.pt",
+            'model_file': input_data["output_dir"] / "temporal_rule_net.pt",
             "extended_clause_file": input_data["output_dir"] / "extended_clauses.json"
     }
-    
-    if not os.path.exists(cfg["extension_training_example_file"]):
-        examples = build_training_examples(cfg)
-        torch.save(examples, cfg["extension_training_example_file"])
-        
-    if not os.path.exists(cfg["extended_clause_file"]):
-        extended_clauses = extend_clauses(cfg)
-        utils_data.save_json(extended_clauses, cfg["extended_clause_file"])
-        
+
+    # 1. Prepare once: compressed atoms of each video, the frames to sample
+    #    (all / with onsets) and the train / validation split by video.
+    if not os.path.exists(cfg["training_data_file"]):
+        training_data = prepare_training_data(cfg)
+        torch.save(training_data, cfg["training_data_file"])
+    training_data = torch.load(cfg["training_data_file"], map_location="cpu")
+
+    # One W&B run for the training and extraction below, only if any is not cached.
+    run = None
+    if not os.path.exists(cfg["model_file"]) or not os.path.exists(cfg["extended_clause_file"]):
+        run = _init_wandb(cfg, {"num_train_videos": len(training_data["train_videos"]),
+                                "num_val_videos": len(training_data["val_videos"]),
+                                "num_atoms": training_data["num_atoms"]},
+                          job_type="step05_temporal_rule_net")
+    try:
+        # 2. Train the TemporalRuleNet; its input rows are built from the atoms per batch.
+        if not os.path.exists(cfg["model_file"]):
+            model = train_temporal_rule_net(training_data, cfg, run)
+            torch.save(model.state_dict(), cfg["model_file"])
+        model = load_temporal_rule_net(training_data, cfg)
+
+        # 3. Read the learned rules (ordered bodies with lags -> heads) out of the model.
+        if not os.path.exists(cfg["extended_clause_file"]):
+            extended_clauses = extract_temporal_clauses(model, training_data, cfg, run)
+            utils_data.save_json(extended_clauses, cfg["extended_clause_file"])
+    finally:
+        if run is not None:
+            run.finish()
