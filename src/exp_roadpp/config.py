@@ -274,6 +274,7 @@ def get_step_05_input(args):
     input_data = {
         "output_dir": output_dir,
         "device": args.device,
+        "num_epochs": args.num_epochs,
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
@@ -291,19 +292,11 @@ def get_step_06_input(args):
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
-        "val_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
-        "dataset_labels_file": args.dataset_path / "gt" / "label.json",
-        "extended_clauses_file": args.output_dir / "step05_output" / "extended_clauses.json",
-        "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
-        "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
-        "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
-        "val_tasks_file": args.output_dir / "step_dataset_output" / "tasks_val.pt",
-        "test_task_file": args.output_dir / "step_dataset_output" / "tasks_test.pt",
         "device": args.device,
-        "delay_windows": args.delay_windows,
-        "threshold": args.threshold,
-        "eval_frame_step": args.eval_frame_step,
-        "label_file": args.dataset_path / "gt" / "label.json"
+        "test_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "test_atoms_compressed.json",
+        "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
+        # Step 06 loads the step 05 model and clauses with the step 05 settings.
+        "step05_input": get_step_05_input(args),
     }
     return input_data
 

@@ -1,17 +1,8 @@
-from pathlib import Path
-import hashlib
-import json
+import os
 import torch
 from tqdm import tqdm
-from src.exp_roadpp.cauvid import CauVid
-from src.exp_roadpp import utils_data
+from src.exp_roadpp import step05, utils_data
 
-
-
-def _atom_label(atom):
-    """Readable name of a flat (key, value, ...) atom signature, e.g. "Car Stop"."""
-    atom = dict(zip(atom[::2], atom[1::2]))
-    return f"{atom['agent_class_label']} {atom.get('action_id_label', atom.get('location_name_label'))}"
 
 def compute_metrics(tp, fp, fn):
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
@@ -34,117 +25,182 @@ def _short_num(n):
     return f"{n:.1f}T"
 
 
-def _print_row(correct, total, label):
-    print(f"{_short_num(correct):>6} / {_short_num(total):<6} [{label}]")
+def _is_fresh(output_file, *source_files):
+    """True if output_file exists and is newer than every source file."""
+    if not os.path.exists(output_file):
+        return False
+    return all(os.path.getmtime(output_file) >= os.path.getmtime(f) for f in source_files if os.path.exists(f))
 
 
-
-
-
-def tasks_evaluation(cfg):
-    """Raw lead-time results of the clauses on the val split: {video_id: (events,
-    predictions) of `evaluate_video`}. Leads are eval_frame_step, 2 * eval_frame_step,
-    ... up to the largest delay window."""
-    
-    test_tasks = torch.load(cfg["test_task_file"])
-    model = CauVid(cfg)
-    
-    raw_results = {}
-    for video_id, video_tasks in tqdm(test_tasks["tasks"].items(), desc="Evaluating Videos"):
-        raw_results[video_id] = []
-        for task in video_tasks:
-            if len(task["input"]) == 0:
+# -------------- Model evaluation --------------
+@torch.no_grad()
+def _score_histograms(model, data, cfg):
+    """(A, S) histograms of the predicted onset probabilities over all at-risk
+    (agent, frame, atom) rows of the split, split into the rows where the atom
+    switches on (positives) and the others (negatives); S score bins over [0, 1]."""
+    num_atoms, num_bins = data["num_atoms"], cfg["num_score_bins"]
+    device = cfg["device"]
+    positives = torch.zeros(num_atoms * num_bins, device=device)
+    negatives = torch.zeros(num_atoms * num_bins, device=device)
+    heads = torch.arange(num_atoms, device=device) * num_bins
+    for video_id in tqdm(data["videos"], desc="Scoring test videos"):
+        for frames in data["frames"][video_id].split(cfg["frames_per_video"]):
+            inputs, targets, at_risk = step05._video_rows(model, data, video_id, frames, device)
+            if len(inputs) == 0:
                 continue
-            predictions = model.predict(task["input"])
-            raw_results[video_id].append({"gt": task["target"], "predictions": predictions})
-    
-    print(f"[Task Evaluation] Completed!")
+            probabilities = torch.sigmoid(model(inputs)[0])
+            cells = heads + (probabilities * num_bins).long().clamp(max=num_bins - 1)
+            positives += torch.bincount(cells[targets], minlength=len(positives))
+            negatives += torch.bincount(cells[at_risk & ~targets], minlength=len(negatives))
+    return positives.view(num_atoms, num_bins).cpu(), negatives.view(num_atoms, num_bins).cpu()
+
+
+def _histogram_metrics(positives, negatives, threshold):
+    """Onset metrics of one head (or all heads summed) from its score histograms:
+    average precision, base rate, metrics at the probability threshold and at
+    the threshold with the best F1."""
+    num_bins = len(positives)
+    # Predicting "on" for every score bin >= b, for b from the highest bin down.
+    tp = positives.flip(0).cumsum(0)
+    fp = negatives.flip(0).cumsum(0)
+    num_positives, num_rows = positives.sum().item(), (positives + negatives).sum().item()
+    precision = tp / (tp + fp).clamp(min=1)
+    average_precision = (precision * positives.flip(0)).sum().item() / max(num_positives, 1)
+
+    def at_bin(b):
+        tp_b, fp_b = positives[b:].sum().item(), negatives[b:].sum().item()
+        return compute_metrics(tp_b, fp_b, num_positives - tp_b)
+
+    best_bin = max(range(num_bins), key=lambda b: at_bin(b)["f1"])
+    return {
+        "onsets": int(num_positives),
+        "at_risk": int(num_rows),
+        "base_rate": num_positives / num_rows if num_rows else 0.0,
+        "average_precision": average_precision,
+        "at_threshold": at_bin(min(int(threshold * num_bins), num_bins - 1)),
+        "best_f1": {**at_bin(best_bin), "threshold": best_bin / num_bins},
+    }
+
+
+def evaluate_model(model, data, cfg):
+    """Next-frame onset prediction of the TemporalRuleNet on the test split, over
+    all heads together (micro) and per head atom with at least one onset."""
+    positives, negatives = _score_histograms(model, data, cfg)
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    per_head = {}
+    for h in torch.nonzero(positives.sum(dim=1)).flatten().tolist():
+        per_head[h] = {"label": step05._atom_name(unique_atoms[h]),
+                       **_histogram_metrics(positives[h], negatives[h], cfg["prob_threshold"])}
+    return {
+        "num_videos": len(data["videos"]),
+        "prob_threshold": cfg["prob_threshold"],
+        "overall": _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"]),
+        # Macro: every head with onsets counts the same.
+        "macro_average_precision": (sum(m["average_precision"] for m in per_head.values()) / len(per_head)
+                                    if per_head else 0.0),
+        "per_head": per_head,
+    }
+
+
+# -------------- Clause evaluation --------------
+def evaluate_clauses(model, data, clauses, step05_cfg):
+    """The step 05 clauses with their test_ counts added: test_support (hits),
+    test_fires, test_confidence, test_anchor_confidence (the anchor alone),
+    test_recall (share of the head's onsets hit), test_base_rate. Sorted by
+    test confidence."""
+    def ratio(a, b):
+        return float(a) / float(b) if b > 0 else None
+
+    counts = step05._rule_head_counts(model, data, list(data["videos"]), step05_cfg,
+                                      desc="Counting rule firings (test)")
+    evaluated = []
+    for clause in clauses:
+        r, h = clause["rule"], clause["head"][0]
+        evaluated.append({
+            **clause,
+            "test_support": int(counts["hits"][r, h]),
+            "test_fires": int(counts["fires"][r, h]),
+            "test_confidence": ratio(counts["hits"][r, h], counts["fires"][r, h]),
+            "test_anchor_confidence": ratio(counts["anchor_hits"][r, h], counts["anchor_fires"][r, h]),
+            "test_recall": ratio(counts["hits"][r, h], counts["onsets"][h]),
+            "test_base_rate": ratio(counts["onsets"][h], counts["at_risk"][h]),
+        })
+    evaluated.sort(key=lambda c: -(c["test_confidence"] or 0))
+    return evaluated
+
+
+# -------------- Summary --------------
+def print_summary(metrics, clauses, cfg, num_examples=15):
+    print("[Evaluation Summary] next-frame onset prediction on the test split")
+    overall = metrics["overall"]
+    print(f"[Videos]\t {metrics['num_videos']}")
+    print(f"[Rows]\t\t {_short_num(overall['at_risk'])} at-risk (agent, frame, atom), "
+          f"{_short_num(overall['onsets'])} onsets, base rate {overall['base_rate']:.4f}")
+    print(f"[AP]\t\t micro {overall['average_precision']:.3f}, macro {metrics['macro_average_precision']:.3f} "
+          f"(random = base rate)")
+    for name, m in (("@" + str(metrics["prob_threshold"]), overall["at_threshold"]),
+                    (f"best F1 @{overall['best_f1']['threshold']:.2f}", overall["best_f1"])):
+        print(f"[{name}]\t precision {m['precision']:.3f}, recall {m['recall']:.3f}, f1 {m['f1']:.3f}")
     print()
-    
-    return raw_results
 
-
-def _compute_metrics(gt, predictions):
-    tp = sum(1 for g, p in zip(gt, predictions) if g == p == 1)
-    fp = sum(1 for g, p in zip(gt, predictions) if g == 0 and p == 1)
-    fn = sum(1 for g, p in zip(gt, predictions) if g == 1 and p == 0)
-    return tp, fp, fn
-
-def result_analysis(cfg):
-    raw_results = utils_data.load_json(cfg["raw_result_file"])
-    num_videos = len(set(raw_results.keys()))
-    num_events = 0
-    summary = {"videos": []}
-    for video_id, video_data in raw_results.items():
-        print(f"Video ID: {video_id}")
-        num_events += len(video_data)
-        video_metrics = {"tp": 0, "fp": 0, "fn": 0}
-        for event in video_data:
-            gt = event["gt"]
-            predictions = event["predictions"]
-            tp, fp, fn = _compute_metrics(gt, predictions)
-            video_metrics["tp"] += tp
-            video_metrics["fp"] += fp
-            video_metrics["fn"] += fn
-        summary["videos"].append({"video_id": video_id, "metrics": video_metrics})   
-    summary["num_videos"] = num_videos
-    summary["num_events"] = num_events
-    
-    return summary
-    
-def print_summary(summary):
-    print("[Evaluation Summary]")
-    print(f"[Videos] \t {summary['num_videos']}")
-    print(f"[Events] \t {summary['num_events']}")
-    print(f"[Detected] \t {summary['detected_events']} events, mean earliest lead "
-          f"{summary['mean_earliest_lead']:.1f} frames")
+    print(f"[Per head, by AP] onsets  base rate  AP  best F1")
+    rows = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
+    for m in rows[:num_examples]:
+        print(f"{_short_num(m['onsets']):>7}  {m['base_rate']:.4f}  {m['average_precision']:.3f}  "
+              f"{m['best_f1']['f1']:.3f}  [{m['label']}]")
     print()
 
-    # Timed: a clause whose lead bin contains L fires L frames before the onset;
-    # any: a clause with the right head fires, whatever its bin.
-    print(f"[Recall per lead]")
-    overall = summary["overall"]
-    for i, lead in enumerate(summary["leads"]):
-        print(f"{lead:>4}f  timed {overall['recall_timed'][i]:.2f}  any {overall['recall_any'][i]:.2f}  "
-              f"({_short_num(overall['timed'][i])} / {_short_num(overall['events'][i])})")
+    print(f"[Clauses]\t {len(clauses)} from step 05")
+    firing = [c for c in clauses if c["test_confidence"] is not None]
+    if firing:
+        confidences = sorted(c["test_confidence"] for c in firing)
+        print(f"[Clauses]\t {len(firing)} fire on test, median confidence {confidences[len(confidences) // 2]:.3f}")
+        extended = [c for c in firing if len(c["bodies"]) > 1 and c["test_anchor_confidence"] is not None]
+        if extended:
+            better = sum(c["test_confidence"] > c["test_anchor_confidence"] for c in extended)
+            print(f"[Extension]\t {better}/{len(extended)} extended clauses beat their anchor on test")
+        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        print(f"[Top {min(num_examples, len(firing))} clauses by test confidence]")
+        for c in firing[:num_examples]:
+            print(f"  conf {c['test_confidence']:.2f} (train {c['confidence']:.2f})  "
+                  f"support {c['test_support']:>5}  {step05._temporal_clause_text(c, unique_atoms)}")
     print()
 
-    print(f"[Precision per lead bin]")
-    for row in summary["precision_per_bin"]:
-        lo, hi = row["lead_bin"]
-        _print_row(row["correct"], row["fired"], f"{lo + 1}-{hi}f  {row['precision']:.2f}")
-    print()
 
-    print(f"[Per atom: timed hits / events at each lead {summary['leads']}; precision]")
-    for row in summary["per_atom"].values():
-        hits = "  ".join(f"{_short_num(h)}/{_short_num(n)}" for h, n in zip(row["timed"], row["events"]))
-        precision = f"{row['correct'] / row['fired']:.2f}" if row["fired"] else "-"
-        print(f"{hits}  {precision:>5}  [{row['label']}]")
-    print()
-    
 def main(input_data):
     print("\n--------- Step 06 Evaluation ----------------------\n")
+    step05_cfg = step05.get_cfg(input_data["step05_input"])
     cfg = {
-        "output_dir": input_data["output_dir"],
         "device": input_data["device"],
-        "delay_windows": input_data["delay_windows"],
-        'extended_clauses_file': input_data["extended_clauses_file"],
         "unique_atoms_file": input_data["unique_atoms_file"],
-        "val_atoms_file": input_data["val_atoms_file"],
-        # Clauses below this confidence (on train) are not used.
-        "threshold": input_data["threshold"],
-        "eval_frame_step": input_data["eval_frame_step"],
-        'label_file': input_data["label_file"],
-        "summary_file": input_data["output_dir"] / f"summary_{input_data['threshold']}.json",
-        "raw_result_file": input_data["output_dir"] / f"raw_results_{input_data['threshold']}.json",
-        "test_task_file": input_data["test_task_file"]
+        "test_atoms_file": input_data["test_atoms_file"],
+        "frames_per_video": step05_cfg["frames_per_video"],
+        # A head is predicted to switch on in the next frame above this probability.
+        "prob_threshold": 0.5,
+        "num_score_bins": 100,
+        "test_data_file": input_data["output_dir"] / "test_data.pt",
+        "metrics_file": input_data["output_dir"] / "test_metrics.json",
+        "test_clause_file": input_data["output_dir"] / "test_clauses.json",
     }
-    if not cfg["raw_result_file"].exists():
-        raw_results = tasks_evaluation(cfg)
-        utils_data.save_json(raw_results, cfg["raw_result_file"])
-    if not cfg["summary_file"].exists():
-        summary = result_analysis(cfg)
-        utils_data.save_json(summary, cfg["summary_file"])
-    summary = utils_data.load_json(cfg["summary_file"])
-    print_summary(summary)
+    step05_cfg["device"] = cfg["device"]
+
+    # 1. Test videos in the format of the step 05 training data.
+    if not os.path.exists(cfg["test_data_file"]):
+        num_atoms = len(utils_data.load_json(cfg["unique_atoms_file"]))
+        torch.save(step05.prepare_videos(cfg["test_atoms_file"], num_atoms, cfg["device"]), cfg["test_data_file"])
+    test_data = torch.load(cfg["test_data_file"], map_location="cpu")
+    model = step05.load_temporal_rule_net(test_data, step05_cfg)
+
+    # 2. The model's next-frame onset prediction; redone whenever the model is retrained.
+    if not _is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"]):
+        utils_data.save_json(evaluate_model(model, test_data, cfg), cfg["metrics_file"])
+    metrics = utils_data.load_json(cfg["metrics_file"])
+
+    # 3. The step 05 clauses on the test videos; redone whenever they change.
+    if not _is_fresh(cfg["test_clause_file"], step05_cfg["extended_clause_file"], cfg["test_data_file"]):
+        clauses = utils_data.load_json(step05_cfg["extended_clause_file"])
+        utils_data.save_json(evaluate_clauses(model, test_data, clauses, step05_cfg), cfg["test_clause_file"])
+    test_clauses = utils_data.load_json(cfg["test_clause_file"])
+
+    print_summary(metrics, test_clauses, cfg)
     print("\n--------- Step 06 Done ---------------\n")

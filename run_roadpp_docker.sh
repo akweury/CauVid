@@ -20,6 +20,7 @@
 #   ./run_roadpp_docker.sh --gpu 0 -- --exp medium --learning True
 #   ./run_roadpp_docker.sh --gpu none -- --device cpu --machine jst
 #   ./run_roadpp_docker.sh --gpu 4 -- --exp medium --tune_05
+#   ./run_roadpp_docker.sh --gpu 0 -- --exp full --num_epochs 50
 #
 # Environment variables (set before running, or export in your shell profile):
 #   CAUVID_ROADPP_DATA_HOST   Host path to the ROAD-Waymo dataset on dgx
