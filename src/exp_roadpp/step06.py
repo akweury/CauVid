@@ -55,10 +55,11 @@ def _score_histograms(model, data, cfg):
     return positives.view(num_atoms, num_bins).cpu(), negatives.view(num_atoms, num_bins).cpu()
 
 
-def _histogram_metrics(positives, negatives, threshold):
+def _histogram_metrics(positives, negatives, threshold, with_curve=False):
     """Onset metrics of one head (or all heads summed) from its score histograms:
     average precision, base rate, metrics at the probability threshold and at
-    the threshold with the best F1."""
+    the threshold with the best F1; with_curve adds the precision-recall curve,
+    one point per score bin from the highest threshold down."""
     num_bins = len(positives)
     # Predicting "on" for every score bin >= b, for b from the highest bin down.
     tp = positives.flip(0).cumsum(0)
@@ -72,6 +73,13 @@ def _histogram_metrics(positives, negatives, threshold):
         return compute_metrics(tp_b, fp_b, num_positives - tp_b)
 
     best_bin = max(range(num_bins), key=lambda b: at_bin(b)["f1"])
+    curve = {}
+    if with_curve:
+        curve = {"curve": {
+            "threshold": [b / num_bins for b in range(num_bins - 1, -1, -1)],
+            "precision": precision.tolist(),
+            "recall": (tp / max(num_positives, 1)).tolist(),
+        }}
     return {
         "onsets": int(num_positives),
         "at_risk": int(num_rows),
@@ -79,6 +87,7 @@ def _histogram_metrics(positives, negatives, threshold):
         "average_precision": average_precision,
         "at_threshold": at_bin(min(int(threshold * num_bins), num_bins - 1)),
         "best_f1": {**at_bin(best_bin), "threshold": best_bin / num_bins},
+        **curve,
     }
 
 
@@ -94,7 +103,8 @@ def evaluate_model(model, data, cfg):
     return {
         "num_videos": len(data["videos"]),
         "prob_threshold": cfg["prob_threshold"],
-        "overall": _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"]),
+        "overall": _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"],
+                                      with_curve=True),
         # Macro: every head with onsets counts the same.
         "macro_average_precision": (sum(m["average_precision"] for m in per_head.values()) / len(per_head)
                                     if per_head else 0.0),
@@ -127,6 +137,142 @@ def evaluate_clauses(model, data, clauses, step05_cfg):
         })
     evaluated.sort(key=lambda c: -(c["test_confidence"] or 0))
     return evaluated
+
+
+# -------------- Results --------------
+def build_results(metrics, clauses):
+    """The main test performance, without the per-head and per-clause details."""
+    overall = metrics["overall"]
+    firing = [c for c in clauses if c["test_confidence"] is not None]
+    extended = [c for c in firing if len(c["bodies"]) > 1 and c["test_anchor_confidence"] is not None]
+    confidences = sorted(c["test_confidence"] for c in firing)
+    heads = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
+    return {
+        "model": {
+            "num_videos": metrics["num_videos"],
+            "at_risk_rows": overall["at_risk"],
+            "onsets": overall["onsets"],
+            "base_rate": overall["base_rate"],
+            "micro_average_precision": overall["average_precision"],
+            "macro_average_precision": metrics["macro_average_precision"],
+            "prob_threshold": metrics["prob_threshold"],
+            "at_threshold": {k: overall["at_threshold"][k] for k in ("precision", "recall", "f1")},
+            "best_f1": {k: overall["best_f1"][k] for k in ("threshold", "precision", "recall", "f1")},
+            "num_heads": len(heads),
+            "top_heads": [{"label": m["label"], "average_precision": m["average_precision"],
+                           "base_rate": m["base_rate"], "onsets": m["onsets"]} for m in heads[:10]],
+        },
+        "clauses": {
+            "num_clauses": len(clauses),
+            "num_firing_on_test": len(firing),
+            "median_test_confidence": confidences[len(confidences) // 2] if confidences else None,
+            "num_extended_firing": len(extended),
+            "num_extended_beating_anchor": sum(c["test_confidence"] > c["test_anchor_confidence"] for c in extended),
+        },
+    }
+
+
+def plot_results(metrics, clauses, cfg, num_heads=30):
+    """Save the step 06 figures, one PDF each, to cfg["figure_dir"]:
+      precision_recall_curve.pdf: all heads together, against the base rate;
+      ap_per_head.pdf: average precision of each head against its base rate;
+      f1_per_head.pdf: best F1 of each head and its precision / recall there;
+      clause_train_vs_test.pdf: train vs test confidence of every clause;
+      clause_extension_gain.pdf: test confidence of the anchor alone vs the extended clause;
+      clause_precision_recall.pdf: test confidence vs recall of every clause.
+    A figure is skipped (with a message) when its data is missing.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure_dir = cfg["figure_dir"]
+    os.makedirs(figure_dir, exist_ok=True)
+
+    def save(fig, name):
+        fig.tight_layout()
+        fig.savefig(figure_dir / name)
+        plt.close(fig)
+        print(f"[Figure]\t {figure_dir / name}")
+
+    def length_scatter(fig, ax, rows, x_key, y_key):
+        # One dot per clause, colored by body length; dashed y = x.
+        points = ax.scatter([c[x_key] for c in rows], [c[y_key] for c in rows],
+                            c=[len(c["bodies"]) for c in rows], cmap="viridis", s=14, alpha=0.7)
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
+        ax.set(xlim=(0, 1), ylim=(0, 1))
+        fig.colorbar(points, ax=ax, label="body length (atoms)")
+
+    # Precision-recall curve of all heads together.
+    overall = metrics["overall"]
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    ax.plot(overall["curve"]["recall"], overall["curve"]["precision"], label="TemporalRuleNet")
+    ax.axhline(overall["base_rate"], color="tab:red", linestyle="--", label="base rate (random)")
+    best = overall["best_f1"]
+    ax.scatter([best["recall"]], [best["precision"]], color="black", zorder=3,
+               label=f"best F1 {best['f1']:.3f} @ {best['threshold']:.2f}")
+    ax.set(title=f"Test onsets, AP {overall['average_precision']:.3f}", xlabel="recall", ylabel="precision",
+           xlim=(0, 1), ylim=(0, 1))
+    ax.legend()
+    save(fig, "precision_recall_curve.pdf")
+
+    # Per head: AP and best F1, the heads with the highest AP.
+    heads = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])[:num_heads]
+    if heads:
+        y = list(range(len(heads)))
+        labels = [f"{m['label']} ({_short_num(m['onsets'])})" for m in heads]
+
+        fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
+        ax.barh(y, [m["average_precision"] for m in heads], color="tab:blue", label="AP")
+        ax.scatter([m["base_rate"] for m in heads], y, color="tab:red", marker="|", s=120,
+                   label="base rate", zorder=3)
+        ax.set_yticks(y, labels, fontsize=7)
+        ax.invert_yaxis()
+        ax.set(title=f"Average precision per head (top {len(heads)}, onsets in brackets)",
+               xlabel="average precision", xlim=(0, 1))
+        ax.legend(loc="lower right")
+        save(fig, "ap_per_head.pdf")
+
+        fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
+        ax.barh(y, [m["best_f1"]["f1"] for m in heads], color="tab:green", label="best F1")
+        ax.scatter([m["best_f1"]["precision"] for m in heads], y, marker="o", s=12, color="tab:blue",
+                   label="precision", zorder=3)
+        ax.scatter([m["best_f1"]["recall"] for m in heads], y, marker="x", s=14, color="tab:orange",
+                   label="recall", zorder=3)
+        ax.set_yticks(y, labels, fontsize=7)
+        ax.invert_yaxis()
+        ax.set(title="Best F1 per head, with its precision and recall", xlabel="score", xlim=(0, 1))
+        ax.legend(loc="lower right")
+        save(fig, "f1_per_head.pdf")
+
+    # Clauses on the test videos.
+    rows = [c for c in clauses if c["test_confidence"] is not None]
+    if not rows:
+        print("[Figure]\t skipped the clause figures: no clause fires on test")
+        return
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    length_scatter(fig, ax, rows, "confidence", "test_confidence")
+    ax.set(title="Clause confidence, train vs test", xlabel="train confidence", ylabel="test confidence")
+    save(fig, "clause_train_vs_test.pdf")
+
+    extended = [c for c in rows if len(c["bodies"]) > 1 and c["test_anchor_confidence"] is not None]
+    if extended:
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        length_scatter(fig, ax, extended, "test_anchor_confidence", "test_confidence")
+        better = sum(c["test_confidence"] > c["test_anchor_confidence"] for c in extended)
+        ax.set(title=f"Extension gain on test ({better}/{len(extended)} above y = x)",
+               xlabel="confidence of the anchor alone", ylabel="confidence of the extended clause")
+        save(fig, "clause_extension_gain.pdf")
+    else:
+        print("[Figure]\t skipped clause_extension_gain.pdf: no extended clause fires on test")
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    largest = max(c["test_support"] for c in rows) or 1
+    ax.scatter([c["test_recall"] or 0 for c in rows], [c["test_confidence"] for c in rows],
+               s=[4 + 60 * c["test_support"] / largest for c in rows], alpha=0.5)
+    ax.set(title="Clause confidence vs recall on test (size = test support)",
+           xlabel="recall (share of head onsets hit)", ylabel="confidence (precision)", xlim=(0, None), ylim=(0, 1))
+    save(fig, "clause_precision_recall.pdf")
 
 
 # -------------- Summary --------------
@@ -181,6 +327,8 @@ def main(input_data):
         "test_data_file": input_data["output_dir"] / "test_data.pt",
         "metrics_file": input_data["output_dir"] / "test_metrics.json",
         "test_clause_file": input_data["output_dir"] / "test_clauses.json",
+        "results_file": input_data["output_dir"] / "test_results.json",
+        "figure_dir": input_data["output_dir"] / "figures",
     }
     step05_cfg["device"] = cfg["device"]
 
@@ -192,7 +340,9 @@ def main(input_data):
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
 
     # 2. The model's next-frame onset prediction; redone whenever the model is retrained.
-    if not _is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"]):
+    metrics = utils_data.load_json(cfg["metrics_file"]) if os.path.exists(cfg["metrics_file"]) else {}
+    if (not _is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"])
+            or "curve" not in metrics.get("overall", {})):
         utils_data.save_json(evaluate_model(model, test_data, cfg), cfg["metrics_file"])
     metrics = utils_data.load_json(cfg["metrics_file"])
 
@@ -202,5 +352,9 @@ def main(input_data):
         utils_data.save_json(evaluate_clauses(model, test_data, clauses, step05_cfg), cfg["test_clause_file"])
     test_clauses = utils_data.load_json(cfg["test_clause_file"])
 
+    # 4. The main results (JSON) and the figures (one PDF each), on every run.
+    utils_data.save_json(build_results(metrics, test_clauses), cfg["results_file"])
+    print(f"[Results]\t {cfg['results_file']}")
+    plot_results(metrics, test_clauses, cfg)
     print_summary(metrics, test_clauses, cfg)
     print("\n--------- Step 06 Done ---------------\n")
