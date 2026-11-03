@@ -71,8 +71,11 @@ def _anchor_scores(model, inputs, baselines, chunk_size=64):
 
 
 # -------------- Detection --------------
-# The scorers whose detections are counted (the prior flags all rows of a head alike).
-DETECTION_SCORERS = ("model", "anchor")
+# The scorers whose detections are counted (the prior flags all rows of a head alike);
+# "mlp" only when the OnsetMLP baseline was trained.
+DETECTION_SCORERS = ("model", "mlp", "anchor")
+# Plot color of each scorer.
+SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray"}
 
 
 def _subset(data, video_ids):
@@ -80,14 +83,14 @@ def _subset(data, video_ids):
     return {**data, "videos": {v: data["videos"][v] for v in video_ids}}
 
 
-def select_thresholds(model, training_data, baselines, cfg):
+def select_thresholds(model, training_data, baselines, cfg, mlp=None):
     """Detection threshold of each scorer: the best-F1 threshold on the step 05
     validation videos, so the test counts are not tuned on the test set.
     Returns {"frame": {scorer: threshold}, "block": {scorer: threshold}}, the
     block level with tolerance cfg["detection_block_tolerance"]."""
-    frame, blocks = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg)
+    frame, blocks = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp)
     thresholds = {"frame": {}, "block": {}}
-    for name in DETECTION_SCORERS:
+    for name in (n for n in DETECTION_SCORERS if n in frame):
         for level, (positives, negatives) in (
                 ("frame", frame[name]),
                 ("block", _block_histograms(blocks, name, cfg["detection_block_tolerance"],
@@ -116,8 +119,9 @@ def _detection(positives, negatives, threshold, minutes):
 
 # -------------- Model evaluation --------------
 @torch.no_grad()
-def _score_videos(model, data, baselines, cfg):
-    """Onset scores of the model and of the baselines on every video of the split.
+def _score_videos(model, data, baselines, cfg, mlp=None):
+    """Onset scores of the model and of the baselines (anchor, prior and, if
+    given, the OnsetMLP mlp) on every video of the split.
 
     Returns (frame, blocks):
       frame {scorer: (positives, negatives)}: (A, S) histograms of the scores over
@@ -145,6 +149,9 @@ def _score_videos(model, data, baselines, cfg):
         "anchor": lambda inputs: _anchor_scores(model, inputs, baselines),
         "prior": lambda inputs: baselines["prior"].expand(len(inputs), -1),
     }
+    if mlp is not None:
+        # Same input layers as the TemporalRuleNet, so it scores the same rows.
+        scorers["mlp"] = lambda inputs: torch.sigmoid(mlp(inputs)[0])
 
     def zeros():
         return torch.zeros(num_atoms * num_bins, device=device)
@@ -337,7 +344,7 @@ def _histogram_metrics(positives, negatives, threshold, with_curve=False):
     }
 
 
-def evaluate_model(model, data, baselines, thresholds, cfg):
+def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
     """Next-frame onset prediction of the TemporalRuleNet on the test split, over
     all heads together (micro) and per head atom with at least one onset; the
     same for the baselines of `fit_baselines` under "baselines", on the same rows.
@@ -345,7 +352,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg):
     "blocks" holds the coarse-fine-focus metrics of `evaluate_blocks`; "detection"
     the event counts at the `select_thresholds` thresholds, frame exact and per
     block (with tolerance cfg["detection_block_tolerance"])."""
-    histograms, blocks = _score_videos(model, data, baselines, cfg)
+    histograms, blocks = _score_videos(model, data, baselines, cfg, mlp)
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     onset_heads = torch.nonzero(histograms["model"][0].sum(dim=1)).flatten().tolist()
 
@@ -373,10 +380,10 @@ def evaluate_model(model, data, baselines, thresholds, cfg):
         "block_size": cfg["block_size"],
         "block_tolerance": k,
         "frame_exact": {name: _detection(*histograms[name], thresholds["frame"][name], minutes)
-                        for name in DETECTION_SCORERS},
+                        for name in DETECTION_SCORERS if name in histograms},
         "block": {name: _detection(*_block_histograms(blocks, name, k, data["num_atoms"]),
                                    thresholds["block"][name], minutes)
-                  for name in DETECTION_SCORERS},
+                  for name in DETECTION_SCORERS if name in histograms},
     }
     return {
         "num_videos": len(data["videos"]),
@@ -451,7 +458,9 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
       f1_per_head.pdf: best F1 of each head and its precision / recall there;
       clause_train_vs_test.pdf: train vs test confidence of every clause;
       clause_extension_gain.pdf: test confidence of the anchor alone vs the extended clause;
-      clause_precision_recall.pdf: test confidence vs recall of every clause.
+      clause_precision_recall.pdf: test confidence vs recall of every clause;
+      compare_ap.pdf, compare_detection.pdf, compare_ap_per_head.pdf: the
+          TemporalRuleNet against the OnsetMLP baseline (`plot_comparison`).
     A figure is skipped (with a message) when its data is missing.
     """
     import matplotlib
@@ -484,8 +493,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     pr_curves(ax, [(f"TemporalRuleNet (AP {overall['average_precision']:.3f})", overall, "tab:blue")]
               + [(f"{name} baseline (AP {metrics['baselines'][name]['overall']['average_precision']:.3f})",
-                  metrics["baselines"][name]["overall"], color)
-                 for name, color in (("anchor", "tab:orange"), ("prior", "tab:gray"))],
+                  metrics["baselines"][name]["overall"], SCORER_COLORS[name])
+                 for name in metrics["baselines"]],
               overall["base_rate"])
     best = overall["best_f1"]
     ax.scatter([best["recall"]], [best["precision"]], color="black", zorder=3,
@@ -498,8 +507,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     blocks = metrics["blocks"]
     for k, by_scorer in blocks["coarse"].items():
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
-        pr_curves(ax, [(f"{name} (AP {by_scorer[name]['average_precision']:.3f})", by_scorer[name], color)
-                       for name, color in (("model", "tab:blue"), ("anchor", "tab:orange"), ("prior", "tab:gray"))],
+        pr_curves(ax, [(f"{name} (AP {m['average_precision']:.3f})", m, SCORER_COLORS[name])
+                       for name, m in by_scorer.items()],
                   by_scorer["model"]["base_rate"])
         ax.set(title=f"Block onsets ({blocks['block_size']} frames, up to {k} block(s) early)")
         ax.legend(fontsize=7)
@@ -516,6 +525,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     ax.legend()
     save(fig, "fine_frame_error.pdf")
 
+    plot_comparison(metrics, save, plt)
+
     # Per head: AP and best F1, the heads with the highest AP.
     heads = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])[:num_heads]
     if heads:
@@ -524,10 +535,12 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
 
         fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
         step05.head_dot_plot(ax, labels,
-                             [("model AP", [m["average_precision"] for m in heads], "tab:blue", "o"),
-                              ("anchor baseline AP", [m["baseline_average_precision"]["anchor"] for m in heads],
-                               "tab:orange", "D"),
-                              ("base rate", [m["base_rate"] for m in heads], "tab:red", "|")],
+                             [("model AP", [m["average_precision"] for m in heads], SCORER_COLORS["model"], "o")]
+                             + [(f"{name} baseline AP", [m["baseline_average_precision"][name] for m in heads],
+                                 SCORER_COLORS[name], marker)
+                                for name, marker in (("mlp", "s"), ("anchor", "D"))
+                                if name in heads[0]["baseline_average_precision"]]
+                             + [("base rate", [m["base_rate"] for m in heads], "tab:red", "|")],
                              reference=[m["base_rate"] for m in heads])
         ax.set(title=f"AP per head (top {len(heads)}, onsets in brackets), gray = lift over base rate",
                xlabel="average precision (log)")
@@ -571,6 +584,90 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
            xlabel="recall (share of head onsets hit)", ylabel="confidence (precision, log)",
            xlim=(0, 1), ylim=(low, 1), yscale="log")
     save(fig, "clause_precision_recall.pdf")
+
+
+def plot_comparison(metrics, save, plt):
+    """The TemporalRuleNet ("model") against the OnsetMLP baseline ("mlp"), with the
+    anchor and prior baselines as references; skipped if the MLP was not trained.
+      compare_ap.pdf: micro AP of every scorer, frame exact and per block;
+      compare_detection.pdf: detected / missed events and false alarms per minute
+          at the validation thresholds, frame exact and per block;
+      compare_ap_per_head.pdf: AP of each head, rule net vs MLP (above y = x: rule net better).
+    """
+    if "mlp" not in metrics["baselines"]:
+        print("[Figure]\t skipped the model comparison figures: no OnsetMLP baseline")
+        return
+    detection = metrics["detection"]
+    k = str(detection["block_tolerance"])
+    block_name = f"block ({detection['block_size']} frames, k = {k})"
+    names = ["model", "mlp", "anchor", "prior"]
+    labels = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior"}
+
+    # AP of every scorer at both levels, log axis (the prior sits at the base rate).
+    ap = {"frame exact": {"model": metrics["overall"]["average_precision"],
+                          **{n: m["overall"]["average_precision"] for n, m in metrics["baselines"].items()}},
+          block_name: {n: m["average_precision"] for n, m in metrics["blocks"]["coarse"][k].items()}}
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    width = 0.8 / len(names)
+    low = step05.log_floor([v for level in ap.values() for v in level.values()])
+    for i, name in enumerate(names):
+        xs = [g + (i - (len(names) - 1) / 2) * width for g in range(len(ap))]
+        values = [level[name] for level in ap.values()]
+        bars = ax.bar(xs, step05.clip_low(values, low), width, bottom=low, color=SCORER_COLORS[name],
+                      label=labels[name])
+        ax.bar_label(bars, labels=[f"{v:.3g}" for v in values], fontsize=6, padding=1)
+    ax.set_xticks(range(len(ap)), list(ap))
+    ax.set(title="Average precision (micro), test", ylabel="average precision (log)", yscale="log", ylim=(low, 1))
+    ax.legend(fontsize=7)
+    save(fig, "compare_ap.pdf")
+
+    # Detected / missed events and false alarms per minute, per level.
+    scorers = [n for n in DETECTION_SCORERS if n in detection["frame_exact"]]
+    fig, axes = plt.subplots(2, 2, figsize=(9, 5), gridspec_kw={"width_ratios": [2, 1]})
+    for row, (level, by_scorer) in enumerate((("frame exact", detection["frame_exact"]),
+                                              (block_name, detection["block"]))):
+        y = list(range(len(scorers)))
+        ticks = [f"{labels[n]} (thr {by_scorer[n]['threshold']:.2g})" for n in scorers]
+        ax = axes[row][0]
+        detected = [by_scorer[n]["detected"] for n in scorers]
+        missed = [by_scorer[n]["missed"] for n in scorers]
+        ax.barh(y, detected, color=[SCORER_COLORS[n] for n in scorers], label="detected")
+        ax.barh(y, missed, left=detected, color="lightgray", label="missed")
+        for i, n in enumerate(scorers):
+            ax.text(by_scorer[n]["events"], i, f" {by_scorer[n]['recall']:.1%} detected", va="center", fontsize=7)
+        ax.set_yticks(y, ticks, fontsize=7)
+        ax.invert_yaxis()
+        ax.set(title=f"{level}: {by_scorer[scorers[0]]['events']} events (gray = missed)", xlabel="events",
+               xlim=(0, by_scorer[scorers[0]]["events"] * 1.35))
+        ax = axes[row][1]
+        rates = [by_scorer[n]["false_alarms_per_minute"] or 0 for n in scorers]
+        bars = ax.barh(y, rates, color=[SCORER_COLORS[n] for n in scorers])
+        ax.bar_label(bars, labels=[f"{r:.1f} (P {by_scorer[n]['precision']:.2f})" for r, n in zip(rates, scorers)],
+                     fontsize=7, padding=2)
+        ax.set_yticks(y, [])
+        ax.invert_yaxis()
+        ax.set(title="false alarms / min (precision)", xlim=(0, max(rates + [1e-9]) * 1.6))
+    fig.suptitle(f"Detections at the validation thresholds, {detection['minutes']:.1f} min of test video")
+    save(fig, "compare_detection.pdf")
+
+    # Per head: rule net vs MLP AP, log-log; size = the head's onsets.
+    heads = [m for m in metrics["per_head"].values() if "mlp" in m["baseline_average_precision"]]
+    if heads:
+        xs = [m["baseline_average_precision"]["mlp"] for m in heads]
+        ys = [m["average_precision"] for m in heads]
+        low = step05.log_floor(xs + ys)
+        largest = max(m["onsets"] for m in heads)
+        fig, ax = plt.subplots(figsize=(5.5, 5))
+        ax.scatter(step05.clip_low(xs, low), step05.clip_low(ys, low), s=[8 + 120 * m["onsets"] / largest for m in heads],
+                   alpha=0.5, color=SCORER_COLORS["model"], clip_on=False)
+        ax.plot([low, 1], [low, 1], "k--", linewidth=0.8)
+        for m, x, y in sorted(zip(heads, xs, ys), key=lambda t: -t[0]["onsets"])[:8]:
+            ax.annotate(m["label"], (max(x, low), max(y, low)), fontsize=6, xytext=(3, 3), textcoords="offset points")
+        better = sum(y > x for x, y in zip(xs, ys))
+        ax.set(title=f"AP per head: rule net better on {better}/{len(heads)} (above y = x)",
+               xlabel="MLP baseline AP (log)", ylabel="rule net AP (log)", xscale="log", yscale="log",
+               xlim=(low, 1), ylim=(low, 1))
+        save(fig, "compare_ap_per_head.pdf")
 
 
 # -------------- Summary --------------
@@ -677,6 +774,7 @@ def main(input_data):
                                           step05_cfg["min_off_frames"])
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
+    mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained
 
     # 2. Baselines fitted on the step 05 training videos: the head prior and the anchor rules alone.
     if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
@@ -691,11 +789,11 @@ def main(input_data):
                 "block_tolerances": metrics.get("blocks", {}).get("block_tolerances"),
                 "detection_block_tolerance": metrics.get("detection", {}).get("block_tolerance")}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
-                            cfg["baseline_file"], step05_cfg["training_data_file"])
+                            cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"])
             or settings != {k: cfg[k] for k in settings}):
         training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
-        thresholds = select_thresholds(model, training_data, baselines, cfg)
-        utils_data.save_json(evaluate_model(model, test_data, baselines, thresholds, cfg), cfg["metrics_file"])
+        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp)
+        utils_data.save_json(evaluate_model(model, test_data, baselines, thresholds, cfg, mlp), cfg["metrics_file"])
     metrics = utils_data.load_json(cfg["metrics_file"])
 
     # 4. The step 05 clauses on the test videos; redone whenever they change.

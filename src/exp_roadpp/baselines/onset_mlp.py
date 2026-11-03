@@ -18,6 +18,7 @@ class OnsetMLP(torch.nn.Module):
     # The input layers and targets are the TemporalRuleNet's, shared code.
     layer_inputs = TemporalRuleNet.layer_inputs
     training_rows = TemporalRuleNet.training_rows
+    future_onsets = staticmethod(TemporalRuleNet.future_onsets)
     loss = TemporalRuleNet.loss
 
     def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), hidden_size=256, dropout=0.2):
@@ -38,11 +39,6 @@ class OnsetMLP(torch.nn.Module):
         """Head logits (B, A) and hidden activations (B, H) of input layers (B, M)."""
         hidden = self.dropout(torch.relu(self.hidden(inputs)))
         return self.head(hidden), hidden
-
-    def regularization_loss(self):
-        """Mean squared weight, the counterpart of TemporalRuleNet.sparsity_loss."""
-        weights = torch.cat([self.hidden.weight.flatten(), self.head.weight.flatten()])
-        return weights.pow(2).mean()
 
     @torch.no_grad()
     def predict(self, X):

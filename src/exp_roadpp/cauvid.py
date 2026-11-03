@@ -215,13 +215,14 @@ class TemporalRuleNet(torch.nn.Module):
         inputs = torch.stack([own, others], dim=1)                            # (F, 2, B, N, A)
         return inputs.permute(0, 3, 1, 2, 4).reshape(len(frames) * N, 2 * B * A).float()
 
-    def training_rows(self, X, frames, min_off_frames=1):
+    def training_rows(self, X, frames, min_off_frames=1, horizon=1):
         """Inputs and onset targets of the agents visible at each target frame.
 
-        Returns inputs (B, M) float; targets (B, A) bool, the atoms that switch on
-        (false -> true) for the agent at t; at_risk (B, A) bool, the atoms off in
-        all of t - min_off_frames..t - 1, the only ones that can switch on (an atom
-        back on after a shorter gap is a re-onset, not a new event); rows (B, 2) long, (t, n).
+        Returns inputs (B, M) float; targets (B, A) bool, the at-risk atoms that
+        switch on (false -> true) for the agent in one of the frames t..t + horizon - 1
+        (horizon 1: exactly at t); at_risk (B, A) bool, the atoms off in all of
+        t - min_off_frames..t - 1, the only ones that can switch on (an atom back on
+        after a shorter gap is a re-onset, not a new event); rows (B, 2) long, (t, n).
         """
         N = X.shape[1]
         inputs = self.layer_inputs(X, frames)
@@ -232,8 +233,23 @@ class TemporalRuleNet(torch.nn.Module):
         past = t[:, None] - torch.arange(1, min_off_frames + 1, device=X.device)     # (B, k)
         held = (X[past.clamp(min=0), n[:, None]] & (past >= 0)[..., None]).any(dim=1)
         at_risk = ~held
-        targets = X[t, n] & at_risk
+        targets = at_risk & self.future_onsets(X, t, n, horizon, min_off_frames)
         return inputs, targets, at_risk, torch.stack([t, n], dim=1)
+
+    @staticmethod
+    def future_onsets(X, t, n, horizon, min_off_frames):
+        """(B, A) bool: the atom switches on for agent n in some frame f of
+        t..t + horizon - 1: on in f, off in f - min_off_frames..f - 1, and the agent
+        visible in f - 1 (not an agent entering the scene)."""
+        T = X.shape[0]
+        frames = t[:, None] + torch.arange(-min_off_frames, horizon, device=X.device)     # (B, L)
+        window = X[frames.clamp(0, T - 1), n[:, None]] & ((frames >= 0) & (frames < T))[..., None]
+        onsets = torch.zeros((len(t), X.shape[2]), dtype=torch.bool, device=X.device)
+        for i in range(min_off_frames, min_off_frames + horizon):      # window index of f
+            held = window[:, i - min_off_frames:i].any(dim=1)
+            seen = window[:, i - 1].any(dim=1, keepdim=True)
+            onsets |= window[:, i] & ~held & seen
+        return onsets
 
     def hard_concrete_mask(self, log_alpha, beta=2 / 3, gamma=-0.1, zeta=1.1, training=True):
         if training:

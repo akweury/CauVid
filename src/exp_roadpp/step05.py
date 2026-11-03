@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data
 from src.exp_roadpp.cauvid import TemporalRuleNet
+from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 
 
 def _video_frames(video_atoms):
@@ -220,32 +221,37 @@ def prepare_training_data(cfg):
     return {**data, "train_videos": train_videos, "val_videos": val_videos}
 
 
-def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator):
+def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator, horizon=1):
     """(<= num_frames,) sorted target frames of one video, a share positive_ratio
-    of them drawn from its frames with onsets and the rest from all its frames."""
+    of them drawn from its frames with onsets and the rest from all its frames.
+    A positive is moved 0..horizon - 1 frames before its onset, where the onset
+    is still ahead within the target horizon."""
     def pick(pool, k):
         if len(pool) == 0 or k <= 0:
             return pool[:0]
         return pool[torch.randint(len(pool), (k,), generator=generator)]
 
     positives = pick(training_data["positive_frames"][video_id], round(positive_ratio * num_frames))
+    positives = (positives - torch.randint(horizon, positives.shape, generator=generator)).clamp(min=0)
     others = pick(training_data["frames"][video_id], num_frames - len(positives))
     return torch.unique(torch.cat([positives, others]))
 
 
-def _video_rows(model, training_data, video_id, frames, device):
+def _video_rows(model, training_data, video_id, frames, device, horizon=1):
     """Inputs, targets and at-risk masks of `TemporalRuleNet.training_rows` for the
-    target frames of one video, rebuilt from its stored atoms."""
+    target frames of one video, rebuilt from its stored atoms; targets are the
+    onsets within the next horizon frames."""
     X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
-    inputs, targets, at_risk, _rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1))
+    inputs, targets, at_risk, _rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
+                                                 horizon)
     return inputs, targets, at_risk
 
 
-def video_rows(model, X, frames, min_off_frames=1):
+def video_rows(model, X, frames, min_off_frames=1, horizon=1):
     """`TemporalRuleNet.training_rows` of the target frames of one (T, N, A) video
     tensor, without the agents entering the scene: their atoms all switch on at
     once in t, which are not events. Returns inputs, targets, at_risk, rows (t, n)."""
-    inputs, targets, at_risk, rows = model.training_rows(X, frames, min_off_frames)
+    inputs, targets, at_risk, rows = model.training_rows(X, frames, min_off_frames, horizon)
     t, n = rows.T
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
     return inputs[seen], targets[seen], at_risk[seen], rows[seen]
@@ -265,7 +271,8 @@ def _validation_loss(model, training_data, val_frames, cfg):
     model.eval()
     losses = []
     for video_id, frames in val_frames.items():
-        inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, cfg["device"])
+        inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, cfg["device"],
+                                               cfg["target_horizon"])
         if len(inputs) == 0:
             continue
         logits, _rules = model(inputs)
@@ -280,32 +287,24 @@ def anchor_rules(cfg):
     return [(body, [head[0] for head in heads]) for body, heads in body_groups.items()]
 
 
-def train_temporal_rule_net(training_data, cfg, run=None):
-    """Train a TemporalRuleNet on the training videos; returns the model with the
-    lowest validation loss.
+def fit_onset_model(model, training_data, cfg, optimizer, history_file, regularization=None, run=None,
+                    model_stats=None):
+    """Train an onset model (TemporalRuleNet or the OnsetMLP baseline) on the
+    training videos; returns it with the weights of the lowest validation loss.
 
     One epoch visits every training video once, in batches of videos_per_batch
     videos with frames_per_video sampled target frames each. The input rows are
-    rebuilt from the stored atoms per batch, never saved. run: the W&B run the
-    losses of each epoch are logged to, or None.
+    rebuilt from the stored atoms per batch, never saved. regularization(epoch):
+    the extra loss term of an epoch, or None; run: the W&B run the losses of each
+    epoch are logged to, or None; model_stats(): extra values logged per epoch.
     """
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
-    # One rule node per (anchor body, lag bin), plus num_free_rules unseeded ones.
-    anchors = anchor_rules(cfg)
-    num_bins = len(cfg["lag_edges"])
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
-                            len(anchors) * num_bins + cfg["num_free_rules"])
-    num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
-    model = model.to(device)
-    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free")
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-
     # Fixed validation frames, so the losses of the epochs are comparable.
     val_frames = {
         video_id: _sample_frames(training_data, video_id, cfg["frames_per_video"],
-                                 cfg["positive_frame_ratio"], generator)
+                                 cfg["positive_frame_ratio"], generator, cfg["target_horizon"])
         for video_id in training_data["val_videos"]
     }
     train_videos = training_data["train_videos"]
@@ -319,19 +318,17 @@ def train_temporal_rule_net(training_data, cfg, run=None):
             parts = [
                 _video_rows(model, training_data, train_videos[i],
                             _sample_frames(training_data, train_videos[i], cfg["frames_per_video"],
-                                           cfg["positive_frame_ratio"], generator),
-                            device)
+                                           cfg["positive_frame_ratio"], generator, cfg["target_horizon"]),
+                            device, cfg["target_horizon"])
                 for i in order[start:start + cfg["videos_per_batch"]]
             ]
             inputs, targets, at_risk = (torch.cat(part) for part in zip(*parts))
             if len(inputs) == 0:
                 continue
 
-            logits, _rules = model(inputs)
+            logits, _hidden = model(inputs)
             onset_loss = model.loss(logits, targets, at_risk, cfg["pos_weight"])
-            # No sparsity pressure in the first epochs, so useful inputs can grow first.
-            l0_lambda = cfg["l0_lambda"] if epoch >= cfg["l0_warmup_epochs"] else 0.0
-            loss = onset_loss + l0_lambda * model.sparsity_loss()
+            loss = onset_loss if regularization is None else onset_loss + regularization(epoch)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -342,15 +339,8 @@ def train_temporal_rule_net(training_data, cfg, run=None):
         print(f"[Epoch {epoch + 1}/{cfg['num_epochs']}] train loss {train_loss:.4f}, val loss {val_loss:.4f}")
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
         if run is not None:
-            with torch.no_grad():
-                active_inputs = (model.rule_mask() > cfg["mask_threshold"]).sum(dim=1).float()
-            run.log({
-                "train/onset_loss": train_loss,
-                "val/onset_loss": val_loss,
-                "model/sparsity_loss": model.sparsity_loss().item(),
-                "model/active_inputs_per_rule": active_inputs.mean().item(),
-                "model/empty_rules": (active_inputs == 0).sum().item(),
-            }, step=epoch)
+            run.log({"train/onset_loss": train_loss, "val/onset_loss": val_loss,
+                     **(model_stats() if model_stats else {})}, step=epoch)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -358,10 +348,38 @@ def train_temporal_rule_net(training_data, cfg, run=None):
     if best_state is not None:
         model.load_state_dict(best_state)
     print(f"[Training] Best val loss {best_val_loss:.4f}")
-    utils_data.save_json(history, cfg["history_file"])
+    utils_data.save_json(history, history_file)
     if run is not None:
         run.summary["best_val_onset_loss"] = best_val_loss
     return model
+
+
+def train_temporal_rule_net(training_data, cfg, run=None):
+    """Train a TemporalRuleNet seeded from the anchor clauses (`fit_onset_model`),
+    with the L0 sparsity loss after l0_warmup_epochs."""
+    # One rule node per (anchor body, lag bin), plus num_free_rules unseeded ones.
+    anchors = anchor_rules(cfg)
+    num_bins = len(cfg["lag_edges"])
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
+                            len(anchors) * num_bins + cfg["num_free_rules"])
+    num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
+    model = model.to(cfg["device"])
+    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free")
+
+    def regularization(epoch):
+        # No sparsity pressure in the first epochs, so useful inputs can grow first.
+        return (cfg["l0_lambda"] if epoch >= cfg["l0_warmup_epochs"] else 0.0) * model.sparsity_loss()
+
+    @torch.no_grad()
+    def model_stats():
+        active_inputs = (model.rule_mask() > cfg["mask_threshold"]).sum(dim=1).float()
+        return {"model/sparsity_loss": model.sparsity_loss().item(),
+                "model/active_inputs_per_rule": active_inputs.mean().item(),
+                "model/empty_rules": (active_inputs == 0).sum().item()}
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    return fit_onset_model(model, training_data, cfg, optimizer, cfg["history_file"], regularization, run,
+                           model_stats)
 
 
 def load_temporal_rule_net(training_data, cfg):
@@ -373,6 +391,30 @@ def load_temporal_rule_net(training_data, cfg):
     """
     state = torch.load(cfg["model_file"], map_location="cpu")
     model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], state["log_alpha"].shape[0])
+    model.load_state_dict(state)
+    return model.to(cfg["device"]).eval()
+
+
+# -------------- Black-box baseline --------------
+def train_onset_mlp(training_data, cfg, run=None):
+    """Train the OnsetMLP baseline (`fit_onset_model`) on the same input rows,
+    targets and batches as the TemporalRuleNet, with weight decay instead of
+    the L0 loss and no anchor seeding. Its hidden size defaults to the number of
+    rule nodes of the TemporalRuleNet, so both have about as many parameters."""
+    hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * len(cfg["lag_edges"]) + cfg["num_free_rules"]
+    model = OnsetMLP(training_data["num_atoms"], cfg["lag_edges"], hidden_size, cfg["mlp_dropout"]).to(cfg["device"])
+    print(f"[Baseline] OnsetMLP with {hidden_size} hidden units")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["mlp_weight_decay"])
+    return fit_onset_model(model, training_data, cfg, optimizer, cfg["mlp_history_file"], run=run)
+
+
+def load_onset_mlp(training_data, cfg):
+    """The trained OnsetMLP of cfg["mlp_model_file"], in eval mode on cfg["device"],
+    or None if it was not trained."""
+    if not os.path.exists(cfg["mlp_model_file"]):
+        return None
+    state = torch.load(cfg["mlp_model_file"], map_location="cpu")
+    model = OnsetMLP(training_data["num_atoms"], cfg["lag_edges"], state["hidden.weight"].shape[0])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -400,7 +442,8 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
     for video_id in tqdm(video_ids, desc=desc):
         video_hits = torch.zeros((num_rules, num_atoms), device=device)
         for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
-            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, device)
+            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, device,
+                                                   cfg["target_horizon"])
             if len(inputs) == 0:
                 continue
             targets, at_risk = targets.float(), at_risk.float()
@@ -567,10 +610,16 @@ def _plot_results(clauses, cfg, num_heads=30):
 
     # Training curves.
     if os.path.exists(cfg["history_file"]):
-        history = utils_data.load_json(cfg["history_file"])
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot([h["epoch"] for h in history], [h["train_loss"] for h in history], label="train")
-        ax.plot([h["epoch"] for h in history], [h["val_loss"] for h in history], label="val")
+        for name, file, color in (("rule net", cfg["history_file"], "tab:blue"),
+                                  ("MLP baseline", cfg["mlp_history_file"], "tab:green")):
+            if not os.path.exists(file):
+                continue
+            history = utils_data.load_json(file)
+            ax.plot([h["epoch"] for h in history], [h["train_loss"] for h in history], color=color,
+                    linestyle="--", label=f"{name} train")
+            ax.plot([h["epoch"] for h in history], [h["val_loss"] for h in history], color=color,
+                    label=f"{name} val")
         ax.set(title="Onset loss per epoch", xlabel="epoch", ylabel="weighted BCE")
         ax.legend()
         save(fig, "training_curves.pdf")
@@ -684,12 +733,16 @@ def _print_summary(clauses, training_data, cfg, num_examples=15):
 
 def get_cfg(input_data):
     """Settings and files of step 05; step 06 uses them to load the trained model."""
+    horizon = 10
     return {
             'device': input_data['device'],
             'seed': 0,
             # An atom switches on only after being off for this many frames for the
             # agent; shorter gaps are label flicker (re-onsets), not new events.
             'min_off_frames': 10,
+            # Target: the atom switches on within the next target_horizon frames (1 =
+            # exactly the next frame); 10 matches the 1 s blocks of the step 06 evaluation.
+            'target_horizon': horizon,
             # Model: lag bins (lo, hi] of the past frames, one input layer each, and
             # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
             'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
@@ -714,15 +767,24 @@ def get_cfg(input_data):
             # A clause must hit its head in min_support training frames of min_videos videos.
             'min_support': 10,
             'min_videos': 2,
+            # Black-box baseline: an OnsetMLP on the same inputs and targets, trained after the
+            # rule net; hidden size None = the number of rule nodes (about as many parameters).
+            'mlp_baseline': True,
+            'mlp_hidden_size': None,
+            'mlp_dropout': 0.2,
+            'mlp_weight_decay': 1e-4,
             'wandb': True,
             'wandb_project': 'cauvid-roadpp',
             'train_atom_file': input_data['train_atom_file'],
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
             "unique_atoms_file": input_data["unique_atoms_file"],
             'training_data_file': input_data["output_dir"] / "training_data.pt",
-            'model_file': input_data["output_dir"] / "temporal_rule_net.pt",
-            "extended_clause_file": input_data["output_dir"] / "extended_clauses.json",
-            'history_file': input_data["output_dir"] / "training_history.json",
+            # One model per target horizon, so a model trained for another target is never reused.
+            'model_file': input_data["output_dir"] / f"temporal_rule_net_h{horizon}.pt",
+            "extended_clause_file": input_data["output_dir"] / f"extended_clauses_h{horizon}.json",
+            'history_file': input_data["output_dir"] / f"training_history_h{horizon}.json",
+            'mlp_model_file': input_data["output_dir"] / f"onset_mlp_h{horizon}.pt",
+            'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_h{horizon}.json",
             'figure_dir': input_data["output_dir"] / "figures",
     }
 
@@ -764,7 +826,17 @@ def main(input_data):
         if run is not None:
             run.finish()
 
-    # 4. Figures (one PDF each) and the terminal summary, on every run.
+    # 4. The black-box baseline on the same data, its own W&B run; step 06 evaluates it.
+    if cfg["mlp_baseline"] and not is_fresh(cfg["mlp_model_file"], cfg["training_data_file"]):
+        run = _init_wandb(cfg, {"num_atoms": training_data["num_atoms"]}, job_type="step05_onset_mlp")
+        try:
+            mlp = train_onset_mlp(training_data, cfg, run)
+            torch.save(mlp.state_dict(), cfg["mlp_model_file"])
+        finally:
+            if run is not None:
+                run.finish()
+
+    # 5. Figures (one PDF each) and the terminal summary, on every run.
     extended_clauses = utils_data.load_json(cfg["extended_clause_file"])
     _plot_results(extended_clauses, cfg)
     _print_summary(extended_clauses, training_data, cfg)
