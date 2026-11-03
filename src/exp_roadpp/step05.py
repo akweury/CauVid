@@ -73,8 +73,9 @@ def _wandb_login(wandb):
     Asks the user to pick a login method: the saved credentials (~/.netrc or
     WANDB_API_KEY) or an API key typed in (hidden), from
     https://wandb.ai/authorize. Without a terminal, only saved credentials are tried.
+    A WANDB_API_KEY in the environment (e.g. forwarded into Docker) is used without asking.
     """
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() or os.environ.get("WANDB_API_KEY"):
         return wandb.login(host=_WANDB_CLOUD_HOST)
     print(
         "[wandb] Choose a login method for https://wandb.ai:\n"

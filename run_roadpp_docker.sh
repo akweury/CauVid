@@ -34,6 +34,9 @@
 #   CAUVID_ROADPP_DEVICE      Device string passed to main.py
 #                             (default: cuda:0, overridden by --gpu none -> cpu)
 #   CAUVID_ROADPP_MACHINE     --machine value passed to main.py (default: dgx)
+#   WANDB_API_KEY             W&B API key forwarded into the container; if unset,
+#                             read from CAUVID_WANDB_KEY_FILE (default
+#                             ~/.config/wandb/api_key, chmod 600, never committed)
 
 set -e
 
@@ -88,6 +91,14 @@ MACHINE="${CAUVID_ROADPP_MACHINE:-dgx-jing}"
 
 mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST"
 
+# W&B key: the container is removed after each run (--rm, HOME=/tmp), so a key
+# typed at the login prompt is lost; forward it from the host instead.
+WANDB_KEY_FILE="${CAUVID_WANDB_KEY_FILE:-$HOME/.config/wandb/api_key}"
+if [[ -z "${WANDB_API_KEY:-}" && -f "$WANDB_KEY_FILE" ]]; then
+    WANDB_API_KEY="$(tr -d '[:space:]' < "$WANDB_KEY_FILE")"
+fi
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+
 if [[ "$GPU_ARG" == "none" ]]; then
     GPU_DOCKER_ARGS=()
     DEVICE="${CAUVID_ROADPP_DEVICE:-cpu}"
@@ -111,6 +122,7 @@ echo "[run_roadpp_docker] GPU:             $GPU_ARG"
 echo "[run_roadpp_docker] Device arg:      $DEVICE"
 echo "[run_roadpp_docker] Entry module:    $ENTRY_MODULE"
 echo "[run_roadpp_docker] Extra args:      ${EXTRA_ARGS[*]:-<none>}"
+echo "[run_roadpp_docker] W&B key:         $([[ -n "$WANDB_API_KEY" ]] && echo set || echo "not set (login prompt)")"
 
 # --- Build image if missing or if its dependencies changed ---
 # Hash requirements.txt + Dockerfile and store it as an image label; rebuild
@@ -150,6 +162,7 @@ docker run --rm -it \
     -e PYTHONPATH=/app \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \
+    -e WANDB_API_KEY \
     "$IMAGE_NAME" \
     python -m "$ENTRY_MODULE" --device "$DEVICE" --machine "$MACHINE" "${EXTRA_ARGS[@]}"
 

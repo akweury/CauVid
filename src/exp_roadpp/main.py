@@ -2,7 +2,7 @@ import numpy as np
 
 
 from src.exp_roadpp import utils_pipe
-from src.exp_roadpp import step01, step02, step03, step04, step05, step06, step_dataset, step_baselines
+from src.exp_roadpp import step01, step02, step03, step04, step05, step05_layer, step06, step06_layer, step_dataset, step_baselines
 from src.exp_roadpp import config
 
 
@@ -34,10 +34,15 @@ def main():
     # clause extension (step 5)
     step05_input = config.get_step_05_input(args)
     step05.main(step05_input)
+    # layered rule net: predicts the full atom state of each layer of frames from the K before it
+    if args.layered_rules == "True":
+        step05_layer.main(step05_input)
 
     # estimation and evaluation of the extended clauses over the val videos
     step06_input = config.get_step_06_input(args)
     step06.main(step06_input)
+    if args.layered_rules == "True":
+        step06_layer.main(step06_input)
 
     raise NotImplementedError()
     # run baseline methods

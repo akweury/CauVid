@@ -339,3 +339,202 @@ class TemporalRuleNet(torch.nn.Module):
                 "heads": [(h, self.head_weight[h, r].item()) for h in heads],
             })
         return rules
+
+
+class LayeredRuleNet(torch.nn.Module):
+    """Layer-per-time-step rule network: predicts the full atom state of every
+    agent in layer t from the K layers t-1..t-K before it.
+
+    A layer is one block of frames (`step05.coarsen_video`). Each of the K past
+    layers gives two groups of A input nodes per agent: slot 0 "self" (the agent
+    holds the atom in that layer) and slot 1 "others" (some other agent holds it),
+    so M = 2 * K * A inputs, each at an exact layer offset 1..K. States may be
+    soft (predicted probabilities), so a predicted layer can be fed back as the
+    input of the next one and rules chain over layers.
+
+    R rule nodes are soft ANDs over a sigmoid mask of the inputs, deterministic
+    and started near 0: with thousands of mostly-0 inputs, a noisy (hard-concrete)
+    mask opens a few of them in every sample and turns the rule off, so it gets no
+    gradient. An L1 of the mask keeps it sparse. The next state is a transition
+    of the previous one: each atom switches on (off -> on) with the weighted OR
+    of the rules of its "on" head, and off with its "off" head:
+        s_t = s_{t-1} * (1 - off) + (1 - s_{t-1}) * on.
+    """
+
+    def __init__(self, num_atoms, num_layers=20, num_rules=256, init_log_alpha=-11.0):
+        super().__init__()
+        self.num_atoms = num_atoms
+        self.num_layers = num_layers
+        self.num_inputs = 2 * num_layers * num_atoms
+        self.log_alpha = torch.nn.Parameter(torch.full((num_rules, self.num_inputs), init_log_alpha))
+        self.on_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
+        self.off_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
+        self.on_bias = torch.nn.Parameter(torch.full((num_atoms,), -4.0))
+        self.off_bias = torch.nn.Parameter(torch.full((num_atoms,), -3.0))
+        # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
+        self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
+        # Inputs a rule may learn; all False for the anchor-only rules.
+        self.register_buffer("learnable", torch.ones((num_rules, self.num_inputs), dtype=torch.bool))
+
+    def input_index(self, atom, slot, offset):
+        """Input node of (atom, slot, layer offset 1..K); slots > 1 are "others"."""
+        return min(slot, 1) * self.num_layers * self.num_atoms + (offset - 1) * self.num_atoms + atom
+
+    def decode_input(self, m):
+        """Input node m -> (atom, slot, offset): slot 0 self, 1 others; the atom
+        holds offset layers before the head."""
+        K, A = self.num_layers, self.num_atoms
+        return m % A, m // (K * A), (m // A) % K + 1
+
+    @torch.no_grad()
+    def seed_rules(self, anchors, offsets, num_specialized=2, head_weight=1.0, noise=0.5):
+        """Seed 1 + num_specialized rule nodes per (anchor body, layer offset).
+
+        anchors: [((atom, slot), [head atom])]. All copies hold the body atom at
+        the offset as a fixed input and start with weight head_weight to the
+        anchor's "on" heads. Copy 0 keeps only the anchor (no learnable inputs), so
+        the general rule keeps its coverage; copies 1.. may add atoms, their gates
+        jittered by noise so they specialize in different directions.
+        Returns the number of seeded rules, the first ones of the R rule nodes.
+        """
+        copies = 1 + num_specialized
+        num_seeded = len(anchors) * len(offsets) * copies
+        if num_seeded > self.log_alpha.shape[0]:
+            raise ValueError(f"{num_seeded} seeded rules do not fit into {self.log_alpha.shape[0]} rule nodes.")
+        r = 0
+        for (atom, slot), heads in anchors:
+            for offset in offsets:
+                for copy in range(copies):
+                    m = self.input_index(atom, slot, offset)
+                    self.fixed_inputs[r, m] = True
+                    self.learnable[r] = copy > 0
+                    self.learnable[r, m] = False
+                    self.log_alpha[r] += noise * torch.randn(self.num_inputs) * (copy > 0)
+                    self.on_weight[:, r] = 0.0
+                    self.on_weight[list(heads), r] = head_weight
+                    self.off_weight[:, r] = 0.0
+                    r += 1
+        return num_seeded
+
+    def layer_inputs(self, context):
+        """(W * N, M) float inputs of every agent from its context of K layers.
+
+        context: (W, K, N, A) states in [0, 1] of W windows, oldest layer first.
+        Row w * N + n is agent n of window w. "Others" is the soft OR over the
+        other agents, 1 - prod(1 - s), so soft states pass their gradient.
+        """
+        W, K, N, A = context.shape
+        own = context.flip(1)                                         # offset 1 first
+        log_free = torch.log1p(-own.clamp(max=1 - 1e-6))
+        others = 1 - torch.exp(log_free.sum(dim=2, keepdim=True) - log_free)
+        inputs = torch.stack([own, others], dim=2)                    # (W, K, 2, N, A)
+        return inputs.permute(0, 3, 2, 1, 4).reshape(W * N, 2 * K * A)
+
+    # -------- forward ----------------------------------
+    def rule_mask(self):
+        """(R, M) mask sigmoid(log_alpha) in [0, 1]; 1 for the fixed inputs, 0 for
+        the inputs a rule may not learn."""
+        return (torch.sigmoid(self.log_alpha) * self.learnable).masked_fill(self.fixed_inputs, 1.0)
+
+    def forward(self, inputs):
+        """On logits (B, A), off logits (B, A) and rule activations (B, R) of
+        inputs (B, M); rules as in `TemporalRuleNet.forward`."""
+        mask = self.rule_mask().clamp(max=1 - 1e-6)
+        rules = torch.exp((1 - inputs) @ torch.log1p(-mask).T)
+        on = rules @ self.on_weight.T + self.on_bias
+        off = rules @ self.off_weight.T + self.off_bias
+        return on, off, rules
+
+    @staticmethod
+    def next_state(prev, on, off):
+        """(B, A) atom probabilities of the next layer from the previous states."""
+        return prev * (1 - torch.sigmoid(off)) + (1 - prev) * torch.sigmoid(on)
+
+    @staticmethod
+    def state_loss(pred, prev, target, pos_weight=20.0):
+        """Sum and total weight of the binary cross-entropy of the predicted states
+        against the true ones; transitions (target != true previous state) weighted
+        up, since most atoms keep their state."""
+        changed = (target > 0.5) != (prev > 0.5)
+        weight = torch.where(changed, pos_weight, 1.0)
+        p = pred.clamp(1e-6, 1 - 1e-6)
+        bce = -(target * torch.log(p) + (1 - target) * torch.log(1 - p))
+        return (bce * weight).sum(), weight.sum()
+
+    def rule_heads(self):
+        """(R,) index into [on heads, off heads] (0..2A-1) of each rule's largest head weight."""
+        return torch.cat([self.on_weight, self.off_weight]).argmax(dim=0)
+
+    def precision_loss(self, rules, prev, target, counts, k=10.0, decay=0.9):
+        """-log of the m-estimate precision (hits + k * p0) / (fires + k) of each
+        rule with learnable inputs, for its main head (`rule_heads`).
+
+        fires: soft firings where the head can happen (atom off for an "on" head,
+        on for an "off" head); hits: those where it happens; p0: its base rate. A
+        rule hitting few examples gets a precision near p0, so precise rules must
+        also cover data. counts {"hits", "fires"} accumulate over the recent
+        batches (decayed, detached), so k is in about 1 / (1 - decay) batches.
+        """
+        prev, target = prev > 0.5, target > 0.5
+        risk = torch.cat([~prev, prev], dim=1)                        # (B, 2A)
+        happens = torch.cat([~prev & target, prev & ~target], dim=1)
+        h = self.rule_heads()
+        m, y = risk[:, h].float(), happens[:, h].float()              # (B, R)
+        hits = decay * counts.get("hits", 0.0) + (rules * y).sum(dim=0)
+        fires = decay * counts.get("fires", 0.0) + (rules * m).sum(dim=0)
+        p0 = (y * m).sum(dim=0) / m.sum(dim=0).clamp(min=1)
+        counts["hits"], counts["fires"] = hits.detach(), fires.detach()
+        precision = (hits + k * p0) / (fires + k)
+        trained = self.learnable.any(dim=1)
+        return -(torch.log(precision.clamp(min=1e-6)) * trained).sum() / trained.sum().clamp(min=1)
+
+    def sparsity_loss(self):
+        """L1 of the learnable mask per rule with any, plus the L1 of the on and
+        off head weights."""
+        trained = self.learnable.any(dim=1)
+        l1 = (torch.sigmoid(self.log_alpha) * self.learnable).sum(dim=1)
+        l1 = (l1 * trained).sum() / trained.sum().clamp(min=1)
+        return l1 + self.on_weight.abs().sum(dim=1).mean() + self.off_weight.abs().sum(dim=1).mean()
+
+    # -------- use after training ----------------------------------
+    @torch.no_grad()
+    def rollout(self, X, steps=1):
+        """(steps, N, A) atom probabilities of the layers after X, each predicted
+        from the K layers before it, the predicted ones included.
+
+        X: (T, N, A) layer states (bool or float), T >= 1; layers before X are empty.
+        The agents visible in the last layer of X stay visible, the others empty.
+        """
+        K = self.num_layers
+        states = [X.new_zeros(X.shape[1:], dtype=torch.float)] * K + list(X.float().unbind(0))
+        visible = (X[-1].float().amax(dim=1, keepdim=True) > 0).float()
+        for _ in range(steps):
+            on, off, _rules = self(self.layer_inputs(torch.stack(states[-K:])[None]))
+            states.append(self.next_state(states[-1], on, off) * visible)
+        return torch.stack(states[-steps:])
+
+    @torch.no_grad()
+    def partial_activation(self, inputs, threshold=0.5):
+        """(B, R) share of each rule's body inputs that hold, in [0, 1]."""
+        body = (self.rule_mask() > threshold).float()
+        return (inputs @ body.T) / body.sum(dim=1).clamp(min=1)
+
+    @torch.no_grad()
+    def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1):
+        """Rules [{"rule": r, "bodies": [(atom, slot, offset)], "heads": [(atom, kind, weight)]}],
+        kind "on" or "off". Bodies are sorted earliest first (largest offset)."""
+        body = self.rule_mask() > mask_threshold
+        rules = []
+        for r in range(body.shape[0]):
+            inputs = torch.nonzero(body[r]).flatten().tolist()
+            heads = [(h, kind, weights[h, r].item())
+                     for kind, weights in (("on", self.on_weight), ("off", self.off_weight))
+                     for h in torch.nonzero(weights[:, r] > weight_threshold).flatten().tolist()]
+            if not inputs or not heads:
+                continue
+            rules.append({
+                "rule": r,
+                "bodies": sorted((self.decode_input(m) for m in inputs), key=lambda b: -b[2]),
+                "heads": heads,
+            })
+        return rules
