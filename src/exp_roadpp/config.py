@@ -295,6 +295,7 @@ def get_step_06_input(args):
         "device": args.device,
         "test_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "test_atoms_compressed.json",
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
+        "frame_rate": args.frame_rate,
         # Step 06 loads the step 05 model and clauses with the step 05 settings.
         "step05_input": get_step_05_input(args),
     }

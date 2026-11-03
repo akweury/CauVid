@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import getpass
@@ -491,6 +492,52 @@ def extract_temporal_clauses(model, training_data, cfg, run=None):
     return clauses
 
 
+# -------------- Plot helpers (shared with step 06) --------------
+# Confidences, precisions and base rates span 1e-6..1, so they go on log axes;
+# a 0 cannot be shown there and is drawn on the lower edge instead.
+def log_floor(values, floor=1e-6):
+    """Lower limit of a log axis: the decade at or below the smallest positive value."""
+    positive = [v for v in values if v is not None and v > floor]
+    return 10 ** math.floor(math.log10(min(positive))) if positive else floor
+
+
+def clip_low(values, low):
+    """Values with None / 0 / anything below low raised to low (drawn on the axis edge)."""
+    return [max(v or 0.0, low) for v in values]
+
+
+def clause_scatter(ax, rows, x_key, y_key):
+    """Log-log scatter of two confidences of every clause, one color per body
+    length, dashed y = x; 0 is drawn on the lower edges."""
+    xs, ys = [c[x_key] for c in rows], [c[y_key] for c in rows]
+    low = log_floor(xs + ys)
+    xs, ys = clip_low(xs, low), clip_low(ys, low)
+    lengths = [len(c["bodies"]) for c in rows]
+    for length in sorted(set(lengths)):
+        picked = [i for i, n in enumerate(lengths) if n == length]
+        ax.scatter([xs[i] for i in picked], [ys[i] for i in picked], s=16, alpha=0.7,
+                   label=f"{length} atom{'s' if length > 1 else ''}", clip_on=False)
+    ax.plot([low, 1], [low, 1], "k--", linewidth=0.8)
+    ax.set(xscale="log", yscale="log", xlim=(low, 1), ylim=(low, 1))
+    ax.legend(title="body length", fontsize=7, title_fontsize=7)
+
+
+def head_dot_plot(ax, labels, series, reference=None):
+    """Per-row dots on a log x axis: series [(label, values, color, marker)], and
+    a gray line from reference (e.g. the base rate) to the first series, the lift."""
+    low = log_floor([v for _label, values, _c, _m in series for v in values] + list(reference or []))
+    y = list(range(len(labels)))
+    if reference is not None:
+        ax.hlines(y, clip_low(reference, low), clip_low(series[0][1], low), color="lightgray", linewidth=2, zorder=1)
+    for label, values, color, marker in series:
+        ax.scatter(clip_low(values, low), y, color=color, marker=marker, s=22, label=label, zorder=3, clip_on=False)
+    ax.set_yticks(y, labels, fontsize=7)
+    ax.invert_yaxis()
+    ax.set(xscale="log", xlim=(low, 1))
+    ax.grid(axis="x", which="major", alpha=0.3)
+    ax.legend(loc="lower right", fontsize=7)
+
+
 def _plot_results(clauses, cfg, num_heads=30):
     """Save the step 05 figures, one PDF each, to cfg["figure_dir"]:
       training_curves.pdf: train / val onset loss per epoch;
@@ -518,15 +565,6 @@ def _plot_results(clauses, cfg, num_heads=30):
     def has(clause, *keys):
         return all(clause.get(k) is not None for k in keys)
 
-    def length_scatter(ax, rows, x_key, y_key):
-        # One dot per clause, colored by body length; dashed y = x.
-        lengths = [len(c["bodies"]) for c in rows]
-        points = ax.scatter([c[x_key] for c in rows], [c[y_key] for c in rows],
-                            c=lengths, cmap="viridis", s=14, alpha=0.7)
-        ax.plot([0, 1], [0, 1], "k--", linewidth=0.8)
-        ax.set(xlim=(0, 1), ylim=(0, 1))
-        fig.colorbar(points, ax=ax, label="body length (atoms)")
-
     # Training curves.
     if os.path.exists(cfg["history_file"]):
         history = utils_data.load_json(cfg["history_file"])
@@ -547,7 +585,7 @@ def _plot_results(clauses, cfg, num_heads=30):
     rows = [c for c in clauses if len(c["bodies"]) > 1 and has(c, "val_confidence", "val_anchor_confidence")]
     if rows:
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
-        length_scatter(ax, rows, "val_anchor_confidence", "val_confidence")
+        clause_scatter(ax, rows, "val_anchor_confidence", "val_confidence")
         better = sum(c["val_confidence"] > c["val_anchor_confidence"] for c in rows)
         ax.set(title=f"Extension gain on val ({better}/{len(rows)} above y = x)",
                xlabel="confidence of the anchor alone", ylabel="confidence of the extended clause")
@@ -559,17 +597,18 @@ def _plot_results(clauses, cfg, num_heads=30):
     rows = [c for c in clauses if has(c, "val_confidence")]
     if rows:
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
-        length_scatter(ax, rows, "confidence", "val_confidence")
+        clause_scatter(ax, rows, "confidence", "val_confidence")
         ax.set(title="Clause confidence, train vs val", xlabel="train confidence", ylabel="val confidence")
         save(fig, "train_vs_val_confidence.pdf")
 
         fig, ax = plt.subplots(figsize=(5.5, 4.5))
         sizes = [4 + 60 * c["support"] / max(r["support"] for r in rows) for c in rows]
-        ax.scatter([c["val_recall"] or 0 for c in rows], [c["val_confidence"] for c in rows],
-                   s=sizes, alpha=0.5)
+        low = log_floor([c["val_confidence"] for c in rows])
+        ax.scatter([c["val_recall"] or 0 for c in rows], clip_low([c["val_confidence"] for c in rows], low),
+                   s=sizes, alpha=0.5, clip_on=False)
         ax.set(title="Val confidence vs recall (size = train support)",
-               xlabel="recall (share of head onsets hit)", ylabel="confidence (precision)",
-               xlim=(0, None), ylim=(0, 1))
+               xlabel="recall (share of head onsets hit)", ylabel="confidence (precision, log)",
+               xlim=(0, 1), ylim=(low, 1), yscale="log")
         save(fig, "precision_recall_val.pdf")
     else:
         print("[Figure]\t skipped train_vs_val_confidence.pdf / precision_recall_val.pdf: no clause fires on val")
@@ -583,14 +622,12 @@ def _plot_results(clauses, cfg, num_heads=30):
     if best:
         heads = sorted(best, key=lambda h: best[h]["val_confidence"], reverse=True)[:num_heads]
         fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
-        y = list(range(len(heads)))
-        ax.barh(y, [best[h]["val_confidence"] for h in heads], color="tab:blue", label="best clause")
-        ax.scatter([best[h]["val_base_rate"] or 0 for h in heads], y, color="tab:red", marker="|", s=120,
-                   label="base rate", zorder=3)
-        ax.set_yticks(y, [_atom_name(unique_atoms[h]) for h in heads], fontsize=7)
-        ax.invert_yaxis()
-        ax.set(title=f"Best val confidence per head (top {len(heads)})", xlabel="val confidence", xlim=(0, 1))
-        ax.legend(loc="lower right")
+        head_dot_plot(ax, [_atom_name(unique_atoms[h]) for h in heads],
+                      [("best clause", [best[h]["val_confidence"] for h in heads], "tab:blue", "o"),
+                       ("base rate", [best[h]["val_base_rate"] for h in heads], "tab:red", "|")],
+                      reference=[best[h]["val_base_rate"] for h in heads])
+        ax.set(title=f"Best val confidence per head (top {len(heads)}), gray = lift over base rate",
+               xlabel="val confidence (log)")
         save(fig, "best_clause_per_head.pdf")
 
     # Delay map: in which lag bin the anchor of the clauses of each head lies.
