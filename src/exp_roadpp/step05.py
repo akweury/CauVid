@@ -236,11 +236,26 @@ def _video_rows(model, training_data, video_id, frames, device):
     """Inputs, targets and at-risk masks of `TemporalRuleNet.training_rows` for the
     target frames of one video, rebuilt from its stored atoms."""
     X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
-    inputs, targets, at_risk, rows = model.training_rows(X, frames.to(device), training_data.get("min_off_frames", 1))
+    inputs, targets, at_risk, _rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1))
+    return inputs, targets, at_risk
+
+
+def video_rows(model, X, frames, min_off_frames=1):
+    """`TemporalRuleNet.training_rows` of the target frames of one (T, N, A) video
+    tensor, without the agents entering the scene: their atoms all switch on at
+    once in t, which are not events. Returns inputs, targets, at_risk, rows (t, n)."""
+    inputs, targets, at_risk, rows = model.training_rows(X, frames, min_off_frames)
     t, n = rows.T
-    # An agent entering the scene in t switches on all of its atoms at once: not events.
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
-    return inputs[seen], targets[seen], at_risk[seen]
+    return inputs[seen], targets[seen], at_risk[seen], rows[seen]
+
+
+def coarsen_video(X, block_size):
+    """(ceil(T / s), N, A) bool: the atom holds in some frame of each block of
+    s = block_size frames (frames past the video end count as empty)."""
+    pad = (-X.shape[0]) % block_size
+    X = torch.cat([X, X.new_zeros((pad, *X.shape[1:]))])
+    return X.view(-1, block_size, *X.shape[1:]).any(dim=1)
 
 
 @torch.no_grad()
