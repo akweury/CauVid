@@ -150,25 +150,36 @@ def build_video_tensor(video_atoms, num_atoms, device="cpu"):
     return X
 
 
-def atom_onsets(X):
-    """(T, N, A) bool: atom a switches on (false -> true) for agent n in frame t."""
-    previous = torch.zeros_like(X)
-    previous[1:] = X[:-1]
-    return X & ~previous
+def atom_onsets(X, min_off_frames=1):
+    """(T, N, A) bool: atom a switches on for agent n in frame t, after being off
+    for at least the min_off_frames frames before t."""
+    held = torch.zeros_like(X)
+    for k in range(1, min_off_frames + 1):
+        held[k:] |= X[:-k]
+    return X & ~held
 
 
-def prepare_videos(atom_file, num_atoms, device):
+def is_fresh(output_file, *source_files):
+    """True if output_file exists and is newer than every existing source file."""
+    if not os.path.exists(output_file):
+        return False
+    return all(os.path.getmtime(output_file) >= os.path.getmtime(f) for f in source_files if os.path.exists(f))
+
+
+def prepare_videos(atom_file, num_atoms, device, min_off_frames=1):
     """Compressed atoms and frame lists of every video of one split.
 
     Returns {
       "num_atoms": A,
+      "min_off_frames": frames an atom must be off before it can switch on again,
       "videos": {video_id: `_video_cells` of its (T, N, A) atom tensor},
       "frames": {video_id: (F,) long, frames with some visible agent},
       "positive_frames": {video_id: (P,) long, frames where some agent already
                           visible in the previous frame switches an atom on},
     }; videos shorter than 2 frames are left out.
     An agent entering the scene switches on all of its atoms at once; those
-    are appearances, not events, so they do not make a frame positive.
+    are appearances, not events, so they do not make a frame positive. Neither
+    does an atom back on after a gap shorter than min_off_frames (label flicker).
     """
     atoms = utils_data.load_json(atom_file)
     videos, frames, positive_frames = {}, {}, {}
@@ -179,12 +190,13 @@ def prepare_videos(atom_file, num_atoms, device):
         visible = X.any(dim=2)                                      # (T, N)
         stayed = torch.zeros_like(visible)
         stayed[1:] = visible[1:] & visible[:-1]                     # visible in t and t - 1
-        has_onset = (atom_onsets(X).any(dim=2) & stayed).any(dim=1)
+        has_onset = (atom_onsets(X, min_off_frames).any(dim=2) & stayed).any(dim=1)
 
         videos[video_id] = _video_cells(X)
         frames[video_id] = torch.nonzero(visible.any(dim=1)).flatten().cpu()
         positive_frames[video_id] = torch.nonzero(has_onset).flatten().cpu()
-    return {"num_atoms": num_atoms, "videos": videos, "frames": frames, "positive_frames": positive_frames}
+    return {"num_atoms": num_atoms, "min_off_frames": min_off_frames, "videos": videos, "frames": frames,
+            "positive_frames": positive_frames}
 
 
 def prepare_training_data(cfg):
@@ -192,7 +204,7 @@ def prepare_training_data(cfg):
     `prepare_videos` data of the training atoms, plus "train_videos" /
     "val_videos", a random split by video."""
     num_atoms = len(utils_data.load_json(cfg['unique_atoms_file']))
-    data = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"])
+    data = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
 
     video_ids = sorted(data["videos"])
     order = torch.randperm(len(video_ids), generator=torch.Generator().manual_seed(cfg["seed"]))
@@ -224,7 +236,7 @@ def _video_rows(model, training_data, video_id, frames, device):
     """Inputs, targets and at-risk masks of `TemporalRuleNet.training_rows` for the
     target frames of one video, rebuilt from its stored atoms."""
     X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
-    inputs, targets, at_risk, rows = model.training_rows(X, frames.to(device))
+    inputs, targets, at_risk, rows = model.training_rows(X, frames.to(device), training_data.get("min_off_frames", 1))
     t, n = rows.T
     # An agent entering the scene in t switches on all of its atoms at once: not events.
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
@@ -245,6 +257,13 @@ def _validation_loss(model, training_data, val_frames, cfg):
     return sum(losses) / len(losses) if losses else float("nan")
 
 
+def anchor_rules(cfg):
+    """[((atom, slot), [head atom])] of the anchor clauses, one per body, in the
+    order their rules are seeded: rules i * B..i * B + B - 1 belong to anchor i."""
+    body_groups = group_clauses_by_body(utils_data.load_json(cfg["causal_anchor_clause_file"]))
+    return [(body, [head[0] for head in heads]) for body, heads in body_groups.items()]
+
+
 def train_temporal_rule_net(training_data, cfg, run=None):
     """Train a TemporalRuleNet on the training videos; returns the model with the
     lowest validation loss.
@@ -258,8 +277,7 @@ def train_temporal_rule_net(training_data, cfg, run=None):
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
     # One rule node per (anchor body, lag bin), plus num_free_rules unseeded ones.
-    body_groups = group_clauses_by_body(utils_data.load_json(cfg["causal_anchor_clause_file"]))
-    anchors = [(body, [head[0] for head in heads]) for body, heads in body_groups.items()]
+    anchors = anchor_rules(cfg)
     num_bins = len(cfg["lag_edges"])
     model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
                             len(anchors) * num_bins + cfg["num_free_rules"])
@@ -617,6 +635,9 @@ def get_cfg(input_data):
     return {
             'device': input_data['device'],
             'seed': 0,
+            # An atom switches on only after being off for this many frames for the
+            # agent; shorter gaps are label flicker (re-onsets), not new events.
+            'min_off_frames': 10,
             # Model: lag bins (lo, hi] of the past frames, one input layer each, and
             # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
             'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
@@ -659,28 +680,32 @@ def main(input_data):
     cfg = get_cfg(input_data)
 
     # 1. Prepare once: compressed atoms of each video, the frames to sample
-    #    (all / with onsets) and the train / validation split by video.
-    if not os.path.exists(cfg["training_data_file"]):
+    #    (all / with onsets) and the train / validation split by video; redone
+    #    when min_off_frames changes. The model and clauses are redone after it.
+    training_data = (torch.load(cfg["training_data_file"], map_location="cpu")
+                     if os.path.exists(cfg["training_data_file"]) else {})
+    if training_data.get("min_off_frames") != cfg["min_off_frames"]:
         training_data = prepare_training_data(cfg)
         torch.save(training_data, cfg["training_data_file"])
-    training_data = torch.load(cfg["training_data_file"], map_location="cpu")
+    model_fresh = is_fresh(cfg["model_file"], cfg["training_data_file"])
+    clauses_fresh = model_fresh and is_fresh(cfg["extended_clause_file"], cfg["model_file"])
 
     # One W&B run for the training and extraction below, only if any is not cached.
     run = None
-    if not os.path.exists(cfg["model_file"]) or not os.path.exists(cfg["extended_clause_file"]):
+    if not clauses_fresh:
         run = _init_wandb(cfg, {"num_train_videos": len(training_data["train_videos"]),
                                 "num_val_videos": len(training_data["val_videos"]),
                                 "num_atoms": training_data["num_atoms"]},
                           job_type="step05_temporal_rule_net")
     try:
         # 2. Train the TemporalRuleNet; its input rows are built from the atoms per batch.
-        if not os.path.exists(cfg["model_file"]):
+        if not model_fresh:
             model = train_temporal_rule_net(training_data, cfg, run)
             torch.save(model.state_dict(), cfg["model_file"])
         model = load_temporal_rule_net(training_data, cfg)
 
         # 3. Read the learned rules (ordered bodies with lags -> heads) out of the model.
-        if not os.path.exists(cfg["extended_clause_file"]):
+        if not clauses_fresh:
             extended_clauses = extract_temporal_clauses(model, training_data, cfg, run)
             utils_data.save_json(extended_clauses, cfg["extended_clause_file"])
     finally:

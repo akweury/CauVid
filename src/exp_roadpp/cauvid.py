@@ -215,12 +215,13 @@ class TemporalRuleNet(torch.nn.Module):
         inputs = torch.stack([own, others], dim=1)                            # (F, 2, B, N, A)
         return inputs.permute(0, 3, 1, 2, 4).reshape(len(frames) * N, 2 * B * A).float()
 
-    def training_rows(self, X, frames):
+    def training_rows(self, X, frames, min_off_frames=1):
         """Inputs and onset targets of the agents visible at each target frame.
 
         Returns inputs (B, M) float; targets (B, A) bool, the atoms that switch on
-        (false -> true) for the agent at t; at_risk (B, A) bool, the atoms off at
-        t - 1, the only ones that can switch on; rows (B, 2) long, (t, n).
+        (false -> true) for the agent at t; at_risk (B, A) bool, the atoms off in
+        all of t - min_off_frames..t - 1, the only ones that can switch on (an atom
+        back on after a shorter gap is a re-onset, not a new event); rows (B, 2) long, (t, n).
         """
         N = X.shape[1]
         inputs = self.layer_inputs(X, frames)
@@ -228,8 +229,9 @@ class TemporalRuleNet(torch.nn.Module):
         n = torch.arange(N, device=X.device).repeat(len(frames))
         keep = X[t, n].any(dim=1)
         t, n, inputs = t[keep], n[keep], inputs[keep]
-        previous = torch.where((t > 0)[:, None], X[(t - 1).clamp(min=0), n], torch.zeros_like(X[t, n]))
-        at_risk = ~previous
+        past = t[:, None] - torch.arange(1, min_off_frames + 1, device=X.device)     # (B, k)
+        held = (X[past.clamp(min=0), n[:, None]] & (past >= 0)[..., None]).any(dim=1)
+        at_risk = ~held
         targets = X[t, n] & at_risk
         return inputs, targets, at_risk, torch.stack([t, n], dim=1)
 

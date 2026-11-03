@@ -25,41 +25,91 @@ def _short_num(n):
     return f"{n:.1f}T"
 
 
-def _is_fresh(output_file, *source_files):
-    """True if output_file exists and is newer than every source file."""
-    if not os.path.exists(output_file):
-        return False
-    return all(os.path.getmtime(output_file) >= os.path.getmtime(f) for f in source_files if os.path.exists(f))
+def score_edges():
+    """(S,) lower edges of the score bins: 0, then 40 log-spaced bins per decade
+    from 1e-8 to 1e-2 (onsets are rare, so most scores are tiny), then steps of 0.01."""
+    return torch.cat([torch.zeros(1), torch.logspace(-8, -2, 241)[:-1], torch.linspace(0.01, 0.99, 99)])
+
+
+# -------------- Baselines --------------
+@torch.no_grad()
+def fit_baselines(model, training_data, step05_cfg):
+    """Scores of two baselines, fitted on all step 05 training videos:
+      prior (A,): onsets / at-risk rows of each head, the same for every row;
+      anchor_confidence (R, A): for each seeded rule r (anchor body in one lag
+          bin) and each head of its anchor clause, the confidence of the anchor
+          input alone; -1 for other heads, free rules and anchors that never fire.
+    The anchor baseline is the anchor clauses with lag bins but without the
+    learned extra atoms, so the model beating it shows the extensions help."""
+    counts = step05._rule_head_counts(model, training_data, list(training_data["videos"]), step05_cfg,
+                                      desc="Counting anchor firings (train)")
+    num_bins = model.num_bins
+    is_anchor_head = torch.zeros_like(counts["anchor_fires"], dtype=torch.bool)
+    for i, (_body, heads) in enumerate(step05.anchor_rules(step05_cfg)):
+        is_anchor_head[i * num_bins:(i + 1) * num_bins, heads] = True
+    valid = is_anchor_head & (counts["anchor_fires"] > 0)
+    return {
+        "prior": counts["onsets"] / counts["at_risk"].clamp(min=1),
+        "anchor_confidence": torch.where(valid, counts["anchor_hits"] / counts["anchor_fires"].clamp(min=1), -1.0),
+    }
+
+
+def _anchor_scores(model, inputs, baselines, chunk_size=64):
+    """(B, A) anchor baseline score of each row: the highest confidence of the
+    anchors firing for the head, or the head's prior if none fires."""
+    confidence = baselines["anchor_confidence"]
+    used = (confidence >= 0).any(dim=1)
+    confidence = confidence[used]
+    anchor_body = model.fixed_inputs[used].float()
+    anchor_size = anchor_body.sum(dim=1)
+    fired = (inputs @ anchor_body.T >= anchor_size) & (anchor_size > 0)            # (B, R')
+    best = torch.full((len(inputs), model.num_atoms), -1.0, device=inputs.device)
+    if len(confidence):
+        best = torch.cat([torch.where(chunk[:, :, None], confidence[None], -1.0).max(dim=1).values
+                          for chunk in fired.split(chunk_size)])
+    return torch.where(best >= 0, best, baselines["prior"])
 
 
 # -------------- Model evaluation --------------
 @torch.no_grad()
-def _score_histograms(model, data, cfg):
-    """(A, S) histograms of the predicted onset probabilities over all at-risk
-    (agent, frame, atom) rows of the split, split into the rows where the atom
-    switches on (positives) and the others (negatives); S score bins over [0, 1]."""
-    num_atoms, num_bins = data["num_atoms"], cfg["num_score_bins"]
+def _score_histograms(model, data, baselines, cfg):
+    """{scorer: (positives, negatives)}, the (A, S) histograms of the onset
+    scores of the model and of the baselines over all at-risk (agent, frame,
+    atom) rows of the split, split into the rows where the atom switches on
+    (positives) and the others (negatives); S score bins of `score_edges`."""
     device = cfg["device"]
-    positives = torch.zeros(num_atoms * num_bins, device=device)
-    negatives = torch.zeros(num_atoms * num_bins, device=device)
+    edges = score_edges().to(device)
+    num_atoms, num_bins = data["num_atoms"], len(edges)
+    baselines = {name: value.to(device) for name, value in baselines.items()}
+    scorers = {
+        "model": lambda inputs: torch.sigmoid(model(inputs)[0]),
+        "anchor": lambda inputs: _anchor_scores(model, inputs, baselines),
+        "prior": lambda inputs: baselines["prior"].expand(len(inputs), -1),
+    }
+    histograms = {name: (torch.zeros(num_atoms * num_bins, device=device),
+                         torch.zeros(num_atoms * num_bins, device=device)) for name in scorers}
     heads = torch.arange(num_atoms, device=device) * num_bins
     for video_id in tqdm(data["videos"], desc="Scoring test videos"):
         for frames in data["frames"][video_id].split(cfg["frames_per_video"]):
             inputs, targets, at_risk = step05._video_rows(model, data, video_id, frames, device)
             if len(inputs) == 0:
                 continue
-            probabilities = torch.sigmoid(model(inputs)[0])
-            cells = heads + (probabilities * num_bins).long().clamp(max=num_bins - 1)
-            positives += torch.bincount(cells[targets], minlength=len(positives))
-            negatives += torch.bincount(cells[at_risk & ~targets], minlength=len(negatives))
-    return positives.view(num_atoms, num_bins).cpu(), negatives.view(num_atoms, num_bins).cpu()
+            for name, score in scorers.items():
+                bins = torch.searchsorted(edges, score(inputs).contiguous(), right=True) - 1
+                cells = heads + bins.clamp(min=0)
+                positives, negatives = histograms[name]
+                positives += torch.bincount(cells[targets], minlength=len(positives))
+                negatives += torch.bincount(cells[at_risk & ~targets], minlength=len(negatives))
+    return {name: (positives.view(num_atoms, num_bins).cpu(), negatives.view(num_atoms, num_bins).cpu())
+            for name, (positives, negatives) in histograms.items()}
 
 
 def _histogram_metrics(positives, negatives, threshold, with_curve=False):
-    """Onset metrics of one head (or all heads summed) from its score histograms:
-    average precision, base rate, metrics at the probability threshold and at
-    the threshold with the best F1; with_curve adds the precision-recall curve,
-    one point per score bin from the highest threshold down."""
+    """Onset metrics of one head (or all heads summed) from its score histograms
+    over the `score_edges` bins: average precision, base rate, metrics at the
+    probability threshold and at the threshold with the best F1; with_curve adds
+    the precision-recall curve, one point per score bin from the highest threshold down."""
+    edges = score_edges()
     num_bins = len(positives)
     # Predicting "on" for every score bin >= b, for b from the highest bin down.
     tp = positives.flip(0).cumsum(0)
@@ -76,7 +126,7 @@ def _histogram_metrics(positives, negatives, threshold, with_curve=False):
     curve = {}
     if with_curve:
         curve = {"curve": {
-            "threshold": [b / num_bins for b in range(num_bins - 1, -1, -1)],
+            "threshold": edges.flip(0).tolist(),
             "precision": precision.tolist(),
             "recall": (tp / max(num_positives, 1)).tolist(),
         }}
@@ -85,30 +135,43 @@ def _histogram_metrics(positives, negatives, threshold, with_curve=False):
         "at_risk": int(num_rows),
         "base_rate": num_positives / num_rows if num_rows else 0.0,
         "average_precision": average_precision,
-        "at_threshold": at_bin(min(int(threshold * num_bins), num_bins - 1)),
-        "best_f1": {**at_bin(best_bin), "threshold": best_bin / num_bins},
+        "at_threshold": at_bin(int(torch.searchsorted(edges, torch.tensor(threshold), right=True)) - 1),
+        "best_f1": {**at_bin(best_bin), "threshold": edges[best_bin].item()},
         **curve,
     }
 
 
-def evaluate_model(model, data, cfg):
+def evaluate_model(model, data, baselines, cfg):
     """Next-frame onset prediction of the TemporalRuleNet on the test split, over
-    all heads together (micro) and per head atom with at least one onset."""
-    positives, negatives = _score_histograms(model, data, cfg)
+    all heads together (micro) and per head atom with at least one onset; the
+    same for the baselines of `fit_baselines` under "baselines", on the same rows.
+    Each per-head entry also has the baselines' AP under "baseline_average_precision"."""
+    histograms = _score_histograms(model, data, baselines, cfg)
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
-    per_head = {}
-    for h in torch.nonzero(positives.sum(dim=1)).flatten().tolist():
-        per_head[h] = {"label": step05._atom_name(unique_atoms[h]),
-                       **_histogram_metrics(positives[h], negatives[h], cfg["prob_threshold"])}
+    onset_heads = torch.nonzero(histograms["model"][0].sum(dim=1)).flatten().tolist()
+
+    def scorer_metrics(positives, negatives):
+        per_head = {h: _histogram_metrics(positives[h], negatives[h], cfg["prob_threshold"]) for h in onset_heads}
+        return {
+            "overall": _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"],
+                                          with_curve=True),
+            # Macro: every head with onsets counts the same.
+            "macro_average_precision": (sum(m["average_precision"] for m in per_head.values()) / len(per_head)
+                                        if per_head else 0.0),
+            "per_head": per_head,
+        }
+
+    results = {name: scorer_metrics(*histograms[name]) for name in histograms}
+    model_results = results.pop("model")
+    for h, m in model_results["per_head"].items():
+        m["label"] = step05._atom_name(unique_atoms[h])
+        m["baseline_average_precision"] = {name: r["per_head"][h]["average_precision"] for name, r in results.items()}
     return {
         "num_videos": len(data["videos"]),
+        "min_off_frames": data["min_off_frames"],
         "prob_threshold": cfg["prob_threshold"],
-        "overall": _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"],
-                                      with_curve=True),
-        # Macro: every head with onsets counts the same.
-        "macro_average_precision": (sum(m["average_precision"] for m in per_head.values()) / len(per_head)
-                                    if per_head else 0.0),
-        "per_head": per_head,
+        **model_results,
+        "baselines": {name: {k: r[k] for k in ("overall", "macro_average_precision")} for name, r in results.items()},
     }
 
 
@@ -147,9 +210,19 @@ def build_results(metrics, clauses):
     extended = [c for c in firing if len(c["bodies"]) > 1 and c["test_anchor_confidence"] is not None]
     confidences = sorted(c["test_confidence"] for c in firing)
     heads = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
+    def summary(m):
+        return {"micro_average_precision": m["overall"]["average_precision"],
+                "macro_average_precision": m["macro_average_precision"],
+                "best_f1": {k: m["overall"]["best_f1"][k] for k in ("threshold", "precision", "recall", "f1")}}
+
+    anchor_ap = metrics["baselines"]["anchor"]["overall"]["average_precision"]
     return {
+        # The main check: the model's micro AP against the anchor rules alone (> 1 = extensions help).
+        "micro_ap_gain_over_anchor": overall["average_precision"] / anchor_ap if anchor_ap > 0 else None,
+        "baselines": {name: summary(m) for name, m in metrics["baselines"].items()},
         "model": {
             "num_videos": metrics["num_videos"],
+            "min_off_frames": metrics["min_off_frames"],
             "at_risk_rows": overall["at_risk"],
             "onsets": overall["onsets"],
             "base_rate": overall["base_rate"],
@@ -160,6 +233,7 @@ def build_results(metrics, clauses):
             "best_f1": {k: overall["best_f1"][k] for k in ("threshold", "precision", "recall", "f1")},
             "num_heads": len(heads),
             "top_heads": [{"label": m["label"], "average_precision": m["average_precision"],
+                           "anchor_average_precision": m["baseline_average_precision"]["anchor"],
                            "base_rate": m["base_rate"], "onsets": m["onsets"]} for m in heads[:10]],
         },
         "clauses": {
@@ -206,12 +280,17 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     # Precision-recall curve of all heads together.
     overall = metrics["overall"]
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
-    ax.plot(overall["curve"]["recall"], overall["curve"]["precision"], label="TemporalRuleNet")
+    ax.plot(overall["curve"]["recall"], overall["curve"]["precision"],
+            label=f"TemporalRuleNet (AP {overall['average_precision']:.3f})")
+    for name, style in (("anchor", "tab:orange"), ("prior", "tab:gray")):
+        baseline = metrics["baselines"][name]["overall"]
+        ax.plot(baseline["curve"]["recall"], baseline["curve"]["precision"], color=style,
+                label=f"{name} baseline (AP {baseline['average_precision']:.3f})")
     ax.axhline(overall["base_rate"], color="tab:red", linestyle="--", label="base rate (random)")
     best = overall["best_f1"]
     ax.scatter([best["recall"]], [best["precision"]], color="black", zorder=3,
                label=f"best F1 {best['f1']:.3f} @ {best['threshold']:.2f}")
-    ax.set(title=f"Test onsets, AP {overall['average_precision']:.3f}", xlabel="recall", ylabel="precision",
+    ax.set(title=f"Test onsets (off >= {metrics['min_off_frames']} frames before)", xlabel="recall", ylabel="precision",
            xlim=(0, 1), ylim=(0, 1))
     ax.legend()
     save(fig, "precision_recall_curve.pdf")
@@ -224,6 +303,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
 
         fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
         ax.barh(y, [m["average_precision"] for m in heads], color="tab:blue", label="AP")
+        ax.scatter([m["baseline_average_precision"]["anchor"] for m in heads], y, color="tab:orange",
+                   marker="D", s=14, label="anchor baseline AP", zorder=3)
         ax.scatter([m["base_rate"] for m in heads], y, color="tab:red", marker="|", s=120,
                    label="base rate", zorder=3)
         ax.set_yticks(y, labels, fontsize=7)
@@ -284,16 +365,19 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
           f"{_short_num(overall['onsets'])} onsets, base rate {overall['base_rate']:.4f}")
     print(f"[AP]\t\t micro {overall['average_precision']:.3f}, macro {metrics['macro_average_precision']:.3f} "
           f"(random = base rate)")
+    for name, baseline in metrics["baselines"].items():
+        print(f"[AP {name}]\t micro {baseline['overall']['average_precision']:.3f}, "
+              f"macro {baseline['macro_average_precision']:.3f} (baseline)")
     for name, m in (("@" + str(metrics["prob_threshold"]), overall["at_threshold"]),
                     (f"best F1 @{overall['best_f1']['threshold']:.2f}", overall["best_f1"])):
         print(f"[{name}]\t precision {m['precision']:.3f}, recall {m['recall']:.3f}, f1 {m['f1']:.3f}")
     print()
 
-    print(f"[Per head, by AP] onsets  base rate  AP  best F1")
+    print(f"[Per head, by AP] onsets  base rate  AP  anchor AP  best F1")
     rows = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
     for m in rows[:num_examples]:
         print(f"{_short_num(m['onsets']):>7}  {m['base_rate']:.4f}  {m['average_precision']:.3f}  "
-              f"{m['best_f1']['f1']:.3f}  [{m['label']}]")
+              f"{m['baseline_average_precision']['anchor']:.3f}  {m['best_f1']['f1']:.3f}  [{m['label']}]")
     print()
 
     print(f"[Clauses]\t {len(clauses)} from step 05")
@@ -323,7 +407,7 @@ def main(input_data):
         "frames_per_video": step05_cfg["frames_per_video"],
         # A head is predicted to switch on in the next frame above this probability.
         "prob_threshold": 0.5,
-        "num_score_bins": 100,
+        "baseline_file": input_data["output_dir"] / "baselines.pt",
         "test_data_file": input_data["output_dir"] / "test_data.pt",
         "metrics_file": input_data["output_dir"] / "test_metrics.json",
         "test_clause_file": input_data["output_dir"] / "test_clauses.json",
@@ -332,27 +416,36 @@ def main(input_data):
     }
     step05_cfg["device"] = cfg["device"]
 
-    # 1. Test videos in the format of the step 05 training data.
-    if not os.path.exists(cfg["test_data_file"]):
+    # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
+    test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
+    if test_data.get("min_off_frames") != step05_cfg["min_off_frames"]:
         num_atoms = len(utils_data.load_json(cfg["unique_atoms_file"]))
-        torch.save(step05.prepare_videos(cfg["test_atoms_file"], num_atoms, cfg["device"]), cfg["test_data_file"])
-    test_data = torch.load(cfg["test_data_file"], map_location="cpu")
+        test_data = step05.prepare_videos(cfg["test_atoms_file"], num_atoms, cfg["device"],
+                                          step05_cfg["min_off_frames"])
+        torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
 
-    # 2. The model's next-frame onset prediction; redone whenever the model is retrained.
+    # 2. Baselines fitted on the step 05 training videos: the head prior and the anchor rules alone.
+    if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
+        training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
+        torch.save(fit_baselines(model, training_data, step05_cfg), cfg["baseline_file"])
+    baselines = torch.load(cfg["baseline_file"], map_location="cpu")
+
+    # 3. Next-frame onset prediction of the model and the baselines; redone whenever any input changes.
     metrics = utils_data.load_json(cfg["metrics_file"]) if os.path.exists(cfg["metrics_file"]) else {}
-    if (not _is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"])
-            or "curve" not in metrics.get("overall", {})):
-        utils_data.save_json(evaluate_model(model, test_data, cfg), cfg["metrics_file"])
+    if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
+                            cfg["baseline_file"])
+            or "baselines" not in metrics):
+        utils_data.save_json(evaluate_model(model, test_data, baselines, cfg), cfg["metrics_file"])
     metrics = utils_data.load_json(cfg["metrics_file"])
 
-    # 3. The step 05 clauses on the test videos; redone whenever they change.
-    if not _is_fresh(cfg["test_clause_file"], step05_cfg["extended_clause_file"], cfg["test_data_file"]):
+    # 4. The step 05 clauses on the test videos; redone whenever they change.
+    if not step05.is_fresh(cfg["test_clause_file"], step05_cfg["extended_clause_file"], cfg["test_data_file"]):
         clauses = utils_data.load_json(step05_cfg["extended_clause_file"])
         utils_data.save_json(evaluate_clauses(model, test_data, clauses, step05_cfg), cfg["test_clause_file"])
     test_clauses = utils_data.load_json(cfg["test_clause_file"])
 
-    # 4. The main results (JSON) and the figures (one PDF each), on every run.
+    # 5. The main results (JSON) and the figures (one PDF each), on every run.
     utils_data.save_json(build_results(metrics, test_clauses), cfg["results_file"])
     print(f"[Results]\t {cfg['results_file']}")
     plot_results(metrics, test_clauses, cfg)
