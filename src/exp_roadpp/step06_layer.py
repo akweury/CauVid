@@ -143,7 +143,7 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
     (up to frame b * block_size - 1): "layered" the h = 1 prediction of the
     LayeredRuleNet; "temporal" and "mlp" the onset probability of the step 05
     TemporalRuleNet and OnsetMLP for target frame b * block_size (an onset within
-    their target_horizon frames, which covers layer b when >= block_size);
+    their first window (10 frames), which covers layer b when >= block_size);
     "anchor" the anchor rules alone (`step06.fit_baselines`); "prior" the layer
     base rate of `layer_priors`. mlp / baselines may be None (left out).
 
@@ -171,12 +171,13 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
                 continue
             # Row w * N + n of both: agent n before layer starts[w], i.e. before frame starts[w] * s.
             inputs = temporal.layer_inputs(X, starts * s)[out["rows"]]
-            scores = {"layered": out["pred"], "temporal": torch.sigmoid(temporal(inputs)[0]),
+            # The step 05 models give one probability per window; the first (10 frames) covers layer b.
+            scores = {"layered": out["pred"], "temporal": temporal.window_probs(temporal(inputs)[0])[:, 0],
                       "prior": prior.expand_as(out["pred"])}
             if mlp is not None:
-                scores["mlp"] = torch.sigmoid(mlp(inputs)[0])
+                scores["mlp"] = mlp.window_probs(mlp(inputs)[0])[:, 0]
             if baselines:
-                scores["anchor"] = step06._anchor_scores(temporal, inputs, baselines)
+                scores["anchor"] = step06._anchor_scores(temporal, inputs, baselines)[:, 0]
             last, target = out["prev"] > 0.5, out["target"] > 0.5
             risk, event = ~last, ~last & target
             for name, score in scores.items():
@@ -375,7 +376,7 @@ def main(input_data):
             utils_data.save_json(compare_models(
                 score_shared_onsets(model, temporal, mlp, baselines, val, priors, cfg),
                 score_shared_onsets(model, temporal, mlp, baselines, test_data, priors, cfg),
-                cfg, step05_cfg["target_horizon"]), cfg["comparison_file"])
+                cfg, step05_cfg["windows"][0]), cfg["comparison_file"])
         comparison = utils_data.load_json(cfg["comparison_file"])
     else:
         print(f"[Skip]\t\t shared task: no step 05 model {step05_cfg['model_file']}")

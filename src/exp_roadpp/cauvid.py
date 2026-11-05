@@ -145,97 +145,152 @@ class CauVid:
     
 
 class TemporalRuleNet(torch.nn.Module):
-    """Layer-per-frame rule network: predicts which atoms switch on in frame t
-    from the K frames before it.
+    """Slot rule network: predicts, for every agent visible in frame t, how likely
+    each atom switches on within the next W frames (W = 10, 20, ..., one window
+    per future slot), from whatever part of the last 50 frames is known.
 
-    Every agent runs the same weights. The frames t-1..t-K are grouped into B lag
-    bins (lo, hi], e.g. edges (1, 2, 4, 8, ..., 100) -> bins 1, 2, 3-4, 5-8, ...,
-    65-100 frames ago. Each bin is one input layer with two groups of A atom
-    nodes: slot 0 "self" (the agent holds the atom in some frame of the bin) and
-    slot 1 "others" (some other agent holds it in some frame of the bin), so
-    M = 2 * B * A input nodes. R rule nodes are soft ANDs over a sparse mask of
-    the inputs; the bins of a rule's inputs give the order of its body atoms.
-    Each head atom is a weighted OR of the rule nodes.
+    Time is cut into slots of slot_size (10) frames: the memory holds the
+    num_slots (5) past slots p = 1..5 (p = 1: the 10 frames before t), the
+    future the slots f = 0..F-1 (f = 0: frames t..t+9), one per window.
+
+    Rules are temporal patterns: rule r is a soft AND of body inputs (atom, slot
+    type, j): the agent itself (slot type 0) or some other agent (1) holds the
+    atom in the slot j = 1..num_slots before the head's slot. To predict the head
+    in future slot f the rule is aligned so that its head lies in f: a body with
+    j > f lies in past slot p = j - f and is looked up, a body with j <= f has not
+    happened yet and is unknown. Every input of the memory is three-valued:
+    true (seen), false (its slot fully observed and the atom absent) or unknown
+    (a slot older than the known history, e.g. before the video start or after a
+    truncation). A body contributes
+      true: 1,   false: 1 - m,   unknown: 1 - m (1 - pi),
+    with m its mask and pi = sigmoid(unknown_logit) the learned chance that an
+    unknown input holds; the rule activation is the product over its inputs, the
+    chance that its whole body holds given what is known. So the confidence of a
+    rule rises as more of its bodies are confirmed true, falls to 0 when one is
+    confirmed false, and stays in between while they are unknown: a far-ahead
+    head (large f) relies on the early bodies only, and its confidence grows as
+    time passes and the later bodies come true.
+
+    The hazard of future slot f and atom a is sigmoid(sum_r w_ar rule_r(f) + b_fa);
+    the probability of an onset within W_k = (k + 1) * slot_size frames is
+    1 - prod_{f <= k} (1 - h_fa), never decreasing with the window.
+
+    Inputs are packed as (B, 2M): the truth values x of the M = 2 * num_slots * A
+    memory inputs, then their known flags (`split_inputs`).
 
     mask_type "hard_concrete": a stochastic L0 mask while training. "sigmoid": the
     deterministic mask sigmoid(log_alpha) of `LayeredRuleNet`, started near 0 so
-    every input gets a gradient (a noisy mask opens a few of the thousands of
-    mostly-0 inputs in every sample, turns the rule off, and the clamped gates of
-    the others get none), kept sparse by an L1 loss.
+    every input gets a gradient, kept sparse by an L1 loss.
     """
 
-    def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), num_rules=256, init_log_alpha=-6.0,
-                 mask_type="hard_concrete"):
+    def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
+                 mask_type="hard_concrete", windows=(10,)):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
+        windows = list(windows)
+        if windows != [slot_size * (f + 1) for f in range(len(windows))]:
+            raise ValueError(f"windows {windows} must be slot_size, 2 * slot_size, ... (slot_size {slot_size}).")
         self.mask_type = mask_type
         self.num_atoms = num_atoms
-        # Bin i covers lo_i..hi_i frames ago, hi_i = lag_edges[i], lo_i = hi_{i-1} + 1.
-        self.lag_bins = [(lo + 1, hi) for lo, hi in zip((0, *lag_edges[:-1]), lag_edges)]
-        self.num_lags = lag_edges[-1]
-        self.num_bins = len(self.lag_bins)
-        self.num_inputs = 2 * self.num_bins * num_atoms
+        self.slot_size, self.num_slots = slot_size, num_slots
+        self.num_bins = num_slots                      # rule seeds per anchor (one per slot offset j)
+        self.num_lags = slot_size * num_slots          # frames of memory
+        self.num_inputs = 2 * num_slots * num_atoms
+        self.windows = windows
+        num_future = len(windows)
         # Very negative so only a few random inputs per rule start non-zero.
         self.log_alpha = torch.nn.Parameter(torch.full((num_rules, self.num_inputs), init_log_alpha))
+        self.unknown_logit = torch.nn.Parameter(torch.full((self.num_inputs,), -4.0))
         self.head_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
-        self.head_bias = torch.nn.Parameter(torch.full((num_atoms,), -4.0))
+        self.head_bias = torch.nn.Parameter(torch.full((num_future, num_atoms), -6.0))
         # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
         self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
+        # Slot offset j of every input; and for each future slot f, the memory input each rule
+        # input (atom, slot type, j) reads (past slot j - f), or M (unknown) for j <= f.
+        j = (torch.arange(self.num_inputs) // num_atoms) % num_slots + 1
+        self.register_buffer("input_offset", j)
+        shift = []
+        for f in range(min(num_future, num_slots)):
+            shift.append(torch.where(j > f, torch.arange(self.num_inputs) - f * num_atoms, self.num_inputs))
+        self.register_buffer("shift_index", torch.stack(shift))
 
-    def input_index(self, atom, slot, bin_index):
-        """Input node of `decode_input`'s (atom, slot, lag bin); slots > 1 are "others"."""
-        return min(slot, 1) * self.num_bins * self.num_atoms + bin_index * self.num_atoms + atom
+    def input_index(self, atom, slot, offset):
+        """Input node of `decode_input`'s (atom, slot type, slot offset j = 1..num_slots)."""
+        return min(slot, 1) * self.num_slots * self.num_atoms + (offset - 1) * self.num_atoms + atom
+
+    def split_inputs(self, inputs):
+        """Packed inputs (B, 2M) -> truth values x (B, M), known flags k (B, M)."""
+        return inputs[:, :self.num_inputs], inputs[:, self.num_inputs:]
 
     @torch.no_grad()
     def seed_rules(self, anchors, head_weight=1.0):
-        """Seed one rule node per (anchor body, lag bin) from the anchor clauses.
+        """Seed one rule node per (anchor body, slot offset j) from the anchor clauses.
 
-        anchors: [((atom, slot), [head atom])]. Rule i * B + k holds the body atom
-        in lag bin k as a fixed input, and starts with weight head_weight to the
-        anchor's heads and 0 to the others; training adds the extra body atoms.
+        anchors: [((atom, slot), [head atom])]. Rule i * J + (j - 1) holds the body
+        atom j slots before the head as a fixed input, and starts with weight
+        head_weight to the anchor's heads and 0 to the others; training adds the
+        extra body atoms.
         Returns the number of seeded rules, the first ones of the R rule nodes.
         """
-        num_seeded = len(anchors) * self.num_bins
+        num_seeded = len(anchors) * self.num_slots
         if num_seeded > self.log_alpha.shape[0]:
             raise ValueError(f"{num_seeded} seeded rules do not fit into {self.log_alpha.shape[0]} rule nodes.")
         for i, ((atom, slot), heads) in enumerate(anchors):
-            for k in range(self.num_bins):
-                r = i * self.num_bins + k
-                self.fixed_inputs[r, self.input_index(atom, slot, k)] = True
+            for j in range(1, self.num_slots + 1):
+                r = i * self.num_slots + j - 1
+                self.fixed_inputs[r, self.input_index(atom, slot, j)] = True
                 self.head_weight[:, r] = 0.0
                 self.head_weight[list(heads), r] = head_weight
         return num_seeded
 
     # -------- inputs and targets of one video ----------------------------------
-    def layer_inputs(self, X, frames):
-        """(F * N, M) float input layers of every agent at each target frame.
+    def layer_inputs(self, X, frames, history=None):
+        """(F * N, 2M) packed memory inputs of every agent at each target frame.
 
         X: (T, N, A) bool atom tensor of `step05.build_video_tensor`; frames: (F,)
-        long target frames t (may be T, one past the video, to predict from it).
-        Row f * N + n is agent n at frames[f]; frames before 0 are empty layers.
+        long target frames t (may be T, one past the video, to predict from it);
+        history: (F,) long, how many frames before t are known (default all of
+        them, t; capped at t). Row f * N + n is agent n at frames[f]. An input is
+        true if the atom was seen in a known frame of its slot, false if the slot
+        is fully known and it was not, unknown otherwise.
         """
-        K, B, A = self.num_lags, self.num_bins, self.num_atoms
-        N = X.shape[1]
-        past = frames[:, None] - torch.arange(1, K + 1, device=X.device)   # (F, K) lag k = column k - 1
-        own = X[past.clamp(min=0)] & (past >= 0)[..., None, None]             # (F, K, N, A)
-        own = torch.stack([own[:, lo - 1:hi].any(dim=1) for lo, hi in self.lag_bins], dim=1)  # (F, B, N, A)
+        J, S, A = self.num_slots, self.slot_size, self.num_atoms
+        N, F = X.shape[1], len(frames)
+        history = frames if history is None else torch.minimum(history.to(frames.device), frames)
+        lags = torch.arange(1, J * S + 1, device=X.device)
+        past = frames[:, None] - lags                                          # (F, L)
+        observed = lags[None, :] <= history.clamp(min=0)[:, None]              # (F, L), implies past >= 0
+        own = X[past.clamp(min=0)] & observed[..., None, None]                 # (F, L, N, A)
+        own = own.view(F, J, S, N, A).any(dim=2)                               # (F, J, N, A)
         holders = own.sum(dim=2, keepdim=True)
         others = (holders - own.int()) > 0
-        inputs = torch.stack([own, others], dim=1)                            # (F, 2, B, N, A)
-        return inputs.permute(0, 3, 1, 2, 4).reshape(len(frames) * N, 2 * B * A).float()
+        x = torch.stack([own, others], dim=1)                                  # (F, 2, J, N, A)
+        slot_known = (torch.arange(1, J + 1, device=X.device) * S)[None, :] <= history.clamp(min=0)[:, None]
+        k = x | slot_known[:, None, :, None, None]
+        x = x.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
+        k = k.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
+        return torch.cat([x, k], dim=1).float()
 
-    def training_rows(self, X, frames, min_off_frames=1, horizon=1):
-        """Inputs and onset targets of the agents visible at each target frame.
+    def training_rows(self, X, frames, min_off_frames=1, history=None):
+        """Inputs and window targets of the agents visible at each target frame.
 
-        Returns inputs (B, M) float; targets (B, A) bool, the at-risk atoms that
-        switch on (false -> true) for the agent in one of the frames t..t + horizon - 1
-        (horizon 1: exactly at t); at_risk (B, A) bool, the atoms off in all of
-        t - min_off_frames..t - 1, the only ones that can switch on (an atom back on
-        after a shorter gap is a re-onset, not a new event); rows (B, 2) long, (t, n).
+        Returns a dict:
+          inputs (B, 2M) float (`layer_inputs`, with the known history per frame);
+          rows (B, 2) long, (t, n);
+          at_risk (B, A) bool: the atoms off in all of t - min_off_frames..t - 1,
+              the only ones that can switch on (an atom back on after a shorter gap
+              is a re-onset, not a new event);
+          first (B, A) long: frames from t to the atom's first onset for the agent
+              (0 = in t itself), max(windows) if none within the largest window;
+          targets (B, W, A) bool: an at-risk atom switches on within window k
+              (first < W_k);
+          known (B, W, A) bool: the target of window k is observed, the video
+              runs on for W_k frames after t or the onset was seen (rows near the
+              video end without an onset are censored, not negatives).
         """
         N = X.shape[1]
-        inputs = self.layer_inputs(X, frames)
+        inputs = self.layer_inputs(X, frames, history)
         t = frames.repeat_interleave(N)
         n = torch.arange(N, device=X.device).repeat(len(frames))
         keep = X[t, n].any(dim=1)
@@ -243,23 +298,28 @@ class TemporalRuleNet(torch.nn.Module):
         past = t[:, None] - torch.arange(1, min_off_frames + 1, device=X.device)     # (B, k)
         held = (X[past.clamp(min=0), n[:, None]] & (past >= 0)[..., None]).any(dim=1)
         at_risk = ~held
-        targets = at_risk & self.future_onsets(X, t, n, horizon, min_off_frames)
-        return inputs, targets, at_risk, torch.stack([t, n], dim=1)
+        windows = torch.tensor(self.windows, device=X.device)
+        first = self.first_onsets(X, t, n, max(self.windows), min_off_frames)
+        targets = at_risk[:, None, :] & (first[:, None, :] < windows[None, :, None])
+        known = ((t[:, None] + windows[None, :]) <= X.shape[0])[..., None] | targets
+        return {"inputs": inputs, "rows": torch.stack([t, n], dim=1), "at_risk": at_risk, "first": first,
+                "targets": targets, "known": known}
 
     @staticmethod
-    def future_onsets(X, t, n, horizon, min_off_frames):
-        """(B, A) bool: the atom switches on for agent n in some frame f of
-        t..t + horizon - 1: on in f, off in f - min_off_frames..f - 1, and the agent
-        visible in f - 1 (not an agent entering the scene)."""
+    def first_onsets(X, t, n, horizon, min_off_frames):
+        """(B, A) long: frames from t to the first frame f of t..t + horizon - 1 where
+        the atom switches on for agent n (on in f, off in f - min_off_frames..f - 1,
+        the agent visible in f - 1, so not an agent entering the scene); horizon if none."""
         T = X.shape[0]
         frames = t[:, None] + torch.arange(-min_off_frames, horizon, device=X.device)     # (B, L)
         window = X[frames.clamp(0, T - 1), n[:, None]] & ((frames >= 0) & (frames < T))[..., None]
-        onsets = torch.zeros((len(t), X.shape[2]), dtype=torch.bool, device=X.device)
-        for i in range(min_off_frames, min_off_frames + horizon):      # window index of f
-            held = window[:, i - min_off_frames:i].any(dim=1)
-            seen = window[:, i - 1].any(dim=1, keepdim=True)
-            onsets |= window[:, i] & ~held & seen
-        return onsets
+        held_count = torch.cat([window.new_zeros((len(t), 1, X.shape[2]), dtype=torch.int32),
+                                window.int().cumsum(dim=1)], dim=1)          # [j]: frames held in window[:j]
+        i = torch.arange(min_off_frames, min_off_frames + horizon, device=X.device)     # window index of f
+        held = (held_count[:, i] - held_count[:, i - min_off_frames]) > 0
+        seen = window[:, i - 1].any(dim=2, keepdim=True)
+        onset = window[:, i] & ~held & seen                                   # (B, horizon, A)
+        return torch.where(onset.any(dim=1), onset.int().argmax(dim=1), horizon)
 
     def hard_concrete_mask(self, log_alpha, beta=2 / 3, gamma=-0.1, zeta=1.1, training=True):
         if training:
@@ -280,21 +340,55 @@ class TemporalRuleNet(torch.nn.Module):
         return mask.masked_fill(self.fixed_inputs, 1.0)
 
     def forward(self, inputs):
-        """Head logits (B, A) and rule activations (B, R) of input layers (B, M).
+        """Hazard logits (B, W, A) of the future slots and the rule activations
+        (B, R) of the head slot f = 0 (every body in the memory), of packed inputs
+        (B, 2M); `window_probs` turns the hazards into onset-within-window probabilities.
 
-        A rule is the product over its masked inputs of (1 - mask * (1 - x)): a
-        missing input with mask 1 turns the rule off. In the log domain this is one
-        matmul, (1 - x) @ log(1 - mask).T.
+        In the log domain a rule is two matmuls: the confirmed-false inputs times
+        log(1 - m) and the unknown inputs times log(1 - m (1 - pi)).
         """
+        x, k = self.split_inputs(inputs)
+        B = len(inputs)
         mask = self.rule_mask().clamp(max=1 - 1e-6)
-        rules = torch.exp((1 - inputs) @ torch.log1p(-mask).T)
-        logits = rules @ self.head_weight.T + self.head_bias
-        return logits, rules
+        log_false = torch.log1p(-mask)                                          # (R, M)
+        log_unknown = torch.log1p(-mask * (1 - torch.sigmoid(self.unknown_logit)))
+        false = torch.cat([(1 - x) * k, x.new_zeros((B, 1))], dim=1)            # column M: a future body
+        unknown = torch.cat([1 - k, x.new_ones((B, 1))], dim=1)
+        hazards, rules_now, all_unknown = [], None, None
+        for f in range(len(self.windows)):
+            if f < self.num_slots:
+                index = self.shift_index[f]
+                rules = torch.exp(false[:, index] @ log_false.T + unknown[:, index] @ log_unknown.T)
+            else:
+                # Every body lies in the future: the same activation for every row.
+                if all_unknown is None:
+                    all_unknown = torch.exp(log_unknown.sum(dim=1)).expand(B, -1)
+                rules = all_unknown
+            if f == 0:
+                rules_now = rules
+            hazards.append(rules @ self.head_weight.T + self.head_bias[f])
+        return torch.stack(hazards, dim=1), rules_now
 
-    def loss(self, logits, targets, at_risk, pos_weight=20.0):
-        """Mean binary cross-entropy over the at-risk atoms; onsets weighted up."""
-        weight = torch.where(targets, pos_weight, 1.0) * at_risk
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
+    @staticmethod
+    def window_log_probs(hazards):
+        """log P(onset within W_k) and log P(no onset within W_k), each (B, W, A),
+        of hazard logits (B, W, A): log P(none) = -sum_{j <= k} softplus(h_j)."""
+        log_none = -torch.nn.functional.softplus(hazards).cumsum(dim=1)
+        log_onset = torch.log(-torch.expm1(log_none.clamp(max=-1e-7)))
+        return log_onset, log_none
+
+    @staticmethod
+    def window_probs(hazards):
+        """(B, W, A) onset probability within each window, non-decreasing in W."""
+        return -torch.expm1(-torch.nn.functional.softplus(hazards).cumsum(dim=1))
+
+    @classmethod
+    def loss(cls, hazards, targets, at_risk, known, pos_weight=20.0):
+        """Mean binary cross-entropy of the onset-within-window probabilities over
+        the at-risk atoms and the observed windows; onsets weighted up."""
+        log_onset, log_none = cls.window_log_probs(hazards)
+        weight = torch.where(targets, pos_weight, 1.0) * (at_risk[:, None, :] & known)
+        bce = -torch.where(targets, log_onset, log_none)
         return (bce * weight).sum() / weight.sum().clamp(min=1)
 
     def sparsity_loss(self, beta=2 / 3, gamma=-0.1, zeta=1.1):
@@ -306,35 +400,35 @@ class TemporalRuleNet(torch.nn.Module):
 
     # -------- use after training ----------------------------------
     @torch.no_grad()
-    def predict(self, X):
-        """Onset probability (N, A) of each atom for each agent in the frame after X.
-
-        Agents not visible in the last frame of X get zeros.
-        """
+    def predict(self, X, history=None):
+        """(N, W, A) probability that each atom switches on for each agent within
+        each window after X, knowing the last `history` frames of X (default all).
+        Agents not visible in the last frame of X get zeros."""
         T, N, _A = X.shape
-        inputs = self.layer_inputs(X, torch.tensor([T], device=X.device))
-        probabilities = torch.sigmoid(self(inputs)[0])
-        return probabilities * X[-1].any(dim=1, keepdim=True)
+        frames = torch.tensor([T], device=X.device)
+        known = None if history is None else torch.tensor([history], device=X.device)
+        probabilities = self.window_probs(self(self.layer_inputs(X, frames, known))[0])
+        return probabilities * X[-1].any(dim=1)[:, None, None]
 
     @torch.no_grad()
     def partial_activation(self, inputs, threshold=0.5):
-        """(B, R) share of each rule's body inputs that hold, in [0, 1]: a rule with
-        3 of its 4 body atoms seen is 0.75 active."""
+        """(B, R) share of each rule's body inputs that hold in the memory (the
+        head in the next slot), in [0, 1]: a rule with 3 of its 4 bodies seen is 0.75 active."""
+        x, _k = self.split_inputs(inputs)
         body = (self.rule_mask() > threshold).float()
-        return (inputs @ body.T) / body.sum(dim=1).clamp(min=1)
+        return (x @ body.T) / body.sum(dim=1).clamp(min=1)
 
     def decode_input(self, m):
-        """Input node m -> (atom, slot, lo, hi): slot 0 self, 1 others; the atom
-        holds lo..hi frames before the head."""
-        B, A = self.num_bins, self.num_atoms
-        lo, hi = self.lag_bins[(m // A) % B]
-        return m % A, m // (B * A), lo, hi
+        """Input node m -> (atom, slot type, j): slot type 0 the agent itself, 1
+        another agent; the atom holds in the slot j slots before the head's slot."""
+        J, A = self.num_slots, self.num_atoms
+        return m % A, m // (J * A), (m // A) % J + 1
 
     @torch.no_grad()
     def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1):
-        """Rules [{"rule": r, "bodies": [(atom, slot, lo, hi)], "heads": [(atom, weight)]}].
+        """Rules [{"rule": r, "bodies": [(atom, slot type, j)], "heads": [(atom, weight)]}].
 
-        Bodies are sorted earliest first (largest lag bin), the order the atoms happen.
+        Bodies are sorted earliest first (largest j), the order the atoms happen.
         """
         body = self.rule_mask() > mask_threshold
         rules = []
@@ -346,11 +440,8 @@ class TemporalRuleNet(torch.nn.Module):
             if not heads:
                 continue
             bodies = sorted((self.decode_input(m) for m in inputs), key=lambda b: -b[2])
-            rules.append({
-                "rule": r,
-                "bodies": bodies,
-                "heads": [(h, self.head_weight[h, r].item()) for h in heads],
-            })
+            rules.append({"rule": r, "bodies": bodies,
+                          "heads": [(h, self.head_weight[h, r].item()) for h in heads]})
         return rules
 
 

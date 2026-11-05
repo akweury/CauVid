@@ -4,49 +4,53 @@ from src.exp_roadpp.cauvid import TemporalRuleNet
 
 
 class OnsetMLP(torch.nn.Module):
-    """Black-box baseline of the TemporalRuleNet: the same input layers, onset
-    targets and loss, with a dense hidden layer in place of the sparse AND rules.
+    """Black-box baseline of the TemporalRuleNet: the same input layers, window
+    targets, hazard heads and loss, with a dense hidden layer in place of the
+    sparse AND rules.
 
-    Input (B, M): the M = 2 * B * A lag-bin nodes of `TemporalRuleNet.layer_inputs`
-    (per lag bin and atom, does the agent itself / some other agent hold it).
-    Output (B, A): onset logits of each atom for the agent in the target frame.
+    Input (B, 2M): the packed memory inputs of `TemporalRuleNet.layer_inputs`
+    (per past slot and atom, does the agent itself / some other agent hold it,
+    and is that known).
+    Output (B, W, A): hazard logits of each window bin and atom
+    (`TemporalRuleNet.window_probs` turns them into onset-within-window probabilities).
     Hidden units are unconstrained (any mix of present and absent inputs), so the
-    gap to the TemporalRuleNet is the cost of the rule structure. With
-    hidden_size = R the parameter count matches a TemporalRuleNet of R rules.
+    gap to the TemporalRuleNet is the cost of the rule structure.
     """
 
-    # The input layers and targets are the TemporalRuleNet's, shared code.
+    # The input layers, targets and loss are the TemporalRuleNet's, shared code.
     layer_inputs = TemporalRuleNet.layer_inputs
     training_rows = TemporalRuleNet.training_rows
-    future_onsets = staticmethod(TemporalRuleNet.future_onsets)
-    loss = TemporalRuleNet.loss
+    first_onsets = staticmethod(TemporalRuleNet.first_onsets)
+    window_log_probs = staticmethod(TemporalRuleNet.window_log_probs)
+    window_probs = staticmethod(TemporalRuleNet.window_probs)
+    loss = classmethod(TemporalRuleNet.loss.__func__)
 
-    def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), hidden_size=256, dropout=0.2):
+    def __init__(self, num_atoms, slot_size=10, num_slots=5, hidden_size=256, dropout=0.2, windows=(10,)):
         super().__init__()
         self.num_atoms = num_atoms
-        # Bin i covers lo_i..hi_i frames ago, as in TemporalRuleNet.
-        self.lag_bins = [(lo + 1, hi) for lo, hi in zip((0, *lag_edges[:-1]), lag_edges)]
-        self.num_lags = lag_edges[-1]
-        self.num_bins = len(self.lag_bins)
-        self.num_inputs = 2 * self.num_bins * num_atoms
-        self.hidden = torch.nn.Linear(self.num_inputs, hidden_size)
+        # The memory slots of TemporalRuleNet.
+        self.slot_size, self.num_slots = slot_size, num_slots
+        self.num_lags = slot_size * num_slots
+        self.num_inputs = 2 * num_slots * num_atoms
+        self.windows = list(windows)
+        self.hidden = torch.nn.Linear(2 * self.num_inputs, hidden_size)
         self.dropout = torch.nn.Dropout(dropout)
-        self.head = torch.nn.Linear(hidden_size, num_atoms)
-        # Onsets are rare: start every head at a low probability, as TemporalRuleNet does.
-        torch.nn.init.constant_(self.head.bias, -4.0)
+        self.head = torch.nn.Linear(hidden_size, len(self.windows) * num_atoms)
+        # Onsets are rare: start every hazard at a low probability, as TemporalRuleNet does.
+        torch.nn.init.constant_(self.head.bias, -6.0)
 
     def forward(self, inputs):
-        """Head logits (B, A) and hidden activations (B, H) of input layers (B, M)."""
+        """Hazard logits (B, W, A) and hidden activations (B, H) of input layers (B, M)."""
         hidden = self.dropout(torch.relu(self.hidden(inputs)))
-        return self.head(hidden), hidden
+        return self.head(hidden).view(len(inputs), len(self.windows), self.num_atoms), hidden
 
     @torch.no_grad()
-    def predict(self, X):
-        """Onset probability (N, A) of each atom for each agent in the frame after X.
-
-        Agents not visible in the last frame of X get zeros.
-        """
+    def predict(self, X, history=None):
+        """(N, W, A) probability that each atom switches on for each agent within
+        each window after X, knowing the last `history` frames of X (default all).
+        Agents not visible in the last frame of X get zeros."""
         T, N, _A = X.shape
-        inputs = self.layer_inputs(X, torch.tensor([T], device=X.device))
-        probabilities = torch.sigmoid(self(inputs)[0])
-        return probabilities * X[-1].any(dim=1, keepdim=True)
+        known = None if history is None else torch.tensor([history], device=X.device)
+        inputs = self.layer_inputs(X, torch.tensor([T], device=X.device), known)
+        probabilities = self.window_probs(self(inputs)[0])
+        return probabilities * X[-1].any(dim=1)[:, None, None]

@@ -226,7 +226,7 @@ def _sample_frames(training_data, video_id, num_frames, positive_ratio, generato
     """(<= num_frames,) sorted target frames of one video, a share positive_ratio
     of them drawn from its frames with onsets and the rest from all its frames.
     A positive is moved 0..horizon - 1 frames before its onset, where the onset
-    is still ahead within the target horizon."""
+    is still ahead within the largest window."""
     def pick(pool, k):
         if len(pool) == 0 or k <= 0:
             return pool[:0]
@@ -238,49 +238,52 @@ def _sample_frames(training_data, video_id, num_frames, positive_ratio, generato
     return torch.unique(torch.cat([positives, others]))
 
 
-def _video_rows(model, training_data, video_id, frames, device, horizon=1):
-    """Inputs, targets and at-risk masks of `TemporalRuleNet.training_rows` for the
-    target frames of one video, rebuilt from its stored atoms; targets are the
-    onsets within the next horizon frames."""
+def _video_rows(model, training_data, video_id, frames, device, history=None):
+    """`video_rows` of the target frames of one stored video, rebuilt from its atoms."""
     X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
-    inputs, targets, at_risk, _rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
-                                                 horizon)
-    return inputs, targets, at_risk
+    return video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
+                      None if history is None else history.to(device))
 
 
-def video_rows(model, X, frames, min_off_frames=1, horizon=1):
-    """`TemporalRuleNet.training_rows` of the target frames of one (T, N, A) video
-    tensor, without the agents entering the scene: their atoms all switch on at
-    once in t, which are not events. Returns inputs, targets, at_risk, rows (t, n)."""
-    inputs, targets, at_risk, rows = model.training_rows(X, frames, min_off_frames, horizon)
-    t, n = rows.T
+def video_rows(model, X, frames, min_off_frames=1, history=None):
+    """`TemporalRuleNet.training_rows` (a dict of inputs, rows, at_risk, first,
+    targets, known) of the target frames of one (T, N, A) video tensor, without
+    the agents entering the scene: their atoms all switch on at once in t, which
+    are not events. history (F,): the frames known before each target frame
+    (default all; older ones are unknown inputs)."""
+    rows = model.training_rows(X, frames, min_off_frames, history)
+    t, n = rows["rows"].T
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
-    return inputs[seen], targets[seen], at_risk[seen], rows[seen]
+    return {key: value[seen] for key, value in rows.items()}
 
 
-def coarsen_video(X, block_size):
-    """(ceil(T / s), N, A) bool: the atom holds in some frame of each block of
-    s = block_size frames (frames past the video end count as empty)."""
-    pad = (-X.shape[0]) % block_size
-    X = torch.cat([X, X.new_zeros((pad, *X.shape[1:]))])
-    return X.view(-1, block_size, *X.shape[1:]).any(dim=1)
+def sample_history(frames, cfg, generator):
+    """(F,) known history of target frames for training: with probability
+    truncate_prob a random 0..memory frames (the model learns to predict from
+    partial facts, with lower confidence), else everything before the frame."""
+    memory = cfg["slot_size"] * cfg["num_slots"]
+    truncated = torch.rand(len(frames), generator=generator) < cfg["truncate_prob"]
+    return torch.where(truncated, torch.randint(memory + 1, (len(frames),), generator=generator), frames.cpu())
+
+
+def concat_rows(parts):
+    """One rows dict of several `video_rows` dicts."""
+    return {key: torch.cat([part[key] for part in parts]) for key in parts[0]}
 
 
 @torch.no_grad()
 def _validation_loss(model, training_data, val_frames, cfg, candidates=None):
-    """Mean onset loss over the fixed target frames of the validation videos
+    """Mean window loss over the fixed target frames of the validation videos
     (only the candidate cells, if candidates is given; see `fit_onset_model`)."""
     model.eval()
     losses = []
-    for video_id, frames in val_frames.items():
-        inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, cfg["device"],
-                                               cfg["target_horizon"])
-        if len(inputs) == 0:
+    for video_id, (frames, history) in val_frames.items():
+        rows = _video_rows(model, training_data, video_id, frames, cfg["device"], history)
+        if len(rows["inputs"]) == 0:
             continue
-        if candidates is not None:
-            at_risk = at_risk & candidates(inputs)
-        logits, _rules = model(inputs)
-        losses.append(model.loss(logits, targets, at_risk, cfg["pos_weight"]).item())
+        at_risk = rows["at_risk"] if candidates is None else rows["at_risk"] & candidates(rows["inputs"])
+        hazards, _rules = model(rows["inputs"])
+        losses.append(model.loss(hazards, rows["targets"], at_risk, rows["known"], cfg["pos_weight"]).item())
     return sum(losses) / len(losses) if losses else float("nan")
 
 
@@ -303,16 +306,18 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     epoch are logged to, or None; model_stats(): extra values logged per epoch;
     candidates(inputs) -> (B, A) bool: if given, the loss only covers these
     (row, head) cells (the cascade verifier learns on the stage-1 candidates).
+    The targets are the onsets within each of cfg["windows"] frames; the known
+    history of each target frame is truncated at random (`sample_history`).
     """
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
-    # Fixed validation frames, so the losses of the epochs are comparable.
-    val_frames = {
-        video_id: _sample_frames(training_data, video_id, cfg["frames_per_video"],
-                                 cfg["positive_frame_ratio"], generator, cfg["target_horizon"])
-        for video_id in training_data["val_videos"]
-    }
+    # Fixed validation frames and known histories, so the losses of the epochs are comparable.
+    val_frames = {}
+    for video_id in training_data["val_videos"]:
+        frames = _sample_frames(training_data, video_id, cfg["frames_per_video"], cfg["positive_frame_ratio"],
+                                generator, max(cfg["windows"]))
+        val_frames[video_id] = (frames, sample_history(frames, cfg, generator))
     train_videos = training_data["train_videos"]
     best_val_loss, best_state = float("inf"), None
     history = []
@@ -321,21 +326,21 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
         order = torch.randperm(len(train_videos), generator=generator).tolist()
         epoch_losses = []
         for start in range(0, len(order), cfg["videos_per_batch"]):
-            parts = [
-                _video_rows(model, training_data, train_videos[i],
-                            _sample_frames(training_data, train_videos[i], cfg["frames_per_video"],
-                                           cfg["positive_frame_ratio"], generator, cfg["target_horizon"]),
-                            device, cfg["target_horizon"])
-                for i in order[start:start + cfg["videos_per_batch"]]
-            ]
-            inputs, targets, at_risk = (torch.cat(part) for part in zip(*parts))
-            if len(inputs) == 0:
+            parts = []
+            for i in order[start:start + cfg["videos_per_batch"]]:
+                frames = _sample_frames(training_data, train_videos[i], cfg["frames_per_video"],
+                                        cfg["positive_frame_ratio"], generator, max(cfg["windows"]))
+                parts.append(_video_rows(model, training_data, train_videos[i], frames, device,
+                                         sample_history(frames, cfg, generator)))
+            rows = concat_rows(parts)
+            if len(rows["inputs"]) == 0:
                 continue
+            at_risk = rows["at_risk"]
             if candidates is not None:
-                at_risk = at_risk & candidates(inputs)
+                at_risk = at_risk & candidates(rows["inputs"])
 
-            logits, _hidden = model(inputs)
-            onset_loss = model.loss(logits, targets, at_risk, cfg["pos_weight"])
+            hazards, _hidden = model(rows["inputs"])
+            onset_loss = model.loss(hazards, rows["targets"], at_risk, rows["known"], cfg["pos_weight"])
             loss = onset_loss if regularization is None else onset_loss + regularization(epoch)
             optimizer.zero_grad()
             loss.backward()
@@ -363,12 +368,12 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
 
 
 def _seeded_rule_net(training_data, cfg):
-    """A TemporalRuleNet with one rule node per (anchor body, lag bin), plus
+    """A TemporalRuleNet with one rule node per (anchor body, slot offset), plus
     num_free_rules unseeded ones, on cfg["device"]."""
     anchors = anchor_rules(cfg)
-    num_bins = len(cfg["lag_edges"])
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
-                            len(anchors) * num_bins + cfg["num_free_rules"], cfg["init_log_alpha"], cfg["mask_type"])
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
+                            len(anchors) * cfg["num_slots"] + cfg["num_free_rules"], cfg["init_log_alpha"],
+                            cfg["mask_type"], cfg["windows"])
     num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
     print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
           f"{cfg['mask_type']} mask")
@@ -416,12 +421,12 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
     eval mode on cfg["device"].
 
     The model is rebuilt with the same sizes it was trained with (num_atoms of
-    the training data, lag_edges and mask_type of cfg, the number of rules of the
+    the training data, slots, mask_type and windows of cfg, the number of rules of the
     saved weights) before its weights, and its seeded anchor inputs, are loaded.
     """
     state = torch.load(model_file or cfg["model_file"], map_location="cpu")
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], state["log_alpha"].shape[0],
-                            mask_type=cfg["mask_type"])
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
+                            state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -430,27 +435,27 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
 @torch.no_grad()
 def candidate_thresholds(model, training_data, cfg):
     """Per-head stage-1 score thresholds that keep cascade_recall of the onset
-    rows of the validation videos (rows with the head switching on within the
-    target horizon); a head with fewer than cascade_min_positives such rows gets
-    the threshold of all heads together.
+    rows of the validation videos, on the largest window (rows with the head
+    switching on within max(windows) frames); a head with fewer than
+    cascade_min_positives such rows gets the threshold of all heads together.
 
     Returns {"thresholds": (A,) CPU, "recall": the target, "val_row_recall" and
     "val_candidate_share": the share of the onset rows and of all at-risk
-    (row, head) cells at or above the thresholds}.
+    (row, head) cells with an observed largest window at or above the thresholds}.
     """
     model.eval()
     device, A = cfg["device"], training_data["num_atoms"]
 
     def rows(video_id):
         for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
-            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, device,
-                                                   cfg["target_horizon"])
-            if len(inputs):
-                yield torch.sigmoid(model(inputs)[0]), targets, at_risk
+            r = _video_rows(model, training_data, video_id, frames, device)
+            if len(r["inputs"]):
+                scores = model.window_probs(model(r["inputs"])[0])[:, -1]
+                yield scores, r["targets"][:, -1], r["at_risk"] & r["known"][:, -1]
 
     heads, values = [], []
     for video_id in tqdm(training_data["val_videos"], desc="Stage-1 scores of the val onsets"):
-        for scores, targets, _at_risk in rows(video_id):
+        for scores, targets, _cells in rows(video_id):
             r, h = torch.nonzero(targets, as_tuple=True)
             heads.append(h)
             values.append(scores[r, h])
@@ -476,12 +481,12 @@ def candidate_thresholds(model, training_data, cfg):
 
 def make_candidates(model, thresholds):
     """candidates(inputs) -> (B, A) bool: the stage-1 model flags the head (its
-    score is at or above the head's threshold)."""
+    probability of an onset within the largest window is at or above the head's threshold)."""
     model.eval()
 
     @torch.no_grad()
     def candidates(inputs):
-        return torch.sigmoid(model(inputs)[0]) >= thresholds.to(inputs.device)
+        return model.window_probs(model(inputs)[0])[:, -1] >= thresholds.to(inputs.device)
     return candidates
 
 
@@ -501,8 +506,9 @@ def train_onset_mlp(training_data, cfg, run=None):
     targets and batches as the TemporalRuleNet, with weight decay instead of
     the L0 loss and no anchor seeding. Its hidden size defaults to the number of
     rule nodes of the TemporalRuleNet, so both have about as many parameters."""
-    hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * len(cfg["lag_edges"]) + cfg["num_free_rules"]
-    model = OnsetMLP(training_data["num_atoms"], cfg["lag_edges"], hidden_size, cfg["mlp_dropout"]).to(cfg["device"])
+    hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * cfg["num_slots"] + cfg["num_free_rules"]
+    model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], hidden_size, cfg["mlp_dropout"],
+                     cfg["windows"]).to(cfg["device"])
     print(f"[Baseline] OnsetMLP with {hidden_size} hidden units")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["mlp_weight_decay"])
     return fit_onset_model(model, training_data, cfg, optimizer, cfg["mlp_history_file"], run=run)
@@ -514,7 +520,8 @@ def load_onset_mlp(training_data, cfg):
     if not os.path.exists(cfg["mlp_model_file"]):
         return None
     state = torch.load(cfg["mlp_model_file"], map_location="cpu")
-    model = OnsetMLP(training_data["num_atoms"], cfg["lag_edges"], state["hidden.weight"].shape[0])
+    model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], state["hidden.weight"].shape[0],
+                     windows=cfg["windows"])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -522,71 +529,100 @@ def load_onset_mlp(training_data, cfg):
 @torch.no_grad()
 def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule firings", candidates=None):
     """Counts of every rule r and head atom h over all frames of the given videos
-    (only the cells candidates(inputs) flags, if given: the verifier's rules are
-    judged on the stage-1 candidates they filter).
+    (with their full history; only the cells candidates(inputs) flags, if given:
+    the verifier's rules are judged on the stage-1 candidates they filter), for
+    each alignment f = 0..J-1: the head in future slot f, so the bodies with
+    j > f are in the memory and the f slots of bodies closest to the head have
+    not happened yet. f = 0 is the whole clause (every body seen, head within the
+    next slot); a larger f is the same clause known only up to its earlier bodies.
 
     Returns a dict of CPU tensors:
-      fires (R, A): rows where every body atom of r holds and h is at risk (off
-          in the previous frame); hits (R, A): the fires where h switches on;
-      videos (R, A): the videos with at least one hit;
-      anchor_fires / anchor_hits (R, A): the same for the anchor input of r alone
-          (its fixed input, without the learned extra atoms; 0 for free rules);
-      onsets (A,): all rows where h switches on; at_risk (A,): all rows where it could.
+      fires (R, J, A): rows where every body of r with j > f holds (r has one) and
+          h is at risk, has not switched on before slot f and slot f is observed;
+      hits (R, J, A): the fires whose first onset of h falls in slot f;
+      videos (R, J, A): the videos with a hit;
+      anchor_fires / anchor_hits (R, J, A): the same for the anchor input of r
+          alone (its fixed input, without the learned extra atoms; 0 for free rules);
+      onsets (J, A) / at_risk (J, A): the hits and fires of an empty body (the base rate).
     """
+    J, S = model.num_slots, model.slot_size
     num_rules, num_atoms = model.log_alpha.shape[0], model.num_atoms
     device = cfg["device"]
-    counts = {name: torch.zeros((num_rules, num_atoms), device=device)
+    shape = (num_rules, J * num_atoms)
+    counts = {name: torch.zeros(shape, device=device)
               for name in ("fires", "hits", "videos", "anchor_fires", "anchor_hits")}
-    counts["onsets"] = torch.zeros(num_atoms, device=device)
-    counts["at_risk"] = torch.zeros(num_atoms, device=device)
-    anchor_body = model.fixed_inputs.float()
-    anchor_size = anchor_body.sum(dim=1)
+    counts["onsets"] = torch.zeros(J * num_atoms, device=device)
+    counts["at_risk"] = torch.zeros(J * num_atoms, device=device)
+    def in_memory(rule_inputs, f):
+        # Bodies with j > f, moved to the past slot p = j - f they lie in for a head in slot f.
+        memory = torch.zeros((num_rules, model.num_inputs + 1), device=device)
+        memory[:, model.shift_index[f]] = (rule_inputs & (model.input_offset > f)).float()
+        return memory[:, :-1]
+
+    body = model.rule_mask() > cfg["mask_threshold"]
+    known_bodies = [in_memory(body, f) for f in range(J)]
+    known_anchors = [in_memory(model.fixed_inputs, f) for f in range(J)]
     for video_id in tqdm(video_ids, desc=desc):
-        video_hits = torch.zeros((num_rules, num_atoms), device=device)
+        video_hits = torch.zeros(shape, device=device)
         for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
-            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, device,
-                                                   cfg["target_horizon"])
-            if len(inputs) == 0:
+            rows = _video_rows(model, training_data, video_id, frames, device)
+            if len(rows["inputs"]) == 0:
                 continue
+            at_risk = rows["at_risk"]
             if candidates is not None:
-                flagged = candidates(inputs)
-                targets, at_risk = targets & flagged, at_risk & flagged
-            targets, at_risk = targets.float(), at_risk.float()
-            fired = (model.partial_activation(inputs, cfg["mask_threshold"]) >= 1).float()
-            anchor_fired = ((inputs @ anchor_body.T >= anchor_size) & (anchor_size > 0)).float()
-            counts["fires"] += fired.T @ at_risk
-            video_hits += fired.T @ targets
-            counts["anchor_fires"] += anchor_fired.T @ at_risk
-            counts["anchor_hits"] += anchor_fired.T @ targets
-            counts["onsets"] += targets.sum(dim=0)
-            counts["at_risk"] += at_risk.sum(dim=0)
+                at_risk = at_risk & candidates(rows["inputs"])
+            x, _k = model.split_inputs(rows["inputs"])
+            first = rows["first"]
+            for f in range(J):
+                risk = (at_risk & (first >= f * S) & rows["known"][:, f]).float()          # (B, A)
+                onset = (at_risk & (first >= f * S) & (first < (f + 1) * S)).float()
+                cols = slice(f * num_atoms, (f + 1) * num_atoms)
+                for prefix, b in (("", known_bodies[f]), ("anchor_", known_anchors[f])):
+                    size = b.sum(dim=1)
+                    fired = ((x @ b.T >= size) & (size > 0)).float()                      # (B, R)
+                    counts[prefix + "fires"][:, cols] += fired.T @ risk
+                    if prefix:
+                        counts["anchor_hits"][:, cols] += fired.T @ onset
+                    else:
+                        video_hits[:, cols] += fired.T @ onset
+                counts["onsets"][cols] += onset.sum(dim=0)
+                counts["at_risk"][cols] += risk.sum(dim=0)
         counts["hits"] += video_hits
         counts["videos"] += video_hits > 0
-    return {name: value.cpu() for name, value in counts.items()}
+    out = {name: value.view(num_rules, J, num_atoms) for name, value in counts.items()
+           if name not in ("onsets", "at_risk")}
+    out["onsets"] = counts["onsets"].view(J, num_atoms)
+    out["at_risk"] = counts["at_risk"].view(J, num_atoms)
+    return {name: value.cpu() for name, value in out.items()}
 
 
 def _temporal_clause_text(clause, unique_atoms):
-    # Bodies earliest first: "Car:MovAway(X0)@-5..8f -> Ped:Wait(X1)@-2..2f => Car:Stop(X0)".
+    # Bodies earliest first, in frames before the head's 10-frame slot:
+    # "Car:MovAway(X0)@-30..-20f -> Ped:Wait(X1)@-10..0f => Car:Stop(X0)".
     def atom(atom_index, slot):
         return f"{_atom_name(unique_atoms[atom_index])}(X{slot})"
-    body = " -> ".join(f"{atom(a, slot)}@-{lo}..{hi}f" for a, slot, lo, hi in clause["bodies"])
+    size = clause.get("slot_size", 10)
+    body = " -> ".join(f"{atom(a, slot)}@-{size * j}..-{size * (j - 1)}f" for a, slot, j in clause["bodies"])
     return f"{body} => {atom(*clause['head'])}"
 
 
 def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=None):
     """Clauses of the trained model, one per (rule node, head) pair with a large
     head weight, kept if the rule hits the head in at least min_support training
-    frames of at least min_videos videos.
+    frames of at least min_videos videos (every body seen, head in the next slot).
 
-    Each clause: bodies [(atom, slot, lo, hi)] earliest first (the atom holds
-    lo..hi frames before the head; slot 0 the head agent, 1 some other agent), body_scopes their
-    slots, head (atom, 0), anchor (atom, slot, lo, hi) its seeded anchor input or
-    None, weight, and on the training videos support (hits), fires, confidence =
-    support / fires, num_videos, anchor_confidence (of the anchor input alone).
-    The val_ fields are the same on the validation videos, plus val_recall (the
-    share of the head's onsets the clause hits) and val_base_rate (the head's
-    onsets / at-risk rows, the confidence of always predicting it). Sorted by confidence.
-    With candidates (the verifier), all counts are over the stage-1 candidate cells.
+    Each clause: bodies [(atom, slot, j)] earliest first (the atom holds in the
+    slot j slots before the head's; slot 0 the head agent, 1 some other agent),
+    body_scopes their slots, head (atom, 0), anchor (atom, slot, j) its seeded
+    anchor input or None, weight, and on the training videos support (hits),
+    fires, confidence = support / fires, num_videos, anchor_confidence (of the
+    anchor input alone). The val_ fields are the same on the validation videos,
+    plus val_recall (the share of the head's onsets the clause hits) and
+    val_base_rate. partial (train and val): per alignment f, the confidence of
+    the head f slots ahead knowing only the bodies with j > f (known_bodies of
+    them), with the base rate: how the confidence grows as more bodies are seen.
+    Sorted by confidence. With candidates (the verifier), all counts are over
+    the stage-1 candidate cells.
     """
     def ratio(a, b):
         return float(a) / float(b) if b > 0 else None
@@ -602,28 +638,40 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
         r = rule["rule"]
         anchor_inputs = torch.nonzero(model.fixed_inputs[r]).flatten().tolist()
         anchor = list(model.decode_input(anchor_inputs[0])) if anchor_inputs else None
+        offsets = [j for _atom, _slot, j in rule["bodies"]]
         for h, weight in rule["heads"]:
-            support, num_videos = int(train["hits"][r, h]), int(train["videos"][r, h])
+            support, num_videos = int(train["hits"][r, 0, h]), int(train["videos"][r, 0, h])
             if support < cfg["min_support"] or num_videos < cfg["min_videos"]:
                 continue
+            partial = []
+            for f in range(max(offsets)):
+                partial.append({
+                    "unseen_slots": f,
+                    "known_bodies": sum(j > f for j in offsets),
+                    "confidence": ratio(train["hits"][r, f, h], train["fires"][r, f, h]),
+                    "val_confidence": ratio(val["hits"][r, f, h], val["fires"][r, f, h]),
+                    "base_rate": ratio(train["onsets"][f, h], train["at_risk"][f, h]),
+                })
             clauses.append({
                 "bodies": [list(b) for b in rule["bodies"]],
-                "body_scopes": [slot for _atom, slot, _lo, _hi in rule["bodies"]],
+                "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
                 "head": [h, 0],
+                "slot_size": model.slot_size,
                 "anchor": anchor,
                 "rule": r,
                 "weight": weight,
                 "support": support,
-                "fires": int(train["fires"][r, h]),
-                "confidence": support / max(int(train["fires"][r, h]), 1),
+                "fires": int(train["fires"][r, 0, h]),
+                "confidence": support / max(int(train["fires"][r, 0, h]), 1),
                 "num_videos": num_videos,
-                "anchor_confidence": ratio(train["anchor_hits"][r, h], train["anchor_fires"][r, h]),
-                "val_support": int(val["hits"][r, h]),
-                "val_fires": int(val["fires"][r, h]),
-                "val_confidence": ratio(val["hits"][r, h], val["fires"][r, h]),
-                "val_anchor_confidence": ratio(val["anchor_hits"][r, h], val["anchor_fires"][r, h]),
-                "val_recall": ratio(val["hits"][r, h], val["onsets"][h]),
-                "val_base_rate": ratio(val["onsets"][h], val["at_risk"][h]),
+                "anchor_confidence": ratio(train["anchor_hits"][r, 0, h], train["anchor_fires"][r, 0, h]),
+                "val_support": int(val["hits"][r, 0, h]),
+                "val_fires": int(val["fires"][r, 0, h]),
+                "val_confidence": ratio(val["hits"][r, 0, h], val["fires"][r, 0, h]),
+                "val_anchor_confidence": ratio(val["anchor_hits"][r, 0, h], val["anchor_fires"][r, 0, h]),
+                "val_recall": ratio(val["hits"][r, 0, h], val["onsets"][0, h]),
+                "val_base_rate": ratio(val["onsets"][0, h], val["at_risk"][0, h]),
+                "partial": partial,
             })
     clauses.sort(key=lambda c: (-c["confidence"], -c["support"]))
 
@@ -694,7 +742,8 @@ def _plot_results(clauses, cfg, num_heads=30):
       train_vs_val_confidence.pdf: overfitting check of every clause;
       precision_recall_val.pdf: val confidence vs recall, size = train support;
       best_clause_per_head.pdf: best val confidence per head vs its base rate;
-      delay_map.pdf: clauses per (head, lag bin of the anchor).
+      delay_map.pdf: clauses per (head, slot of the anchor before the head);
+      partial_evidence.pdf: clause confidence (val, over the base rate) by how many of its bodies are known.
     A figure is skipped (with a message) when its data is missing.
     """
     import matplotlib
@@ -785,8 +834,9 @@ def _plot_results(clauses, cfg, num_heads=30):
                xlabel="val confidence (log)")
         save(fig, "best_clause_per_head.pdf")
 
-    # Delay map: in which lag bin the anchor of the clauses of each head lies.
-    bins = [(lo + 1, hi) for lo, hi in zip((0, *cfg["lag_edges"][:-1]), cfg["lag_edges"])]
+    # Delay map: how many slots before the head the anchor of the clauses of each head lies.
+    size = cfg["slot_size"]
+    bins = [(size * (j - 1), size * j) for j in range(1, cfg["num_slots"] + 1)]
     rows = [c for c in clauses if c.get("anchor")]
     if rows:
         heads = sorted({c["head"][0] for c in rows},
@@ -794,14 +844,34 @@ def _plot_results(clauses, cfg, num_heads=30):
         grid = torch.zeros((len(heads), len(bins)))
         for c in rows:
             if c["head"][0] in heads:
-                grid[heads.index(c["head"][0]), bins.index((c["anchor"][2], c["anchor"][3]))] += 1
+                grid[heads.index(c["head"][0]), c["anchor"][2] - 1] += 1
         fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
         image = ax.imshow(grid.numpy(), aspect="auto", cmap="Blues")
-        ax.set_xticks(range(len(bins)), [f"{lo}-{hi}" if lo != hi else f"{lo}" for lo, hi in bins], fontsize=7)
+        ax.set_xticks(range(len(bins)), [f"{lo}-{hi}" for lo, hi in bins], fontsize=7)
         ax.set_yticks(range(len(heads)), [_atom_name(unique_atoms[h]) for h in heads], fontsize=7)
-        ax.set(title="Clauses per head and anchor lag bin", xlabel="anchor held this many frames before the head")
+        ax.set(title="Clauses per head and anchor slot", xlabel="anchor held this many frames before the head's slot")
         fig.colorbar(image, ax=ax, label="clauses")
         save(fig, "delay_map.pdf")
+
+    # Partial evidence: confidence of the clauses with 2+ bodies by how many of their bodies are known.
+    rows = [c for c in clauses if len(c["bodies"]) > 1 and c.get("partial")]
+    if rows:
+        fig, ax = plt.subplots(figsize=(5.5, 4.5))
+        lift = {}
+        for c in rows:
+            points = [(p["known_bodies"], p["val_confidence"] / p["base_rate"]) for p in c["partial"]
+                      if p["val_confidence"] is not None and p["base_rate"]]
+            if len(points) > 1:
+                ax.plot(*zip(*sorted(points)), color="tab:blue", alpha=0.15, linewidth=0.8)
+            for known, value in points:
+                lift.setdefault(known, []).append(value)
+        known = sorted(lift)
+        ax.plot(known, [sorted(lift[k])[len(lift[k]) // 2] for k in known], "o-", color="black", label="median")
+        ax.axhline(1, color="tab:red", linestyle="--", label="base rate")
+        ax.set(title="Clause confidence by bodies known (val)", xlabel="bodies of the clause known",
+               ylabel="confidence / base rate (log)", yscale="log")
+        ax.legend()
+        save(fig, "partial_evidence.pdf")
 
 
 def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 Result", clause_file=None):
@@ -839,23 +909,33 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
 
 def get_cfg(input_data):
     """Settings and files of step 05; step 06 uses them to load the trained model."""
-    horizon = 10
+    slot_size, num_slots = 10, 5
+    windows = [slot_size * (f + 1) for f in range(10)]
     mask_type, num_free_rules = "sigmoid", 128
     # Files are named by the settings that change the model, so a model trained
     # for other settings is never reused.
-    tag = f"h{horizon}_{mask_type}_f{num_free_rules}"
+    tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     return {
             'device': input_data['device'],
             'seed': 0,
             # An atom switches on only after being off for this many frames for the
             # agent; shorter gaps are label flicker (re-onsets), not new events.
             'min_off_frames': 10,
-            # Target: the atom switches on within the next target_horizon frames (1 =
-            # exactly the next frame); 10 matches the 1 s blocks of the step 06 evaluation.
-            'target_horizon': horizon,
-            # Model: lag bins (lo, hi] of the past frames, one input layer each, and
-            # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
-            'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
+            # Targets: the atom switches on within the next W frames, for each window W
+            # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
+            # probability per window, never decreasing with W.
+            'windows': windows,
+            # Model: time in slots of slot_size frames; the memory holds num_slots past
+            # slots (5 x 10 = 50 frames), a rule is a pattern over the num_slots slots
+            # before its head, and each window is one more future slot. The videos are
+            # ~200 frames, so 50 frames of memory leave the largest window (100 frames)
+            # observable at t = 50..~100.
+            'slot_size': slot_size,
+            'num_slots': num_slots,
+            # Partial facts: a share truncate_prob of the training frames know only a
+            # random 0..50 frames of history (the older memory is unknown), so the
+            # model learns calibrated, lower confidence from partial facts.
+            'truncate_prob': 0.5,
             # Rules: one per (anchor body, lag bin) with the anchor as a fixed input
             # and seed_head_weight to its heads, plus num_free_rules unseeded ones,
             # so heads without an anchor (about a quarter of the onsets) can be recalled.
