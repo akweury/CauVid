@@ -447,7 +447,6 @@ def get_cfg(input_data):
             'precision_lambda': 0.1,
             'precision_k': 10.0,
             'precision_decay': 0.9,
-            'val_video_ratio': base['val_video_ratio'],
             # Rule extraction.
             'mask_threshold': 0.5,
             'weight_threshold': 0.1,
@@ -470,12 +469,8 @@ def main(input_data):
     print(f"----------------- Step 05 (layered): Layered Rule Learning -----------------")
     cfg = get_cfg(input_data)
 
-    # 1. The step 05 training videos and split, prepared by step 05 if missing.
-    if os.path.exists(cfg["training_data_file"]):
-        training_data = torch.load(cfg["training_data_file"], map_location="cpu")
-    else:
-        training_data = step05.prepare_training_data(cfg["step05_cfg"])
-        torch.save(training_data, cfg["training_data_file"])
+    # 1. The step 05 training videos and split (the dataset's train / val), prepared by step 05 if missing.
+    training_data = step05.load_training_data(cfg["step05_cfg"])
     model_fresh = step05.is_fresh(cfg["model_file"], cfg["training_data_file"])
     clauses_fresh = model_fresh and step05.is_fresh(cfg["clause_file"], cfg["model_file"])
 

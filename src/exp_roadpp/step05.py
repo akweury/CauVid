@@ -202,24 +202,41 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1):
             "positive_frames": positive_frames}
 
 
+# Marks how training_data.pt was split, so a file made another way is rebuilt.
+SPLIT_SOURCE = "dataset train / dataset val"
+
+
 def prepare_training_data(cfg):
     """Everything the TemporalRuleNet training samples its batches from: the
-    `prepare_videos` data of the training atoms, plus "train_videos" /
-    "val_videos", a random split by video."""
+    `prepare_videos` data of the dataset's train split ("train_videos", all of
+    them trained on) and of its val split ("val_videos": model selection, the
+    cascade thresholds and the step 06 alarm thresholds), in one dict."""
     num_atoms = len(utils_data.load_json(cfg['unique_atoms_file']))
-    data = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
-
-    video_ids = sorted(data["videos"])
-    order = torch.randperm(len(video_ids), generator=torch.Generator().manual_seed(cfg["seed"]))
-    num_val = max(1, round(cfg["val_video_ratio"] * len(video_ids)))
-    val_videos = sorted(video_ids[i] for i in order[:num_val].tolist())
-    train_videos = sorted(video_ids[i] for i in order[num_val:].tolist())
+    train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
+    val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
+    shared = set(train["videos"]) & set(val["videos"])
+    if shared:
+        raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
+    data = {"num_atoms": num_atoms, "min_off_frames": cfg["min_off_frames"], "split": SPLIT_SOURCE}
+    for key in ("videos", "frames", "positive_frames"):
+        data[key] = {**train[key], **val[key]}
+    train_videos, val_videos = sorted(train["videos"]), sorted(val["videos"])
 
     num_frames = sum(len(f) for f in data["frames"].values())
     num_positive = sum(len(f) for f in data["positive_frames"].values())
-    print(f"[Videos]\t {len(video_ids)} ({len(train_videos)} train, {len(val_videos)} val)")
+    print(f"[Videos]\t {len(train_videos)} train, {len(val_videos)} val (the dataset splits)")
     print(f"[Frames]\t {num_frames} ({num_positive} with onsets)")
     return {**data, "train_videos": train_videos, "val_videos": val_videos}
+
+
+def load_training_data(cfg):
+    """training_data.pt, (re)built by `prepare_training_data` if it is missing,
+    has another min_off_frames or was split another way."""
+    data = torch.load(cfg["training_data_file"], map_location="cpu") if os.path.exists(cfg["training_data_file"]) else {}
+    if data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE:
+        data = prepare_training_data(cfg)
+        torch.save(data, cfg["training_data_file"])
+    return data
 
 
 def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator, horizon=1):
@@ -958,7 +975,6 @@ def get_cfg(input_data):
             'pos_weight': 20.0,
             'l0_lambda': 1e-3,
             'l0_warmup_epochs': 10,
-            'val_video_ratio': 0.1,
             # Rule extraction thresholds of the trained model.
             'mask_threshold': 0.5,
             'weight_threshold': 0.1,
@@ -984,6 +1000,7 @@ def get_cfg(input_data):
             'wandb': True,
             'wandb_project': 'cauvid-roadpp',
             'train_atom_file': input_data['train_atom_file'],
+            'val_atom_file': input_data['val_atom_file'],
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
             "unique_atoms_file": input_data["unique_atoms_file"],
             'training_data_file': input_data["output_dir"] / "training_data.pt",
@@ -1004,14 +1021,10 @@ def main(input_data):
     print(f"----------------- Step 05: Temporal Rule Learning -----------------")
     cfg = get_cfg(input_data)
 
-    # 1. Prepare once: compressed atoms of each video, the frames to sample
-    #    (all / with onsets) and the train / validation split by video; redone
-    #    when min_off_frames changes. The model and clauses are redone after it.
-    training_data = (torch.load(cfg["training_data_file"], map_location="cpu")
-                     if os.path.exists(cfg["training_data_file"]) else {})
-    if training_data.get("min_off_frames") != cfg["min_off_frames"]:
-        training_data = prepare_training_data(cfg)
-        torch.save(training_data, cfg["training_data_file"])
+    # 1. Prepare once: compressed atoms of each video of the dataset's train and
+    #    val splits and the frames to sample (all / with onsets); redone when
+    #    min_off_frames or the split changes. The model and clauses are redone after it.
+    training_data = load_training_data(cfg)
     model_fresh = is_fresh(cfg["model_file"], cfg["training_data_file"])
     clauses_fresh = model_fresh and is_fresh(cfg["extended_clause_file"], cfg["model_file"])
 

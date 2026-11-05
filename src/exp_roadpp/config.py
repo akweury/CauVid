@@ -279,6 +279,8 @@ def get_step_05_input(args):
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",
         'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
+        # The dataset's own val split: model selection and all thresholds.
+        'val_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
         "delay_windows": args.delay_windows,
         "past_windows": getattr(args, "past_windows", [3, 5, 10]),
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",

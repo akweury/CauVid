@@ -53,7 +53,7 @@ def _score_bins(scores, edges):
 # -------------- Baselines --------------
 @torch.no_grad()
 def fit_baselines(model, training_data, step05_cfg):
-    """Scores of two baselines, fitted on all step 05 training videos (full history):
+    """Scores of two baselines, fitted on the step 05 train videos (full history):
       prior (W, A): the share of at-risk rows whose atom switches on within window
           k, the same for every row;
       anchor_confidence (R, W, A): for each seeded rule r (anchor body in one slot)
@@ -71,7 +71,7 @@ def fit_baselines(model, training_data, step05_cfg):
     anchor_size = anchor_body.sum(dim=1)
     hits, fires = torch.zeros((R, W * A), device=device), torch.zeros((R, W * A), device=device)
     onsets, at_risk = torch.zeros(W * A, device=device), torch.zeros(W * A, device=device)
-    for video_id in tqdm(training_data["videos"], desc="Fitting the baselines (train)"):
+    for video_id in tqdm(training_data["train_videos"], desc="Fitting the baselines (train)"):
         for frames in training_data["frames"][video_id].split(step05_cfg["frames_per_video"]):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
             if len(rows["inputs"]) == 0:
