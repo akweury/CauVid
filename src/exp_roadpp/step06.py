@@ -16,7 +16,7 @@ and alarm precision).
 import os
 import torch
 from tqdm import tqdm
-from src.exp_roadpp import step05, utils_data
+from src.exp_roadpp import step05, step05_causal, step05_rules, utils_data
 
 
 def compute_metrics(tp, fp, fn):
@@ -114,16 +114,21 @@ def _anchor_scores(model, inputs, baselines, chunk_size=8):
 # "mlp" only when the OnsetMLP baseline was trained; "candidate" (the stage-1 flags
 # at the cascade thresholds, a fixed 0 / 1 score) and "cascade" (the verifier's
 # probabilities on those candidates, 0 elsewhere) only when the step 05 cascade was trained.
-DETECTION_SCORERS = ("model", "mlp", "anchor", "candidate", "cascade")
+# "net_pruned": the rule net after the step 05b causal pruning, if it was made; "rule_set":
+# the step 05c rule set (each rule precise, the set covering the events), if it was made.
+DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "mlp", "anchor", "candidate", "cascade")
 # Scorers counted at a fixed threshold instead of the best validation F1.
-FIXED_THRESHOLDS = {"candidate": 0.5}
+# The rule set alarms whenever one of its rules fires (its scores are their precisions, >= the level).
+FIXED_THRESHOLDS = {"candidate": 0.5, "rule_set": 1e-6}
 # The scorers that read the memory, compared under a truncated history.
-HISTORY_SCORERS = ("model", "mlp")
+HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "mlp")
 # Plot color of each scorer.
 SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
-                 "candidate": "tab:purple", "cascade": "tab:brown"}
+                 "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
+                 "rule_set": "tab:olive"}
 SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
-                 "candidate": "candidates", "cascade": "cascade"}
+                 "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
+                 "rule_set": "rule set"}
 # Event recall levels of the operating points read off the test curves.
 RECALL_LEVELS = (0.3, 0.5, 0.7)
 
@@ -133,8 +138,9 @@ def _subset(data, video_ids):
     return {**data, "videos": {v: data["videos"][v] for v in video_ids}}
 
 
-def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None):
-    """{name: f(inputs, stage1) -> (B, W, A) probabilities}; stage1 is the model's own."""
+def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None, extra=None):
+    """{name: f(inputs, stage1) -> (B, W, A) probabilities}; stage1 is the model's own;
+    extra {name: model} adds models of the same inputs (e.g. net_pruned)."""
     baselines = {name: value.to(device) for name, value in baselines.items()}
     scorers = {
         "model": lambda inputs, stage1: stage1,
@@ -149,11 +155,16 @@ def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None)
         scorers["candidate"] = lambda inputs, stage1: (stage1[:, -1:] >= thresholds).float().expand_as(stage1)
         scorers["cascade"] = lambda inputs, stage1: torch.where(
             stage1[:, -1:] >= thresholds, verifier.window_probs(verifier(inputs)[0]), 0.0)
+    for name, other in (extra or {}).items():
+        if hasattr(other, "window_probs"):
+            scorers[name] = lambda inputs, stage1, other=other: other.window_probs(other(inputs)[0])
+        else:                                                    # a scorer of the inputs, e.g. the rule set
+            scorers[name] = lambda inputs, stage1, other=other: other(inputs)
     return {name: f for name, f in scorers.items() if names is None or name in names}
 
 
 @torch.no_grad()
-def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=None, names=None):
+def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=None, names=None, extra=None):
     """Window scores of the model and of the baselines on every video of the split.
 
     Rows are the frames t >= cfg["min_context"]; history: if given, every row
@@ -183,7 +194,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     S, A = len(edges), data["num_atoms"]
     W, top = len(model.windows), max(model.windows)
     min_context, D = cfg["min_context"], cfg["min_alarm_frames"]
-    scorers = _scorers(model, baselines, mlp, cascade, device, names)
+    scorers = _scorers(model, baselines, mlp, cascade, device, names, extra)
     heads = torch.arange(A, device=device)
     window_index = torch.arange(W, device=device)[None, :, None]
 
@@ -398,11 +409,12 @@ def _calibration(rows, num_buckets=10):
             "ece": ece}
 
 
-def select_thresholds(model, training_data, baselines, cfg, mlp=None, cascade=None):
+def select_thresholds(model, training_data, baselines, cfg, mlp=None, cascade=None, extra=None):
     """Alarm threshold of each window and scorer: the best F1 of event recall and
     alarm precision on the step 05 validation videos (fixed for FIXED_THRESHOLDS),
     so the test counts are not tuned on the test set. Returns {w: {scorer: threshold}}."""
-    scores = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp, cascade)
+    scores = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp, cascade,
+                           extra=extra)
     edges = score_edges()
     thresholds = {}
     for k, w in enumerate(model.windows):
@@ -417,7 +429,7 @@ def select_thresholds(model, training_data, baselines, cfg, mlp=None, cascade=No
     return thresholds
 
 
-def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=None):
+def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=None, extra=None):
     """Window metrics of the model and of the baselines on the test split.
 
     Returns {"windows": {w: {"rows": {scorer: AP, macro AP, base rate, best F1,
@@ -430,7 +442,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
     cfg["history_levels"] (and the full memory) and window, AP, calibration, the
     mean score of the onset and the other rows and the detections at the
     full-history thresholds of the scorers reading the memory}, plus the settings."""
-    scores = _score_videos(model, data, baselines, cfg, mlp, cascade)
+    scores = _score_videos(model, data, baselines, cfg, mlp, cascade, extra=extra)
     minutes = scores["num_frames"] / cfg["frame_rate"] / 60
     edges = score_edges()
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
@@ -438,6 +450,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
            "min_context": cfg["min_context"], "windows": model.windows, "headline_window": cfg["headline_window"],
            "frame_rate": cfg["frame_rate"], "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
            "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
+           "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
            "threshold_from": "val (best F1 of event recall and alarm precision)", "results": {}}
     for k, w in enumerate(model.windows):
         result = {"rows": {}, "detection": {}}
@@ -481,13 +494,14 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
         out["per_head"][str(h)] = m
 
     out["trajectory"] = {name: {"mean": (tr["sum"] / tr["count"].clamp(min=1)).tolist(), "count": tr["count"].tolist()}
-                         for name, tr in scores["trajectory"].items() if name in ("model", "mlp", "cascade")}
+                         for name, tr in scores["trajectory"].items()
+                         if name in ("model", "net_pruned", "rule_set", "mlp", "cascade")}
 
     # The same rows knowing only part of the memory: how the confidence grows with the known facts.
     out["history"] = {}
     for level in [*cfg["history_levels"], None]:
         partial = scores if level is None else _score_videos(model, data, baselines, cfg, mlp, cascade, level,
-                                                             HISTORY_SCORERS)
+                                                             HISTORY_SCORERS, extra)
         key = str(cfg["min_context"] if level is None else level)
         out["history"][key] = {}
         for k, w in enumerate(model.windows):
@@ -697,7 +711,7 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     cmap = plt.get_cmap("viridis")
     for i, w in enumerate(shown):
-        for name, style in (("model", "o-"), ("mlp", "s--")):
+        for name, style in (("model", "o-"), ("net_pruned", "^-."), ("rule_set", "d:"), ("mlp", "s--")):
             if name not in metrics["history"][str(levels[0])][str(w)]:
                 continue
             values = [metrics["history"][str(h)][str(w)][name] for h in levels]
@@ -716,7 +730,7 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
 
     # The confidence approaching an onset: the mean score of its own head j frames before it.
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    for name, style in (("model", "-"), ("mlp", "--"), ("cascade", ":")):
+    for name, style in (("model", "-"), ("net_pruned", "-."), ("rule_set", (0, (1, 1))), ("mlp", "--"), ("cascade", ":")):
         if name not in metrics["trajectory"]:
             continue
         mean = torch.tensor(metrics["trajectory"][name]["mean"])                     # (top, W)
@@ -724,7 +738,7 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
         for i, w in enumerate(shown):
             k = windows.index(w)
             lead = [j for j in range(len(mean)) if count[j, k] >= 5]
-            ax.plot([-j for j in lead], [mean[j, k].item() for j in lead], style,
+            ax.plot([-j for j in lead], [mean[j, k].item() for j in lead], linestyle=style,
                     color=cmap(i / max(len(shown) - 1, 1)), label=f"{SCORER_LABELS[name]}, within {w}")
     ax.axvline(0, color="tab:red", linewidth=1)
     ax.set(title="Mean confidence of an event's head before it happens", xlabel="frames relative to the onset",
@@ -742,7 +756,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
                              [("rule net AP", [m["average_precision"] for m in heads], SCORER_COLORS["model"], "o")]
                              + [(f"{SCORER_LABELS[name]} AP", [m["baseline_average_precision"][name] for m in heads],
                                  SCORER_COLORS[name], marker)
-                                for name, marker in (("mlp", "s"), ("cascade", "^"), ("anchor", "D"))
+                                for name, marker in (("net_pruned", "v"), ("rule_set", "P"), ("mlp", "s"), ("cascade", "^"),
+                                                     ("anchor", "D"))
                                 if name in heads[0]["baseline_average_precision"]]
                              + [("base rate", [m["base_rate"] for m in heads], "tab:red", "|")],
                              reference=[m["base_rate"] for m in heads])
@@ -857,6 +872,20 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
               + ", ".join(f"{j} frames before {mean[j][k]:.3f}" for j in leads))
         print()
 
+    if metrics.get("rule_levels"):
+        print("[Rule sets on test] each rule at least p precise (train); event recall / row precision / rules, "
+              "* = the level chosen on val")
+        levels = list(metrics["rule_levels"])
+        print(f"  {'W':>5}" + "".join(f"{'p>=' + level:>22}" for level in levels))
+        for w in windows:
+            cells = []
+            for level in levels:
+                m = metrics["rule_levels"][level][str(w)]
+                star = "*" if metrics["rule_levels_chosen"].get(str(w)) == level else " "
+                cells.append(f"{star}R {m['recall']:.2f} P {m['precision']:.3f} n {m['rules']:>3}")
+            print(f"  {w:>5}" + "".join(f"{c:>22}" for c in cells))
+        print()
+
     print(f"[Per head, window {headline}, by AP] onset rows  base rate  AP  MLP AP  anchor AP  best F1")
     rows = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
     for m in rows[:num_examples]:
@@ -931,6 +960,16 @@ def main(input_data):
         cascade = {"verifier": step05.load_temporal_rule_net(test_data, step05_cfg, step05_cfg["verifier_model_file"]),
                    "thresholds": torch.load(step05_cfg["candidate_threshold_file"])["thresholds"]}
     cfg["cascade"] = cascade is not None
+    # The step 05b causally pruned rule net, scored like the rule net, if it was made.
+    pruned = step05_causal.load_pruned_rule_net(test_data, step05_cfg)
+    extra = {"net_pruned": pruned} if pruned is not None else {}
+    cfg["net_pruned"] = pruned is not None
+    # The step 05c rule set, scored by the precision of its rules that fire, if it was made.
+    selection_file = step05_rules.selection_file_of(step05_cfg)
+    selection = utils_data.load_json(selection_file) if os.path.exists(selection_file) else None
+    if selection is not None:
+        extra["rule_set"] = step05_rules.RuleSetScorer(selection, model.num_inputs, model.num_atoms, cfg["device"])
+    cfg["rule_set"] = selection is not None
 
     # 2. Baselines fitted on the step 05 training videos: the window prior and the anchor rules alone.
     if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
@@ -943,15 +982,22 @@ def main(input_data):
     metrics = utils_data.load_json(cfg["metrics_file"]) if os.path.exists(cfg["metrics_file"]) else {}
     settings = {"windows": step05_cfg["windows"], "min_context": cfg["min_context"],
                 "headline_window": cfg["headline_window"], "cascade": cfg["cascade"],
-                "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"]}
+                "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
+                "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
-                            step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"])
+                            step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"],
+                            step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"], selection_file)
             or settings != {key: metrics.get(key) for key in settings}):
         training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
-        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp, cascade)
-        utils_data.save_json(evaluate_model(model, test_data, baselines, thresholds, cfg, mlp, cascade),
-                             cfg["metrics_file"])
+        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp, cascade, extra)
+        metrics = evaluate_model(model, test_data, baselines, thresholds, cfg, mlp, cascade, extra)
+        if selection is not None:
+            # Every precision level's rule set on the test videos: recall vs precision of precise rules.
+            metrics["rule_levels"] = step05_rules.level_tradeoff(model, selection, test_data,
+                                                                 {"device": cfg["device"], "step05_cfg": step05_cfg})
+            metrics["rule_levels_chosen"] = selection["chosen_level"]
+        utils_data.save_json(metrics, cfg["metrics_file"])
     metrics = utils_data.load_json(cfg["metrics_file"])
 
     # 4. The step 05 clauses on the test videos; redone whenever they change.
