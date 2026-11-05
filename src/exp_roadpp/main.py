@@ -2,7 +2,7 @@ import numpy as np
 
 
 from src.exp_roadpp import utils_pipe
-from src.exp_roadpp import step01, step02, step03, step04, step05, step05_causal, step05_rules, step05_layer, step06, step06_layer, step_dataset, step_baselines
+from src.exp_roadpp import step01, step02, step03, step04, step05, step05_causal, step05_rules, step05_motif, step05_layer, step06, step06_layer, step_dataset, step_baselines
 from src.exp_roadpp import config
 
 
@@ -38,6 +38,8 @@ def main():
     step05_causal.main(step05_input)
     # rule set selection: every rule precise, the set covering the events (greedy set cover)
     step05_rules.main(step05_input)
+    # two-level rule net: 2-frame motifs, 10-frame rules, every clause pushed to a minimum precision
+    step05_motif.main(step05_input)
     # layered rule net: predicts the full atom state of each layer of frames from the K before it
     if args.layered_rules == "True":
         step05_layer.main(step05_input)

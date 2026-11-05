@@ -16,7 +16,7 @@ and alarm precision).
 import os
 import torch
 from tqdm import tqdm
-from src.exp_roadpp import step05, step05_causal, step05_rules, utils_data
+from src.exp_roadpp import step05, step05_causal, step05_motif, step05_rules, utils_data
 
 
 def compute_metrics(tp, fp, fn):
@@ -116,19 +116,20 @@ def _anchor_scores(model, inputs, baselines, chunk_size=8):
 # probabilities on those candidates, 0 elsewhere) only when the step 05 cascade was trained.
 # "net_pruned": the rule net after the step 05b causal pruning, if it was made; "rule_set":
 # the step 05c rule set (each rule precise, the set covering the events), if it was made.
-DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "mlp", "anchor", "candidate", "cascade")
+# "motif_net": the step 05d two-level MotifRuleNet, if it was trained.
+DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp", "anchor", "candidate", "cascade")
 # Scorers counted at a fixed threshold instead of the best validation F1.
 # The rule set alarms whenever one of its rules fires (its scores are their precisions, >= the level).
 FIXED_THRESHOLDS = {"candidate": 0.5, "rule_set": 1e-6}
 # The scorers that read the memory, compared under a truncated history.
-HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "mlp")
+HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp")
 # Plot color of each scorer.
 SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
                  "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
-                 "rule_set": "tab:olive"}
+                 "rule_set": "tab:olive", "motif_net": "tab:pink"}
 SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
                  "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
-                 "rule_set": "rule set"}
+                 "rule_set": "rule set", "motif_net": "motif net"}
 # Event recall levels of the operating points read off the test curves.
 RECALL_LEVELS = (0.3, 0.5, 0.7)
 
@@ -138,9 +139,21 @@ def _subset(data, video_ids):
     return {**data, "videos": {v: data["videos"][v] for v in video_ids}}
 
 
-def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None, extra=None):
+def _own_inputs(other, context, num_rows):
+    """The inputs of a model with its own input layers (own_inputs) for the rows of
+    the current chunk (context: X, frames, known, min_off_frames); same row
+    selection as `step05.video_rows`, so the rows match the main model's."""
+    inputs = step05.video_rows(other, context["X"], context["frames"], context["min_off_frames"],
+                               context["known"])["inputs"]
+    assert len(inputs) == num_rows, "the rows of the two models differ"
+    return inputs
+
+
+def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None, extra=None, context=None):
     """{name: f(inputs, stage1) -> (B, W, A) probabilities}; stage1 is the model's own;
-    extra {name: model} adds models of the same inputs (e.g. net_pruned)."""
+    extra {name: model} adds models of the same inputs (e.g. net_pruned), scorers of
+    the inputs (the rule set) or models with their own inputs (the motif net, built
+    from context, the current chunk set by `_score_videos`)."""
     baselines = {name: value.to(device) for name, value in baselines.items()}
     scorers = {
         "model": lambda inputs, stage1: stage1,
@@ -156,7 +169,10 @@ def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None,
         scorers["cascade"] = lambda inputs, stage1: torch.where(
             stage1[:, -1:] >= thresholds, verifier.window_probs(verifier(inputs)[0]), 0.0)
     for name, other in (extra or {}).items():
-        if hasattr(other, "window_probs"):
+        if getattr(other, "own_inputs", False):
+            scorers[name] = lambda inputs, stage1, other=other: other.window_probs(
+                other(_own_inputs(other, context, len(inputs)))[0])
+        elif hasattr(other, "window_probs"):
             scorers[name] = lambda inputs, stage1, other=other: other.window_probs(other(inputs)[0])
         else:                                                    # a scorer of the inputs, e.g. the rule set
             scorers[name] = lambda inputs, stage1, other=other: other(inputs)
@@ -194,7 +210,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     S, A = len(edges), data["num_atoms"]
     W, top = len(model.windows), max(model.windows)
     min_context, D = cfg["min_context"], cfg["min_alarm_frames"]
-    scorers = _scorers(model, baselines, mlp, cascade, device, names, extra)
+    context = {}
+    scorers = _scorers(model, baselines, mlp, cascade, device, names, extra, context)
     heads = torch.arange(A, device=device)
     window_index = torch.arange(W, device=device)[None, :, None]
 
@@ -226,6 +243,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             F = len(frames)
             known = None if history is None else frames.clamp(max=history)
             rows = step05.video_rows(model, X, frames, data["min_off_frames"], known)
+            context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"])
             t, n = rows["rows"].T
             valid = rows["at_risk"][:, None, :] & rows["known"]                     # (B, W, A)
             targets = rows["targets"]
@@ -451,6 +469,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
            "frame_rate": cfg["frame_rate"], "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
            "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
+           "motif_net": cfg.get("motif_net", False),
            "threshold_from": "val (best F1 of event recall and alarm precision)", "results": {}}
     for k, w in enumerate(model.windows):
         result = {"rows": {}, "detection": {}}
@@ -495,7 +514,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
 
     out["trajectory"] = {name: {"mean": (tr["sum"] / tr["count"].clamp(min=1)).tolist(), "count": tr["count"].tolist()}
                          for name, tr in scores["trajectory"].items()
-                         if name in ("model", "net_pruned", "rule_set", "mlp", "cascade")}
+                         if name in ("model", "net_pruned", "rule_set", "motif_net", "mlp", "cascade")}
 
     # The same rows knowing only part of the memory: how the confidence grows with the known facts.
     out["history"] = {}
@@ -711,7 +730,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     cmap = plt.get_cmap("viridis")
     for i, w in enumerate(shown):
-        for name, style in (("model", "o-"), ("net_pruned", "^-."), ("rule_set", "d:"), ("mlp", "s--")):
+        for name, style in (("model", "o-"), ("net_pruned", "^-."), ("rule_set", "d:"), ("motif_net", "*-"),
+                            ("mlp", "s--")):
             if name not in metrics["history"][str(levels[0])][str(w)]:
                 continue
             values = [metrics["history"][str(h)][str(w)][name] for h in levels]
@@ -730,7 +750,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
 
     # The confidence approaching an onset: the mean score of its own head j frames before it.
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    for name, style in (("model", "-"), ("net_pruned", "-."), ("rule_set", (0, (1, 1))), ("mlp", "--"), ("cascade", ":")):
+    for name, style in (("model", "-"), ("net_pruned", "-."), ("rule_set", (0, (1, 1))), ("motif_net", (0, (5, 1))),
+                        ("mlp", "--"), ("cascade", ":")):
         if name not in metrics["trajectory"]:
             continue
         mean = torch.tensor(metrics["trajectory"][name]["mean"])                     # (top, W)
@@ -756,8 +777,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
                              [("rule net AP", [m["average_precision"] for m in heads], SCORER_COLORS["model"], "o")]
                              + [(f"{SCORER_LABELS[name]} AP", [m["baseline_average_precision"][name] for m in heads],
                                  SCORER_COLORS[name], marker)
-                                for name, marker in (("net_pruned", "v"), ("rule_set", "P"), ("mlp", "s"), ("cascade", "^"),
-                                                     ("anchor", "D"))
+                                for name, marker in (("net_pruned", "v"), ("rule_set", "P"), ("motif_net", "*"),
+                                                     ("mlp", "s"), ("cascade", "^"), ("anchor", "D"))
                                 if name in heads[0]["baseline_average_precision"]]
                              + [("base rate", [m["base_rate"] for m in heads], "tab:red", "|")],
                              reference=[m["base_rate"] for m in heads])
@@ -970,6 +991,14 @@ def main(input_data):
     if selection is not None:
         extra["rule_set"] = step05_rules.RuleSetScorer(selection, model.num_inputs, model.num_atoms, cfg["device"])
     cfg["rule_set"] = selection is not None
+    # The step 05d MotifRuleNet (its own 2-frame inputs, memory 60 frames), if it was trained.
+    motif_file, motif_cfg = step05_motif.model_file_of(step05_cfg)
+    motif = step05_motif.load_motif_rule_net(test_data, {**motif_cfg, "device": cfg["device"]})
+    if motif is not None:
+        extra["motif_net"] = motif
+        # Every model is evaluated with its full memory: the rows need the longest one before them.
+        cfg["min_context"] = max(cfg["min_context"], motif.num_lags)
+    cfg["motif_net"] = motif is not None
 
     # 2. Baselines fitted on the step 05 training videos: the window prior and the anchor rules alone.
     if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
@@ -983,11 +1012,12 @@ def main(input_data):
     settings = {"windows": step05_cfg["windows"], "min_context": cfg["min_context"],
                 "headline_window": cfg["headline_window"], "cascade": cfg["cascade"],
                 "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
-                "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"]}
+                "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
                             step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"],
-                            step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"], selection_file)
+                            step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"], selection_file,
+                            motif_file)
             or settings != {key: metrics.get(key) for key in settings}):
         training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
         thresholds = select_thresholds(model, training_data, baselines, cfg, mlp, cascade, extra)
