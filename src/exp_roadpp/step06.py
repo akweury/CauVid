@@ -86,17 +86,21 @@ def _subset(data, video_ids):
 def select_thresholds(model, training_data, baselines, cfg, mlp=None):
     """Detection threshold of each scorer: the best-F1 threshold on the step 05
     validation videos, so the test counts are not tuned on the test set.
-    Returns {"frame": {scorer: threshold}, "block": {scorer: threshold}}, the
-    block level with tolerance cfg["detection_block_tolerance"]."""
-    frame, blocks = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp)
-    thresholds = {"frame": {}, "block": {}}
+    Returns {"window": {w: {scorer: threshold}}, "block": {scorer: threshold}},
+    one per detection window w and the block level with tolerance
+    cfg["detection_block_tolerance"]."""
+    frame, blocks, windows = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines,
+                                           cfg, mlp)
+
+    def best_threshold(positives, negatives):
+        return _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"])["best_f1"]["threshold"]
+
+    thresholds = {"window": {w: {} for w in windows}, "block": {}}
     for name in (n for n in DETECTION_SCORERS if n in frame):
-        for level, (positives, negatives) in (
-                ("frame", frame[name]),
-                ("block", _block_histograms(blocks, name, cfg["detection_block_tolerance"],
-                                            training_data["num_atoms"]))):
-            best = _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"])["best_f1"]
-            thresholds[level][name] = best["threshold"]
+        thresholds["block"][name] = best_threshold(*_block_histograms(blocks, name, cfg["detection_block_tolerance"],
+                                                                      training_data["num_atoms"]))
+        for w, by_scorer in windows.items():
+            thresholds["window"][w][name] = best_threshold(*by_scorer[name])
     return thresholds
 
 
@@ -123,10 +127,12 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
     """Onset scores of the model and of the baselines (anchor, prior and, if
     given, the OnsetMLP mlp) on every video of the split.
 
-    Returns (frame, blocks):
+    Returns (frame, blocks, windows):
       frame {scorer: (positives, negatives)}: (A, S) histograms of the scores over
           all at-risk (agent, frame, atom) rows, split into the rows where the
-          atom switches on (positives) and the others; S bins of `score_edges`.
+          atom switches on within the next cfg["target_horizon"] frames, the
+          target the model was trained on (positives), and the others; S bins
+          of `score_edges`.
       blocks: the coarse level, frames merged into blocks of s = block_size:
           "events": one per block onset (the atom held in block b, not in b - 1,
               the agent visible in b - 1): "head" (E,), "true_frame" (E,) its first
@@ -137,12 +143,29 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
           "negatives" {scorer: {k: (A, S)}}: histograms of the block scores of the
               other at-risk blocks, without the k blocks before an onset (those
               are the tolerance window of the onset, not false alarms).
-    K is the largest of cfg["block_tolerances"].
+      windows {w: {scorer: (positives, negatives)}}: event-level detection with
+          a tolerance window of w frames, for each w of cfg["detection_windows"].
+          An event is one onset (agent, frame t, atom): on in t, off in the
+          min_off_frames frames before, the agent visible in t - 1. positives
+          (A, S): per event, the highest score of its at-risk rows in t - w..t
+          (an alarm up to w frames early, or at the onset, hits it); negatives
+          (A, S): the at-risk rows that are no onset and have none in the next
+          w frames (rows inside an event's window are neither).
+    K is the largest of cfg["block_tolerances"], W the largest detection window.
+
+    Only fully buffered predictions count: rows of frames t >= cfg["min_context"]
+    (the model sees its whole lag range); an event or block onset only if every
+    frame of its tolerance window is such a row (window events of w: t - w >=
+    min_context; block onsets: block b - K starts at or after it); "num_frames"
+    the scored frames.
     """
     device = cfg["device"]
     edges = score_edges().to(device)
     num_atoms, num_bins = data["num_atoms"], len(edges)
     s, K = cfg["block_size"], max(cfg["block_tolerances"])
+    horizon, W = cfg["target_horizon"], max(cfg["detection_windows"])
+    assert W < 255, "the frames to the next onset are kept as uint8"
+    min_context = cfg["min_context"]
     baselines = {name: value.to(device) for name, value in baselines.items()}
     scorers = {
         "model": lambda inputs: torch.sigmoid(model(inputs)[0]),
@@ -162,36 +185,68 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
     frame = {name: (zeros(), zeros()) for name in scorers}
     negatives = {name: {k: zeros() for k in cfg["block_tolerances"]} for name in scorers}
     events = {"head": [], "true_frame": [], "frames": [], "scores": {name: [] for name in scorers}}
+    window_negatives = {name: {w: zeros() for w in cfg["detection_windows"]} for name in scorers}
+    window_events = {"head": [], "frame": [], "scores": {name: [] for name in scorers}}
     all_heads = torch.arange(num_atoms, device=device)
     num_frames = 0
     chunk = s * max(1, cfg["frames_per_video"] // s)            # whole blocks per chunk
     for video_id in tqdm(data["videos"], desc="Scoring test videos"):
         X = step05._video_from_cells(data["videos"][video_id], num_atoms, device)
         T, N, A = X.shape
-        num_frames += T
+        num_frames += max(T - min_context, 0)
         num_blocks = -(-T // s)
+        # Window events: the exact onsets, and for every (t, n, a) the frames to the next one (W + 1 if none
+        # within W). e_lead (E, W + 1): the frames t_e - j, j = 0..W, whose scores can hit event e.
+        onsets = step05.atom_onsets(X, data["min_off_frames"])
+        onsets[0] = False
+        onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
+        to_next = torch.full((T, N, A), W + 1, dtype=torch.uint8, device=device)
+        for j in range(W, 0, -1):
+            to_next[:-j].masked_fill_(onsets[j:], j)
+        e_t, e_n, e_a = torch.nonzero(onsets, as_tuple=True)
+        e_lead = e_t[:, None] - torch.arange(W + 1, device=device)
+        e_scores = {name: torch.full(e_lead.shape, -1.0, device=device) for name in scorers}
         # Highest score of the at-risk frames of each (block, agent, atom), -1 if none, and its frame offset.
         block_max = {name: torch.full((num_blocks, N, A), -1.0, device=device) for name in scorers}
         block_arg = torch.zeros((num_blocks, N, A), dtype=torch.long, device=device)
-        for begin in range(0, T, chunk):
+        # Chunks of whole blocks from the block of min_context; only its fully buffered rows are scored.
+        for begin in range((min_context // s) * s, T, chunk):
             frames = torch.arange(begin, min(begin + chunk, T), device=device)
-            inputs, targets, at_risk, rows = step05.video_rows(model, X, frames, data["min_off_frames"])
+            inputs, targets, at_risk, rows = step05.video_rows(model, X, frames, data["min_off_frames"], horizon)
+            buffered = rows[:, 0] >= min_context
+            inputs, targets, at_risk, rows = inputs[buffered], targets[buffered], at_risk[buffered], rows[buffered]
             if len(inputs) == 0:
                 continue
             t, n = rows.T
             b0, nb = begin // s, -(-len(frames) // s)
+            # The chunk's rows in each event window: e_row (E, W + 1) row index, e_valid if it exists and is at risk.
+            row_of = torch.full((len(frames), N), -1, dtype=torch.long, device=device)
+            row_of[t - begin, n] = torch.arange(len(t), device=device)
+            e_in = (e_lead >= begin) & (e_lead < begin + len(frames))
+            e_row = torch.where(e_in, row_of[(e_lead - begin).clamp(0, len(frames) - 1), e_n[:, None]], -1)
+            e_valid = (e_row >= 0) & at_risk[e_row.clamp(min=0), e_a[:, None]]
+            # Window negatives: at-risk rows that are no onset, by frames to the next onset.
+            no_onset, to_next_rows = at_risk & ~onsets[t, n], to_next[t, n]
             for name, score in scorers.items():
                 scores = score(inputs)
                 positives_f, negatives_f = frame[name]
                 row_cells = cells(all_heads, scores)
                 positives_f += torch.bincount(row_cells[targets], minlength=len(positives_f))
                 negatives_f += torch.bincount(row_cells[at_risk & ~targets], minlength=len(negatives_f))
+                e_scores[name] = torch.where(e_valid, scores[e_row.clamp(min=0), e_a[:, None]], e_scores[name])
+                for w, histogram in window_negatives[name].items():
+                    histogram += torch.bincount(row_cells[no_onset & (to_next_rows > w)], minlength=len(histogram))
                 dense = torch.full((nb * s, N, A), -1.0, device=device)
                 dense[t - begin, n] = torch.where(at_risk, scores, -1.0)
                 values, offsets = dense.view(nb, s, N, A).max(dim=1)
                 block_max[name][b0:b0 + nb] = values
                 if name == "model":
                     block_arg[b0:b0 + nb] = offsets
+
+        window_events["head"].append(e_a)
+        window_events["frame"].append(e_t)
+        for name in scorers:
+            window_events["scores"][name].append(e_scores[name])
 
         # Block onsets: held in b, not in b - 1, the agent visible in b - 1, some frame of b scored.
         Xc = step05.coarsen_video(X, s)
@@ -201,6 +256,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
         at_risk_c[1:] = ~Xc[:-1] & Xc[:-1].any(dim=2, keepdim=True)
         at_risk_c &= block_max["model"] >= 0
         onset &= at_risk_c
+        first_block = -(-min_context // s)                      # first block starting at or after min_context
+        onset[:first_block + K] = False                         # blocks b - K..b fully buffered
         b, n, a = torch.nonzero(onset, as_tuple=True)
         padded = torch.cat([X, X.new_zeros(((-T) % s, N, A))]).view(num_blocks, s, N, A)
         events["head"].append(a)
@@ -233,7 +290,15 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
         "scores": {name: torch.cat(v).cpu() for name, v in events["scores"].items()},
         "negatives": {name: {k: cpu(h) for k, h in v.items()} for name, v in negatives.items()},
     }
-    return {name: (cpu(p), cpu(n)) for name, (p, n) in frame.items()}, blocks
+    e_head, e_frame = torch.cat(window_events["head"]).cpu(), torch.cat(window_events["frame"]).cpu()
+    e_scores = {name: torch.cat(v).cpu() for name, v in window_events["scores"].items()}
+    e_kept = {w: e_frame - w >= min_context for w in cfg["detection_windows"]}
+    windows = {w: {name: (_block_histogram(e_head[e_kept[w]], e_scores[name][e_kept[w], :w + 1].max(dim=1).values,
+                                           num_atoms),
+                          cpu(window_negatives[name][w]))
+                   for name in scorers}
+               for w in cfg["detection_windows"]}
+    return {name: (cpu(p), cpu(n)) for name, (p, n) in frame.items()}, blocks, windows
 
 
 def _block_histogram(heads, scores, num_atoms):
@@ -345,14 +410,16 @@ def _histogram_metrics(positives, negatives, threshold, with_curve=False):
 
 
 def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
-    """Next-frame onset prediction of the TemporalRuleNet on the test split, over
-    all heads together (micro) and per head atom with at least one onset; the
-    same for the baselines of `fit_baselines` under "baselines", on the same rows.
-    Each per-head entry also has the baselines' AP under "baseline_average_precision";
-    "blocks" holds the coarse-fine-focus metrics of `evaluate_blocks`; "detection"
-    the event counts at the `select_thresholds` thresholds, frame exact and per
-    block (with tolerance cfg["detection_block_tolerance"])."""
-    histograms, blocks = _score_videos(model, data, baselines, cfg, mlp)
+    """Onset prediction of the TemporalRuleNet on the test split (an onset within
+    the next target_horizon frames, its training target), over all heads together
+    (micro) and per head atom with at least one onset; the same for the baselines
+    of `fit_baselines` under "baselines", on the same rows. Each per-head entry
+    also has the baselines' AP under "baseline_average_precision"; "blocks" holds
+    the coarse-fine-focus metrics of `evaluate_blocks`; "detection" the event
+    counts at the `select_thresholds` thresholds, per tolerance window of
+    cfg["detection_windows"] frames ("window", w = 0 frame exact) and per block
+    (with tolerance cfg["detection_block_tolerance"])."""
+    histograms, blocks, windows = _score_videos(model, data, baselines, cfg, mlp)
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     onset_heads = torch.nonzero(histograms["model"][0].sum(dim=1)).flatten().tolist()
 
@@ -379,8 +446,13 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
         "minutes": minutes,
         "block_size": cfg["block_size"],
         "block_tolerance": k,
-        "frame_exact": {name: _detection(*histograms[name], thresholds["frame"][name], minutes)
-                        for name in DETECTION_SCORERS if name in histograms},
+        "frame_rate": cfg["frame_rate"],
+        "windows": cfg["detection_windows"],
+        "headline_window": cfg["detection_window"],
+        # JSON keys are strings.
+        "window": {str(w): {name: _detection(*by_scorer[name], thresholds["window"][w][name], minutes)
+                            for name in DETECTION_SCORERS if name in by_scorer}
+                   for w, by_scorer in windows.items()},
         "block": {name: _detection(*_block_histograms(blocks, name, k, data["num_atoms"]),
                                    thresholds["block"][name], minutes)
                   for name in DETECTION_SCORERS if name in histograms},
@@ -388,6 +460,8 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
     return {
         "num_videos": len(data["videos"]),
         "min_off_frames": data["min_off_frames"],
+        "target_horizon": cfg["target_horizon"],
+        "min_context": cfg["min_context"],
         "detection": detection,
         "prob_threshold": cfg["prob_threshold"],
         **model_results,
@@ -438,7 +512,7 @@ def build_results(metrics, clauses):
         "min_off_frames": metrics["min_off_frames"],
         "detection": detection,
         "average_precision": {
-            "frame_exact": {"model": metrics["overall"]["average_precision"],
+            f"frame_h{metrics['target_horizon']}": {"model": metrics["overall"]["average_precision"],
                             **{name: m["overall"]["average_precision"] for name, m in metrics["baselines"].items()}},
             "block": {name: m["average_precision"] for name, m in metrics["blocks"]["coarse"][k].items()},
         },
@@ -525,6 +599,7 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     ax.legend()
     save(fig, "fine_frame_error.pdf")
 
+    plot_detection_windows(metrics["detection"], save, plt)
     plot_comparison(metrics, save, plt)
 
     # Per head: AP and best F1, the heads with the highest AP.
@@ -586,12 +661,31 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     save(fig, "clause_precision_recall.pdf")
 
 
+def plot_detection_windows(detection, save, plt):
+    """detection_vs_window.pdf: recall, precision and false alarms per minute of
+    every detection scorer against the tolerance window (each at its own
+    validation threshold), to pick a window."""
+    windows = detection["windows"]
+    scorers = [n for n in DETECTION_SCORERS if n in detection["window"][str(windows[0])]]
+    seconds = [w / detection["frame_rate"] for w in windows]
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
+    for ax, key, label in zip(axes, ("recall", "precision", "false_alarms_per_minute"),
+                              ("recall (events detected)", "precision", "false alarms / min")):
+        for name in scorers:
+            ax.plot(seconds, [detection["window"][str(w)][name][key] or 0 for w in windows], "o-",
+                    color=SCORER_COLORS[name], label=name)
+        ax.set(xlabel="tolerance window (s before the onset)", ylabel=label, title=label)
+    axes[0].legend(fontsize=7)
+    fig.suptitle(f"Event detection vs tolerance window ({detection['minutes']:.1f} min of test video)")
+    save(fig, "detection_vs_window.pdf")
+
+
 def plot_comparison(metrics, save, plt):
     """The TemporalRuleNet ("model") against the OnsetMLP baseline ("mlp"), with the
     anchor and prior baselines as references; skipped if the MLP was not trained.
-      compare_ap.pdf: micro AP of every scorer, frame exact and per block;
+      compare_ap.pdf: micro AP of every scorer, per frame (onset within the horizon) and per block;
       compare_detection.pdf: detected / missed events and false alarms per minute
-          at the validation thresholds, frame exact and per block;
+          at the validation thresholds, in the headline window and per block;
       compare_ap_per_head.pdf: AP of each head, rule net vs MLP (above y = x: rule net better).
     """
     if "mlp" not in metrics["baselines"]:
@@ -604,7 +698,7 @@ def plot_comparison(metrics, save, plt):
     labels = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior"}
 
     # AP of every scorer at both levels, log axis (the prior sits at the base rate).
-    ap = {"frame exact": {"model": metrics["overall"]["average_precision"],
+    ap = {f"frame (onset within {metrics['target_horizon']})": {"model": metrics["overall"]["average_precision"],
                           **{n: m["overall"]["average_precision"] for n, m in metrics["baselines"].items()}},
           block_name: {n: m["average_precision"] for n, m in metrics["blocks"]["coarse"][k].items()}}
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
@@ -622,9 +716,10 @@ def plot_comparison(metrics, save, plt):
     save(fig, "compare_ap.pdf")
 
     # Detected / missed events and false alarms per minute, per level.
-    scorers = [n for n in DETECTION_SCORERS if n in detection["frame_exact"]]
+    w = detection["headline_window"]
+    scorers = [n for n in DETECTION_SCORERS if n in detection["window"][str(w)]]
     fig, axes = plt.subplots(2, 2, figsize=(9, 5), gridspec_kw={"width_ratios": [2, 1]})
-    for row, (level, by_scorer) in enumerate((("frame exact", detection["frame_exact"]),
+    for row, (level, by_scorer) in enumerate(((f"window {w} frames", detection["window"][str(w)]),
                                               (block_name, detection["block"]))):
         y = list(range(len(scorers)))
         ticks = [f"{labels[n]} (thr {by_scorer[n]['threshold']:.2g})" for n in scorers]
@@ -672,17 +767,21 @@ def plot_comparison(metrics, save, plt):
 
 # -------------- Summary --------------
 def print_summary(metrics, clauses, cfg, num_examples=15):
-    print("[Evaluation Summary] next-frame onset prediction on the test split")
+    print(f"[Evaluation Summary] onset prediction (within {metrics['target_horizon']} frames) on the test split, "
+          f"fully buffered frames only (>= {metrics['min_context']} frames of context)")
     detection = metrics["detection"]
-    print(f"[Detection] events = onsets in {detection['minutes']:.1f} min of test video; "
-          f"thresholds picked on {detection['threshold_from']}")
-    print(f"  {'level':<15}{'scorer':<8}{'events':>8}{'detected':>10}{'missed':>8}{'false alarms':>14}"
+    print(f"[Detection] events = onsets in {detection['minutes']:.1f} min of fully buffered test video; "
+          f"thresholds picked on {detection['threshold_from']} per level; window w: an alarm in the w frames "
+          f"before the onset or at it detects it (w = 0 frame exact); false alarms are frames; "
+          f"* = headline window")
+    print(f"  {'level':<20}{'scorer':<8}{'events':>8}{'detected':>10}{'missed':>8}{'false alarms':>14}"
           f"{'recall':>8}{'precision':>11}{'FA/min':>8}")
-    levels = (("frame exact", detection["frame_exact"]),
-              (f"block {detection['block_size']}f k{detection['block_tolerance']}", detection["block"]))
+    levels = [(f"window {w}f {w / detection['frame_rate']:.1f}s" + (" *" if w == detection["headline_window"] else ""),
+               detection["window"][str(w)]) for w in detection["windows"]]
+    levels.append((f"block {detection['block_size']}f k{detection['block_tolerance']}", detection["block"]))
     for level, by_scorer in levels:
         for name, d in by_scorer.items():
-            print(f"  {level:<15}{name:<8}{d['events']:>8}{d['detected']:>10}{d['missed']:>8}{d['false_alarms']:>14}"
+            print(f"  {level:<20}{name:<8}{d['events']:>8}{d['detected']:>10}{d['missed']:>8}{d['false_alarms']:>14}"
                   f"{d['recall']:>8.3f}{d['precision']:>11.3f}{d['false_alarms_per_minute'] or 0:>8.2f}")
     print()
     overall = metrics["overall"]
@@ -745,8 +844,18 @@ def main(input_data):
         "unique_atoms_file": input_data["unique_atoms_file"],
         "test_atoms_file": input_data["test_atoms_file"],
         "frames_per_video": step05_cfg["frames_per_video"],
-        # A head is predicted to switch on in the next frame above this probability.
+        # The frame-level target is the step 05 training target: an onset within the next target_horizon frames.
+        "target_horizon": step05_cfg["target_horizon"],
+        # Only fully buffered predictions are evaluated: frames with the model's whole lag range
+        # (100 frames) before them, so no rule misses its body for lack of history.
+        "min_context": step05_cfg["lag_edges"][-1],
+        # A head is predicted to switch on above this probability.
         "prob_threshold": 0.5,
+        # Event detection: an onset is detected by an alarm in the w frames before it or at it, for each
+        # w (frames, 10 fps: 0 / 0.5 / 1 / 2 / 3 / 5 s), each with its own validation threshold;
+        # detection_window is the headline one (compare_detection.pdf), pick it from detection_vs_window.pdf.
+        "detection_windows": [0, 5, 10, 20, 30, 50],
+        "detection_window": 10,
         # Coarse-fine-focus: frames merged into blocks of block_size; an onset is hit
         # at the coarse level by a high score in its block or up to k blocks before
         # it (k in block_tolerances); frame errors are counted within frame_tolerances.
@@ -765,6 +874,7 @@ def main(input_data):
     }
     step05_cfg["device"] = cfg["device"]
     assert cfg["detection_block_tolerance"] in cfg["block_tolerances"]
+    assert cfg["detection_window"] in cfg["detection_windows"]
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
@@ -787,7 +897,11 @@ def main(input_data):
     #    The detection thresholds are picked on the step 05 validation videos.
     settings = {"block_size": metrics.get("blocks", {}).get("block_size"),
                 "block_tolerances": metrics.get("blocks", {}).get("block_tolerances"),
-                "detection_block_tolerance": metrics.get("detection", {}).get("block_tolerance")}
+                "detection_block_tolerance": metrics.get("detection", {}).get("block_tolerance"),
+                "detection_windows": metrics.get("detection", {}).get("windows"),
+                "detection_window": metrics.get("detection", {}).get("headline_window"),
+                "target_horizon": metrics.get("target_horizon"),
+                "min_context": metrics.get("min_context")}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"])
             or settings != {k: cfg[k] for k in settings}):
