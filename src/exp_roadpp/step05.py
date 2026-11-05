@@ -288,6 +288,15 @@ def concat_rows(parts):
     return {key: torch.cat([part[key] for part in parts]) for key in parts[0]}
 
 
+def coarsen_video(X, block_size):
+    """(ceil(T / s), N, A) bool: the atom holds in some frame of each block of
+    s = block_size frames (frames past the video end count as empty).
+    Used by step05_layer / step06_layer."""
+    pad = (-X.shape[0]) % block_size
+    X = torch.cat([X, X.new_zeros((pad, *X.shape[1:]))])
+    return X.view(-1, block_size, *X.shape[1:]).any(dim=1)
+
+
 @torch.no_grad()
 def _validation_loss(model, training_data, val_frames, cfg, candidates=None):
     """Mean window loss over the fixed target frames of the validation videos
