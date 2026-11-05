@@ -153,13 +153,23 @@ class TemporalRuleNet(torch.nn.Module):
     65-100 frames ago. Each bin is one input layer with two groups of A atom
     nodes: slot 0 "self" (the agent holds the atom in some frame of the bin) and
     slot 1 "others" (some other agent holds it in some frame of the bin), so
-    M = 2 * B * A input nodes. R rule nodes are soft ANDs over a sparse
-    hard-concrete mask of the inputs; the bins of a rule's inputs give the order
-    of its body atoms. Each head atom is a weighted OR of the rule nodes.
+    M = 2 * B * A input nodes. R rule nodes are soft ANDs over a sparse mask of
+    the inputs; the bins of a rule's inputs give the order of its body atoms.
+    Each head atom is a weighted OR of the rule nodes.
+
+    mask_type "hard_concrete": a stochastic L0 mask while training. "sigmoid": the
+    deterministic mask sigmoid(log_alpha) of `LayeredRuleNet`, started near 0 so
+    every input gets a gradient (a noisy mask opens a few of the thousands of
+    mostly-0 inputs in every sample, turns the rule off, and the clamped gates of
+    the others get none), kept sparse by an L1 loss.
     """
 
-    def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), num_rules=256, init_log_alpha=-6.0):
+    def __init__(self, num_atoms, lag_edges=(1, 2, 4, 8, 16, 32, 64, 100), num_rules=256, init_log_alpha=-6.0,
+                 mask_type="hard_concrete"):
         super().__init__()
+        if mask_type not in ("hard_concrete", "sigmoid"):
+            raise ValueError(f"Unknown mask_type {mask_type}.")
+        self.mask_type = mask_type
         self.num_atoms = num_atoms
         # Bin i covers lo_i..hi_i frames ago, hi_i = lag_edges[i], lo_i = hi_{i-1} + 1.
         self.lag_bins = [(lo + 1, hi) for lo, hi in zip((0, *lag_edges[:-1]), lag_edges)]
@@ -261,9 +271,12 @@ class TemporalRuleNet(torch.nn.Module):
         return s_bar.clamp(0, 1)
     # -------- forward ----------------------------------
     def rule_mask(self):
-        """(R, M) mask in [0, 1]: stochastic while training, deterministic in eval;
-        1 for the fixed inputs."""
-        mask = self.hard_concrete_mask(self.log_alpha, training=self.training)
+        """(R, M) mask in [0, 1]; 1 for the fixed inputs. hard_concrete: stochastic
+        while training, deterministic in eval; sigmoid: sigmoid(log_alpha) always."""
+        if self.mask_type == "sigmoid":
+            mask = torch.sigmoid(self.log_alpha)
+        else:
+            mask = self.hard_concrete_mask(self.log_alpha, training=self.training)
         return mask.masked_fill(self.fixed_inputs, 1.0)
 
     def forward(self, inputs):
@@ -285,9 +298,9 @@ class TemporalRuleNet(torch.nn.Module):
         return (bce * weight).sum() / weight.sum().clamp(min=1)
 
     def sparsity_loss(self, beta=2 / 3, gamma=-0.1, zeta=1.1):
-        """Expected number of active inputs per rule (L0 of the hard-concrete mask),
-        the fixed inputs left out, plus the L1 of the head weights."""
-        shift = beta * torch.log(torch.tensor(-gamma / zeta))
+        """Expected number of active inputs per rule (L0 of the hard-concrete mask;
+        L1 of the sigmoid mask), the fixed inputs left out, plus the L1 of the head weights."""
+        shift = beta * torch.log(torch.tensor(-gamma / zeta)) if self.mask_type == "hard_concrete" else 0.0
         l0 = (torch.sigmoid(self.log_alpha - shift) * ~self.fixed_inputs).sum(dim=1).mean()
         return l0 + self.head_weight.abs().sum(dim=1).mean()
 

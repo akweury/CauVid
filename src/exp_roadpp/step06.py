@@ -73,9 +73,15 @@ def _anchor_scores(model, inputs, baselines, chunk_size=64):
 # -------------- Detection --------------
 # The scorers whose detections are counted (the prior flags all rows of a head alike);
 # "mlp" only when the OnsetMLP baseline was trained.
-DETECTION_SCORERS = ("model", "mlp", "anchor")
+# "candidate" (the stage-1 flags at the cascade thresholds, a fixed 0 / 1 score) and
+# "cascade" (the verifier's score on those candidates, 0 elsewhere) only when the
+# step 05 cascade was trained.
+DETECTION_SCORERS = ("model", "mlp", "anchor", "candidate", "cascade")
+# Scorers counted at a fixed threshold instead of the best validation F1.
+FIXED_THRESHOLDS = {"candidate": 0.5}
 # Plot color of each scorer.
-SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray"}
+SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
+                 "candidate": "tab:purple", "cascade": "tab:brown"}
 
 
 def _subset(data, video_ids):
@@ -83,16 +89,18 @@ def _subset(data, video_ids):
     return {**data, "videos": {v: data["videos"][v] for v in video_ids}}
 
 
-def select_thresholds(model, training_data, baselines, cfg, mlp=None):
+def select_thresholds(model, training_data, baselines, cfg, mlp=None, cascade=None):
     """Detection threshold of each scorer: the best-F1 threshold on the step 05
     validation videos, so the test counts are not tuned on the test set.
     Returns {"window": {w: {scorer: threshold}}, "block": {scorer: threshold}},
     one per detection window w and the block level with tolerance
     cfg["detection_block_tolerance"]."""
     frame, blocks, windows = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines,
-                                           cfg, mlp)
+                                           cfg, mlp, cascade)
 
     def best_threshold(positives, negatives):
+        if name in FIXED_THRESHOLDS:
+            return FIXED_THRESHOLDS[name]
         return _histogram_metrics(positives.sum(dim=0), negatives.sum(dim=0), cfg["prob_threshold"])["best_f1"]["threshold"]
 
     thresholds = {"window": {w: {} for w in windows}, "block": {}}
@@ -123,9 +131,12 @@ def _detection(positives, negatives, threshold, minutes):
 
 # -------------- Model evaluation --------------
 @torch.no_grad()
-def _score_videos(model, data, baselines, cfg, mlp=None):
+def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None):
     """Onset scores of the model and of the baselines (anchor, prior and, if
-    given, the OnsetMLP mlp) on every video of the split.
+    given, the OnsetMLP mlp) on every video of the split; with cascade
+    {"verifier", "thresholds"} also "candidate" (1 where the model, stage 1, is at
+    or above the head's threshold) and "cascade" (the verifier's score there, 0
+    elsewhere).
 
     Returns (frame, blocks, windows):
       frame {scorer: (positives, negatives)}: (A, S) histograms of the scores over
@@ -167,14 +178,20 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
     assert W < 255, "the frames to the next onset are kept as uint8"
     min_context = cfg["min_context"]
     baselines = {name: value.to(device) for name, value in baselines.items()}
+    # Each scorer gets the input rows and the model's (stage 1) scores of them.
     scorers = {
-        "model": lambda inputs: torch.sigmoid(model(inputs)[0]),
-        "anchor": lambda inputs: _anchor_scores(model, inputs, baselines),
-        "prior": lambda inputs: baselines["prior"].expand(len(inputs), -1),
+        "model": lambda inputs, stage1: stage1,
+        "anchor": lambda inputs, stage1: _anchor_scores(model, inputs, baselines),
+        "prior": lambda inputs, stage1: baselines["prior"].expand(len(inputs), -1),
     }
     if mlp is not None:
         # Same input layers as the TemporalRuleNet, so it scores the same rows.
-        scorers["mlp"] = lambda inputs: torch.sigmoid(mlp(inputs)[0])
+        scorers["mlp"] = lambda inputs, stage1: torch.sigmoid(mlp(inputs)[0])
+    if cascade is not None:
+        verifier, cascade_thresholds = cascade["verifier"], cascade["thresholds"].to(device)
+        scorers["candidate"] = lambda inputs, stage1: (stage1 >= cascade_thresholds).float()
+        scorers["cascade"] = lambda inputs, stage1: torch.where(stage1 >= cascade_thresholds,
+                                                                torch.sigmoid(verifier(inputs)[0]), 0.0)
 
     def zeros():
         return torch.zeros(num_atoms * num_bins, device=device)
@@ -227,8 +244,9 @@ def _score_videos(model, data, baselines, cfg, mlp=None):
             e_valid = (e_row >= 0) & at_risk[e_row.clamp(min=0), e_a[:, None]]
             # Window negatives: at-risk rows that are no onset, by frames to the next onset.
             no_onset, to_next_rows = at_risk & ~onsets[t, n], to_next[t, n]
+            stage1 = torch.sigmoid(model(inputs)[0])
             for name, score in scorers.items():
-                scores = score(inputs)
+                scores = score(inputs, stage1)
                 positives_f, negatives_f = frame[name]
                 row_cells = cells(all_heads, scores)
                 positives_f += torch.bincount(row_cells[targets], minlength=len(positives_f))
@@ -409,7 +427,7 @@ def _histogram_metrics(positives, negatives, threshold, with_curve=False):
     }
 
 
-def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
+def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=None):
     """Onset prediction of the TemporalRuleNet on the test split (an onset within
     the next target_horizon frames, its training target), over all heads together
     (micro) and per head atom with at least one onset; the same for the baselines
@@ -419,7 +437,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
     counts at the `select_thresholds` thresholds, per tolerance window of
     cfg["detection_windows"] frames ("window", w = 0 frame exact) and per block
     (with tolerance cfg["detection_block_tolerance"])."""
-    histograms, blocks, windows = _score_videos(model, data, baselines, cfg, mlp)
+    histograms, blocks, windows = _score_videos(model, data, baselines, cfg, mlp, cascade)
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     onset_heads = torch.nonzero(histograms["model"][0].sum(dim=1)).flatten().tolist()
 
@@ -462,6 +480,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None):
         "min_off_frames": data["min_off_frames"],
         "target_horizon": cfg["target_horizon"],
         "min_context": cfg["min_context"],
+        "cascade": cfg["cascade"],
         "detection": detection,
         "prob_threshold": cfg["prob_threshold"],
         **model_results,
@@ -774,6 +793,9 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
           f"thresholds picked on {detection['threshold_from']} per level; window w: an alarm in the w frames "
           f"before the onset or at it detects it (w = 0 frame exact); false alarms are frames; "
           f"* = headline window")
+    if metrics.get("cascade"):
+        print("[Cascade]\t candidate = stage-1 flags at the step 05 recall thresholds (its recall is the ceiling "
+              "of the cascade); cascade = the verifier on those candidates")
     print(f"  {'level':<20}{'scorer':<8}{'events':>8}{'detected':>10}{'missed':>8}{'false alarms':>14}"
           f"{'recall':>8}{'precision':>11}{'FA/min':>8}")
     levels = [(f"window {w}f {w / detection['frame_rate']:.1f}s" + (" *" if w == detection["headline_window"] else ""),
@@ -885,6 +907,12 @@ def main(input_data):
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
     mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained
+    # The step 05 cascade (stage-1 thresholds and the verifier), None if it was not trained.
+    cascade = None
+    if step05_cfg["cascade"] and os.path.exists(step05_cfg["verifier_model_file"]):
+        cascade = {"verifier": step05.load_temporal_rule_net(test_data, step05_cfg, step05_cfg["verifier_model_file"]),
+                   "thresholds": torch.load(step05_cfg["candidate_threshold_file"])["thresholds"]}
+    cfg["cascade"] = cascade is not None
 
     # 2. Baselines fitted on the step 05 training videos: the head prior and the anchor rules alone.
     if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
@@ -901,13 +929,16 @@ def main(input_data):
                 "detection_windows": metrics.get("detection", {}).get("windows"),
                 "detection_window": metrics.get("detection", {}).get("headline_window"),
                 "target_horizon": metrics.get("target_horizon"),
-                "min_context": metrics.get("min_context")}
+                "min_context": metrics.get("min_context"),
+                "cascade": metrics.get("cascade")}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
-                            cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"])
+                            cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
+                            step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"])
             or settings != {k: cfg[k] for k in settings}):
         training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
-        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp)
-        utils_data.save_json(evaluate_model(model, test_data, baselines, thresholds, cfg, mlp), cfg["metrics_file"])
+        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp, cascade)
+        utils_data.save_json(evaluate_model(model, test_data, baselines, thresholds, cfg, mlp, cascade),
+                             cfg["metrics_file"])
     metrics = utils_data.load_json(cfg["metrics_file"])
 
     # 4. The step 05 clauses on the test videos; redone whenever they change.

@@ -267,8 +267,9 @@ def coarsen_video(X, block_size):
 
 
 @torch.no_grad()
-def _validation_loss(model, training_data, val_frames, cfg):
-    """Mean onset loss over the fixed target frames of the validation videos."""
+def _validation_loss(model, training_data, val_frames, cfg, candidates=None):
+    """Mean onset loss over the fixed target frames of the validation videos
+    (only the candidate cells, if candidates is given; see `fit_onset_model`)."""
     model.eval()
     losses = []
     for video_id, frames in val_frames.items():
@@ -276,6 +277,8 @@ def _validation_loss(model, training_data, val_frames, cfg):
                                                cfg["target_horizon"])
         if len(inputs) == 0:
             continue
+        if candidates is not None:
+            at_risk = at_risk & candidates(inputs)
         logits, _rules = model(inputs)
         losses.append(model.loss(logits, targets, at_risk, cfg["pos_weight"]).item())
     return sum(losses) / len(losses) if losses else float("nan")
@@ -289,7 +292,7 @@ def anchor_rules(cfg):
 
 
 def fit_onset_model(model, training_data, cfg, optimizer, history_file, regularization=None, run=None,
-                    model_stats=None):
+                    model_stats=None, candidates=None):
     """Train an onset model (TemporalRuleNet or the OnsetMLP baseline) on the
     training videos; returns it with the weights of the lowest validation loss.
 
@@ -297,7 +300,9 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     videos with frames_per_video sampled target frames each. The input rows are
     rebuilt from the stored atoms per batch, never saved. regularization(epoch):
     the extra loss term of an epoch, or None; run: the W&B run the losses of each
-    epoch are logged to, or None; model_stats(): extra values logged per epoch.
+    epoch are logged to, or None; model_stats(): extra values logged per epoch;
+    candidates(inputs) -> (B, A) bool: if given, the loss only covers these
+    (row, head) cells (the cascade verifier learns on the stage-1 candidates).
     """
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
@@ -326,6 +331,8 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
             inputs, targets, at_risk = (torch.cat(part) for part in zip(*parts))
             if len(inputs) == 0:
                 continue
+            if candidates is not None:
+                at_risk = at_risk & candidates(inputs)
 
             logits, _hidden = model(inputs)
             onset_loss = model.loss(logits, targets, at_risk, cfg["pos_weight"])
@@ -336,7 +343,7 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
             epoch_losses.append(onset_loss.item())
 
         train_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
-        val_loss = _validation_loss(model, training_data, val_frames, cfg)
+        val_loss = _validation_loss(model, training_data, val_frames, cfg, candidates)
         print(f"[Epoch {epoch + 1}/{cfg['num_epochs']}] train loss {train_loss:.4f}, val loss {val_loss:.4f}")
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss})
         if run is not None:
@@ -355,45 +362,137 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     return model
 
 
-def train_temporal_rule_net(training_data, cfg, run=None):
-    """Train a TemporalRuleNet seeded from the anchor clauses (`fit_onset_model`),
-    with the L0 sparsity loss after l0_warmup_epochs."""
-    # One rule node per (anchor body, lag bin), plus num_free_rules unseeded ones.
+def _seeded_rule_net(training_data, cfg):
+    """A TemporalRuleNet with one rule node per (anchor body, lag bin), plus
+    num_free_rules unseeded ones, on cfg["device"]."""
     anchors = anchor_rules(cfg)
     num_bins = len(cfg["lag_edges"])
     model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"],
-                            len(anchors) * num_bins + cfg["num_free_rules"])
+                            len(anchors) * num_bins + cfg["num_free_rules"], cfg["init_log_alpha"], cfg["mask_type"])
     num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
-    model = model.to(cfg["device"])
-    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free")
+    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
+          f"{cfg['mask_type']} mask")
+    return model.to(cfg["device"])
 
+
+def _fit_rule_net(model, training_data, cfg, history_file, run=None, candidates=None):
+    """`fit_onset_model` of a TemporalRuleNet, with its sparsity loss after
+    l0_warmup_epochs; the sigmoid gates get their own learning rate (gate_lr,
+    and a tiny gate_eps: their gradients start at ~1e-12, sigmoid' of -11)."""
     def regularization(epoch):
         # No sparsity pressure in the first epochs, so useful inputs can grow first.
         return (cfg["l0_lambda"] if epoch >= cfg["l0_warmup_epochs"] else 0.0) * model.sparsity_loss()
 
     @torch.no_grad()
     def model_stats():
-        active_inputs = (model.rule_mask() > cfg["mask_threshold"]).sum(dim=1).float()
+        active = (model.rule_mask() > cfg["mask_threshold"]) & ~model.fixed_inputs
+        extra = active.sum(dim=1).float()
+        gates = model.log_alpha[~model.fixed_inputs]
         return {"model/sparsity_loss": model.sparsity_loss().item(),
-                "model/active_inputs_per_rule": active_inputs.mean().item(),
-                "model/empty_rules": (active_inputs == 0).sum().item()}
+                "model/extra_inputs_per_rule": extra.mean().item(),
+                "model/max_extra_inputs": extra.max().item(),
+                "model/share_rules_extended": (extra > 0).float().mean().item(),
+                "gates/max_log_alpha": gates.max().item(),
+                "gates/count_above_0": (gates > 0).sum().item()}
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
-    return fit_onset_model(model, training_data, cfg, optimizer, cfg["history_file"], regularization, run,
-                           model_stats)
+    if cfg["mask_type"] == "sigmoid":
+        others = [p for name, p in model.named_parameters() if name != "log_alpha"]
+        optimizer = torch.optim.Adam([{"params": [model.log_alpha], "lr": cfg["gate_lr"], "eps": cfg["gate_eps"]},
+                                      {"params": others, "lr": cfg["lr"]}])
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    return fit_onset_model(model, training_data, cfg, optimizer, history_file, regularization, run, model_stats,
+                           candidates)
 
 
-def load_temporal_rule_net(training_data, cfg):
-    """The trained TemporalRuleNet of cfg["model_file"], in eval mode on cfg["device"].
+def train_temporal_rule_net(training_data, cfg, run=None):
+    """Stage 1 of the cascade: the recall model, a TemporalRuleNet seeded from the
+    anchor clauses plus free rules for the heads without an anchor."""
+    return _fit_rule_net(_seeded_rule_net(training_data, cfg), training_data, cfg, cfg["history_file"], run)
+
+
+def load_temporal_rule_net(training_data, cfg, model_file=None):
+    """The trained TemporalRuleNet of model_file (default cfg["model_file"]), in
+    eval mode on cfg["device"].
 
     The model is rebuilt with the same sizes it was trained with (num_atoms of
-    the training data, lag_edges of cfg, the number of rules of the saved weights)
-    before its weights, and its seeded anchor inputs, are loaded.
+    the training data, lag_edges and mask_type of cfg, the number of rules of the
+    saved weights) before its weights, and its seeded anchor inputs, are loaded.
     """
-    state = torch.load(cfg["model_file"], map_location="cpu")
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], state["log_alpha"].shape[0])
+    state = torch.load(model_file or cfg["model_file"], map_location="cpu")
+    model = TemporalRuleNet(training_data["num_atoms"], cfg["lag_edges"], state["log_alpha"].shape[0],
+                            mask_type=cfg["mask_type"])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
+
+
+# -------------- Cascade: stage-1 candidates and the stage-2 verifier --------------
+@torch.no_grad()
+def candidate_thresholds(model, training_data, cfg):
+    """Per-head stage-1 score thresholds that keep cascade_recall of the onset
+    rows of the validation videos (rows with the head switching on within the
+    target horizon); a head with fewer than cascade_min_positives such rows gets
+    the threshold of all heads together.
+
+    Returns {"thresholds": (A,) CPU, "recall": the target, "val_row_recall" and
+    "val_candidate_share": the share of the onset rows and of all at-risk
+    (row, head) cells at or above the thresholds}.
+    """
+    model.eval()
+    device, A = cfg["device"], training_data["num_atoms"]
+
+    def rows(video_id):
+        for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
+            inputs, targets, at_risk = _video_rows(model, training_data, video_id, frames, device,
+                                                   cfg["target_horizon"])
+            if len(inputs):
+                yield torch.sigmoid(model(inputs)[0]), targets, at_risk
+
+    heads, values = [], []
+    for video_id in tqdm(training_data["val_videos"], desc="Stage-1 scores of the val onsets"):
+        for scores, targets, _at_risk in rows(video_id):
+            r, h = torch.nonzero(targets, as_tuple=True)
+            heads.append(h)
+            values.append(scores[r, h])
+    heads, values = (torch.cat(x).cpu() if x else torch.zeros(0) for x in (heads, values))
+    q = 1 - cfg["cascade_recall"]
+    thresholds = torch.full((A,), torch.quantile(values, q).item() if len(values) else 0.0)
+    for h in heads.unique().tolist():
+        if (heads == h).sum() >= cfg["cascade_min_positives"]:
+            thresholds[h] = torch.quantile(values[heads == h], q)
+
+    kept, onsets, candidates, cells = 0, 0, 0, 0
+    on_device = thresholds.to(device)
+    for video_id in tqdm(training_data["val_videos"], desc="Stage-1 candidates of val"):
+        for scores, targets, at_risk in rows(video_id):
+            flagged = scores >= on_device
+            kept += (flagged & targets).sum().item()
+            onsets += targets.sum().item()
+            candidates += (flagged & at_risk).sum().item()
+            cells += at_risk.sum().item()
+    return {"thresholds": thresholds, "recall": cfg["cascade_recall"],
+            "val_row_recall": kept / max(onsets, 1), "val_candidate_share": candidates / max(cells, 1)}
+
+
+def make_candidates(model, thresholds):
+    """candidates(inputs) -> (B, A) bool: the stage-1 model flags the head (its
+    score is at or above the head's threshold)."""
+    model.eval()
+
+    @torch.no_grad()
+    def candidates(inputs):
+        return torch.sigmoid(model(inputs)[0]) >= thresholds.to(inputs.device)
+    return candidates
+
+
+def train_verifier(training_data, cfg, candidates, run=None):
+    """Stage 2 of the cascade: a TemporalRuleNet seeded like stage 1, trained only
+    on the stage-1 candidate cells with verifier_pos_weight, so its rules (the
+    anchors extended by the atoms that separate true from false candidates)
+    learn to reject the stage-1 false alarms."""
+    verifier_cfg = {**cfg, "pos_weight": cfg["verifier_pos_weight"]}
+    return _fit_rule_net(_seeded_rule_net(training_data, cfg), training_data, verifier_cfg,
+                         cfg["verifier_history_file"], run, candidates)
 
 
 # -------------- Black-box baseline --------------
@@ -421,8 +520,10 @@ def load_onset_mlp(training_data, cfg):
 
 
 @torch.no_grad()
-def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule firings"):
-    """Counts of every rule r and head atom h over all frames of the given videos.
+def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule firings", candidates=None):
+    """Counts of every rule r and head atom h over all frames of the given videos
+    (only the cells candidates(inputs) flags, if given: the verifier's rules are
+    judged on the stage-1 candidates they filter).
 
     Returns a dict of CPU tensors:
       fires (R, A): rows where every body atom of r holds and h is at risk (off
@@ -447,6 +548,9 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
                                                    cfg["target_horizon"])
             if len(inputs) == 0:
                 continue
+            if candidates is not None:
+                flagged = candidates(inputs)
+                targets, at_risk = targets & flagged, at_risk & flagged
             targets, at_risk = targets.float(), at_risk.float()
             fired = (model.partial_activation(inputs, cfg["mask_threshold"]) >= 1).float()
             anchor_fired = ((inputs @ anchor_body.T >= anchor_size) & (anchor_size > 0)).float()
@@ -469,7 +573,7 @@ def _temporal_clause_text(clause, unique_atoms):
     return f"{body} => {atom(*clause['head'])}"
 
 
-def extract_temporal_clauses(model, training_data, cfg, run=None):
+def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=None):
     """Clauses of the trained model, one per (rule node, head) pair with a large
     head weight, kept if the rule hits the head in at least min_support training
     frames of at least min_videos videos.
@@ -482,15 +586,16 @@ def extract_temporal_clauses(model, training_data, cfg, run=None):
     The val_ fields are the same on the validation videos, plus val_recall (the
     share of the head's onsets the clause hits) and val_base_rate (the head's
     onsets / at-risk rows, the confidence of always predicting it). Sorted by confidence.
+    With candidates (the verifier), all counts are over the stage-1 candidate cells.
     """
     def ratio(a, b):
         return float(a) / float(b) if b > 0 else None
 
     rules = model.extract_rules(cfg["mask_threshold"], cfg["weight_threshold"])
     train = _rule_head_counts(model, training_data, training_data["train_videos"], cfg,
-                              desc="Counting rule firings (train)")
+                              desc="Counting rule firings (train)", candidates=candidates)
     val = _rule_head_counts(model, training_data, training_data["val_videos"], cfg,
-                            desc="Counting rule firings (val)")
+                            desc="Counting rule firings (val)", candidates=candidates)
 
     clauses = []
     for rule in rules:
@@ -699,12 +804,12 @@ def _plot_results(clauses, cfg, num_heads=30):
         save(fig, "delay_map.pdf")
 
 
-def _print_summary(clauses, training_data, cfg, num_examples=15):
+def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 Result", clause_file=None):
     """Terminal summary of the step 05 result, printed on every run (cached or not)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
-    print(f"----------------- Step 05 Result -----------------")
+    print(f"----------------- {title} -----------------")
     print(f"[Videos]\t {len(training_data['train_videos'])} train, {len(training_data['val_videos'])} val")
-    print(f"[Clauses]\t {len(clauses)} in {cfg['extended_clause_file']}")
+    print(f"[Clauses]\t {len(clauses)} in {clause_file or cfg['extended_clause_file']}")
     if not clauses:
         print("[Clauses]\t none passed min_support / min_videos / weight_threshold")
         return
@@ -735,6 +840,10 @@ def _print_summary(clauses, training_data, cfg, num_examples=15):
 def get_cfg(input_data):
     """Settings and files of step 05; step 06 uses them to load the trained model."""
     horizon = 10
+    mask_type, num_free_rules = "sigmoid", 128
+    # Files are named by the settings that change the model, so a model trained
+    # for other settings is never reused.
+    tag = f"h{horizon}_{mask_type}_f{num_free_rules}"
     return {
             'device': input_data['device'],
             'seed': 0,
@@ -748,9 +857,17 @@ def get_cfg(input_data):
             # R rule nodes. Edges 1, 2, 4, ..., 100 -> bins 1, 2, 3-4, ..., 65-100 frames ago.
             'lag_edges': [1, 2, 4, 8, 16, 32, 64, 100],
             # Rules: one per (anchor body, lag bin) with the anchor as a fixed input
-            # and seed_head_weight to its heads, plus num_free_rules unseeded ones.
-            'num_free_rules': 0,
+            # and seed_head_weight to its heads, plus num_free_rules unseeded ones,
+            # so heads without an anchor (about a quarter of the onsets) can be recalled.
+            'num_free_rules': num_free_rules,
             'seed_head_weight': 1.0,
+            # Mask of the rule bodies: "sigmoid" (deterministic, init_log_alpha -11 so
+            # every input gets a gradient; its gates learn at gate_lr) or
+            # "hard_concrete" (the stochastic L0 mask; use init_log_alpha -6).
+            'mask_type': mask_type,
+            'init_log_alpha': -11.0,
+            'gate_lr': 0.05,
+            'gate_eps': 1e-20,
             # Training: batches of target frames sampled from a few videos at a time.
             'num_epochs': input_data['num_epochs'],
             'lr': 0.01,
@@ -768,6 +885,16 @@ def get_cfg(input_data):
             # A clause must hit its head in min_support training frames of min_videos videos.
             'min_support': 10,
             'min_videos': 2,
+            # Cascade. Stage 1 (the model above) is the recall model: per head, the
+            # threshold keeping cascade_recall of the val onset rows flags the
+            # candidates (heads with < cascade_min_positives val onset rows use the
+            # threshold of all heads). Stage 2, the verifier, is a rule net trained
+            # only on those candidates (pos_weight verifier_pos_weight) to reject
+            # the false ones; step 06 scores the cascade.
+            'cascade': True,
+            'cascade_recall': 0.9,
+            'cascade_min_positives': 20,
+            'verifier_pos_weight': 5.0,
             # Black-box baseline: an OnsetMLP on the same inputs and targets, trained after the
             # rule net; hidden size None = the number of rule nodes (about as many parameters).
             'mlp_baseline': True,
@@ -780,12 +907,15 @@ def get_cfg(input_data):
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
             "unique_atoms_file": input_data["unique_atoms_file"],
             'training_data_file': input_data["output_dir"] / "training_data.pt",
-            # One model per target horizon, so a model trained for another target is never reused.
-            'model_file': input_data["output_dir"] / f"temporal_rule_net_h{horizon}.pt",
-            "extended_clause_file": input_data["output_dir"] / f"extended_clauses_h{horizon}.json",
-            'history_file': input_data["output_dir"] / f"training_history_h{horizon}.json",
-            'mlp_model_file': input_data["output_dir"] / f"onset_mlp_h{horizon}.pt",
-            'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_h{horizon}.json",
+            'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",
+            "extended_clause_file": input_data["output_dir"] / f"extended_clauses_{tag}.json",
+            'history_file': input_data["output_dir"] / f"training_history_{tag}.json",
+            'mlp_model_file': input_data["output_dir"] / f"onset_mlp_{tag}.pt",
+            'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_{tag}.json",
+            'candidate_threshold_file': input_data["output_dir"] / f"cascade_thresholds_{tag}.pt",
+            'verifier_model_file': input_data["output_dir"] / f"verifier_rule_net_{tag}.pt",
+            'verifier_clause_file': input_data["output_dir"] / f"verifier_clauses_{tag}.json",
+            'verifier_history_file': input_data["output_dir"] / f"verifier_history_{tag}.json",
             'figure_dir': input_data["output_dir"] / "figures",
     }
 
@@ -837,7 +967,51 @@ def main(input_data):
             if run is not None:
                 run.finish()
 
-    # 5. Figures (one PDF each) and the terminal summary, on every run.
+    # 5. Cascade: stage-1 candidate thresholds on val, then the verifier on the candidates, its own W&B run.
+    if cfg["cascade"]:
+        run_cascade(model, training_data, cfg)
+
+    # 6. Figures (one PDF each) and the terminal summary, on every run.
     extended_clauses = utils_data.load_json(cfg["extended_clause_file"])
     _plot_results(extended_clauses, cfg)
     _print_summary(extended_clauses, training_data, cfg)
+    if cfg["cascade"]:
+        print_cascade_summary(training_data, cfg)
+
+
+def run_cascade(model, training_data, cfg):
+    """Stage-1 thresholds (`candidate_thresholds`), the verifier trained on the
+    candidates (`train_verifier`) and its clauses, each redone when its inputs change."""
+    if not is_fresh(cfg["candidate_threshold_file"], cfg["model_file"], cfg["training_data_file"]):
+        torch.save(candidate_thresholds(model, training_data, cfg), cfg["candidate_threshold_file"])
+    candidates = make_candidates(model, torch.load(cfg["candidate_threshold_file"])["thresholds"])
+
+    verifier_fresh = is_fresh(cfg["verifier_model_file"], cfg["candidate_threshold_file"])
+    clauses_fresh = verifier_fresh and is_fresh(cfg["verifier_clause_file"], cfg["verifier_model_file"])
+    run = None
+    if not clauses_fresh:
+        run = _init_wandb(cfg, {"num_atoms": training_data["num_atoms"]}, job_type="step05_verifier")
+    try:
+        if not verifier_fresh:
+            verifier = train_verifier(training_data, cfg, candidates, run)
+            torch.save(verifier.state_dict(), cfg["verifier_model_file"])
+        verifier = load_temporal_rule_net(training_data, cfg, cfg["verifier_model_file"])
+        if not clauses_fresh:
+            utils_data.save_json(extract_temporal_clauses(verifier, training_data, cfg, run, candidates),
+                                 cfg["verifier_clause_file"])
+    finally:
+        if run is not None:
+            run.finish()
+
+
+def print_cascade_summary(training_data, cfg):
+    stage1 = torch.load(cfg["candidate_threshold_file"])
+    thresholds = stage1["thresholds"]
+    print(f"----------------- Step 05 Cascade -----------------")
+    print(f"[Stage 1]\t target recall {stage1['recall']:.2f}: val onset rows kept {stage1['val_row_recall']:.3f}, "
+          f"candidates {stage1['val_candidate_share']:.4f} of the at-risk cells")
+    print(f"[Stage 1]\t thresholds median {thresholds.median():.3g}, min {thresholds.min():.3g}, "
+          f"max {thresholds.max():.3g}")
+    _print_summary(utils_data.load_json(cfg["verifier_clause_file"]), training_data, cfg,
+                   title="Step 05 Verifier (stage 2, counts over the candidates)",
+                   clause_file=cfg["verifier_clause_file"])
