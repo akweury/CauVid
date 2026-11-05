@@ -714,7 +714,8 @@ def plot_comparison(metrics, save, plt):
     k = str(detection["block_tolerance"])
     block_name = f"block ({detection['block_size']} frames, k = {k})"
     names = ["model", "mlp", "anchor", "prior"]
-    labels = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior"}
+    labels = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
+              "candidate": "stage-1 candidates", "cascade": "cascade"}
 
     # AP of every scorer at both levels, log axis (the prior sits at the base rate).
     ap = {f"frame (onset within {metrics['target_horizon']})": {"model": metrics["overall"]["average_precision"],
