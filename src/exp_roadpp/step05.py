@@ -231,12 +231,51 @@ def prepare_training_data(cfg):
 
 def load_training_data(cfg):
     """training_data.pt, (re)built by `prepare_training_data` if it is missing,
-    has another min_off_frames or was split another way."""
+    has another min_off_frames or was split another way. Adds the event types of
+    the heads ("event_types", `head_event_types`) and "target_heads" (A,) bool,
+    the heads the models learn: all but the noise heads if cfg["exclude_noise_heads"]."""
     data = torch.load(cfg["training_data_file"], map_location="cpu") if os.path.exists(cfg["training_data_file"]) else {}
     if data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE:
         data = prepare_training_data(cfg)
         torch.save(data, cfg["training_data_file"])
+    data["event_types"] = head_event_types(data, utils_data.load_json(cfg["unique_atoms_file"]), cfg)
+    noise = data["event_types"]["types"] == EVENT_TYPES.index("noise")
+    data["target_heads"] = ~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise)
+    print(f"[Heads]\t {int(data['target_heads'].sum())} of {data['num_atoms']} heads are learned"
+          + (f" ({int(noise.sum())} noise heads, < {cfg['noise_below']} train + val onsets, left out)"
+             if cfg["exclude_noise_heads"] else ""))
     return data
+
+
+# Event types by the frequency of their head (onsets in the train + val videos), see
+# `head_event_types`: heads with < noise_below onsets are "noise", > trivial_above "trivial".
+EVENT_TYPES = ("noise", "regular", "trivial")
+
+
+def head_event_types(training_data, unique_atoms, cfg):
+    """The event type of every head by its frequency: its onsets (on after
+    min_off_frames off, the agent visible in the frame before) in the train + val
+    videos: fewer than cfg["noise_below"] onsets (every head never seen included)
+    is "noise", more than cfg["trivial_above"] is "trivial", the rest "regular".
+    Returns {"types": (A,) long EVENT_TYPES index, "heads": {type: [{"head",
+    "label", "onsets"}], most frequent first}, the two cutoffs and the onset count}."""
+    A = training_data["num_atoms"]
+    counts = torch.zeros(A)
+    for video in training_data["videos"].values():
+        X = _video_from_cells(video, A, "cpu")
+        onsets = atom_onsets(X, training_data["min_off_frames"])
+        onsets[0] = False
+        onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
+        counts += onsets.sum(dim=(0, 1)).float()
+    types = torch.full((A,), EVENT_TYPES.index("regular"), dtype=torch.long)
+    types[counts < cfg["noise_below"]] = EVENT_TYPES.index("noise")
+    types[counts > cfg["trivial_above"]] = EVENT_TYPES.index("trivial")
+    order = torch.argsort(counts, descending=True, stable=True)
+    heads = {t: [{"head": int(a), "label": _atom_name(unique_atoms[a]), "onsets": int(counts[a])}
+                 for a in order.tolist() if types[a] == g]
+             for g, t in enumerate(EVENT_TYPES)}
+    return {"types": types, "heads": heads, "noise_below": cfg["noise_below"], "trivial_above": cfg["trivial_above"],
+            "count_source": "train + val onsets", "num_onsets": int(counts.sum())}
 
 
 def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator, horizon=1):
@@ -256,10 +295,18 @@ def _sample_frames(training_data, video_id, num_frames, positive_ratio, generato
 
 
 def _video_rows(model, training_data, video_id, frames, device, history=None):
-    """`video_rows` of the target frames of one stored video, rebuilt from its atoms."""
+    """`video_rows` of the target frames of one stored video, rebuilt from its atoms.
+    Heads outside training_data["target_heads"] (the noise heads, see
+    `load_training_data`) are never at risk and never targets, so no loss, count
+    or clause covers them."""
     X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
-    return video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
+    rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
                       None if history is None else history.to(device))
+    if "target_heads" in training_data:
+        target_heads = training_data["target_heads"].to(device)
+        rows["at_risk"] = rows["at_risk"] & target_heads
+        rows["targets"] = rows["targets"] & target_heads[None, None, :]
+    return rows
 
 
 def video_rows(model, X, frames, min_off_frames=1, history=None):
@@ -940,13 +987,24 @@ def get_cfg(input_data):
     mask_type, num_free_rules = "sigmoid", 128
     # Files are named by the settings that change the model, so a model trained
     # for other settings is never reused.
+    # Noise heads (fewer than noise_below onsets in the train + val videos) are no training
+    # targets; step 06 reports their events separately.
+    exclude_noise_heads, noise_below = True, 5
     tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
+    if exclude_noise_heads:
+        tag += f"_tn{noise_below}"
     return {
             'device': input_data['device'],
             'seed': 0,
             # An atom switches on only after being off for this many frames for the
             # agent; shorter gaps are label flicker (re-onsets), not new events.
             'min_off_frames': 10,
+            # Event types by head frequency (onsets in the train + val videos, `head_event_types`):
+            # fewer than noise_below onsets are noise, more than trivial_above trivial, the rest
+            # regular. With exclude_noise_heads the noise heads are no training targets.
+            'exclude_noise_heads': exclude_noise_heads,
+            'noise_below': noise_below,
+            'trivial_above': 100,
             # Targets: the atom switches on within the next W frames, for each window W
             # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
             # probability per window, never decreasing with W.

@@ -28,6 +28,8 @@ def get_cfg(input_data):
     fine_size, motif_span, slot_size, num_slots = 2, 5, 10, 6
     num_free_motifs, num_free_rules, p_min = 1024, 1024, 0.05
     tag = f"b{fine_size}x{motif_span}_s{slot_size}x{num_slots}_m{num_free_motifs}_r{num_free_rules}_p{p_min}"
+    if base["exclude_noise_heads"]:
+        tag += f"_tn{base['noise_below']}"                     # the noise heads are no training targets
     output_dir = input_data["output_dir"]
     return {
         "enabled": True,

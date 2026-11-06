@@ -6,12 +6,21 @@ the next W frames, for each window W of step 05 (10, 20, ..., 100). Per window:
   rows: precision-recall / AP of these probabilities against "it did switch on
       within W" (rows whose window runs past the video end without an onset are
       censored), and their calibration;
-  events: an onset is detected for window W if the score of some frame in the W
-      frames up to it reaches the threshold (the model said "within W" in time);
+  events: an onset is detected if, in some frame of its at-risk stretch (the
+      frames before the onset in which the agent is scored and the atom is off,
+      back to the first gap), the window-W score of its agent and head reaches
+      detected_th; one frame is enough. Prediction time: the frames from the
+      earliest detected frame to the onset (None if missed). Coverage: the
+      detected frames / the prediction time (0 if missed);
   alarms: an alarm is raised when the score crosses the threshold upwards (one
       per episode, not one per frame); it is correct if the onset follows within W.
-Thresholds are picked on the step 05 validation videos (best F1 of event recall
-and alarm precision).
+The threshold is the fixed cfg["detected_th"] (the rule set and the candidates use
+FIXED_THRESHOLDS); every metric is also stored as a curve over all thresholds.
+Every metric is also reported per event type: the heads are split by their
+frequency in the train + val videos into noise, regular and trivial events
+(`step05.head_event_types`). The noise heads are no training targets (step 05
+exclude_noise_heads), so the overall metrics count only the regular and trivial
+events and heads; the noise events are reported on their own.
 """
 import os
 import torch
@@ -118,8 +127,9 @@ def _anchor_scores(model, inputs, baselines, chunk_size=8):
 # the step 05c rule set (each rule precise, the set covering the events), if it was made.
 # "motif_net": the step 05d two-level MotifRuleNet, if it was trained.
 DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp", "anchor", "candidate", "cascade")
-# Scorers counted at a fixed threshold instead of the best validation F1.
-# The rule set alarms whenever one of its rules fires (its scores are their precisions, >= the level).
+# Scorers detected at a fixed threshold instead of cfg["detected_th"]: their scores are no
+# probabilities. The candidates are 0 / 1; the rule set detects whenever one of its rules
+# fires (its scores are their precisions, >= the level, mostly below 0.5).
 FIXED_THRESHOLDS = {"candidate": 0.5, "rule_set": 1e-6}
 # The scorers that read the memory, compared under a truncated history.
 HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp")
@@ -132,6 +142,12 @@ SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior":
                  "rule_set": "rule set", "motif_net": "motif net"}
 # Event recall levels of the operating points read off the test curves.
 RECALL_LEVELS = (0.3, 0.5, 0.7)
+# Event types by the frequency of their head (`step05.head_event_types`). The noise heads
+# are no training targets (step05 exclude_noise_heads): the overall metrics count only the
+# COUNTED_TYPES, the noise events are reported on their own (by_type).
+EVENT_TYPES = step05.EVENT_TYPES
+COUNTED_TYPES = ("regular", "trivial")
+TYPE_COLORS = {"noise": "tab:gray", "regular": "tab:blue", "trivial": "tab:orange"}
 
 
 def _subset(data, video_ids):
@@ -185,22 +201,37 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
 
     Rows are the frames t >= cfg["min_context"]; history: if given, every row
     knows only that many frames before t (the older memory is unknown), else all
-    of them. An alarm needs the score at or above the threshold for
-    cfg["min_alarm_frames"] frames in a row: the sustained score of a frame is the
-    lowest score of the last min_alarm_frames frames. Returns
+    of them. Returns
       num_frames: the scored frames of all videos;
       rows {scorer: {"pos", "neg": (W, A, S), "score_sum": (W, S), "pos_sum",
           "neg_sum": (W,)}}: histograms (S bins of `score_edges`) of the scores of
           the at-risk rows with window k observed, split by whether the atom
           switched on within W_k; score_sum the sum of the scores per bin
           (calibration); pos_sum / neg_sum the summed scores of the two groups;
-      starts {scorer: {"pos", "neg": (W, S)}}: alarms at each threshold bin b,
-          rows whose sustained score is in bin >= b while the frame before was
-          below b (or not scored), split by whether the onset followed within W_k;
-      events {scorer: (W, A, S)}: per exact onset (on in t_e, off in the
-          min_off_frames frames before, the agent visible in t_e - 1) whose W_k
-          frames up to it are all rows, the histogram of the highest sustained
-          score of window k over the frames t_e - W_k + 1..t_e;
+      starts {scorer: {"pos", "neg": (W, S), "by_type": {type: {"pos", "neg"}}}}:
+          alarms at each threshold bin b, rows whose score is in bin >= b while the
+          frame before was below b (or not scored), split by whether the onset
+          followed within W_k, on the counted heads (COUNTED_TYPES); by_type the
+          alarms on the heads of each event type (cfg["head_types"]); per_head
+          {"pos", "neg": (A, W, S)} those of each head;
+      events {scorer: {...}}: the event detection (`_event_stats`) of every exact
+          onset (on in t_e, off in the min_off_frames frames before, the agent
+          visible in t_e - 1, t_e - 1 >= min_context), from the window-k scores of
+          its agent and head over its at-risk stretch: the frames t_e - 1,
+          t_e - 2, ... back to the first one that is not a row or not at risk.
+          A threshold bin b detects the event if some frame of the stretch scores
+          in bin >= b; its prediction time is the lead t_e - t of the earliest such
+          frame t and its coverage the share of the frames t..t_e - 1 that do:
+            num_events: int; lookback_sum (W,): the summed stretch lengths;
+            detected, lead_sum, coverage_sum (W, S): per threshold bin, the
+                detected events and the summed prediction times (detected events)
+                and coverages (0 for the missed ones);
+            lead_at, count_at (E, W) long: per event, the prediction time (0 if
+                missed) and the number of detected frames at the scorer's
+                detection threshold (`detection_threshold`);
+            by_type {type: the same of the events of that type};
+            per_head {"num_events": (A,), "detected", "lead_sum", "coverage_sum":
+                (A, W, S)}: the same sums per head (every event);
       trajectory {scorer: {"sum", "count": (top, W)}}: the summed score of the
           onset's own head and agent j frames before the onset, over all onsets
           (the confidence approaching an event).
@@ -209,9 +240,13 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     edges = score_edges().to(device)
     S, A = len(edges), data["num_atoms"]
     W, top = len(model.windows), max(model.windows)
-    min_context, D = cfg["min_context"], cfg["min_alarm_frames"]
+    min_context = cfg["min_context"]
     context = {}
     scorers = _scorers(model, baselines, mlp, cascade, device, names, extra, context)
+    threshold_bins = {name: _threshold_bin(detection_threshold(name, cfg)) for name in scorers}
+    head_type = cfg["head_types"].to(device)                                         # (A,) EVENT_TYPES index
+    counted_index = [EVENT_TYPES.index(t) for t in COUNTED_TYPES]
+    counted = torch.isin(head_type, torch.tensor(counted_index, device=device))       # (A,) heads of the overall metrics
     heads = torch.arange(A, device=device)
     window_index = torch.arange(W, device=device)[None, :, None]
 
@@ -220,24 +255,34 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
 
     rows_hist = {name: {"pos": zeros(W * A * S), "neg": zeros(W * A * S), "score_sum": zeros(W * S),
                         "pos_sum": zeros(W), "neg_sum": zeros(W)} for name in scorers}
-    starts = {name: {"pos": zeros(W * (S + 1)), "neg": zeros(W * (S + 1))} for name in scorers}
+    starts = {name: {"pos": zeros(A * W * (S + 1)), "neg": zeros(A * W * (S + 1))} for name in scorers}
     trajectory = {name: {"sum": zeros(top, W), "count": zeros(top, W)} for name in scorers}
-    event_heads, event_frames, event_scores = [], [], {name: [] for name in scorers}
+
+    def event_stats():
+        return {"num_events": 0, "lookback_sum": zeros(W), "detected": zeros(W, S), "lead_sum": zeros(W, S),
+                "coverage_sum": zeros(W, S), "lead_at": [], "count_at": []}
+
+    def head_stats():
+        return {"num_events": zeros(A), "detected": zeros(A, W, S), "lead_sum": zeros(A, W, S),
+                "coverage_sum": zeros(A, W, S)}
+
+    events = {name: {**event_stats(), "by_type": {t: event_stats() for t in EVENT_TYPES}, "per_head": head_stats()}
+              for name in scorers}
     num_frames = 0
     for video_id in tqdm(data["videos"], desc="Scoring videos" + ("" if history is None else f" (history {history})")):
         X = step05._video_from_cells(data["videos"][video_id], A, device)
         T, N, _A = X.shape
         num_frames += max(T - min_context, 0)
-        # Exact onsets and, per onset, the frames t_e - j (j = 0..top - 1) whose window scores can detect it.
+        # Exact onsets and, per onset, the frames t_e - j (j = 0..T - 1) before it.
         onsets = step05.atom_onsets(X, data["min_off_frames"])
         onsets[0] = False
         onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
+        onsets[:min_context + 1] = False                                             # t_e - 1 must be a row
         e_t, e_n, e_a = torch.nonzero(onsets, as_tuple=True)
-        e_lead = e_t[:, None] - torch.arange(top, device=device)                     # (E, top)
-        e_scores = {name: torch.full((len(e_t), top, W), -1.0, device=device) for name in scorers}
-        e_raw = {name: torch.full((len(e_t), top, W), -1.0, device=device) for name in scorers}
-        # The scores of the last D frames (-1: not a row), for the sustained scores.
-        recent = {name: torch.full((D, N, W, A), -1.0, device=device) for name in scorers}
+        e_lead = e_t[:, None] - torch.arange(T, device=device)                       # (E, T)
+        e_raw = {name: torch.full((len(e_t), T, W), -1.0, device=device) for name in scorers}
+        # The scores of the frame before the current chunk (-1: not a row), for the alarm starts.
+        previous = {name: torch.full((1, N, W, A), -1.0, device=device) for name in scorers}
         for begin in range(min_context, T, cfg["frames_per_video"]):
             frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
             F = len(frames)
@@ -259,10 +304,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
                 if len(t):
                     p = score(rows["inputs"], stage1)
                     dense[t - begin, n] = torch.where(valid, p, -1.0)
-                # Sustained scores: sustained[s] is the lowest score of the D frames up to frame begin + s - 1.
-                window = torch.cat([recent[name], dense])
-                sustained = window.unfold(0, D, 1).min(dim=-1).values                  # (F + 1, N, W, A)
-                recent[name] = window[-D:]
+                window = torch.cat([previous[name], dense])                          # (F + 1, N, W, A)
+                previous[name] = window[-1:]
                 if p is None:
                     continue
                 bins = _score_bins(p, edges)                                         # (B, W, A)
@@ -270,54 +313,116 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
                 h = rows_hist[name]
                 h["pos"] += torch.bincount(cell[valid & targets], minlength=W * A * S)
                 h["neg"] += torch.bincount(cell[valid & ~targets], minlength=W * A * S)
-                h["score_sum"] += torch.bincount((window_index * S + bins)[valid].flatten(), weights=p[valid],
-                                                 minlength=W * S)
-                h["pos_sum"] += torch.where(valid & targets, p, 0.0).sum(dim=(0, 2))
-                h["neg_sum"] += torch.where(valid & ~targets, p, 0.0).sum(dim=(0, 2))
+                counted_valid = valid & counted                                      # calibration: counted heads
+                h["score_sum"] += torch.bincount((window_index * S + bins)[counted_valid].flatten(),
+                                                 weights=p[counted_valid], minlength=W * S)
+                h["pos_sum"] += torch.where(counted_valid & targets, p, 0.0).sum(dim=(0, 2))
+                h["neg_sum"] += torch.where(counted_valid & ~targets, p, 0.0).sum(dim=(0, 2))
                 # Alarms: the threshold bins b with previous bin < b <= current bin (a difference array).
-                now, before = sustained[1:][t - begin, n], sustained[:-1][t - begin, n]
+                now, before = window[1:][t - begin, n], window[:-1][t - begin, n]
                 high = torch.where(valid & (now >= 0), _score_bins(now.clamp(min=0), edges), -1)
                 low = torch.where(before >= 0, _score_bins(before.clamp(min=0), edges), -1)
                 up = high > low
-                base = (window_index * (S + 1)).expand_as(bins)
+                base = ((heads[None, None, :] * W + window_index) * (S + 1)).expand_as(bins)
                 for key, mask in (("pos", up & targets), ("neg", up & ~targets)):
-                    starts[name][key] += (torch.bincount(base[mask] + low[mask] + 1, minlength=W * (S + 1))
-                                          - torch.bincount(base[mask] + high[mask] + 1, minlength=W * (S + 1)))
+                    starts[name][key] += (torch.bincount(base[mask] + low[mask] + 1, minlength=A * W * (S + 1))
+                                          - torch.bincount(base[mask] + high[mask] + 1, minlength=A * W * (S + 1)))
                 index = (e_row.clamp(min=0), slice(None), e_a[:, None])
-                e_scores[name] = torch.where(e_valid[..., None], now[index], e_scores[name])
                 e_raw[name] = torch.where(e_valid[..., None], p[index], e_raw[name])
-        event_heads.append(e_a)
-        event_frames.append(e_t)
+        e_type = head_type[e_a]
+        e_counted = counted[e_a]
         for name in scorers:
-            event_scores[name].append(e_scores[name])
-            seen = e_raw[name] >= 0
-            trajectory[name]["sum"] += torch.where(seen, e_raw[name], 0.0).sum(dim=0)
-            trajectory[name]["count"] += seen.sum(dim=0)
+            raw = e_raw[name]
+            seen = (raw[:, :top] >= 0) & e_counted[:, None, None]
+            lead = seen.shape[1]
+            trajectory[name]["sum"][:lead] += torch.where(seen, raw[:, :top], 0.0).sum(dim=0)
+            trajectory[name]["count"][:lead] += seen.sum(dim=0)
+            detections = _detect(raw[:, 1:], edges)
+            _event_stats(events[name], detections, e_counted, threshold_bins[name])
+            for g, event_type in enumerate(EVENT_TYPES):
+                _event_stats(events[name]["by_type"][event_type], detections, e_type == g, threshold_bins[name])
+            _head_event_stats(events[name]["per_head"], detections, e_a)
 
-    e_head, e_frame = torch.cat(event_heads).cpu(), torch.cat(event_frames).cpu()
-    events = {}
-    for name in scorers:
-        scores = torch.cat(event_scores[name]).cpu()                                 # (E, top, W)
-        per_window = []
-        for k, w in enumerate(model.windows):
-            kept = e_frame - w + 1 >= min_context
-            best = scores[kept, :w, k].max(dim=1).values if kept.any() else torch.zeros(0)
-            bins = _score_bins(best, score_edges())
-            per_window.append(torch.bincount(e_head[kept] * S + bins, minlength=A * S).view(A, S))
-        events[name] = torch.stack(per_window).float()
+    for e in (stats for scorer in events.values() for stats in (scorer, *scorer["by_type"].values())):
+        e["lead_at"] = torch.cat(e["lead_at"]).cpu() if e["lead_at"] else torch.zeros((0, W), dtype=torch.long)
+        e["count_at"] = torch.cat(e["count_at"]).cpu() if e["count_at"] else torch.zeros((0, W), dtype=torch.long)
+        for key in ("lookback_sum", "detected", "lead_sum", "coverage_sum"):
+            e[key] = e[key].cpu()
+    for scorer in events.values():
+        scorer["per_head"] = {key: v.cpu() for key, v in scorer["per_head"].items()}
+
+    head_type_cpu, counted_cpu = head_type.cpu(), counted.cpu()
+
+    def alarm_starts(v):                                                             # (A * W * (S + 1),) -> (A, W, S)
+        return v.view(A, W, S + 1).cumsum(dim=2)[:, :, :S].cpu()
     return {
         "num_frames": num_frames,
         "rows": {name: {"pos": h["pos"].view(W, A, S).cpu(), "neg": h["neg"].view(W, A, S).cpu(),
                         "score_sum": h["score_sum"].view(W, S).cpu(), "pos_sum": h["pos_sum"].cpu(),
                         "neg_sum": h["neg_sum"].cpu()} for name, h in rows_hist.items()},
-        "starts": {name: {key: v.view(W, S + 1).cumsum(dim=1)[:, :S].cpu() for key, v in s.items()}
+        "starts": {name: {**{key: alarm_starts(v)[counted_cpu].sum(dim=0) for key, v in s.items()},
+                          "by_type": {t: {key: alarm_starts(v)[head_type_cpu == g].sum(dim=0) for key, v in s.items()}
+                                      for g, t in enumerate(EVENT_TYPES)},
+                          "per_head": {key: alarm_starts(v) for key, v in s.items()}}
                    for name, s in starts.items()},
         "events": events,
         "trajectory": {name: {key: v.cpu() for key, v in tr.items()} for name, tr in trajectory.items()},
     }
 
 
-# -------------- Metrics --------------
+def _detect(scores, edges):
+    """Detection of one video's events at every threshold bin.
+
+    scores (E, L, W): the window scores of each event's agent and head j = 1..L
+    frames before its onset, -1 where the frame is not a row or the head is not
+    at risk; the at-risk stretch is the frames before the first such gap.
+    Returns earliest (E, W, S) long: the prediction time at threshold bin b (the
+    largest j of the stretch scoring in bin >= b, 0 if missed), count (E, W, S):
+    the frames of the stretch scoring in bin >= b, lookback (E, W): the stretch length."""
+    E, L, W = scores.shape
+    S = len(edges)
+    device = scores.device
+    if E == 0 or L == 0:
+        return (torch.zeros((E, W, S), dtype=torch.long, device=device),
+                torch.zeros((E, W, S), dtype=torch.long, device=device), torch.zeros((E, W), device=device))
+    stretch = (scores >= 0).long().cumprod(dim=1).bool()                             # (E, L, W)
+    bins = _score_bins(scores.clamp(min=0), edges)
+    cell = ((torch.arange(E, device=device)[:, None, None] * W + torch.arange(W, device=device)) * S + bins)[stretch]
+    leads = torch.arange(1, L + 1, device=device)[None, :, None].expand(E, L, W)[stretch]
+    # Per event and window, the detected frames and the earliest one at every threshold bin b (score bin >= b).
+    count = torch.bincount(cell, minlength=E * W * S).view(E, W, S).flip(2).cumsum(2).flip(2)
+    earliest = torch.zeros(E * W * S, dtype=torch.long, device=device).scatter_reduce(0, cell, leads, "amax")
+    earliest = earliest.view(E, W, S).flip(2).cummax(dim=2).values.flip(2)          # 0: not detected
+    return earliest, count, stretch.sum(dim=1).float()
+
+
+def _event_stats(stats, detections, keep, threshold_bin):
+    """Add the `_detect` detections of one video's events where keep (E,) bool to
+    stats (see `_score_videos`)."""
+    earliest, count, lookback = (d[keep] for d in detections)
+    stats["num_events"] += len(earliest)
+    if len(earliest) == 0:
+        return
+    stats["lookback_sum"] += lookback.sum(dim=0)
+    stats["detected"] += (earliest > 0).sum(dim=0)
+    stats["lead_sum"] += earliest.sum(dim=0)
+    stats["coverage_sum"] += (count / earliest.clamp(min=1)).sum(dim=0)
+    stats["lead_at"].append(earliest[:, :, threshold_bin])
+    stats["count_at"].append(count[:, :, threshold_bin])
+
+
+def _head_event_stats(stats, detections, event_heads):
+    """Add the `_detect` detections of one video's events to the per-head sums of
+    stats, by the head (E,) of each event."""
+    earliest, count, _lookback = detections
+    if len(earliest) == 0:
+        return
+    stats["num_events"].index_add_(0, event_heads, torch.ones(len(event_heads), device=event_heads.device))
+    stats["detected"].index_add_(0, event_heads, (earliest > 0).float())
+    stats["lead_sum"].index_add_(0, event_heads, earliest.float())
+    stats["coverage_sum"].index_add_(0, event_heads, count / earliest.clamp(min=1))
+
+
 def _histogram_metrics(positives, negatives, threshold, with_curve=False):
     """Onset metrics of one head (or all heads summed) from its score histograms
     over the `score_edges` bins: average precision, base rate, metrics at the
@@ -377,33 +482,149 @@ def _detection(positives, negatives, threshold, minutes):
     }
 
 
-def _detection_curve(events, starts_pos, starts_neg):
-    """Per threshold bin b: detected events (event histogram (A, S) at bins >= b),
-    their recall, the alarms, correct alarms and alarm precision; F1 of the two."""
-    detected = events.sum(dim=0).flip(0).cumsum(0).flip(0)
-    num_events = events.sum().item()
+def _detection_curve(events, k, starts_pos, starts_neg):
+    """Per threshold bin b, window k: detected events (some frame of the at-risk
+    stretch before the onset scores in bin >= b), their recall, the mean
+    prediction time of the detected events (frames), the mean coverage of all
+    events (0 if missed) and of the detected ones; the alarms, correct alarms and
+    alarm precision."""
+    num_events = events["num_events"]
+    detected = events["detected"][k]
     alarms = starts_pos + starts_neg
-    recall = detected / max(num_events, 1)
-    precision = starts_pos / alarms.clamp(min=1)
-    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-12)
-    return {"events": num_events, "detected": detected, "recall": recall, "alarms": alarms,
-            "correct_alarms": starts_pos, "precision": precision, "f1": f1}
+    return {"events": num_events, "detected": detected, "recall": detected / max(num_events, 1),
+            "prediction_time": torch.where(detected > 0, events["lead_sum"][k] / detected.clamp(min=1), float("nan")),
+            "coverage": events["coverage_sum"][k] / max(num_events, 1),
+            "coverage_detected": torch.where(detected > 0, events["coverage_sum"][k] / detected.clamp(min=1),
+                                             float("nan")),
+            "alarms": alarms, "correct_alarms": starts_pos, "precision": starts_pos / alarms.clamp(min=1)}
 
 
-def _detection_at(curve, b, threshold, minutes):
+def _nan_to_none(value):
+    return None if value != value else value
+
+
+def _detection_at(curve, b, threshold, minutes, frame_rate):
     alarms, correct = curve["alarms"][b].item(), curve["correct_alarms"][b].item()
+    prediction_time = _nan_to_none(curve["prediction_time"][b].item())
     return {
         "threshold": threshold,
         "events": int(curve["events"]),
         "detected": int(curve["detected"][b]),
         "missed": int(curve["events"] - curve["detected"][b]),
         "recall": curve["recall"][b].item(),
+        "mean_prediction_time": prediction_time,
+        "mean_prediction_seconds": None if prediction_time is None else prediction_time / frame_rate,
+        "coverage": curve["coverage"][b].item(),
+        "coverage_detected": _nan_to_none(curve["coverage_detected"][b].item()),
         "alarms": int(alarms),
         "false_alarms": int(alarms - correct),
         "precision": curve["precision"][b].item(),
         "alarms_per_minute": alarms / minutes if minutes else None,
         "false_alarms_per_minute": (alarms - correct) / minutes if minutes else None,
     }
+
+
+def _event_values(events, k):
+    """Per event of window k at the scorer's detection threshold: prediction time
+    (frames, None if missed) and coverage (0 if missed)."""
+    lead, count = events["lead_at"][:, k], events["count_at"][:, k]
+    return {"prediction_time": [int(x) if x > 0 else None for x in lead.tolist()],
+            "coverage": (count / lead.clamp(min=1)).tolist()}
+
+
+HEAD_THRESHOLD_SOURCES = ("head", "type", "global")
+
+
+def select_head_thresholds(scores, cfg):
+    """Per-head detection thresholds of every scorer and window, tuned on the
+    `_score_videos` scores of the validation videos: the threshold bin with the
+    best F1 of the head's event recall and alarm precision, if the head has at
+    least cfg["per_head_min_events"] val events (and some F1 > 0); else the one of
+    the pooled events and alarms of its event type, with the same condition; else
+    cfg["detected_th"]. The scorers with FIXED_THRESHOLDS keep theirs.
+    Returns {scorer: {"bins", "source": (W, A) long (HEAD_THRESHOLD_SOURCES index)}}."""
+    head_type = cfg["head_types"]
+    min_events = cfg["per_head_min_events"]
+    global_bin = _threshold_bin(cfg["detected_th"])
+
+    def best(detected, num_events, pos, neg):
+        """Best-F1 bin and its F1 of (..., S) histograms, (...,) events."""
+        recall = detected / num_events[..., None].clamp(min=1)
+        precision = pos / (pos + neg).clamp(min=1)
+        f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-12)
+        return f1.argmax(dim=-1), f1.amax(dim=-1)
+
+    out = {}
+    for name in (n for n in DETECTION_SCORERS if n in scores["events"] and n not in FIXED_THRESHOLDS):
+        events, starts = scores["events"][name]["per_head"], scores["starts"][name]["per_head"]
+        W, A = events["detected"].shape[1], events["detected"].shape[0]
+        bins = torch.full((W, A), global_bin, dtype=torch.long)
+        source = torch.full((W, A), HEAD_THRESHOLD_SOURCES.index("global"), dtype=torch.long)
+        for k in range(W):
+            for g in range(len(EVENT_TYPES)):
+                of_type = head_type == g
+                num_events = events["num_events"][of_type].sum()
+                b, f1 = best(events["detected"][of_type, k].sum(dim=0), num_events,
+                             starts["pos"][of_type, k].sum(dim=0), starts["neg"][of_type, k].sum(dim=0))
+                if num_events >= min_events and f1 > 0:
+                    bins[k, of_type] = b
+                    source[k, of_type] = HEAD_THRESHOLD_SOURCES.index("type")
+            b, f1 = best(events["detected"][:, k], events["num_events"], starts["pos"][:, k], starts["neg"][:, k])
+            own = (events["num_events"] >= min_events) & (f1 > 0)
+            bins[k, own] = b[own]
+            source[k, own] = HEAD_THRESHOLD_SOURCES.index("head")
+        out[name] = {"bins": bins, "source": source}
+    return out
+
+
+def _head_operating_point(events, starts, k, bins, heads, minutes, fps):
+    """Detections of window k with a threshold bin per head (bins (A,)), summed over
+    the heads where heads (A,) bool: event recall, prediction time, coverage and alarms."""
+    index = torch.arange(len(bins))
+    num_events = events["num_events"][heads].sum().item()
+    detected = events["detected"][index, k, bins][heads].sum().item()
+    lead = events["lead_sum"][index, k, bins][heads].sum().item()
+    coverage = events["coverage_sum"][index, k, bins][heads].sum().item()
+    correct = starts["pos"][index, k, bins][heads].sum().item()
+    alarms = correct + starts["neg"][index, k, bins][heads].sum().item()
+    prediction_time = lead / detected if detected else None
+    return {
+        "events": int(num_events),
+        "detected": int(detected),
+        "missed": int(num_events - detected),
+        "recall": detected / num_events if num_events else 0.0,
+        "mean_prediction_time": prediction_time,
+        "mean_prediction_seconds": None if prediction_time is None else prediction_time / fps,
+        "coverage": coverage / num_events if num_events else 0.0,
+        "coverage_detected": coverage / detected if detected else None,
+        "alarms": int(alarms),
+        "false_alarms": int(alarms - correct),
+        "precision": correct / alarms if alarms else 0.0,
+        "alarms_per_minute": alarms / minutes if minutes else None,
+        "false_alarms_per_minute": (alarms - correct) / minutes if minutes else None,
+    }
+
+
+def _per_head_threshold_point(events, starts, k, thresholds, counted, cfg, minutes, fps):
+    """The per-head-threshold operating point of window k: overall (the counted
+    heads), by_type, and how many heads of each type use their own, their type's
+    or the global threshold."""
+    bins = thresholds["bins"][k]
+    point = _head_operating_point(events, starts, k, bins, counted, minutes, fps)
+    point["by_type"] = {}
+    for g, event_type in enumerate(EVENT_TYPES):
+        of_type = cfg["head_types"] == g
+        point["by_type"][event_type] = {
+            **_head_operating_point(events, starts, k, bins, of_type, minutes, fps),
+            "threshold_sources": {source: int(((thresholds["source"][k] == i) & of_type).sum())
+                                  for i, source in enumerate(HEAD_THRESHOLD_SOURCES)}}
+    return point
+
+
+def detection_threshold(name, cfg):
+    """The detection threshold of a scorer: cfg["detected_th"], or the fixed one of
+    the scorers whose scores are no probabilities (FIXED_THRESHOLDS)."""
+    return FIXED_THRESHOLDS.get(name, cfg["detected_th"])
 
 
 def _threshold_bin(threshold):
@@ -427,79 +648,121 @@ def _calibration(rows, num_buckets=10):
             "ece": ece}
 
 
-def select_thresholds(model, training_data, baselines, cfg, mlp=None, cascade=None, extra=None):
-    """Alarm threshold of each window and scorer: the best F1 of event recall and
-    alarm precision on the step 05 validation videos (fixed for FIXED_THRESHOLDS),
-    so the test counts are not tuned on the test set. Returns {w: {scorer: threshold}}."""
-    scores = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp, cascade,
-                           extra=extra)
-    edges = score_edges()
-    thresholds = {}
-    for k, w in enumerate(model.windows):
-        thresholds[w] = {}
-        for name in (n for n in DETECTION_SCORERS if n in scores["events"]):
-            if name in FIXED_THRESHOLDS:
-                thresholds[w][name] = FIXED_THRESHOLDS[name]
-                continue
-            curve = _detection_curve(scores["events"][name][k], scores["starts"][name]["pos"][k],
-                                     scores["starts"][name]["neg"][k])
-            thresholds[w][name] = edges[int(curve["f1"].argmax())].item()
-    return thresholds
-
-
-def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=None, extra=None):
+def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=None, head_thresholds=None):
     """Window metrics of the model and of the baselines on the test split.
 
     Returns {"windows": {w: {"rows": {scorer: AP, macro AP, base rate, best F1,
-    calibration, the precision-recall curve}, "detection": {scorer: the counts
-    at the validation threshold, "at_recall": the best alarm precision and alarm
-    rates at event recall >= RECALL_LEVELS, "curve": recall / precision / alarms
-    per minute per threshold bin}}}, "per_head": AP of each head at the headline
-    window, against the baselines, "trajectory": the mean score of the onset's
-    head j frames before it, per window, "history": per known history in
-    cfg["history_levels"] (and the full memory) and window, AP, calibration, the
-    mean score of the onset and the other rows and the detections at the
-    full-history thresholds of the scorers reading the memory}, plus the settings."""
+    calibration, the precision-recall curve}, "detection": {scorer: event recall,
+    prediction time, coverage and alarms at the detection threshold
+    (`detection_threshold`), "events": the per-event prediction times and
+    coverages there, "at_recall": the best alarm precision and alarm rates at
+    event recall >= RECALL_LEVELS, "curve": the same per threshold bin}}},
+    "per_head": AP of each head at the headline window, against the baselines,
+    "trajectory": the mean score of the onset's head j frames before it, per
+    window, "history": per known history in cfg["history_levels"] (and the full
+    memory) and window, AP, calibration, the mean score of the onset and the other
+    rows and the detections of the scorers reading the memory}, plus the settings.
+    head_thresholds (`select_head_thresholds`): adds "per_head_threshold" to the
+    detection of those scorers, the operating point with a threshold per head
+    (overall and by_type), and "head_thresholds": the thresholds and their source per
+    scorer, window and head."""
     scores = _score_videos(model, data, baselines, cfg, mlp, cascade, extra=extra)
     minutes = scores["num_frames"] / cfg["frame_rate"] / 60
+    fps = cfg["frame_rate"]
     edges = score_edges()
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     out = {"num_videos": len(data["videos"]), "minutes": minutes, "min_off_frames": data["min_off_frames"],
            "min_context": cfg["min_context"], "windows": model.windows, "headline_window": cfg["headline_window"],
-           "frame_rate": cfg["frame_rate"], "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
-           "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
+           "frame_rate": fps, "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
+           "detected_th": cfg["detected_th"], "detection_metric": cfg["detection_metric"],
+           "noise_below": cfg["event_types"]["noise_below"], "trivial_above": cfg["event_types"]["trivial_above"],
+           "exclude_noise_heads": cfg["exclude_noise_heads"], "counted_types": list(COUNTED_TYPES),
+           "per_head_min_events": cfg["per_head_min_events"],
+           "history_levels": cfg["history_levels"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
            "motif_net": cfg.get("motif_net", False),
-           "threshold_from": "val (best F1 of event recall and alarm precision)", "results": {}}
+           "threshold_from": f"detected_th {cfg['detected_th']} (fixed: {FIXED_THRESHOLDS})",
+           "event_types": {key: v for key, v in cfg["event_types"].items() if key != "types"}, "results": {}}
+    # The heads of the overall metrics: the regular and trivial ones (the noise heads are no training targets).
+    counted = torch.isin(cfg["head_types"], torch.tensor([EVENT_TYPES.index(t) for t in COUNTED_TYPES]))
+
+    def counted_rows(rows, k):
+        return {"pos": rows["pos"][k][counted], "neg": rows["neg"][k][counted], "score_sum": rows["score_sum"][k]}
+
     for k, w in enumerate(model.windows):
         result = {"rows": {}, "detection": {}}
         for name, rows in scores["rows"].items():
             pos, neg = rows["pos"][k], rows["neg"][k]
-            heads = torch.nonzero(pos.sum(dim=1)).flatten().tolist()
+            heads = torch.nonzero((pos.sum(dim=1) > 0) & counted).flatten().tolist()
             per_head = [_histogram_metrics(pos[h], neg[h], cfg["prob_threshold"])["average_precision"] for h in heads]
             result["rows"][name] = {
-                **_histogram_metrics(pos.sum(dim=0), neg.sum(dim=0), cfg["prob_threshold"], with_curve=True),
+                **_histogram_metrics(pos[counted].sum(dim=0), neg[counted].sum(dim=0), cfg["prob_threshold"],
+                                     with_curve=True),
                 "macro_average_precision": sum(per_head) / len(per_head) if per_head else 0.0,
-                "calibration": _calibration({key: v[k] for key, v in rows.items()}),
+                "calibration": _calibration(counted_rows(rows, k)),
+                "by_type": {},
             }
+            for g, event_type in enumerate(EVENT_TYPES):
+                of_type = cfg["head_types"] == g
+                m = _histogram_metrics(pos[of_type].sum(dim=0), neg[of_type].sum(dim=0), cfg["prob_threshold"])
+                result["rows"][name]["by_type"][event_type] = {
+                    key: m[key] for key in ("onsets", "at_risk", "base_rate", "average_precision")}
         for name in (n for n in DETECTION_SCORERS if n in scores["events"]):
-            curve = _detection_curve(scores["events"][name][k], scores["starts"][name]["pos"][k],
-                                     scores["starts"][name]["neg"][k])
-            threshold = thresholds[w][name]
+            events = scores["events"][name]
+            curve = _detection_curve(events, k, scores["starts"][name]["pos"][k], scores["starts"][name]["neg"][k])
+            threshold = detection_threshold(name, cfg)
+            by_type = {}
+            for event_type in EVENT_TYPES:
+                typed = events["by_type"][event_type]
+                starts = scores["starts"][name]["by_type"][event_type]
+                typed_curve = _detection_curve(typed, k, starts["pos"][k], starts["neg"][k])
+                times = sorted(t for t in _event_values(typed, k)["prediction_time"] if t is not None)
+                by_type[event_type] = {
+                    **_detection_at(typed_curve, _threshold_bin(threshold), threshold, minutes, fps),
+                    "median_prediction_time": times[len(times) // 2] if times else None,
+                    "events_at_threshold": _event_values(typed, k),
+                    "curve": {"recall": typed_curve["recall"].tolist(),
+                              "prediction_time": [_nan_to_none(x) for x in typed_curve["prediction_time"].tolist()],
+                              "coverage": typed_curve["coverage"].tolist(),
+                              "precision": typed_curve["precision"].tolist()},
+                }
             at_recall = {}
             for level in RECALL_LEVELS:
                 reach = torch.nonzero(curve["recall"] >= level).flatten()
                 if len(reach):
                     b = int(reach[curve["precision"][reach].argmax()])
-                    at_recall[str(level)] = _detection_at(curve, b, edges[b].item(), minutes)
+                    at_recall[str(level)] = _detection_at(curve, b, edges[b].item(), minutes, fps)
+            values = _event_values(events, k)
+            times = sorted(t for t in values["prediction_time"] if t is not None)
             result["detection"][name] = {
-                **_detection_at(curve, _threshold_bin(threshold), threshold, minutes),
+                **_detection_at(curve, _threshold_bin(threshold), threshold, minutes, fps),
+                "median_prediction_time": times[len(times) // 2] if times else None,
+                "mean_lookback": events["lookback_sum"][k].item() / max(events["num_events"], 1),
+                "events_at_threshold": values,
+                "by_type": by_type,
+                **({"per_head_threshold": _per_head_threshold_point(
+                    scores["events"][name]["per_head"], scores["starts"][name]["per_head"], k,
+                    head_thresholds[name], counted, cfg, minutes, fps)} if name in (head_thresholds or {}) else {}),
                 "at_recall": at_recall,
                 "curve": {"threshold": edges.tolist(), "recall": curve["recall"].tolist(),
+                          "prediction_time": [_nan_to_none(x) for x in curve["prediction_time"].tolist()],
+                          "coverage": curve["coverage"].tolist(),
                           "precision": curve["precision"].tolist(),
                           "alarms_per_minute": (curve["alarms"] / max(minutes, 1e-9)).tolist()},
             }
         out["results"][str(w)] = result
+
+    if head_thresholds:
+        edges_list = edges.tolist()
+        out["head_thresholds"] = {
+            "min_events": cfg["per_head_min_events"],
+            "labels": [step05._atom_name(a) for a in unique_atoms],
+            "event_types": [EVENT_TYPES[int(g)] for g in cfg["head_types"]],
+            "scorers": {name: {str(w): {"threshold": [edges_list[b] for b in t["bins"][k].tolist()],
+                                        "source": [HEAD_THRESHOLD_SOURCES[x] for x in t["source"][k].tolist()]}
+                               for k, w in enumerate(model.windows)}
+                        for name, t in head_thresholds.items()},
+        }
 
     k = model.windows.index(cfg["headline_window"])
     pos, neg = scores["rows"]["model"]["pos"][k], scores["rows"]["model"]["neg"][k]
@@ -507,6 +770,7 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
     for h in torch.nonzero(pos.sum(dim=1)).flatten().tolist():
         m = _histogram_metrics(pos[h], neg[h], cfg["prob_threshold"])
         m["label"] = step05._atom_name(unique_atoms[h])
+        m["event_type"] = EVENT_TYPES[int(cfg["head_types"][h])]
         m["baseline_average_precision"] = {
             name: _histogram_metrics(r["pos"][k][h], r["neg"][k][h], cfg["prob_threshold"])["average_precision"]
             for name, r in scores["rows"].items() if name != "model"}
@@ -527,18 +791,26 @@ def evaluate_model(model, data, baselines, thresholds, cfg, mlp=None, cascade=No
             out["history"][key][str(w)] = {}
             for name in (n for n in HISTORY_SCORERS if n in partial["rows"]):
                 rows = partial["rows"][name]
-                pos, neg = rows["pos"][k].sum(dim=0), rows["neg"][k].sum(dim=0)
-                curve = _detection_curve(partial["events"][name][k], partial["starts"][name]["pos"][k],
+                pos, neg = rows["pos"][k][counted].sum(dim=0), rows["neg"][k][counted].sum(dim=0)
+                curve = _detection_curve(partial["events"][name], k, partial["starts"][name]["pos"][k],
                                          partial["starts"][name]["neg"][k])
-                detection = _detection_at(curve, _threshold_bin(thresholds[w][name]), thresholds[w][name], minutes)
+                threshold = detection_threshold(name, cfg)
+                detection = _detection_at(curve, _threshold_bin(threshold), threshold, minutes, fps)
                 out["history"][key][str(w)][name] = {
                     "average_precision": _histogram_metrics(pos, neg, cfg["prob_threshold"])["average_precision"],
-                    "ece": _calibration({key_: v[k] for key_, v in rows.items() if key_ in ("pos", "neg", "score_sum")})["ece"],
+                    "ece": _calibration(counted_rows(rows, k))["ece"],
                     "mean_onset_score": rows["pos_sum"][k].item() / max(pos.sum().item(), 1),
                     "mean_other_score": rows["neg_sum"][k].item() / max(neg.sum().item(), 1),
                     "recall": detection["recall"],
+                    "mean_prediction_time": detection["mean_prediction_time"],
+                    "coverage": detection["coverage"],
                     "precision": detection["precision"],
                     "alarms_per_minute": detection["alarms_per_minute"],
+                    "recall_by_type": {
+                        t: _detection_curve(partial["events"][name]["by_type"][t], k,
+                                            partial["starts"][name]["by_type"][t]["pos"][k],
+                                            partial["starts"][name]["by_type"][t]["neg"][k])["recall"][
+                            _threshold_bin(threshold)].item() for t in EVENT_TYPES},
                 }
     return out
 
@@ -579,9 +851,17 @@ def evaluate_clauses(model, data, clauses, step05_cfg):
 
 
 # -------------- Results --------------
+def _strip_detection(d):
+    """A detection entry without its curves and per-event values (also in by_type)."""
+    out = {key: value for key, value in d.items() if key not in ("curve", "events_at_threshold", "by_type")}
+    if "by_type" in d:
+        out["by_type"] = {t: _strip_detection(v) for t, v in d["by_type"].items()}
+    return out
+
+
 def build_results(metrics, clauses):
     """The headline test numbers per window: AP of every scorer, the detections at
-    the validation thresholds and the operating points at fixed event recall. The
+    the detection thresholds and the operating points at fixed event recall. The
     curves and per-head details are in test_metrics.json."""
     firing = [c for c in clauses if c["test_confidence"] is not None]
     extended = [c for c in firing if len(c["bodies"]) > 1 and c["test_anchor_confidence"] is not None]
@@ -590,9 +870,10 @@ def build_results(metrics, clauses):
         windows[w] = {
             "base_rate": result["rows"]["model"]["base_rate"],
             "average_precision": {name: r["average_precision"] for name, r in result["rows"].items()},
+            "average_precision_by_type": {name: {t: v["average_precision"] for t, v in r["by_type"].items()}
+                                          for name, r in result["rows"].items()},
             "ece": {name: r["calibration"]["ece"] for name, r in result["rows"].items()},
-            "detection": {name: {key: value for key, value in d.items() if key != "curve"}
-                          for name, d in result["detection"].items()},
+            "detection": {name: _strip_detection(d) for name, d in result["detection"].items()},
         }
     return {
         "test_videos": metrics["num_videos"],
@@ -600,7 +881,8 @@ def build_results(metrics, clauses):
         "min_context": metrics["min_context"],
         "headline_window": metrics["headline_window"],
         "threshold_from": metrics["threshold_from"],
-        "min_alarm_frames": metrics["min_alarm_frames"],
+        "detection_metric": metrics["detection_metric"],
+        "event_types": {t: [h["label"] for h in heads] for t, heads in metrics["event_types"]["heads"].items()},
         "windows": windows,
         "history": metrics["history"],
         "clauses": {
@@ -615,10 +897,19 @@ def build_results(metrics, clauses):
 def plot_results(metrics, clauses, cfg, num_heads=30):
     """Save the step 06 figures, one PDF each, to cfg["figure_dir"]:
       ap_vs_window.pdf: AP of every scorer per window, against the base rate;
-      detection_vs_window.pdf: event recall, alarm precision and alarms per minute
-          per window at the validation thresholds;
+      detection_vs_window.pdf: event recall, mean prediction time, coverage (all
+          events and the detected ones), alarm precision and false alarms per
+          minute per window at the detection thresholds;
       detection_curve.pdf: event recall vs alarms per minute of every scorer
           (all thresholds), at the headline window;
+      detection_threshold.pdf: event recall, mean prediction time and coverage
+          over the threshold, at the headline window;
+      detection_events.pdf: the distributions (cumulative) of the prediction time
+          and coverage of the detected events at the headline window;
+      event_types.pdf, detection_by_type.pdf, detection_by_type_vs_window.pdf,
+          detection_threshold_by_type.pdf: per event type (`_plot_event_types`);
+      per_head_threshold.pdf, per_head_threshold_vs_window.pdf, head_thresholds.pdf:
+          the per-head thresholds against detected_th (`_plot_head_thresholds`);
       precision_recall_curve.pdf: row precision-recall at the headline window;
       calibration.pdf: predicted vs observed onset share of the rule net, per window;
       history.pdf: AP and mean onset confidence per known history (partial facts), per window;
@@ -662,36 +953,90 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     ax.legend(fontsize=7)
     save(fig, "ap_vs_window.pdf")
 
-    # Detection at the validation thresholds per window.
-    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
-    for ax, key, label in zip(axes, ("recall", "precision", "alarms_per_minute"),
-                              ("event recall", "alarm precision", "alarms / min")):
+    # Event detection and alarms at the detection thresholds per window.
+    panels = (("recall", "event recall", 1), ("mean_prediction_seconds", "mean prediction time (s)", 1),
+              ("coverage", "coverage (missed = 0)", 1), ("coverage_detected", "coverage of detected events", 1),
+              ("precision", "alarm precision", 1), ("false_alarms_per_minute", "false alarms / min (log)", 1))
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+    for ax, (key, label, _unit) in zip(axes.flat, panels):
         for name in detection_names:
-            ax.plot(seconds, [results[str(w)]["detection"][name][key] or 0 for w in windows], "o-",
+            values = [results[str(w)]["detection"][name][key] for w in windows]
+            ax.plot(seconds, [float("nan") if v is None else v for v in values], "o-", markersize=4,
                     color=SCORER_COLORS[name], label=SCORER_LABELS[name])
-        ax.set(title=label, xlabel="window W (s)", ylabel=label)
-        if key == "alarms_per_minute":
+        ax.set(title=label, xlabel="window W (s)")
+        if key == "false_alarms_per_minute":
             ax.set_yscale("log")
+        elif key != "mean_prediction_seconds":
+            ax.set_ylim(0, 1)
         ax.grid(alpha=0.3)
-    axes[0].legend(fontsize=7)
-    fig.suptitle(f"Detections at the validation thresholds ({metrics['minutes']:.1f} min of test video)")
+    axes.flat[0].legend(fontsize=7)
+    fig.suptitle(f"Event detection at detected_th = {metrics['detected_th']} "
+                 f"({metrics['minutes']:.1f} min of test video)")
     save(fig, "detection_vs_window.pdf")
 
     # Event recall vs alarms per minute at the headline window, every threshold.
+    swept = [n for n in detection_names if n not in FIXED_THRESHOLDS]
     fig, ax = plt.subplots(figsize=(6, 4.5))
-    for name in detection_names:
-        if name in FIXED_THRESHOLDS:
-            continue
+    for name in swept:
         curve = results[headline]["detection"][name]["curve"]
         points = sorted((a, r) for a, r in zip(curve["alarms_per_minute"], curve["recall"]) if a > 0)
         ax.plot([a for a, _r in points], [r for _a, r in points], color=SCORER_COLORS[name], label=SCORER_LABELS[name])
         d = results[headline]["detection"][name]
         ax.plot(d["alarms_per_minute"] or 0, d["recall"], "o", color=SCORER_COLORS[name])
-    ax.set(title=f"Event recall vs alarms, window {headline} frames (dots: val thresholds)",
+    ax.set(title=f"Event recall vs alarms, window {headline} frames (dots: detected_th)",
            xlabel="alarms per minute (log)", ylabel="event recall", xscale="log", ylim=(0, 1))
     ax.grid(alpha=0.3)
     ax.legend(fontsize=7)
     save(fig, "detection_curve.pdf")
+
+    # Recall, prediction time and coverage over the detection threshold at the headline window.
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
+    fps = metrics["frame_rate"]
+    for name in swept:
+        curve = results[headline]["detection"][name]["curve"]
+        rows = [(t, r, pt, c) for t, r, pt, c in zip(curve["threshold"], curve["recall"], curve["prediction_time"],
+                                                     curve["coverage"]) if t > 0]
+        thresholds = [t for t, *_ in rows]
+        style = dict(color=SCORER_COLORS[name], label=SCORER_LABELS[name])
+        axes[0].plot(thresholds, [r for _t, r, _pt, _c in rows], **style)
+        axes[1].plot(thresholds, [float("nan") if pt is None else pt / fps for _t, _r, pt, _c in rows], **style)
+        axes[2].plot(thresholds, [c for _t, _r, _pt, c in rows], **style)
+    for ax, label in zip(axes, ("event recall", "mean prediction time of detected events (s)",
+                                "coverage (missed = 0)")):
+        ax.axvline(metrics["detected_th"], color="k", linestyle="--", linewidth=0.8)
+        ax.set(title=label, xlabel="detection threshold (log)", xscale="log", xlim=(1e-4, 1))
+        ax.grid(alpha=0.3)
+    axes[0].set_ylim(0, 1)
+    axes[2].set_ylim(0, 1)
+    axes[0].legend(fontsize=7)
+    fig.suptitle(f"Event detection over the threshold, window {headline} frames (dashed: detected_th)")
+    save(fig, "detection_threshold.pdf")
+
+    # Distributions over the events at the detection threshold, headline window.
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for name in detection_names:
+        d = results[headline]["detection"][name]
+        values = d["events_at_threshold"]
+        times = sorted(t / fps for t in values["prediction_time"] if t is not None)
+        covered = sorted(c for t, c in zip(values["prediction_time"], values["coverage"]) if t is not None)
+        if not times:
+            continue
+        label = f"{SCORER_LABELS[name]} ({len(times)}/{d['events']} detected)"
+        share = [(i + 1) / len(times) for i in range(len(times))]
+        axes[0].step(times, share, where="post", color=SCORER_COLORS[name], label=label)
+        axes[1].step(covered, share, where="post", color=SCORER_COLORS[name], label=label)
+    axes[0].set(title="Prediction time of the detected events", xlabel="seconds before the onset",
+                ylabel="share of detected events (cumulative)", ylim=(0, 1))
+    axes[1].set(title="Coverage of the detected events", xlabel="detected frames / prediction time",
+                ylabel="share of detected events (cumulative)", xlim=(0, 1), ylim=(0, 1))
+    for ax in axes:
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+    fig.suptitle(f"Detected events at detected_th = {metrics['detected_th']}, window {headline} frames")
+    save(fig, "detection_events.pdf")
+
+    _plot_event_types(metrics, plt, save, detection_names, swept, seconds, headline)
+    _plot_head_thresholds(metrics, plt, save, swept, seconds, headline)
 
     # Row precision-recall at the headline window.
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
@@ -769,7 +1114,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     save(fig, "trajectory.pdf")
 
     # Per head at the headline window.
-    heads = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])[:num_heads]
+    learned = [m for m in metrics["per_head"].values() if m.get("event_type") != "noise"]   # noise heads: not trained
+    heads = sorted(learned, key=lambda m: -m["average_precision"])[:num_heads]
     if heads:
         labels = [f"{m['label']} ({_short_num(m['onsets'])})" for m in heads]
         fig, ax = plt.subplots(figsize=(7, 0.25 * len(heads) + 1.5))
@@ -786,7 +1132,7 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
                xlabel="average precision (log)")
         save(fig, "ap_per_head.pdf")
 
-    heads = [m for m in metrics["per_head"].values() if "mlp" in m["baseline_average_precision"]]
+    heads = [m for m in learned if "mlp" in m["baseline_average_precision"]]
     if heads:
         xs = [m["baseline_average_precision"]["mlp"] for m in heads]
         ys = [m["average_precision"] for m in heads]
@@ -835,6 +1181,194 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
     save(fig, "clause_precision_recall.pdf")
 
 
+def _plot_event_types(metrics, plt, save, detection_names, swept, seconds, headline):
+    """The figures of the event types (noise / regular / trivial heads by frequency):
+      event_types.pdf: onsets per head (train + val), coloured by type;
+      detection_by_type.pdf: AP, event recall, prediction time, coverage, alarm
+          precision and false alarms per minute per type at the headline window;
+      detection_by_type_vs_window.pdf: AP, recall, coverage and alarm precision per
+          type and window;
+      detection_threshold_by_type.pdf: event recall over the threshold per type."""
+    if "event_types" not in metrics:
+        print("[Figure]\t skipped the event type figures: no event types in the metrics")
+        return
+    types = metrics["event_types"]
+    windows, results, fps = metrics["windows"], metrics["results"], metrics["frame_rate"]
+    total = max(types["num_onsets"], 1)
+
+    # Onsets per head, most frequent first, coloured by type.
+    heads = sorted(((h["onsets"], t) for t, hs in types["heads"].items() for h in hs if h["onsets"] > 0), reverse=True)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for event_type in EVENT_TYPES:
+        ranks = [i for i, (_n, t) in enumerate(heads) if t == event_type]
+        share = sum(heads[i][0] for i in ranks) / total
+        ax.bar(ranks, [heads[i][0] for i in ranks], width=0.8, color=TYPE_COLORS[event_type],
+               label=f"{event_type}: {len(types['heads'][event_type])} heads, {share:.0%} of onsets")
+    ax.set(title=f"Onsets per head ({types['count_source']}); noise: < {types['noise_below']}, "
+                 f"trivial: > {types['trivial_above']}",
+           xlabel="head rank (most frequent first)", ylabel="onsets (log)", yscale="log")
+    ax.grid(alpha=0.3, axis="y")
+    ax.legend(fontsize=8)
+    save(fig, "event_types.pdf")
+
+    # Grouped bars per type at the headline window.
+    def value(name, event_type, key, w=headline):
+        if key == "average_precision":
+            return results[w]["rows"][name]["by_type"][event_type]["average_precision"]
+        v = results[w]["detection"][name]["by_type"][event_type][key]
+        if v is not None and key == "mean_prediction_time":
+            v /= fps
+        return float("nan") if v is None else v
+
+    panels = (("average_precision", "row AP (log)"), ("recall", "event recall"),
+              ("mean_prediction_time", "mean prediction time (s)"), ("coverage", "coverage (missed = 0)"),
+              ("precision", "alarm precision"), ("false_alarms_per_minute", "false alarms / min (log)"))
+    width = 0.8 / len(detection_names)
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
+    for ax, (key, label) in zip(axes.flat, panels):
+        for i, name in enumerate(detection_names):
+            xs = [g + (i - (len(detection_names) - 1) / 2) * width for g in range(len(EVENT_TYPES))]
+            ax.bar(xs, [value(name, t, key) for t in EVENT_TYPES], width=width * 0.9,
+                   color=SCORER_COLORS[name], label=SCORER_LABELS[name])
+        events = [results[headline]["detection"][detection_names[0]]["by_type"][t]["events"] for t in EVENT_TYPES]
+        ax.set_xticks(range(len(EVENT_TYPES)), [f"{t}\n({n} events)" for t, n in zip(EVENT_TYPES, events)])
+        ax.set(title=label)
+        if key in ("average_precision", "false_alarms_per_minute"):
+            ax.set_yscale("log")
+        elif key != "mean_prediction_time":
+            ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3, axis="y")
+    axes.flat[1].legend(fontsize=7)
+    fig.suptitle(f"Per event type, window {headline} frames, detected_th = {metrics['detected_th']}")
+    save(fig, "detection_by_type.pdf")
+
+    # Per type and window.
+    panels = (("average_precision", "row AP (log)"), ("recall", "event recall"),
+              ("coverage", "coverage (missed = 0)"), ("precision", "alarm precision"))
+    fig, axes = plt.subplots(len(EVENT_TYPES), len(panels), figsize=(15, 9.5), sharex=True)
+    for row, event_type in enumerate(EVENT_TYPES):
+        for col, (key, label) in enumerate(panels):
+            ax = axes[row, col]
+            for name in detection_names:
+                ax.plot(seconds, [value(name, event_type, key, str(w)) for w in windows], "o-", markersize=3,
+                        color=SCORER_COLORS[name], label=SCORER_LABELS[name])
+            ax.set(title=f"{event_type}: {label}")
+            if key == "average_precision":
+                ax.set_yscale("log")
+            else:
+                ax.set_ylim(0, 1)
+            ax.grid(alpha=0.3)
+            if row == len(EVENT_TYPES) - 1:
+                ax.set_xlabel("window W (s)")
+    axes[0, 1].legend(fontsize=6)
+    fig.suptitle(f"Per event type and window, detected_th = {metrics['detected_th']}")
+    save(fig, "detection_by_type_vs_window.pdf")
+
+    # Event recall over the threshold per type.
+    fig, axes = plt.subplots(1, len(EVENT_TYPES), figsize=(14, 4.2), sharey=True)
+    for ax, event_type in zip(axes, EVENT_TYPES):
+        for name in swept:
+            d = results[headline]["detection"][name]
+            points = [(t, r) for t, r in zip(d["curve"]["threshold"], d["by_type"][event_type]["curve"]["recall"])
+                      if t > 0]
+            ax.plot([t for t, _r in points], [r for _t, r in points], color=SCORER_COLORS[name],
+                    label=SCORER_LABELS[name])
+        ax.axvline(metrics["detected_th"], color="k", linestyle="--", linewidth=0.8)
+        n = results[headline]["detection"][swept[0]]["by_type"][event_type]["events"] if swept else 0
+        ax.set(title=f"{event_type} ({n} events)", xlabel="detection threshold (log)", xscale="log",
+               xlim=(1e-4, 1), ylim=(0, 1))
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("event recall")
+    axes[0].legend(fontsize=7)
+    fig.suptitle(f"Event recall over the threshold per event type, window {headline} frames (dashed: detected_th)")
+    save(fig, "detection_threshold_by_type.pdf")
+
+
+def _plot_head_thresholds(metrics, plt, save, swept, seconds, headline):
+    """The figures of the per-head thresholds (tuned on val) against detected_th:
+      per_head_threshold.pdf: event recall, alarm precision and false alarms per
+          minute of both operating points, overall and per counted event type, at
+          the headline window;
+      per_head_threshold_vs_window.pdf: the same overall per window;
+      head_thresholds.pdf: the rule net's threshold of every head vs its onsets."""
+    if "head_thresholds" not in metrics:
+        print("[Figure]\t skipped the per-head threshold figures: no per-head thresholds in the metrics")
+        return
+    windows, results = metrics["windows"], metrics["results"]
+    names = [n for n in swept if "per_head_threshold" in results[headline]["detection"][n]]
+    groups = ["overall", *metrics.get("counted_types", EVENT_TYPES)]
+    points = (("detected_th", "tab:gray"), ("per-head", "tab:blue"))
+
+    def point(name, group, which, w=headline):
+        d = results[w]["detection"][name]
+        if which == "per-head":
+            d = d["per_head_threshold"]
+        return d if group == "overall" else d["by_type"][group]
+
+    panels = (("recall", "event recall"), ("precision", "alarm precision"),
+              ("false_alarms_per_minute", "false alarms / min (log)"))
+    fig, axes = plt.subplots(len(groups), len(panels), figsize=(14, 3.2 * len(groups)), squeeze=False)
+    xs = range(len(names))
+    for row, group in enumerate(groups):
+        for col, (key, label) in enumerate(panels):
+            ax = axes[row, col]
+            for i, (which, color) in enumerate(points):
+                ax.bar([x + (i - 0.5) * 0.4 for x in xs], [point(n, group, which)[key] or 0 for n in names],
+                       width=0.38, color=color, label=which if (row, col) == (0, 0) else None)
+            ax.set_xticks(list(xs), [SCORER_LABELS[n] for n in names], fontsize=7)
+            events = point(names[0], group, "per-head")["events"] if names else 0
+            ax.set(title=f"{group} ({events} events): {label}")
+            if key == "false_alarms_per_minute":
+                ax.set_yscale("log")
+            else:
+                ax.set_ylim(0, 1)
+            ax.grid(alpha=0.3, axis="y")
+    axes[0, 0].legend(fontsize=7)
+    fig.suptitle(f"detected_th = {metrics['detected_th']} vs per-head thresholds tuned on val, "
+                 f"window {headline} frames")
+    save(fig, "per_head_threshold.pdf")
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(14, 4))
+    for ax, (key, label) in zip(axes, panels):
+        for name in names:
+            for which, style in (("detected_th", "--"), ("per-head", "o-")):
+                ax.plot(seconds, [point(name, "overall", which, str(w))[key] or float("nan") for w in windows], style,
+                        markersize=3, color=SCORER_COLORS[name],
+                        label=f"{SCORER_LABELS[name]}, {which}" if which == "per-head" else None)
+        ax.set(title=label, xlabel="window W (s)")
+        if key == "false_alarms_per_minute":
+            ax.set_yscale("log")
+        else:
+            ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=6)
+    fig.suptitle(f"Overall ({' + '.join(metrics.get('counted_types', EVENT_TYPES))} events): per-head thresholds "
+                 f"(solid) vs detected_th = {metrics['detected_th']} (dashed)")
+    save(fig, "per_head_threshold_vs_window.pdf")
+
+    if "model" not in metrics["head_thresholds"]["scorers"]:
+        return
+    info = metrics["head_thresholds"]
+    onsets = {h["head"]: h["onsets"] for heads in metrics["event_types"]["heads"].values() for h in heads}
+    chosen = info["scorers"]["model"][headline]
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    for source, marker in (("head", "o"), ("type", "^"), ("global", "x")):
+        for event_type in metrics.get("counted_types", EVENT_TYPES):
+            heads = [a for a, (s_, t) in enumerate(zip(chosen["source"], info["event_types"]))
+                     if s_ == source and t == event_type and onsets.get(a, 0) > 0]
+            if heads:
+                ax.scatter([onsets[a] for a in heads], [max(chosen["threshold"][a], 1e-4) for a in heads],
+                           marker=marker, color=TYPE_COLORS[event_type], alpha=0.7,
+                           label=f"{event_type}, {source} threshold ({len(heads)})")
+    ax.axhline(metrics["detected_th"], color="k", linestyle="--", linewidth=0.8, label="detected_th")
+    ax.set(title=f"Rule net threshold per head, window {headline} frames\n"
+                 f"(tuned on val; its own with >= {info['min_events']} val events)", xlabel="train + val onsets of the head (log)", ylabel="threshold (log)",
+           xscale="log", yscale="log")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=7)
+    save(fig, "head_thresholds.pdf")
+
+
 # -------------- Summary --------------
 def print_summary(metrics, clauses, cfg, num_examples=15):
     windows, results = metrics["windows"], metrics["results"]
@@ -851,17 +1385,77 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
               + "".join(f"{r[n]['average_precision']:>12.4f}" for n in row_names)
               + f"{r['model']['calibration']['ece']:>9.4f}")
     print()
-    print(f"[Detection] thresholds from {metrics['threshold_from']}; an alarm is raised when the score has stayed at "
-          f"or above the threshold for {metrics['min_alarm_frames']} frames, correct if the onset follows within W; "
-          f"an event is detected if an alarm was up in the W frames before it")
-    print(f"  {'W':>5} {'scorer':<20}{'events':>7}{'detected':>9}{'recall':>8}{'alarms':>8}{'precision':>10}"
-          f"{'alarms/min':>11}{'FA/min':>9}{'thr':>10}")
+    print(f"[Detection] threshold {metrics['threshold_from']}; an event is detected if its score reaches the "
+          f"threshold in any frame of the at-risk stretch before the onset; PT: prediction time (s) from the "
+          f"earliest detected frame, mean / median over the detected events; cov: detected frames / prediction "
+          f"time (missed = 0); an alarm is an upward crossing, correct if the onset follows within W")
+    print(f"  {'W':>5} {'scorer':<14}{'events':>7}{'detected':>9}{'recall':>8}{'PT mean':>9}{'PT med':>8}"
+          f"{'cov':>7}{'cov det':>8}{'lookback':>9}{'alarms':>8}{'precision':>10}{'FA/min':>9}{'thr':>9}")
+
+    def sec(frames):
+        return float("nan") if frames is None else frames / fps
+
     for w in windows:
         for name, d in results[str(w)]["detection"].items():
-            print(f"  {w:>5} {SCORER_LABELS[name]:<20}{d['events']:>7}{d['detected']:>9}{d['recall']:>8.3f}"
-                  f"{d['alarms']:>8}{d['precision']:>10.4f}{d['alarms_per_minute'] or 0:>11.2f}"
-                  f"{d['false_alarms_per_minute'] or 0:>9.2f}{d['threshold']:>10.3g}")
+            cov_det = float("nan") if d["coverage_detected"] is None else d["coverage_detected"]
+            print(f"  {w:>5} {SCORER_LABELS[name]:<14}{d['events']:>7}{d['detected']:>9}{d['recall']:>8.3f}"
+                  f"{sec(d['mean_prediction_time']):>9.2f}{sec(d['median_prediction_time']):>8.2f}"
+                  f"{d['coverage']:>7.3f}{cov_det:>8.3f}{sec(d['mean_lookback']):>9.2f}"
+                  f"{d['alarms']:>8}{d['precision']:>10.4f}{d['false_alarms_per_minute'] or 0:>9.2f}"
+                  f"{d['threshold']:>9.3g}")
+    print(f"  (lookback: mean length (s) of the at-risk stretch searched before the onset; overall rows count only "
+          f"the {' + '.join(metrics.get('counted_types', EVENT_TYPES))} events, noise events are reported per type)")
     print()
+
+    if "event_types" in metrics:
+        types = metrics["event_types"]
+        print(f"[Event types] heads by {types['count_source']}: noise < {types['noise_below']} onsets, "
+              f"trivial > {types['trivial_above']} onsets, regular in between")
+        for event_type in EVENT_TYPES:
+            heads = types["heads"][event_type]
+            seen = [h for h in heads if h["onsets"] > 0]
+            names = ", ".join(f"{h['label']} ({h['onsets']})" for h in seen[:8]) + (", ..." if len(seen) > 8 else "")
+            print(f"  {event_type:<8} {len(heads):>3} heads ({len(seen)} seen), "
+                  f"{sum(h['onsets'] for h in heads) / max(types['num_onsets'], 1):.0%} of onsets: {names}")
+        print(f"[Per event type, window {headline}] AP of the rows; detections at the detection thresholds")
+        print(f"  {'type':<9}{'scorer':<14}{'events':>7}{'AP':>8}{'recall':>8}{'PT mean':>9}{'PT med':>8}"
+              f"{'cov':>7}{'alarms':>8}{'precision':>10}{'FA/min':>9}")
+        for event_type in EVENT_TYPES:
+            for name, d in results[headline]["detection"].items():
+                t = d["by_type"][event_type]
+                ap = results[headline]["rows"][name]["by_type"][event_type]["average_precision"]
+                print(f"  {event_type:<9}{SCORER_LABELS[name]:<14}{t['events']:>7}{ap:>8.4f}{t['recall']:>8.3f}"
+                      f"{sec(t['mean_prediction_time']):>9.2f}{sec(t['median_prediction_time']):>8.2f}"
+                      f"{t['coverage']:>7.3f}{t['alarms']:>8}{t['precision']:>10.4f}"
+                      f"{t['false_alarms_per_minute'] or 0:>9.2f}")
+        if any("per_head_threshold" in d for d in results[headline]["detection"].values()):
+            print(f"[Per-head thresholds, window {headline}] tuned on val (own threshold with >= "
+                  f"{metrics['per_head_min_events']} val events, else the type's, else detected_th); "
+                  f"in brackets: at detected_th")
+            print(f"  {'scorer':<14}{'group':<9}{'events':>7}{'recall':>15}{'PT mean':>9}{'cov':>7}"
+                  f"{'precision':>17}{'FA/min':>17}{'own/type/global':>17}")
+            for name, d in results[headline]["detection"].items():
+                if "per_head_threshold" not in d:
+                    continue
+                for group in ("overall", *metrics.get("counted_types", EVENT_TYPES), "noise"):
+                    h = d["per_head_threshold"] if group == "overall" else d["per_head_threshold"]["by_type"][group]
+                    g = d if group == "overall" else d["by_type"][group]
+                    src = ("" if group == "overall" else
+                           "/".join(str(h["threshold_sources"][x]) for x in HEAD_THRESHOLD_SOURCES))
+                    print(f"  {SCORER_LABELS[name]:<14}{group:<9}{h['events']:>7}"
+                          f"{h['recall']:>8.3f} ({g['recall']:.3f})"
+                          f"{sec(h['mean_prediction_time']):>9.2f}{h['coverage']:>7.3f}"
+                          f"{h['precision']:>9.4f} ({g['precision']:.3f})"
+                          f"{h['false_alarms_per_minute'] or 0:>9.1f} ({g['false_alarms_per_minute'] or 0:.1f})"
+                          f"{src:>17}")
+        print(f"[Event recall per type and window]")
+        print(f"  {'type':<9}{'scorer':<14}" + "".join(f"{w:>7}" for w in windows))
+        for event_type in EVENT_TYPES:
+            for name in results[headline]["detection"]:
+                print(f"  {event_type:<9}{SCORER_LABELS[name]:<14}"
+                      + "".join(f"{results[str(w)]['detection'][name]['by_type'][event_type]['recall']:>7.3f}"
+                                for w in windows))
+        print()
     print(f"[Operating points] window {headline} frames, best alarm precision at event recall >= R (test curves)")
     for name, d in results[headline]["detection"].items():
         if name in FIXED_THRESHOLDS:
@@ -872,8 +1466,8 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
     print()
 
     print(f"[Partial facts] the same rows knowing only the last H frames of history (older memory unknown); "
-          f"detections at the full-history thresholds")
-    print(f"  {'W':>5} {'scorer':<10}" + "".join(f"{'H=' + h:>24}" for h in sorted(metrics["history"], key=int)))
+          f"detections at the detection thresholds")
+    print(f"  {'W':>5} {'scorer':<10}" + "".join(f"{'H=' + h:>33}" for h in sorted(metrics["history"], key=int)))
     for w in windows:
         for name in HISTORY_SCORERS:
             if name not in metrics["history"][str(metrics["min_context"])][str(w)]:
@@ -881,9 +1475,10 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
             cells = []
             for h in sorted(metrics["history"], key=int):
                 v = metrics["history"][h][str(w)][name]
-                cells.append(f"AP {v['average_precision']:.3f} c {v['mean_onset_score']:.3f} R {v['recall']:.2f}")
-            print(f"  {w:>5} {SCORER_LABELS[name]:<10}" + "".join(f"{c:>24}" for c in cells))
-    print(f"  (c: mean confidence of the true onsets; R: event recall)")
+                cells.append(f"AP {v['average_precision']:.3f} c {v['mean_onset_score']:.3f} R {v['recall']:.2f} "
+                             f"cov {v['coverage']:.2f}")
+            print(f"  {w:>5} {SCORER_LABELS[name]:<10}" + "".join(f"{c:>33}" for c in cells))
+    print(f"  (c: mean confidence of the true onsets; R: event recall; cov: coverage)")
     print()
     if "model" in metrics["trajectory"]:
         k = windows.index(int(headline))
@@ -908,7 +1503,8 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
         print()
 
     print(f"[Per head, window {headline}, by AP] onset rows  base rate  AP  MLP AP  anchor AP  best F1")
-    rows = sorted(metrics["per_head"].values(), key=lambda m: -m["average_precision"])
+    rows = sorted((m for m in metrics["per_head"].values() if m.get("event_type") != "noise"),
+                  key=lambda m: -m["average_precision"])
     for m in rows[:num_examples]:
         b = m["baseline_average_precision"]
         print(f"  {_short_num(m['onsets']):>7}  {m['base_rate']:.4f}  {m['average_precision']:.3f}  "
@@ -947,8 +1543,18 @@ def main(input_data):
         # Only fully buffered predictions are evaluated: frames with the model's whole
         # lag range before them, so no rule misses its body for lack of history.
         "min_context": step05_cfg["slot_size"] * step05_cfg["num_slots"],
-        # An alarm needs the score at or above the threshold for this many frames in a row.
-        "min_alarm_frames": 5,
+        # Event detection: an event is detected if the score of its agent and head reaches
+        # detected_th in any frame of the at-risk stretch before the onset (one frame is
+        # enough); prediction time = frames from the earliest such frame to the onset;
+        # coverage = detected frames / prediction time (0 if missed). The rule set and the
+        # candidates use FIXED_THRESHOLDS. The curves sweep every threshold.
+        "detected_th": 0.5,
+        # Version of the detection metric; a cached test_metrics.json of another one is redone.
+        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds",
+        # Second operating point: one threshold per head, tuned on the val videos (best F1 of
+        # the head's event recall and alarm precision) for heads with at least this many val
+        # events, else the threshold of the head's event type, else detected_th.
+        "per_head_min_events": 10,
         # Partial facts: the rows are scored again knowing only this many frames of history.
         "history_levels": [0, 10, 20, 30, 40],
         # The window of the per-head metrics and of the single-window figures.
@@ -1002,16 +1608,19 @@ def main(input_data):
 
     # 2. Baselines fitted on the step 05 training videos: the window prior and the anchor rules alone.
     if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
-        training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
+        training_data = step05.load_training_data(step05_cfg)
         torch.save(fit_baselines(model, training_data, step05_cfg), cfg["baseline_file"])
     baselines = torch.load(cfg["baseline_file"], map_location="cpu")
 
     # 3. Window metrics of the model and the baselines; redone whenever any input or setting changes.
-    #    The alarm thresholds are picked on the step 05 validation videos.
     metrics = utils_data.load_json(cfg["metrics_file"]) if os.path.exists(cfg["metrics_file"]) else {}
     settings = {"windows": step05_cfg["windows"], "min_context": cfg["min_context"],
                 "headline_window": cfg["headline_window"], "cascade": cfg["cascade"],
-                "min_alarm_frames": cfg["min_alarm_frames"], "history_levels": cfg["history_levels"],
+                "detected_th": cfg["detected_th"], "detection_metric": cfg["detection_metric"],
+                "noise_below": step05_cfg["noise_below"], "trivial_above": step05_cfg["trivial_above"],
+                "exclude_noise_heads": step05_cfg["exclude_noise_heads"],
+                "per_head_min_events": cfg["per_head_min_events"],
+                "history_levels": cfg["history_levels"],
                 "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
@@ -1019,9 +1628,17 @@ def main(input_data):
                             step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"], selection_file,
                             motif_file)
             or settings != {key: metrics.get(key) for key in settings}):
-        training_data = torch.load(step05_cfg["training_data_file"], map_location="cpu")
-        thresholds = select_thresholds(model, training_data, baselines, cfg, mlp, cascade, extra)
-        metrics = evaluate_model(model, test_data, baselines, thresholds, cfg, mlp, cascade, extra)
+        training_data = step05.load_training_data(step05_cfg)
+        cfg["event_types"] = training_data["event_types"]
+        cfg["head_types"] = cfg["event_types"]["types"]
+        cfg["exclude_noise_heads"] = step05_cfg["exclude_noise_heads"]
+        # Per-head thresholds tuned on the validation videos (never on test).
+        val_scores = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp,
+                                   cascade, extra=extra)
+        head_thresholds = select_head_thresholds(val_scores, cfg)
+        del val_scores
+        del training_data
+        metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds)
         if selection is not None:
             # Every precision level's rule set on the test videos: recall vs precision of precise rules.
             metrics["rule_levels"] = step05_rules.level_tradeoff(model, selection, test_data,
