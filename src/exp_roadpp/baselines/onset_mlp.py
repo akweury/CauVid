@@ -14,7 +14,9 @@ class OnsetMLP(torch.nn.Module):
     Output (B, W, A): hazard logits of each window bin and atom
     (`TemporalRuleNet.window_probs` turns them into onset-within-window probabilities).
     Hidden units are unconstrained (any mix of present and absent inputs), so the
-    gap to the TemporalRuleNet is the cost of the rule structure.
+    gap to the TemporalRuleNet is the cost of the rule structure. activation "gelu"
+    (default) or "relu": with ReLU and a large learning rate every hidden unit can
+    die in the first epochs, leaving one constant score per head (the prior).
     """
 
     # The input layers, targets and loss are the TemporalRuleNet's, shared code.
@@ -25,7 +27,10 @@ class OnsetMLP(torch.nn.Module):
     window_probs = staticmethod(TemporalRuleNet.window_probs)
     loss = classmethod(TemporalRuleNet.loss.__func__)
 
-    def __init__(self, num_atoms, slot_size=10, num_slots=5, hidden_size=256, dropout=0.2, windows=(10,)):
+    ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "relu": torch.relu}
+
+    def __init__(self, num_atoms, slot_size=10, num_slots=5, hidden_size=256, dropout=0.2, windows=(10,),
+                 activation="gelu"):
         super().__init__()
         self.num_atoms = num_atoms
         # The memory slots of TemporalRuleNet.
@@ -35,13 +40,14 @@ class OnsetMLP(torch.nn.Module):
         self.windows = list(windows)
         self.hidden = torch.nn.Linear(2 * self.num_inputs, hidden_size)
         self.dropout = torch.nn.Dropout(dropout)
+        self.activation = self.ACTIVATIONS[activation]
         self.head = torch.nn.Linear(hidden_size, len(self.windows) * num_atoms)
         # Onsets are rare: start every hazard at a low probability, as TemporalRuleNet does.
         torch.nn.init.constant_(self.head.bias, -6.0)
 
     def forward(self, inputs):
         """Hazard logits (B, W, A) and hidden activations (B, H) of input layers (B, M)."""
-        hidden = self.dropout(torch.relu(self.hidden(inputs)))
+        hidden = self.dropout(self.activation(self.hidden(inputs)))
         return self.head(hidden).view(len(inputs), len(self.windows), self.num_atoms), hidden
 
     @torch.no_grad()

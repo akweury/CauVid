@@ -248,15 +248,18 @@ def load_training_data(cfg):
 
 
 # Event types by the frequency of their head (onsets in the train + val videos), see
-# `head_event_types`: heads with < noise_below onsets are "noise", > trivial_above "trivial".
-EVENT_TYPES = ("noise", "regular", "trivial")
+# `head_event_types`: heads with < noise_below onsets are "noise", < rare_below "rare",
+# > trivial_above "trivial", the rest "regular". The rare heads are training targets like the
+# regular ones; step 06 only reports them apart (too few onsets for reliable rules).
+EVENT_TYPES = ("noise", "rare", "regular", "trivial")
 
 
 def head_event_types(training_data, unique_atoms, cfg):
     """The event type of every head by its frequency: its onsets (on after
     min_off_frames off, the agent visible in the frame before) in the train + val
     videos: fewer than cfg["noise_below"] onsets (every head never seen included)
-    is "noise", more than cfg["trivial_above"] is "trivial", the rest "regular".
+    is "noise", fewer than cfg["rare_below"] "rare", more than cfg["trivial_above"]
+    "trivial", the rest "regular".
     Returns {"types": (A,) long EVENT_TYPES index, "heads": {type: [{"head",
     "label", "onsets"}], most frequent first}, the two cutoffs and the onset count}."""
     A = training_data["num_atoms"]
@@ -268,13 +271,15 @@ def head_event_types(training_data, unique_atoms, cfg):
         onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
         counts += onsets.sum(dim=(0, 1)).float()
     types = torch.full((A,), EVENT_TYPES.index("regular"), dtype=torch.long)
+    types[counts < cfg.get("rare_below", 0)] = EVENT_TYPES.index("rare")
     types[counts < cfg["noise_below"]] = EVENT_TYPES.index("noise")
     types[counts > cfg["trivial_above"]] = EVENT_TYPES.index("trivial")
     order = torch.argsort(counts, descending=True, stable=True)
     heads = {t: [{"head": int(a), "label": _atom_name(unique_atoms[a]), "onsets": int(counts[a])}
                  for a in order.tolist() if types[a] == g]
              for g, t in enumerate(EVENT_TYPES)}
-    return {"types": types, "heads": heads, "noise_below": cfg["noise_below"], "trivial_above": cfg["trivial_above"],
+    return {"types": types, "heads": heads, "noise_below": cfg["noise_below"], "rare_below": cfg.get("rare_below"),
+            "trivial_above": cfg["trivial_above"],
             "count_source": "train + val onsets", "num_onsets": int(counts.sum())}
 
 
@@ -385,6 +390,12 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
+    # Optional (the OnsetMLP sets them): gradient-norm clipping, halving the learning rate
+    # after lr_patience epochs without a better val loss, and early stopping after patience.
+    grad_clip, patience = cfg.get("grad_clip"), cfg.get("patience")
+    scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=cfg["lr_patience"])
+                 if cfg.get("lr_patience") else None)
+    best_epoch = 0
     # Fixed validation frames and known histories, so the losses of the epochs are comparable.
     val_frames = {}
     for video_id in training_data["val_videos"]:
@@ -417,6 +428,8 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
             loss = onset_loss if regularization is None else onset_loss + regularization(epoch)
             optimizer.zero_grad()
             loss.backward()
+            if grad_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             epoch_losses.append(onset_loss.item())
 
@@ -428,12 +441,18 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
             run.log({"train/onset_loss": train_loss, "val/onset_loss": val_loss,
                      **(model_stats() if model_stats else {})}, step=epoch)
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            best_val_loss, best_epoch = val_loss, epoch + 1
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        if scheduler is not None:
+            scheduler.step(val_loss)
+            history[-1]["lr"] = optimizer.param_groups[0]["lr"]
+        if patience and epoch + 1 - best_epoch >= patience:
+            print(f"[Training] Early stop: no better val loss for {patience} epochs")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"[Training] Best val loss {best_val_loss:.4f}")
+    print(f"[Training] Best val loss {best_val_loss:.4f} (epoch {best_epoch})")
     utils_data.save_json(history, history_file)
     if run is not None:
         run.summary["best_val_onset_loss"] = best_val_loss
@@ -581,10 +600,18 @@ def train_onset_mlp(training_data, cfg, run=None):
     rule nodes of the TemporalRuleNet, so both have about as many parameters."""
     hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * cfg["num_slots"] + cfg["num_free_rules"]
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], hidden_size, cfg["mlp_dropout"],
-                     cfg["windows"]).to(cfg["device"])
-    print(f"[Baseline] OnsetMLP with {hidden_size} hidden units")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["mlp_weight_decay"])
-    return fit_onset_model(model, training_data, cfg, optimizer, cfg["mlp_history_file"], run=run)
+                     cfg["windows"], cfg["mlp_activation"]).to(cfg["device"])
+    print(f"[Baseline] OnsetMLP with {hidden_size} {cfg['mlp_activation']} hidden units, lr {cfg['mlp_lr']}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["mlp_lr"], weight_decay=cfg["mlp_weight_decay"])
+    mlp_cfg = {**cfg, "grad_clip": cfg["mlp_grad_clip"], "lr_patience": cfg["mlp_lr_patience"],
+               "patience": cfg["mlp_patience"]}
+
+    @torch.no_grad()
+    def model_stats():
+        # Hidden units that never vary would leave one constant score per head (the prior).
+        return {"model/hidden_weight_norm": model.hidden.weight.norm().item()}
+    return fit_onset_model(model, training_data, mlp_cfg, optimizer, cfg["mlp_history_file"], run=run,
+                           model_stats=model_stats)
 
 
 def load_onset_mlp(training_data, cfg):
@@ -594,7 +621,7 @@ def load_onset_mlp(training_data, cfg):
         return None
     state = torch.load(cfg["mlp_model_file"], map_location="cpu")
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], state["hidden.weight"].shape[0],
-                     windows=cfg["windows"])
+                     windows=cfg["windows"], activation=cfg["mlp_activation"])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -993,6 +1020,10 @@ def get_cfg(input_data):
     tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
         tag += f"_tn{noise_below}"
+    # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
+    # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
+    mlp_lr, mlp_activation = 1e-3, "gelu"
+    mlp_tag = f"{tag}_lr{mlp_lr:g}_{mlp_activation}"
     return {
             'device': input_data['device'],
             'seed': 0,
@@ -1004,6 +1035,8 @@ def get_cfg(input_data):
             # regular. With exclude_noise_heads the noise heads are no training targets.
             'exclude_noise_heads': exclude_noise_heads,
             'noise_below': noise_below,
+            # Heads with noise_below..rare_below - 1 onsets are learned but reported as "rare".
+            'rare_below': 10,
             'trivial_above': 100,
             # Targets: the atom switches on within the next W frames, for each window W
             # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
@@ -1064,6 +1097,13 @@ def get_cfg(input_data):
             'mlp_hidden_size': None,
             'mlp_dropout': 0.2,
             'mlp_weight_decay': 1e-4,
+            'mlp_lr': mlp_lr,
+            'mlp_activation': mlp_activation,
+            'mlp_grad_clip': 1.0,
+            # Halve the lr after mlp_lr_patience epochs without a better val loss; stop after
+            # mlp_patience (num_epochs is the maximum); the best val epoch is kept.
+            'mlp_lr_patience': 5,
+            'mlp_patience': 20,
             'wandb': True,
             'wandb_project': 'cauvid-roadpp',
             'train_atom_file': input_data['train_atom_file'],
@@ -1074,8 +1114,8 @@ def get_cfg(input_data):
             'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",
             "extended_clause_file": input_data["output_dir"] / f"extended_clauses_{tag}.json",
             'history_file': input_data["output_dir"] / f"training_history_{tag}.json",
-            'mlp_model_file': input_data["output_dir"] / f"onset_mlp_{tag}.pt",
-            'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_{tag}.json",
+            'mlp_model_file': input_data["output_dir"] / f"onset_mlp_{mlp_tag}.pt",
+            'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_{mlp_tag}.json",
             'candidate_threshold_file': input_data["output_dir"] / f"cascade_thresholds_{tag}.pt",
             'verifier_model_file': input_data["output_dir"] / f"verifier_rule_net_{tag}.pt",
             'verifier_clause_file': input_data["output_dir"] / f"verifier_clauses_{tag}.json",

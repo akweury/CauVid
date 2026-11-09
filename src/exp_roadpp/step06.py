@@ -146,8 +146,8 @@ RECALL_LEVELS = (0.3, 0.5, 0.7)
 # are no training targets (step05 exclude_noise_heads): the overall metrics count only the
 # COUNTED_TYPES, the noise events are reported on their own (by_type).
 EVENT_TYPES = step05.EVENT_TYPES
-COUNTED_TYPES = ("regular", "trivial")
-TYPE_COLORS = {"noise": "tab:gray", "regular": "tab:blue", "trivial": "tab:orange"}
+COUNTED_TYPES = ("rare", "regular", "trivial")
+TYPE_COLORS = {"noise": "tab:gray", "rare": "tab:purple", "regular": "tab:blue", "trivial": "tab:orange"}
 
 
 def _subset(data, video_ids):
@@ -196,8 +196,16 @@ def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None,
 
 
 @torch.no_grad()
-def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=None, names=None, extra=None):
+def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=None, names=None, extra=None,
+                  alarm_filter=None):
     """Window scores of the model and of the baselines on every video of the split.
+
+    alarm_filter (k, g) (default cfg["alarm_filter"], else (1, 1): every frame on its own):
+    the alarms and the event detection read the alarm score, the lowest score of the
+    last k frames (a threshold is reached only after k frames in a row above it; a
+    frame of the k that is not a row or not at risk gives no alarm score), and an alarm
+    starts only if no frame of the g before scored as high (alarms g frames apart merge).
+    The row histograms (AP, calibration) and the trajectory read the raw scores.
 
     Rows are the frames t >= cfg["min_context"]; history: if given, every row
     knows only that many frames before t (the older memory is unknown), else all
@@ -209,8 +217,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
           switched on within W_k; score_sum the sum of the scores per bin
           (calibration); pos_sum / neg_sum the summed scores of the two groups;
       starts {scorer: {"pos", "neg": (W, S), "by_type": {type: {"pos", "neg"}}}}:
-          alarms at each threshold bin b, rows whose score is in bin >= b while the
-          frame before was below b (or not scored), split by whether the onset
+          alarms at each threshold bin b, rows whose alarm score is in bin >= b while
+          the g frames before were below b (or not scored), split by whether the onset
           followed within W_k, on the counted heads (COUNTED_TYPES); by_type the
           alarms on the heads of each event type (cfg["head_types"]); per_head
           {"pos", "neg": (A, W, S)} those of each head;
@@ -219,8 +227,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
           visible in t_e - 1, t_e - 1 >= min_context), from the window-k scores of
           its agent and head over its at-risk stretch: the frames t_e - 1,
           t_e - 2, ... back to the first one that is not a row or not at risk.
-          A threshold bin b detects the event if some frame of the stretch scores
-          in bin >= b; its prediction time is the lead t_e - t of the earliest such
+          A threshold bin b detects the event if the alarm score of some frame of
+          the stretch is in bin >= b; its prediction time is the lead t_e - t of the earliest such
           frame t and its coverage the share of the frames t..t_e - 1 that do:
             num_events: int; lookback_sum (W,): the summed stretch lengths;
             detected, lead_sum, coverage_sum (W, S): per threshold bin, the
@@ -243,6 +251,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     min_context = cfg["min_context"]
     context = {}
     scorers = _scorers(model, baselines, mlp, cascade, device, names, extra, context)
+    persist, gap = alarm_filter or cfg.get("alarm_filter") or (1, 1)
     threshold_bins = {name: _threshold_bin(detection_threshold(name, cfg)) for name in scorers}
     head_type = cfg["head_types"].to(device)                                         # (A,) EVENT_TYPES index
     counted_index = [EVENT_TYPES.index(t) for t in COUNTED_TYPES]
@@ -281,8 +290,12 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
         e_t, e_n, e_a = torch.nonzero(onsets, as_tuple=True)
         e_lead = e_t[:, None] - torch.arange(T, device=device)                       # (E, T)
         e_raw = {name: torch.full((len(e_t), T, W), -1.0, device=device) for name in scorers}
-        # The scores of the frame before the current chunk (-1: not a row), for the alarm starts.
-        previous = {name: torch.full((1, N, W, A), -1.0, device=device) for name in scorers}
+        e_alarm = ({name: torch.full((len(e_t), T, W), -1.0, device=device) for name in scorers}
+                   if persist > 1 else e_raw)
+        # The raw scores of the persist - 1 frames before the current chunk and the alarm scores
+        # of the gap frames before it (-1: not a row), for the alarm scores and starts.
+        raw_before = {name: torch.full((persist - 1, N, W, A), -1.0, device=device) for name in scorers}
+        alarm_before = {name: torch.full((gap, N, W, A), -1.0, device=device) for name in scorers}
         for begin in range(min_context, T, cfg["frames_per_video"]):
             frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
             F = len(frames)
@@ -304,8 +317,12 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
                 if len(t):
                     p = score(rows["inputs"], stage1)
                     dense[t - begin, n] = torch.where(valid, p, -1.0)
-                window = torch.cat([previous[name], dense])                          # (F + 1, N, W, A)
-                previous[name] = window[-1:]
+                # Alarm scores: the lowest raw score of the last `persist` frames.
+                raw_window = torch.cat([raw_before[name], dense])                    # (persist - 1 + F, N, W, A)
+                raw_before[name] = raw_window[len(raw_window) - (persist - 1):]
+                alarm = raw_window.unfold(0, persist, 1).amin(dim=-1) if persist > 1 else dense
+                window = torch.cat([alarm_before[name], alarm])                      # (gap + F, N, W, A)
+                alarm_before[name] = window[-gap:]
                 if p is None:
                     continue
                 bins = _score_bins(p, edges)                                         # (B, W, A)
@@ -319,7 +336,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
                 h["pos_sum"] += torch.where(counted_valid & targets, p, 0.0).sum(dim=(0, 2))
                 h["neg_sum"] += torch.where(counted_valid & ~targets, p, 0.0).sum(dim=(0, 2))
                 # Alarms: the threshold bins b with previous bin < b <= current bin (a difference array).
-                now, before = window[1:][t - begin, n], window[:-1][t - begin, n]
+                now = alarm[t - begin, n]
+                before = window[:-1].unfold(0, gap, 1).amax(dim=-1)[t - begin, n]   # best of the gap frames before
                 high = torch.where(valid & (now >= 0), _score_bins(now.clamp(min=0), edges), -1)
                 low = torch.where(before >= 0, _score_bins(before.clamp(min=0), edges), -1)
                 up = high > low
@@ -329,6 +347,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
                                           - torch.bincount(base[mask] + high[mask] + 1, minlength=A * W * (S + 1)))
                 index = (e_row.clamp(min=0), slice(None), e_a[:, None])
                 e_raw[name] = torch.where(e_valid[..., None], p[index], e_raw[name])
+                if persist > 1:
+                    e_alarm[name] = torch.where(e_valid[..., None], now[index], e_alarm[name])
         e_type = head_type[e_a]
         e_counted = counted[e_a]
         for name in scorers:
@@ -337,7 +357,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             lead = seen.shape[1]
             trajectory[name]["sum"][:lead] += torch.where(seen, raw[:, :top], 0.0).sum(dim=0)
             trajectory[name]["count"][:lead] += seen.sum(dim=0)
-            detections = _detect(raw[:, 1:], edges)
+            detections = _detect(e_alarm[name][:, 1:], edges)
             _event_stats(events[name], detections, e_counted, threshold_bins[name])
             for g, event_type in enumerate(EVENT_TYPES):
                 _event_stats(events[name]["by_type"][event_type], detections, e_type == g, threshold_bins[name])
@@ -621,6 +641,194 @@ def _per_head_threshold_point(events, starts, k, thresholds, counted, cfg, minut
     return point
 
 
+# -------------- Alarm filter (persistence, merged alarms) --------------
+def _event_f1(curve):
+    """(S,) F1 of event recall and alarm precision per threshold bin of a `_detection_curve`."""
+    recall, precision = curve["recall"], curve["precision"]
+    return 2 * recall * precision / (recall + precision).clamp(min=1e-12)
+
+
+def select_alarm_filter(model, val_data, baselines, cfg):
+    """The alarm filter (k, g) of `_score_videos` with the best rule-net event F1 on the
+    validation videos: for each (k, g) of cfg["alarm_filter_grid"], the best F1 over the
+    thresholds of the counted heads' event recall and alarm precision, averaged over the
+    windows. Returns (chosen (k, g), grid [{"persist", "gap", "mean_best_f1", "per_window"}])."""
+    grid = []
+    for persist in cfg["alarm_filter_grid"]["persist"]:
+        for gap in cfg["alarm_filter_grid"]["gap"]:
+            scores = _score_videos(model, val_data, baselines, cfg, names=("model",), alarm_filter=(persist, gap))
+            per_window = []
+            for k in range(len(model.windows)):
+                curve = _detection_curve(scores["events"]["model"], k, scores["starts"]["model"]["pos"][k],
+                                         scores["starts"]["model"]["neg"][k])
+                f1 = _event_f1(curve)
+                b = int(f1.argmax())
+                per_window.append({"best_f1": f1[b].item(), "threshold": score_edges()[b].item(),
+                                   "recall": curve["recall"][b].item(), "precision": curve["precision"][b].item()})
+            grid.append({"persist": persist, "gap": gap, "per_window": per_window,
+                         "mean_best_f1": sum(p["best_f1"] for p in per_window) / len(per_window)})
+            print(f"[Alarm filter] val k={persist} g={gap}: mean best event F1 {grid[-1]['mean_best_f1']:.4f}")
+    best = max(grid, key=lambda g: (g["mean_best_f1"], -g["persist"], -g["gap"]))
+    return (best["persist"], best["gap"]), grid
+
+
+def _alarm_filter_comparison(model, data, baselines, cfg, minutes, fps):
+    """Rule-net detection on the test videos without (k = g = 1) and with the chosen alarm
+    filter, per window: at the detection threshold and at the best event F1, overall and by type."""
+    out = {}
+    for label, alarm_filter in (("raw", (1, 1)), ("filtered", tuple(cfg["alarm_filter"]))):
+        scores = _score_videos(model, data, baselines, cfg, names=("model",), alarm_filter=alarm_filter)
+        events, starts = scores["events"]["model"], scores["starts"]["model"]
+        out[label] = {"alarm_filter": list(alarm_filter), "windows": {}}
+        for k, w in enumerate(model.windows):
+            curve = _detection_curve(events, k, starts["pos"][k], starts["neg"][k])
+            b = int(_event_f1(curve).argmax())
+            th = detection_threshold("model", cfg)
+            entry = {"at_threshold": _detection_at(curve, _threshold_bin(th), th, minutes, fps),
+                     "best_f1": _detection_at(curve, b, score_edges()[b].item(), minutes, fps), "by_type": {}}
+            for event_type in EVENT_TYPES:
+                typed = _detection_curve(events["by_type"][event_type], k, starts["by_type"][event_type]["pos"][k],
+                                         starts["by_type"][event_type]["neg"][k])
+                entry["by_type"][event_type] = _detection_at(typed, _threshold_bin(th), th, minutes, fps)
+            out[label]["windows"][str(w)] = entry
+    return out
+
+
+# -------------- Per-head calibration (Platt scaling on val) --------------
+# The scorers whose scores are probabilities, calibrated per window and head.
+CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "mlp", "cascade")
+
+
+def _bin_scores():
+    """(S,) a representative score of each `score_edges` bin (its middle)."""
+    edges = score_edges()
+    return (edges + torch.cat([edges[1:], torch.ones(1)])) / 2
+
+
+def _logit(p):
+    p = p.clamp(1e-9, 1 - 1e-9)
+    return torch.log(p) - torch.log1p(-p)
+
+
+def _fit_platt(pos, neg, iterations=50, ridge=1e-2):
+    """Platt scaling sigmoid(a * logit(score) + c) of every (..., S) pair of score
+    histograms (the bin middles as the scores), by Newton steps on the count-weighted
+    log loss with a small ridge toward the identity (a = 1, c = 0). Returns a, c (...)."""
+    z = _logit(_bin_scores())
+    shape = pos.shape[:-1]
+    a, c = torch.ones(shape), torch.zeros(shape)
+    n = pos + neg
+    for _ in range(iterations):
+        q = torch.sigmoid(a[..., None] * z + c[..., None])
+        r = n * q - pos                                                              # dloss / dlogit per bin
+        g_a, g_c = (r * z).sum(-1) + ridge * (a - 1), r.sum(-1) + ridge * c
+        h = n * q * (1 - q)
+        h_aa, h_ac, h_cc = (h * z * z).sum(-1) + ridge, (h * z).sum(-1), h.sum(-1) + ridge
+        det = (h_aa * h_cc - h_ac ** 2).clamp(min=1e-12)
+        a = a - (h_cc * g_a - h_ac * g_c) / det
+        c = c - (h_aa * g_c - h_ac * g_a) / det
+    return a, c
+
+
+def fit_calibration(val_rows, cfg, windows):
+    """Per scorer of CALIBRATED_SCORERS, window and head, the Platt scaling of its
+    validation rows (`_score_videos` rows histograms): the head's own fit if it has
+    at least cfg["calibration_min_events"] * W onset rows in window W (an event gives
+    about W of them), else the fit of its event type's pooled rows (the same
+    condition), else the identity; a fit with a <= 0 (not
+    monotone) is replaced by the identity too.
+    Returns {scorer: {"a", "c": (W, A), "source": (W, A) long, CALIBRATION_SOURCES index}}."""
+    head_type = cfg["head_types"]
+    out = {}
+    for name in (n for n in CALIBRATED_SCORERS if n in val_rows):
+        pos, neg = val_rows[name]["pos"].float(), val_rows[name]["neg"].float()          # (W, A, S)
+        W, A, _S = pos.shape
+        min_rows = cfg["calibration_min_events"] * torch.tensor(windows, dtype=torch.float)       # (W,)
+        a, c = torch.ones(W, A), torch.zeros(W, A)
+        source = torch.full((W, A), CALIBRATION_SOURCES.index("identity"), dtype=torch.long)
+        for g in range(len(EVENT_TYPES)):
+            of_type = head_type == g
+            if not of_type.any():
+                continue
+            type_pos, type_neg = pos[:, of_type].sum(dim=1), neg[:, of_type].sum(dim=1)      # (W, S)
+            ta, tc = _fit_platt(type_pos, type_neg)
+            enough = type_pos.sum(-1) >= min_rows                                          # (W,)
+            use = enough[:, None] & of_type[None, :]
+            a = torch.where(use, ta[:, None], a)
+            c = torch.where(use, tc[:, None], c)
+            source[use] = CALIBRATION_SOURCES.index("type")
+        ha, hc = _fit_platt(pos, neg)
+        own = pos.sum(-1) >= min_rows[:, None]
+        a, c = torch.where(own, ha, a), torch.where(own, hc, c)
+        source[own] = CALIBRATION_SOURCES.index("head")
+        bad = ~(a > 0) | ~torch.isfinite(a) | ~torch.isfinite(c)
+        a, c = torch.where(bad, 1.0, a), torch.where(bad, 0.0, c)
+        source[bad] = CALIBRATION_SOURCES.index("identity")
+        out[name] = {"a": a, "c": c, "source": source}
+    return out
+
+
+CALIBRATION_SOURCES = ("head", "type", "identity")
+
+
+def _calibrated_histograms(pos, neg, a, c):
+    """The (A, S) score histograms of one window after the calibration a, c (A,):
+    each bin's rows move to the bin of its calibrated middle score. Returns pos, neg,
+    score_sum (S,) (the summed calibrated scores per new bin)."""
+    calibrated = torch.sigmoid(a[:, None] * _logit(_bin_scores())[None, :] + c[:, None])      # (A, S)
+    new_bin = _score_bins(calibrated, score_edges())
+    S = pos.shape[1]
+    pos_c = torch.zeros_like(pos).scatter_add_(1, new_bin, pos)
+    neg_c = torch.zeros_like(neg).scatter_add_(1, new_bin, neg)
+    score_sum = torch.zeros(S).index_add_(0, new_bin.flatten(), ((pos + neg) * calibrated).flatten())
+    return pos_c, neg_c, score_sum
+
+
+def _calibrated_threshold_bins(a, c, level):
+    """(A,) the raw threshold bin of each head at which its calibrated score reaches level:
+    the lowest bin whose lower edge calibrates to >= level (the last bin + 1 if none)."""
+    calibrated = torch.sigmoid(a[:, None] * _logit(score_edges())[None, :] + c[:, None])      # (A, S)
+    reach = calibrated >= level
+    S = reach.shape[1]
+    return torch.where(reach.any(dim=1), reach.float().argmax(dim=1), S - 1)
+
+
+def evaluate_calibration(scores, calibration, cfg, counted, windows, minutes, fps):
+    """Per calibrated scorer and window on the test videos: the pooled AP and ECE of the
+    counted heads before and after the per-head calibration, and the event detection
+    when alarming at the calibrated probability levels cfg["calibrated_levels"]
+    (overall, i.e. the counted heads, and by type)."""
+    out = {}
+    for name, cal in calibration.items():
+        if name not in scores["rows"]:
+            continue
+        rows = scores["rows"][name]
+        events, starts = scores["events"][name]["per_head"], scores["starts"][name]["per_head"]
+        out[name] = {}
+        for k, w in enumerate(windows):
+            pos, neg = rows["pos"][k][counted], rows["neg"][k][counted]
+            pos_c, neg_c, score_sum = _calibrated_histograms(pos, neg, cal["a"][k][counted], cal["c"][k][counted])
+            raw = _histogram_metrics(pos.sum(dim=0), neg.sum(dim=0), cfg["prob_threshold"])
+            calibrated = _histogram_metrics(pos_c.sum(dim=0), neg_c.sum(dim=0), cfg["prob_threshold"])
+            entry = {
+                "average_precision_raw": raw["average_precision"],
+                "average_precision_calibrated": calibrated["average_precision"],
+                "ece_raw": _calibration({"pos": pos, "neg": neg, "score_sum": rows["score_sum"][k]})["ece"],
+                "ece_calibrated": _calibration({"pos": pos_c, "neg": neg_c, "score_sum": score_sum})["ece"],
+                "head_sources": {src: int(((cal["source"][k] == i) & counted).sum())
+                                 for i, src in enumerate(CALIBRATION_SOURCES)},
+                "levels": {},
+            }
+            for level in cfg["calibrated_levels"]:
+                bins = _calibrated_threshold_bins(cal["a"][k], cal["c"][k], level)
+                point = _head_operating_point(events, starts, k, bins, counted, minutes, fps)
+                point["by_type"] = {t: _head_operating_point(events, starts, k, bins, cfg["head_types"] == g,
+                                                             minutes, fps) for g, t in enumerate(EVENT_TYPES)}
+                entry["levels"][str(level)] = point
+            out[name][str(w)] = entry
+    return out
+
+
 def detection_threshold(name, cfg):
     """The detection threshold of a scorer: cfg["detected_th"], or the fixed one of
     the scorers whose scores are no probabilities (FIXED_THRESHOLDS)."""
@@ -648,7 +856,8 @@ def _calibration(rows, num_buckets=10):
             "ece": ece}
 
 
-def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=None, head_thresholds=None):
+def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=None, head_thresholds=None,
+                   calibration=None):
     """Window metrics of the model and of the baselines on the test split.
 
     Returns {"windows": {w: {"rows": {scorer: AP, macro AP, base rate, best F1,
@@ -665,7 +874,11 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
     head_thresholds (`select_head_thresholds`): adds "per_head_threshold" to the
     detection of those scorers, the operating point with a threshold per head
     (overall and by_type), and "head_thresholds": the thresholds and their source per
-    scorer, window and head."""
+    scorer, window and head. calibration (`fit_calibration`): adds "calibration"
+    (`evaluate_calibration`). Every detection uses the alarm filter cfg["alarm_filter"];
+    "alarm_filter" compares the rule net without and with it. "per_head_detection":
+    each head's event detection per scorer and window ("reliable": at least
+    cfg["per_head_min_test_events"] test events)."""
     scores = _score_videos(model, data, baselines, cfg, mlp, cascade, extra=extra)
     minutes = scores["num_frames"] / cfg["frame_rate"] / 60
     fps = cfg["frame_rate"]
@@ -675,9 +888,13 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
            "min_context": cfg["min_context"], "windows": model.windows, "headline_window": cfg["headline_window"],
            "frame_rate": fps, "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
            "detected_th": cfg["detected_th"], "detection_metric": cfg["detection_metric"],
-           "noise_below": cfg["event_types"]["noise_below"], "trivial_above": cfg["event_types"]["trivial_above"],
+           "noise_below": cfg["event_types"]["noise_below"], "rare_below": cfg["event_types"].get("rare_below"),
+           "trivial_above": cfg["event_types"]["trivial_above"],
            "exclude_noise_heads": cfg["exclude_noise_heads"], "counted_types": list(COUNTED_TYPES),
            "per_head_min_events": cfg["per_head_min_events"],
+           "alarm_filter_grid": cfg["alarm_filter_grid"], "calibration_min_events": cfg["calibration_min_events"],
+           "calibrated_levels": cfg["calibrated_levels"],
+           "per_head_min_test_events": cfg["per_head_min_test_events"],
            "history_levels": cfg["history_levels"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
            "motif_net": cfg.get("motif_net", False),
@@ -775,6 +992,31 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
             name: _histogram_metrics(r["pos"][k][h], r["neg"][k][h], cfg["prob_threshold"])["average_precision"]
             for name, r in scores["rows"].items() if name != "model"}
         out["per_head"][str(h)] = m
+
+    # Event detection of each head (with test events or alarms), per scorer and window, at the
+    # detection threshold: event recall, mean prediction time, coverage, alarms and alarm precision.
+    out["per_head_detection"] = {}
+    for name in (n for n in DETECTION_SCORERS if n in scores["events"]):
+        events, starts = scores["events"][name]["per_head"], scores["starts"][name]["per_head"]
+        A = events["num_events"].shape[0]
+        bins = torch.full((A,), _threshold_bin(detection_threshold(name, cfg)), dtype=torch.long)
+        out["per_head_detection"][name] = {}
+        for k, w in enumerate(model.windows):
+            heads = {}
+            for h in range(A):
+                one = torch.zeros(A, dtype=torch.bool)
+                one[h] = True
+                point = _head_operating_point(events, starts, k, bins, one, minutes, fps)
+                if point["events"] or point["alarms"]:
+                    heads[str(h)] = {"label": step05._atom_name(unique_atoms[h]),
+                                     "event_type": EVENT_TYPES[int(cfg["head_types"][h])],
+                                     "reliable": point["events"] >= cfg["per_head_min_test_events"], **point}
+            out["per_head_detection"][name][str(w)] = heads
+
+    if calibration:
+        out["calibration"] = evaluate_calibration(scores, calibration, cfg, counted, model.windows, minutes, fps)
+    out["alarm_filter"] = {"chosen": list(cfg["alarm_filter"]), "val_grid": cfg.get("alarm_filter_val_grid"),
+                           "test": _alarm_filter_comparison(model, data, baselines, cfg, minutes, fps)}
 
     out["trajectory"] = {name: {"mean": (tr["sum"] / tr["count"].clamp(min=1)).tolist(), "count": tr["count"].tolist()}
                          for name, tr in scores["trajectory"].items()
@@ -884,6 +1126,16 @@ def build_results(metrics, clauses):
         "detection_metric": metrics["detection_metric"],
         "event_types": {t: [h["label"] for h in heads] for t, heads in metrics["event_types"]["heads"].items()},
         "windows": windows,
+        "alarm_filter": metrics.get("alarm_filter"),
+        "calibration": {name: {w: {key: v for key, v in e.items() if key != "levels"}
+                               | {"levels": {q: {key: p[key] for key in ("recall", "precision", "alarms_per_minute",
+                                                                          "mean_prediction_seconds")}
+                                             for q, p in e["levels"].items()}}
+                               for w, e in per_window.items()}
+                        for name, per_window in metrics.get("calibration", {}).items()},
+        "per_head_detection": {name: {w: {h: d for h, d in heads.items() if d["reliable"]}
+                                      for w, heads in per_window.items()}
+                               for name, per_window in metrics.get("per_head_detection", {}).items()},
         "history": metrics["history"],
         "clauses": {
             "num_clauses": len(clauses),
@@ -1205,7 +1457,7 @@ def _plot_event_types(metrics, plt, save, detection_names, swept, seconds, headl
         ax.bar(ranks, [heads[i][0] for i in ranks], width=0.8, color=TYPE_COLORS[event_type],
                label=f"{event_type}: {len(types['heads'][event_type])} heads, {share:.0%} of onsets")
     ax.set(title=f"Onsets per head ({types['count_source']}); noise: < {types['noise_below']}, "
-                 f"trivial: > {types['trivial_above']}",
+                 f"rare: < {types.get('rare_below')}, trivial: > {types['trivial_above']}",
            xlabel="head rank (most frequent first)", ylabel="onsets (log)", yscale="log")
     ax.grid(alpha=0.3, axis="y")
     ax.legend(fontsize=8)
@@ -1370,6 +1622,65 @@ def _plot_head_thresholds(metrics, plt, save, swept, seconds, headline):
 
 
 # -------------- Summary --------------
+def _print_alarm_filter_calibration(metrics, sec):
+    """The alarm filter (val grid, test without / with it) and the calibrated operating points."""
+    windows = metrics["windows"]
+    af = metrics.get("alarm_filter")
+    if af:
+        k, g = af["chosen"]
+        print(f"[Alarm filter] k={k} frames in a row above the threshold, alarms < g={g} frames apart merge "
+              f"(chosen on val by the rule net's mean best event F1)")
+        for entry in af.get("val_grid") or []:
+            print(f"  val k={entry['persist']:>2} g={entry['gap']:>2}: mean best F1 {entry['mean_best_f1']:.4f}")
+        print(f"  test, rule net, counted heads: raw (k=g=1) -> filtered; at the detection threshold | at the best F1")
+        print(f"  {'W':>5}{'recall':>16}{'precision':>18}{'alarms/min':>18}{'PT mean':>16}"
+              f"{'best-F1 recall':>20}{'precision':>18}")
+        for w in windows:
+            raw, fil = af["test"]["raw"]["windows"][str(w)], af["test"]["filtered"]["windows"][str(w)]
+            r, f = raw["at_threshold"], fil["at_threshold"]
+            rb, fb = raw["best_f1"], fil["best_f1"]
+            print(f"  {w:>5}{r['recall']:>8.3f}->{f['recall']:<6.3f}{r['precision']:>9.4f}->{f['precision']:<7.4f}"
+                  f"{r['alarms_per_minute']:>9.1f}->{f['alarms_per_minute']:<7.1f}"
+                  f"{sec(r['mean_prediction_time']):>8.2f}->{sec(f['mean_prediction_time']):<6.2f}"
+                  f"{rb['recall']:>12.3f}->{fb['recall']:<6.3f}{rb['precision']:>9.4f}->{fb['precision']:<7.4f}")
+        print()
+    cal = metrics.get("calibration")
+    if cal:
+        print(f"[Calibration] per-head Platt scaling fitted on val; counted heads; AP / ECE raw -> calibrated; "
+              f"detection when alarming at calibrated probability q (recall / alarm precision / alarms per min)")
+        for name, per_window in cal.items():
+            for w in windows:
+                e = per_window[str(w)]
+                levels = "  ".join(f"q={q}: {p['recall']:.2f}/{p['precision']:.3f}/{p['alarms_per_minute'] or 0:.1f}"
+                                   for q, p in e["levels"].items())
+                print(f"  {SCORER_LABELS[name]:<11}{w:>4}  AP {e['average_precision_raw']:.4f}->"
+                      f"{e['average_precision_calibrated']:.4f}  ECE {e['ece_raw']:.4f}->{e['ece_calibrated']:.4f}  "
+                      f"{levels}")
+        print()
+
+
+def _print_per_head_detection(metrics, sec, headline):
+    """Event detection of every head with enough test events (`reliable`), per scorer, at the
+    headline window and the largest one, at the detection threshold."""
+    per_head = metrics.get("per_head_detection")
+    if not per_head:
+        return
+    print(f"[Per head event detection] heads with >= {metrics['per_head_min_test_events']} test events; "
+          f"recall / alarm precision / mean prediction time (s), at the detection threshold")
+    names = [n for n in ("model", "motif_net", "mlp", "rule_set", "cascade") if n in per_head]
+    for w in (headline, str(max(metrics["windows"]))):
+        heads = {h: d for h, d in per_head["model"][w].items() if d["reliable"]}
+        print(f"  W={w}  {'head':<20}{'type':<9}{'events':>7}" + "".join(f"{SCORER_LABELS[n]:>24}" for n in names))
+        for h, d in sorted(heads.items(), key=lambda x: (x[1]["event_type"], -x[1]["events"])):
+            cells = []
+            for n in names:
+                e = per_head[n][w].get(h)
+                cells.append("—" if e is None else
+                             f"{e['recall']:.2f}/{e['precision']:.3f}/{sec(e['mean_prediction_time']):.1f}")
+            print(f"        {d['label']:<20}{d['event_type']:<9}{d['events']:>7}" + "".join(f"{c:>24}" for c in cells))
+    print()
+
+
 def print_summary(metrics, clauses, cfg, num_examples=15):
     windows, results = metrics["windows"], metrics["results"]
     headline = str(metrics["headline_window"])
@@ -1410,7 +1721,7 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
     if "event_types" in metrics:
         types = metrics["event_types"]
         print(f"[Event types] heads by {types['count_source']}: noise < {types['noise_below']} onsets, "
-              f"trivial > {types['trivial_above']} onsets, regular in between")
+              f"rare < {types.get('rare_below')}, trivial > {types['trivial_above']} onsets, regular in between")
         for event_type in EVENT_TYPES:
             heads = types["heads"][event_type]
             seen = [h for h in heads if h["onsets"] > 0]
@@ -1511,6 +1822,9 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
               f"{b.get('mlp', 0):.3f}  {b.get('anchor', 0):.3f}  {m['best_f1']['f1']:.3f}  [{m['label']}]")
     print()
 
+    _print_alarm_filter_calibration(metrics, sec)
+    _print_per_head_detection(metrics, sec, headline)
+
     print(f"[Clauses]\t {len(clauses)} from step 05")
     firing = [c for c in clauses if c["test_confidence"] is not None]
     if firing:
@@ -1550,7 +1864,18 @@ def main(input_data):
         # candidates use FIXED_THRESHOLDS. The curves sweep every threshold.
         "detected_th": 0.5,
         # Version of the detection metric; a cached test_metrics.json of another one is redone.
-        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds",
+        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds_alarm_filter_calibration",
+        # Alarm filter (`_score_videos`), chosen on the val videos (`select_alarm_filter`): an
+        # alarm needs k frames in a row above the threshold (persist) and alarms closer than
+        # g frames merge (gap). k = g = 1 is the plain per-frame alarm.
+        "alarm_filter_grid": {"persist": [1, 3, 5, 10], "gap": [1, 10, 30]},
+        # Per-head calibration (Platt scaling on val) of the probability scorers: own fit for
+        # heads with >= calibration_min_events val events, else their event type's; the test
+        # detection is reported when alarming at these calibrated probabilities.
+        "calibration_min_events": 5,
+        "calibrated_levels": [0.05, 0.1, 0.2, 0.3, 0.5],
+        # Per-head results are "reliable" with at least this many test events.
+        "per_head_min_test_events": 5,
         # Second operating point: one threshold per head, tuned on the val videos (best F1 of
         # the head's event recall and alarm precision) for heads with at least this many val
         # events, else the threshold of the head's event type, else detected_th.
@@ -1617,9 +1942,13 @@ def main(input_data):
     settings = {"windows": step05_cfg["windows"], "min_context": cfg["min_context"],
                 "headline_window": cfg["headline_window"], "cascade": cfg["cascade"],
                 "detected_th": cfg["detected_th"], "detection_metric": cfg["detection_metric"],
-                "noise_below": step05_cfg["noise_below"], "trivial_above": step05_cfg["trivial_above"],
+                "noise_below": step05_cfg["noise_below"], "rare_below": step05_cfg["rare_below"],
+                "trivial_above": step05_cfg["trivial_above"],
                 "exclude_noise_heads": step05_cfg["exclude_noise_heads"],
                 "per_head_min_events": cfg["per_head_min_events"],
+                "alarm_filter_grid": cfg["alarm_filter_grid"], "calibration_min_events": cfg["calibration_min_events"],
+                "calibrated_levels": cfg["calibrated_levels"],
+                "per_head_min_test_events": cfg["per_head_min_test_events"],
                 "history_levels": cfg["history_levels"],
                 "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
@@ -1632,13 +1961,17 @@ def main(input_data):
         cfg["event_types"] = training_data["event_types"]
         cfg["head_types"] = cfg["event_types"]["types"]
         cfg["exclude_noise_heads"] = step05_cfg["exclude_noise_heads"]
-        # Per-head thresholds tuned on the validation videos (never on test).
-        val_scores = _score_videos(model, _subset(training_data, training_data["val_videos"]), baselines, cfg, mlp,
-                                   cascade, extra=extra)
+        # Everything tuned on the validation videos (never on test): the alarm filter (rule net),
+        # then with it the per-head thresholds and the per-head calibration of every scorer.
+        val_data = _subset(training_data, training_data["val_videos"])
+        cfg["alarm_filter"], cfg["alarm_filter_val_grid"] = select_alarm_filter(model, val_data, baselines, cfg)
+        print(f"[Alarm filter] chosen on val: k={cfg['alarm_filter'][0]}, g={cfg['alarm_filter'][1]}")
+        val_scores = _score_videos(model, val_data, baselines, cfg, mlp, cascade, extra=extra)
         head_thresholds = select_head_thresholds(val_scores, cfg)
-        del val_scores
+        calibration = fit_calibration(val_scores["rows"], cfg, model.windows)
+        del val_scores, val_data
         del training_data
-        metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds)
+        metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds, calibration)
         if selection is not None:
             # Every precision level's rule set on the test videos: recall vs precision of precise rules.
             metrics["rule_levels"] = step05_rules.level_tradeoff(model, selection, test_data,
