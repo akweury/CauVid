@@ -732,13 +732,16 @@ def _fit_platt(pos, neg, iterations=50, ridge=1e-2):
 
 def fit_calibration(val_rows, cfg, windows):
     """Per scorer of CALIBRATED_SCORERS, window and head, the Platt scaling of its
-    validation rows (`_score_videos` rows histograms): the head's own fit if it has
-    at least cfg["calibration_min_events"] * W onset rows in window W (an event gives
-    about W of them), else the fit of its event type's pooled rows (the same
-    condition), else the identity; a fit with a <= 0 (not
-    monotone) is replaced by the identity too.
+    validation rows (`_score_videos` rows histograms), from the most specific level
+    that has enough data and a valid fit: the head's own rows, else the pooled rows
+    of its event type, else the pooled rows of all learned heads (the noise heads
+    are no training targets), else the identity. Enough: at least
+    cfg["calibration_min_events"] * W onset rows in window W (an event gives about W
+    of them); valid: a > 0 (monotone) and finite. Every head thus gets a calibration
+    of one scale, so the pooled ranking of all heads stays comparable.
     Returns {scorer: {"a", "c": (W, A), "source": (W, A) long, CALIBRATION_SOURCES index}}."""
     head_type = cfg["head_types"]
+    learned = head_type != EVENT_TYPES.index("noise")
     out = {}
     for name in (n for n in CALIBRATED_SCORERS if n in val_rows):
         pos, neg = val_rows[name]["pos"].float(), val_rows[name]["neg"].float()          # (W, A, S)
@@ -746,29 +749,32 @@ def fit_calibration(val_rows, cfg, windows):
         min_rows = cfg["calibration_min_events"] * torch.tensor(windows, dtype=torch.float)       # (W,)
         a, c = torch.ones(W, A), torch.zeros(W, A)
         source = torch.full((W, A), CALIBRATION_SOURCES.index("identity"), dtype=torch.long)
+
+        def apply(fit_pos, fit_neg, heads, level):
+            """Overwrite (a, c, source) with the fit of the pooled (W, S) rows on heads (A,)
+            bool, in the windows where it has enough rows and is valid."""
+            nonlocal a, c
+            fa, fc = _fit_platt(fit_pos, fit_neg)
+            ok = (fit_pos.sum(-1) >= min_rows) & (fa > 0) & torch.isfinite(fa) & torch.isfinite(fc)   # (W,)
+            use = ok[:, None] & heads[None, :]
+            a, c = torch.where(use, fa[:, None], a), torch.where(use, fc[:, None], c)
+            source[use] = CALIBRATION_SOURCES.index(level)
+
+        # From the least to the most specific level; each overwrites where it is usable.
+        apply(pos[:, learned].sum(dim=1), neg[:, learned].sum(dim=1), torch.ones(A, dtype=torch.bool), "all")
         for g in range(len(EVENT_TYPES)):
             of_type = head_type == g
-            if not of_type.any():
-                continue
-            type_pos, type_neg = pos[:, of_type].sum(dim=1), neg[:, of_type].sum(dim=1)      # (W, S)
-            ta, tc = _fit_platt(type_pos, type_neg)
-            enough = type_pos.sum(-1) >= min_rows                                          # (W,)
-            use = enough[:, None] & of_type[None, :]
-            a = torch.where(use, ta[:, None], a)
-            c = torch.where(use, tc[:, None], c)
-            source[use] = CALIBRATION_SOURCES.index("type")
+            if of_type.any():
+                apply(pos[:, of_type].sum(dim=1), neg[:, of_type].sum(dim=1), of_type, "type")
         ha, hc = _fit_platt(pos, neg)
-        own = pos.sum(-1) >= min_rows[:, None]
+        own = (pos.sum(-1) >= min_rows[:, None]) & (ha > 0) & torch.isfinite(ha) & torch.isfinite(hc)
         a, c = torch.where(own, ha, a), torch.where(own, hc, c)
         source[own] = CALIBRATION_SOURCES.index("head")
-        bad = ~(a > 0) | ~torch.isfinite(a) | ~torch.isfinite(c)
-        a, c = torch.where(bad, 1.0, a), torch.where(bad, 0.0, c)
-        source[bad] = CALIBRATION_SOURCES.index("identity")
         out[name] = {"a": a, "c": c, "source": source}
     return out
 
 
-CALIBRATION_SOURCES = ("head", "type", "identity")
+CALIBRATION_SOURCES = ("head", "type", "all", "identity")
 
 
 def _calibrated_histograms(pos, neg, a, c):
@@ -782,6 +788,22 @@ def _calibrated_histograms(pos, neg, a, c):
     neg_c = torch.zeros_like(neg).scatter_add_(1, new_bin, neg)
     score_sum = torch.zeros(S).index_add_(0, new_bin.flatten(), ((pos + neg) * calibrated).flatten())
     return pos_c, neg_c, score_sum
+
+
+def _pooled_average_precision(pos, neg, scores):
+    """AP of the rows of all heads ranked together, from (A, S) histograms and the
+    (A, S) score of each (head, bin) cell: the cells sorted by score, cells of equal
+    score one tie group. Unlike re-binning the calibrated scores, this adds no ties
+    beyond the raw bins, so a monotone map shared by all heads leaves it unchanged."""
+    scores, order = scores.flatten().sort(descending=True)
+    pos, neg = pos.flatten()[order], neg.flatten()[order]
+    groups = torch.unique_consecutive(scores, return_inverse=True)[1]
+    num_groups = int(groups.max()) + 1 if len(groups) else 0
+    group_pos = torch.zeros(num_groups).index_add_(0, groups, pos)
+    group_neg = torch.zeros(num_groups).index_add_(0, groups, neg)
+    tp, fp = group_pos.cumsum(0), group_neg.cumsum(0)
+    precision = tp / (tp + fp).clamp(min=1)
+    return ((precision * group_pos).sum() / group_pos.sum().clamp(min=1)).item()
 
 
 def _calibrated_threshold_bins(a, c, level):
@@ -808,11 +830,13 @@ def evaluate_calibration(scores, calibration, cfg, counted, windows, minutes, fp
         for k, w in enumerate(windows):
             pos, neg = rows["pos"][k][counted], rows["neg"][k][counted]
             pos_c, neg_c, score_sum = _calibrated_histograms(pos, neg, cal["a"][k][counted], cal["c"][k][counted])
-            raw = _histogram_metrics(pos.sum(dim=0), neg.sum(dim=0), cfg["prob_threshold"])
-            calibrated = _histogram_metrics(pos_c.sum(dim=0), neg_c.sum(dim=0), cfg["prob_threshold"])
+            # Pooled AP of the (head, raw bin) cells ranked by their raw / calibrated score.
+            middles = _bin_scores()[None, :].expand_as(pos)
+            calibrated_middles = torch.sigmoid(cal["a"][k][counted][:, None] * _logit(middles)
+                                               + cal["c"][k][counted][:, None])
             entry = {
-                "average_precision_raw": raw["average_precision"],
-                "average_precision_calibrated": calibrated["average_precision"],
+                "average_precision_raw": _pooled_average_precision(pos, neg, middles),
+                "average_precision_calibrated": _pooled_average_precision(pos, neg, calibrated_middles),
                 "ece_raw": _calibration({"pos": pos, "neg": neg, "score_sum": rows["score_sum"][k]})["ece"],
                 "ece_calibrated": _calibration({"pos": pos_c, "neg": neg_c, "score_sum": score_sum})["ece"],
                 "head_sources": {src: int(((cal["source"][k] == i) & counted).sum())
@@ -1864,7 +1888,7 @@ def main(input_data):
         # candidates use FIXED_THRESHOLDS. The curves sweep every threshold.
         "detected_th": 0.5,
         # Version of the detection metric; a cached test_metrics.json of another one is redone.
-        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds_alarm_filter_calibration",
+        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds_alarm_filter_calibration_all",
         # Alarm filter (`_score_videos`), chosen on the val videos (`select_alarm_filter`): an
         # alarm needs k frames in a row above the threshold (persist) and alarms closer than
         # g frames merge (gap). k = g = 1 is the plain per-frame alarm.
