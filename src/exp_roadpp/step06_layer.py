@@ -162,9 +162,11 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
     histograms = {name: (torch.zeros(A * S, device=device), torch.zeros(A * S, device=device)) for name in names}
     num_frames = 0
     for video_id in tqdm(data["videos"], desc="Scoring the shared onset task"):
-        X = step05._video_from_cells(data["videos"][video_id], A, device)
+        # The step 05 models read the geometry atoms too (inputs only, after the A label atoms);
+        # the layered net and the scored heads are the label atoms.
+        X = step05._video_from_cells(data["videos"][video_id], data["num_atoms"], device)
         num_frames += X.shape[0]
-        layers = step05.coarsen_video(X, s).float()
+        layers = step05.coarsen_video(X[..., :A], s).float()
         for starts in torch.arange(1, layers.shape[0], device=device).split(cfg["windows_per_video"]):
             out = step05_layer.unroll(model, step05_layer._windows(layers, starts, K, 1), 1)[0]
             if len(out["rows"]) == 0:
@@ -174,12 +176,12 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
             inputs = (temporal.layer_inputs(X, starts * s) if not temporal.roles
                       else temporal.layer_inputs(X, starts * s, roles=roles))[out["rows"]]
             # The step 05 models give one probability per window; the first (10 frames) covers layer b.
-            scores = {"layered": out["pred"], "temporal": temporal.window_probs(temporal(inputs)[0])[:, 0],
+            scores = {"layered": out["pred"], "temporal": temporal.window_probs(temporal(inputs)[0])[:, 0, :A],
                       "prior": prior.expand_as(out["pred"])}
             if mlp is not None:
-                scores["mlp"] = mlp.window_probs(mlp(inputs)[0])[:, 0]
+                scores["mlp"] = mlp.window_probs(mlp(inputs)[0])[:, 0, :A]
             if baselines:
-                scores["anchor"] = step06._anchor_scores(temporal, inputs, baselines)[:, 0]
+                scores["anchor"] = step06._anchor_scores(temporal, inputs, baselines)[:, 0, :A]
             last, target = out["prev"] > 0.5, out["target"] > 0.5
             risk, event = ~last, ~last & target
             for name, score in scores.items():
