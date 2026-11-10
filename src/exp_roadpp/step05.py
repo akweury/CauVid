@@ -5,7 +5,7 @@ import getpass
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import utils_data, roles as agent_roles
+from src.exp_roadpp import utils_data, roles as agent_roles, geometry as agent_geometry
 from src.exp_roadpp.cauvid import TemporalRuleNet
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 
@@ -35,11 +35,31 @@ def _video_cells(X):
 
 
 def _video_from_cells(video, num_atoms, device):
-    # Inverse of `_video_cells`.
+    # Inverse of `_video_cells`; with num_atoms below the stored atoms (`label_atom_count`:
+    # the label atoms only) the atoms from num_atoms on (the geometry atoms) are left out.
     X = torch.zeros((*video["shape"], num_atoms), dtype=torch.bool, device=device)
     t, n, a = video["cells"].to(device).long().T
-    X[t, n, a] = True
+    keep = a < num_atoms
+    X[t[keep], n[keep], a[keep]] = True
     return X
+
+
+def label_atom_count(data):
+    """The number of GT label atoms of `prepare_videos` data: its first atoms; the
+    geometry atoms (`geometry.py`) follow them."""
+    return data.get("num_label_atoms", data["num_atoms"])
+
+
+def load_vocabulary(cfg):
+    """The atom signatures of every atom index: the label vocabulary of
+    cfg["unique_atoms_file"], then the geometry atoms of cfg["geometry"] (`geometry.vocabulary`)."""
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    return unique_atoms + agent_geometry.vocabulary(unique_atoms, cfg.get("geometry", ()))
+
+
+def is_input_atom(signature):
+    """Geometry atoms are inputs only: no head learns or is evaluated on them."""
+    return len(signature) > 1 and signature[1] == "geometry"
 
 
 def video_roles(video, device):
@@ -176,14 +196,19 @@ def is_fresh(output_file, *source_files):
     return all(os.path.getmtime(output_file) >= os.path.getmtime(f) for f in source_files if os.path.exists(f))
 
 
-def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=()):
+def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=(), geometry=(),
+                   unique_atoms=None):
     """Compressed atoms and frame lists of every video of one split.
     With roles (`roles.ROLES`), each video also gets "roles" (T, N, K) int16: the
     agent filling each role for each agent and frame (-1: none), from the boxes of
     box_file (step_dataset `_tracks_to_boxes`); a video without boxes has none.
+    With geometry (`geometry.GEOMETRY` groups), the geometry atoms of the boxes
+    (`geometry.video_geometry`) follow the num_atoms label atoms in every video.
+    "ahead" and geometry need unique_atoms, the label vocabulary (num_atoms of them).
 
     Returns {
-      "num_atoms": A,
+      "num_atoms": A, the label atoms and the geometry atoms after them,
+      "num_label_atoms": the label atoms (num_atoms),
       "min_off_frames": frames an atom must be off before it can switch on again,
       "videos": {video_id: `_video_cells` of its (T, N, A) atom tensor},
       "frames": {video_id: (F,) long, frames with some visible agent},
@@ -196,37 +221,57 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     """
     atoms = utils_data.load_json(atom_file)
     boxes = None
-    if roles:
+    if roles or geometry:
         if box_file is None or not os.path.exists(box_file):
-            raise FileNotFoundError(f"Agent roles {roles} need the box file {box_file} (step_dataset).")
+            raise FileNotFoundError(f"Agent roles {roles} and geometry {geometry} need the box file {box_file}"
+                                    " (step_dataset).")
+        if unique_atoms is None or len(unique_atoms) != num_atoms:
+            raise ValueError("Agent roles and geometry need the label vocabulary (unique_atoms, num_atoms long).")
         boxes = torch.load(box_file, map_location="cpu")
+    geometry_atoms = agent_geometry.vocabulary(unique_atoms, geometry) if geometry else []
     videos, frames, positive_frames = {}, {}, {}
     role_stats = torch.zeros(len(roles))
+    geometry_stats = torch.zeros(len(agent_geometry.fact_names(geometry)))
     num_rows = 0
     for video_id, video_atoms in tqdm(atoms.items(), desc="Preparing videos"):
         X = build_video_tensor(video_atoms, num_atoms, device=device)
         if X.shape[0] < 2:
             continue
+        # Rows, onsets and positive frames from the label atoms only.
         visible = X.any(dim=2)                                      # (T, N)
         stayed = torch.zeros_like(visible)
         stayed[1:] = visible[1:] & visible[:-1]                     # visible in t and t - 1
         has_onset = (atom_onsets(X, min_off_frames).any(dim=2) & stayed).any(dim=1)
+        num_rows += int(visible.sum())
 
+        if boxes is not None:
+            agent_ids = video_agent_ids(video_atoms)
+            ego = agent_ids.get(None)
+            video_boxes, classes = agent_roles.video_boxes(boxes.get(video_id), agent_ids, X.shape[0])
+        if roles:
+            in_ego_lane = agent_roles.ego_lane(X, unique_atoms) if "ahead" in roles else None
+            partners = agent_roles.role_partners(video_boxes, classes, ego, roles, in_ego_lane)
+            partners[~visible.cpu()] = -1
+            role_stats += (partners >= 0).sum(dim=(0, 1)).float()
+        if geometry:
+            G = agent_geometry.video_geometry(video_boxes, classes, X, unique_atoms, geometry, ego)
+            geometry_stats += G.view(*G.shape[:2], -1, len(geometry_stats)).sum(dim=(0, 1, 2)).float()
+            X = torch.cat([X, G.to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
         if roles:
-            agent_ids = video_agent_ids(video_atoms)
-            video_boxes, classes = agent_roles.video_boxes(boxes.get(video_id), agent_ids, X.shape[0])
-            partners = agent_roles.role_partners(video_boxes, classes, agent_ids.get(None), roles)
-            partners[~visible.cpu()] = -1
             videos[video_id]["roles"] = partners.to(torch.int16)
-            role_stats += (partners >= 0).sum(dim=(0, 1)).float()
-            num_rows += int(visible.sum())
         frames[video_id] = torch.nonzero(visible.any(dim=1)).flatten().cpu()
         positive_frames[video_id] = torch.nonzero(has_onset).flatten().cpu()
+    name = atom_file.name if hasattr(atom_file, "name") else atom_file
     if roles:
-        print(f"[Roles]\t {atom_file.name if hasattr(atom_file, 'name') else atom_file}: share of visible agents "
-              "with a partner: " + ", ".join(f"{r} {role_stats[k] / max(num_rows, 1):.2f}" for k, r in enumerate(roles)))
-    return {"num_atoms": num_atoms, "min_off_frames": min_off_frames, "roles": list(roles), "videos": videos,
+        print(f"[Roles]\t {name}: share of visible agents (rows) with a partner: "
+              + ", ".join(f"{r} {role_stats[k] / max(num_rows, 1):.2f}" for k, r in enumerate(roles)))
+    if geometry:
+        print(f"[Geometry]\t {name}: share of visible agents (rows) holding each fact: "
+              + ", ".join(f"{f} {geometry_stats[k] / max(num_rows, 1):.2f}"
+                          for k, f in enumerate(agent_geometry.fact_names(geometry))))
+    return {"num_atoms": num_atoms + len(geometry_atoms), "num_label_atoms": num_atoms,
+            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
             "frames": frames, "positive_frames": positive_frames}
 
 
@@ -239,16 +284,17 @@ def prepare_training_data(cfg):
     `prepare_videos` data of the dataset's train split ("train_videos", all of
     them trained on) and of its val split ("val_videos": model selection, the
     cascade thresholds and the step 06 alarm thresholds), in one dict."""
-    num_atoms = len(utils_data.load_json(cfg['unique_atoms_file']))
+    unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
+    num_atoms = len(unique_atoms)
     train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
-                           cfg.get("train_box_file"), cfg["roles"])
+                           cfg.get("train_box_file"), cfg["roles"], cfg["geometry"], unique_atoms)
     val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
-                         cfg.get("val_box_file"), cfg["roles"])
+                         cfg.get("val_box_file"), cfg["roles"], cfg["geometry"], unique_atoms)
     shared = set(train["videos"]) & set(val["videos"])
     if shared:
         raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
-    data = {"num_atoms": num_atoms, "min_off_frames": cfg["min_off_frames"], "split": SPLIT_SOURCE,
-            "roles": list(cfg["roles"])}
+    data = {"num_atoms": train["num_atoms"], "num_label_atoms": num_atoms, "min_off_frames": cfg["min_off_frames"],
+            "split": SPLIT_SOURCE, "roles": list(cfg["roles"]), "geometry": list(cfg["geometry"])}
     for key in ("videos", "frames", "positive_frames"):
         data[key] = {**train[key], **val[key]}
     train_videos, val_videos = sorted(train["videos"]), sorted(val["videos"])
@@ -262,21 +308,24 @@ def prepare_training_data(cfg):
 
 def load_training_data(cfg):
     """training_data.pt, (re)built by `prepare_training_data` if it is missing,
-    has another min_off_frames, other agent roles or was split another way. Adds the event types of
-    the heads ("event_types", `head_event_types`) and "target_heads" (A,) bool,
-    the heads the models learn: all but the noise heads if cfg["exclude_noise_heads"]."""
+    has another min_off_frames, other agent roles or geometry or was split another way. Adds the event
+    types of the heads ("event_types", `head_event_types`) and "target_heads" (A,) bool,
+    the heads the models learn: never the geometry heads (inputs only), and not the noise
+    heads if cfg["exclude_noise_heads"]."""
     data = torch.load(cfg["training_data_file"], map_location="cpu") if os.path.exists(cfg["training_data_file"]) else {}
     if (data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE
-            or data.get("roles", []) != list(cfg["roles"])):
+            or data.get("roles", []) != list(cfg["roles"]) or data.get("geometry", []) != list(cfg["geometry"])):
         data = prepare_training_data(cfg)
         torch.save(data, cfg["training_data_file"])
-    data["event_types"] = head_event_types(data, utils_data.load_json(cfg["unique_atoms_file"]), cfg)
-    noise = data["event_types"]["types"] == EVENT_TYPES.index("noise")
-    data["target_heads"] = ~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise)
+    data["event_types"] = head_event_types(data, load_vocabulary(cfg), cfg)
+    types = data["event_types"]["types"]
+    noise, inputs = types == EVENT_TYPES.index("noise"), types == EVENT_TYPES.index("input")
+    data["target_heads"] = ~inputs & (~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise))
     data["pos_weight_scale"] = head_pos_weight_scale(data["event_types"], cfg)
     print(f"[Heads]\t {int(data['target_heads'].sum())} of {data['num_atoms']} heads are learned"
           + (f" ({int(noise.sum())} noise heads, < {cfg['noise_below']} train + val onsets, left out)"
-             if cfg["exclude_noise_heads"] else ""))
+             if cfg["exclude_noise_heads"] else "")
+          + (f" ({int(inputs.sum())} geometry atoms, inputs only)" if inputs.any() else ""))
     return data
 
 
@@ -294,7 +343,7 @@ def head_pos_weight_scale(event_types, cfg):
     if not cfg.get("type_balance"):
         return scale
     means = {t: sum(h["onsets"] for h in event_types["heads"][t]) / len(event_types["heads"][t])
-             for t in EVENT_TYPES if t != "noise" and event_types["heads"][t]}
+             for t in EVENT_TYPES if t not in ("noise", "input") and event_types["heads"][t]}
     reference = max(means.values())
     for g, t in enumerate(EVENT_TYPES):
         if t in means and means[t] > 0:
@@ -320,10 +369,11 @@ def type_balance_tag(cfg):
     return f"_tbh{cfg['type_balance_power']:g}m{cfg['type_balance_max']:g}" if cfg.get("type_balance") else ""
 
 
-# `head_event_types`: heads with < noise_below onsets are "noise", < rare_below "rare",
+# `head_event_types`: heads of the geometry atoms are "input" (inputs only, never targets),
+# the others with < noise_below onsets are "noise", < rare_below "rare",
 # > trivial_above "trivial", the rest "regular". The rare heads are training targets like the
 # regular ones; step 06 only reports them apart (too few onsets for reliable rules).
-EVENT_TYPES = ("noise", "rare", "regular", "trivial")
+EVENT_TYPES = ("noise", "rare", "regular", "trivial", "input")       # "input" last: step 06 reports the others
 
 
 def head_event_types(training_data, unique_atoms, cfg):
@@ -331,7 +381,7 @@ def head_event_types(training_data, unique_atoms, cfg):
     min_off_frames off, the agent visible in the frame before) in the train + val
     videos: fewer than cfg["noise_below"] onsets (every head never seen included)
     is "noise", fewer than cfg["rare_below"] "rare", more than cfg["trivial_above"]
-    "trivial", the rest "regular".
+    "trivial", the rest "regular"; the geometry atoms (inputs only) are "input".
     Returns {"types": (A,) long EVENT_TYPES index, "heads": {type: [{"head",
     "label", "onsets"}], most frequent first}, the two cutoffs and the onset count}."""
     A = training_data["num_atoms"]
@@ -346,6 +396,7 @@ def head_event_types(training_data, unique_atoms, cfg):
     types[counts < cfg.get("rare_below", 0)] = EVENT_TYPES.index("rare")
     types[counts < cfg["noise_below"]] = EVENT_TYPES.index("noise")
     types[counts > cfg["trivial_above"]] = EVENT_TYPES.index("trivial")
+    types[torch.tensor([is_input_atom(s) for s in unique_atoms[:A]], dtype=torch.bool)] = EVENT_TYPES.index("input")
     order = torch.argsort(counts, descending=True, stable=True)
     heads = {t: [{"head": int(a), "label": _atom_name(unique_atoms[a]), "onsets": int(counts[a])}
                  for a in order.tolist() if types[a] == g]
@@ -886,7 +937,7 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
     if run is not None:
         import wandb
         table = wandb.Table(columns=["clause", "confidence", "support", "fires", "num_videos", "weight", "length"])
-        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        unique_atoms = load_vocabulary(cfg)
         for clause in clauses:
             table.add_data(_temporal_clause_text(clause, unique_atoms), clause["confidence"], clause["support"],
                            clause["fires"], clause["num_videos"], clause["weight"], len(clause["bodies"]))
@@ -957,7 +1008,7 @@ def _plot_results(clauses, cfg, num_heads=30):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    unique_atoms = load_vocabulary(cfg)
     figure_dir = cfg["figure_dir"]
     os.makedirs(figure_dir, exist_ok=True)
 
@@ -1083,7 +1134,7 @@ def _plot_results(clauses, cfg, num_heads=30):
 
 def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 Result", clause_file=None):
     """Terminal summary of the step 05 result, printed on every run (cached or not)."""
-    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    unique_atoms = load_vocabulary(cfg)
     print(f"----------------- {title} -----------------")
     print(f"[Videos]\t {len(training_data['train_videos'])} train, {len(training_data['val_videos'])} val")
     print(f"[Clauses]\t {len(clauses)} in {clause_file or cfg['extended_clause_file']}")
@@ -1130,11 +1181,18 @@ def get_cfg(input_data):
     # Agent roles (`roles.py`): one more input scope per role, the atoms of the agent filling
     # it for the row's agent (e.g. the agent ahead of it), from the GT boxes; () for none.
     roles = ("ahead", "near_ped")
+    # Geometry atoms (`geometry.py`): facts of the GT boxes that hold without depth (bearing
+    # sector, at the image edge, bearing drift), inputs only, after the label atoms; () for none.
+    geometry = agent_geometry.GEOMETRY
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
     if roles:
         base_tag += "_r" + "-".join(roles)
+        if "ahead" in roles:
+            base_tag += "L"                     # "ahead": the ego's lead in its lane (roles.py)
+    if geometry:
+        base_tag += "_g" + "-".join(geometry)
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     tag = base_tag + type_balance_tag(type_balance)
@@ -1233,6 +1291,7 @@ def get_cfg(input_data):
             'train_atom_file': input_data['train_atom_file'],
             'val_atom_file': input_data['val_atom_file'],
             'roles': roles,
+            'geometry': geometry,
             'train_box_file': input_data.get('train_box_file'),
             'val_box_file': input_data.get('val_box_file'),
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],

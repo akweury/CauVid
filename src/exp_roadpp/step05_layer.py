@@ -21,7 +21,9 @@ from src.exp_roadpp.cauvid import LayeredRuleNet
 # -------------- Layers and windows --------------
 def _video_layers(training_data, video_id, cfg):
     """(L, N, A) float layer states of one video, blocks of block_size frames."""
-    X = step05._video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], cfg["device"])
+    # The label atoms only: the layered net predicts the GT labels, not the geometry atoms.
+    X = step05._video_from_cells(training_data["videos"][video_id], step05.label_atom_count(training_data),
+                                 cfg["device"])
     return step05.coarsen_video(X, cfg["block_size"]).float()
 
 
@@ -164,7 +166,7 @@ def train_layered_rule_net(training_data, cfg, run=None):
     generator = torch.Generator().manual_seed(cfg["seed"])
     anchors = step05.anchor_rules(cfg)
     copies = len(cfg["anchor_offsets"]) * (1 + cfg["num_specialized"])
-    model = LayeredRuleNet(training_data["num_atoms"], cfg["num_layers"],
+    model = LayeredRuleNet(step05.label_atom_count(training_data), cfg["num_layers"],
                            len(anchors) * copies + cfg["num_free_rules"], cfg["init_log_alpha"])
     num_seeded = model.seed_rules(anchors, cfg["anchor_offsets"], cfg["num_specialized"], cfg["seed_head_weight"])
     model = model.to(cfg["device"])
@@ -235,7 +237,7 @@ def train_layered_rule_net(training_data, cfg, run=None):
 def load_layered_rule_net(training_data, cfg):
     """The trained LayeredRuleNet of cfg["model_file"], in eval mode on cfg["device"]."""
     state = torch.load(cfg["model_file"], map_location="cpu")
-    model = LayeredRuleNet(training_data["num_atoms"], cfg["num_layers"], state["log_alpha"].shape[0])
+    model = LayeredRuleNet(step05.label_atom_count(training_data), cfg["num_layers"], state["log_alpha"].shape[0])
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 

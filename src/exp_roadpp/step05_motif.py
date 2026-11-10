@@ -30,6 +30,8 @@ def get_cfg(input_data):
     tag = f"b{fine_size}x{motif_span}_s{slot_size}x{num_slots}_m{num_free_motifs}_r{num_free_rules}_p{p_min}"
     if base["exclude_noise_heads"]:
         tag += f"_tn{base['noise_below']}"                     # the noise heads are no training targets
+    if base["geometry"]:
+        tag += "_g" + "-".join(base["geometry"])              # the geometry atoms (inputs) widen every input
     output_dir = input_data["output_dir"]
     return {
         "enabled": True,
@@ -74,6 +76,7 @@ def get_cfg(input_data):
         "wandb": base["wandb"],
         "wandb_project": base["wandb_project"],
         "unique_atoms_file": base["unique_atoms_file"],
+        "geometry": base["geometry"],
         "training_data_file": base["training_data_file"],
         "model_file": output_dir / f"motif_rule_net_{tag}.pt",
         "clause_file": output_dir / f"motif_clauses_{tag}.json",
@@ -284,7 +287,7 @@ def extract_clauses(model, training_data, cfg):
 
 
 def print_summary(clauses, cfg, num_examples=15):
-    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    unique_atoms = step05.load_vocabulary(cfg)
     print("----------------- Step 05d Result (MotifRuleNet) -----------------")
     print(f"[Clauses]\t {len(clauses)} in {cfg['clause_file']}")
     if not clauses:

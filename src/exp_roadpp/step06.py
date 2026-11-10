@@ -145,7 +145,10 @@ RECALL_LEVELS = (0.3, 0.5, 0.7)
 # Event types by the frequency of their head (`step05.head_event_types`). The noise heads
 # are no training targets (step05 exclude_noise_heads): the overall metrics count only the
 # COUNTED_TYPES, the noise events are reported on their own (by_type).
-EVENT_TYPES = step05.EVENT_TYPES
+# The geometry heads ("input", last in step05.EVENT_TYPES) are inputs only: no type of the
+# reports, so their events and alarms are never counted (the indices of the others are the same).
+EVENT_TYPES = tuple(t for t in step05.EVENT_TYPES if t != "input")
+INPUT_TYPE = step05.EVENT_TYPES.index("input")
 COUNTED_TYPES = ("rare", "regular", "trivial")
 TYPE_COLORS = {"noise": "tab:gray", "rare": "tab:purple", "regular": "tab:blue", "trivial": "tab:orange"}
 
@@ -785,7 +788,7 @@ def fit_calibration(val_rows, cfg, windows):
     of one scale, so the pooled ranking of all heads stays comparable.
     Returns {scorer: {"a", "c": (W, A), "source": (W, A) long, CALIBRATION_SOURCES index}}."""
     head_type = cfg["head_types"]
-    learned = head_type != EVENT_TYPES.index("noise")
+    learned = (head_type != EVENT_TYPES.index("noise")) & (head_type != INPUT_TYPE)
     out = {}
     for name in (n for n in CALIBRATED_SCORERS if n in val_rows):
         pos, neg = val_rows[name]["pos"].float(), val_rows[name]["neg"].float()          # (W, A, S)
@@ -951,7 +954,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
     minutes = scores["num_frames"] / cfg["frame_rate"] / 60
     fps = cfg["frame_rate"]
     edges = score_edges()
-    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    unique_atoms = step05.load_vocabulary(cfg)
     out = {"num_videos": len(data["videos"]), "minutes": minutes, "min_off_frames": data["min_off_frames"],
            "min_context": cfg["min_context"], "windows": model.windows, "headline_window": cfg["headline_window"],
            "frame_rate": fps, "prob_threshold": cfg["prob_threshold"], "cascade": cfg["cascade"],
@@ -1047,7 +1050,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
         out["head_thresholds"] = {
             "min_events": cfg["per_head_min_events"],
             "labels": [step05._atom_name(a) for a in unique_atoms],
-            "event_types": [EVENT_TYPES[int(g)] for g in cfg["head_types"]],
+            "event_types": [step05.EVENT_TYPES[int(g)] for g in cfg["head_types"]],
             "gate": {key: cfg[key] for key in ("gate_min_events", "gate_min_precision", "gate_min_correct")},
             "scorers": {name: {str(w): {"threshold": [edges_list[b] for b in t["bins"][k].tolist()],
                                         "source": [HEAD_THRESHOLD_SOURCES[x] for x in t["source"][k].tolist()],
@@ -1061,6 +1064,8 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
     pos, neg = scores["rows"]["model"]["pos"][k], scores["rows"]["model"]["neg"][k]
     out["per_head"] = {}
     for h in torch.nonzero(pos.sum(dim=1)).flatten().tolist():
+        if int(cfg["head_types"][h]) == INPUT_TYPE:
+            continue
         m = _histogram_metrics(pos[h], neg[h], cfg["prob_threshold"])
         m["label"] = step05._atom_name(unique_atoms[h])
         m["event_type"] = EVENT_TYPES[int(cfg["head_types"][h])]
@@ -1080,6 +1085,8 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
         for k, w in enumerate(model.windows):
             heads = {}
             for h in range(A):
+                if int(cfg["head_types"][h]) == INPUT_TYPE:
+                    continue
                 one = torch.zeros(A, dtype=torch.bool)
                 one[h] = True
                 point = _head_operating_point(events, starts, k, bins, one, minutes, fps)
@@ -1928,7 +1935,7 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
         if extended:
             better = sum(c["test_confidence"] > c["test_anchor_confidence"] for c in extended)
             print(f"[Extension]\t {better}/{len(extended)} extended clauses beat their anchor on test")
-        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        unique_atoms = step05.load_vocabulary(cfg)
         print(f"[Top {min(num_examples, len(firing))} clauses by test confidence]")
         for c in firing[:num_examples]:
             print(f"  conf {c['test_confidence']:.2f} (train {c['confidence']:.2f})  "
@@ -2001,16 +2008,18 @@ def main(input_data):
         "figure_dir": input_data["output_dir"] / "figures",
     }
     step05_cfg["device"] = cfg["device"]
+    cfg["geometry"] = step05_cfg["geometry"]          # the geometry atoms follow the label atoms (`step05.load_vocabulary`)
     assert cfg["headline_window"] in step05_cfg["windows"]
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
     if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
-            or test_data.get("roles", []) != list(step05_cfg["roles"])):
-        num_atoms = len(utils_data.load_json(cfg["unique_atoms_file"]))
-        test_data = step05.prepare_videos(cfg["test_atoms_file"], num_atoms, cfg["device"],
+            or test_data.get("roles", []) != list(step05_cfg["roles"])
+            or test_data.get("geometry", []) != list(step05_cfg["geometry"])):
+        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        test_data = step05.prepare_videos(cfg["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
-                                          step05_cfg["roles"])
+                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms)
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
     mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained

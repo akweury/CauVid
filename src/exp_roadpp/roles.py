@@ -13,10 +13,12 @@ y2 is further away. The ego vehicle has no box: it stands at the bottom centre
 of the image (EGO_BOX), so its roles use the same definitions.
 
 ROLES (the order of the role channels is the order of cfg["roles"]):
-  ahead:    the nearest agent in front of it in its lane column: further away
-            (y2 smaller by > AHEAD_MIN_GAP) and horizontally inside its extent
-            (>= AHEAD_MIN_OVERLAP of the candidate's width overlaps it); for the
-            ego, the lead agent in the ego path.
+  ahead:    the ego's lead agent: of the agents labelled in the ego's lane
+            (location "VehLane", EGO_LANE_LABELS), the nearest one, the largest y2
+            (in one lane, the nearer agent stands lower in the image and occludes the
+            farther one: an order, no distance). Only the ego has this role: for
+            another agent, "ahead of it" needs its heading and depth, which 2D boxes
+            do not give.
   near_ped: the nearest pedestrian (agent class "Ped") whose ground point (bottom
             centre) is within NEAR_PED_MAX_HEIGHTS times the larger box height of
             the two (scale-aware: a fixed image distance would span metres near
@@ -29,19 +31,20 @@ in the "others" channel, as no other agent holds them.
 import torch
 
 ROLES = ("ahead", "near_ped")
-EGO_BOX = (0.35, 1.0, 0.65, 1.0)          # the ego path: centre third of the image, at the bottom
-AHEAD_MIN_GAP = 0.01
-AHEAD_MIN_OVERLAP = 0.5
+EGO_BOX = (0.35, 1.0, 0.65, 1.0)          # where the ego stands: bottom centre of the image
+EGO_LANE_LABELS = ("VehLane",)
 NEAR_PED_MAX_HEIGHTS = 1.0
 PEDESTRIAN_CLASSES = ("Ped",)
 NON_GROUND_CLASSES = ("TL", "OthTL")
 
 
-def role_partners(boxes, classes, ego, roles=ROLES):
+def role_partners(boxes, classes, ego, roles=ROLES, in_ego_lane=None):
     """(T, N, K) long: the agent filling role k of agent n in frame t, -1 if none.
 
     boxes (T, N, 4) float, NaN where the agent has no box in that frame; classes
-    [N] agent class labels (None if unknown); ego: the ego agent's index or None.
+    [N] agent class labels (None if unknown); ego: the ego agent's index or None;
+    in_ego_lane (T, N) bool: the agent is labelled in the ego's lane (`ego_lane`),
+    needed for "ahead".
     An agent without a box in frame t (other than the ego) has no partners then,
     and is no partner of anyone."""
     T, N, _ = boxes.shape
@@ -63,12 +66,12 @@ def role_partners(boxes, classes, ego, roles=ROLES):
         candidate[:, :, ego] = False
     for k, role in enumerate(roles):
         if role == "ahead":
-            further = y2[:, None, :] < y2[:, :, None] - AHEAD_MIN_GAP                   # m further away than n
-            overlap = (torch.minimum(x2[:, :, None], x2[:, None, :])
-                       - torch.maximum(x1[:, :, None], x1[:, None, :])).clamp(min=0)
-            width = (x2 - x1).clamp(min=1e-6)[:, None, :]
-            ok = candidate & further & (overlap / width >= AHEAD_MIN_OVERLAP)
-            # The nearest of them: the largest y2 (closest to n).
+            if in_ego_lane is None:
+                raise ValueError('The role "ahead" needs in_ego_lane (T, N) bool.')
+            ok = torch.zeros_like(candidate)
+            if ego is not None:
+                ok[:, ego, :] = candidate[:, ego, :] & in_ego_lane.cpu().bool()
+            # The nearest of them: the largest y2 (lowest in the image).
             score = torch.where(ok, y2[:, None, :], -float("inf"))
         elif role == "near_ped":
             ped = torch.tensor([c in PEDESTRIAN_CLASSES for c in classes], dtype=torch.bool)
@@ -83,6 +86,16 @@ def role_partners(boxes, classes, ego, roles=ROLES):
         best = score.argmax(dim=2)                                                     # (T, n)
         out[:, :, k] = torch.where(ok.any(dim=2), best, -1)
     return out
+
+
+def ego_lane(X, unique_atoms):
+    """(T, N) bool: agent n holds a location atom of EGO_LANE_LABELS in frame t
+    (X (T, N, A) bool label atoms, unique_atoms the label vocabulary)."""
+    lane = [a for a, sig in enumerate(unique_atoms)
+            if dict(zip(sig[0::2], sig[1::2])).get("location_name_label") in EGO_LANE_LABELS]
+    if not lane:
+        return torch.zeros(X.shape[:2], dtype=torch.bool)
+    return X[:, :, lane].any(dim=2).cpu()
 
 
 def video_boxes(video_boxes_entry, agent_ids, num_frames):

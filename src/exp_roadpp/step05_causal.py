@@ -283,7 +283,7 @@ def get_cfg_from_step05(step05_cfg):
 
 
 def _print_summary(tests, stats, cfg):
-    unique_atoms = utils_data.load_json(cfg["step05_cfg"]["unique_atoms_file"])
+    unique_atoms = step05.load_vocabulary(cfg["step05_cfg"])
     tested = [t for t in tests if t["tested"]]
     print("----------------- Step 05b Result (causal pruning) -----------------")
     print(f"[Tests]\t\t {len(tests)} (rule, head, body atom), {len(tested)} tested, "

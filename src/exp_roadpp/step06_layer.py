@@ -27,7 +27,7 @@ def layer_priors(training_data, cfg):
     """(H, 2, A) base rate of each horizon h (index h - 1), kind (onset, offset)
     and head over the training videos: atoms off (on) in a layer and on (off) h
     layers later, for the agents visible in both."""
-    H, A = cfg["rollout_steps"], training_data["num_atoms"]
+    H, A = cfg["rollout_steps"], step05.label_atom_count(training_data)
     events, at_risk = torch.zeros((H, 2, A)), torch.zeros((H, 2, A))
     for video_id in tqdm(training_data["train_videos"], desc="Counting layer base rates (train)"):
         layers = step05_layer._video_layers(training_data, video_id, cfg).cpu() > 0.5
@@ -56,7 +56,7 @@ def score_videos(model, data, priors, cfg):
     }.
     """
     model.eval()
-    device, H, K, A = cfg["device"], cfg["rollout_steps"], model.num_layers, data["num_atoms"]
+    device, H, K, A = cfg["device"], cfg["rollout_steps"], model.num_layers, step05.label_atom_count(data)
     edges = step06.score_edges().to(device)
     S = len(edges)
     priors = priors.to(device)
@@ -151,7 +151,7 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
     histograms of the rows with and without the event, the frames of all videos).
     """
     model.eval()
-    device, s, K, A = cfg["device"], cfg["block_size"], model.num_layers, data["num_atoms"]
+    device, s, K, A = cfg["device"], cfg["block_size"], model.num_layers, step05.label_atom_count(data)
     edges = step06.score_edges().to(device)
     S = len(edges)
     heads = torch.arange(A, device=device)
@@ -343,11 +343,12 @@ def main(input_data):
     # 1. Test videos, the same file as step 06 (same min_off_frames, so step 06 keeps it).
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
     if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
-            or test_data.get("roles", []) != list(step05_cfg["roles"])):
-        num_atoms = len(utils_data.load_json(cfg["unique_atoms_file"]))
-        test_data = step05.prepare_videos(input_data["test_atoms_file"], num_atoms, cfg["device"],
+            or test_data.get("roles", []) != list(step05_cfg["roles"])
+            or test_data.get("geometry", []) != list(step05_cfg["geometry"])):
+        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        test_data = step05.prepare_videos(input_data["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
-                                          step05_cfg["roles"])
+                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms)
         torch.save(test_data, cfg["test_data_file"])
     model = step05_layer.load_layered_rule_net(test_data, cfg)
 
