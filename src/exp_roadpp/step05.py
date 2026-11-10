@@ -251,35 +251,41 @@ def load_training_data(cfg):
 # Event types by the frequency of their head (onsets in the train + val videos), see
 def head_pos_weight_scale(event_types, cfg):
     """(A,) factor of every head's onset weight (pos_weight): with cfg["type_balance"], an
-    event type with fewer onsets (train + val) weighs its onsets up, (N_max / N_type) ** power
-    capped at type_balance_max, N_max the onsets of the most frequent learned type, so the
-    frequent trivial heads no longer dominate the loss, the sparsity budget and the rules;
-    else 1 for every head. The noise heads (no targets) keep 1."""
+    event type whose heads have fewer onsets each (mean train + val onsets per head) weighs
+    its onsets up, (M_max / M_type) ** power capped at type_balance_max, M_max the mean of
+    the type with the most onsets per head (trivial), so the frequent trivial heads no longer
+    dominate the loss, the sparsity budget and the rules; else 1 for every head. The mean per
+    head, not the type's total: a type of few heads (medium: 2 trivial heads, 278 onsets, vs
+    17 regular heads, 485) is still the frequent one. The noise heads (no targets) keep 1."""
     types = event_types["types"]
     scale = torch.ones(len(types))
     if not cfg.get("type_balance"):
         return scale
-    totals = {t: sum(h["onsets"] for h in event_types["heads"][t]) for t in EVENT_TYPES if t != "noise"}
-    reference = max(totals.values())
+    means = {t: sum(h["onsets"] for h in event_types["heads"][t]) / len(event_types["heads"][t])
+             for t in EVENT_TYPES if t != "noise" and event_types["heads"][t]}
+    reference = max(means.values())
     for g, t in enumerate(EVENT_TYPES):
-        if t in totals and totals[t] > 0:
-            scale[types == g] = min((reference / totals[t]) ** cfg["type_balance_power"], cfg["type_balance_max"])
+        if t in means and means[t] > 0:
+            scale[types == g] = min((reference / means[t]) ** cfg["type_balance_power"], cfg["type_balance_max"])
     print("[Type balance]\t onset weight x " + ", ".join(
-        f"{t} {scale[types == EVENT_TYPES.index(t)][0]:.2f} ({totals[t]} onsets)"
-        for t in totals if (types == EVENT_TYPES.index(t)).any()))
+        f"{t} {scale[types == EVENT_TYPES.index(t)][0]:.2f} ({means[t]:.1f} onsets per head)"
+        for t in means if (types == EVENT_TYPES.index(t)).any()))
     return scale
 
 
 def pos_weight_of(training_data, cfg):
-    """The onset weight of the loss: cfg["pos_weight"] times the per-head type balance
-    (`head_pos_weight_scale`, (A,) on cfg["device"]) if the training data has it."""
+    """The onset weight of the loss: cfg["pos_weight"], times the per-head type balance
+    (`head_pos_weight_scale`, (A,) on cfg["device"]) only for the main rule net
+    (cfg["balanced"], set by `train_temporal_rule_net`); every other model is unweighted."""
     scale = training_data.get("pos_weight_scale")
-    return cfg["pos_weight"] if scale is None else cfg["pos_weight"] * scale.to(cfg["device"])
+    if scale is None or not cfg.get("balanced"):
+        return cfg["pos_weight"]
+    return cfg["pos_weight"] * scale.to(cfg["device"])
 
 
 def type_balance_tag(cfg):
-    """File tag suffix of the type balance, "" without it."""
-    return f"_tb{cfg['type_balance_power']:g}m{cfg['type_balance_max']:g}" if cfg.get("type_balance") else ""
+    """File tag suffix of the type balance (per-head mean), "" without it."""
+    return f"_tbh{cfg['type_balance_power']:g}m{cfg['type_balance_max']:g}" if cfg.get("type_balance") else ""
 
 
 # `head_event_types`: heads with < noise_below onsets are "noise", < rare_below "rare",
@@ -541,7 +547,9 @@ def _fit_rule_net(model, training_data, cfg, history_file, run=None, candidates=
 def train_temporal_rule_net(training_data, cfg, run=None):
     """Stage 1 of the cascade: the recall model, a TemporalRuleNet seeded from the
     anchor clauses plus free rules for the heads without an anchor."""
-    return _fit_rule_net(_seeded_rule_net(training_data, cfg), training_data, cfg, cfg["history_file"], run)
+    # Only the main rule net has the type-balanced onset weights (`pos_weight_of`).
+    return _fit_rule_net(_seeded_rule_net(training_data, cfg), training_data, {**cfg, "balanced": True},
+                         cfg["history_file"], run)
 
 
 def load_temporal_rule_net(training_data, cfg, model_file=None):
@@ -1053,17 +1061,19 @@ def get_cfg(input_data):
     # Noise heads (fewer than noise_below onsets in the train + val videos) are no training
     # targets; step 06 reports their events separately.
     exclude_noise_heads, noise_below = True, 5
-    # Type balance (`head_pos_weight_scale`): the onsets of the less frequent event types
-    # weigh (N_max / N_type) ** power, at most type_balance_max, in every model's loss.
-    type_balance = {"type_balance": True, "type_balance_power": 1.0, "type_balance_max": 4.0}
-    tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
+    # Type balance (`head_pos_weight_scale`), main rule net only: the onsets of the event types
+    # with fewer onsets per head weigh (M_max / M_type) ** power, at most type_balance_max.
+    type_balance = {"type_balance": True, "type_balance_power": 0.5, "type_balance_max": 4.0}
+    base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
-        tag += f"_tn{noise_below}"
-    tag += type_balance_tag(type_balance)
+        base_tag += f"_tn{noise_below}"
+    # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
+    # carries the type balance; the unweighted models (the MLP) keep base_tag.
+    tag = base_tag + type_balance_tag(type_balance)
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
-    mlp_tag = f"{tag}_lr{mlp_lr:g}_{mlp_activation}"
+    mlp_tag = f"{base_tag}_lr{mlp_lr:g}_{mlp_activation}"
     return {
             'device': input_data['device'],
             'seed': 0,
@@ -1079,6 +1089,10 @@ def get_cfg(input_data):
             'rare_below': 10,
             'trivial_above': 100,
             **type_balance,
+            # Train only the main rule net (training time): the MLP and the motif net are not
+            # trained, their cached (unweighted) models are evaluated if they exist; the models
+            # derived from the main rule net (cascade, causal pruning, rule set) are skipped.
+            'main_only': True,
             # Targets: the atom switches on within the next W frames, for each window W
             # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
             # probability per window, never decreasing with W.
@@ -1199,7 +1213,7 @@ def main(input_data):
             run.finish()
 
     # 4. The black-box baseline on the same data, its own W&B run; step 06 evaluates it.
-    if cfg["mlp_baseline"] and not is_fresh(cfg["mlp_model_file"], cfg["training_data_file"]):
+    if cfg["mlp_baseline"] and not cfg["main_only"] and not is_fresh(cfg["mlp_model_file"], cfg["training_data_file"]):
         run = _init_wandb(cfg, {"num_atoms": training_data["num_atoms"]}, job_type="step05_onset_mlp")
         try:
             mlp = train_onset_mlp(training_data, cfg, run)
@@ -1209,14 +1223,14 @@ def main(input_data):
                 run.finish()
 
     # 5. Cascade: stage-1 candidate thresholds on val, then the verifier on the candidates, its own W&B run.
-    if cfg["cascade"]:
+    if cfg["cascade"] and not cfg["main_only"]:
         run_cascade(model, training_data, cfg)
 
     # 6. Figures (one PDF each) and the terminal summary, on every run.
     extended_clauses = utils_data.load_json(cfg["extended_clause_file"])
     _plot_results(extended_clauses, cfg)
     _print_summary(extended_clauses, training_data, cfg)
-    if cfg["cascade"]:
+    if cfg["cascade"] and not cfg["main_only"]:
         print_cascade_summary(training_data, cfg)
 
 

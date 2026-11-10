@@ -204,6 +204,9 @@ def main(input_data):
     print("----------------- Step 05c: Rule Set Selection -----------------")
     cfg = get_cfg(input_data)
     step05_cfg = cfg["step05_cfg"]
+    if step05_cfg["main_only"]:
+        print("[Skip]\t\t main_only: only the main rule net is trained")
+        return
     pruned_file = step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"]
     source = pruned_file if os.path.exists(pruned_file) else step05_cfg["model_file"]
     if not os.path.exists(source):

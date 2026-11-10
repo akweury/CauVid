@@ -30,7 +30,6 @@ def get_cfg(input_data):
     tag = f"b{fine_size}x{motif_span}_s{slot_size}x{num_slots}_m{num_free_motifs}_r{num_free_rules}_p{p_min}"
     if base["exclude_noise_heads"]:
         tag += f"_tn{base['noise_below']}"                     # the noise heads are no training targets
-    tag += step05.type_balance_tag(base)                         # the type-balanced onset weights
     output_dir = input_data["output_dir"]
     return {
         "enabled": True,
@@ -306,8 +305,11 @@ def main(input_data):
     if not cfg["enabled"]:
         print("[Skip]\t\t disabled")
         return
-    training_data = step05.load_training_data(cfg["step05_cfg"])
     model_fresh = step05.is_fresh(cfg["model_file"], cfg["training_data_file"])
+    if cfg["step05_cfg"]["main_only"] and not model_fresh:
+        print(f"[Skip]\t\t main_only: no cached motif net {cfg['model_file'].name}, not trained")
+        return
+    training_data = step05.load_training_data(cfg["step05_cfg"])
     clauses_fresh = model_fresh and step05.is_fresh(cfg["clause_file"], cfg["model_file"])
     run = None
     if not clauses_fresh:
