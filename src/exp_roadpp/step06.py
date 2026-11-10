@@ -258,6 +258,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     counted = torch.isin(head_type, torch.tensor(counted_index, device=device))       # (A,) heads of the overall metrics
     heads = torch.arange(A, device=device)
     window_index = torch.arange(W, device=device)[None, :, None]
+    window_sizes = torch.tensor(model.windows, device=device)
 
     def zeros(*shape):
         return torch.zeros(shape, device=device)
@@ -296,6 +297,9 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
         # of the gap frames before it (-1: not a row), for the alarm scores and starts.
         raw_before = {name: torch.full((persist - 1, N, W, A), -1.0, device=device) for name in scorers}
         alarm_before = {name: torch.full((gap, N, W, A), -1.0, device=device) for name in scorers}
+        # (T + 1, N): frames before t in which the agent is not visible (`_agent_observed`).
+        gone_before = torch.cat([torch.zeros((1, N), dtype=torch.long, device=device),
+                                 (~X.any(dim=2)).long().cumsum(dim=0)])
         for begin in range(min_context, T, cfg["frames_per_video"]):
             frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
             F = len(frames)
@@ -303,8 +307,13 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             rows = step05.video_rows(model, X, frames, data["min_off_frames"], known)
             context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"])
             t, n = rows["rows"].T
-            valid = rows["at_risk"][:, None, :] & rows["known"]                     # (B, W, A)
             targets = rows["targets"]
+            # A row counts (rows, alarms) only if its outcome is observable: the window does not
+            # run past the video end (known) and, with exclude_agent_leaving, the agent does not
+            # leave the scene within it before an onset.
+            valid = rows["at_risk"][:, None, :] & rows["known"]                     # (B, W, A)
+            if cfg.get("exclude_agent_leaving"):
+                valid &= _agent_observed(gone_before, t, n, window_sizes, targets)
             row_of = torch.full((F, N), -1, dtype=torch.long, device=device)
             row_of[t - begin, n] = torch.arange(len(t), device=device)
             e_in = (e_lead >= begin) & (e_lead < begin + F)
@@ -388,6 +397,18 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
         "events": events,
         "trajectory": {name: {key: v.cpu() for key, v in tr.items()} for name, tr in trajectory.items()},
     }
+
+
+def _agent_observed(gone_before, t, n, window_sizes, targets):
+    """(B, W, A) bool: the outcome of row (t, n) in window k is observable for the
+    agent: it is visible in every frame t..t + W_k - 1 inside the video (frames past
+    the video end are left to `known`), or the onset was seen (targets) before it left.
+    An alarm for an agent that leaves the scene (or whose track drops out) is neither
+    right nor wrong. gone_before (T + 1, N): invisible frames before each frame."""
+    T = gone_before.shape[0] - 1
+    end = (t[:, None] + window_sizes[None, :]).clamp(max=T)                          # (B, W)
+    gone = gone_before[end, n[:, None]] - gone_before[t[:, None], n[:, None]]
+    return (gone == 0)[:, :, None] | targets
 
 
 def _detect(scores, edges):
@@ -562,7 +583,12 @@ def select_head_thresholds(scores, cfg):
     least cfg["per_head_min_events"] val events (and some F1 > 0); else the one of
     the pooled events and alarms of its event type, with the same condition; else
     cfg["detected_th"]. The scorers with FIXED_THRESHOLDS keep theirs.
-    Returns {scorer: {"bins", "source": (W, A) long (HEAD_THRESHOLD_SOURCES index)}}."""
+    Per-event gating: a head is open (may raise alarms) in window k only if on val it has
+    at least cfg["gate_min_events"] events and its alarms at its threshold reach
+    cfg["gate_min_precision"] with at least cfg["gate_min_correct"] correct ones; the
+    gated heads raise no alarms (`_head_operating_point`), their events count as missed.
+    Returns {scorer: {"bins", "source": (W, A) long (HEAD_THRESHOLD_SOURCES index),
+    "open": (W, A) bool, "val_precision": (W, A) the head's val alarm precision at its bin}}."""
     head_type = cfg["head_types"]
     min_events = cfg["per_head_min_events"]
     global_bin = _threshold_bin(cfg["detected_th"])
@@ -593,20 +619,30 @@ def select_head_thresholds(scores, cfg):
             own = (events["num_events"] >= min_events) & (f1 > 0)
             bins[k, own] = b[own]
             source[k, own] = HEAD_THRESHOLD_SOURCES.index("head")
-        out[name] = {"bins": bins, "source": source}
+        # Per-event gating: the head's own val alarms at its chosen threshold.
+        index = torch.arange(A)
+        correct = torch.stack([starts["pos"][index, k, bins[k]] for k in range(W)])           # (W, A)
+        alarms = correct + torch.stack([starts["neg"][index, k, bins[k]] for k in range(W)])
+        val_precision = correct / alarms.clamp(min=1)
+        is_open = ((events["num_events"] >= cfg["gate_min_events"])[None, :]
+                   & (correct >= cfg["gate_min_correct"]) & (val_precision >= cfg["gate_min_precision"]))
+        out[name] = {"bins": bins, "source": source, "open": is_open, "val_precision": val_precision}
     return out
 
 
-def _head_operating_point(events, starts, k, bins, heads, minutes, fps):
+def _head_operating_point(events, starts, k, bins, heads, minutes, fps, open_heads=None):
     """Detections of window k with a threshold bin per head (bins (A,)), summed over
-    the heads where heads (A,) bool: event recall, prediction time, coverage and alarms."""
+    the heads where heads (A,) bool: event recall, prediction time, coverage and alarms.
+    open_heads (A,) bool (per-event gating): the other heads raise no alarms and detect
+    nothing, their events still count (as missed)."""
     index = torch.arange(len(bins))
+    alarming = heads if open_heads is None else heads & open_heads
     num_events = events["num_events"][heads].sum().item()
-    detected = events["detected"][index, k, bins][heads].sum().item()
-    lead = events["lead_sum"][index, k, bins][heads].sum().item()
-    coverage = events["coverage_sum"][index, k, bins][heads].sum().item()
-    correct = starts["pos"][index, k, bins][heads].sum().item()
-    alarms = correct + starts["neg"][index, k, bins][heads].sum().item()
+    detected = events["detected"][index, k, bins][alarming].sum().item()
+    lead = events["lead_sum"][index, k, bins][alarming].sum().item()
+    coverage = events["coverage_sum"][index, k, bins][alarming].sum().item()
+    correct = starts["pos"][index, k, bins][alarming].sum().item()
+    alarms = correct + starts["neg"][index, k, bins][alarming].sum().item()
     prediction_time = lead / detected if detected else None
     return {
         "events": int(num_events),
@@ -625,19 +661,26 @@ def _head_operating_point(events, starts, k, bins, heads, minutes, fps):
     }
 
 
-def _per_head_threshold_point(events, starts, k, thresholds, counted, cfg, minutes, fps):
+def _per_head_threshold_point(events, starts, k, thresholds, counted, cfg, minutes, fps, gated=False):
     """The per-head-threshold operating point of window k: overall (the counted
     heads), by_type, and how many heads of each type use their own, their type's
-    or the global threshold."""
+    or the global threshold. gated: only the heads open by the per-event gating
+    (thresholds["open"]) alarm; adds the number of open heads."""
     bins = thresholds["bins"][k]
-    point = _head_operating_point(events, starts, k, bins, counted, minutes, fps)
+    open_heads = thresholds["open"][k] if gated else None
+    point = _head_operating_point(events, starts, k, bins, counted, minutes, fps, open_heads)
+    if gated:
+        point["open_heads"] = int((open_heads & counted).sum())
+        point["gated_heads"] = int((~open_heads & counted).sum())
     point["by_type"] = {}
     for g, event_type in enumerate(EVENT_TYPES):
         of_type = cfg["head_types"] == g
         point["by_type"][event_type] = {
-            **_head_operating_point(events, starts, k, bins, of_type, minutes, fps),
+            **_head_operating_point(events, starts, k, bins, of_type, minutes, fps, open_heads),
             "threshold_sources": {source: int(((thresholds["source"][k] == i) & of_type).sum())
                                   for i, source in enumerate(HEAD_THRESHOLD_SOURCES)}}
+        if gated:
+            point["by_type"][event_type]["open_heads"] = int((open_heads & of_type).sum())
     return point
 
 
@@ -920,6 +963,9 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
            "calibrated_levels": cfg["calibrated_levels"],
            "per_head_min_test_events": cfg["per_head_min_test_events"],
            "history_levels": cfg["history_levels"],
+           "exclude_agent_leaving": cfg.get("exclude_agent_leaving", False),
+           "gate_min_events": cfg["gate_min_events"], "gate_min_precision": cfg["gate_min_precision"],
+           "gate_min_correct": cfg["gate_min_correct"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
            "motif_net": cfg.get("motif_net", False),
            "threshold_from": f"detected_th {cfg['detected_th']} (fixed: {FIXED_THRESHOLDS})",
@@ -981,9 +1027,11 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
                 "mean_lookback": events["lookback_sum"][k].item() / max(events["num_events"], 1),
                 "events_at_threshold": values,
                 "by_type": by_type,
-                **({"per_head_threshold": _per_head_threshold_point(
+                **({key: _per_head_threshold_point(
                     scores["events"][name]["per_head"], scores["starts"][name]["per_head"], k,
-                    head_thresholds[name], counted, cfg, minutes, fps)} if name in (head_thresholds or {}) else {}),
+                    head_thresholds[name], counted, cfg, minutes, fps, gated=gated)
+                    for key, gated in (("per_head_threshold", False), ("per_head_threshold_gated", True))}
+                   if name in (head_thresholds or {}) else {}),
                 "at_recall": at_recall,
                 "curve": {"threshold": edges.tolist(), "recall": curve["recall"].tolist(),
                           "prediction_time": [_nan_to_none(x) for x in curve["prediction_time"].tolist()],
@@ -999,8 +1047,11 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
             "min_events": cfg["per_head_min_events"],
             "labels": [step05._atom_name(a) for a in unique_atoms],
             "event_types": [EVENT_TYPES[int(g)] for g in cfg["head_types"]],
+            "gate": {key: cfg[key] for key in ("gate_min_events", "gate_min_precision", "gate_min_correct")},
             "scorers": {name: {str(w): {"threshold": [edges_list[b] for b in t["bins"][k].tolist()],
-                                        "source": [HEAD_THRESHOLD_SOURCES[x] for x in t["source"][k].tolist()]}
+                                        "source": [HEAD_THRESHOLD_SOURCES[x] for x in t["source"][k].tolist()],
+                                        "open": t["open"][k].tolist(),
+                                        "val_precision": t["val_precision"][k].tolist()}
                                for k, w in enumerate(model.windows)}
                         for name, t in head_thresholds.items()},
         }
@@ -1783,6 +1834,24 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
                           f"{h['precision']:>9.4f} ({g['precision']:.3f})"
                           f"{h['false_alarms_per_minute'] or 0:>9.1f} ({g['false_alarms_per_minute'] or 0:.1f})"
                           f"{src:>17}")
+        if any("per_head_threshold_gated" in d for d in results[headline]["detection"].values()):
+            print(f"[Per-event gating, window {headline}] per-head thresholds, only the heads with val alarm "
+                  f"precision >= {metrics.get('gate_min_precision')} (>= {metrics.get('gate_min_correct')} correct, "
+                  f">= {metrics.get('gate_min_events')} val events) alarm; in brackets: ungated per-head thresholds")
+            print(f"  {'scorer':<14}{'group':<9}{'events':>7}{'open heads':>11}{'recall':>15}{'PT mean':>9}"
+                  f"{'precision':>17}{'FA/min':>17}")
+            for name, d in results[headline]["detection"].items():
+                if "per_head_threshold_gated" not in d:
+                    continue
+                for group in ("overall", *metrics.get("counted_types", EVENT_TYPES)):
+                    gp = d["per_head_threshold_gated"]
+                    up = d["per_head_threshold"]
+                    h, u = (gp, up) if group == "overall" else (gp["by_type"][group], up["by_type"][group])
+                    print(f"  {SCORER_LABELS[name]:<14}{group:<9}{h['events']:>7}{h.get('open_heads', 0):>11}"
+                          f"{h['recall']:>8.3f} ({u['recall']:.3f})"
+                          f"{sec(h['mean_prediction_time']):>9.2f}"
+                          f"{h['precision']:>9.4f} ({u['precision']:.3f})"
+                          f"{h['false_alarms_per_minute'] or 0:>9.1f} ({u['false_alarms_per_minute'] or 0:.1f})")
         print(f"[Event recall per type and window]")
         print(f"  {'type':<9}{'scorer':<14}" + "".join(f"{w:>7}" for w in windows))
         for event_type in EVENT_TYPES:
@@ -1888,7 +1957,19 @@ def main(input_data):
         # candidates use FIXED_THRESHOLDS. The curves sweep every threshold.
         "detected_th": 0.5,
         # Version of the detection metric; a cached test_metrics.json of another one is redone.
-        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds_alarm_filter_calibration_all",
+        "detection_metric": "stretch_first_detection_coverage_by_type_head_thresholds_alarm_filter_calibration_all"
+                            "_agent_observed_gated",
+        # Rows (and so alarms) whose outcome cannot be seen are left out: past the video end
+        # (always, `known`) and, with this, the agent leaving the scene or its track dropping
+        # out within the window before an onset (`_agent_observed`).
+        "exclude_agent_leaving": True,
+        # Per-event gating (`select_head_thresholds`): a head alarms only if on val it has
+        # >= gate_min_events events and its alarms at its per-head threshold reach
+        # gate_min_precision with >= gate_min_correct correct ones; reported as the
+        # "per_head_threshold_gated" operating point next to the ungated "per_head_threshold".
+        "gate_min_events": 5,
+        "gate_min_precision": 0.05,
+        "gate_min_correct": 2,
         # Alarm filter (`_score_videos`), chosen on the val videos (`select_alarm_filter`): an
         # alarm needs k frames in a row above the threshold (persist) and alarms closer than
         # g frames merge (gap). k = g = 1 is the plain per-frame alarm.
@@ -1974,6 +2055,9 @@ def main(input_data):
                 "calibrated_levels": cfg["calibrated_levels"],
                 "per_head_min_test_events": cfg["per_head_min_test_events"],
                 "history_levels": cfg["history_levels"],
+                "exclude_agent_leaving": cfg["exclude_agent_leaving"],
+                "gate_min_events": cfg["gate_min_events"], "gate_min_precision": cfg["gate_min_precision"],
+                "gate_min_correct": cfg["gate_min_correct"],
                 "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
