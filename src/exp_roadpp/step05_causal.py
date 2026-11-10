@@ -92,7 +92,8 @@ def collect_rows(model, training_data, video_ids, cfg):
         frames = torch.arange(memory, X.shape[0], cfg["row_stride"], device=device)
         if len(frames) == 0:
             continue
-        rows = step05.video_rows(model, X, frames, training_data["min_off_frames"])
+        rows = step05.video_rows(model, X, frames, training_data["min_off_frames"],
+                                 roles=step05.video_roles(training_data["videos"][video_id], device))
         if len(rows["inputs"]) == 0:
             continue
         x, _k = model.split_inputs(rows["inputs"])

@@ -5,7 +5,7 @@ import getpass
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import utils_data
+from src.exp_roadpp import utils_data, roles as agent_roles
 from src.exp_roadpp.cauvid import TemporalRuleNet
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 
@@ -40,6 +40,13 @@ def _video_from_cells(video, num_atoms, device):
     t, n, a = video["cells"].to(device).long().T
     X[t, n, a] = True
     return X
+
+
+def video_roles(video, device):
+    """(T, N, K) long agent roles of a stored video (`prepare_videos`), or None if
+    the data was prepared without roles."""
+    roles = video.get("roles")
+    return None if roles is None else roles.to(device).long()
 
 
 def group_clauses_by_body(clauses):
@@ -169,8 +176,11 @@ def is_fresh(output_file, *source_files):
     return all(os.path.getmtime(output_file) >= os.path.getmtime(f) for f in source_files if os.path.exists(f))
 
 
-def prepare_videos(atom_file, num_atoms, device, min_off_frames=1):
+def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=()):
     """Compressed atoms and frame lists of every video of one split.
+    With roles (`roles.ROLES`), each video also gets "roles" (T, N, K) int16: the
+    agent filling each role for each agent and frame (-1: none), from the boxes of
+    box_file (step_dataset `_tracks_to_boxes`); a video without boxes has none.
 
     Returns {
       "num_atoms": A,
@@ -185,7 +195,14 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1):
     does an atom back on after a gap shorter than min_off_frames (label flicker).
     """
     atoms = utils_data.load_json(atom_file)
+    boxes = None
+    if roles:
+        if box_file is None or not os.path.exists(box_file):
+            raise FileNotFoundError(f"Agent roles {roles} need the box file {box_file} (step_dataset).")
+        boxes = torch.load(box_file, map_location="cpu")
     videos, frames, positive_frames = {}, {}, {}
+    role_stats = torch.zeros(len(roles))
+    num_rows = 0
     for video_id, video_atoms in tqdm(atoms.items(), desc="Preparing videos"):
         X = build_video_tensor(video_atoms, num_atoms, device=device)
         if X.shape[0] < 2:
@@ -196,10 +213,21 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1):
         has_onset = (atom_onsets(X, min_off_frames).any(dim=2) & stayed).any(dim=1)
 
         videos[video_id] = _video_cells(X)
+        if roles:
+            agent_ids = video_agent_ids(video_atoms)
+            video_boxes, classes = agent_roles.video_boxes(boxes.get(video_id), agent_ids, X.shape[0])
+            partners = agent_roles.role_partners(video_boxes, classes, agent_ids.get(None), roles)
+            partners[~visible.cpu()] = -1
+            videos[video_id]["roles"] = partners.to(torch.int16)
+            role_stats += (partners >= 0).sum(dim=(0, 1)).float()
+            num_rows += int(visible.sum())
         frames[video_id] = torch.nonzero(visible.any(dim=1)).flatten().cpu()
         positive_frames[video_id] = torch.nonzero(has_onset).flatten().cpu()
-    return {"num_atoms": num_atoms, "min_off_frames": min_off_frames, "videos": videos, "frames": frames,
-            "positive_frames": positive_frames}
+    if roles:
+        print(f"[Roles]\t {atom_file.name if hasattr(atom_file, 'name') else atom_file}: share of visible agents "
+              "with a partner: " + ", ".join(f"{r} {role_stats[k] / max(num_rows, 1):.2f}" for k, r in enumerate(roles)))
+    return {"num_atoms": num_atoms, "min_off_frames": min_off_frames, "roles": list(roles), "videos": videos,
+            "frames": frames, "positive_frames": positive_frames}
 
 
 # Marks how training_data.pt was split, so a file made another way is rebuilt.
@@ -212,12 +240,15 @@ def prepare_training_data(cfg):
     them trained on) and of its val split ("val_videos": model selection, the
     cascade thresholds and the step 06 alarm thresholds), in one dict."""
     num_atoms = len(utils_data.load_json(cfg['unique_atoms_file']))
-    train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
-    val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"])
+    train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
+                           cfg.get("train_box_file"), cfg["roles"])
+    val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
+                         cfg.get("val_box_file"), cfg["roles"])
     shared = set(train["videos"]) & set(val["videos"])
     if shared:
         raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
-    data = {"num_atoms": num_atoms, "min_off_frames": cfg["min_off_frames"], "split": SPLIT_SOURCE}
+    data = {"num_atoms": num_atoms, "min_off_frames": cfg["min_off_frames"], "split": SPLIT_SOURCE,
+            "roles": list(cfg["roles"])}
     for key in ("videos", "frames", "positive_frames"):
         data[key] = {**train[key], **val[key]}
     train_videos, val_videos = sorted(train["videos"]), sorted(val["videos"])
@@ -231,11 +262,12 @@ def prepare_training_data(cfg):
 
 def load_training_data(cfg):
     """training_data.pt, (re)built by `prepare_training_data` if it is missing,
-    has another min_off_frames or was split another way. Adds the event types of
+    has another min_off_frames, other agent roles or was split another way. Adds the event types of
     the heads ("event_types", `head_event_types`) and "target_heads" (A,) bool,
     the heads the models learn: all but the noise heads if cfg["exclude_noise_heads"]."""
     data = torch.load(cfg["training_data_file"], map_location="cpu") if os.path.exists(cfg["training_data_file"]) else {}
-    if data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE:
+    if (data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE
+            or data.get("roles", []) != list(cfg["roles"])):
         data = prepare_training_data(cfg)
         torch.save(data, cfg["training_data_file"])
     data["event_types"] = head_event_types(data, utils_data.load_json(cfg["unique_atoms_file"]), cfg)
@@ -344,9 +376,10 @@ def _video_rows(model, training_data, video_id, frames, device, history=None):
     Heads outside training_data["target_heads"] (the noise heads, see
     `load_training_data`) are never at risk and never targets, so no loss, count
     or clause covers them."""
-    X = _video_from_cells(training_data["videos"][video_id], training_data["num_atoms"], device)
+    video = training_data["videos"][video_id]
+    X = _video_from_cells(video, training_data["num_atoms"], device)
     rows = video_rows(model, X, frames.to(device), training_data.get("min_off_frames", 1),
-                      None if history is None else history.to(device))
+                      None if history is None else history.to(device), video_roles(video, device))
     if "target_heads" in training_data:
         target_heads = training_data["target_heads"].to(device)
         rows["at_risk"] = rows["at_risk"] & target_heads
@@ -354,13 +387,20 @@ def _video_rows(model, training_data, video_id, frames, device, history=None):
     return rows
 
 
-def video_rows(model, X, frames, min_off_frames=1, history=None):
+def video_rows(model, X, frames, min_off_frames=1, history=None, roles=None):
     """`TemporalRuleNet.training_rows` (a dict of inputs, rows, at_risk, first,
     targets, known) of the target frames of one (T, N, A) video tensor, without
     the agents entering the scene: their atoms all switch on at once in t, which
     are not events. history (F,): the frames known before each target frame
-    (default all; older ones are unknown inputs)."""
-    rows = model.training_rows(X, frames, min_off_frames, history)
+    (default all; older ones are unknown inputs). roles (T, N, K): the agent roles
+    (`video_roles`), passed on only to models that read roles."""
+    if getattr(model, "roles", ()):
+        if roles is None:
+            raise ValueError(f"The model reads the agent roles {model.roles}, the data has none: "
+                             "prepare it with the same cfg['roles'].")
+        rows = model.training_rows(X, frames, min_off_frames, history, roles=roles)
+    else:
+        rows = model.training_rows(X, frames, min_off_frames, history)
     t, n = rows["rows"].T
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
     return {key: value[seen] for key, value in rows.items()}
@@ -507,7 +547,7 @@ def _seeded_rule_net(training_data, cfg):
     anchors = anchor_rules(cfg)
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
                             len(anchors) * cfg["num_slots"] + cfg["num_free_rules"], cfg["init_log_alpha"],
-                            cfg["mask_type"], cfg["windows"])
+                            cfg["mask_type"], cfg["windows"], roles=cfg["roles"])
     num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
     print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
           f"{cfg['mask_type']} mask")
@@ -552,6 +592,18 @@ def train_temporal_rule_net(training_data, cfg, run=None):
                          cfg["history_file"], run)
 
 
+def _saved_roles(num_inputs, num_atoms, cfg):
+    """The roles of a saved model with num_inputs memory inputs: none for a model of
+    the two scopes (own, others; trained before the roles), else cfg["roles"]."""
+    num_scopes = num_inputs // (cfg["num_slots"] * num_atoms)
+    if num_scopes == 2:
+        return ()
+    if num_scopes != 2 + len(cfg["roles"]):
+        raise ValueError(f"The saved model has {num_scopes} input scopes, cfg['roles'] {cfg['roles']} gives "
+                         f"{2 + len(cfg['roles'])}.")
+    return tuple(cfg["roles"])
+
+
 def load_temporal_rule_net(training_data, cfg, model_file=None):
     """The trained TemporalRuleNet of model_file (default cfg["model_file"]), in
     eval mode on cfg["device"].
@@ -562,7 +614,8 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
     """
     state = torch.load(model_file or cfg["model_file"], map_location="cpu")
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
-                            state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"])
+                            state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"],
+                            roles=_saved_roles(state["log_alpha"].shape[1], training_data["num_atoms"], cfg))
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -644,7 +697,7 @@ def train_onset_mlp(training_data, cfg, run=None):
     rule nodes of the TemporalRuleNet, so both have about as many parameters."""
     hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * cfg["num_slots"] + cfg["num_free_rules"]
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], hidden_size, cfg["mlp_dropout"],
-                     cfg["windows"], cfg["mlp_activation"]).to(cfg["device"])
+                     cfg["windows"], cfg["mlp_activation"], roles=cfg["roles"]).to(cfg["device"])
     print(f"[Baseline] OnsetMLP with {hidden_size} {cfg['mlp_activation']} hidden units, lr {cfg['mlp_lr']}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["mlp_lr"], weight_decay=cfg["mlp_weight_decay"])
     mlp_cfg = {**cfg, "grad_clip": cfg["mlp_grad_clip"], "lr_patience": cfg["mlp_lr_patience"],
@@ -665,7 +718,8 @@ def load_onset_mlp(training_data, cfg):
         return None
     state = torch.load(cfg["mlp_model_file"], map_location="cpu")
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], state["hidden.weight"].shape[0],
-                     windows=cfg["windows"], activation=cfg["mlp_activation"])
+                     windows=cfg["windows"], activation=cfg["mlp_activation"],
+                     roles=_saved_roles(state["hidden.weight"].shape[1] // 2, training_data["num_atoms"], cfg))
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -740,11 +794,19 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
     return {name: value.cpu() for name, value in out.items()}
 
 
+def scope_names(model):
+    """Names of the input scopes (slot types) of a model: X0 the agent itself, X1
+    some other agent, then its roles (e.g. "ahead")."""
+    return ["X0", "X1", *getattr(model, "roles", ())]
+
+
 def _temporal_clause_text(clause, unique_atoms):
     # Bodies earliest first, in frames before the head's 10-frame slot:
-    # "Car:MovAway(X0)@-30..-20f -> Ped:Wait(X1)@-10..0f => Car:Stop(X0)".
+    # "Car:MovAway(X0)@-30..-20f -> Car:Brake(ahead)@-10..0f => Car:Stop(X0)".
+    names = clause.get("scope_names") or ["X0", "X1"]
+
     def atom(atom_index, slot):
-        return f"{_atom_name(unique_atoms[atom_index])}(X{slot})"
+        return f"{_atom_name(unique_atoms[atom_index])}({names[slot] if slot < len(names) else f'X{slot}'})"
     size = clause.get("slot_size", 10)
     body = " -> ".join(f"{atom(a, slot)}@-{size * j}..-{size * (j - 1)}f" for a, slot, j in clause["bodies"])
     return f"{body} => {atom(*clause['head'])}"
@@ -799,6 +861,7 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
             clauses.append({
                 "bodies": [list(b) for b in rule["bodies"]],
                 "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
+                "scope_names": scope_names(model),
                 "head": [h, 0],
                 "slot_size": model.slot_size,
                 "anchor": anchor,
@@ -1064,9 +1127,14 @@ def get_cfg(input_data):
     # Type balance (`head_pos_weight_scale`), main rule net only: the onsets of the event types
     # with fewer onsets per head weigh (M_max / M_type) ** power, at most type_balance_max.
     type_balance = {"type_balance": True, "type_balance_power": 0.5, "type_balance_max": 4.0}
+    # Agent roles (`roles.py`): one more input scope per role, the atoms of the agent filling
+    # it for the row's agent (e.g. the agent ahead of it), from the GT boxes; () for none.
+    roles = ("ahead", "near_ped")
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
+    if roles:
+        base_tag += "_r" + "-".join(roles)
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     tag = base_tag + type_balance_tag(type_balance)
@@ -1089,9 +1157,10 @@ def get_cfg(input_data):
             'rare_below': 10,
             'trivial_above': 100,
             **type_balance,
-            # Train only the main rule net (training time): the MLP and the motif net are not
-            # trained, their cached (unweighted) models are evaluated if they exist; the models
-            # derived from the main rule net (cascade, causal pruning, rule set) are skipped.
+            # Train only the main rule net and the MLP baseline (training time): the motif net is
+            # not trained, its cached model is evaluated if it exists; the models derived from the
+            # main rule net (cascade, causal pruning, rule set) are skipped. The MLP is always
+            # trained (mlp_baseline), as the comparison of the rule net on the same inputs.
             'main_only': True,
             # Targets: the atom switches on within the next W frames, for each window W
             # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
@@ -1163,6 +1232,9 @@ def get_cfg(input_data):
             'wandb_project': 'cauvid-roadpp',
             'train_atom_file': input_data['train_atom_file'],
             'val_atom_file': input_data['val_atom_file'],
+            'roles': roles,
+            'train_box_file': input_data.get('train_box_file'),
+            'val_box_file': input_data.get('val_box_file'),
             'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
             "unique_atoms_file": input_data["unique_atoms_file"],
             'training_data_file': input_data["output_dir"] / "training_data.pt",
@@ -1213,7 +1285,7 @@ def main(input_data):
             run.finish()
 
     # 4. The black-box baseline on the same data, its own W&B run; step 06 evaluates it.
-    if cfg["mlp_baseline"] and not cfg["main_only"] and not is_fresh(cfg["mlp_model_file"], cfg["training_data_file"]):
+    if cfg["mlp_baseline"] and not is_fresh(cfg["mlp_model_file"], cfg["training_data_file"]):
         run = _init_wandb(cfg, {"num_atoms": training_data["num_atoms"]}, job_type="step05_onset_mlp")
         try:
             mlp = train_onset_mlp(training_data, cfg, run)

@@ -108,7 +108,9 @@ def model_file_of(step05_cfg):
                    "output_dir": step05_cfg["model_file"].parent,
                    "train_atom_file": step05_cfg["train_atom_file"], "val_atom_file": step05_cfg["val_atom_file"],
                    "causal_anchor_clause_file": step05_cfg["causal_anchor_clause_file"],
-                   "unique_atoms_file": step05_cfg["unique_atoms_file"]})
+                   "unique_atoms_file": step05_cfg["unique_atoms_file"],
+                   "train_box_file": step05_cfg.get("train_box_file"),
+                   "val_box_file": step05_cfg.get("val_box_file")})
     return cfg["model_file"], cfg
 
 

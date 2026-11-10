@@ -109,7 +109,8 @@ def rule_statistics(model, pairs, data, video_ids, cfg, selections=None):
         fired_dense = torch.zeros((T, N, len(pairs)), dtype=torch.bool, device=device)
         risk_dense = torch.zeros((T, N, A), dtype=torch.bool, device=device)
         for frames in torch.arange(memory, T, device=device).split(cfg["step05_cfg"]["frames_per_video"]):
-            rows = step05.video_rows(model, X, frames, data["min_off_frames"])
+            rows = step05.video_rows(model, X, frames, data["min_off_frames"],
+                                     roles=step05.video_roles(data["videos"][video_id], device))
             if len(rows["inputs"]) == 0:
                 continue
             x, _k = model.split_inputs(rows["inputs"])

@@ -88,6 +88,68 @@ def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels):
 
     return video_atoms
 
+# Frame size of the ROAD++ (Waymo front camera) videos, to normalize boxes given in pixels.
+DEFAULT_FRAME_SIZE = (1920, 1280)
+
+
+def _normalized_box(box, frame):
+    """(x1, y1, x2, y2) in [0, 1] of a GT box: a list [x1, y1, x2, y2] or a dict
+    {"x1", "y1", "x2", "y2"}, normalized already or in pixels (divided by the
+    frame's width / height, else DEFAULT_FRAME_SIZE). None if it cannot be read."""
+    if isinstance(box, dict):
+        box = [box.get(key) for key in ("x1", "y1", "x2", "y2")]
+    if not isinstance(box, (list, tuple)) or len(box) != 4 or any(v is None for v in box):
+        return None
+    x1, y1, x2, y2 = (float(v) for v in box)
+    if max(x1, y1, x2, y2) > 1.5:
+        width = float(frame.get("width") or DEFAULT_FRAME_SIZE[0])
+        height = float(frame.get("height") or DEFAULT_FRAME_SIZE[1])
+        x1, x2, y1, y2 = x1 / width, x2 / width, y1 / height, y2 / height
+    return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+
+
+def _tracks_to_boxes(track_dir, video_ids, box_file, dataset_labels):
+    """Per-frame boxes of every agent tube, for the agent roles of step 05 (`roles.py`).
+
+    Saves {video_id: {tube_uid: {"label": agent class label, "frames": (K,) long,
+    "boxes": (K, 4) float normalized x1, y1, x2, y2}}} to box_file (torch). The
+    tube_uid is the one of the tube's atoms (`utils_data.get_start_end_frame`),
+    so step 05 maps the boxes onto its agents; tubes without one are left out
+    (their atoms share the ego's None)."""
+    out, unread, read = {}, 0, 0
+    for vid in tqdm(video_ids, desc="Tracks to Boxes"):
+        track_file = Path(track_dir) / f"{vid}_gt.json"
+        if not track_file.exists():
+            continue
+        data = utils_data.load_json(track_file)["data"]
+        frames = data["frames"]
+        tubes = {}
+        for tube in data["agent_tubes"].values():
+            _start, _end, tube_uid = utils_data.get_start_end_frame(tube, frames)
+            if tube_uid is None:
+                continue
+            frame_ids, boxes = [], []
+            for frame_id, box_id in tube.get("annos", {}).items():
+                frame = frames.get(str(frame_id), {})
+                box = _normalized_box(frame.get("annos", {}).get(box_id, {}).get("box"), frame)
+                if box is None:
+                    unread += 1
+                    continue
+                read += 1
+                frame_ids.append(int(frame_id))
+                boxes.append(box)
+            if frame_ids:
+                tubes[tube_uid] = {"label": dataset_labels["agent_labels"][tube["label_id"]],
+                                   "frames": torch.tensor(frame_ids, dtype=torch.long),
+                                   "boxes": torch.tensor(boxes, dtype=torch.float)}
+        out[vid] = tubes
+    torch.save(out, box_file)
+    print(f"[Boxes] {read} boxes of {sum(len(t) for t in out.values())} tubes in {len(out)} videos"
+          f" ({unread} unreadable) saved to {box_file}")
+    if read == 0:
+        raise ValueError(f"No readable box in the tracks of {track_dir}: check the box format (`_normalized_box`).")
+
+
 def _build_unique_atoms(atom_files, unique_atoms_file):
     """Vocabulary of atom signatures without tube_uid, shared by all splits.
     Built from the interval atoms, since per_frame_atoms miss atoms whose intervals
@@ -232,6 +294,15 @@ def prepare_per_frame_atoms(language_model, cfg):
             _compress_atom_file(atoms_folder / f"{split_name}_atoms.json", compressed_file, atom_vocab)
         else:
             print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
+
+    # The agents' boxes per frame (step 05 agent roles), for the videos of each split's atom file.
+    for split_name in splits:
+        box_file = atoms_folder / f"{split_name}_boxes.pt"
+        if not os.path.exists(box_file):
+            video_ids = list(utils_data.load_json(atoms_folder / f"{split_name}_atoms_compressed.json"))
+            _tracks_to_boxes(track_dir, video_ids, box_file, cfg["dataset_labels"])
+        else:
+            print(f"[Boxes] {box_file} already exists.")
 
 # -------------- Task Preparation Helper Functions --------------
 def _prepare_task_target(interval_atom):

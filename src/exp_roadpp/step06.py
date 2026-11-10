@@ -160,7 +160,7 @@ def _own_inputs(other, context, num_rows):
     the current chunk (context: X, frames, known, min_off_frames); same row
     selection as `step05.video_rows`, so the rows match the main model's."""
     inputs = step05.video_rows(other, context["X"], context["frames"], context["min_off_frames"],
-                               context["known"])["inputs"]
+                               context["known"], context.get("roles"))["inputs"]
     assert len(inputs) == num_rows, "the rows of the two models differ"
     return inputs
 
@@ -281,6 +281,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
     num_frames = 0
     for video_id in tqdm(data["videos"], desc="Scoring videos" + ("" if history is None else f" (history {history})")):
         X = step05._video_from_cells(data["videos"][video_id], A, device)
+        roles = step05.video_roles(data["videos"][video_id], device)
         T, N, _A = X.shape
         num_frames += max(T - min_context, 0)
         # Exact onsets and, per onset, the frames t_e - j (j = 0..T - 1) before it.
@@ -304,8 +305,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
             F = len(frames)
             known = None if history is None else frames.clamp(max=history)
-            rows = step05.video_rows(model, X, frames, data["min_off_frames"], known)
-            context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"])
+            rows = step05.video_rows(model, X, frames, data["min_off_frames"], known, roles)
+            context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"], roles=roles)
             t, n = rows["rows"].T
             targets = rows["targets"]
             # A row counts (rows, alarms) only if its outcome is observable: the window does not
@@ -2004,10 +2005,12 @@ def main(input_data):
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
-    if test_data.get("min_off_frames") != step05_cfg["min_off_frames"]:
+    if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
+            or test_data.get("roles", []) != list(step05_cfg["roles"])):
         num_atoms = len(utils_data.load_json(cfg["unique_atoms_file"]))
         test_data = step05.prepare_videos(cfg["test_atoms_file"], num_atoms, cfg["device"],
-                                          step05_cfg["min_off_frames"])
+                                          step05_cfg["min_off_frames"], input_data.get("test_box_file"),
+                                          step05_cfg["roles"])
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
     mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained

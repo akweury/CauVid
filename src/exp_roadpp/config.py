@@ -281,6 +281,9 @@ def get_step_05_input(args):
         'train_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "train_atoms_compressed.json",
         # The dataset's own val split: model selection and all thresholds.
         'val_atom_file': args.output_dir / "step_dataset_output" / "atoms" / "val_atoms_compressed.json",
+        # Per-frame agent boxes of each split (step_dataset), for the agent roles of step 05.
+        'train_box_file': args.output_dir / "step_dataset_output" / "atoms" / "train_boxes.pt",
+        'val_box_file': args.output_dir / "step_dataset_output" / "atoms" / "val_boxes.pt",
         "delay_windows": args.delay_windows,
         "past_windows": getattr(args, "past_windows", [3, 5, 10]),
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
@@ -296,6 +299,7 @@ def get_step_06_input(args):
         "output_dir": output_dir,
         "device": args.device,
         "test_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "test_atoms_compressed.json",
+        "test_box_file": args.output_dir / "step_dataset_output" / "atoms" / "test_boxes.pt",
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "frame_rate": args.frame_rate,
         # Step 06 loads the step 05 model and clauses with the step 05 settings.

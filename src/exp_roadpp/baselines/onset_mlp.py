@@ -30,13 +30,16 @@ class OnsetMLP(torch.nn.Module):
     ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "relu": torch.relu}
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, hidden_size=256, dropout=0.2, windows=(10,),
-                 activation="gelu"):
+                 activation="gelu", roles=()):
         super().__init__()
         self.num_atoms = num_atoms
         # The memory slots of TemporalRuleNet.
         self.slot_size, self.num_slots = slot_size, num_slots
         self.num_lags = slot_size * num_slots
-        self.num_inputs = 2 * num_slots * num_atoms
+        # The scopes of TemporalRuleNet: the agent itself, some other agent, one per role.
+        self.roles = tuple(roles)
+        self.num_scopes = 2 + len(self.roles)
+        self.num_inputs = self.num_scopes * num_slots * num_atoms
         self.windows = list(windows)
         self.hidden = torch.nn.Linear(2 * self.num_inputs, hidden_size)
         self.dropout = torch.nn.Dropout(dropout)
@@ -51,12 +54,12 @@ class OnsetMLP(torch.nn.Module):
         return self.head(hidden).view(len(inputs), len(self.windows), self.num_atoms), hidden
 
     @torch.no_grad()
-    def predict(self, X, history=None):
+    def predict(self, X, history=None, roles=None):
         """(N, W, A) probability that each atom switches on for each agent within
         each window after X, knowing the last `history` frames of X (default all).
         Agents not visible in the last frame of X get zeros."""
         T, N, _A = X.shape
         known = None if history is None else torch.tensor([history], device=X.device)
-        inputs = self.layer_inputs(X, torch.tensor([T], device=X.device), known)
+        inputs = self.layer_inputs(X, torch.tensor([T], device=X.device), known, roles)
         probabilities = self.window_probs(self(inputs)[0])
         return probabilities * X[-1].any(dim=1)[:, None, None]

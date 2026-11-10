@@ -175,8 +175,11 @@ class TemporalRuleNet(torch.nn.Module):
     the probability of an onset within W_k = (k + 1) * slot_size frames is
     1 - prod_{f <= k} (1 - h_fa), never decreasing with the window.
 
-    Inputs are packed as (B, 2M): the truth values x of the M = 2 * num_slots * A
-    memory inputs, then their known flags (`split_inputs`).
+    Inputs are packed as (B, 2M): the truth values x of the M = scopes * num_slots * A
+    memory inputs, then their known flags (`split_inputs`). Scopes: 0 the agent
+    itself, 1 some other agent, 2.. one per role of `roles` (e.g. "ahead": the
+    agent ahead of it, `roles.role_partners`), so rules can name a specific
+    related agent instead of any agent of the class.
 
     mask_type "hard_concrete": a stochastic L0 mask while training. "sigmoid": the
     deterministic mask sigmoid(log_alpha) of `LayeredRuleNet`, started near 0 so
@@ -184,7 +187,7 @@ class TemporalRuleNet(torch.nn.Module):
     """
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
-                 mask_type="hard_concrete", windows=(10,)):
+                 mask_type="hard_concrete", windows=(10,), roles=()):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
@@ -196,7 +199,9 @@ class TemporalRuleNet(torch.nn.Module):
         self.slot_size, self.num_slots = slot_size, num_slots
         self.num_bins = num_slots                      # rule seeds per anchor (one per slot offset j)
         self.num_lags = slot_size * num_slots          # frames of memory
-        self.num_inputs = 2 * num_slots * num_atoms
+        self.roles = tuple(roles)
+        self.num_scopes = 2 + len(self.roles)
+        self.num_inputs = self.num_scopes * num_slots * num_atoms
         self.windows = windows
         num_future = len(windows)
         # Very negative so only a few random inputs per rule start non-zero.
@@ -216,8 +221,10 @@ class TemporalRuleNet(torch.nn.Module):
         self.register_buffer("shift_index", torch.stack(shift))
 
     def input_index(self, atom, slot, offset):
-        """Input node of `decode_input`'s (atom, slot type, slot offset j = 1..num_slots)."""
-        return min(slot, 1) * self.num_slots * self.num_atoms + (offset - 1) * self.num_atoms + atom
+        """Input node of `decode_input`'s (atom, slot type (scope), slot offset j = 1..num_slots)."""
+        if not 0 <= slot < self.num_scopes:
+            raise ValueError(f"Scope {slot} outside 0..{self.num_scopes - 1}.")
+        return slot * self.num_slots * self.num_atoms + (offset - 1) * self.num_atoms + atom
 
     def split_inputs(self, inputs):
         """Packed inputs (B, 2M) -> truth values x (B, M), known flags k (B, M)."""
@@ -239,13 +246,14 @@ class TemporalRuleNet(torch.nn.Module):
         for i, ((atom, slot), heads) in enumerate(anchors):
             for j in range(1, self.num_slots + 1):
                 r = i * self.num_slots + j - 1
-                self.fixed_inputs[r, self.input_index(atom, slot, j)] = True
+                # The anchors name the head agent (0) or other agents (>= 1: any other agent).
+                self.fixed_inputs[r, self.input_index(atom, min(slot, 1), j)] = True
                 self.head_weight[:, r] = 0.0
                 self.head_weight[list(heads), r] = head_weight
         return num_seeded
 
     # -------- inputs and targets of one video ----------------------------------
-    def layer_inputs(self, X, frames, history=None):
+    def layer_inputs(self, X, frames, history=None, roles=None):
         """(F * N, 2M) packed memory inputs of every agent at each target frame.
 
         X: (T, N, A) bool atom tensor of `step05.build_video_tensor`; frames: (F,)
@@ -254,6 +262,11 @@ class TemporalRuleNet(torch.nn.Module):
         them, t; capped at t). Row f * N + n is agent n at frames[f]. An input is
         true if the atom was seen in a known frame of its slot, false if the slot
         is fully known and it was not, unknown otherwise.
+        Scopes (slot types): 0 the agent itself, 1 some other agent, then one per
+        role of self.roles: the atoms of the agent filling that role for this agent
+        in frame t - 1 (the last observed frame), read over the whole memory.
+        roles (T, N, K) long (`roles.role_partners`, -1: none) is needed if the
+        model has roles; an agent without a partner gets false (where known).
         """
         J, S, A = self.num_slots, self.slot_size, self.num_atoms
         N, F = X.shape[1], len(frames)
@@ -265,15 +278,27 @@ class TemporalRuleNet(torch.nn.Module):
         own = own.view(F, J, S, N, A).any(dim=2)                               # (F, J, N, A)
         holders = own.sum(dim=2, keepdim=True)
         others = (holders - own.int()) > 0
-        x = torch.stack([own, others], dim=1)                                  # (F, 2, J, N, A)
+        channels = [own, others]
+        if self.roles:
+            if roles is None:
+                raise ValueError(f"This model reads the agent roles {self.roles}: pass roles (T, N, K).")
+            last = frames - 1
+            partner = roles.to(X.device)[last.clamp(min=0)]                     # (F, N, K)
+            partner = torch.where((last >= 0)[:, None, None], partner, -1)
+            for k in range(len(self.roles)):
+                p = partner[:, :, k]                                           # (F, N)
+                index = p.clamp(min=0)[:, None, :, None].expand(F, J, N, A)
+                channels.append(own.gather(2, index) & (p >= 0)[:, None, :, None])
+        x = torch.stack(channels, dim=1)                                       # (F, scopes, J, N, A)
         slot_known = (torch.arange(1, J + 1, device=X.device) * S)[None, :] <= history.clamp(min=0)[:, None]
         k = x | slot_known[:, None, :, None, None]
         x = x.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
         k = k.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
         return torch.cat([x, k], dim=1).float()
 
-    def training_rows(self, X, frames, min_off_frames=1, history=None):
+    def training_rows(self, X, frames, min_off_frames=1, history=None, roles=None):
         """Inputs and window targets of the agents visible at each target frame.
+        roles: the agent roles of `layer_inputs` (only models with roles take them).
 
         Returns a dict:
           inputs (B, 2M) float (`layer_inputs`, with the known history per frame);
@@ -290,7 +315,8 @@ class TemporalRuleNet(torch.nn.Module):
               video end without an onset are censored, not negatives).
         """
         N = X.shape[1]
-        inputs = self.layer_inputs(X, frames, history)
+        inputs = (self.layer_inputs(X, frames, history) if roles is None
+                  else self.layer_inputs(X, frames, history, roles=roles))
         t = frames.repeat_interleave(N)
         n = torch.arange(N, device=X.device).repeat(len(frames))
         keep = X[t, n].any(dim=1)
@@ -400,14 +426,14 @@ class TemporalRuleNet(torch.nn.Module):
 
     # -------- use after training ----------------------------------
     @torch.no_grad()
-    def predict(self, X, history=None):
+    def predict(self, X, history=None, roles=None):
         """(N, W, A) probability that each atom switches on for each agent within
         each window after X, knowing the last `history` frames of X (default all).
-        Agents not visible in the last frame of X get zeros."""
+        Agents not visible in the last frame of X get zeros. roles: see `layer_inputs`."""
         T, N, _A = X.shape
         frames = torch.tensor([T], device=X.device)
         known = None if history is None else torch.tensor([history], device=X.device)
-        probabilities = self.window_probs(self(self.layer_inputs(X, frames, known))[0])
+        probabilities = self.window_probs(self(self.layer_inputs(X, frames, known, roles))[0])
         return probabilities * X[-1].any(dim=1)[:, None, None]
 
     @torch.no_grad()
@@ -420,7 +446,8 @@ class TemporalRuleNet(torch.nn.Module):
 
     def decode_input(self, m):
         """Input node m -> (atom, slot type, j): slot type 0 the agent itself, 1
-        another agent; the atom holds in the slot j slots before the head's slot."""
+        another agent, 2 + k the agent of role self.roles[k]; the atom holds in
+        the slot j slots before the head's slot."""
         J, A = self.num_slots, self.num_atoms
         return m % A, m // (J * A), (m // A) % J + 1
 
