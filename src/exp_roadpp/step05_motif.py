@@ -30,6 +30,7 @@ def get_cfg(input_data):
     tag = f"b{fine_size}x{motif_span}_s{slot_size}x{num_slots}_m{num_free_motifs}_r{num_free_rules}_p{p_min}"
     if base["exclude_noise_heads"]:
         tag += f"_tn{base['noise_below']}"                     # the noise heads are no training targets
+    tag += step05.type_balance_tag(base)                         # the type-balanced onset weights
     output_dir = input_data["output_dir"]
     return {
         "enabled": True,
@@ -156,7 +157,8 @@ def train_motif_rule_net(training_data, cfg, run=None):
             if len(rows["inputs"]) == 0:
                 continue
             hazards, rules_now = model(rows["inputs"])
-            window_loss = model.loss(hazards, rows["targets"], rows["at_risk"], rows["known"], cfg["pos_weight"])
+            window_loss = model.loss(hazards, rows["targets"], rows["at_risk"], rows["known"],
+                                     step05.pos_weight_of(training_data, cfg))
             loss = window_loss
             if regularize:
                 precision = model.precision_loss(rules_now, rows, counts, cfg["p_min"], cfg["precision_k"],

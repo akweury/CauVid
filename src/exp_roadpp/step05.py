@@ -241,6 +241,7 @@ def load_training_data(cfg):
     data["event_types"] = head_event_types(data, utils_data.load_json(cfg["unique_atoms_file"]), cfg)
     noise = data["event_types"]["types"] == EVENT_TYPES.index("noise")
     data["target_heads"] = ~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise)
+    data["pos_weight_scale"] = head_pos_weight_scale(data["event_types"], cfg)
     print(f"[Heads]\t {int(data['target_heads'].sum())} of {data['num_atoms']} heads are learned"
           + (f" ({int(noise.sum())} noise heads, < {cfg['noise_below']} train + val onsets, left out)"
              if cfg["exclude_noise_heads"] else ""))
@@ -248,6 +249,39 @@ def load_training_data(cfg):
 
 
 # Event types by the frequency of their head (onsets in the train + val videos), see
+def head_pos_weight_scale(event_types, cfg):
+    """(A,) factor of every head's onset weight (pos_weight): with cfg["type_balance"], an
+    event type with fewer onsets (train + val) weighs its onsets up, (N_max / N_type) ** power
+    capped at type_balance_max, N_max the onsets of the most frequent learned type, so the
+    frequent trivial heads no longer dominate the loss, the sparsity budget and the rules;
+    else 1 for every head. The noise heads (no targets) keep 1."""
+    types = event_types["types"]
+    scale = torch.ones(len(types))
+    if not cfg.get("type_balance"):
+        return scale
+    totals = {t: sum(h["onsets"] for h in event_types["heads"][t]) for t in EVENT_TYPES if t != "noise"}
+    reference = max(totals.values())
+    for g, t in enumerate(EVENT_TYPES):
+        if t in totals and totals[t] > 0:
+            scale[types == g] = min((reference / totals[t]) ** cfg["type_balance_power"], cfg["type_balance_max"])
+    print("[Type balance]\t onset weight x " + ", ".join(
+        f"{t} {scale[types == EVENT_TYPES.index(t)][0]:.2f} ({totals[t]} onsets)"
+        for t in totals if (types == EVENT_TYPES.index(t)).any()))
+    return scale
+
+
+def pos_weight_of(training_data, cfg):
+    """The onset weight of the loss: cfg["pos_weight"] times the per-head type balance
+    (`head_pos_weight_scale`, (A,) on cfg["device"]) if the training data has it."""
+    scale = training_data.get("pos_weight_scale")
+    return cfg["pos_weight"] if scale is None else cfg["pos_weight"] * scale.to(cfg["device"])
+
+
+def type_balance_tag(cfg):
+    """File tag suffix of the type balance, "" without it."""
+    return f"_tb{cfg['type_balance_power']:g}m{cfg['type_balance_max']:g}" if cfg.get("type_balance") else ""
+
+
 # `head_event_types`: heads with < noise_below onsets are "noise", < rare_below "rare",
 # > trivial_above "trivial", the rest "regular". The rare heads are training targets like the
 # regular ones; step 06 only reports them apart (too few onsets for reliable rules).
@@ -361,7 +395,8 @@ def _validation_loss(model, training_data, val_frames, cfg, candidates=None):
             continue
         at_risk = rows["at_risk"] if candidates is None else rows["at_risk"] & candidates(rows["inputs"])
         hazards, _rules = model(rows["inputs"])
-        losses.append(model.loss(hazards, rows["targets"], at_risk, rows["known"], cfg["pos_weight"]).item())
+        losses.append(model.loss(hazards, rows["targets"], at_risk, rows["known"],
+                                 pos_weight_of(training_data, cfg)).item())
     return sum(losses) / len(losses) if losses else float("nan")
 
 
@@ -396,6 +431,7 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=cfg["lr_patience"])
                  if cfg.get("lr_patience") else None)
     best_epoch = 0
+    pos_weight = pos_weight_of(training_data, cfg)                                   # scalar or (A,)
     # Fixed validation frames and known histories, so the losses of the epochs are comparable.
     val_frames = {}
     for video_id in training_data["val_videos"]:
@@ -424,7 +460,7 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
                 at_risk = at_risk & candidates(rows["inputs"])
 
             hazards, _hidden = model(rows["inputs"])
-            onset_loss = model.loss(hazards, rows["targets"], at_risk, rows["known"], cfg["pos_weight"])
+            onset_loss = model.loss(hazards, rows["targets"], at_risk, rows["known"], pos_weight)
             loss = onset_loss if regularization is None else onset_loss + regularization(epoch)
             optimizer.zero_grad()
             loss.backward()
@@ -1017,9 +1053,13 @@ def get_cfg(input_data):
     # Noise heads (fewer than noise_below onsets in the train + val videos) are no training
     # targets; step 06 reports their events separately.
     exclude_noise_heads, noise_below = True, 5
+    # Type balance (`head_pos_weight_scale`): the onsets of the less frequent event types
+    # weigh (N_max / N_type) ** power, at most type_balance_max, in every model's loss.
+    type_balance = {"type_balance": True, "type_balance_power": 1.0, "type_balance_max": 4.0}
     tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
         tag += f"_tn{noise_below}"
+    tag += type_balance_tag(type_balance)
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
@@ -1038,6 +1078,7 @@ def get_cfg(input_data):
             # Heads with noise_below..rare_below - 1 onsets are learned but reported as "rare".
             'rare_below': 10,
             'trivial_above': 100,
+            **type_balance,
             # Targets: the atom switches on within the next W frames, for each window W
             # (10, 20, ..., 100 frames = 1..10 s at 10 fps); the model gives one
             # probability per window, never decreasing with W.
