@@ -1350,7 +1350,9 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
 
 def get_cfg(input_data):
     """Settings and files of step 05; step 06 uses them to load the trained model."""
-    slot_size, num_slots = 10, 5
+    # Memory: 3 slots of 10 frames (3 s). Medium 6b02b3 / full 78e420 scored with only the last h s of
+    # their 5 s memory known: AP at 1 s >= 90% of the full memory, best at 2-3 s, no gain beyond 3 s.
+    slot_size, num_slots = 10, 3
     windows = [slot_size * (f + 1) for f in range(10)]
     mask_type, num_free_rules = "sigmoid", 128
     # Files are named by the settings that change the model, so a model trained
@@ -1422,14 +1424,17 @@ def get_cfg(input_data):
             # probability per window, never decreasing with W.
             'windows': windows,
             # Model: time in slots of slot_size frames; the memory holds num_slots past
-            # slots (5 x 10 = 50 frames), a rule is a pattern over the num_slots slots
-            # before its head, and each window is one more future slot. The videos are
-            # ~200 frames, so 50 frames of memory leave the largest window (100 frames)
-            # observable at t = 50..~100.
+            # slots (3 x 10 = 30 frames), a rule is a pattern over the num_slots slots
+            # before its head, and each window is one more future slot. The rule net's
+            # hazards depend on the memory for the first num_slots future slots only (its
+            # rules shifted by f slots); later slots get a constant hazard per head, so its
+            # windows beyond num_slots slots add only that constant (the MLP reads every
+            # window from the inputs). The videos are ~200 frames, so 30 frames of memory
+            # leave the largest window (100 frames) observable at t = 30..~100.
             'slot_size': slot_size,
             'num_slots': num_slots,
             # Partial facts: a share truncate_prob of the training frames know only a
-            # random 0..50 frames of history (the older memory is unknown), so the
+            # random 0..memory frames of history (the older memory is unknown), so the
             # model learns calibrated, lower confidence from partial facts.
             'truncate_prob': 0.5,
             # Rules: one per (anchor body, lag bin) with the anchor as a fixed input

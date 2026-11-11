@@ -147,7 +147,7 @@ class CauVid:
 class TemporalRuleNet(torch.nn.Module):
     """Slot rule network: predicts, for every agent visible in frame t, how likely
     each atom switches on within the next W frames (W = 10, 20, ..., one window
-    per future slot), from whatever part of the last 50 frames is known.
+    per future slot), from whatever part of the last num_lags (slot_size * num_slots) frames is known.
 
     Time is cut into slots of slot_size (10) frames: the memory holds the
     num_slots (5) past slots p = 1..5 (p = 1: the 10 frames before t), the

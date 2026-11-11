@@ -361,6 +361,9 @@ def get_step_06_input(args):
         "test_box_file": args.output_dir / "step_dataset_output" / "atoms" / "test_boxes.pt",
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "frame_rate": args.frame_rate,
+        # Camera frames of the review videos (`step06_review`): <frame_dir>/<video>/%05d.jpg, else <video_dir>/<video>.mp4.
+        "frame_dir": args.dataset_path / "frames",
+        "video_dir": args.dataset_path / "videos",
         # Step 06 loads the step 05 model and clauses with the step 05 settings.
         "step05_input": get_step_05_input(args),
     }

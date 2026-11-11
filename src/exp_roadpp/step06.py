@@ -2231,7 +2231,7 @@ def main(input_data):
         # Windows of the per-head rank (head_rank.pdf, one page each), frames.
         "head_rank_windows": [10, 20, 50, 100],
         # Partial facts: the rows are scored again knowing only this many frames of history.
-        "history_levels": [0, 10, 20, 30, 40],
+        "history_levels": list(range(0, step05_cfg["slot_size"] * step05_cfg["num_slots"], step05_cfg["slot_size"])),
         # The window of the per-head metrics and of the single-window figures.
         "headline_window": 20,
         # Probability threshold of the "at_threshold" row metrics.
@@ -2376,4 +2376,11 @@ def main(input_data):
     # 7. Situation rates: how often the onset follows the same situation, and how plausible the false alarms are (`step06_ceiling`).
     step06_ceiling.main(model, mlp, test_data, step05_cfg, cfg, input_data["output_dir"] / "ceiling.json",
                         calibration)
+
+    # 8. Review videos: a sample of the test videos with the alarms and events drawn in, and review.csv
+    # for a human review (`step06_review`); skipped without a camera frame source or opencv.
+    from src.exp_roadpp import step06_review
+    step06_review.main(model, mlp, baselines, calibration, test_data, step05_cfg,
+                       {**cfg, "test_box_file": input_data.get("test_box_file")}, input_data["output_dir"] / "review",
+                       input_data.get("frame_dir"), input_data.get("video_dir"))
     print("\n--------- Step 06 Done ---------------\n")
