@@ -1,5 +1,11 @@
 import json 
 import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 # -------------- Settings --------------
@@ -66,6 +72,55 @@ def step_0_setup(args):
     if os.path.exists(args.dataset_path):
         print(f"\n##### Dataset path exists: {args.dataset_path} #####\n")
 
+    return setup_run(args)
+
+
+# -------------- Runs --------------
+# Steps 01-04 and step_dataset are deterministic preprocessing, shared by every run of an
+# experiment (args.output_dir/stepXX_output, computed once, then only read). Steps 05 and 06
+# (and their sub-steps: layered net, causal pruning, motif net, episode alarms) write into a
+# folder of their own per run, args.output_dir/runs/<run_id>/, so runs on several machines
+# (or with other settings) never overwrite each other.
+def _git(*cmd):
+    try:
+        return subprocess.run(["git", "-C", str(root), *cmd], capture_output=True, text=True,
+                              timeout=20).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def setup_run(args):
+    """args.run_id (new unless --run_id names an existing run to resume) and args.run_dir.
+    A new run folder is created exclusively (never shared), with run_info.json (machine,
+    command, start time, git commit and whether the code had uncommitted changes) and a
+    snapshot of the pipeline code (the step settings live in the code)."""
+    resume = bool(getattr(args, "run_id", None))
+    runs = args.output_dir / "runs"
+    os.makedirs(runs, exist_ok=True)
+    if resume:
+        args.run_dir = runs / args.run_id
+        os.makedirs(args.run_dir, exist_ok=True)
+    else:
+        while True:
+            args.run_id = f"{time.strftime('%Y%m%d-%H%M%S')}_{args.machine}_{secrets.token_hex(3)}"
+            args.run_dir = runs / args.run_id
+            try:
+                os.makedirs(args.run_dir)                   # exclusive: fails if another run took the name
+                break
+            except FileExistsError:
+                continue
+    info = {"run_id": args.run_id, "machine": args.machine, "host": socket.gethostname(), "exp": args.exp,
+            "command": " ".join(sys.argv), "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "git_commit": _git("rev-parse", "HEAD"), "git_dirty": bool(_git("status", "--porcelain")),
+            "device": str(getattr(args, "device", None)), "num_epochs": getattr(args, "num_epochs", None)}
+    name = "run_info.json" if not resume else f"run_info_resume_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    with open(args.run_dir / name, "w") as f:
+        json.dump(info, f, indent=2)
+    snapshot = args.run_dir / ("code" if not resume else f"code_resume_{time.strftime('%Y%m%d-%H%M%S')}")
+    shutil.copytree(root, snapshot, ignore=shutil.ignore_patterns("output", "data", "__pycache__", "*.pt",
+                                                                  "*.json", "*.pdf", "weights", "wandb"),
+                    dirs_exist_ok=True)
+    print(f"\n##### Run {args.run_id}{' (resumed)' if resume else ''}: {args.run_dir} #####\n")
     return args
 
 
@@ -269,7 +324,7 @@ def get_step_04_input(args):
 
 
 def get_step_05_input(args):
-    output_dir = args.output_dir / "step05_output"
+    output_dir = args.run_dir / "step05_output"                 # per run (`setup_run`)
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
@@ -293,7 +348,7 @@ def get_step_05_input(args):
     return input_data
 
 def get_step_06_input(args):
-    output_dir = args.output_dir / "step06_output"
+    output_dir = args.run_dir / "step06_output"                 # per run (`setup_run`)
     os.makedirs(output_dir, exist_ok=True)
     input_data = {
         "output_dir": output_dir,
