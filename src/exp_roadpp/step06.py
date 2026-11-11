@@ -60,17 +60,45 @@ def _score_bins(scores, edges):
 
 
 # -------------- Baselines --------------
+# Lookup baseline: per context, the agent's own label atoms in the last slot of the memory ("a car
+# reversing in the lane"), the onset share of the train rows in that context, shrunk toward the prior
+# with LOOKUP_PRIOR_ROWS rows (Bayes). On medium 88be20 (W20) such a lookup, counted on the other
+# test videos, already matched the models' AP (0.034 vs rule net 0.039, MLP 0.045): a model or module
+# is worth it only if it clearly beats this baseline. Changing it: bump BASELINE_VERSION.
+LOOKUP_PRIOR_ROWS = 20
+BASELINE_VERSION = "prior_anchor_lookup_v1"
+
+
+def _lookup_weights(num_labels, device="cpu"):
+    """(L, 2) float64 integer weights of the two context hashes (`_lookup_keys`), fixed by the seed."""
+    generator = torch.Generator().manual_seed(0)
+    high = max(2 ** 29 // max(num_labels, 1), 2)
+    return torch.randint(0, high, (num_labels, 2), generator=generator).double().to(device)
+
+
+def _lookup_keys(x, weights):
+    """(B,) long context key of the own last-slot label atoms x (B, L) 0/1: two exact float64
+    projections (< 2^29 each) packed into one int64 (distinct contexts collide with chance ~2^-50)."""
+    h = (x.double() @ weights).long()
+    return h[:, 0] * (2 ** 29) + h[:, 1]
+
+
 @torch.no_grad()
 def fit_baselines(model, training_data, step05_cfg):
-    """Scores of two baselines, fitted on the step 05 train videos (full history):
+    """Scores of three baselines, fitted on the step 05 train videos (full history):
       prior (W, A): the share of at-risk rows whose atom switches on within window
           k, the same for every row;
       anchor_confidence (R, W, A): for each seeded rule r (anchor body in one slot)
           and each head of its anchor clause, the confidence of the anchor input
           alone (seen in the memory) for an onset within window k; -1 for other
-          heads, free rules and anchors that never fire.
+          heads, free rules and anchors that never fire;
+      lookup_keys (K,) long sorted, lookup_rates (K, W, A), lookup_weights (L, 2): the lookup
+          baseline (LOOKUP_PRIOR_ROWS): the smoothed onset share per context of the own last-slot
+          label atoms (`_lookup_scores`); contexts not seen in train get the prior.
     The anchor baseline is the anchor clauses without the learned extra atoms, so
-    the model beating it shows the extensions help."""
+    the model beating it shows the extensions help; the lookup baseline is what the agent's
+    own current labels alone tell, so a model beating it shows the memory, the other agents
+    and the rules help."""
     device = step05_cfg["device"]
     R, W, A = model.log_alpha.shape[0], len(model.windows), model.num_atoms
     is_anchor_head = torch.zeros((R, A), dtype=torch.bool)
@@ -80,6 +108,10 @@ def fit_baselines(model, training_data, step05_cfg):
     anchor_size = anchor_body.sum(dim=1)
     hits, fires = torch.zeros((R, W * A), device=device), torch.zeros((R, W * A), device=device)
     onsets, at_risk = torch.zeros(W * A, device=device), torch.zeros(W * A, device=device)
+    L = training_data.get("num_label_atoms", A)
+    weights = _lookup_weights(L, device)
+    index, capacity = {}, 1024                                           # context key -> row of the counts
+    ctx_risk, ctx_onset = torch.zeros((capacity, W * A), device=device), torch.zeros((capacity, W * A), device=device)
     for video_id in tqdm(training_data["train_videos"], desc="Fitting the baselines (train)"):
         for frames in training_data["frames"][video_id].split(step05_cfg["frames_per_video"]):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
@@ -93,11 +125,32 @@ def fit_baselines(model, training_data, step05_cfg):
             hits += fired.T @ onset
             onsets += onset.sum(dim=0)
             at_risk += risk.sum(dim=0)
+            keys, inverse = torch.unique(_lookup_keys(x[:, :L], weights), return_inverse=True)
+            for key in keys.tolist():
+                index.setdefault(key, len(index))
+            if len(index) > capacity:
+                grow = torch.zeros((max(len(index), 2 * capacity) - capacity, W * A), device=device)
+                ctx_risk, ctx_onset = torch.cat([ctx_risk, grow]), torch.cat([ctx_onset, grow])
+                capacity = len(ctx_risk)
+            rows_of = torch.tensor([index[k] for k in keys.tolist()], device=device)[inverse]
+            ctx_risk.index_add_(0, rows_of, risk)
+            ctx_onset.index_add_(0, rows_of, risk * onset)
     fires, hits = fires.view(R, W, A).cpu(), hits.view(R, W, A).cpu()
     valid = is_anchor_head[:, None, :] & (fires > 0)
+    prior = (onsets / at_risk.clamp(min=1)).view(W, A).cpu()
+    K = len(index)
+    keys = torch.tensor(list(index.keys()), dtype=torch.long)
+    order = keys.argsort()
+    rows = torch.tensor(list(index.values()), dtype=torch.long)[order]
+    n, pos = ctx_risk[:K].cpu()[rows].view(K, W, A), ctx_onset[:K].cpu()[rows].view(K, W, A)
+    print(f"[Baselines]\t lookup: {K} contexts of the own last-slot label atoms in the train rows")
     return {
-        "prior": (onsets / at_risk.clamp(min=1)).view(W, A).cpu(),
+        "prior": prior,
         "anchor_confidence": torch.where(valid, hits / fires.clamp(min=1), -1.0),
+        "lookup_keys": keys[order],
+        "lookup_rates": (pos + LOOKUP_PRIOR_ROWS * prior[None]) / (n + LOOKUP_PRIOR_ROWS),
+        "lookup_weights": weights.cpu(),
+        "version": BASELINE_VERSION,
     }
 
 
@@ -118,6 +171,18 @@ def _anchor_scores(model, inputs, baselines, chunk_size=8):
     return torch.where(best >= 0, best, baselines["prior"][None])
 
 
+def _lookup_scores(model, inputs, baselines):
+    """(B, W, A) lookup baseline score of each row: the train onset share of its context (the own
+    label atoms of the last slot, `fit_baselines`), or the prior for a context not seen in train."""
+    x, _k = model.split_inputs(inputs)
+    weights = baselines["lookup_weights"]
+    keys = _lookup_keys(x[:, :weights.shape[0]], weights)
+    table = baselines["lookup_keys"]
+    i = torch.searchsorted(table, keys).clamp(max=len(table) - 1)
+    found = table[i] == keys
+    return torch.where(found[:, None, None], baselines["lookup_rates"][i], baselines["prior"][None])
+
+
 # -------------- Scorers --------------
 # The scorers whose detections are counted (the prior flags all rows of a head alike);
 # "mlp" only when the OnsetMLP baseline was trained; "candidate" (the stage-1 flags
@@ -126,7 +191,8 @@ def _anchor_scores(model, inputs, baselines, chunk_size=8):
 # "net_pruned": the rule net after the step 05b causal pruning, if it was made; "rule_set":
 # the step 05c rule set (each rule precise, the set covering the events), if it was made.
 # "motif_net": the step 05d two-level MotifRuleNet, if it was trained.
-DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp", "anchor", "candidate", "cascade")
+DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp", "lookup", "anchor", "candidate",
+                     "cascade")
 # Scorers detected at a fixed threshold instead of cfg["detected_th"]: their scores are no
 # probabilities. The candidates are 0 / 1; the rule set detects whenever one of its rules
 # fires (its scores are their precisions, >= the level, mostly below 0.5).
@@ -136,11 +202,18 @@ HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp")
 # Plot color of each scorer.
 SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
                  "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
-                 "rule_set": "tab:olive", "motif_net": "tab:pink", "model_cal": "navy", "mlp_cal": "darkgreen"}
+                 "rule_set": "tab:olive", "motif_net": "tab:pink", "model_cal": "navy", "mlp_cal": "darkgreen",
+                 "lookup": "#1baf7a", "lookup_cal": "#127a55"}
 SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
                  "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
                  "rule_set": "rule set", "motif_net": "motif net", "model_cal": "rule net (calibrated)",
-                 "mlp_cal": "MLP (calibrated)"}
+                 "mlp_cal": "MLP (calibrated)", "lookup": "own-label lookup",
+                 "lookup_cal": "own-label lookup (calibrated)"}
+# The scorers of the per-head rank (`head_rank.pdf`), with their marker (identity never by color alone).
+HEAD_RANK_SCORERS = ("model", "mlp", "lookup")
+HEAD_RANK_MARKERS = {"model": "o", "mlp": "s", "lookup": "D"}
+HEAD_RANK_COLORS = {"model": "#2a78d6", "mlp": "#eb6834", "lookup": "#1baf7a"}   # validated: CVD dE >= 9.2
+HEAD_RANK_SHORT = {"model": "rule net", "mlp": "MLP", "lookup": "lookup"}
 # Event recall levels of the operating points read off the test curves.
 RECALL_LEVELS = (0.3, 0.5, 0.7)
 # Event types by the frequency of their head (`step05.head_event_types`). The noise heads
@@ -174,12 +247,14 @@ def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None,
     extra {name: model} adds models of the same inputs (e.g. net_pruned), scorers of
     the inputs (the rule set) or models with their own inputs (the motif net, built
     from context, the current chunk set by `_score_videos`)."""
-    baselines = {name: value.to(device) for name, value in baselines.items()}
+    baselines = {name: value.to(device) for name, value in baselines.items() if torch.is_tensor(value)}
     scorers = {
         "model": lambda inputs, stage1: stage1,
         "anchor": lambda inputs, stage1: _anchor_scores(model, inputs, baselines),
         "prior": lambda inputs, stage1: baselines["prior"].expand(len(inputs), -1, -1),
     }
+    if "lookup_keys" in baselines:
+        scorers["lookup"] = lambda inputs, stage1: _lookup_scores(model, inputs, baselines)
     if mlp is not None:
         # Same input layers as the TemporalRuleNet, so it scores the same rows.
         scorers["mlp"] = lambda inputs, stage1: mlp.window_probs(mlp(inputs)[0])
@@ -744,7 +819,7 @@ def _alarm_filter_comparison(model, data, baselines, cfg, minutes, fps):
 
 # -------------- Per-head calibration (Platt scaling on val) --------------
 # The scorers whose scores are probabilities, calibrated per window and head.
-CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "mlp", "cascade")
+CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "mlp", "cascade", "lookup")
 
 
 def _bin_scores():
@@ -835,17 +910,19 @@ def calibrate(p, cal, heads=None):
 
 
 def load_calibration(model, mlp, baselines, cfg, step05_cfg):
-    """The per-head calibration (`fit_calibration`) of the rule net and the MLP on the val videos,
+    """The per-head calibration (`fit_calibration`) of the rule net, the MLP and the lookup baseline on the val videos,
     from cfg["calibration_file"] (saved by `main`), refitted if the file is missing or older than
     the models (e.g. a run evaluated before it was saved)."""
-    sources = [step05_cfg["model_file"], step05_cfg["mlp_model_file"], step05_cfg["training_data_file"]]
+    sources = [step05_cfg["model_file"], step05_cfg["mlp_model_file"], step05_cfg["training_data_file"],
+               cfg["baseline_file"]]
     if not step05.is_fresh(cfg["calibration_file"], *sources):
         training_data = step05.load_training_data(step05_cfg)
         cfg.setdefault("head_types", training_data["event_types"]["types"])
         val_data = _subset(training_data, training_data["val_videos"])
         del training_data
         # The row histograms read the raw scores only: no alarm filter needed.
-        val_scores = _score_videos(model, val_data, baselines, cfg, mlp, names=("model", "mlp"), alarm_filter=(1, 1))
+        val_scores = _score_videos(model, val_data, baselines, cfg, mlp, names=("model", "mlp", "lookup"),
+                                   alarm_filter=(1, 1))
         calibration = fit_calibration(val_scores["rows"], cfg, model.windows)
         torch.save({name: {k: v.cpu() for k, v in cal.items()} for name, cal in calibration.items()},
                    cfg["calibration_file"])
@@ -1000,6 +1077,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
            "gate_min_correct": cfg["gate_min_correct"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
            "motif_net": cfg.get("motif_net", False),
+           "baselines": BASELINE_VERSION, "head_rank_windows": cfg["head_rank_windows"],
            "threshold_from": f"detected_th {cfg['detected_th']} (fixed: {FIXED_THRESHOLDS})",
            "event_types": {key: v for key, v in cfg["event_types"].items() if key != "types"}, "results": {}}
     # The heads of the overall metrics: the regular and trivial ones (the noise heads are no training targets).
@@ -1101,6 +1179,28 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
             name: _histogram_metrics(r["pos"][k][h], r["neg"][k][h], cfg["prob_threshold"])["average_precision"]
             for name, r in scores["rows"].items() if name != "model"}
         out["per_head"][str(h)] = m
+
+    # Per-head rank (`head_rank.pdf`): the row AP of every counted head with test events, per window of
+    # cfg["head_rank_windows"], of the rule net, the MLP and the lookup baseline, with its base rate
+    # (the AP of a random score) and its number of test events.
+    num_events = scores["events"]["model"]["per_head"]["num_events"]
+    ranked = [n for n in HEAD_RANK_SCORERS if n in scores["rows"]]
+    rank_windows = [w for w in cfg["head_rank_windows"] if w in model.windows]
+    out["head_rank"] = {"windows": rank_windows, "scorers": ranked, "heads": {}}
+    for h in torch.nonzero(counted & (num_events.to(counted.device) > 0)).flatten().tolist():
+        entry = {"label": step05._atom_name(unique_atoms[h]), "event_type": EVENT_TYPES[int(cfg["head_types"][h])],
+                 "events": int(num_events[h]), "onset_rows": {}, "base_rate": {}, "ap": {n: {} for n in ranked}}
+        for w in rank_windows:
+            k = model.windows.index(w)
+            p_m, n_m = scores["rows"]["model"]["pos"][k][h], scores["rows"]["model"]["neg"][k][h]
+            rows_w = float(p_m.sum() + n_m.sum())
+            entry["onset_rows"][str(w)] = int(p_m.sum())
+            entry["base_rate"][str(w)] = float(p_m.sum()) / rows_w if rows_w else None
+            for name in ranked:
+                p, n = scores["rows"][name]["pos"][k][h], scores["rows"][name]["neg"][k][h]
+                entry["ap"][name][str(w)] = (_histogram_metrics(p, n, cfg["prob_threshold"])["average_precision"]
+                                             if p.sum() > 0 else None)
+        out["head_rank"]["heads"][str(h)] = entry
 
     # Event detection of each head (with test events or alarms), per scorer and window, at the
     # detection threshold: event recall, mean prediction time, coverage, alarms and alarm precision.
@@ -1279,6 +1379,8 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
       trajectory.pdf: mean confidence of an onset's head in the frames before it;
       ap_per_head.pdf: AP of each head at the headline window, against the baselines;
       compare_ap_per_head.pdf: rule net vs MLP AP per head;
+      head_rank.pdf: every counted head ranked by its rule net AP, one page per window of
+          head_rank_windows (`_plot_head_rank`);
       clause_train_vs_test.pdf, clause_extension_gain.pdf, clause_precision_recall.pdf:
           the step 05 clauses on the test videos.
     A figure is skipped (with a message) when its data is missing.
@@ -1512,6 +1614,9 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
                xlabel="MLP AP (log)", ylabel="rule net AP (log)", xscale="log", yscale="log",
                xlim=(low, 1), ylim=(low, 1))
         save(fig, "compare_ap_per_head.pdf")
+
+    if metrics.get("head_rank"):
+        _plot_head_rank(metrics, plt, figure_dir)
 
     # Clauses on the test videos.
     rows = [c for c in clauses if c["test_confidence"] is not None]
@@ -1795,6 +1900,104 @@ def _print_per_head_detection(metrics, sec, headline):
     print()
 
 
+def _plot_head_rank(metrics, plt, figure_dir):
+    """head_rank.pdf, one page per window of metrics["head_rank"]: every counted head with test events,
+    ranked by the rule net's row AP (best on top). Left: the AP of the rule net, the MLP and the own-label
+    lookup baseline (log), the base rate (the AP of a random score) as a grey bar. Right: the lift,
+    AP / base rate (log; 1 = random). Labels: the head, its event type and test events (n); heads with
+    fewer than per_head_min_test_events events are marked "*" (their AP is noisy)."""
+    from matplotlib.backends.backend_pdf import PdfPages
+    rank = metrics["head_rank"]
+    fps, min_events = metrics["frame_rate"], metrics["per_head_min_test_events"]
+    path = figure_dir / "head_rank.pdf"
+    with PdfPages(path) as pdf:
+        for w in (str(v) for v in rank["windows"]):
+            heads = [m for m in rank["heads"].values()
+                     if m["ap"]["model"].get(w) is not None and m["base_rate"].get(w)]
+            if not heads:
+                continue
+            heads.sort(key=lambda m: m["ap"]["model"][w])                   # best last = top of the plot
+            y = list(range(len(heads)))
+            labels = [f"{'* ' if m['events'] < min_events else ''}{m['label']} ({m['event_type']}, n={m['events']})"
+                      for m in heads]
+            fig, axes = plt.subplots(1, 2, figsize=(11, 0.26 * len(heads) + 1.8), sharey=True)
+            values = {"ap": {}, "lift": {}}
+            for name in rank["scorers"]:
+                ap = [m["ap"][name].get(w) for m in heads]
+                values["ap"][name] = [float("nan") if a is None else a for a in ap]
+                values["lift"][name] = [float("nan") if a is None else a / m["base_rate"][w]
+                                        for a, m in zip(ap, heads)]
+            for ax, key in zip(axes, ("ap", "lift")):
+                # A thin grey span per head from its lowest to its highest value, then the markers.
+                for i in y:
+                    v = [values[key][n][i] for n in rank["scorers"] if values[key][n][i] == values[key][n][i]]
+                    if key == "ap":
+                        v.append(heads[i]["base_rate"][w])
+                    if v:
+                        ax.plot([min(v), max(v)], [i, i], color="#d6d6d3", linewidth=1.2, zorder=1)
+                if key == "ap":
+                    ax.scatter([m["base_rate"][w] for m in heads], y, marker="|", s=90, color="#8a8a86",
+                               linewidths=1.5, label="base rate (random)", zorder=2)
+                else:
+                    ax.axvline(1, color="#8a8a86", linewidth=1, linestyle="--", zorder=1)
+                for name in rank["scorers"]:
+                    ax.scatter(values[key][name], y, marker=HEAD_RANK_MARKERS[name], s=40,
+                               color=HEAD_RANK_COLORS[name], edgecolors="white", linewidths=0.8,
+                               label=SCORER_LABELS[name], zorder=3)
+                ax.set_xscale("log")
+                ax.grid(axis="x", color="#ececea", linewidth=0.8)
+                ax.set_axisbelow(True)
+                for side in ("top", "right"):
+                    ax.spines[side].set_visible(False)
+            axes[0].set_yticks(y, labels, fontsize=7)
+            axes[0].set(xlabel="row AP (log)", title="AP per head")
+            axes[1].set(xlabel="AP / base rate (log; 1 = random)", title="lift over a random score")
+            handles, names = axes[0].get_legend_handles_labels()
+            fig.suptitle(f"Heads ranked by rule net AP, window {int(w) / fps:g} s "
+                         f"(n = test events; * fewer than {min_events})", fontsize=10)
+            top = 1 - 0.9 / fig.get_figheight()
+            fig.legend(handles, names, loc="upper center", ncol=len(names), fontsize=8, frameon=False,
+                       bbox_to_anchor=(0.5, top + 0.35 / fig.get_figheight()))
+            fig.tight_layout(rect=(0, 0, 1, top))
+            pdf.savefig(fig)
+            plt.close(fig)
+    print(f"[Figure]\t {path}")
+
+
+def _print_head_rank(metrics, num=8):
+    """The best and the worst heads of the rule net (by row AP, at least per_head_min_test_events test
+    events) per window of the head rank, with the MLP, the lookup baseline and the base rate."""
+    rank = metrics.get("head_rank")
+    if not rank:
+        return
+    fps, min_events = metrics["frame_rate"], metrics["per_head_min_test_events"]
+    names = rank["scorers"]
+    print(f"[Head rank] row AP per head (>= {min_events} test events), best and worst {num} by rule net AP; "
+          f"lift = rule net AP / base rate; full list: figures/head_rank.pdf")
+    for w in (str(v) for v in rank["windows"]):
+        heads = sorted((m for m in rank["heads"].values()
+                        if m["events"] >= min_events and m["ap"]["model"].get(w) is not None and m["base_rate"].get(w)),
+                       key=lambda m: -m["ap"]["model"][w])
+        if not heads:
+            continue
+        print(f"  window {int(w) / fps:g} s ({len(heads)} heads)")
+        print(f"    {'head':<26}{'type':>9}{'events':>7}{'base':>8}"
+              + "".join(f"{HEAD_RANK_SHORT.get(n, n):>10}" for n in names) + f"{'lift':>7}")
+        shown = heads if len(heads) <= 2 * num else heads[:num] + [None] + heads[-num:]
+        for m in shown:
+            if m is None:
+                print("    ...")
+                continue
+            print(f"    {m['label'][:26]:<26}{m['event_type']:>9}{m['events']:>7}{m['base_rate'][w]:>8.4f}"
+                  + "".join(f"{_fmt_ap(m['ap'][n].get(w)):>10}" for n in names)
+                  + f"{m['ap']['model'][w] / m['base_rate'][w]:>7.1f}")
+    print()
+
+
+def _fmt_ap(v):
+    return "-" if v is None else f"{v:.4f}"
+
+
 def print_summary(metrics, clauses, cfg, num_examples=15):
     windows, results = metrics["windows"], metrics["results"]
     headline = str(metrics["headline_window"])
@@ -1956,6 +2159,7 @@ def print_summary(metrics, clauses, cfg, num_examples=15):
 
     _print_alarm_filter_calibration(metrics, sec)
     _print_per_head_detection(metrics, sec, headline)
+    _print_head_rank(metrics)
 
     print(f"[Clauses]\t {len(clauses)} from step 05")
     firing = [c for c in clauses if c["test_confidence"] is not None]
@@ -2024,6 +2228,8 @@ def main(input_data):
         # the head's event recall and alarm precision) for heads with at least this many val
         # events, else the threshold of the head's event type, else detected_th.
         "per_head_min_events": 10,
+        # Windows of the per-head rank (head_rank.pdf, one page each), frames.
+        "head_rank_windows": [10, 20, 50, 100],
         # Partial facts: the rows are scored again knowing only this many frames of history.
         "history_levels": [0, 10, 20, 30, 40],
         # The window of the per-head metrics and of the single-window figures.
@@ -2087,10 +2293,14 @@ def main(input_data):
     cfg["motif_net"] = motif is not None
 
     # 2. Baselines fitted on the step 05 training videos: the window prior and the anchor rules alone.
-    if not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"]):
+    baselines = (torch.load(cfg["baseline_file"], map_location="cpu", weights_only=False)
+                 if os.path.exists(cfg["baseline_file"]) else {})
+    if (not step05.is_fresh(cfg["baseline_file"], step05_cfg["model_file"], step05_cfg["training_data_file"])
+            or baselines.get("version") != BASELINE_VERSION):
         training_data = step05.load_training_data(step05_cfg)
         torch.save(fit_baselines(model, training_data, step05_cfg), cfg["baseline_file"])
-    baselines = torch.load(cfg["baseline_file"], map_location="cpu")
+        del training_data
+        baselines = torch.load(cfg["baseline_file"], map_location="cpu", weights_only=False)
 
     # 3. Window metrics of the model and the baselines; redone whenever any input or setting changes.
     metrics = utils_data.load_json(cfg["metrics_file"]) if os.path.exists(cfg["metrics_file"]) else {}
@@ -2108,7 +2318,8 @@ def main(input_data):
                 "exclude_agent_leaving": cfg["exclude_agent_leaving"],
                 "gate_min_events": cfg["gate_min_events"], "gate_min_precision": cfg["gate_min_precision"],
                 "gate_min_correct": cfg["gate_min_correct"],
-                "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"]}
+                "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"],
+                "baselines": BASELINE_VERSION, "head_rank_windows": cfg["head_rank_windows"]}
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
                             step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"],

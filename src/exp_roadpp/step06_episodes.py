@@ -40,7 +40,7 @@ episodes instead of one alarm per upward crossing (`step06`):
     and are left out ("duplicate_alarms"), so several members alarming together do not
     multiply the correct alarms.
 Computed for every window of the model, every score threshold and tolerance, on the
-counted heads (`step06.COUNTED_TYPES`), for the rule net and the OnsetMLP.
+counted heads (`step06.COUNTED_TYPES`), for the rule net, the OnsetMLP and the own-label lookup baseline.
 Calibrated scorers "model_cal" / "mlp_cal" (with a calibration, `step06.load_calibration`): the same
 scores mapped to probabilities by the per-head Platt scaling fitted on val, swept over
 calibrated_thresholds. The raw scores are no probabilities (step 05 weights the onsets by
@@ -53,7 +53,7 @@ import torch
 from tqdm import tqdm
 from src.exp_roadpp import step05, step06, utils_data
 
-SCORERS = ("model", "mlp")
+SCORERS = ("model", "mlp", "lookup")             # "lookup": the own-label lookup baseline (`step06.fit_baselines`)
 
 
 def _default_cfg(frame_rate):

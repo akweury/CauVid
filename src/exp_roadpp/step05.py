@@ -627,6 +627,10 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     # Optional: gradient-norm clipping and halving the learning rate (the OnsetMLP sets them)
     # after lr_patience epochs without a better val loss; early stopping after patience (both models).
     grad_clip, patience = cfg.get("grad_clip"), cfg.get("patience")
+    # The best val epoch (and early stopping) only counts from epoch select_from_epoch + 1 on: the
+    # rule net sets it to l0_warmup_epochs, so the kept model has trained under the sparsity loss
+    # (medium 080f05 / 88be20: the best val epoch was 10, the last one without it).
+    select_from = cfg.get("select_from_epoch", 0)
     scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=cfg["lr_patience"])
                  if cfg.get("lr_patience") else None)
     best_epoch = 0
@@ -675,18 +679,21 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
         if run is not None:
             run.log({"train/onset_loss": train_loss, "val/onset_loss": val_loss,
                      **(model_stats() if model_stats else {})}, step=epoch)
-        if val_loss < best_val_loss:
+        selectable = epoch + 1 > select_from
+        if selectable and val_loss < best_val_loss:
             best_val_loss, best_epoch = val_loss, epoch + 1
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         if scheduler is not None:
             scheduler.step(val_loss)
             history[-1]["lr"] = optimizer.param_groups[0]["lr"]
-        if patience and epoch + 1 - best_epoch >= patience:
+        if patience and selectable and epoch + 1 - max(best_epoch, select_from) >= patience:
             print(f"[Training] Early stop: no better val loss for {patience} epochs")
             break
 
     if best_state is not None:
         model.load_state_dict(best_state)
+    else:
+        print(f"[Training] No epoch after {select_from} (num_epochs {cfg['num_epochs']}): the last one is kept")
     print(f"[Training] Best val loss {best_val_loss:.4f} (epoch {best_epoch})")
     utils_data.save_json(history, history_file)
     if run is not None:
@@ -735,6 +742,8 @@ def _fit_rule_net(model, training_data, cfg, history_file, run=None, candidates=
                                       {"params": others, "lr": cfg["lr"]}])
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    # The kept (best val) epoch must have trained under the sparsity loss.
+    cfg = {**cfg, "select_from_epoch": cfg["l0_warmup_epochs"]}
     return fit_onset_model(model, training_data, cfg, optimizer, history_file, regularization, run, model_stats,
                            candidates)
 
@@ -1374,7 +1383,7 @@ def get_cfg(input_data):
             'l0_lambda': 1e-3,
             'l0_warmup_epochs': 10,
             # Early stopping: stop after patience epochs without a better val loss (num_epochs is
-            # the maximum); the best val epoch is kept. Medium 080f05 (grid + self gate): best val
+            # the maximum); the best val epoch after l0_warmup_epochs is kept. Medium 080f05 (grid + self gate): best val
             # epoch 10, val loss +43% by epoch 100 while train loss fell 4x.
             'patience': 10,
             # Rule extraction thresholds of the trained model.
