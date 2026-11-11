@@ -470,6 +470,12 @@ def get_cfg(input_data):
 def main(input_data):
     print(f"----------------- Step 05 (layered): Layered Rule Learning -----------------")
     cfg = get_cfg(input_data)
+    # Like the motif net: with main_only (only the main rule net and the MLP are trained), a cached
+    # layered net is still evaluated, but none is trained (each run has its own folder, so it would
+    # be retrained from scratch every run).
+    if cfg["step05_cfg"]["main_only"] and not os.path.exists(cfg["model_file"]):
+        print(f"[Skip]\t\t main_only: no cached layered net {cfg['model_file'].name}, not trained")
+        return
 
     # 1. The step 05 training videos and split (the dataset's train / val), prepared by step 05 if missing.
     training_data = step05.load_training_data(cfg["step05_cfg"])
