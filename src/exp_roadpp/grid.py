@@ -139,3 +139,40 @@ def vocabulary(unique_atoms, compound, atom_name):
         cls, label = atom_name(unique_atoms[a]).split(":", 1)
         out.append(["pred", "grid", "grid_label", f"{label}@{names[p]}", "agent_class_label", cls])
     return out
+
+
+# -------------- Groups of adjacent same-class agents --------------
+# A group: per frame, the agents of the same class whose boxes overlap (IoU > 0) or whose centres are
+# closer than one box width (the mean width of the two, in pixels), connected components. Step 06
+# counts an alarm as correct at the group level when the event happens to an agent of the alarm
+# agent's group (same class, adjacent in the image): the labels and the 2D boxes often cannot tell
+# which of such agents it will be (full test: 71% of the onsets happen to an agent in a group; the
+# box motion of the members does not tell them apart, only the nearest member is a little likelier).
+GROUP_TAG = "groups_overlap_or_1width_v1"
+FRAME_SIZE_PX = (1920, 1280)                      # ROAD++ front camera, to compare distances in pixels
+
+
+def agent_groups(boxes, has_box, classes):
+    """(T, N) long group id of every agent and frame (the smallest agent index of its group, -1
+    without a box). boxes (T, N, 4) normalized; has_box (T, N) bool; classes [N] class labels."""
+    T, N, _ = boxes.shape
+    W, H = FRAME_SIZE_PX
+    b = boxes.nan_to_num(0.0)
+    x1, y1, x2, y2 = (b[..., i] for i in range(4))
+    ix = (torch.minimum(x2[:, :, None], x2[:, None]) - torch.maximum(x1[:, :, None], x1[:, None])).clamp(min=0)
+    iy = (torch.minimum(y2[:, :, None], y2[:, None]) - torch.maximum(y1[:, :, None], y1[:, None])).clamp(min=0)
+    overlap = ix * iy > 0
+    cx, cy, w = (x1 + x2) / 2 * W, (y1 + y2) / 2 * H, (x2 - x1) * W
+    near = torch.sqrt((cx[:, :, None] - cx[:, None]) ** 2 + (cy[:, :, None] - cy[:, None]) ** 2) \
+        < (w[:, :, None] + w[:, None]) / 2
+    index = {c: i for i, c in enumerate(sorted({str(c) for c in classes}))}
+    cls = torch.tensor([index[str(c)] for c in classes], dtype=torch.long)
+    adj = (overlap | near) & (cls[:, None] == cls[None])[None] & has_box[:, :, None] & has_box[:, None]
+    adj |= torch.eye(N, dtype=torch.bool)[None] & has_box[:, :, None]
+    label = torch.where(has_box, torch.arange(N)[None].expand(T, N), N)
+    while True:                                                  # connected components: min label propagation
+        new = torch.where(has_box, torch.where(adj, label[:, None, :], N).amin(dim=2), N)
+        if torch.equal(new, label):
+            break
+        label = new
+    return torch.where(has_box, label, -1)

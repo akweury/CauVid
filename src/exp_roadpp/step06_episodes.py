@@ -25,6 +25,11 @@ episodes instead of one alarm per upward crossing (`step06`):
   - an alarm that hits no event is a false alarm only if its outcome is seen: the
     agent stays in the scene (rows) for max(tol, 1) frames after e. Alarms cut off by
     the agent leaving or the video end are left out.
+  - group level ("results_group", if the test data has "groups", `grid.agent_groups`): the
+    same alarms and events, but an alarm also hits an event of its head that happens to
+    another agent of its group (adjacent, same class) in the frame before the onset, o - 1.
+    The gap to the object level ("results") is the cost of picking the wrong one of
+    several adjacent agents.
 Computed for every window of the model, every score threshold and tolerance, on the
 counted heads (`step06.COUNTED_TYPES`), for the rule net and the OnsetMLP.
 """
@@ -50,7 +55,7 @@ def _default_cfg(frame_rate):
         "print_threshold": 0.5,
         "print_tolerance_s": 1.0,
         # Version of this metric; a cached file of another one is redone.
-        "metric": "episode_alarms_v2",
+        "metric": "episode_alarms_v3_group",
     }
 
 
@@ -135,7 +140,8 @@ def _empty_stats():
 
 @torch.no_grad()
 def score_episodes(model, mlp, baselines, data, cfg, ep):
-    """{scorer: {window: {threshold: {tol_frames: stats}}}} and the scored frames.
+    """{level: {scorer: {window: {threshold: {tol_frames: stats}}}}} (levels "object" and, with
+    groups in the data, "group") and the scored frames.
     stats: events, detected, alarms (counted), correct, excluded (unobservable alarms),
     lead / lag (frames, per detected event), by_type {type: the same}."""
     device, fps = cfg["device"], cfg["frame_rate"]
@@ -148,9 +154,11 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
     windows = list(model.windows)
     tolerances = [int(round(s * fps)) for s in ep["tolerances_s"]]
     scorers = step06._scorers(model, baselines, mlp, None, device, names=SCORERS)
-    stats = {name: {w: {th: {tol: {**_empty_stats(), "by_type": {t: _empty_stats() for t in step06.COUNTED_TYPES}}
-                              for tol in tolerances} for th in ep["thresholds"]} for w in windows}
-             for name in scorers}
+    levels = ["object"] + (["group"] if all("groups" in v for v in data["videos"].values()) else [])
+    stats = {level: {name: {w: {th: {tol: {**_empty_stats(),
+                                           "by_type": {t: _empty_stats() for t in step06.COUNTED_TYPES}}
+                                     for tol in tolerances} for th in ep["thresholds"]} for w in windows}
+                     for name in scorers} for level in levels}
     num_frames = 0
     for video_id in tqdm(data["videos"], desc="Scoring alarm episodes"):
         video = data["videos"][video_id]
@@ -183,6 +191,9 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
         e_t, e_n, e_h = torch.nonzero(onsets, as_tuple=True)
         e_end = _event_ends(X, e_t, e_n, heads[e_h], m).to(device)
         e_pair, e_type = e_n * H + e_h, type_of_head[e_h]
+        # Group of every agent in the frame before each onset (-1: no box), for the group level.
+        groups = video["groups"].to(device).long() if "group" in levels else None
+        e_group = groups[e_t - 1, :] if groups is not None else None                 # (E, N)
         # First frame >= t without a row of the agent (T past the video end): alarm observability.
         next_gone = torch.cat([_next_index(~is_row), torch.full((1, N), T, dtype=torch.long, device=device)])
         row_p = is_row[:, :, None].expand(T, N, H).reshape(T, N * H)
@@ -192,21 +203,26 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
                 score = dense[name][k].reshape(T, N * H)
                 for th in ep["thresholds"]:
                     pair, start, end = alarm_episodes(score, row_p, risk_p, th, ep["fill_gap"], ep["min_length"])
-                    s_n, s_type = pair // H, type_of_head[pair % H]
-                    for tol in tolerances:
+                    s_n, s_h, s_type = pair // H, pair % H, type_of_head[pair % H]
+                    who = {"object": e_pair[:, None] == pair[None]}                   # (E, S) the event's agent
+                    if "group" in levels:
+                        g_e = e_group.gather(1, e_n[:, None])                         # (E, 1)
+                        g_s = e_group[:, s_n]                                         # (E, S)
+                        who["group"] = (e_h[:, None] == s_h[None]) & (
+                            (e_n[:, None] == s_n[None]) | ((g_e >= 0) & (g_e == g_s)))
+                    for level, tol in ((lv, tl) for lv in levels for tl in tolerances):
                         # hit (E, S): the alarm covers the onset or ends at most tol frames before it.
-                        hit = ((e_pair[:, None] == pair[None]) & (start[None] <= e_t[:, None])
-                               & (e_t[:, None] <= end[None] + tol))
+                        hit = who[level] & (start[None] <= e_t[:, None]) & (e_t[:, None] <= end[None] + tol)
                         correct = hit.any(dim=0)
                         seen = next_gone[(end + 1).clamp(max=T), s_n] > end + max(tol, 1)
                         counted = correct | seen
                         detected = hit.any(dim=1)
                         lead = e_t - torch.where(hit, start[None], T).amin(dim=1) if len(start) else None
                         lag = torch.where(hit, end[None], -1).amax(dim=1) - e_end if len(start) else None
-                        groups = [(stats[name][w][th][tol], None)] + \
-                                 [(stats[name][w][th][tol]["by_type"][t], step06.EVENT_TYPES.index(t))
-                                  for t in step06.COUNTED_TYPES]
-                        for st, g in groups:
+                        cell = stats[level][name][w][th][tol]
+                        parts = [(cell, None)] + [(cell["by_type"][t], step06.EVENT_TYPES.index(t))
+                                                  for t in step06.COUNTED_TYPES]
+                        for st, g in parts:
                             ev = torch.ones_like(e_t, dtype=torch.bool) if g is None else e_type == g
                             al = torch.ones_like(start, dtype=torch.bool) if g is None else s_type == g
                             st["events"] += int(ev.sum())
@@ -246,7 +262,7 @@ def evaluate(model, mlp, baselines, data, cfg, ep):
     minutes = num_frames / fps / 60
     out = {**{key: ep[key] for key in ep}, "frame_rate": fps, "minutes": minutes,
            "min_context": cfg["min_context"], "counted_types": list(step06.COUNTED_TYPES),
-           "headline_window": cfg["headline_window"], "results": {}}
+           "headline_window": cfg["headline_window"], "results": {}, "results_group": None}
     print_tol = int(round(ep["print_tolerance_s"] * fps))
 
     def entry(st, th, tol):
@@ -256,11 +272,13 @@ def evaluate(model, mlp, baselines, data, cfg, ep):
             e["lead_s"] = [v / fps for v in st["lead"]]
             e["lag_s"] = [v / fps for v in st["lag"]]
         return e
-    for name, by_w in stats.items():
-        out["results"][name] = {
-            str(w): {str(th): {str(tol / fps): entry(st, th, tol) for tol, st in by_tol.items()}
-                     for th, by_tol in by_th.items()}
-            for w, by_th in by_w.items()}
+    for level, key in (("object", "results"), ("group", "results_group")):
+        if level not in stats:
+            continue
+        out[key] = {name: {str(w): {str(th): {str(tol / fps): entry(st, th, tol) for tol, st in by_tol.items()}
+                                    for th, by_tol in by_th.items()}
+                           for w, by_th in by_w.items()}
+                    for name, by_w in stats[level].items()}
     return out
 
 
@@ -291,6 +309,16 @@ def print_summary(metrics, headline_window):
             print(f"  {t:<8}{r['events']:>7}{r['detected']:>7}{r['recall']:>7.3f}{r['alarms']:>7}"
                   f"{r['false_alarms']:>7}{r['precision']:>7.3f}{_fmt(r['false_alarms_per_minute'], '{:.1f}'):>7}"
                   f"{_fmt(r['mean_lead_s']):>7}{_fmt(r['mean_lag_s']):>7}")
+    if metrics.get("results_group"):
+        print(f"  Group level (the event may happen to an adjacent agent of the same class), tolerance {tol} s:")
+        print(f"  {'':<14}{'th':>5}{'recall obj':>11}{'recall grp':>11}{'prec obj':>10}{'prec grp':>10}"
+              f"{'FA/min obj':>11}{'FA/min grp':>11}")
+        for name in metrics["results"]:
+            for t in metrics["results"][name][w]:
+                o, g = metrics["results"][name][w][t][tol], metrics["results_group"][name][w][t][tol]
+                print(f"  {name:<14}{t:>5}{o['recall']:>11.3f}{g['recall']:>11.3f}{o['precision']:>10.3f}"
+                      f"{g['precision']:>10.3f}{_fmt(o['false_alarms_per_minute'], '{:.1f}'):>11}"
+                      f"{_fmt(g['false_alarms_per_minute'], '{:.1f}'):>11}")
     print()
 
 
@@ -298,7 +326,8 @@ def print_summary(metrics, headline_window):
 def plot_episodes(metrics, figure_dir):
     """Figures of the episode alarms, one PDF each, in figure_dir:
       episode_vs_tolerance.pdf: recall, precision, false alarms / min and mean lead time over
-          the matching tolerance (print threshold, headline window), per scorer;
+          the matching tolerance (print threshold, headline window), per scorer; dashed: the
+          group level (also in episode_threshold.pdf);
       episode_threshold.pdf: precision vs recall and false alarms / min vs recall over the
           score thresholds (print tolerance, headline window), threshold labels on the points;
       episode_vs_window.pdf: recall, precision, false alarms / min and mean lead per window
@@ -340,12 +369,16 @@ def plot_episodes(metrics, figure_dir):
     keys = (("recall", "event recall", False), ("precision", "alarm precision", False),
             ("false_alarms_per_minute", "false alarms / min", False), ("mean_lead_s", "mean lead (s)", False))
     fig, axes = panels(len(keys))
+    group = metrics.get("results_group")
     for name in names:
-        by_tol = results[name][w][th]
-        x = [float(t) for t in by_tol]
-        for ax, (key, title, _) in zip(axes, keys):
-            ax.plot(x, [r[key] if r[key] is not None else float("nan") for r in by_tol.values()],
-                    "o-", color=color(name), label=label(name))
+        for res, style, suffix in ((results, "o-", ""), (group, "s--", " (group)")):
+            if not res:
+                continue
+            by_tol = res[name][w][th]
+            x = [float(t) for t in by_tol]
+            for ax, (key, title, _) in zip(axes, keys):
+                ax.plot(x, [r[key] if r[key] is not None else float("nan") for r in by_tol.values()],
+                        style, color=color(name), label=label(name) + suffix)
     for ax, (key, title, _) in zip(axes, keys):
         ax.set(title=title, xlabel="tolerance (s)")
         ax.grid(alpha=0.3)
@@ -356,13 +389,16 @@ def plot_episodes(metrics, figure_dir):
     # 2. Over the score threshold.
     fig, axes = panels(2)
     for name in names:
-        rows = [(t, by_tol[tol]) for t, by_tol in results[name][w].items()]
-        rec = [r["recall"] for _, r in rows]
-        for ax, key in zip(axes, ("precision", "false_alarms_per_minute")):
-            y = [r[key] or 0 for _, r in rows]
-            ax.plot(rec, y, "o-", color=color(name), label=label(name))
-            for (t, _), xi, yi in zip(rows, rec, y):
-                ax.annotate(t, (xi, yi), fontsize=7, xytext=(3, 3), textcoords="offset points")
+        for res, style, suffix in ((results, "o-", ""), (group, "s--", " (group)")):
+            if not res:
+                continue
+            rows = [(t, by_tol[tol]) for t, by_tol in res[name][w].items()]
+            rec = [r["recall"] for _, r in rows]
+            for ax, key in zip(axes, ("precision", "false_alarms_per_minute")):
+                y = [r[key] or 0 for _, r in rows]
+                ax.plot(rec, y, style, color=color(name), label=label(name) + suffix)
+                for (t, _), xi, yi in zip(rows, rec, y):
+                    ax.annotate(t, (xi, yi), fontsize=7, xytext=(3, 3), textcoords="offset points")
     axes[0].set(title="precision vs recall (thresholds)", xlabel="event recall", ylabel="alarm precision")
     axes[1].set(title="false alarms vs recall (thresholds)", xlabel="event recall", ylabel="false alarms / min")
     for ax in axes:

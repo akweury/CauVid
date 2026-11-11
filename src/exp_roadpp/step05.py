@@ -295,6 +295,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     With geometry (`geometry.GEOMETRY` groups), the geometry atoms of the boxes
     (`geometry.video_geometry`) follow the num_atoms label atoms in every video.
     "ahead" and geometry need unique_atoms, the label vocabulary (num_atoms of them).
+    With a box file, each video also gets "groups" (T, N) int16 (`grid.agent_groups`, -1: no box)
+    and the data "group_tag" (`grid.GROUP_TAG`).
     With grid_spec (`fit_grid`), the grid atoms (`grid.grid_atoms`: the position atoms,
     then the kept compound atoms) follow the geometry atoms; "grid_layout" gives their
     [start, end) atom ranges.
@@ -320,6 +322,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
                                     f"{box_file} (step_dataset).")
         if unique_atoms is None or len(unique_atoms) != num_atoms:
             raise ValueError("Agent roles and geometry need the label vocabulary (unique_atoms, num_atoms long).")
+    if box_file is not None and os.path.exists(box_file):
+        # With boxes, every video also gets its groups of adjacent same-class agents (step 06 group-level metrics).
         boxes = torch.load(box_file, map_location="cpu")
     geometry_atoms = agent_geometry.vocabulary(unique_atoms, geometry) if geometry else []
     grid_start = num_atoms + len(geometry_atoms)
@@ -361,6 +365,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
         videos[video_id] = _video_cells(X)
         if roles:
             videos[video_id]["roles"] = partners.to(torch.int16)
+        if boxes is not None:
+            videos[video_id]["groups"] = agent_grid.agent_groups(video_boxes, has_box, classes).to(torch.int16)
         frames[video_id] = torch.nonzero(visible.any(dim=1)).flatten().cpu()
         positive_frames[video_id] = torch.nonzero(has_onset).flatten().cpu()
     name = atom_file.name if hasattr(atom_file, "name") else atom_file
@@ -377,6 +383,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid, "num_label_atoms": num_atoms,
            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
            "frames": frames, "positive_frames": positive_frames}
+    if boxes is not None:
+        out["group_tag"] = agent_grid.GROUP_TAG
     if grid_spec is not None:
         p = grid_start + 2 * agent_grid.num_cells()
         out["grid_layout"] = {"position": [grid_start, p], "compound": [p, grid_start + num_grid]}

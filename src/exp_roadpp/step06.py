@@ -2020,7 +2020,8 @@ def main(input_data):
     if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
             or test_data.get("roles", []) != list(step05_cfg["roles"])
             or test_data.get("geometry", []) != list(step05_cfg["geometry"])
-            or test_data.get("grid_tag", "") != step05.grid_tag(step05_cfg)):
+            or test_data.get("grid_tag", "") != step05.grid_tag(step05_cfg)
+            or test_data.get("group_tag") != step05.agent_grid.GROUP_TAG):
         unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
         test_data = step05.prepare_videos(cfg["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
