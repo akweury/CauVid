@@ -41,6 +41,12 @@ episodes instead of one alarm per upward crossing (`step06`):
     multiply the correct alarms.
 Computed for every window of the model, every score threshold and tolerance, on the
 counted heads (`step06.COUNTED_TYPES`), for the rule net and the OnsetMLP.
+Calibrated scorers "model_cal" / "mlp_cal" (with a calibration, `step06.load_calibration`): the same
+scores mapped to probabilities by the per-head Platt scaling fitted on val, swept over
+calibrated_thresholds. The raw scores are no probabilities (step 05 weights the onsets by
+pos_weight, so a raw 0.9 can be a 10% chance): only a calibrated threshold says how likely the
+event is when the alarm goes off, and the alarm level is then a choice of the cost of a false
+alarm vs a missed event, not a property of the model.
 """
 import os
 import torch
@@ -63,9 +69,21 @@ def _default_cfg(frame_rate):
         # The operating point of the printed tables.
         "print_threshold": 0.5,
         "print_tolerance_s": 1.0,
+        # Probability thresholds of the calibrated scorers and their printed one.
+        "calibrated_thresholds": [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5],
+        "print_calibrated_threshold": 0.1,
         # Version of this metric; a cached file of another one is redone.
-        "metric": "episode_alarms_v4_window_seen_group_dedup",
+        "metric": "episode_alarms_v5_window_seen_group_dedup_calibrated",
     }
+
+
+def thresholds_of(name, ep):
+    """The score thresholds of a scorer: probabilities for the calibrated ones."""
+    return ep["calibrated_thresholds"] if name.endswith("_cal") else ep["thresholds"]
+
+
+def print_threshold_of(name, ep):
+    return ep["print_calibrated_threshold"] if name.endswith("_cal") else ep["print_threshold"]
 
 
 # -------------- Episodes --------------
@@ -149,7 +167,7 @@ def _empty_stats():
 
 
 @torch.no_grad()
-def score_episodes(model, mlp, baselines, data, cfg, ep):
+def score_episodes(model, mlp, baselines, data, cfg, ep, calibration=None):
     """{level: {scorer: {window: {threshold: {tol_frames: stats}}}}} (levels "object" and, with
     groups in the data, "group") and the scored frames.
     stats: events, detected, alarms (counted), correct, excluded (unobservable alarms),
@@ -164,11 +182,13 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
     windows = list(model.windows)
     tolerances = [int(round(s * fps)) for s in ep["tolerances_s"]]
     scorers = step06._scorers(model, baselines, mlp, None, device, names=SCORERS)
+    calibrated = {f"{name}_cal": calibration[name] for name in scorers if calibration and name in calibration}
+    names = list(scorers) + list(calibrated)
     levels = ["object"] + (["group"] if all("groups" in v for v in data["videos"].values()) else [])
     stats = {level: {name: {w: {th: {tol: {**_empty_stats(),
                                            "by_type": {t: _empty_stats() for t in step06.COUNTED_TYPES}}
-                                     for tol in tolerances} for th in ep["thresholds"]} for w in windows}
-                     for name in scorers} for level in levels}
+                                     for tol in tolerances} for th in thresholds_of(name, ep)} for w in windows}
+                     for name in names} for level in levels}
     num_frames = 0
     for video_id in tqdm(data["videos"], desc="Scoring alarm episodes"):
         video = data["videos"][video_id]
@@ -180,7 +200,7 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
         num_frames += T - min_context
         is_row = torch.zeros((T, N), dtype=torch.bool, device=device)
         at_risk = torch.zeros((T, N, H), dtype=torch.bool, device=device)
-        dense = {name: torch.zeros((len(windows), T, N, H), device=device) for name in scorers}
+        dense = {name: torch.zeros((len(windows), T, N, H), device=device) for name in names}
         for begin in range(min_context, T, cfg["frames_per_video"]):
             frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
             rows = step05.video_rows(model, X, frames, m, None, roles)
@@ -193,6 +213,9 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
             for name, score in scorers.items():
                 p = score(rows["inputs"], stage1)                                  # (B, W, A)
                 dense[name][:, t, n] = p[:, :, heads].transpose(0, 1)
+                if f"{name}_cal" in calibrated:
+                    q = step06.calibrate(p[:, :, heads], calibrated[f"{name}_cal"], heads)
+                    dense[f"{name}_cal"][:, t, n] = q.transpose(0, 1)
         # Events: the exact onsets of the counted heads (as `step06._score_videos`).
         onsets = step05.atom_onsets(X[..., heads], m)
         onsets[0] = False
@@ -208,10 +231,10 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
         next_gone = torch.cat([_next_index(~is_row), torch.full((1, N), T, dtype=torch.long, device=device)])
         row_p = is_row[:, :, None].expand(T, N, H).reshape(T, N * H)
         risk_p = at_risk.reshape(T, N * H)
-        for name in scorers:
+        for name in names:
             for k, w in enumerate(windows):
                 score = dense[name][k].reshape(T, N * H)
-                for th in ep["thresholds"]:
+                for th in thresholds_of(name, ep):
                     pair, start, end = alarm_episodes(score, row_p, risk_p, th, ep["fill_gap"], ep["min_length"])
                     s_n, s_h, s_type = pair // H, pair % H, type_of_head[pair % H]
                     who = {"object": e_pair[:, None] == pair[None]}                   # (E, S) the event's agent
@@ -277,8 +300,8 @@ def _summary(st, minutes, fps):
     }
 
 
-def evaluate(model, mlp, baselines, data, cfg, ep):
-    stats, num_frames = score_episodes(model, mlp, baselines, data, cfg, ep)
+def evaluate(model, mlp, baselines, data, cfg, ep, calibration=None):
+    stats, num_frames = score_episodes(model, mlp, baselines, data, cfg, ep, calibration)
     fps = cfg["frame_rate"]
     minutes = num_frames / fps / 60
     out = {**{key: ep[key] for key in ep}, "frame_rate": fps, "minutes": minutes,
@@ -286,9 +309,9 @@ def evaluate(model, mlp, baselines, data, cfg, ep):
            "headline_window": cfg["headline_window"], "results": {}, "results_group": None}
     print_tol = int(round(ep["print_tolerance_s"] * fps))
 
-    def entry(st, th, tol):
+    def entry(name, st, th, tol):
         e = {**_summary(st, minutes, fps), "by_type": {t: _summary(s, minutes, fps) for t, s in st["by_type"].items()}}
-        if th == ep["print_threshold"] and tol == print_tol:
+        if th == print_threshold_of(name, ep) and tol == print_tol:
             # The per-event values of the printed operating point (seconds), for the figures.
             e["lead_s"] = [v / fps for v in st["lead"]]
             e["lag_s"] = [v / fps for v in st["lag"]]
@@ -296,7 +319,7 @@ def evaluate(model, mlp, baselines, data, cfg, ep):
     for level, key in (("object", "results"), ("group", "results_group")):
         if level not in stats:
             continue
-        out[key] = {name: {str(w): {str(th): {str(tol / fps): entry(st, th, tol) for tol, st in by_tol.items()}
+        out[key] = {name: {str(w): {str(th): {str(tol / fps): entry(name, st, th, tol) for tol, st in by_tol.items()}
                                     for th, by_tol in by_th.items()}
                            for w, by_th in by_w.items()}
                     for name, by_w in stats[level].items()}
@@ -309,14 +332,14 @@ def _fmt(v, f="{:.2f}"):
 
 
 def print_summary(metrics, headline_window):
-    w, th, tol = str(headline_window), str(metrics["print_threshold"]), str(float(metrics["print_tolerance_s"]))
+    w, tol = str(headline_window), str(float(metrics["print_tolerance_s"]))
     print(f"[Episode alarms] window {w} frames; high frames merged into one alarm per agent and head "
           f"(gaps <= {metrics['fill_gap']} frames smoothed, >= {metrics['min_length']} frames long); "
           f"{metrics['minutes']:.1f} min")
     header = (f"  {'':<8}{'events':>7}{'detect':>7}{'recall':>7}{'alarms':>7}{'false':>7}{'prec':>7}"
               f"{'FA/min':>7}{'lead s':>7}{'lag s':>7}")
     for name, by_w in metrics["results"].items():
-        by_th = by_w[w]
+        by_th, th = by_w[w], str(print_threshold_of(name, metrics))
         print(f"  {name}: threshold {th}, by tolerance (s)")
         print(header)
         for t, r in by_th[th].items():
@@ -371,10 +394,13 @@ def plot_episodes(metrics, figure_dir):
 
     results = metrics["results"]
     w = str(metrics["headline_window"])
-    th, tol = str(metrics["print_threshold"]), str(float(metrics["print_tolerance_s"]))
-    point = (f"window {int(w) / metrics['frame_rate']:g} s, threshold {th}, tolerance {tol} s, "
-             f">= {metrics['min_length']} frames")
+    tol = str(float(metrics["print_tolerance_s"]))
+    point = (f"window {int(w) / metrics['frame_rate']:g} s, threshold {metrics['print_threshold']} raw / "
+             f"{metrics['print_calibrated_threshold']} calibrated, tolerance {tol} s, >= {metrics['min_length']} frames")
     names = list(results)
+
+    def th_of(name):
+        return str(print_threshold_of(name, metrics))
 
     def color(name):
         return step06.SCORER_COLORS.get(name)
@@ -395,7 +421,7 @@ def plot_episodes(metrics, figure_dir):
         for res, style, suffix in ((results, "o-", ""), (group, "s--", " (group)")):
             if not res:
                 continue
-            by_tol = res[name][w][th]
+            by_tol = res[name][w][th_of(name)]
             x = [float(t) for t in by_tol]
             for ax, (key, title, _) in zip(axes, keys):
                 ax.plot(x, [r[key] if r[key] is not None else float("nan") for r in by_tol.values()],
@@ -404,7 +430,7 @@ def plot_episodes(metrics, figure_dir):
         ax.set(title=title, xlabel="tolerance (s)")
         ax.grid(alpha=0.3)
     axes[0].legend()
-    fig.suptitle(f"Episode alarms vs matching tolerance (window {int(w) / metrics['frame_rate']:g} s, threshold {th})")
+    fig.suptitle(f"Episode alarms vs matching tolerance ({point})")
     save(fig, "episode_vs_tolerance.pdf")
 
     # 2. Over the score threshold.
@@ -435,13 +461,14 @@ def plot_episodes(metrics, figure_dir):
         ws = list(results[name])
         x = [int(v) / metrics["frame_rate"] for v in ws]
         for ax, (key, title, _) in zip(axes, keys):
-            ax.plot(x, [results[name][v][th][tol][key] if results[name][v][th][tol][key] is not None
-                        else float("nan") for v in ws], "o-", color=color(name), label=label(name))
+            r = [results[name][v][th_of(name)][tol] for v in ws]
+            ax.plot(x, [e[key] if e[key] is not None else float("nan") for e in r], "o-", color=color(name),
+                    label=label(name))
     for ax, (key, title, _) in zip(axes, keys):
         ax.set(title=title, xlabel="window (s)")
         ax.grid(alpha=0.3)
     axes[0].legend()
-    fig.suptitle(f"Episode alarms per window (threshold {th}, tolerance {tol} s)")
+    fig.suptitle(f"Episode alarms per window ({point})")
     save(fig, "episode_vs_window.pdf")
 
     # 4. Per event type.
@@ -449,7 +476,7 @@ def plot_episodes(metrics, figure_dir):
     fig, axes = panels(2)
     width = 0.8 / max(len(names), 1)
     for i, name in enumerate(names):
-        by_type = results[name][w][th][tol]["by_type"]
+        by_type = results[name][w][th_of(name)][tol]["by_type"]
         for ax, key in zip(axes, ("recall", "precision")):
             x = [j + i * width for j in range(len(types))]
             bars = ax.bar(x, [by_type[t][key] for t in types], width, color=color(name), label=label(name))
@@ -468,7 +495,7 @@ def plot_episodes(metrics, figure_dir):
     # 5. Lead and lag of the detected events.
     fig, axes = panels(2)
     for name in names:
-        r = results[name][w][th][tol]
+        r = results[name][w][th_of(name)][tol]
         for ax, key in zip(axes, ("lead_s", "lag_s")):
             values = r.get(key) or []
             if values:
@@ -484,17 +511,20 @@ def plot_episodes(metrics, figure_dir):
     save(fig, "episode_lead_lag.pdf")
 
 
-def main(model, mlp, baselines, test_data, step05_cfg, cfg, output_file):
+def main(model, mlp, baselines, test_data, step05_cfg, cfg, output_file, calibration=None):
     """Episode alarm metrics of the test videos (cached in output_file, redone when the
-    models, the test data or the settings change)."""
+    models, the test data, the calibration or the settings change). calibration: the per-head
+    calibration on val (`step06.load_calibration`), adds the calibrated scorers."""
     ep = _default_cfg(cfg["frame_rate"])
     metrics = utils_data.load_json(output_file) if os.path.exists(output_file) else {}
     sources = [step05_cfg["model_file"], step05_cfg["mlp_model_file"], cfg["test_data_file"], cfg["baseline_file"]]
+    if calibration is not None:
+        sources.append(cfg["calibration_file"])
     if (not step05.is_fresh(output_file, *sources) or {k: metrics.get(k) for k in ep} != ep
             or metrics.get("min_context") != cfg["min_context"]):
         if "head_types" not in cfg:
             cfg["head_types"] = step05.load_training_data(step05_cfg)["event_types"]["types"]
-        metrics = evaluate(model, mlp, baselines, test_data, cfg, ep)
+        metrics = evaluate(model, mlp, baselines, test_data, cfg, ep, calibration)
         utils_data.save_json(metrics, output_file)
     print_summary(metrics, cfg["headline_window"])
     print(f"[Results]\t {output_file}")

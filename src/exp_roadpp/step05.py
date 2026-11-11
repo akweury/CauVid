@@ -53,12 +53,11 @@ def label_atom_count(data):
 def load_vocabulary(cfg):
     """The atom signatures of every atom index: the label vocabulary of
     cfg["unique_atoms_file"], then the geometry atoms of cfg["geometry"] (`geometry.vocabulary`),
-    then the grid atoms of cfg["grid"] (`grid.vocabulary`, the kept compound atoms of the grid file)."""
+    then the grid position atoms of cfg["grid"] (`grid.vocabulary`)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     out = unique_atoms + agent_geometry.vocabulary(unique_atoms, cfg.get("geometry", ()))
-    spec = load_grid(cfg)
-    if spec is not None:
-        out += agent_grid.vocabulary(unique_atoms, spec["compound"], _atom_name)
+    if cfg.get("grid"):
+        out += agent_grid.vocabulary()
     return out
 
 
@@ -72,8 +71,7 @@ def grid_tag(cfg):
     """File tag of the grid settings ("" without the grid)."""
     if not cfg.get("grid"):
         return ""
-    return (f"_grid{agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS}q{agent_grid.OVERLAP:g}"
-            f"v{agent_grid.MIN_VIDEOS}f{agent_grid.MIN_FRAMES}")
+    return f"_grid{agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS}q{agent_grid.OVERLAP:g}pos"
 
 
 def _agent_boxes(boxes, video_id, video_atoms, X_labels):
@@ -90,38 +88,28 @@ def _agent_boxes(boxes, video_id, video_atoms, X_labels):
 
 def fit_grid(cfg):
     """The grid of the train split (`grid.py`): the coordinate quantiles of each box corner (the
-    rank map of the rows and columns) and the compound atoms seen in at least MIN_VIDEOS train videos and MIN_FRAMES rows."""
+    rank map of the rows and columns)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     A = len(unique_atoms)
     if not cfg.get("train_box_file") or not os.path.exists(cfg["train_box_file"]):
         raise FileNotFoundError(f"The grid needs the train box file {cfg.get('train_box_file')} (step_dataset).")
     boxes = torch.load(cfg["train_box_file"], map_location="cpu")
     atoms = utils_data.load_json(cfg["train_atom_file"])
-    videos, points = [], []
+    points, num_videos = [], 0
     for video_id, video_atoms in tqdm(atoms.items(), desc="Grid: train boxes"):
         X = build_video_tensor(video_atoms, A)
         if X.shape[0] < 2:
             continue
         video_boxes, _classes, has_box = _agent_boxes(boxes, video_id, video_atoms, X)
-        videos.append((X, video_boxes, has_box))
+        num_videos += 1
         points.append(agent_grid.corner_points(video_boxes)[has_box])          # (K, 2 corners, 2 axes)
     del atoms
     points = torch.cat(points)
     sample = torch.randperm(len(points), generator=torch.Generator().manual_seed(0))[:2_000_000]
     knots = agent_grid.axis_knots(points[sample])
-    frames = torch.zeros((A, 2 * agent_grid.num_cells()), dtype=torch.long)
-    num_videos = torch.zeros_like(frames)
-    for X, video_boxes, has_box in videos:
-        c = agent_grid.compound_counts(X, agent_grid.corner_cells(video_boxes, has_box, knots))
-        frames += c
-        num_videos += (c > 0).long()
-    compound = agent_grid.select_compound(frames, num_videos)
-    print(f"[Grid]\t {agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS} cells, {len(videos)} train videos: "
-          f"{len(compound)} of {int((frames > 0).sum())} occurring compound atoms kept "
-          f"(>= {agent_grid.MIN_VIDEOS} videos, >= {agent_grid.MIN_FRAMES} rows)")
+    print(f"[Grid]\t {agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS} cells, {num_videos} train videos, {len(points)} boxes")
     return {"rows": agent_grid.GRID_ROWS, "cols": agent_grid.GRID_COLS, "overlap": agent_grid.OVERLAP,
-            "min_videos": agent_grid.MIN_VIDEOS, "min_frames": agent_grid.MIN_FRAMES, "knots": knots,
-            "compound": compound, "num_train_videos": len(videos)}
+            "knots": knots, "num_train_videos": num_videos}
 
 
 def load_grid(cfg):
@@ -135,19 +123,15 @@ def load_grid(cfg):
 
 def rule_input_mask(data, cfg, num_scopes=2):
     """(M,) bool: the memory inputs a TemporalRuleNet rule may learn, None for all. With the grid:
-    the agent itself reads its plain label atoms and its position atoms, not its compound atoms
-    (its own position and labels already give them); the other agents (and roles) read the
-    plain label atoms and the compound atoms, not the position atoms (a position of some
-    other agent without what it does says little, and the compound atoms carry both)."""
+    the agent itself reads its label atoms and its position atoms; the other agents (and roles)
+    only the label atoms (some other agent's position, pooled over the agents, says little)."""
     layout = data.get("grid_layout")
     if not layout:
         return None
     J, A = cfg["num_slots"], data["num_atoms"]
     atom = torch.arange(A)
     position = (atom >= layout["position"][0]) & (atom < layout["position"][1])
-    compound = (atom >= layout["compound"][0]) & (atom < layout["compound"][1])
     allowed = torch.ones((num_scopes, J, A), dtype=torch.bool)
-    allowed[0][:, compound] = False
     allowed[1:][:, :, position] = False
     return allowed.flatten()
 
@@ -297,9 +281,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     "ahead" and geometry need unique_atoms, the label vocabulary (num_atoms of them).
     With a box file, each video also gets "groups" (T, N) int16 (`grid.agent_groups`, -1: no box)
     and the data "group_tag" (`grid.GROUP_TAG`).
-    With grid_spec (`fit_grid`), the grid atoms (`grid.grid_atoms`: the position atoms,
-    then the kept compound atoms) follow the geometry atoms; "grid_layout" gives their
-    [start, end) atom ranges.
+    With grid_spec (`fit_grid`), the grid position atoms (`grid.grid_atoms`) follow the geometry
+    atoms; "grid_layout" gives their [start, end) atom range.
 
     Returns {
       "num_atoms": A, the label atoms and the geometry atoms after them,
@@ -327,7 +310,7 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
         boxes = torch.load(box_file, map_location="cpu")
     geometry_atoms = agent_geometry.vocabulary(unique_atoms, geometry) if geometry else []
     grid_start = num_atoms + len(geometry_atoms)
-    num_grid = (2 * agent_grid.num_cells() + len(grid_spec["compound"])) if grid_spec is not None else 0
+    num_grid = 2 * agent_grid.num_cells() if grid_spec is not None else 0
     grid_rows = 0
     videos, frames, positive_frames = {}, {}, {}
     role_stats = torch.zeros(len(roles))
@@ -360,8 +343,7 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
         if grid_spec is not None:
             cells = agent_grid.corner_cells(video_boxes, has_box, grid_spec["knots"])
             grid_rows += int(has_box.sum())
-            X = torch.cat([X, agent_grid.grid_atoms(X[..., :num_atoms].cpu(), cells,
-                                                    grid_spec["compound"]).to(X.device)], dim=2)
+            X = torch.cat([X, agent_grid.grid_atoms(cells).to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
         if roles:
             videos[video_id]["roles"] = partners.to(torch.int16)
@@ -379,15 +361,14 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
                           for k, f in enumerate(agent_geometry.fact_names(geometry))))
     if grid_spec is not None:
         print(f"[Grid]\t {name}: share of visible agents (rows) with a box: {grid_rows / max(num_rows, 1):.2f}; "
-              f"{num_grid} grid atoms ({2 * agent_grid.num_cells()} position, {len(grid_spec['compound'])} compound)")
+              f"{num_grid} grid position atoms")
     out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid, "num_label_atoms": num_atoms,
            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
            "frames": frames, "positive_frames": positive_frames}
     if boxes is not None:
         out["group_tag"] = agent_grid.GROUP_TAG
     if grid_spec is not None:
-        p = grid_start + 2 * agent_grid.num_cells()
-        out["grid_layout"] = {"position": [grid_start, p], "compound": [p, grid_start + num_grid]}
+        out["grid_layout"] = {"position": [grid_start, grid_start + num_grid]}
     return out
 
 
@@ -643,8 +624,8 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     torch.manual_seed(cfg["seed"])
     generator = torch.Generator().manual_seed(cfg["seed"])
     device = cfg["device"]
-    # Optional (the OnsetMLP sets them): gradient-norm clipping, halving the learning rate
-    # after lr_patience epochs without a better val loss, and early stopping after patience.
+    # Optional: gradient-norm clipping and halving the learning rate (the OnsetMLP sets them)
+    # after lr_patience epochs without a better val loss; early stopping after patience (both models).
     grad_clip, patience = cfg.get("grad_clip"), cfg.get("patience")
     scheduler = (torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=cfg["lr_patience"])
                  if cfg.get("lr_patience") else None)
@@ -1312,8 +1293,8 @@ def get_cfg(input_data):
     # Geometry atoms (`geometry.py`): facts of the GT boxes that hold without depth (bearing
     # sector, at the image edge, bearing drift), inputs only, after the label atoms; () for none.
     geometry = ()                               # was agent_geometry.GEOMETRY
-    # Grid atoms (`grid.py`): the cells of the two box corners in the 2D image, for the agent
-    # itself (position atoms) and bound to what the other agents do (compound atoms).
+    # Grid atoms (`grid.py`): the cells of the agent's own two box corners in the 2D image
+    # (position atoms; the compound atoms of the other agents are removed, no rule used them).
     grid = input_data.get("grid", True)         # --grid (default True)
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
@@ -1392,6 +1373,10 @@ def get_cfg(input_data):
             'pos_weight': 20.0,
             'l0_lambda': 1e-3,
             'l0_warmup_epochs': 10,
+            # Early stopping: stop after patience epochs without a better val loss (num_epochs is
+            # the maximum); the best val epoch is kept. Medium 080f05 (grid + self gate): best val
+            # epoch 10, val loss +43% by epoch 100 while train loss fell 4x.
+            'patience': 10,
             # Rule extraction thresholds of the trained model.
             'mask_threshold': 0.5,
             'weight_threshold': 0.1,
@@ -1429,7 +1414,7 @@ def get_cfg(input_data):
             'geometry': geometry,
             'grid': grid,
             'require_self': require_self,
-            # The grid fitted on the train split (`fit_grid`): row quantiles and kept compound atoms.
+            # The grid fitted on the train split (`fit_grid`): the corner coordinate quantiles.
             'grid_file': input_data["output_dir"] / f"grid_spec{grid_tag({'grid': grid})}.json",
             'train_box_file': input_data.get('train_box_file'),
             'val_box_file': input_data.get('val_box_file'),

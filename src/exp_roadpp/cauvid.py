@@ -211,8 +211,8 @@ class TemporalRuleNet(torch.nn.Module):
         self.head_bias = torch.nn.Parameter(torch.full((num_future, num_atoms), -6.0))
         # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
         self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
-        # (M,) bool: the memory inputs a rule may learn (None: all), e.g. not the grid compound
-        # atoms of the agent itself (`step05.rule_input_mask`). Not saved: rebuilt from the data.
+        # (M,) bool: the memory inputs a rule may learn (None: all), e.g. not the grid position
+        # atoms of the other agents (`step05.rule_input_mask`). Not saved: rebuilt from the data.
         if input_mask is not None and input_mask.shape != (self.num_inputs,):
             raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
         self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None

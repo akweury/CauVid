@@ -20,12 +20,9 @@ mostly above the horizon, the bottom-right ones below it, so each corner gets it
 Atoms (inputs only, never heads; `step05.is_input_atom`), after the label atoms:
   position: "pos:TL_r{i}c{j}" / "pos:BR_r{i}c{j}", 2 * R * C atoms: the agent's own
       corners. Rules read them in the agent's own scope (where am I in the image).
-  compound: "<label atom>@TL_r{i}c{j}" / "...@BR_...": the agent holds the label atom
-      and that corner lies in that cell. Rules read them in the "other agent" scope, so
-      a rule can name where in the image another agent does something ("an agent whose
-      box bottom-right is in r2c2 brakes"), which the plain "some other agent brakes"
-      cannot. Only the (atom, corner, cell) triples seen in at least MIN_VIDEOS train
-      videos and MIN_FRAMES train rows are kept (`select_compound`).
+Removed: compound atoms "<label atom>@<corner>_<cell>" (another agent holds the label atom with
+its corner in that cell), read in the "other agent" scope. Medium 080f05 (grid 3x3 + self gate):
+none of their 4,550 rule inputs got an active gate (max mask 0.375), they were 42% of the inputs.
 The ego has no box and gets no grid atom; its label atoms stay plain.
 The grid follows the 2D image only (no depth): the rules it allows are rules of the
 image, not of the 3D scene, which the fixed front camera of ROAD++ makes consistent
@@ -39,8 +36,6 @@ import torch
 GRID_ROWS, GRID_COLS = 3, 3
 OVERLAP = 0.1                     # share of a cell's width / height added on each side
 CORNERS = ("TL", "BR")
-MIN_VIDEOS = 5                    # a compound atom must occur in this many train videos
-MIN_FRAMES = 50                   # ... and in this many train rows (agent-frames)
 
 
 def num_cells():
@@ -106,39 +101,14 @@ def position_names():
     return [f"{c}_{g}" for c in CORNERS for g in cell_names()]
 
 
-def compound_counts(X_labels, cells):
-    """(A, 2 * R * C) long: the rows (agent-frames) of one video where the agent holds label atom a
-    and its corner lies in the cell. X_labels (T, N, A) bool; cells (T, N, 2, R * C) bool."""
-    T, N, A = X_labels.shape
-    return torch.einsum("tna,tnk->ak", X_labels.float(), cells.reshape(T, N, -1).float()).long()
+def grid_atoms(cells):
+    """(T, N, 2 * R * C) bool grid columns of one video: the position atoms. cells (T, N, 2, R * C) bool."""
+    return cells.flatten(-2)
 
 
-def select_compound(frames, videos, min_videos=MIN_VIDEOS, min_frames=MIN_FRAMES):
-    """The kept (atom, position) pairs of the (A, P) train counts: [[a, p]], p = corner * R * C + cell."""
-    keep = (videos >= min_videos) & (frames >= min_frames)
-    return torch.nonzero(keep).tolist()
-
-
-def grid_atoms(X_labels, cells, compound):
-    """(T, N, 2 * R * C + K) bool grid columns of one video: the position atoms, then the
-    K compound atoms of `compound` ([[a, p]])."""
-    T, N, _ = X_labels.shape
-    pos = cells.reshape(T, N, -1)
-    if not compound:
-        return pos
-    a, p = torch.tensor(compound, dtype=torch.long, device=X_labels.device).T
-    return torch.cat([pos, X_labels[..., a] & pos[..., p]], dim=2)
-
-
-def vocabulary(unique_atoms, compound, atom_name):
-    """Signatures of the grid atoms (position, then compound), after the label vocabulary;
-    `step05._atom_name` reads them as "pos:TL_r0c1" and "Car:Brake@TL_r0c1"."""
-    names = position_names()
-    out = [["pred", "grid", "grid_label", n, "agent_class_label", "pos"] for n in names]
-    for a, p in compound:
-        cls, label = atom_name(unique_atoms[a]).split(":", 1)
-        out.append(["pred", "grid", "grid_label", f"{label}@{names[p]}", "agent_class_label", cls])
-    return out
+def vocabulary():
+    """Signatures of the position atoms, after the label vocabulary; `step05._atom_name` reads them as "pos:TL_r0c1"."""
+    return [["pred", "grid", "grid_label", n, "agent_class_label", "pos"] for n in position_names()]
 
 
 # -------------- Groups of adjacent same-class agents --------------

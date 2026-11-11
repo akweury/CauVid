@@ -136,10 +136,11 @@ HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp")
 # Plot color of each scorer.
 SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
                  "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
-                 "rule_set": "tab:olive", "motif_net": "tab:pink"}
+                 "rule_set": "tab:olive", "motif_net": "tab:pink", "model_cal": "navy", "mlp_cal": "darkgreen"}
 SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
                  "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
-                 "rule_set": "rule set", "motif_net": "motif net"}
+                 "rule_set": "rule set", "motif_net": "motif net", "model_cal": "rule net (calibrated)",
+                 "mlp_cal": "MLP (calibrated)"}
 # Event recall levels of the operating points read off the test curves.
 RECALL_LEVELS = (0.3, 0.5, 0.7)
 # Event types by the frequency of their head (`step05.head_event_types`). The noise heads
@@ -822,6 +823,33 @@ def fit_calibration(val_rows, cfg, windows):
 
 
 CALIBRATION_SOURCES = ("head", "type", "all", "identity")
+
+
+def calibrate(p, cal, heads=None):
+    """Calibrated probabilities sigmoid(a * logit(p) + c) of (..., W, H) window scores p of the
+    heads (default all), with one `fit_calibration` entry {"a", "c": (W, A)}."""
+    a, c = cal["a"].to(p.device), cal["c"].to(p.device)
+    if heads is not None:
+        a, c = a[:, heads], c[:, heads]
+    return torch.sigmoid(a * _logit(p) + c)
+
+
+def load_calibration(model, mlp, baselines, cfg, step05_cfg):
+    """The per-head calibration (`fit_calibration`) of the rule net and the MLP on the val videos,
+    from cfg["calibration_file"] (saved by `main`), refitted if the file is missing or older than
+    the models (e.g. a run evaluated before it was saved)."""
+    sources = [step05_cfg["model_file"], step05_cfg["mlp_model_file"], step05_cfg["training_data_file"]]
+    if not step05.is_fresh(cfg["calibration_file"], *sources):
+        training_data = step05.load_training_data(step05_cfg)
+        cfg.setdefault("head_types", training_data["event_types"]["types"])
+        val_data = _subset(training_data, training_data["val_videos"])
+        del training_data
+        # The row histograms read the raw scores only: no alarm filter needed.
+        val_scores = _score_videos(model, val_data, baselines, cfg, mlp, names=("model", "mlp"), alarm_filter=(1, 1))
+        calibration = fit_calibration(val_scores["rows"], cfg, model.windows)
+        torch.save({name: {k: v.cpu() for k, v in cal.items()} for name, cal in calibration.items()},
+                   cfg["calibration_file"])
+    return torch.load(cfg["calibration_file"], map_location="cpu")
 
 
 def _calibrated_histograms(pos, neg, a, c):
@@ -2006,6 +2034,8 @@ def main(input_data):
         "baseline_file": input_data["output_dir"] / "baselines.pt",
         "test_data_file": input_data["output_dir"] / "test_data.pt",
         "metrics_file": input_data["output_dir"] / "test_metrics.json",
+        # The per-head Platt calibration fitted on val (`fit_calibration`), for the episode alarms.
+        "calibration_file": input_data["output_dir"] / "calibration.pt",
         "test_clause_file": input_data["output_dir"] / "test_clauses.json",
         "results_file": input_data["output_dir"] / "test_results.json",
         "figure_dir": input_data["output_dir"] / "figures",
@@ -2097,6 +2127,8 @@ def main(input_data):
         val_scores = _score_videos(model, val_data, baselines, cfg, mlp, cascade, extra=extra)
         head_thresholds = select_head_thresholds(val_scores, cfg)
         calibration = fit_calibration(val_scores["rows"], cfg, model.windows)
+        torch.save({name: {k: v.cpu() for k, v in cal.items()} for name, cal in calibration.items()},
+                   cfg["calibration_file"])
         del val_scores, val_data
         del training_data
         metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds, calibration)
@@ -2120,8 +2152,16 @@ def main(input_data):
     plot_results(metrics, test_clauses, cfg)
     print_summary(metrics, test_clauses, cfg)
 
-    # 6. Episode alarms: the high frames of an agent and head merged into one alarm (`step06_episodes`).
-    from src.exp_roadpp import step06_episodes
+    # 6. Episode alarms: the high frames of an agent and head merged into one alarm (`step06_episodes`),
+    # of the raw scores and of the probabilities calibrated on val.
+    from src.exp_roadpp import step06_episodes, step06_ceiling
+    if "head_types" not in cfg:
+        cfg["head_types"] = step05.load_training_data(step05_cfg)["event_types"]["types"]
+    calibration = load_calibration(model, mlp, baselines, cfg, step05_cfg)
     step06_episodes.main(model, mlp, baselines, test_data, step05_cfg, cfg,
-                         input_data["output_dir"] / "episode_alarms.json")
+                         input_data["output_dir"] / "episode_alarms.json", calibration)
+
+    # 7. Situation rates: how often the onset follows the same situation, and how plausible the false alarms are (`step06_ceiling`).
+    step06_ceiling.main(model, mlp, test_data, step05_cfg, cfg, input_data["output_dir"] / "ceiling.json",
+                        calibration)
     print("\n--------- Step 06 Done ---------------\n")
