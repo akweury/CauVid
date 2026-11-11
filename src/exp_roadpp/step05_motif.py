@@ -117,7 +117,8 @@ def model_file_of(step05_cfg):
                    "unique_atoms_file": step05_cfg["unique_atoms_file"],
                    "train_box_file": step05_cfg.get("train_box_file"),
                    "val_box_file": step05_cfg.get("val_box_file"),
-                   "grid": step05_cfg.get("grid", True), "require_self": step05_cfg.get("require_self", True)})
+                   "grid": step05_cfg.get("grid", True), "motion": step05_cfg.get("motion", True),
+                   "require_self": step05_cfg.get("require_self", True)})
     return cfg["model_file"], cfg
 
 

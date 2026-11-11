@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 
 from src.exp_roadpp import utils_data, roles as agent_roles, geometry as agent_geometry, grid as agent_grid
+from src.exp_roadpp import motion as agent_motion
 from src.exp_roadpp.cauvid import TemporalRuleNet
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 
@@ -53,25 +54,32 @@ def label_atom_count(data):
 def load_vocabulary(cfg):
     """The atom signatures of every atom index: the label vocabulary of
     cfg["unique_atoms_file"], then the geometry atoms of cfg["geometry"] (`geometry.vocabulary`),
-    then the grid position atoms of cfg["grid"] (`grid.vocabulary`)."""
+    then the grid position atoms of cfg["grid"] (`grid.vocabulary`), then the motion atoms of
+    cfg["motion"] (`motion.vocabulary`)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     out = unique_atoms + agent_geometry.vocabulary(unique_atoms, cfg.get("geometry", ()))
     if cfg.get("grid"):
         out += agent_grid.vocabulary()
+    if cfg.get("motion"):
+        out += agent_motion.vocabulary()
     return out
 
 
 def is_input_atom(signature):
-    """Geometry and grid atoms are inputs only: no head learns or is evaluated on them."""
-    return len(signature) > 1 and signature[1] in ("geometry", "grid")
+    """Geometry, grid and motion atoms are inputs only: no head learns or is evaluated on them."""
+    return len(signature) > 1 and signature[1] in ("geometry", "grid", "motion")
 
 
 # -------------- Grid atoms (`grid.py`) --------------
 def grid_tag(cfg):
-    """File tag of the grid settings ("" without the grid)."""
-    if not cfg.get("grid"):
-        return ""
-    return f"_grid{agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS}q{agent_grid.OVERLAP:g}pos"
+    """File tag of the box atoms: the grid settings and the motion atoms ("" without both). The
+    grid spec file is named by the grid part only (`grid_tag({"grid": ...})`)."""
+    tag = ""
+    if cfg.get("grid"):
+        tag += f"_grid{agent_grid.GRID_ROWS}x{agent_grid.GRID_COLS}q{agent_grid.OVERLAP:g}pos"
+    if cfg.get("motion"):
+        tag += agent_motion.tag()
+    return tag
 
 
 def _agent_boxes(boxes, video_id, video_atoms, X_labels):
@@ -121,18 +129,61 @@ def load_grid(cfg):
     return utils_data.load_json(cfg["grid_file"])
 
 
+# -------------- Motion atoms (`motion.py`) --------------
+def fit_motion(cfg):
+    """The motion thresholds of the train split (`motion.fit`): the signals of every train box, per class."""
+    if not cfg.get("train_box_file") or not os.path.exists(cfg["train_box_file"]):
+        raise FileNotFoundError(f"The motion atoms need the train box file {cfg.get('train_box_file')} (step_dataset).")
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    A = len(unique_atoms)
+    boxes = torch.load(cfg["train_box_file"], map_location="cpu")
+    atoms = utils_data.load_json(cfg["train_atom_file"])
+    samples = {}
+    for video_id, video_atoms in tqdm(atoms.items(), desc="Motion: train boxes"):
+        X = build_video_tensor(video_atoms, A)
+        if X.shape[0] <= agent_motion.K:
+            continue
+        video_boxes, classes, has_box = _agent_boxes(boxes, video_id, video_atoms, X)
+        sig = agent_motion.signals(video_boxes, has_box)                         # (T, N, 4)
+        for n, cls in enumerate(classes):
+            v = sig[:, n][~torch.isnan(sig[:, n, 0])]
+            if len(v):
+                samples.setdefault(str(cls), []).append(v)
+    del atoms
+    spec = agent_motion.fit({cls: torch.cat(v) for cls, v in samples.items()})
+    print(f"[Motion]\t thresholds per class (own fit for >= {agent_motion.MIN_CLASS_SAMPLES} train signals): "
+          + ", ".join(f"{c} {n}{'' if c in spec['classes'] else ' (all)'}" for c, n in sorted(spec["counts"].items())))
+    for cls, t in [("all", spec["all"])] + sorted(spec["classes"].items()):
+        print(f"[Motion]\t {cls}: " + ", ".join(f"{s} {[round(v, 4) for v in t[s]]}" for s in agent_motion.SIGNALS))
+    return {**spec, "k": agent_motion.K, "debounce": agent_motion.DEBOUNCE, "version": agent_motion.VERSION}
+
+
+def load_motion(cfg):
+    """The motion thresholds of cfg["motion_file"] (fitted on the train split by `fit_motion` if
+    missing), None without the motion atoms."""
+    if not cfg.get("motion"):
+        return None
+    if not os.path.exists(cfg["motion_file"]):
+        utils_data.save_json(fit_motion(cfg), cfg["motion_file"])
+    return utils_data.load_json(cfg["motion_file"])
+
+
 def rule_input_mask(data, cfg, num_scopes=2):
-    """(M,) bool: the memory inputs a TemporalRuleNet rule may learn, None for all. With the grid:
-    the agent itself reads its label atoms and its position atoms; the other agents (and roles)
-    only the label atoms (some other agent's position, pooled over the agents, says little)."""
+    """(M,) bool: the memory inputs a TemporalRuleNet rule may learn, None for all. With the grid
+    or the motion atoms: the agent itself reads its label, position and motion atoms; the other
+    agents (and roles) only the label atoms (some other agent's position or motion, pooled over
+    the agents, says little)."""
     layout = data.get("grid_layout")
     if not layout:
         return None
     J, A = cfg["num_slots"], data["num_atoms"]
     atom = torch.arange(A)
-    position = (atom >= layout["position"][0]) & (atom < layout["position"][1])
+    own_only = torch.zeros(A, dtype=torch.bool)
+    for key in ("position", "motion"):
+        if key in layout:
+            own_only |= (atom >= layout[key][0]) & (atom < layout[key][1])
     allowed = torch.ones((num_scopes, J, A), dtype=torch.bool)
-    allowed[1:][:, :, position] = False
+    allowed[1:][:, :, own_only] = False
     return allowed.flatten()
 
 
@@ -271,7 +322,7 @@ def is_fresh(output_file, *source_files):
 
 
 def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=(), geometry=(),
-                   unique_atoms=None, grid_spec=None):
+                   unique_atoms=None, grid_spec=None, motion_spec=None):
     """Compressed atoms and frame lists of every video of one split.
     With roles (`roles.ROLES`), each video also gets "roles" (T, N, K) int16: the
     agent filling each role for each agent and frame (-1: none), from the boxes of
@@ -282,7 +333,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     With a box file, each video also gets "groups" (T, N) int16 (`grid.agent_groups`, -1: no box)
     and the data "group_tag" (`grid.GROUP_TAG`).
     With grid_spec (`fit_grid`), the grid position atoms (`grid.grid_atoms`) follow the geometry
-    atoms; "grid_layout" gives their [start, end) atom range.
+    atoms; with motion_spec (`fit_motion`), the motion atoms (`motion.motion_atoms`) follow them;
+    "grid_layout" gives their [start, end) atom ranges ("position", "motion").
 
     Returns {
       "num_atoms": A, the label atoms and the geometry atoms after them,
@@ -299,7 +351,7 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     """
     atoms = utils_data.load_json(atom_file)
     boxes = None
-    if roles or geometry or grid_spec is not None:
+    if roles or geometry or grid_spec is not None or motion_spec is not None:
         if box_file is None or not os.path.exists(box_file):
             raise FileNotFoundError(f"Agent roles {roles}, geometry {geometry} and the grid need the box file "
                                     f"{box_file} (step_dataset).")
@@ -311,6 +363,9 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     geometry_atoms = agent_geometry.vocabulary(unique_atoms, geometry) if geometry else []
     grid_start = num_atoms + len(geometry_atoms)
     num_grid = 2 * agent_grid.num_cells() if grid_spec is not None else 0
+    motion_start = grid_start + num_grid
+    num_motion = len(agent_motion.ATOMS) if motion_spec is not None else 0
+    motion_on = torch.zeros(num_motion)
     grid_rows = 0
     videos, frames, positive_frames = {}, {}, {}
     role_stats = torch.zeros(len(roles))
@@ -344,6 +399,10 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
             cells = agent_grid.corner_cells(video_boxes, has_box, grid_spec["knots"])
             grid_rows += int(has_box.sum())
             X = torch.cat([X, agent_grid.grid_atoms(cells).to(X.device)], dim=2)
+        if motion_spec is not None:
+            M_atoms = agent_motion.motion_atoms(video_boxes, has_box, classes, motion_spec)
+            motion_on += M_atoms.sum(dim=(0, 1)).float()
+            X = torch.cat([X, M_atoms.to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
         if roles:
             videos[video_id]["roles"] = partners.to(torch.int16)
@@ -362,13 +421,20 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     if grid_spec is not None:
         print(f"[Grid]\t {name}: share of visible agents (rows) with a box: {grid_rows / max(num_rows, 1):.2f}; "
               f"{num_grid} grid position atoms")
-    out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid, "num_label_atoms": num_atoms,
+    if motion_spec is not None:
+        print(f"[Motion]\t {name}: share of visible agents (rows) holding each motion atom: "
+              + ", ".join(f"{a} {motion_on[i] / max(num_rows, 1):.3f}" for i, a in enumerate(agent_motion.ATOMS)))
+    out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid + num_motion, "num_label_atoms": num_atoms,
            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
            "frames": frames, "positive_frames": positive_frames}
     if boxes is not None:
         out["group_tag"] = agent_grid.GROUP_TAG
+    if grid_spec is not None or motion_spec is not None:
+        out["grid_layout"] = {}
     if grid_spec is not None:
-        out["grid_layout"] = {"position": [grid_start, grid_start + num_grid]}
+        out["grid_layout"]["position"] = [grid_start, grid_start + num_grid]
+    if motion_spec is not None:
+        out["grid_layout"]["motion"] = [motion_start, motion_start + num_motion]
     return out
 
 
@@ -383,11 +449,13 @@ def prepare_training_data(cfg):
     cascade thresholds and the step 06 alarm thresholds), in one dict."""
     unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
     num_atoms = len(unique_atoms)
-    grid_spec = load_grid(cfg)
+    grid_spec, motion_spec = load_grid(cfg), load_motion(cfg)
     train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
-                           cfg.get("train_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec)
+                           cfg.get("train_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
+                           motion_spec)
     val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
-                         cfg.get("val_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec)
+                         cfg.get("val_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
+                         motion_spec)
     shared = set(train["videos"]) & set(val["videos"])
     if shared:
         raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
@@ -1305,6 +1373,10 @@ def get_cfg(input_data):
     # Grid atoms (`grid.py`): the cells of the agent's own two box corners in the 2D image
     # (position atoms; the compound atoms of the other agents are removed, no rule used them).
     grid = input_data.get("grid", True)         # --grid (default True)
+    # Motion atoms (`motion.py`): how the agent's own box grows, shrinks and moves (approach, recede,
+    # closing in faster / slower, left / right, still), own scope only; the lookup of the own current
+    # labels matched the models without them (full 78e420).
+    motion = input_data.get("motion", True)     # --motion (default True)
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
     require_self = input_data.get("require_self", True)       # --require_self (default True)
@@ -1317,7 +1389,7 @@ def get_cfg(input_data):
             base_tag += "L"                     # "ahead": the ego's lead in its lane (roles.py)
     if geometry:
         base_tag += "_g" + "-".join(geometry)
-    base_tag += grid_tag({"grid": grid})
+    base_tag += grid_tag({"grid": grid, "motion": motion})
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "")
@@ -1422,6 +1494,9 @@ def get_cfg(input_data):
             'roles': roles,
             'geometry': geometry,
             'grid': grid,
+            'motion': motion,
+            # The motion thresholds fitted on the train split (`fit_motion`).
+            'motion_file': input_data["output_dir"] / f"motion_spec{agent_motion.tag()}.json",
             'require_self': require_self,
             # The grid fitted on the train split (`fit_grid`): the corner coordinate quantiles.
             'grid_file': input_data["output_dir"] / f"grid_spec{grid_tag({'grid': grid})}.json",

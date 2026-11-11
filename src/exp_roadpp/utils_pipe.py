@@ -43,6 +43,8 @@ def get_parser():
     parser.add_argument("--machine", type=str, default="ml-pulsar", help="Machine name, default is ml-pulsar")
     parser.add_argument("--grid", type=str, default="True",
                         help="Step 05: grid atoms of the 2D boxes (grid.py), default True; False for the no-grid baseline")
+    parser.add_argument("--motion", type=str, default="True",
+                        help="Step 05: motion atoms of the own 2D box (motion.py), default True; False for the ablation")
     parser.add_argument("--require_self", type=str, default="True",
                         help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
     parser.add_argument("--run_id", type=str, default=None,

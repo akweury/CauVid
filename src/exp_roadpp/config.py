@@ -343,9 +343,11 @@ def get_step_05_input(args):
         "past_windows": getattr(args, "past_windows", [3, 5, 10]),
         "unique_atoms_file": args.output_dir / "step_dataset_output" / "atoms" / "unique_atoms.json",
         "events_file": args.output_dir / "step_dataset_output" / "train_events.pt",
-        # Step 05 model settings from the command line (default True): the grid atoms and the self gate.
+        # Step 05 model settings from the command line (default True): the grid atoms, the self gate
+        # and the motion atoms.
         "grid": str(getattr(args, "grid", "True")) == "True",
         "require_self": str(getattr(args, "require_self", "True")) == "True",
+        "motion": str(getattr(args, "motion", "True")) == "True",
     }
     return input_data
 
