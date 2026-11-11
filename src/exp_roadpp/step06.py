@@ -2111,4 +2111,9 @@ def main(input_data):
     print(f"[Results]\t {cfg['results_file']}")
     plot_results(metrics, test_clauses, cfg)
     print_summary(metrics, test_clauses, cfg)
+
+    # 6. Episode alarms: the high frames of an agent and head merged into one alarm (`step06_episodes`).
+    from src.exp_roadpp import step06_episodes
+    step06_episodes.main(model, mlp, baselines, test_data, step05_cfg, cfg,
+                         input_data["output_dir"] / "episode_alarms.json")
     print("\n--------- Step 06 Done ---------------\n")

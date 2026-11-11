@@ -44,6 +44,7 @@ def layer_priors(training_data, cfg):
 @torch.no_grad()
 def score_videos(model, data, priors, cfg):
     """Rollout scores of every layer of the split, started from each layer.
+    Rows: the agents visible in the last observed layer and in every layer up to the target.
 
     Returns {
       "histograms": {kind: {scorer: (positives, negatives)}}, (H, A, S) score
@@ -76,6 +77,12 @@ def score_videos(model, data, priors, cfg):
         padded = torch.cat([layers, layers.new_zeros((H, *layers.shape[1:]))])
         for starts in torch.arange(1, layers.shape[0]).split(cfg["windows_per_video"]):
             windows = step05_layer._windows(padded, starts, K, H)
+            # Roll out only the agents seen in the last observed layer K - 1, up to the first layer
+            # they are gone. Others would enter the context with their true states (`unroll` keeps
+            # them for agents it does not predict) and leak into the "others" inputs and, with an
+            # empty last layer, count all their atoms as onsets of the later horizons.
+            alive = (windows[:, K - 1:].amax(dim=3) > 0).int().cumprod(dim=1).bool()   # (W, H + 1, N)
+            windows = torch.cat([windows[:, :K], windows[:, K:] * alive[:, 1:, :, None]], dim=1)
             last_all = windows[:, K - 1].reshape(-1, A) > 0.5
             for h, out in enumerate(step05_layer.unroll(model, windows, H, feed_prob=1.0)):
                 if len(out["rows"]) == 0:
