@@ -180,8 +180,12 @@ def score_shared_onsets(model, temporal, mlp, baselines, data, priors, cfg):
                 continue
             # Row w * N + n of both: agent n before layer starts[w], i.e. before frame starts[w] * s.
             roles = step05.video_roles(data["videos"][video_id], device)
-            inputs = (temporal.layer_inputs(X, starts * s) if not temporal.roles
-                      else temporal.layer_inputs(X, starts * s, roles=roles))[out["rows"]]
+            # Only the rows of the layered net (ascending row indices w * N + n), not every agent.
+            keep = torch.zeros(len(starts) * X.shape[1], dtype=torch.bool, device=device)
+            keep[out["rows"]] = True
+            keep = keep.view(len(starts), X.shape[1])
+            inputs = (temporal.layer_inputs(X, starts * s, keep=keep) if not temporal.roles
+                      else temporal.layer_inputs(X, starts * s, roles=roles, keep=keep))
             # The step 05 models give one probability per window; the first (10 frames) covers layer b.
             scores = {"layered": out["pred"], "temporal": temporal.window_probs(temporal(inputs)[0])[:, 0, :A],
                       "prior": prior.expand_as(out["pred"])}
@@ -353,11 +357,14 @@ def main(input_data):
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
     if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
             or test_data.get("roles", []) != list(step05_cfg["roles"])
-            or test_data.get("geometry", []) != list(step05_cfg["geometry"])):
+            or test_data.get("geometry", []) != list(step05_cfg["geometry"])
+            or test_data.get("grid_tag", "") != step05.grid_tag(step05_cfg)):
         unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
         test_data = step05.prepare_videos(input_data["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
-                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms)
+                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms,
+                                          step05.load_grid(step05_cfg))
+        test_data["grid_tag"] = step05.grid_tag(step05_cfg)
         torch.save(test_data, cfg["test_data_file"])
     model = step05_layer.load_layered_rule_net(test_data, cfg)
 

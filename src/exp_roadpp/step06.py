@@ -2012,17 +2012,21 @@ def main(input_data):
     }
     step05_cfg["device"] = cfg["device"]
     cfg["geometry"] = step05_cfg["geometry"]          # the geometry atoms follow the label atoms (`step05.load_vocabulary`)
+    cfg["grid"], cfg["grid_file"] = step05_cfg["grid"], step05_cfg["grid_file"]   # the grid atoms follow them
     assert cfg["headline_window"] in step05_cfg["windows"]
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
     test_data = torch.load(cfg["test_data_file"], map_location="cpu") if os.path.exists(cfg["test_data_file"]) else {}
     if (test_data.get("min_off_frames") != step05_cfg["min_off_frames"]
             or test_data.get("roles", []) != list(step05_cfg["roles"])
-            or test_data.get("geometry", []) != list(step05_cfg["geometry"])):
+            or test_data.get("geometry", []) != list(step05_cfg["geometry"])
+            or test_data.get("grid_tag", "") != step05.grid_tag(step05_cfg)):
         unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
         test_data = step05.prepare_videos(cfg["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
-                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms)
+                                          step05_cfg["roles"], step05_cfg["geometry"], unique_atoms,
+                                          step05.load_grid(step05_cfg))
+        test_data["grid_tag"] = step05.grid_tag(step05_cfg)
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
     mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained

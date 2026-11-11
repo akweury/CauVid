@@ -32,6 +32,7 @@ def get_cfg(input_data):
         tag += f"_tn{base['noise_below']}"                     # the noise heads are no training targets
     if base["geometry"]:
         tag += "_g" + "-".join(base["geometry"])              # the geometry atoms (inputs) widen every input
+    tag += step05.grid_tag(base)                              # so do the grid atoms
     output_dir = input_data["output_dir"]
     return {
         "enabled": True,
@@ -77,6 +78,8 @@ def get_cfg(input_data):
         "wandb_project": base["wandb_project"],
         "unique_atoms_file": base["unique_atoms_file"],
         "geometry": base["geometry"],
+        "grid": base["grid"],
+        "grid_file": base["grid_file"],
         "training_data_file": base["training_data_file"],
         "model_file": output_dir / f"motif_rule_net_{tag}.pt",
         "clause_file": output_dir / f"motif_clauses_{tag}.json",

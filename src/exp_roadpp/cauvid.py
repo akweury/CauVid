@@ -187,7 +187,7 @@ class TemporalRuleNet(torch.nn.Module):
     """
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
-                 mask_type="hard_concrete", windows=(10,), roles=()):
+                 mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
@@ -211,6 +211,12 @@ class TemporalRuleNet(torch.nn.Module):
         self.head_bias = torch.nn.Parameter(torch.full((num_future, num_atoms), -6.0))
         # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
         self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
+        # (M,) bool: the memory inputs a rule may learn (None: all), e.g. not the grid compound
+        # atoms of the agent itself (`step05.rule_input_mask`). Not saved: rebuilt from the data.
+        if input_mask is not None and input_mask.shape != (self.num_inputs,):
+            raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
+        self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None
+                             else input_mask.bool().clone(), persistent=False)
         # Slot offset j of every input; and for each future slot f, the memory input each rule
         # input (atom, slot type, j) reads (past slot j - f), or M (unknown) for j <= f.
         j = (torch.arange(self.num_inputs) // num_atoms) % num_slots + 1
@@ -253,7 +259,7 @@ class TemporalRuleNet(torch.nn.Module):
         return num_seeded
 
     # -------- inputs and targets of one video ----------------------------------
-    def layer_inputs(self, X, frames, history=None, roles=None):
+    def layer_inputs(self, X, frames, history=None, roles=None, keep=None):
         """(F * N, 2M) packed memory inputs of every agent at each target frame.
 
         X: (T, N, A) bool atom tensor of `step05.build_video_tensor`; frames: (F,)
@@ -267,6 +273,8 @@ class TemporalRuleNet(torch.nn.Module):
         in frame t - 1 (the last observed frame), read over the whole memory.
         roles (T, N, K) long (`roles.role_partners`, -1: none) is needed if the
         model has roles; an agent without a partner gets false (where known).
+        keep (F, N) bool: if given, only the rows of these (frame, agent) pairs, in the
+        same order (row f * N + n of the full output, the kept ones), saving memory.
         """
         J, S, A = self.num_slots, self.slot_size, self.num_atoms
         N, F = X.shape[1], len(frames)
@@ -274,8 +282,11 @@ class TemporalRuleNet(torch.nn.Module):
         lags = torch.arange(1, J * S + 1, device=X.device)
         past = frames[:, None] - lags                                          # (F, L)
         observed = lags[None, :] <= history.clamp(min=0)[:, None]              # (F, L), implies past >= 0
-        own = X[past.clamp(min=0)] & observed[..., None, None]                 # (F, L, N, A)
-        own = own.view(F, J, S, N, A).any(dim=2)                               # (F, J, N, A)
+        # The atoms seen in each slot, one slot at a time ((F, S, N, A) at most, not (F, L, N, A)).
+        own = torch.zeros((F, J, N, A), dtype=torch.bool, device=X.device)
+        for j in range(J):
+            lag = slice(j * S, (j + 1) * S)
+            own[:, j] = (X[past[:, lag].clamp(min=0)] & observed[:, lag, None, None]).any(dim=1)
         holders = own.sum(dim=2, keepdim=True)
         others = (holders - own.int()) > 0
         channels = [own, others]
@@ -292,8 +303,12 @@ class TemporalRuleNet(torch.nn.Module):
         x = torch.stack(channels, dim=1)                                       # (F, scopes, J, N, A)
         slot_known = (torch.arange(1, J + 1, device=X.device) * S)[None, :] <= history.clamp(min=0)[:, None]
         k = x | slot_known[:, None, :, None, None]
-        x = x.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
-        k = k.permute(0, 3, 1, 2, 4).reshape(F * N, self.num_inputs)
+        x = x.permute(0, 3, 1, 2, 4)                                           # (F, N, scopes, J, A)
+        k = k.permute(0, 3, 1, 2, 4)
+        if keep is not None:
+            x, k = x[keep], k[keep]
+        x = x.reshape(-1, self.num_inputs)
+        k = k.reshape(-1, self.num_inputs)
         return torch.cat([x, k], dim=1).float()
 
     def training_rows(self, X, frames, min_off_frames=1, history=None, roles=None):
@@ -315,12 +330,12 @@ class TemporalRuleNet(torch.nn.Module):
               video end without an onset are censored, not negatives).
         """
         N = X.shape[1]
-        inputs = (self.layer_inputs(X, frames, history) if roles is None
-                  else self.layer_inputs(X, frames, history, roles=roles))
         t = frames.repeat_interleave(N)
         n = torch.arange(N, device=X.device).repeat(len(frames))
         keep = X[t, n].any(dim=1)
-        t, n, inputs = t[keep], n[keep], inputs[keep]
+        inputs = (self.layer_inputs(X, frames, history, keep=keep.view(len(frames), N)) if roles is None
+                  else self.layer_inputs(X, frames, history, roles=roles, keep=keep.view(len(frames), N)))
+        t, n = t[keep], n[keep]
         past = t[:, None] - torch.arange(1, min_off_frames + 1, device=X.device)     # (B, k)
         held = (X[past.clamp(min=0), n[:, None]] & (past >= 0)[..., None]).any(dim=1)
         at_risk = ~held
@@ -363,7 +378,7 @@ class TemporalRuleNet(torch.nn.Module):
             mask = torch.sigmoid(self.log_alpha)
         else:
             mask = self.hard_concrete_mask(self.log_alpha, training=self.training)
-        return mask.masked_fill(self.fixed_inputs, 1.0)
+        return (mask * self.input_mask).masked_fill(self.fixed_inputs, 1.0)
 
     def forward(self, inputs):
         """Hazard logits (B, W, A) of the future slots and the rule activations
@@ -421,7 +436,7 @@ class TemporalRuleNet(torch.nn.Module):
         """Expected number of active inputs per rule (L0 of the hard-concrete mask;
         L1 of the sigmoid mask), the fixed inputs left out, plus the L1 of the head weights."""
         shift = beta * torch.log(torch.tensor(-gamma / zeta)) if self.mask_type == "hard_concrete" else 0.0
-        l0 = (torch.sigmoid(self.log_alpha - shift) * ~self.fixed_inputs).sum(dim=1).mean()
+        l0 = (torch.sigmoid(self.log_alpha - shift) * (~self.fixed_inputs & self.input_mask)).sum(dim=1).mean()
         return l0 + self.head_weight.abs().sum(dim=1).mean()
 
     # -------- use after training ----------------------------------
