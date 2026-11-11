@@ -720,7 +720,8 @@ def _seeded_rule_net(training_data, cfg):
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
                             len(anchors) * cfg["num_slots"] + cfg["num_free_rules"], cfg["init_log_alpha"],
                             cfg["mask_type"], cfg["windows"], roles=cfg["roles"],
-                            input_mask=rule_input_mask(training_data, cfg, 2 + len(cfg["roles"])))
+                            input_mask=rule_input_mask(training_data, cfg, 2 + len(cfg["roles"])),
+                            require_self=cfg.get("require_self", False))
     num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
     print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
           f"{cfg['mask_type']} mask")
@@ -789,7 +790,8 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
     roles = _saved_roles(state["log_alpha"].shape[1], training_data["num_atoms"], cfg)
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
                             state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"],
-                            roles=roles, input_mask=rule_input_mask(training_data, cfg, 2 + len(roles)))
+                            roles=roles, input_mask=rule_input_mask(training_data, cfg, 2 + len(roles)),
+                            require_self=cfg.get("require_self", False))
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -1312,7 +1314,10 @@ def get_cfg(input_data):
     geometry = ()                               # was agent_geometry.GEOMETRY
     # Grid atoms (`grid.py`): the cells of the two box corners in the 2D image, for the agent
     # itself (position atoms) and bound to what the other agents do (compound atoms).
-    grid = True
+    grid = input_data.get("grid", True)         # --grid (default True)
+    # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
+    # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
+    require_self = input_data.get("require_self", True)       # --require_self (default True)
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
@@ -1325,7 +1330,7 @@ def get_cfg(input_data):
     base_tag += grid_tag({"grid": grid})
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
-    tag = base_tag + type_balance_tag(type_balance)
+    tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "")
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
@@ -1423,6 +1428,7 @@ def get_cfg(input_data):
             'roles': roles,
             'geometry': geometry,
             'grid': grid,
+            'require_self': require_self,
             # The grid fitted on the train split (`fit_grid`): row quantiles and kept compound atoms.
             'grid_file': input_data["output_dir"] / f"grid_spec{grid_tag({'grid': grid})}.json",
             'train_box_file': input_data.get('train_box_file'),

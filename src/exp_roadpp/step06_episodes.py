@@ -23,13 +23,22 @@ episodes instead of one alarm per upward crossing (`step06`):
     o - s of the earliest alarm hitting it; lag = e - end of the latest one
     (> 0: the alarm goes on after the event, < 0: it stops before the event ends).
   - an alarm that hits no event is a false alarm only if its outcome is seen: the
-    agent stays in the scene (rows) for max(tol, 1) frames after e. Alarms cut off by
-    the agent leaving or the video end are left out.
+    agent stays in the scene (rows) for max(tol, 1) frames after e, or for the W frames
+    of the window of its first frame s..s + W - 1 (the prediction made at s, "an onset
+    within W", is then seen to fail). Only the alarms whose outcome is seen neither way
+    (cut off by the agent leaving or the video end soon after they start) are left out.
+    (Without the second way, the alarms still high when the agent leaves or the video
+    ends were all left out: on medium, 59% of the alarms, 61% of them with their first
+    window seen without an onset.)
   - group level ("results_group", if the test data has "groups", `grid.agent_groups`): the
     same alarms and events, but an alarm also hits an event of its head that happens to
     another agent of its group (adjacent, same class) in the frame before the onset, o - 1.
     The gap to the object level ("results") is the cost of picking the wrong one of
-    several adjacent agents.
+    several adjacent agents. An event counts one correct alarm: of the alarms of the group
+    hitting it, the one starting first; the others, hitting only events an earlier alarm
+    already hit, are duplicates (one more agent of the group alarming for the same event)
+    and are left out ("duplicate_alarms"), so several members alarming together do not
+    multiply the correct alarms.
 Computed for every window of the model, every score threshold and tolerance, on the
 counted heads (`step06.COUNTED_TYPES`), for the rule net and the OnsetMLP.
 """
@@ -55,7 +64,7 @@ def _default_cfg(frame_rate):
         "print_threshold": 0.5,
         "print_tolerance_s": 1.0,
         # Version of this metric; a cached file of another one is redone.
-        "metric": "episode_alarms_v3_group",
+        "metric": "episode_alarms_v4_window_seen_group_dedup",
     }
 
 
@@ -135,7 +144,8 @@ def _event_ends(X, e_t, e_n, e_a, min_off_frames):
 
 # -------------- Scoring --------------
 def _empty_stats():
-    return {"events": 0, "detected": 0, "alarms": 0, "correct": 0, "excluded": 0, "lead": [], "lag": []}
+    return {"events": 0, "detected": 0, "alarms": 0, "correct": 0, "excluded": 0, "duplicate": 0,
+            "lead": [], "lag": []}
 
 
 @torch.no_grad()
@@ -214,8 +224,18 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
                         # hit (E, S): the alarm covers the onset or ends at most tol frames before it.
                         hit = who[level] & (start[None] <= e_t[:, None]) & (e_t[:, None] <= end[None] + tol)
                         correct = hit.any(dim=0)
-                        seen = next_gone[(end + 1).clamp(max=T), s_n] > end + max(tol, 1)
-                        counted = correct | seen
+                        duplicate = torch.zeros_like(correct)
+                        if level == "group" and len(start):
+                            # One correct alarm per event: the first-starting one hitting it.
+                            first = torch.where(hit, start[None], T + 1).argmin(dim=1)              # (E,)
+                            owner = torch.zeros_like(hit)
+                            owner[torch.arange(len(e_t), device=device), first] = True
+                            owner &= hit
+                            duplicate = correct & ~owner.any(dim=0)
+                            correct = correct & ~duplicate
+                        seen = ((next_gone[(end + 1).clamp(max=T), s_n] > end + max(tol, 1))
+                                | (next_gone[start, s_n] > start + w - 1))
+                        counted = (correct | seen) & ~duplicate
                         detected = hit.any(dim=1)
                         lead = e_t - torch.where(hit, start[None], T).amin(dim=1) if len(start) else None
                         lag = torch.where(hit, end[None], -1).amax(dim=1) - e_end if len(start) else None
@@ -229,7 +249,8 @@ def score_episodes(model, mlp, baselines, data, cfg, ep):
                             st["detected"] += int((detected & ev).sum())
                             st["alarms"] += int((counted & al).sum())
                             st["correct"] += int((correct & al).sum())
-                            st["excluded"] += int((~counted & al).sum())
+                            st["excluded"] += int((~counted & ~duplicate & al).sum())
+                            st["duplicate"] += int((duplicate & al).sum())
                             if lead is not None:
                                 st["lead"] += lead[detected & ev].tolist()
                                 st["lag"] += lag[detected & ev].tolist()
@@ -247,7 +268,7 @@ def _summary(st, minutes, fps):
         "events": st["events"], "detected": st["detected"], "missed": st["events"] - st["detected"],
         "recall": st["detected"] / st["events"] if st["events"] else 0.0,
         "alarms": st["alarms"], "correct_alarms": st["correct"], "false_alarms": false,
-        "excluded_alarms": st["excluded"],
+        "excluded_alarms": st["excluded"], "duplicate_alarms": st["duplicate"],
         "precision": st["correct"] / st["alarms"] if st["alarms"] else 0.0,
         "false_alarms_per_minute": false / minutes if minutes else None,
         "events_per_correct_alarm": st["detected"] / st["correct"] if st["correct"] else None,

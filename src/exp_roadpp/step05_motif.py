@@ -116,7 +116,8 @@ def model_file_of(step05_cfg):
                    "causal_anchor_clause_file": step05_cfg["causal_anchor_clause_file"],
                    "unique_atoms_file": step05_cfg["unique_atoms_file"],
                    "train_box_file": step05_cfg.get("train_box_file"),
-                   "val_box_file": step05_cfg.get("val_box_file")})
+                   "val_box_file": step05_cfg.get("val_box_file"),
+                   "grid": step05_cfg.get("grid", True), "require_self": step05_cfg.get("require_self", True)})
     return cfg["model_file"], cfg
 
 

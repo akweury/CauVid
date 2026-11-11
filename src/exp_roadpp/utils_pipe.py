@@ -37,6 +37,10 @@ def get_parser():
     parser.add_argument("--exp", type=str, default="debug", help="Experiment name, default is debug")
 
     parser.add_argument("--machine", type=str, default="ml-pulsar", help="Machine name, default is ml-pulsar")
+    parser.add_argument("--grid", type=str, default="True",
+                        help="Step 05: grid atoms of the 2D boxes (grid.py), default True; False for the no-grid baseline")
+    parser.add_argument("--require_self", type=str, default="True",
+                        help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
     parser.add_argument("--run_id", type=str, default=None,
                         help="Resume this run (folder output/<exp>/runs/<run_id>) instead of starting a new one, "
                              "e.g. to redo step 06 of a trained model; default: a new run folder")

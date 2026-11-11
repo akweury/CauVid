@@ -187,7 +187,7 @@ class TemporalRuleNet(torch.nn.Module):
     """
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
-                 mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None):
+                 mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None, require_self=False):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
@@ -217,6 +217,13 @@ class TemporalRuleNet(torch.nn.Module):
             raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
         self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None
                              else input_mask.bool().clone(), persistent=False)
+        # require_self: every rule must hold an atom of the agent itself (scope 0). Its activation is
+        # multiplied by the self gate, the chance that at least one of its own-agent body atoms holds
+        # (`forward`): ~1 for a rule with own-agent atoms (they all hold when it fires), ~0 for a rule
+        # of the other agents only, which would otherwise fire for every agent of the scene alike.
+        self.require_self = require_self
+        self.register_buffer("self_inputs", torch.arange(self.num_inputs) < num_slots * num_atoms,
+                             persistent=False)
         # Slot offset j of every input; and for each future slot f, the memory input each rule
         # input (atom, slot type, j) reads (past slot j - f), or M (unknown) for j <= f.
         j = (torch.arange(self.num_inputs) // num_atoms) % num_slots + 1
@@ -395,15 +402,26 @@ class TemporalRuleNet(torch.nn.Module):
         log_unknown = torch.log1p(-mask * (1 - torch.sigmoid(self.unknown_logit)))
         false = torch.cat([(1 - x) * k, x.new_zeros((B, 1))], dim=1)            # column M: a future body
         unknown = torch.cat([1 - k, x.new_ones((B, 1))], dim=1)
+        if self.require_self:
+            # Self gate 1 - prod_i (1 - m_i p_i) over the own-agent inputs, p_i = 1 if true, pi if unknown, 0 if false.
+            mask_self = mask * self.self_inputs
+            log_self_true = torch.log1p(-mask_self)
+            log_self_unknown = torch.log1p(-mask_self * torch.sigmoid(self.unknown_logit))
+            true = torch.cat([x * k, x.new_zeros((B, 1))], dim=1)
         hazards, rules_now, all_unknown = [], None, None
         for f in range(len(self.windows)):
             if f < self.num_slots:
                 index = self.shift_index[f]
                 rules = torch.exp(false[:, index] @ log_false.T + unknown[:, index] @ log_unknown.T)
+                if self.require_self:
+                    rules = rules * -torch.expm1(true[:, index] @ log_self_true.T
+                                                 + unknown[:, index] @ log_self_unknown.T)
             else:
                 # Every body lies in the future: the same activation for every row.
                 if all_unknown is None:
                     all_unknown = torch.exp(log_unknown.sum(dim=1)).expand(B, -1)
+                    if self.require_self:
+                        all_unknown = all_unknown * -torch.expm1(log_self_unknown.sum(dim=1))
                 rules = all_unknown
             if f == 0:
                 rules_now = rules
@@ -481,6 +499,8 @@ class TemporalRuleNet(torch.nn.Module):
             heads = torch.nonzero(self.head_weight[:, r] > weight_threshold).flatten().tolist()
             if not heads:
                 continue
+            if self.require_self and not self.self_inputs[inputs].any():
+                continue                                    # muted by the self gate (`forward`)
             bodies = sorted((self.decode_input(m) for m in inputs), key=lambda b: -b[2])
             rules.append({"rule": r, "bodies": bodies,
                           "heads": [(h, self.head_weight[h, r].item()) for h in heads]})
