@@ -1508,8 +1508,11 @@ def plot_results(metrics, clauses, cfg, num_heads=30):
 
     fig, ax = plt.subplots(figsize=(5.5, 4.5))
     low = step05.log_floor([c["test_confidence"] for c in rows])
+    top_support = max(r["test_support"] for r in rows)
+    if top_support == 0:
+        print(f"[Warning]\t {len(rows)} clauses fire on test, but none hits an onset (test support 0 for all)")
     ax.scatter([c["test_recall"] or 0 for c in rows], step05.clip_low([c["test_confidence"] for c in rows], low),
-               s=[4 + 60 * c["test_support"] / max(r["test_support"] for r in rows) for c in rows], alpha=0.5,
+               s=[4 + 60 * c["test_support"] / max(top_support, 1) for c in rows], alpha=0.5,
                clip_on=False)
     ax.set(title="Clause confidence vs recall on test (size = support)", xlabel="recall (share of head onsets hit)",
            ylabel="confidence (precision, log)", xlim=(0, 1), ylim=(low, 1), yscale="log")
