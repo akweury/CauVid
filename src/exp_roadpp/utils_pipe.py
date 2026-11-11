@@ -16,10 +16,14 @@ def parse_args(parser=None):
 
     args = parser.parse_args()
 
-    # load experiment configuration
+    # load experiment configuration: its values replace the parser defaults, but an option
+    # given explicitly on the command line (e.g. --num_epochs 50) keeps its value.
+    given = {action.dest for action in parser._actions for opt in action.option_strings
+             if any(arg == opt or arg.startswith(opt + "=") for arg in sys.argv[1:])}
     exp_config_path = config.exp_config_path / f"{args.exp}.json"
     for key, value in utils_data.load_json(exp_config_path).items():
-        setattr(args, key, value)
+        if key not in given:
+            setattr(args, key, value)
 
 
     return args
