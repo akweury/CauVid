@@ -117,8 +117,8 @@ def setup_run(args):
     with open(args.run_dir / name, "w") as f:
         json.dump(info, f, indent=2)
     snapshot = args.run_dir / ("code" if not resume else f"code_resume_{time.strftime('%Y%m%d-%H%M%S')}")
-    shutil.copytree(root, snapshot, ignore=shutil.ignore_patterns("output", "data", "__pycache__", "*.pt",
-                                                                  "*.json", "*.pdf", "weights", "wandb"),
+    shutil.copytree(root, snapshot, ignore=shutil.ignore_patterns("output", "data", "external_roadpp_repo",
+                                                                  "__pycache__", "weights", "wandb", "*.pt", "*.pdf"),
                     dirs_exist_ok=True)
     print(f"\n##### Run {args.run_id}{' (resumed)' if resume else ''}: {args.run_dir} #####\n")
     return args
