@@ -50,7 +50,7 @@ def _default_cfg(frame_rate):
         "print_threshold": 0.5,
         "print_tolerance_s": 1.0,
         # Version of this metric; a cached file of another one is redone.
-        "metric": "episode_alarms_v1",
+        "metric": "episode_alarms_v2",
     }
 
 
@@ -245,13 +245,20 @@ def evaluate(model, mlp, baselines, data, cfg, ep):
     fps = cfg["frame_rate"]
     minutes = num_frames / fps / 60
     out = {**{key: ep[key] for key in ep}, "frame_rate": fps, "minutes": minutes,
-           "min_context": cfg["min_context"], "counted_types": list(step06.COUNTED_TYPES), "results": {}}
+           "min_context": cfg["min_context"], "counted_types": list(step06.COUNTED_TYPES),
+           "headline_window": cfg["headline_window"], "results": {}}
+    print_tol = int(round(ep["print_tolerance_s"] * fps))
+
+    def entry(st, th, tol):
+        e = {**_summary(st, minutes, fps), "by_type": {t: _summary(s, minutes, fps) for t, s in st["by_type"].items()}}
+        if th == ep["print_threshold"] and tol == print_tol:
+            # The per-event values of the printed operating point (seconds), for the figures.
+            e["lead_s"] = [v / fps for v in st["lead"]]
+            e["lag_s"] = [v / fps for v in st["lag"]]
+        return e
     for name, by_w in stats.items():
         out["results"][name] = {
-            str(w): {str(th): {str(tol / fps): {**_summary(st, minutes, fps),
-                                                "by_type": {t: _summary(s, minutes, fps)
-                                                            for t, s in st["by_type"].items()}}
-                               for tol, st in by_tol.items()}
+            str(w): {str(th): {str(tol / fps): entry(st, th, tol) for tol, st in by_tol.items()}
                      for th, by_tol in by_th.items()}
             for w, by_th in by_w.items()}
     return out
@@ -287,6 +294,139 @@ def print_summary(metrics, headline_window):
     print()
 
 
+# -------------- Figures --------------
+def plot_episodes(metrics, figure_dir):
+    """Figures of the episode alarms, one PDF each, in figure_dir:
+      episode_vs_tolerance.pdf: recall, precision, false alarms / min and mean lead time over
+          the matching tolerance (print threshold, headline window), per scorer;
+      episode_threshold.pdf: precision vs recall and false alarms / min vs recall over the
+          score thresholds (print tolerance, headline window), threshold labels on the points;
+      episode_vs_window.pdf: recall, precision, false alarms / min and mean lead per window
+          (print threshold and tolerance);
+      episode_by_type.pdf: recall and precision per event type (print point, headline window);
+      episode_lead_lag.pdf: the distributions of the lead and lag times of the detected
+          events (print point, headline window).
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(figure_dir, exist_ok=True)
+
+    def save(fig, name):
+        fig.tight_layout()
+        fig.savefig(figure_dir / name)
+        plt.close(fig)
+        print(f"[Figure]\t {figure_dir / name}")
+
+    results = metrics["results"]
+    w = str(metrics["headline_window"])
+    th, tol = str(metrics["print_threshold"]), str(float(metrics["print_tolerance_s"]))
+    point = (f"window {int(w) / metrics['frame_rate']:g} s, threshold {th}, tolerance {tol} s, "
+             f">= {metrics['min_length']} frames")
+    names = list(results)
+
+    def color(name):
+        return step06.SCORER_COLORS.get(name)
+
+    def label(name):
+        return step06.SCORER_LABELS.get(name, name)
+
+    def panels(n):
+        fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.4))
+        return fig, list(axes)
+
+    # 1. Over the matching tolerance.
+    keys = (("recall", "event recall", False), ("precision", "alarm precision", False),
+            ("false_alarms_per_minute", "false alarms / min", False), ("mean_lead_s", "mean lead (s)", False))
+    fig, axes = panels(len(keys))
+    for name in names:
+        by_tol = results[name][w][th]
+        x = [float(t) for t in by_tol]
+        for ax, (key, title, _) in zip(axes, keys):
+            ax.plot(x, [r[key] if r[key] is not None else float("nan") for r in by_tol.values()],
+                    "o-", color=color(name), label=label(name))
+    for ax, (key, title, _) in zip(axes, keys):
+        ax.set(title=title, xlabel="tolerance (s)")
+        ax.grid(alpha=0.3)
+    axes[0].legend()
+    fig.suptitle(f"Episode alarms vs matching tolerance (window {int(w) / metrics['frame_rate']:g} s, threshold {th})")
+    save(fig, "episode_vs_tolerance.pdf")
+
+    # 2. Over the score threshold.
+    fig, axes = panels(2)
+    for name in names:
+        rows = [(t, by_tol[tol]) for t, by_tol in results[name][w].items()]
+        rec = [r["recall"] for _, r in rows]
+        for ax, key in zip(axes, ("precision", "false_alarms_per_minute")):
+            y = [r[key] or 0 for _, r in rows]
+            ax.plot(rec, y, "o-", color=color(name), label=label(name))
+            for (t, _), xi, yi in zip(rows, rec, y):
+                ax.annotate(t, (xi, yi), fontsize=7, xytext=(3, 3), textcoords="offset points")
+    axes[0].set(title="precision vs recall (thresholds)", xlabel="event recall", ylabel="alarm precision")
+    axes[1].set(title="false alarms vs recall (thresholds)", xlabel="event recall", ylabel="false alarms / min")
+    for ax in axes:
+        ax.grid(alpha=0.3)
+    axes[0].legend()
+    fig.suptitle(f"Episode alarms over the score threshold (window {int(w) / metrics['frame_rate']:g} s, "
+                 f"tolerance {tol} s)")
+    save(fig, "episode_threshold.pdf")
+
+    # 3. Over the window.
+    fig, axes = panels(len(keys))
+    for name in names:
+        ws = list(results[name])
+        x = [int(v) / metrics["frame_rate"] for v in ws]
+        for ax, (key, title, _) in zip(axes, keys):
+            ax.plot(x, [results[name][v][th][tol][key] if results[name][v][th][tol][key] is not None
+                        else float("nan") for v in ws], "o-", color=color(name), label=label(name))
+    for ax, (key, title, _) in zip(axes, keys):
+        ax.set(title=title, xlabel="window (s)")
+        ax.grid(alpha=0.3)
+    axes[0].legend()
+    fig.suptitle(f"Episode alarms per window (threshold {th}, tolerance {tol} s)")
+    save(fig, "episode_vs_window.pdf")
+
+    # 4. Per event type.
+    types = list(metrics["counted_types"])
+    fig, axes = panels(2)
+    width = 0.8 / max(len(names), 1)
+    for i, name in enumerate(names):
+        by_type = results[name][w][th][tol]["by_type"]
+        for ax, key in zip(axes, ("recall", "precision")):
+            x = [j + i * width for j in range(len(types))]
+            bars = ax.bar(x, [by_type[t][key] for t in types], width, color=color(name), label=label(name))
+            for b, t in zip(bars, types):
+                ax.annotate(f"{by_type[t]['detected']}/{by_type[t]['events']}" if key == "recall"
+                            else f"{by_type[t]['correct_alarms']}/{by_type[t]['alarms']}",
+                            (b.get_x() + b.get_width() / 2, b.get_height()), ha="center", fontsize=7,
+                            xytext=(0, 2), textcoords="offset points")
+    for ax, key in zip(axes, ("event recall (detected / events)", "alarm precision (correct / alarms)")):
+        ax.set_xticks([j + width * (len(names) - 1) / 2 for j in range(len(types))], types)
+        ax.set(title=key, ylim=(0, 1))
+    axes[0].legend()
+    fig.suptitle(f"Episode alarms per event type ({point})")
+    save(fig, "episode_by_type.pdf")
+
+    # 5. Lead and lag of the detected events.
+    fig, axes = panels(2)
+    for name in names:
+        r = results[name][w][th][tol]
+        for ax, key in zip(axes, ("lead_s", "lag_s")):
+            values = r.get(key) or []
+            if values:
+                ax.hist(values, bins=30, alpha=0.5, color=color(name),
+                        label=f"{label(name)} (n={len(values)}, median {sorted(values)[len(values) // 2]:.1f} s)")
+    axes[0].set(title="lead: onset - alarm start", xlabel="seconds before the onset", ylabel="events")
+    axes[1].set(title="lag: alarm end - event end", xlabel="seconds (< 0: alarm stops before the event ends)",
+                ylabel="events")
+    axes[1].axvline(0, color="k", lw=0.8)
+    for ax in axes:
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Lead and lag of the detected events ({point})")
+    save(fig, "episode_lead_lag.pdf")
+
+
 def main(model, mlp, baselines, test_data, step05_cfg, cfg, output_file):
     """Episode alarm metrics of the test videos (cached in output_file, redone when the
     models, the test data or the settings change)."""
@@ -301,4 +441,5 @@ def main(model, mlp, baselines, test_data, step05_cfg, cfg, output_file):
         utils_data.save_json(metrics, output_file)
     print_summary(metrics, cfg["headline_window"])
     print(f"[Results]\t {output_file}")
+    plot_episodes(metrics, cfg["figure_dir"])
     return metrics
