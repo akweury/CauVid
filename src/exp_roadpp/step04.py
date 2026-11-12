@@ -585,6 +585,12 @@ def main_v2(input_data):
     }
     print(f"----------------- Step 04: Causal Filtering -----------------")
     causal_clause_file = input_data["output_dir"] / "causal_clauses.json"
+    # Causal clauses hold atom indices: rebuilt whenever the anchors or the train atoms are newer.
+    if causal_clause_file.exists() and any(
+            os.path.getmtime(f) > os.path.getmtime(causal_clause_file)
+            for f in (input_data["anchor_clause_file"], input_data["train_atom_file"]) if os.path.exists(f)):
+        print(f"[Step 04] {causal_clause_file} is older than the anchors / atoms: rebuilding")
+        causal_clause_file.unlink()
     if causal_clause_file.exists():
         causal_clauses = utils_data.load_json(causal_clause_file)
         # Rebuild if the anchors are in the old [atom_index, "oid", obj_id] format.

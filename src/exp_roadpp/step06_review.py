@@ -4,7 +4,8 @@ For a random sample of the test videos (REVIEW["num_videos"], seed REVIEW["seed"
 at least one scorer alarms), one MP4 per video and scorer of REVIEW["scorers"] (the rule net, the MLP
 and the calibrated own-label lookup), in <video>/<scorer>.mp4, each scorer at the threshold where its
 episode recall is closest to REVIEW["target_recall"] (`choose_thresholds`), so the same videos can be
-compared at a matched recall. Each shows the camera frames with
+compared at a matched recall, and <video>/gt.mp4 with the ground truth only (`gt_only`: the
+boxes, the ego's labels and the GT events, no alarm). Each shows the camera frames with
 Layout: the camera frame on the left, a side column on the right with the current list (top) and
 the timeline (below), a header line over both.
   - every agent's GT box (thin grey) with its id "#n"; an agent with an active alarm or a shown
@@ -44,7 +45,7 @@ SCORER_NAMES = {"model": "rule net", "mlp": "MLP", "lookup": "own-label lookup",
                 "mlp_cal": "MLP (calibrated)"}
 FRAME_OFFSET = 1                            # tensor frame t = decoded video frame t - FRAME_OFFSET
 REVIEW = {
-    "num_videos": 100,
+    "num_videos": 10,
     "seed": 0,
     # Scorers to compare on the same videos ("_cal": its probabilities calibrated on val), each at the
     # threshold where its episode recall (headline window, tolerance_s) is closest to target_recall.
@@ -58,7 +59,7 @@ REVIEW = {
     "event_show_s": 1.0,                    # an event label stays this long after the onset
     "timeline_rows": 40,                    # at most (and as many as fit under the list)
     "panel_lines": 10,                      # items of the current list at most (active alarms and shown events)
-    "version": "review_v9_three_scorers",
+    "version": "review_v11_gt_video",
 }
 # One clearly different colour per category: correct alarm (green), false alarm (red), GT event caught
 # by an alarm (blue), GT event missed (yellow); a hit at the group level only, an alarm whose event
@@ -214,7 +215,7 @@ def _text(cv2, img, s, x, y, color, scale=0.45, bg=True):
 
 
 def render_video(result, video_id, boxes, classes, label_names, head_names, out_path, reader, scorer_name,
-                 threshold, window_s, fps, review):
+                 threshold, window_s, fps, review, ego=None):
     """Write one review MP4 of `analyse_video` result: a header line over the camera frame (left) and
     a side column (right) with the current alarms / events and the GT labels of their agents (top)
     and the timeline of the whole video (below)."""
@@ -311,6 +312,11 @@ def render_video(result, video_id, boxes, classes, label_names, head_names, out_
         for kind, x in items:                                   # the colour and box width of each marked agent
             key = x["status"] if kind == "alarm" else _event_key(x)
             marked.setdefault(x["n"], COLORS[key])
+        # The ego (the camera car, no box): its current labels in the header; with an alarm or event a
+        # border around the whole frame in its colour and an "EGO" tag.
+        if ego is not None and ego in marked:
+            cv2.rectangle(frame, (2, 2), (W_img - 3, H_img - 3), marked[ego], 6)
+            _text(cv2, frame, "EGO", W_img // 2 - 20, H_img - 12, marked[ego], 0.7)
         # Every agent: a thin grey box and its id; the marked ones a thick coloured box.
         for n in range(N):
             pb = box_of(t, n)
@@ -326,8 +332,9 @@ def render_video(result, video_id, boxes, classes, label_names, head_names, out_
                 _text(cv2, frame, f"#{n}", p1[0], p1[1] - 2, COLORS["box"], 0.33, bg=False)
         # Side column, top: the list of what is on now (agent and its GT labels, then the alarm / event).
         listing = np.full((list_h, W_side, 3), (22, 22, 22), dtype=np.uint8)
-        _text(cv2, listing, f"Now: {len([i for i in items if i[0] == 'alarm'])} alarms, "
-              f"{len([i for i in items if i[0] == 'event'])} events", 6, 18, COLORS["text"], 0.45, bg=False)
+        n_alarms, n_events = sum(i[0] == "alarm" for i in items), sum(i[0] == "event" for i in items)
+        _text(cv2, listing, f"Now: {n_events} GT events" if threshold is None else f"Now: {n_alarms} alarms, {n_events} events",
+              6, 18, COLORS["text"], 0.45, bg=False)
         for i, (kind, x) in enumerate(items[:list_lines]):
             n, y = x["n"], 28 + line_h * i
             labels = ",".join(label_names[a].split(":", 1)[-1] for a in torch.nonzero(X[t, n, :L]).flatten().tolist())
@@ -347,9 +354,16 @@ def render_video(result, video_id, boxes, classes, label_names, head_names, out_
         cv2.line(tl, (tx(t), title_h - 2), (tx(t), cursor_bottom), (255, 255, 255), 1)
         side = np.vstack([listing, tl])
         header = np.full((header_h, W_out, 3), COLORS["panel"], dtype=np.uint8)
-        _text(cv2, header, f"{video_id}  frame {t}  {t / fps:5.1f}s  |  {scorer_name} >= {threshold}  window {window_s:g}s"
-              f"  |  green correct   red false   blue event caught   yellow event missed   cyan group hit   grey unobservable",
-              4, 17, COLORS["text"], 0.45, bg=False)
+        ego_now = ("  |  ego: " + (",".join(label_names[a].split(":", 1)[-1]
+                                            for a in torch.nonzero(X[t, ego, :L]).flatten().tolist()) or "-")
+                   if ego is not None else "")
+        if threshold is None:                                   # the ground truth only (`gt_only`)
+            title = (f"{video_id}  frame {t}  {t / fps:5.1f}s  |  ground truth only{ego_now}"
+                     f"  |  blue: GT event (onset, shown 1 s; timeline: onset to end)")
+        else:
+            title = (f"{video_id}  frame {t}  {t / fps:5.1f}s  |  {scorer_name} >= {threshold}  window {window_s:g}s"
+                     f"{ego_now}  |  green correct  red false  blue event caught  yellow missed  cyan group hit  grey unobservable")
+        _text(cv2, header, title, 4, 17, COLORS["text"], 0.45, bg=False)
         writer.write(np.vstack([header, np.hstack([frame, side])]))
     writer.release()
 
@@ -372,6 +386,13 @@ def choose_thresholds(episode_file, window, tolerance_s):
         else:
             out[name] = (REVIEW["fallback_thresholds"][name], None)
     return out
+
+
+def gt_only(result):
+    """The `analyse_video` result reduced to the ground truth: no alarms, every GT event drawn as
+    "EVENT" in blue (none is caught or missed without a scorer)."""
+    return {**result, "score": torch.zeros_like(result["score"]), "alarms": [],
+            "events": [{**e, "detected": True, "detected_group": False, "lead": None} for e in result["events"]]}
 
 
 def _lines(name, video_id, result, classes, head_names, fps):
@@ -474,10 +495,19 @@ def main(model, mlp, baselines, calibration, test_data, step05_cfg, cfg, output_
         os.makedirs(out_dir, exist_ok=True)
         any_result = next(iter(results.values()))
         vb, classes, _has_box = step05._agent_boxes(boxes_all, video_id, atoms[video_id], any_result["X"][..., :L])
+        ego = step05.video_agent_ids(atoms[video_id]).get(None)          # the camera car: no box
+        classes = list(classes)
+        if ego is not None:
+            classes[ego] = "EGO"
+        # The ground truth alone (gt.mp4): the boxes, the ego's labels and the GT events, no alarm.
+        reader = FrameReader(video_id, frame_dir, video_dir)
+        render_video(gt_only(any_result), video_id, vb, classes, label_names, head_names, out_dir / "gt.mp4", reader,
+                     "ground truth", None, window / fps, fps, REVIEW, ego)
+        reader.close()
         for name, result in results.items():
             reader = FrameReader(video_id, frame_dir, video_dir)        # read in order: one per video
             render_video(result, video_id, vb, classes, label_names, head_names, out_dir / f"{name}.mp4", reader,
-                         SCORER_NAMES.get(name, name), thresholds[name][0], window / fps, fps, REVIEW)
+                         SCORER_NAMES.get(name, name), thresholds[name][0], window / fps, fps, REVIEW, ego)
             reader.close()
             lines += _lines(name, video_id, result, classes, head_names, fps)
             summary.append(_summary(name, video_id, thresholds[name][0], result))
@@ -506,6 +536,8 @@ def _readme(cfg, fps, thresholds):
 each scorer at the threshold where its episode recall over the whole test split is closest to
 {REVIEW['target_recall']} (so the three catch about as many events and their alarms can be compared):
 {scorers}
+  gt.mp4: the ground truth only (no model): every agent's box, the ego's labels in the header, each GT
+          event in blue for 1 s from its onset and over its whole duration in the timeline.
 review_summary.csv: per video and scorer, the alarms (correct / group / false / unobservable, precision)
 and the GT events (caught / missed).
 
@@ -515,7 +547,8 @@ Box colours: green = correct alarm (the event follows on this agent within the a
 cyan = the event follows on an adjacent agent of the same class only, red = false alarm, grey = the
 agent left too soon to tell. EVENT (blue) = a GT event that an alarm caught, MISSED (yellow) = one
 that none did, MISSED (group hit) (cyan) = one caught only by an adjacent same-class agent's alarm.
-Thin grey boxes: every agent with its id #n. Right column, top: what is on now (alarm / event,
+Thin grey boxes: every agent with its id #n. The ego (the camera car, #n "EGO" in the lists) has no box:
+its current labels are in the header, and an alarm or event of it draws a border around the whole frame. Right column, top: what is on now (alarm / event,
 the agent's class and current GT labels); below: the timeline,
 one row per agent and head with an alarm or event over the whole video: the thick bar is the alarm
 (start to end), the thin bar below it the GT event (onset to end, a tick at the onset); the white

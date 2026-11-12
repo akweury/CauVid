@@ -130,7 +130,34 @@ class Language:
 
     def video2atoms(self, target, segments, frames=None):
         atoms = []
-        if target == "av":
+        if target == "av" and frames is not None:
+            # The ego's actions per frame (frames[f]["av_action_ids"]): each action's runs of
+            # consecutive frames, one atom each, end_frame exclusive (one past the run's last
+            # frame; `step_dataset.get_frame_pairs` reads start_frame <= f < end_frame). The ROAD++
+            # av_action_tubes disagree with them: train_00347 has one tube AV-Mov 1-199 while its
+            # frames are AV-Mov 1-133, AV-TurLft 134-171, AV-Mov 172-199; train_00387 a tube
+            # AV-TurRht 34-192 for AV-Mov 34-188, AV-TurRht 189-192. From the tubes, the ego
+            # held one label per video in 116 of the 119 full test videos (0 train + val onsets).
+            on = {}
+            for frame_id in sorted(frames, key=int):
+                for action_id in frames[frame_id].get("av_action_ids") or []:
+                    on.setdefault(int(action_id), []).append(int(frame_id))
+            for action_id, frame_ids in sorted(on.items()):
+                start = previous = frame_ids[0]
+                for f in frame_ids[1:] + [None]:
+                    if f is not None and f == previous + 1:
+                        previous = f
+                        continue
+                    atoms.append(self.predicates['action'].make_atom(
+                        action_id=action_id,
+                        agent_class="av",
+                        start_frame=start,
+                        end_frame=previous + 1,
+                        tube_uid=None).to_dict())
+                    if f is not None:
+                        start = previous = f
+        elif target == "av":
+            # Fallback without the frames: the av_action_tubes, first to last frame (see above).
             for seg_id, segment in segments.items():
                 # av from start to end of the segment, with action
                 av_action_id = segment["label_id"]

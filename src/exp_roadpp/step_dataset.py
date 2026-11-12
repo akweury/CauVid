@@ -73,7 +73,7 @@ def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels):
             frames = track_data["data"]["frames"]
 
             interval_atoms = []
-            interval_atoms.extend(lang.video2atoms("av", segments_by_ego_actions))
+            interval_atoms.extend(lang.video2atoms("av", segments_by_ego_actions, frames))
             interval_atoms.extend(lang.video2atoms("agents", agent_tubes, frames))
 
 
@@ -258,6 +258,13 @@ def _plot_onset_statistics(counts, unique_atoms, plot_file, top_k=15):
 
 
 
+# Version of the atom files: files of another version (or of none) are rebuilt, with the vocabulary
+# and the compressed files (the boxes are kept). "av_frames_v1": the ego's atoms from the per-frame
+# av_action_ids instead of the av_action_tubes (`video2atoms`). The vocabulary may change with it, and
+# steps 03 / 04 store atom indices: they rebuild when unique_atoms.json is newer than their outputs.
+ATOMS_VERSION = "av_frames_v1"
+
+
 def prepare_per_frame_atoms(language_model, cfg):
     data_num = cfg["data_num"]
     track_dir = cfg["track_dir"]
@@ -269,6 +276,17 @@ def prepare_per_frame_atoms(language_model, cfg):
     train_indices, val_indices, test_indices = _split_example_indices(len(all_track_files))
     atoms_folder= Path(output_dir) / "atoms" 
     os.makedirs(atoms_folder, exist_ok=True)
+    version_file = atoms_folder / "atoms_version.txt"
+    version = version_file.read_text().strip() if version_file.exists() else None
+    if version != ATOMS_VERSION:
+        stale = [atoms_folder / f"{split}_atoms{suffix}.json" for split in ("train", "val", "test")
+                 for suffix in ("", "_compressed")] + [atoms_folder / "unique_atoms.json"]
+        stale = [f for f in stale if f.exists()]
+        if stale:
+            print(f"[Per Frame Atoms] atom files of version {version} (now {ATOMS_VERSION}): rebuilding "
+                  + ", ".join(f.name for f in stale))
+            for f in stale:
+                f.unlink()
 
     splits = {"train": train_indices, "val": val_indices, "test": test_indices}
     for split_name, indices in splits.items():
@@ -294,6 +312,8 @@ def prepare_per_frame_atoms(language_model, cfg):
             _compress_atom_file(atoms_folder / f"{split_name}_atoms.json", compressed_file, atom_vocab)
         else:
             print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
+
+    version_file.write_text(ATOMS_VERSION + "\n")
 
     # The agents' boxes per frame (step 05 agent roles), for the videos of each split's atom file.
     for split_name in splits:

@@ -232,7 +232,13 @@ def main(input_data):
         "output_dir": input_data["output_dir"]
     }
     anchor_clause_file = cfg["output_dir"] / "anchor_clauses.json"
-    if not anchor_clause_file.exists():
+    # Anchors hold atom indices: rebuilt whenever the vocabulary (or the train atoms) is newer.
+    stale = anchor_clause_file.exists() and any(
+        os.path.getmtime(f) > os.path.getmtime(anchor_clause_file)
+        for f in (cfg["unique_atoms_file"], cfg["train_atom_file"]) if os.path.exists(f))
+    if stale:
+        print(f"[Step 03] {anchor_clause_file} is older than the atoms: rebuilding")
+    if not anchor_clause_file.exists() or stale:
         # Convert atoms to anchor clauses
         anchor_data = build_anchor_clauses(cfg)
         utils_data.save_json(anchor_data, anchor_clause_file)
