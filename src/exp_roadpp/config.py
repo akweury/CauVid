@@ -25,6 +25,12 @@ os.makedirs(exp_config_path, exist_ok=True)
 
 # -------------- Inputs --------------
 def step_0_setup(args):
+    return setup_run(machine_setup(args))
+
+
+def machine_setup(args):
+    """args.device, args.dataset_path and args.output_dir of args.machine and args.exp (no run folder;
+    `step_0_setup` adds it). Diagnostics that only read the shared step outputs use this alone."""
     # get the dataset phyiscal path
     # ml-pulsar
     if args.machine == "ml-pulsar":
@@ -72,7 +78,7 @@ def step_0_setup(args):
     if os.path.exists(args.dataset_path):
         print(f"\n##### Dataset path exists: {args.dataset_path} #####\n")
 
-    return setup_run(args)
+    return args
 
 
 # -------------- Runs --------------

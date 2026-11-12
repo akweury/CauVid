@@ -10,6 +10,8 @@
 #   ./run_roadpp_docker.sh [--gpu 0|all|none] [--rebuild] [-- <extra args for main.py>]
 #   Add --tune_05 to the extra args to run step05_tune.py (step 05
 #   hyperparameter sweep, needs the step 04 outputs) instead of main.py.
+#   Add --timing_diag to run step05_timing_diag.py (which signals precede an
+#   onset by ~2 s rather than ~10 s; needs the step_dataset outputs only).
 #
 # The image is rebuilt automatically whenever requirements.txt or the
 # Dockerfile changes (tracked via a content-hash label on the image).
@@ -78,6 +80,8 @@ PY_ARGS=()
 for arg in "${EXTRA_ARGS[@]}"; do
     if [[ "$arg" == "--tune_05" ]]; then
         ENTRY_MODULE="src.exp_roadpp.step05_tune"
+    elif [[ "$arg" == "--timing_diag" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.step05_timing_diag"
     else
         PY_ARGS+=("$arg")
     fi
