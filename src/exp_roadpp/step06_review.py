@@ -1,33 +1,37 @@
 """Step 06r: review videos, the test videos with the predicted events drawn in, for a human review.
 
 For a random sample of the test videos (REVIEW["num_videos"], seed REVIEW["seed"], only videos where
-at least one scorer alarms), one MP4 per video and scorer of REVIEW["scorers"] (the rule net, the MLP
-and the calibrated own-label lookup), in <video>/<scorer>.mp4, each scorer at the threshold where its
-episode recall is closest to REVIEW["target_recall"] (`choose_thresholds`), so the same videos can be
-compared at a matched recall, and <video>/gt.mp4 with the ground truth only (`gt_only`: the
-boxes, the ego's labels and the GT events, no alarm). Each shows the camera frames with
-Layout: the camera frame on the left, a side column on the right with the current list (top) and
-the timeline (below), a header line over both.
-  - every agent's GT box (thin grey) with its id "#n"; an agent with an active alarm or a shown
-    event gets a thick box in the colour below, and an item in the current list with the alarm
-    (head, score, outcome) or the event, and the agent's class and current GT labels;
-  - the alarms of the scorer (`step06_episodes.alarm_episodes`: the frames whose window-W score of an
-    agent and head is >= the threshold, merged into episodes, >= min_length frames) as a thick box
-    around the alarmed agent ("ALARM <head> p=<score>" in the list), coloured by the outcome of the alarm
-    under the step 06 episode rules (tolerance REVIEW["tolerance_s"]):
+some scorer alarms on a reviewed agent), three agents per video, each in videos of its own
+(`focus_agents`): the ego and the REVIEW["focus_others"] other agents seen in the most frames. Per
+agent, <video>/<agent>/<scorer>.mp4 for each scorer of REVIEW["scorers"] (the rule net, the MLP and
+the calibrated own-label lookup), each at the threshold where its episode recall is closest to
+REVIEW["target_recall"] (`choose_thresholds`), so the scorers can be compared at a matched recall, and
+<video>/<agent>/gt.mp4 with the ground truth only (`gt_only`).
+Layout (`render_video`): a header line over the camera frame (left) and a side column (right) about
+the reviewed agent only, in large type (REVIEW["font_scale"]):
+  - the frame: the reviewed agent in a thick box (the ego, without a box: a border while it has an
+    alarm or event), every other agent in a thin grey box;
+  - who it is and its current GT labels;
+  - its alarms (`step06_episodes.alarm_episodes`: the frames whose window-W score of the agent and a
+    head is >= the threshold, merged into episodes, >= min_length frames, "ALARM <head> p=<score>")
+    and GT events now, coloured by the outcome under the step 06 episode rules (tolerance
+    REVIEW["tolerance_s"]):
       correct (green): the event of that head follows on that agent within the alarm (+ tolerance);
       group (cyan): it follows on an adjacent agent of the same class (`grid.agent_groups`) only;
       false (red): no such event, the outcome seen; unobservable (grey): the agent left too soon;
-  - the GT events (exact onsets of the counted heads) as "EVENT <head>" on the agent's box for 1 s
-    from the onset, "MISSED" (yellow) if no alarm of the agent and head hit it, "MISSED (group hit)"
-    (cyan) if only an alarm of an adjacent same-class agent did;
-  - the timeline of the whole video: one row per agent and head with an alarm or an event (alarm
-    bars in the alarm colours over the alarm's frames, above a thin bar over each event's frames from
-    its onset to its end with a tick at the onset, event ticks blue, missed ones yellow, group hits cyan), a seconds axis, the current frame as a cursor.
-Next to the videos, review.csv: one line per alarm and per event and scorer (video, scorer, agent,
-class, head, frames, seconds, peak score, outcome, matched event / lead), with empty columns for the
-reviewer's verdict and comment; review_summary.csv: one line per video and scorer (alarm outcomes,
-precision, events caught / missed); README.txt explaining the colours, thresholds and verdicts.
+    a GT event (exact onset of a counted head) shows for 1 s from the onset: "EVENT" (blue) if an
+    alarm of the agent and head hit it, "MISSED" (yellow) if none, "MISSED (group)" (cyan) if only an
+    alarm of an adjacent same-class agent did;
+  - its scores now for the heads of its class (`agent_heads`), the REVIEW["pred_lines"] highest, as
+    bars with the threshold (not in gt.mp4);
+  - its timeline over the whole video: one row per head with an alarm or an event (alarm bars in the
+    alarm colours, below them a thin bar over each event from its onset to its end with a tick at the
+    onset), a seconds axis, the current frame as a cursor.
+Next to the videos, review.csv: one line per alarm and per event of the reviewed agents and scorer
+(video, scorer, agent, class, head, frames, seconds, peak score, outcome, matched event / lead), with
+empty columns for the reviewer's verdict and comment; review_summary.csv: one line per video, agent
+and scorer (alarm outcomes, precision, events caught / missed); README.txt explaining the colours,
+thresholds and verdicts.
 
 Frames: from frame_dir/<video>/%05d.jpg if it exists, else decoded from video_dir/<video>.mp4.
 The atom tensors are indexed by the ROAD++ frame id, which starts at 1 (the frames are extracted as
@@ -55,11 +59,13 @@ REVIEW = {
                             "mlp_cal": 0.05},
     "tolerance_s": 1.0,
     "width": 1280,                          # width of the camera frame (left), pixels (scaled down)
-    "side_width": 640,                      # width of the side column (right): current list and timeline
+    "side_width": 720,                      # width of the side column (right): the focus agent only
+    "font_scale": 0.75,                     # type size of the side column
+    "focus_others": 2,                      # agents per video besides the ego: the ones seen longest
     "event_show_s": 1.0,                    # an event label stays this long after the onset
-    "timeline_rows": 40,                    # at most (and as many as fit under the list)
-    "panel_lines": 10,                      # items of the current list at most (active alarms and shown events)
-    "version": "review_v11_gt_video",
+    "panel_lines": 3,                       # items of the now-list at most (the agent's alarms and events)
+    "pred_lines": 6,                        # heads of the prediction bars (the highest scores now)
+    "version": "review_v12_focus_agents",
 }
 # One clearly different colour per category: correct alarm (green), false alarm (red), GT event caught
 # by an alarm (blue), GT event missed (yellow); a hit at the group level only, an alarm whose event
@@ -206,94 +212,142 @@ class FrameReader:
 
 
 # -------------- Drawing --------------
-def _text(cv2, img, s, x, y, color, scale=0.45, bg=True):
-    (w, h), base = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+def _text(cv2, img, s, x, y, color, scale=0.45, bg=True, thick=1):
+    (w, h), base = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
     x, y = int(max(0, min(x, img.shape[1] - w - 2))), int(max(h + 2, min(y, img.shape[0] - 2)))
     if bg:
         cv2.rectangle(img, (x - 1, y - h - 3), (x + w + 1, y + base - 1), (0, 0, 0), -1)
-    cv2.putText(img, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+    cv2.putText(img, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def _wrap(s, width):
+    """s cut into lines of at most width characters, at the commas where possible."""
+    lines, cur = [], ""
+    for part in s.split(","):
+        nxt = part if not cur else cur + "," + part
+        if len(nxt) <= width:
+            cur = nxt
+        else:
+            if cur:
+                lines.append(cur + ",")
+            cur = part[:width]
+    return lines + ([cur] if cur else [])
+
+
+def focus_agents(X_labels, ego, num_other):
+    """The agents of one video to review, each in a video of its own: the ego (if any), then the
+    num_other other agents seen in the most frames (holding some label atom)."""
+    frames = X_labels.any(dim=2).sum(dim=0)                                     # (N,)
+    others = [n for n in torch.argsort(frames, descending=True).tolist() if n != ego and frames[n] > 0]
+    return ([ego] if ego is not None else []) + others[:num_other]
+
+
+def agent_heads(X_labels, n, label_names, head_names):
+    """Indices into head_names of the heads of agent n's class (the class prefix of its label atoms:
+    "av" for the ego, "Car", "Ped", ...)."""
+    held = torch.nonzero(X_labels[:, n].any(dim=0)).flatten().tolist()
+    prefix = label_names[held[0]].split(":", 1)[0] if held else None
+    return [i for i, h in enumerate(head_names) if h.split(":", 1)[0] == prefix]
+
+
+def of_agent(result, n):
+    """The `analyse_video` result restricted to agent n's alarms and events."""
+    return {**result, "alarms": [a for a in result["alarms"] if a["n"] == n],
+            "events": [e for e in result["events"] if e["n"] == n]}
 
 
 def render_video(result, video_id, boxes, classes, label_names, head_names, out_path, reader, scorer_name,
-                 threshold, window_s, fps, review, ego=None):
-    """Write one review MP4 of `analyse_video` result: a header line over the camera frame (left) and
-    a side column (right) with the current alarms / events and the GT labels of their agents (top)
-    and the timeline of the whole video (below)."""
+                 threshold, window_s, fps, review, ego=None, focus=None, heads=()):
+    """Write one review MP4 of the focus agent of `analyse_video` result (`of_agent`): a header line
+    over the camera frame (left; the focus agent's box marked) and a side column (right) about the
+    focus agent only, in large type: who it is and its current GT labels; its alarms and GT events
+    now; its scores now for the heads of its class (heads), the highest first, as bars with the
+    alarm threshold (not in the ground-truth video, threshold None); its timeline over the whole video."""
     import cv2
     import numpy as np
     X, score, T, N = result["X"], result["score"], result["T"], result["N"]
+    n0 = focus
     W_img = review["width"]
     H_img = int(round(W_img * 1280 / 1920))
-    W_side, header_h = review["side_width"], 26
+    W_side, header_h = review["side_width"], 34
     show = int(round(review["event_show_s"] * fps))
     L = len(label_names)
+    fs = review["font_scale"]                                   # the side column's type size
+    line_h = int(round(44 * fs))
+    small = fs * 0.8
+    is_ego = n0 == ego
+    who = "EGO (camera car)" if is_ego else f"#{n0} {classes[n0] or ''}"
 
-    # The list (top of the side column): one line per alarm active at t and per event shown at t,
-    # the informative ones first, so a full list cuts the false and unobservable alarms.
+    def short(h):
+        return head_names[h].split(":", 1)[-1]
+
+    # Side column, top to bottom: identity + GT labels, now-list, predictions, timeline.
+    info_h = int(line_h * 3.4)
+    now_lines = review["panel_lines"]
+    now_h = line_h * (now_lines + 1)
+    pred_lines = review["pred_lines"] if threshold is not None else 0
+    pred_h = line_h * (pred_lines + 1) if pred_lines else 0
+    tl_h = max(H_img - info_h - now_h - pred_h, 4 * line_h)
+    side_h = info_h + now_h + pred_h + tl_h
     rank = {"correct": 1, "group": 2, "false": 3, "unobservable": 4}
 
     def active(t):
         items = [("alarm", a) for a in result["alarms"] if a["start"] <= t <= a["end"]]
         items += [("event", e) for e in result["events"] if e["t"] <= t < e["t"] + show]
         return sorted(items, key=lambda it: 0 if it[0] == "event" else rank[it[1]["status"]])
-    list_lines = review["panel_lines"]                                  # a fixed list height
-    line_h = 34                                                         # two text lines per item
-    list_h = 28 + line_h * list_lines
 
-    # The timeline (below the list): one row per agent and head with an alarm or an event, alarm bars
-    # in the alarm colours, event ticks, a seconds axis; the cursor is drawn per frame.
-    pairs = []
-    for a in sorted(result["alarms"], key=lambda a: a["start"]):
-        if (a["n"], a["h"]) not in pairs:
-            pairs.append((a["n"], a["h"]))
-    for e in sorted(result["events"], key=lambda e: e["t"]):
-        if (e["n"], e["h"]) not in pairs:
-            pairs.append((e["n"], e["h"]))
-    # The timeline fills the column down to the bottom of the frame: its rows share the height left
-    # under the list (between MIN_ROW_H and MAX_ROW_H pixels each; rows that do not fit are left out).
-    min_row_h, max_row_h, axis_h, title_h = 14, 28, 26, 24
-    tl_h = H_img - list_h
-    room = max((tl_h - title_h - axis_h) // min_row_h, 1)
-    shown = min(len(pairs), room, review["timeline_rows"])
-    hidden = len(pairs) - shown
-    pairs = pairs[:shown]
-    row_h = min(max((tl_h - title_h - axis_h) // max(shown, 1), min_row_h), max_row_h)
+    # The timeline of the focus agent: one row per head with an alarm or an event.
+    rows = []
+    for x in sorted(result["alarms"], key=lambda a: a["start"]) + sorted(result["events"], key=lambda e: e["t"]):
+        if x["h"] not in rows:
+            rows.append(x["h"])
+    title_h, axis_h = line_h, int(line_h * 0.9)
+    room = max((tl_h - title_h - axis_h) // max(int(line_h * 0.7), 1), 1)
+    hidden = max(len(rows) - room, 0)
+    rows = rows[:room]
+    row_h = min(max((tl_h - title_h - axis_h) // max(len(rows), 1), int(line_h * 0.7)), line_h)
     timeline = np.full((tl_h, W_side, 3), COLORS["panel"], dtype=np.uint8)
-    x0, x1 = 150, W_side - 10
+    x0, x1 = int(W_side * 0.32), W_side - 12
 
     def tx(t):
         return int(x0 + (x1 - x0) * t / max(T - 1, 1))
-    _text(cv2, timeline, "Timeline (whole video)" + (f", {hidden} more rows not shown" if hidden else ""),
-          6, 17, COLORS["text"], 0.45, bg=False)
-    for r, (n, h) in enumerate(pairs):
+    _text(cv2, timeline, "Timeline" + (f" (+{hidden} rows)" if hidden else "") + ("" if rows else ": no alarm or event"),
+          8, int(title_h * 0.75), COLORS["text"], fs, bg=False, thick=2)
+    for r, h in enumerate(rows):
         y = title_h + r * row_h
-        _text(cv2, timeline, f"#{n} {head_names[h]}"[:22], 6, y + row_h // 2 + 5, COLORS["text"], 0.4, bg=False)
+        _text(cv2, timeline, short(h)[:14], 8, y + row_h // 2 + int(8 * small), COLORS["text"], small, bg=False)
         cv2.line(timeline, (x0, y + row_h // 2), (x1, y + row_h // 2), (70, 70, 70), 1)
-        # Alarms: a thick bar in the upper part of the row, from the alarm start to its end.
-        # Events: a thin bar in the lower part, from the onset to the end of the event (the label off
-        # for min_off_frames frames, or the agent gone), and a tick over the whole row at the onset.
         split = y + (row_h * 3) // 5
         for a in result["alarms"]:
-            if (a["n"], a["h"]) == (n, h):
-                cv2.rectangle(timeline, (tx(a["start"]), y + 2), (max(tx(a["end"]), tx(a["start"]) + 1), split - 1),
+            if a["h"] == h:
+                cv2.rectangle(timeline, (tx(a["start"]), y + 2), (max(tx(a["end"]), tx(a["start"]) + 2), split - 1),
                               COLORS[a["status"]], -1)
         for e in result["events"]:
-            if (e["n"], e["h"]) == (n, h):
+            if e["h"] == h:
                 c = COLORS[_event_key(e)]
-                cv2.rectangle(timeline, (tx(e["t"]), split + 2), (max(tx(e["end"]), tx(e["t"]) + 1), split + 4), c, -1)
-                cv2.line(timeline, (tx(e["t"]), y), (tx(e["t"]), y + row_h - 1), c, 2)
-    axis_y = tl_h - axis_h + 4                                          # the axis at the bottom of the column
+                cv2.rectangle(timeline, (tx(e["t"]), split + 2), (max(tx(e["end"]), tx(e["t"]) + 2), split + 5), c, -1)
+                cv2.line(timeline, (tx(e["t"]), y), (tx(e["t"]), y + row_h - 1), c, 3)
+    axis_y = tl_h - axis_h + 4
     cv2.line(timeline, (x0, axis_y), (x1, axis_y), (120, 120, 120), 1)
     step = 5 if T / fps <= 60 else 10
     for sec in range(0, int(T / fps) + 1, step):
         x = tx(int(sec * fps))
-        cv2.line(timeline, (x, axis_y), (x, axis_y + 4), (120, 120, 120), 1)
-        _text(cv2, timeline, f"{sec}s", x - 8, axis_y + 16, (170, 170, 170), 0.35, bg=False)
-    cursor_bottom = axis_y + 4
+        cv2.line(timeline, (x, axis_y), (x, axis_y + 5), (120, 120, 120), 1)
+        _text(cv2, timeline, f"{sec}s", x - 10, axis_y + int(22 * small), (170, 170, 170), small * 0.8, bg=False)
+    cursor_bottom = axis_y + 5
 
-    W_out, H_out = W_img + W_side, header_h + H_img
+    # The prediction bars: 0 .. bar_max (the threshold in the middle at most, so small calibrated
+    # thresholds stay visible), a tick at the threshold.
+    bar_max = min(1.0, max(0.1, 2 * threshold)) if threshold is not None else 1.0
+    bx0, bx1 = int(W_side * 0.42), W_side - 90
+
+    def bx(v):
+        return int(bx0 + (bx1 - bx0) * min(max(v / bar_max, 0.0), 1.0))
+
+    W_out, H_out = W_img + W_side, header_h + max(H_img, side_h)
     writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W_out, H_out))
     sx, sy = W_img, H_img
+    focus_color = (255, 255, 255)
 
     def box_of(t, n):
         b = boxes[t, n]
@@ -308,63 +362,84 @@ def render_video(result, video_id, boxes, classes, label_names, head_names, out_
         else:
             frame = cv2.resize(img, (W_img, H_img), interpolation=cv2.INTER_AREA)
         items = active(t)
-        marked = {}
-        for kind, x in items:                                   # the colour and box width of each marked agent
-            key = x["status"] if kind == "alarm" else _event_key(x)
-            marked.setdefault(x["n"], COLORS[key])
-        # The ego (the camera car, no box): its current labels in the header; with an alarm or event a
-        # border around the whole frame in its colour and an "EGO" tag.
-        if ego is not None and ego in marked:
-            cv2.rectangle(frame, (2, 2), (W_img - 3, H_img - 3), marked[ego], 6)
-            _text(cv2, frame, "EGO", W_img // 2 - 20, H_img - 12, marked[ego], 0.7)
-        # Every agent: a thin grey box and its id; the marked ones a thick coloured box.
+        color = COLORS[items[0][1]["status"] if items[0][0] == "alarm" else _event_key(items[0][1])] if items else focus_color
+        # Every other agent: a thin grey box; the focus agent: a thick box (white, or the colour of
+        # its first item now); the ego (no box): a border around the whole frame.
         for n in range(N):
             pb = box_of(t, n)
-            if pb is None:
+            if pb is None or n == n0:
                 continue
-            p1, p2 = pb
-            if n in marked:
-                color = marked[n]
-                cv2.rectangle(frame, p1, p2, color, 3)
-                _text(cv2, frame, f"#{n}", p1[0], p1[1] - 3, color, 0.5)
-            else:
-                cv2.rectangle(frame, p1, p2, COLORS["box"], 1)
-                _text(cv2, frame, f"#{n}", p1[0], p1[1] - 2, COLORS["box"], 0.33, bg=False)
-        # Side column, top: the list of what is on now (agent and its GT labels, then the alarm / event).
-        listing = np.full((list_h, W_side, 3), (22, 22, 22), dtype=np.uint8)
+            cv2.rectangle(frame, pb[0], pb[1], COLORS["box"], 1)
+        if is_ego:
+            if items:
+                cv2.rectangle(frame, (3, 3), (W_img - 4, H_img - 4), color, 8)
+            _text(cv2, frame, "EGO", W_img // 2 - 30, H_img - 14, color, 1.0, thick=2)
+        else:
+            pb = box_of(t, n0)
+            if pb is not None:
+                cv2.rectangle(frame, pb[0], pb[1], color, 4)
+                _text(cv2, frame, f"#{n0}", pb[0][0], pb[0][1] - 4, color, 0.8, thick=2)
+
+        # Side column.
+        info = np.full((info_h, W_side, 3), (40, 40, 40), dtype=np.uint8)
+        _text(cv2, info, who, 8, int(line_h * 0.85), (255, 255, 255), fs * 1.15, bg=False, thick=2)
+        labels = ",".join(label_names[a].split(":", 1)[-1] for a in torch.nonzero(X[t, n0, :L]).flatten().tolist())
+        gt_lines = _wrap("GT: " + (labels or ("-" if is_ego or box_of(t, n0) else "(not in view)")),
+                         int(W_side / (19 * small)))
+        for i, s in enumerate(gt_lines[:2]):
+            _text(cv2, info, s, 8, int(line_h * (1.75 + 0.8 * i)), (210, 210, 210), small, bg=False)
+
+        now = np.full((now_h, W_side, 3), (22, 22, 22), dtype=np.uint8)
         n_alarms, n_events = sum(i[0] == "alarm" for i in items), sum(i[0] == "event" for i in items)
-        _text(cv2, listing, f"Now: {n_events} GT events" if threshold is None else f"Now: {n_alarms} alarms, {n_events} events",
-              6, 18, COLORS["text"], 0.45, bg=False)
-        for i, (kind, x) in enumerate(items[:list_lines]):
-            n, y = x["n"], 28 + line_h * i
-            labels = ",".join(label_names[a].split(":", 1)[-1] for a in torch.nonzero(X[t, n, :L]).flatten().tolist())
+        _text(cv2, now, f"Now: {n_events} GT events" if threshold is None else f"Now: {n_alarms} alarms, {n_events} GT events",
+              8, int(line_h * 0.75), COLORS["text"], fs, bg=False, thick=2)
+        for i, (kind, x) in enumerate(items[:now_lines]):
+            y = int(line_h * (1.75 + i))
             if kind == "alarm":
                 c = COLORS[x["status"]]
-                what = f"ALARM {head_names[x['h']]}  p={float(score[t, n, x['h']]):.2f}  [{x['status']}]"
+                what = f"ALARM {short(x['h'])} p={float(score[t, n0, x['h']]):.2f} [{x['status']}]"
             else:
                 c = COLORS[_event_key(x)]
-                what = ("EVENT " if x["detected"] else ("MISSED (group hit) " if x["detected_group"] else "MISSED ")) \
-                    + head_names[x["h"]]
-            _text(cv2, listing, what, 6, y + 13, c, 0.45, bg=False)
-            _text(cv2, listing, f"  #{n} {classes[n] or ''}  GT: {labels or '-'}"[:70], 6, y + 29, (200, 200, 200), 0.4,
-                  bg=False)
-        if len(items) > list_lines:
-            _text(cv2, listing, f"+{len(items) - list_lines} more", W_side - 80, 18, COLORS["text"], 0.4, bg=False)
+                what = ("EVENT " if x["detected"] else ("MISSED (group) " if x["detected_group"] else "MISSED ")) + short(x["h"])
+            _text(cv2, now, what, 8, y, c, fs, bg=False, thick=2)
+        if len(items) > now_lines:
+            _text(cv2, now, f"+{len(items) - now_lines}", W_side - 60, int(line_h * 0.75), COLORS["text"], small, bg=False)
+        parts = [info, now]
+
+        if pred_lines:
+            pred = np.full((pred_h, W_side, 3), (30, 30, 30), dtype=np.uint8)
+            _text(cv2, pred, f"Predicted now (event within {window_s:g} s)", 8, int(line_h * 0.75), COLORS["text"],
+                  fs, bg=False, thick=2)
+            top = sorted(heads, key=lambda h: -float(score[t, n0, h]))[:pred_lines]
+            for i, h in enumerate(top):
+                v = float(score[t, n0, h])
+                y = int(line_h * (1 + i))
+                on = v >= threshold
+                c = (0, 165, 255) if on else (150, 150, 150)
+                _text(cv2, pred, short(h)[:14], 8, y + int(line_h * 0.7), (255, 255, 255) if on else (190, 190, 190),
+                      small, bg=False, thick=2 if on else 1)
+                cv2.rectangle(pred, (bx0, y + int(line_h * 0.2)), (bx1, y + int(line_h * 0.8)), (55, 55, 55), -1)
+                cv2.rectangle(pred, (bx0, y + int(line_h * 0.2)), (max(bx(v), bx0 + 1), y + int(line_h * 0.8)), c, -1)
+                cv2.line(pred, (bx(threshold), y + int(line_h * 0.1)), (bx(threshold), y + int(line_h * 0.9)),
+                         (255, 255, 255), 2)
+                _text(cv2, pred, f"{v:.2f}", bx1 + 8, y + int(line_h * 0.7), c, small, bg=False, thick=2 if on else 1)
+            parts.append(pred)
+
         tl = timeline.copy()
-        cv2.line(tl, (tx(t), title_h - 2), (tx(t), cursor_bottom), (255, 255, 255), 1)
-        side = np.vstack([listing, tl])
+        cv2.line(tl, (tx(t), title_h - 2), (tx(t), cursor_bottom), (255, 255, 255), 2)
+        parts.append(tl)
+        side = np.vstack(parts)
+        body = np.zeros((H_out - header_h, W_out, 3), dtype=np.uint8)
+        body[:H_img, :W_img] = frame
+        body[:side.shape[0], W_img:] = side
         header = np.full((header_h, W_out, 3), COLORS["panel"], dtype=np.uint8)
-        ego_now = ("  |  ego: " + (",".join(label_names[a].split(":", 1)[-1]
-                                            for a in torch.nonzero(X[t, ego, :L]).flatten().tolist()) or "-")
-                   if ego is not None else "")
         if threshold is None:                                   # the ground truth only (`gt_only`)
-            title = (f"{video_id}  frame {t}  {t / fps:5.1f}s  |  ground truth only{ego_now}"
-                     f"  |  blue: GT event (onset, shown 1 s; timeline: onset to end)")
+            title = f"{video_id}  {t / fps:5.1f}s  |  {who}  |  ground truth only"
         else:
-            title = (f"{video_id}  frame {t}  {t / fps:5.1f}s  |  {scorer_name} >= {threshold}  window {window_s:g}s"
-                     f"{ego_now}  |  green correct  red false  blue event caught  yellow missed  cyan group hit  grey unobservable")
-        _text(cv2, header, title, 4, 17, COLORS["text"], 0.45, bg=False)
-        writer.write(np.vstack([header, np.hstack([frame, side])]))
+            title = (f"{video_id}  {t / fps:5.1f}s  |  {who}  |  {scorer_name} >= {threshold}  |  green correct  "
+                     f"red false  blue caught  yellow missed  cyan group  grey unobservable")
+        _text(cv2, header, title, 6, 24, COLORS["text"], 0.62, bg=False, thick=1)
+        writer.write(np.vstack([header, body]))
     writer.release()
 
 
@@ -418,12 +493,12 @@ def _lines(name, video_id, result, classes, head_names, fps):
     return lines
 
 
-def _summary(name, video_id, threshold, result):
-    """review_summary.csv line of one video and scorer: the alarm outcomes and the events caught."""
+def _summary(name, video_id, threshold, result, agent=""):
+    """review_summary.csv line of one video, focus agent and scorer: the alarm outcomes and the events caught."""
     alarms = [a["status"] for a in result["alarms"]]
     events = result["events"]
     seen = sum(s in ("correct", "group", "false") for s in alarms)
-    return {"video": video_id, "scorer": name, "threshold": threshold, "alarms": len(alarms),
+    return {"video": video_id, "agent": agent, "scorer": name, "threshold": threshold, "alarms": len(alarms),
             "correct": alarms.count("correct"), "group": alarms.count("group"), "false": alarms.count("false"),
             "unobservable": alarms.count("unobservable"),
             "precision": round(alarms.count("correct") / seen, 3) if seen else "",
@@ -489,28 +564,37 @@ def main(model, mlp, baselines, calibration, test_data, step05_cfg, cfg, output_
             continue
         results = {name: analyse_video(model, test_data["videos"][video_id], test_data["num_atoms"], scorers[name],
                                        heads, rcfg, thresholds[name][0], k, tol) for name in scorers}
-        if any(r is None for r in results.values()) or not any(r["alarms"] for r in results.values()):
-            continue                                            # too short, or no scorer alarms in it
-        out_dir = output_dir / video_id
-        os.makedirs(out_dir, exist_ok=True)
+        if any(r is None for r in results.values()):
+            continue                                            # too short
         any_result = next(iter(results.values()))
-        vb, classes, _has_box = step05._agent_boxes(boxes_all, video_id, atoms[video_id], any_result["X"][..., :L])
+        X_labels = any_result["X"][..., :L]
         ego = step05.video_agent_ids(atoms[video_id]).get(None)          # the camera car: no box
+        focus = focus_agents(X_labels, ego, REVIEW["focus_others"])
+        if not any(a["n"] in focus for r in results.values() for a in r["alarms"]):
+            continue                                            # no scorer alarms on a focus agent
+        vb, classes, _has_box = step05._agent_boxes(boxes_all, video_id, atoms[video_id], X_labels)
         classes = list(classes)
         if ego is not None:
             classes[ego] = "EGO"
-        # The ground truth alone (gt.mp4): the boxes, the ego's labels and the GT events, no alarm.
-        reader = FrameReader(video_id, frame_dir, video_dir)
-        render_video(gt_only(any_result), video_id, vb, classes, label_names, head_names, out_dir / "gt.mp4", reader,
-                     "ground truth", None, window / fps, fps, REVIEW, ego)
-        reader.close()
-        for name, result in results.items():
-            reader = FrameReader(video_id, frame_dir, video_dir)        # read in order: one per video
-            render_video(result, video_id, vb, classes, label_names, head_names, out_dir / f"{name}.mp4", reader,
-                         SCORER_NAMES.get(name, name), thresholds[name][0], window / fps, fps, REVIEW, ego)
+        for n in focus:
+            tag = "ego" if n == ego else f"agent{n}_{classes[n] or 'unknown'}"
+            out_dir = output_dir / video_id / tag
+            os.makedirs(out_dir, exist_ok=True)
+            hs = agent_heads(X_labels, n, label_names, head_names)
+            # The ground truth alone (gt.mp4): the agent's GT labels and events, no alarm.
+            reader = FrameReader(video_id, frame_dir, video_dir)
+            render_video(of_agent(gt_only(any_result), n), video_id, vb, classes, label_names, head_names,
+                         out_dir / "gt.mp4", reader, "ground truth", None, window / fps, fps, REVIEW, ego, n, hs)
             reader.close()
-            lines += _lines(name, video_id, result, classes, head_names, fps)
-            summary.append(_summary(name, video_id, thresholds[name][0], result))
+            for name, result in results.items():
+                agent_result = of_agent(result, n)
+                reader = FrameReader(video_id, frame_dir, video_dir)    # read in order: one per video
+                render_video(agent_result, video_id, vb, classes, label_names, head_names, out_dir / f"{name}.mp4",
+                             reader, SCORER_NAMES.get(name, name), thresholds[name][0], window / fps, fps, REVIEW,
+                             ego, n, hs)
+                reader.close()
+                lines += _lines(name, video_id, agent_result, classes, head_names, fps)
+                summary.append(_summary(name, video_id, thresholds[name][0], agent_result, tag))
         chosen += 1
     for path, rows in ((done, lines), (output_dir / "review_summary.csv", summary)):
         with open(path, "w", newline="") as f:
@@ -525,36 +609,39 @@ def main(model, mlp, baselines, calibration, test_data, step05_cfg, cfg, output_
         seen = t["correct"] + t["false"]
         print(f"[Review]\t {name}: {t['alarms']} alarms ({t['correct']} correct, {t['false']} false"
               + (f", precision {t['correct'] / seen:.3f}" if seen else "") + f"), {t['detected']}/{t['events']} events caught")
-    print(f"[Review]\t {chosen} videos x {len(thresholds)} scorers in {output_dir}; {len(lines)} lines in {done}")
+    print(f"[Review]\t {chosen} videos x (ego + {REVIEW['focus_others']} agents) x {len(thresholds)} scorers in "
+          f"{output_dir}; {len(lines)} lines in {done}")
 
 
 def _readme(cfg, fps, thresholds):
     scorers = "\n".join(f"  {name}.mp4: {SCORER_NAMES.get(name, name)}, alarm threshold {th}"
                         + (f" (episode recall {recall:.2f})" if recall is not None else "")
                         for name, (th, recall) in thresholds.items())
-    return f"""Review videos (step06_review.py), frame rate {fps}: one folder per test video, one MP4 per scorer,
-each scorer at the threshold where its episode recall over the whole test split is closest to
-{REVIEW['target_recall']} (so the three catch about as many events and their alarms can be compared):
+    return f"""Review videos (step06_review.py), frame rate {fps}: one folder per test video, in it one folder per
+reviewed agent: ego/ (the camera car) and agent<n>_<class>/ for the {REVIEW['focus_others']} other agents seen in the
+most frames. Each agent folder holds one MP4 per scorer, each scorer at the threshold where its episode
+recall over the whole test split is closest to {REVIEW['target_recall']} (so the scorers catch about as many
+events and their alarms can be compared):
 {scorers}
-  gt.mp4: the ground truth only (no model): every agent's box, the ego's labels in the header, each GT
-          event in blue for 1 s from its onset and over its whole duration in the timeline.
-review_summary.csv: per video and scorer, the alarms (correct / group / false / unobservable, precision)
-and the GT events (caught / missed).
+  gt.mp4: the ground truth only (no model): the agent's GT labels and events.
+review_summary.csv: per video, agent and scorer, the alarms (correct / group / false / unobservable,
+precision) and the GT events (caught / missed).
 
 Window: "the event starts within {cfg['headline_window'] / fps:g} s". Alarm: the frames where the score of an agent
 and head is >= the threshold, merged into one alarm (gaps of 1 frame bridged, >= 0.5 s long).
-Box colours: green = correct alarm (the event follows on this agent within the alarm + {REVIEW['tolerance_s']} s),
+Left: the camera frame; the reviewed agent in a thick box (white, or the colour of its current alarm /
+event), the others thin grey; for the ego (no box) a border around the frame while it has an alarm or event.
+Colours: green = correct alarm (the event follows on this agent within the alarm + {REVIEW['tolerance_s']} s),
 cyan = the event follows on an adjacent agent of the same class only, red = false alarm, grey = the
 agent left too soon to tell. EVENT (blue) = a GT event that an alarm caught, MISSED (yellow) = one
-that none did, MISSED (group hit) (cyan) = one caught only by an adjacent same-class agent's alarm.
-Thin grey boxes: every agent with its id #n. The ego (the camera car, #n "EGO" in the lists) has no box:
-its current labels are in the header, and an alarm or event of it draws a border around the whole frame. Right column, top: what is on now (alarm / event,
-the agent's class and current GT labels); below: the timeline,
-one row per agent and head with an alarm or event over the whole video: the thick bar is the alarm
-(start to end), the thin bar below it the GT event (onset to end, a tick at the onset); the white
-line is now.
+that none did, MISSED (group) (cyan) = one caught only by an adjacent same-class agent's alarm.
+Right, only about the reviewed agent: who it is and its current GT labels; its alarms and GT events now;
+its scores now for the heads of its class, the {REVIEW['pred_lines']} highest, as bars (orange: at or above the
+threshold, the white tick); its timeline over the whole video, one row per head with an alarm or event:
+the thick bar is the alarm (start to end), the thin bar below it the GT event (onset to end, a tick at
+the onset); the white line is now.
 
-review.csv: one line per alarm and per GT event, per scorer. Fill in "verdict" and "comment". Suggested verdicts:
+review.csv: one line per alarm and per GT event of the reviewed agents, per scorer. Fill in "verdict" and "comment". Suggested verdicts:
   alarm:  reasonable (the situation makes the event likely; it just did not happen) /
           wrong_agent (the event happened to another agent) / early_or_late (right event, timing off) /
           label_error (the event did happen, the GT misses it) / no_reason (nothing suggests it);
