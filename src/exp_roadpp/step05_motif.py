@@ -118,6 +118,7 @@ def model_file_of(step05_cfg):
                    "train_box_file": step05_cfg.get("train_box_file"),
                    "val_box_file": step05_cfg.get("val_box_file"),
                    "grid": step05_cfg.get("grid", True), "motion": step05_cfg.get("motion", True),
+                   "ego_motion": step05_cfg.get("ego_motion", False),
                    "require_self": step05_cfg.get("require_self", True)})
     return cfg["model_file"], cfg
 

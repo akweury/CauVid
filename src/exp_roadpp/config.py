@@ -354,6 +354,7 @@ def get_step_05_input(args):
         "grid": str(getattr(args, "grid", "True")) == "True",
         "require_self": str(getattr(args, "require_self", "True")) == "True",
         "motion": str(getattr(args, "motion", "True")) == "True",
+        "ego_motion": str(getattr(args, "ego_motion", "False")) == "True",
     }
     return input_data
 

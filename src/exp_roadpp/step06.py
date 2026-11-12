@@ -2250,6 +2250,7 @@ def main(input_data):
     cfg["geometry"] = step05_cfg["geometry"]          # the geometry atoms follow the label atoms (`step05.load_vocabulary`)
     cfg["grid"], cfg["grid_file"] = step05_cfg["grid"], step05_cfg["grid_file"]   # the grid atoms follow them
     cfg["motion"], cfg["motion_file"] = step05_cfg["motion"], step05_cfg["motion_file"]   # then the motion atoms
+    cfg["ego_motion"] = step05_cfg.get("ego_motion", False)                                 # then the ego motion atoms
     assert cfg["headline_window"] in step05_cfg["windows"]
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
@@ -2263,7 +2264,8 @@ def main(input_data):
         test_data = step05.prepare_videos(cfg["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
                                           step05_cfg["roles"], step05_cfg["geometry"], unique_atoms,
-                                          step05.load_grid(step05_cfg), step05.load_motion(step05_cfg))
+                                          step05.load_grid(step05_cfg), step05.load_motion(step05_cfg),
+                                          step05.load_ego_motion(step05_cfg))
         test_data["grid_tag"] = step05.grid_tag(step05_cfg)
         torch.save(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)

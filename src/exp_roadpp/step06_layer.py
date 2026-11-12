@@ -364,7 +364,8 @@ def main(input_data):
         test_data = step05.prepare_videos(input_data["test_atoms_file"], len(unique_atoms), cfg["device"],
                                           step05_cfg["min_off_frames"], input_data.get("test_box_file"),
                                           step05_cfg["roles"], step05_cfg["geometry"], unique_atoms,
-                                          step05.load_grid(step05_cfg), step05.load_motion(step05_cfg))
+                                          step05.load_grid(step05_cfg), step05.load_motion(step05_cfg),
+                                          step05.load_ego_motion(step05_cfg))
         test_data["grid_tag"] = step05.grid_tag(step05_cfg)
         torch.save(test_data, cfg["test_data_file"])
     model = step05_layer.load_layered_rule_net(test_data, cfg)

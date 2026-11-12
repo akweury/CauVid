@@ -45,6 +45,8 @@ def get_parser():
                         help="Step 05: grid atoms of the 2D boxes (grid.py), default True; False for the no-grid baseline")
     parser.add_argument("--motion", type=str, default="True",
                         help="Step 05: motion atoms of the own 2D box (motion.py), default True; False for the ablation")
+    parser.add_argument("--ego_motion", type=str, default="False",
+                        help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
     parser.add_argument("--require_self", type=str, default="True",
                         help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
     parser.add_argument("--run_id", type=str, default=None,
