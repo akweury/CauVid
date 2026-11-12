@@ -2377,10 +2377,12 @@ def main(input_data):
     step06_ceiling.main(model, mlp, test_data, step05_cfg, cfg, input_data["output_dir"] / "ceiling.json",
                         calibration)
 
-    # 8. Review videos: a sample of the test videos with the alarms and events drawn in, and review.csv
-    # for a human review (`step06_review`); skipped without a camera frame source or opencv.
+    # 8. Review videos: a sample of the test videos with the alarms and events drawn in, one per scorer
+    # (rule net, MLP, calibrated lookup) at a matched episode recall, and review.csv for a human review
+    # (`step06_review`); skipped without a camera frame source or opencv.
     from src.exp_roadpp import step06_review
     step06_review.main(model, mlp, baselines, calibration, test_data, step05_cfg,
                        {**cfg, "test_box_file": input_data.get("test_box_file")}, input_data["output_dir"] / "review",
-                       input_data.get("frame_dir"), input_data.get("video_dir"))
+                       input_data.get("frame_dir"), input_data.get("video_dir"),
+                       input_data["output_dir"] / "episode_alarms.json")
     print("\n--------- Step 06 Done ---------------\n")
