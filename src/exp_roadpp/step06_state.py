@@ -8,7 +8,15 @@ Since most labels keep their state, the overall state recall / precision look hi
 persistence; the onset and offset cells measure the forecast.
 
 Scorers: "state_mlp"; "markov" (the train rate of on in t + h given the state now, per head: knows
-only the state now); "persist" (the state now copied forward: never predicts a change).
+only the state now); "persist" (the state now copied forward: never predicts a change); and, if
+trained, the step 05 onset models "rule_net" (TemporalRuleNet) and "onset_mlp" (OnsetMLP): a label off
+now gets their P(onset within W = h frames), one on now the Markov rate (they model no offsets, so
+their offset metrics are Markov's). They were trained on the at-risk cells only (off for the
+min_off_frames before); here they also score the labels that went off just before now.
+"lookup": the state version of the step 06 own-label lookup: the train share of on in t + h per
+context = the agent's own label atoms now and those seen in its last memory slot (`fit_state_lookup`),
+smoothed towards the Markov rate with step06.LOOKUP_PRIOR_ROWS rows; unseen contexts get Markov.
+It covers onsets and offsets; a model beating it shows the memory and the other agents help.
 Operating points, tuned on the val videos (micro best F1 over the counted heads): an agent's label
 that is off now is predicted on if p >= onset threshold; one that is on now is predicted off if
 p <= offset threshold. The persistence never predicts a change. Reported per scorer and horizon
@@ -47,32 +55,141 @@ STATE = {
     "pred_lines": 6,
     "version": "state_review_v1",
 }
+SCORER_TITLES = {"state_mlp": "state MLP", "lookup": "own-label lookup", "rule_net": "rule net (onsets; offsets Markov)",
+                 "onset_mlp": "onset MLP (onsets; offsets Markov)"}
 STATE_COLORS = {"correct": (0, 210, 0), "false": (0, 0, 255), "missed": (0, 230, 255), "caught": (255, 150, 40),
                 "unknown": (150, 150, 150), "pred_on": (255, 0, 255)}
 
 
 # -------------- Scores --------------
-def _scores(model, rows, markov):
-    """{scorer: (B, K, L) probability of on in t - 1 + h} of one rows dict."""
-    now = rows["now"]
-    m = markov.to(now.device)                                                  # (K, 2, L)
-    return {"state_mlp": torch.sigmoid(model(rows["inputs"], now)),
-            "markov": torch.where(now[:, None, :] > 0.5, m[None, :, 1], m[None, :, 0]),
-            "persist": now[:, None, :].expand(-1, m.shape[0], -1)}
+def load_onset_scorers(data, step05_cfg, horizons):
+    """{name: (model, (K,) window index of each horizon)} of the step 05 onset models that were trained:
+    "rule_net" (the TemporalRuleNet) and "onset_mlp" (the OnsetMLP baseline). Used as state scorers:
+    P(on in now + h) of a label off now = their P(onset within W = h frames); of a label on now = the
+    Markov rate (they have no offset model). Skipped if some horizon is not one of their windows."""
+    out = {}
+    models = {}
+    if os.path.exists(step05_cfg["model_file"]):
+        models["rule_net"] = step05.load_temporal_rule_net(data, step05_cfg)
+    mlp = step05.load_onset_mlp(data, step05_cfg)
+    if mlp is not None:
+        models["onset_mlp"] = mlp
+    for name, m in models.items():
+        missing = [h for h in horizons if h not in m.windows]
+        if missing:
+            print(f"[State]\t {name} skipped: horizons {missing} are not among its windows {m.windows}")
+            continue
+        out[name] = (m.eval(), torch.tensor([m.windows.index(h) for h in horizons]))
+    return out
 
 
 @torch.no_grad()
-def video_rows(model, video, num_atoms, num_labels, min_context, chunk, device):
-    """All rows of one video (now = min_context - 1 .. T - 1), concatenated, or None."""
+def _lookup_context_keys(rows, weights):
+    """(B,) long key of each row's context: its own label atoms now and in the last memory slot
+    (the first L memory inputs: own scope, slot 0)."""
+    L = rows["now"].shape[1]
+    return step06._lookup_keys(torch.cat([rows["now"], rows["inputs"][:, :L]], dim=1), weights)
+
+
+@torch.no_grad()
+def fit_state_lookup(model, data, video_ids, ckpt, cfg):
+    """The lookup scorer fitted on the videos: {"keys" (C,) long sorted, "count" (C, K, L) known
+    rows, "on" (C, K, L) of them with the label on in t + h, "weights" (2L, 2)}."""
+    device, L, K = cfg["device"], ckpt["num_label_atoms"], len(ckpt["horizons"])
+    weights = step06._lookup_weights(2 * L, device)
+    index, capacity = {}, 1024
+    count = torch.zeros((capacity, K, L), dtype=torch.float64, device=device)
+    on = torch.zeros_like(count)
+    for video_id in tqdm(video_ids, desc="Fitting the state lookup (train)"):
+        rows, _X = video_rows(model, data["videos"][video_id], data["num_atoms"], L, cfg["min_context"],
+                              cfg["frames_per_video"], device)
+        if rows is None:
+            continue
+        keys, inverse = torch.unique(_lookup_context_keys(rows, weights), return_inverse=True)
+        for key in keys.tolist():
+            index.setdefault(key, len(index))
+        if len(index) > capacity:
+            grow = torch.zeros((max(len(index), 2 * capacity) - capacity, K, L), dtype=torch.float64, device=device)
+            count, on = torch.cat([count, grow]), torch.cat([on, grow])
+            capacity = len(count)
+        rows_of = torch.tensor([index[k] for k in keys.tolist()], device=device)[inverse]
+        known = rows["known"][:, :, None].expand(-1, -1, L)
+        count.index_add_(0, rows_of, known.double())
+        on.index_add_(0, rows_of, (known & rows["targets"]).double())
+    C = len(index)
+    keys = torch.tensor(list(index.keys()), dtype=torch.long)
+    order = keys.argsort()
+    pos = torch.tensor(list(index.values()), dtype=torch.long)[order]
+    print(f"[State]\t lookup: {C} contexts (own labels now + last slot) in the train rows")
+    return {"keys": keys[order], "count": count[:C].cpu()[pos], "on": on[:C].cpu()[pos], "weights": weights.cpu(),
+            "version": "state_lookup_v1"}
+
+
+def _lookup_probs(rows, lookup, prior):
+    """(B, K, L) smoothed train share of on in t + h of each row's context; prior (B, K, L) (Markov)
+    for contexts not seen in train."""
+    device = prior.device
+    keys = _lookup_context_keys(rows, lookup["weights"].to(device))
+    table = lookup["keys"].to(device)
+    if len(table) == 0:
+        return prior
+    i = torch.searchsorted(table, keys).clamp(max=len(table) - 1)
+    found = table[i] == keys
+    m = step06.LOOKUP_PRIOR_ROWS
+    n, pos = lookup["count"].to(device)[i].float(), lookup["on"].to(device)[i].float()
+    rate = (pos + m * prior) / (n + m)
+    return torch.where(found[:, None, None], rate, prior)
+
+
+def _same_inputs(a, b):
+    """True if models a and b read the same `layer_inputs` (atoms, slots, roles)."""
+    return (a.num_atoms, a.slot_size, a.num_slots, tuple(a.roles)) == (b.num_atoms, b.slot_size, b.num_slots,
+                                                                         tuple(b.roles))
+
+
+def _onset_probs(m, kidx, inputs, num_labels, batch=4096):
+    """(B, K, L) P(onset within the horizon windows) of the label atoms."""
+    kidx = kidx.to(inputs.device)
+    return torch.cat([m.window_probs(m(x)[0])[:, kidx, :num_labels] for x in inputs.split(batch)])
+
+
+def _scores(model, rows, markov, onset_scorers=(), lookup=None):
+    """{scorer: (B, K, L) probability of on in t - 1 + h} of one rows dict."""
+    now = rows["now"]
+    m = markov.to(now.device)                                                  # (K, 2, L)
+    on_now = now[:, None, :] > 0.5
+    out = {"state_mlp": torch.sigmoid(model(rows["inputs"], now)),
+           "markov": torch.where(on_now, m[None, :, 1], m[None, :, 0]),
+           "persist": now[:, None, :].expand(-1, m.shape[0], -1)}
+    if lookup is not None:
+        out["lookup"] = _lookup_probs(rows, lookup, out["markov"])
+    for name in onset_scorers:
+        out[name] = torch.where(on_now, m[None, :, 1], rows[f"onset_{name}"])
+    return out
+
+
+@torch.no_grad()
+def video_rows(model, video, num_atoms, num_labels, min_context, chunk, device, onset_scorers=None):
+    """All rows of one video (now = min_context - 1 .. T - 1), concatenated, or None; with onset_scorers
+    ({name: (model, kidx)}) also "onset_<name>" (B, K, L), their onset probabilities of the rows."""
     X = step05._video_from_cells(video, num_atoms, device)
     T = X.shape[0]
     roles = step05.video_roles(video, device)
+    visible = X.any(dim=2)
     parts = []
     for begin in range(min_context, T + 1, chunk):
         frames = torch.arange(begin, min(begin + chunk, T + 1), device=device)
         rows = step05_state.state_rows(model, X, frames, num_labels, roles)
-        if rows is not None:
-            parts.append(rows)
+        if rows is None:
+            continue
+        for name, (m, kidx) in (onset_scorers or {}).items():
+            if _same_inputs(m, model):
+                inputs = rows["inputs"]
+            else:                                   # the same rows (agents visible now), the model's own inputs
+                f = frames[frames >= 1]
+                inputs = m.layer_inputs(X, f, None, roles if m.roles else None, keep=visible[f - 1])
+            rows[f"onset_{name}"] = _onset_probs(m, kidx, inputs, num_labels)
+        parts.append(rows)
     return (step05.concat_rows(parts), X) if parts else (None, X)
 
 
@@ -89,21 +206,22 @@ def predict_on(p, now, th):
 
 
 @torch.no_grad()
-def evaluate_pass(model, data, video_ids, ckpt, cfg, counted, thresholds=None):
+def evaluate_pass(model, data, video_ids, ckpt, cfg, counted, thresholds=None, onset_scorers=None, lookup=None):
     """Score histograms {scorer: (K, 2 now, 2 target, L, NB)} over the videos and, with thresholds,
     the exact-match counts {scorer: (K, 4) rows, rows right, changed rows, changed rows right}."""
     device, K, L = cfg["device"], len(ckpt["horizons"]), ckpt["num_label_atoms"]
-    hist = {s: torch.zeros((K, 2, 2, L, NB), dtype=torch.float64, device=device) for s in SCORERS}
-    exact = {s: torch.zeros((K, 4), dtype=torch.float64) for s in SCORERS}
+    names = list(SCORERS) + (["lookup"] if lookup is not None else []) + list(onset_scorers or {})
+    hist = {s: torch.zeros((K, 2, 2, L, NB), dtype=torch.float64, device=device) for s in names}
+    exact = {s: torch.zeros((K, 4), dtype=torch.float64) for s in names}
     head_index = torch.arange(L, device=device)[None, :] * NB
     counted = counted.to(device)
     for video_id in tqdm(video_ids, desc=cfg.get("desc", "State forecast")):
         rows, _X = video_rows(model, data["videos"][video_id], data["num_atoms"], L, cfg["min_context"],
-                              cfg["frames_per_video"], device)
+                              cfg["frames_per_video"], device, onset_scorers)
         if rows is None:
             continue
         now = rows["now"] > 0.5
-        for s, p in _scores(model, rows, ckpt["markov"]).items():
+        for s, p in _scores(model, rows, ckpt["markov"], onset_scorers or {}, lookup).items():
             b = _bins(p)
             for k in range(K):
                 known = rows["known"][:, k]
@@ -249,13 +367,103 @@ def print_summary(metrics, horizons, fps):
                   f"{f(m['onset']['precision']):>6} | {m['offset']['count']:>7.0f} {f(m['offset']['ap']):>6} "
                   f"{f(m['offset']['recall']):>6} {f(m['offset']['precision']):>6} | {f(e['all_right']):>6} "
                   f"{f(e['changed_all_right']):>6}")
-        heads = metrics["state_mlp"][str(h)]["per_head"]
-        top = sorted(heads.items(), key=lambda kv: -(kv[1]["onset"]["count"] + kv[1]["offset"]["count"]))[:12]
-        print(f"  state_mlp per head (most changes first): onset AP / R / P, offset AP / R / P")
-        for name, m in top:
-            print(f"    {name:<24} {m['type']:<8} on n={m['onset']['count']:<6.0f} {f(m['onset']['ap'])} "
-                  f"{f(m['onset']['recall'])} {f(m['onset']['precision'])}   off n={m['offset']['count']:<6.0f} "
-                  f"{f(m['offset']['ap'])} {f(m['offset']['recall'])} {f(m['offset']['precision'])}")
+        for s in [s for s in metrics if s not in ("markov", "persist")]:
+            heads = metrics[s][str(h)]["per_head"]
+            top = sorted(heads.items(), key=lambda kv: -(kv[1]["onset"]["count"] + kv[1]["offset"]["count"]))[:12]
+            print(f"  {s} per head (most changes first): onset AP / R / P, offset AP / R / P")
+            for name, m in top:
+                print(f"    {name:<24} {m['type']:<8} on n={m['onset']['count']:<6.0f} {f(m['onset']['ap'])} "
+                      f"{f(m['onset']['recall'])} {f(m['onset']['precision'])}   off n={m['offset']['count']:<6.0f} "
+                      f"{f(m['offset']['ap'])} {f(m['offset']['recall'])} {f(m['offset']['precision'])}")
+
+
+# -------------- Comparison figure --------------
+# The compared models (fixed order and color, step06.HEAD_RANK_COLORS: validated, CVD dE >= 9.2) and
+# the Markov baseline as a grey reference tick over every group.
+COMPARE_SCORERS = ("state_mlp", "lookup", "rule_net")
+COMPARE_COLORS = {"state_mlp": "#eb6834", "lookup": "#1baf7a", "rule_net": "#2a78d6"}
+COMPARE_LABELS = {"state_mlp": "state MLP", "lookup": "own-label lookup", "rule_net": "rule net (offsets: Markov)"}
+
+
+def plot_comparison(metrics, horizon, fps, out_path):
+    """state_compare.pdf / .png: the compared models at the test operating points, horizon h.
+    Top row: onset (off -> on), offset (on -> off) and state: AP, recall, precision, F1; exact match
+    (all rows, rows with a change). Bottom row: onset and offset AP per event type. Markov: grey tick."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    scorers = [s for s in COMPARE_SCORERS if s in metrics]
+    if not scorers:
+        return
+    key = str(horizon)
+    ink, muted, grid = "#1f1f1f", "#6b6b6b", "#e6e6e6"
+    plt.rcParams.update({"font.size": 9, "axes.edgecolor": muted, "axes.labelcolor": ink, "xtick.color": muted,
+                         "ytick.color": muted, "axes.titlesize": 10})
+
+    def group(ax, names, values_of, title):
+        """Grouped bars: one group per name, one bar per scorer; values_of(scorer) -> [value or None]."""
+        n = len(scorers)
+        width = 0.8 / n
+        for i, s in enumerate(scorers):
+            vals = values_of(s)
+            for j, v in enumerate(vals):
+                x = j - 0.4 + (i + 0.5) * width
+                if v is None:
+                    ax.text(x, 0.01, "-", ha="center", va="bottom", fontsize=7, color=muted)
+                    continue
+                ax.bar(x, v, width * 0.9, color=COMPARE_COLORS[s], label=COMPARE_LABELS[s] if j == 0 else None,
+                       zorder=2)
+                ax.text(x, v + 0.012, f"{v:.2f}", ha="center", va="bottom", fontsize=6.5, color=ink, rotation=90)
+        ref = values_of("markov") if "markov" in metrics else []
+        for j, v in enumerate(ref):
+            if v is not None:
+                ax.plot([j - 0.42, j + 0.42], [v, v], color="#8a8a8a", lw=1.5, ls=(0, (3, 2)), zorder=3,
+                        label="Markov" if j == 0 else None)
+        ax.set_xticks(range(len(names)), names)
+        ax.set_ylim(0, 1.12)
+        ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+        ax.grid(axis="y", color=grid, lw=0.8, zorder=0)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.set_title(title, loc="left", color=ink)
+
+    def task(s, name):
+        m = metrics[s][key]["micro"][name]
+        return [m["ap"], m["recall"], m["precision"], m["f1"] if (m["recall"] is not None) else None]
+
+    micro = metrics[scorers[0]][key]["micro"]
+    fig, axes = plt.subplots(2, 4, figsize=(15, 7.5), gridspec_kw={"height_ratios": [1, 1]})
+    cols = ["AP", "Recall", "Precision", "F1"]
+    group(axes[0, 0], cols, lambda s: task(s, "onset"), f"Onset: off now, on in {horizon / fps:g} s "
+                                                        f"(n={micro['onset']['count']:.0f})")
+    group(axes[0, 1], cols, lambda s: task(s, "offset"), f"Offset: on now, off in {horizon / fps:g} s "
+                                                         f"(n={micro['offset']['count']:.0f})")
+    group(axes[0, 2], cols, lambda s: task(s, "state"), f"State in {horizon / fps:g} s (all cells)")
+    group(axes[0, 3], ["all rows", "rows with\na change"],
+          lambda s: [metrics[s][key]["exact"]["all_right"], metrics[s][key]["exact"]["changed_all_right"]],
+          "Exact match (agent, frame)")
+    types = [t for t in step06.COUNTED_TYPES if all(t in metrics[s][key]["by_type"] for s in scorers)]
+
+    def by_type(s, name, what):
+        return [metrics[s][key]["by_type"][t][name][what] for t in types]
+    if types:
+        for c, (name, what) in enumerate((("onset", "ap"), ("onset", "recall"), ("offset", "ap"), ("offset", "recall"))):
+            counts = ", ".join(f"{t} {metrics[scorers[0]][key]['by_type'][t][name]['count']:.0f}" for t in types)
+            group(axes[1, c], types, lambda s, n=name, w=what: by_type(s, n, w),
+                  f"{name.capitalize()} {'AP' if what == 'ap' else 'recall'} by event type\n(n: {counts})")
+    else:
+        for ax in axes[1]:
+            ax.axis("off")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False, bbox_to_anchor=(0.5, 1.0))
+    fig.suptitle(f"Label state {horizon / fps:g} s ahead, test videos (micro over the counted heads; "
+                 f"recall / precision / F1 at the val thresholds)", y=0.955, fontsize=11, color=ink)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    for suffix in (".pdf", ".png"):
+        fig.savefig(str(out_path) + suffix, dpi=150)
+    plt.close(fig)
+    print(f"[State]\t {out_path}.pdf / .png")
 
 
 # -------------- Review videos --------------
@@ -271,27 +479,30 @@ def _runs(values):
 
 
 @torch.no_grad()
-def dense_video(model, video, data, ckpt, cfg, k, thresholds):
-    """Per now-frame (T, N, L) tensors of one video for horizon index k: p (nan where no row),
-    pred (predicted on in now + h), known (T, N); X labels (T, N, L); or None.
-    thresholds: {"onset": (K,), "offset": (K,)} bins of all horizons (`tune_thresholds`)."""
+def dense_video(model, video, data, ckpt, cfg, k, thresholds, scorers, onset_scorers=None, lookup=None):
+    """{scorer: per now-frame (T, N, L) tensors of one video for horizon index k: p (nan where no row),
+    pred (predicted on in now + h), known (T, N); X labels (T, N, L)}, or None.
+    thresholds: {scorer: {"onset": (K,), "offset": (K,)}} bins of all horizons (`tune_thresholds`)."""
     L = ckpt["num_label_atoms"]
     rows, X = video_rows(model, video, data["num_atoms"], L, cfg["min_context"], cfg["frames_per_video"],
-                         cfg["device"])
+                         cfg["device"], onset_scorers)
     if rows is None:
         return None
     T, N = X.shape[:2]
-    p_rows = torch.sigmoid(model(rows["inputs"], rows["now"]))
-    pred_rows = predict_on(p_rows, rows["now"], thresholds)
+    scores = _scores(model, rows, ckpt["markov"], onset_scorers or {}, lookup)
     t, n = rows["rows"].T
-    now = t - 1
-    P = torch.full((T, N, L), float("nan"))
-    pred = torch.zeros((T, N, L), dtype=torch.bool)
+    now, n = (t - 1).cpu(), n.cpu()
     known = torch.zeros((T, N), dtype=torch.bool)
-    P[now.cpu(), n.cpu()] = p_rows[:, k].cpu()
-    pred[now.cpu(), n.cpu()] = pred_rows[:, k].cpu()
-    known[now.cpu(), n.cpu()] = rows["known"][:, k].cpu()
-    return {"P": P, "pred": pred, "known": known, "S": X[..., :L].cpu(), "X": X.cpu(), "T": T, "N": N}
+    known[now, n] = rows["known"][:, k].cpu()
+    out = {}
+    for s in scorers:
+        pred_rows = predict_on(scores[s], rows["now"], thresholds[s])
+        P = torch.full((T, N, L), float("nan"))
+        pred = torch.zeros((T, N, L), dtype=torch.bool)
+        P[now, n] = scores[s][:, k].cpu()
+        pred[now, n] = pred_rows[:, k].cpu()
+        out[s] = {"P": P, "pred": pred, "known": known, "S": X[..., :L].cpu(), "T": T, "N": N}
+    return out
 
 
 def transitions(d, t, n, h, heads):
@@ -320,7 +531,8 @@ def transitions(d, t, n, h, heads):
     return sorted(out, key=lambda x: rank[x[3]])
 
 
-def render_video(d, video_id, n0, boxes, classes, label_names, heads, th, h, fps, out_path, reader, ego):
+def render_video(d, video_id, n0, boxes, classes, label_names, heads, th, h, fps, out_path, reader, ego,
+                 scorer="state_mlp"):
     """One review MP4 of agent n0: the camera frame (left) and the side column (right): who it is and
     its GT labels now; the predicted changes in h frames (start / stop) and the missed ones; its
     predicted probabilities of the labels h frames ahead as bars (the cut of each: onset threshold for
@@ -483,7 +695,7 @@ def render_video(d, video_id, n0, boxes, classes, label_names, heads, th, h, fps
         body[:H_img, :W_img] = frame
         body[:side.shape[0], W_img:] = side
         header = np.full((header_h, W_out, 3), COLORS["panel"], dtype=np.uint8)
-        title = (f"{video_id}  {t / fps:5.1f}s  |  {who}  |  state MLP, labels {h / fps:g} s ahead  |  green correct  "
+        title = (f"{video_id}  {t / fps:5.1f}s  |  {who}  |  {SCORER_TITLES.get(scorer, scorer)}, labels {h / fps:g} s ahead  |  green correct  "
                  f"red false  yellow missed  blue GT predicted  * on now")
         _text(cv2, header, title, 6, 24, COLORS["text"], 0.62, bg=False, thick=1)
         writer.write(np.vstack([header, body]))
@@ -503,7 +715,9 @@ def _video_counts(d, n, h, heads):
 
 
 def review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted, output_dir, frame_dir, video_dir,
-                  test_atoms_file, test_box_file):
+                  test_atoms_file, test_box_file, onset_scorers=None, lookup=None):
+    """Review videos of the learned scorers (state_mlp and the onset models of onset_scorers), one
+    <scorer>.mp4 per reviewed agent; thresholds {scorer: {"onset": (K,), "offset": (K,)}}."""
     try:
         import cv2  # noqa: F401
     except ImportError:
@@ -516,7 +730,8 @@ def review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted,
     fps = cfg["frame_rate"]
     k = ckpt["horizons"].index(STATE["headline_horizon"]) if STATE["headline_horizon"] in ckpt["horizons"] else 0
     h = ckpt["horizons"][k]
-    th = {"onset": thresholds["onset"][k], "offset": thresholds["offset"][k]}
+    scorers = ["state_mlp"] + (["lookup"] if lookup is not None else []) + list(onset_scorers or {})
+    th = {s: {"onset": thresholds[s]["onset"][k], "offset": thresholds[s]["offset"][k]} for s in scorers}
     heads_all = torch.nonzero(counted).flatten().tolist()
     head_names = [label_names[l] for l in heads_all]
     atoms = utils_data.load_json(test_atoms_file)
@@ -529,10 +744,11 @@ def review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted,
             break
         if not FrameReader(video_id, frame_dir, video_dir).available:
             continue
-        d = dense_video(model, test_data["videos"][video_id], test_data, ckpt, cfg, k, thresholds)
-        if d is None:
+        dense = dense_video(model, test_data["videos"][video_id], test_data, ckpt, cfg, k, thresholds, scorers,
+                            onset_scorers, lookup)
+        if dense is None:
             continue
-        X_labels = d["S"]
+        X_labels = dense["state_mlp"]["S"]
         ego = step05.video_agent_ids(atoms[video_id]).get(None)
         focus = focus_agents(X_labels, ego, STATE["focus_others"])
         if not any((X_labels[1:, n][:, heads_all] != X_labels[:-1, n][:, heads_all]).any() for n in focus):
@@ -546,28 +762,38 @@ def review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted,
             out_dir = output_dir / video_id / tag
             os.makedirs(out_dir, exist_ok=True)
             heads = [heads_all[i] for i in agent_heads(X_labels, n, label_names, head_names)]
-            reader = FrameReader(video_id, frame_dir, video_dir)
-            render_video(d, video_id, n, vb, classes, label_names, heads, th, h, fps, out_dir / "state_mlp.mp4",
-                         reader, ego)
-            reader.close()
-            summary.append({"video": video_id, "agent": tag, **_video_counts(d, n, h, heads)})
+            for s in scorers:
+                reader = FrameReader(video_id, frame_dir, video_dir)
+                render_video(dense[s], video_id, n, vb, classes, label_names, heads, th[s], h, fps,
+                             out_dir / f"{s}.mp4", reader, ego, scorer=s)
+                reader.close()
+                summary.append({"video": video_id, "agent": tag, "scorer": s,
+                                **_video_counts(dense[s], n, h, heads)})
         chosen += 1
     with open(output_dir / "state_review.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(summary[0]) if summary else ["video"])
         writer.writeheader()
         writer.writerows(summary)
-    (output_dir / "README.txt").write_text(_readme(h, fps, th))
+    (output_dir / "README.txt").write_text(_readme(h, fps, th, scorers))
     print(f"[State review]\t {chosen} videos x (ego + {STATE['focus_others']} agents) in {output_dir}")
 
 
-def _readme(h, fps, th):
-    on = th["onset"] / NB if th["onset"] < NB else None
-    off = (th["offset"] + 1) / NB if th["offset"] >= 0 else None
+def _readme(h, fps, th, scorers):
+    def cut(t):
+        on = f"{int(t['onset']) / NB:.3f}" if t["onset"] < NB else "never"
+        off = f"{(int(t['offset']) + 1) / NB:.3f}" if t["offset"] >= 0 else "never"
+        return f"on if p >= {on} (label off now), off if p <= {off} (label on now)"
+    cuts = "\n".join(f"  {s}.mp4: {cut(th[s])}" for s in scorers)
     return f"""State review videos (step06_state.py), frame rate {fps}: one folder per test video, in it one folder per
-reviewed agent (ego/ and the {STATE['focus_others']} other agents seen longest), each with state_mlp.mp4.
-In every frame ("now") the StateMLP predicts which GT labels the agent holds {h / fps:g} s later.
-A label off now is predicted on if p >= {on}; a label on now is predicted off if p <= {off}
-(thresholds of the best micro F1 on the val videos).
+reviewed agent (ego/ and the {STATE['focus_others']} other agents seen longest), each with one video per model:
+{', '.join(s + '.mp4' for s in scorers)}.
+In every frame ("now") the model predicts which GT labels the agent holds {h / fps:g} s later.
+state_mlp: the StateMLP (step05_state). lookup: the train share of on {h / fps:g} s later per context
+(the agent's own labels now and in the last 1 s), Markov for unseen contexts. rule_net / onset_mlp: the step 05 onset models; a label off now
+is on in {h / fps:g} s with their P(onset within {h} frames); a label on now gets the Markov rate of the
+train videos (they have no offset model, so their STOPs are the Markov baseline's).
+Thresholds (best micro F1 on the val videos):
+{cuts}
 Right column: the agent and its GT labels now; the predicted changes ({h / fps:g} s ahead):
   START / STOP (green: it happens, red: it does not, grey: the agent is gone by then),
   MISSED START / MISSED STOP (yellow: the GT changes, the model keeps the state);
@@ -595,6 +821,7 @@ def main(input_data):
     if model is None:
         print(f"[State]\t skipped: no StateMLP {scfg['model_file']} (step05_state)")
         return
+    onset_scorers = load_onset_scorers(test_data, step05_cfg, ckpt["horizons"])
     cfg = {"device": input_data["device"], "frame_rate": input_data["frame_rate"],
            "min_context": step05_cfg["slot_size"] * step05_cfg["num_slots"],
            "frames_per_video": step05_cfg["frames_per_video"]}
@@ -604,26 +831,37 @@ def main(input_data):
     vocab = step05.load_vocabulary({**step05_cfg, "unique_atoms_file": input_data["unique_atoms_file"]})
     label_names = [step05._atom_name(s) for s in vocab[:L]]
 
-    # 1. Thresholds on the val videos.
+    # 1. The lookup (train videos, cached) and the thresholds on the val videos.
     training_data = step05.load_training_data(step05_cfg)
+    lookup_file = out / "state_lookup.pt"
+    lookup = torch.load(lookup_file, map_location="cpu") if step05.is_fresh(
+        lookup_file, step05_cfg["training_data_file"]) else None
+    if lookup is None or lookup.get("version") != "state_lookup_v1" or lookup["count"].shape[1:] != (
+            len(horizons), L):
+        lookup = fit_state_lookup(model, training_data, training_data["train_videos"], ckpt, cfg)
+        torch.save(lookup, lookup_file)
+    print(f"[State]\t scorers: {', '.join(list(SCORERS) + ['lookup'] + list(onset_scorers))}")
     val_hist, _ = evaluate_pass(model, training_data, training_data["val_videos"], ckpt,
-                                {**cfg, "desc": "State forecast (val)"}, counted)
+                                {**cfg, "desc": "State forecast (val)"}, counted, onset_scorers=onset_scorers,
+                                lookup=lookup)
     del training_data
-    thresholds = {s: tune_thresholds(val_hist[s], counted, s) for s in SCORERS}
+    thresholds = {s: tune_thresholds(val_hist[s], counted, s) for s in val_hist}
     for s, th in thresholds.items():
         print(f"[State] {s}: onset bins {th['onset'].tolist()}, offset bins {th['offset'].tolist()} (of {NB})")
 
     # 2. Test.
     hist, exact = evaluate_pass(model, test_data, sorted(test_data["videos"]), ckpt,
-                                {**cfg, "desc": "State forecast (test)"}, counted, thresholds)
+                                {**cfg, "desc": "State forecast (test)"}, counted, thresholds, onset_scorers, lookup)
     metrics = metrics_of(hist, exact, thresholds, counted, head_types, label_names, horizons)
     utils_data.save_json({"horizons": horizons, "frame_rate": cfg["frame_rate"], "min_context": cfg["min_context"],
                           "model_file": str(scfg["model_file"]), "scorers": metrics}, out / "state_metrics.json")
     print(f"[State]\t {out / 'state_metrics.json'}")
     print_summary(metrics, horizons, cfg["frame_rate"])
+    for h in horizons:
+        plot_comparison(metrics, h, cfg["frame_rate"], out / ("state_compare" + (f"_h{h}" if len(horizons) > 1 else "")))
 
-    # 3. Review videos of the StateMLP.
-    review_videos(model, test_data, ckpt, cfg, thresholds["state_mlp"], label_names, counted, out / "state_review",
+    # 3. Review videos of the StateMLP, the lookup and the onset models.
+    review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted, out / "state_review",
                   input_data.get("frame_dir"), input_data.get("video_dir"), input_data["test_atoms_file"],
-                  input_data["test_box_file"])
+                  input_data["test_box_file"], onset_scorers, lookup)
     print("\n--------- Step 06 (state) Done ---------------\n")
