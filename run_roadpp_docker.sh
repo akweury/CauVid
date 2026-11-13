@@ -12,6 +12,9 @@
 #   hyperparameter sweep, needs the step 04 outputs) instead of main.py.
 #   Add --timing_diag to run step05_timing_diag.py (which signals precede an
 #   onset by ~2 s rather than ~10 s; needs the step_dataset outputs only).
+#   Add --ablation to run the whole experiment (src/exp_roadpp/ablation.py): the
+#   main model and every ablation variant, one run each, then the paper tables;
+#   resumable with --suite <id>, a subset with --variants a,b, --list to list them.
 #
 # The image is rebuilt automatically whenever requirements.txt or the
 # Dockerfile changes (tracked via a content-hash label on the image).
@@ -23,6 +26,8 @@
 #   ./run_roadpp_docker.sh --gpu none -- --device cpu --machine jst
 #   ./run_roadpp_docker.sh --gpu 4 -- --exp medium --tune_05
 #   ./run_roadpp_docker.sh --gpu 0 -- --exp full --num_epochs 50
+#   ./run_roadpp_docker.sh --gpu 6 --exp medium --ablation
+#   ./run_roadpp_docker.sh --gpu 6 --exp full --ablation --suite 20261114-0900
 #
 # Environment variables (set before running, or export in your shell profile):
 #   CAUVID_ROADPP_DATA_HOST   Host path to the ROAD-Waymo dataset on dgx
@@ -82,6 +87,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.step05_tune"
     elif [[ "$arg" == "--timing_diag" ]]; then
         ENTRY_MODULE="src.exp_roadpp.step05_timing_diag"
+    elif [[ "$arg" == "--ablation" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.ablation"
     else
         PY_ARGS+=("$arg")
     fi

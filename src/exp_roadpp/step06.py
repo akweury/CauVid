@@ -2192,7 +2192,7 @@ def main(input_data):
         "frames_per_video": step05_cfg["frames_per_video"],
         # Only fully buffered predictions are evaluated: frames with the model's whole
         # lag range before them, so no rule misses its body for lack of history.
-        "min_context": step05_cfg["slot_size"] * step05_cfg["num_slots"],
+        "min_context": max(step05_cfg["slot_size"] * step05_cfg["num_slots"], input_data.get("eval_min_context", 0)),
         # Event detection: an event is detected if the score of its agent and head reaches
         # detected_th in any frame of the at-risk stretch before the onset (one frame is
         # enough); prediction time = frames from the earliest such frame to the onset;

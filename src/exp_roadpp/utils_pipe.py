@@ -49,6 +49,21 @@ def get_parser():
                         help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
     parser.add_argument("--require_self", type=str, default="True",
                         help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
+    # Ablation settings (`ablation.py` runs the whole suite); the defaults are the main model.
+    parser.add_argument("--anchor_source", type=str, default="causal", choices=["causal", "all", "random", "none"],
+                        help="Step 05: anchor clauses seeding the rules: causal (step 04 filter, default), all (every "
+                             "LLM anchor, no causal filter), random (random LLM anchors, as many as causal), none")
+    parser.add_argument("--anchor_subset_seed", type=int, default=0, help="Seed of --anchor_source random")
+    parser.add_argument("--num_free_rules", type=int, default=None,
+                        help="Step 05: unseeded rules (default 128; with --anchor_source none 128 + the causal seeds)")
+    parser.add_argument("--truncate_prob", type=float, default=0.5,
+                        help="Step 05: share of training frames with a truncated history (partial facts), default 0.5")
+    parser.add_argument("--num_slots", type=int, default=3, help="Step 05: memory slots of 10 frames, default 3")
+    parser.add_argument("--roles", type=str, default="", help="Step 05: agent roles, e.g. ahead,near_ped (default none)")
+    parser.add_argument("--geometry", type=str, default="False", help="Step 05: geometry atoms, default False")
+    parser.add_argument("--type_balance", type=str, default="False", help="Step 05: event type balance, default False")
+    parser.add_argument("--eval_min_context", type=int, default=0,
+                        help="Step 06/07: score from this frame on at least (0: the model's memory)")
     parser.add_argument("--run_id", type=str, default=None,
                         help="Resume this run (folder output/<exp>/runs/<run_id>) instead of starting a new one, "
                              "e.g. to redo step 06 of a trained model; default: a new run folder")
@@ -62,6 +77,10 @@ def get_parser():
     parser.add_argument("--state_forecast", type=str, default="True",
                         help="Train the StateMLP (step05_state: the GT label state of every agent 2 s ahead, every frame) "
                              "and evaluate it with review videos (step06_state), default True")
+
+    parser.add_argument("--paper", type=str, default="True",
+                        help="Step 07 (step07_paper): every onset model at fixed false-alarm budgets, thresholds on val, "
+                             "and the test events each detects (paper_metrics.json, paper_events.csv), default True")
 
     parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
 

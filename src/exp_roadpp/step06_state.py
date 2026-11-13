@@ -823,7 +823,8 @@ def main(input_data):
         return
     onset_scorers = load_onset_scorers(test_data, step05_cfg, ckpt["horizons"])
     cfg = {"device": input_data["device"], "frame_rate": input_data["frame_rate"],
-           "min_context": step05_cfg["slot_size"] * step05_cfg["num_slots"],
+           "min_context": max(step05_cfg["slot_size"] * step05_cfg["num_slots"],
+                              input_data.get("eval_min_context", 0)),
            "frames_per_video": step05_cfg["frames_per_video"]}
     L, horizons = ckpt["num_label_atoms"], ckpt["horizons"]
     head_types = ckpt["head_types"]

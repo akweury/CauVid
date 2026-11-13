@@ -3,7 +3,7 @@ import numpy as np
 
 from src.exp_roadpp import utils_pipe
 from src.exp_roadpp import step01, step02, step03, step04, step05, step05_causal, step05_rules, step05_motif, step05_layer, step06, step06_layer, step_dataset, step_baselines
-from src.exp_roadpp import step05_state, step06_state
+from src.exp_roadpp import step05_state, step06_state, step07_paper
 from src.exp_roadpp import config
 
 
@@ -55,8 +55,11 @@ def main():
         step06_layer.main(step06_input)
     if args.state_forecast == "True":
         step06_state.main(step06_input)
+    # paper numbers: every onset model at fixed false-alarm budgets (thresholds on val), the test events per model
+    if args.paper == "True":
+        step07_paper.main(step06_input)
 
-    raise NotImplementedError()
+    return  # the baselines below are not part of the pipeline run
     # run baseline methods
     step_baselines_input = config.get_step_baselines_input(args)
     step_baselines.main(step_baselines_input)

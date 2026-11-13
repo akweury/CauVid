@@ -355,6 +355,15 @@ def get_step_05_input(args):
         "require_self": str(getattr(args, "require_self", "True")) == "True",
         "motion": str(getattr(args, "motion", "True")) == "True",
         "ego_motion": str(getattr(args, "ego_motion", "False")) == "True",
+        # Ablation settings (`ablation.py`); the defaults are the main model.
+        "anchor_source": getattr(args, "anchor_source", "causal"),
+        "anchor_subset_seed": int(getattr(args, "anchor_subset_seed", 0)),
+        "truncate_prob": float(getattr(args, "truncate_prob", 0.5)),
+        "num_slots": int(getattr(args, "num_slots", 3)),
+        "num_free_rules": getattr(args, "num_free_rules", None),
+        "roles": tuple(r for r in str(getattr(args, "roles", "") or "").split(",") if r),
+        "geometry": str(getattr(args, "geometry", "False")) == "True",
+        "type_balance": str(getattr(args, "type_balance", "False")) == "True",
     }
     return input_data
 
@@ -373,6 +382,9 @@ def get_step_06_input(args):
         "video_dir": args.dataset_path / "videos",
         # Step 06 loads the step 05 model and clauses with the step 05 settings.
         "step05_input": get_step_05_input(args),
+        # Score from this frame on at least (0: the model's memory), so variants with other memories
+        # are evaluated on the same frames and events (`ablation.py`).
+        "eval_min_context": int(getattr(args, "eval_min_context", 0) or 0),
     }
     return input_data
 

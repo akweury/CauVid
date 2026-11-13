@@ -1412,11 +1412,35 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
               f"{_temporal_clause_text(clause, unique_atoms)}")
 
 
+def anchor_file_of(input_data, source, seed=0):
+    """The anchor clause file of an anchor source ({clause_id: {"anchor": {"head", "body"}}}, the step 04
+    format): "causal" the step 04 file itself; the others are written once into the run's step05_output:
+    "all" every step 03 LLM anchor, "random" as many of them as the causal file holds, drawn with seed,
+    "none" no anchor."""
+    causal = input_data["causal_anchor_clause_file"]
+    if source == "causal":
+        return causal
+    out = input_data["output_dir"] / (f"anchors_{source}" + (f"{seed}" if source == "random" else "") + ".json")
+    if not os.path.exists(out):
+        import random
+        llm = utils_data.load_json(input_data["anchor_clause_file"])            # step 03: [{"head", "body"}]
+        if source == "none":
+            chosen = []
+        elif source == "all":
+            chosen = llm
+        else:
+            k = len(utils_data.load_json(causal))
+            chosen = random.Random(seed).sample(llm, min(k, len(llm)))
+        utils_data.save_json({str(i): {"anchor": c} for i, c in enumerate(chosen)}, out)
+        print(f"[Anchors]\t {source}: {len(chosen)} of {len(llm)} LLM anchor clauses -> {out}")
+    return out
+
+
 def get_cfg(input_data):
     """Settings and files of step 05; step 06 uses them to load the trained model."""
     # Memory: 3 slots of 10 frames (3 s). Medium 6b02b3 / full 78e420 scored with only the last h s of
     # their 5 s memory known: AP at 1 s >= 90% of the full memory, best at 2-3 s, no gain beyond 3 s.
-    slot_size, num_slots = 10, 3
+    slot_size, num_slots = 10, input_data.get("num_slots", 3)       # --num_slots (default 3)
     windows = [slot_size * (f + 1) for f in range(10)]
     mask_type, num_free_rules = "sigmoid", 128
     # Files are named by the settings that change the model, so a model trained
@@ -1429,13 +1453,14 @@ def get_cfg(input_data):
     # Off: no clear gain (type balance inflates the scores of the regular / rare heads into
     # false alarms; roles left the val loss unchanged; geometry made it worse). A module is kept
     # only with a clear effect in a clean ablation; set these to re-run one.
-    type_balance = {"type_balance": False, "type_balance_power": 0.5, "type_balance_max": 4.0}
+    type_balance = {"type_balance": input_data.get("type_balance", False), "type_balance_power": 0.5,
+                    "type_balance_max": 4.0}                                     # --type_balance
     # Agent roles (`roles.py`): one more input scope per role, the atoms of the agent filling
     # it for the row's agent (e.g. the agent ahead of it), from the GT boxes; () for none.
-    roles = ()                                  # was ("ahead", "near_ped")
+    roles = tuple(input_data.get("roles", ()))  # --roles ahead,near_ped (default none)
     # Geometry atoms (`geometry.py`): facts of the GT boxes that hold without depth (bearing
     # sector, at the image edge, bearing drift), inputs only, after the label atoms; () for none.
-    geometry = ()                               # was agent_geometry.GEOMETRY
+    geometry = agent_geometry.GEOMETRY if input_data.get("geometry") else ()   # --geometry (default False)
     # Grid atoms (`grid.py`): the cells of the agent's own two box corners in the 2D image
     # (position atoms; the compound atoms of the other agents are removed, no rule used them).
     grid = input_data.get("grid", True)         # --grid (default True)
@@ -1451,7 +1476,27 @@ def get_cfg(input_data):
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
     require_self = input_data.get("require_self", True)       # --require_self (default True)
+    # Anchor clauses that seed the rules (`anchor_file`, the causal step ablation): "causal" (the step 04
+    # causal filter of the LLM anchors, the main model), "all" (every LLM anchor, no causal filter),
+    # "random" (a random subset of the LLM anchors as large as the causal one, anchor_subset_seed),
+    # "none" (no anchors: free rules only, as many more as the causal anchors seed, the same capacity).
+    anchor_source = input_data.get("anchor_source", "causal")
+    anchor_seed = input_data.get("anchor_subset_seed", 0)
+    if anchor_source not in ("causal", "all", "random", "none"):
+        raise ValueError(f"Unknown anchor_source {anchor_source}")
+    anchor_file = anchor_file_of(input_data, anchor_source, anchor_seed)
+    if input_data.get("num_free_rules") is not None:
+        num_free_rules = int(input_data["num_free_rules"])
+    elif anchor_source == "none":
+        causal_bodies = len(group_clauses_by_body(utils_data.load_json(input_data["causal_anchor_clause_file"])))
+        num_free_rules += causal_bodies * num_slots
+    # Partial facts: the share of training frames with a truncated history (--truncate_prob, default 0.5).
+    truncate_prob = float(input_data.get("truncate_prob", 0.5))
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
+    if truncate_prob != 0.5:
+        base_tag += f"{truncate_prob:g}"
+    if anchor_source != "causal":
+        base_tag += f"_a{anchor_source}" + (str(anchor_seed) if anchor_source == "random" else "")
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
     if roles:
@@ -1505,7 +1550,7 @@ def get_cfg(input_data):
             # Partial facts: a share truncate_prob of the training frames know only a
             # random 0..memory frames of history (the older memory is unknown), so the
             # model learns calibrated, lower confidence from partial facts.
-            'truncate_prob': 0.5,
+            'truncate_prob': truncate_prob,
             # Rules: one per (anchor body, lag bin) with the anchor as a fixed input
             # and seed_head_weight to its heads, plus num_free_rules unseeded ones,
             # so heads without an anchor (about a quarter of the onsets) can be recalled.
@@ -1579,7 +1624,10 @@ def get_cfg(input_data):
             'grid_file': input_data["output_dir"] / f"grid_spec{grid_tag({'grid': grid})}.json",
             'train_box_file': input_data.get('train_box_file'),
             'val_box_file': input_data.get('val_box_file'),
-            'causal_anchor_clause_file': input_data['causal_anchor_clause_file'],
+            # The anchor clauses the rules are seeded from (`anchor_file_of`; the causal ones by default).
+            'causal_anchor_clause_file': anchor_file,
+            'anchor_source': anchor_source,
+            'anchor_subset_seed': anchor_seed,
             "unique_atoms_file": input_data["unique_atoms_file"],
             'training_data_file': input_data["output_dir"] / "training_data.pt",
             'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",

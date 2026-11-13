@@ -119,7 +119,10 @@ def model_file_of(step05_cfg):
                    "val_box_file": step05_cfg.get("val_box_file"),
                    "grid": step05_cfg.get("grid", True), "motion": step05_cfg.get("motion", True),
                    "ego_motion": step05_cfg.get("ego_motion", False),
-                   "require_self": step05_cfg.get("require_self", True)})
+                   "require_self": step05_cfg.get("require_self", True),
+                   "num_slots": step05_cfg.get("num_slots", 3), "roles": step05_cfg.get("roles", ()),
+                   "geometry": bool(step05_cfg.get("geometry")), "type_balance": step05_cfg.get("type_balance", False),
+                   "truncate_prob": step05_cfg.get("truncate_prob", 0.5)})
     return cfg["model_file"], cfg
 
 
