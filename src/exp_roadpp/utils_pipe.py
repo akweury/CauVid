@@ -59,6 +59,9 @@ def get_parser():
     parser.add_argument("--baselines", type=str, default="False", help="Whether to run baselines, default is False")
     parser.add_argument("--num_epochs", type=int, default=200, help="Training epochs of the step 05 TemporalRuleNet, default is 1000")
     parser.add_argument("--layered_rules", type=str, default="True", help="Whether to also train the layered rule net (step05_layer) after step 05, default is True")
+    parser.add_argument("--state_forecast", type=str, default="True",
+                        help="Train the StateMLP (step05_state: the GT label state of every agent 2 s ahead, every frame) "
+                             "and evaluate it with review videos (step06_state), default True")
 
     parser.add_argument("--skip_baselines_03", type=str, default="True", help="Whether to skip baselines, default is True")
 

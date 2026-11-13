@@ -3,6 +3,7 @@ import numpy as np
 
 from src.exp_roadpp import utils_pipe
 from src.exp_roadpp import step01, step02, step03, step04, step05, step05_causal, step05_rules, step05_motif, step05_layer, step06, step06_layer, step_dataset, step_baselines
+from src.exp_roadpp import step05_state, step06_state
 from src.exp_roadpp import config
 
 
@@ -43,12 +44,17 @@ def main():
     # layered rule net: predicts the full atom state of each layer of frames from the K before it
     if args.layered_rules == "True":
         step05_layer.main(step05_input)
+    # state forecast: the GT label state of every agent 2 s ahead, every frame (StateMLP)
+    if args.state_forecast == "True":
+        step05_state.main(step05_input)
 
     # estimation and evaluation of the extended clauses over the val videos
     step06_input = config.get_step_06_input(args)
     step06.main(step06_input)
     if args.layered_rules == "True":
         step06_layer.main(step06_input)
+    if args.state_forecast == "True":
+        step06_state.main(step06_input)
 
     raise NotImplementedError()
     # run baseline methods
