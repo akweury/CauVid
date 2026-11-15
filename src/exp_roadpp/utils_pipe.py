@@ -43,8 +43,9 @@ def get_parser():
     parser.add_argument("--machine", type=str, default="ml-pulsar", help="Machine name, default is ml-pulsar")
     parser.add_argument("--grid", type=str, default="True",
                         help="Step 05: grid atoms of the 2D boxes (grid.py), default True; False for the no-grid baseline")
-    parser.add_argument("--motion", type=str, default="True",
-                        help="Step 05: motion atoms of the own 2D box (motion.py), default True; False for the ablation")
+    parser.add_argument("--motion", type=str, default="False",
+                        help="Step 05: motion atoms of the own 2D box (motion.py), default False (off since 2026-11-15: "
+                             "no effect on medium or full); True for the ablation or to resume a run trained with them")
     parser.add_argument("--ego_motion", type=str, default="False",
                         help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
     parser.add_argument("--require_self", type=str, default="True",
@@ -62,6 +63,9 @@ def get_parser():
     parser.add_argument("--roles", type=str, default="", help="Step 05: agent roles, e.g. ahead,near_ped (default none)")
     parser.add_argument("--geometry", type=str, default="False", help="Step 05: geometry atoms, default False")
     parser.add_argument("--type_balance", type=str, default="False", help="Step 05: event type balance, default False")
+    parser.add_argument("--review_videos", type=str, default="False",
+                        help="Step 06: render the review videos (review/, state_review/; ~1.4 GB each on full, slow), "
+                             "default False; True to render them (e.g. later for one run: --run_id <run> --review_videos True)")
     parser.add_argument("--eval_min_context", type=int, default=0,
                         help="Step 06/07: score from this frame on at least (0: the model's memory)")
     parser.add_argument("--run_id", type=str, default=None,
@@ -74,9 +78,10 @@ def get_parser():
     parser.add_argument("--baselines", type=str, default="False", help="Whether to run baselines, default is False")
     parser.add_argument("--num_epochs", type=int, default=200, help="Training epochs of the step 05 TemporalRuleNet, default is 1000")
     parser.add_argument("--layered_rules", type=str, default="True", help="Whether to also train the layered rule net (step05_layer) after step 05, default is True")
-    parser.add_argument("--state_forecast", type=str, default="True",
+    parser.add_argument("--state_forecast", type=str, default="False",
                         help="Train the StateMLP (step05_state: the GT label state of every agent 2 s ahead, every frame) "
-                             "and evaluate it with review videos (step06_state), default True")
+                             "and evaluate it (step06_state), default False (off since 2026-11-15: no clear gain over "
+                             "the own-label lookup on medium)")
 
     parser.add_argument("--paper", type=str, default="True",
                         help="Step 07 (step07_paper): every onset model at fixed false-alarm budgets, thresholds on val, "

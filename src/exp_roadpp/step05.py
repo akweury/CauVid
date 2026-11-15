@@ -539,6 +539,23 @@ def prepare_training_data(cfg):
     return {**data, "train_videos": train_videos, "val_videos": val_videos}
 
 
+def save_data(data, path):
+    """torch.save to a temporary file, then renamed: a run reading the shared file never sees half of it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    torch.save(data, tmp)
+    os.replace(tmp, path)
+
+
+def shared_data_file(local_file, cfg, kind):
+    """The prepared dataset file of a run: its own local_file if it has one (runs made before the shared
+    cache), else <exp>/data_cache/<kind>_data_<data_key>.pt, shared by every run with the same data
+    settings (min_off_frames, roles, geometry, grid / motion / ego motion atoms)."""
+    if os.path.exists(local_file) or not cfg.get("data_cache_dir"):
+        return local_file
+    return cfg["data_cache_dir"] / f"{kind}_data_{cfg['data_key']}.pt"
+
+
 def load_training_data(cfg):
     """training_data.pt, (re)built by `prepare_training_data` if it is missing,
     has another min_off_frames, other agent roles or geometry or was split another way. Adds the event
@@ -550,7 +567,7 @@ def load_training_data(cfg):
             or data.get("roles", []) != list(cfg["roles"]) or data.get("geometry", []) != list(cfg["geometry"])
             or data.get("grid_tag", "") != grid_tag(cfg)):
         data = prepare_training_data(cfg)
-        torch.save(data, cfg["training_data_file"])
+        save_data(data, cfg["training_data_file"])
     data["event_types"] = head_event_types(data, load_vocabulary(cfg), cfg)
     types = data["event_types"]["types"]
     noise, inputs = types == EVENT_TYPES.index("noise"), types == EVENT_TYPES.index("input")
@@ -1465,9 +1482,10 @@ def get_cfg(input_data):
     # (position atoms; the compound atoms of the other agents are removed, no rule used them).
     grid = input_data.get("grid", True)         # --grid (default True)
     # Motion atoms (`motion.py`): how the agent's own box grows, shrinks and moves (approach, recede,
-    # closing in faster / slower, left / right, still), own scope only; the lookup of the own current
-    # labels matched the models without them (full 78e420).
-    motion = input_data.get("motion", True)     # --motion (default True)
+    # closing in faster / slower, left / right, still), own scope only. Off since 2026-11-15: no effect
+    # (medium suite 20261113-1635: every metric unchanged without them; full 78e420: the own-label lookup
+    # matched the models without them). --motion True for the ablation or to resume a run that used them.
+    motion = input_data.get("motion", False)    # --motion (default False)
     # Ego motion atoms (`ego_motion.py`): the ego's speed level read from the scene, the size and
     # closing speed of its lead agent and of its nearest agent; the timing diagnostic
     # (`step05_timing_diag`) found the AV-Stop timing there, none in the ego's labels. Off until an
@@ -1506,6 +1524,10 @@ def get_cfg(input_data):
     if geometry:
         base_tag += "_g" + "-".join(geometry)
     base_tag += grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion})
+    # The prepared datasets depend only on these settings (`shared_data_file`).
+    min_off_frames = 10
+    data_key = (f"m{min_off_frames}" + ("_r" + "-".join(roles) if roles else "") + ("_g" + "-".join(geometry) if geometry else "")
+                + grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion}))
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "")
@@ -1518,7 +1540,9 @@ def get_cfg(input_data):
             'seed': 0,
             # An atom switches on only after being off for this many frames for the
             # agent; shorter gaps are label flicker (re-onsets), not new events.
-            'min_off_frames': 10,
+            'min_off_frames': min_off_frames,
+            'data_key': data_key,
+            'data_cache_dir': input_data.get("data_cache_dir"),
             # Event types by head frequency (onsets in the train + val videos, `head_event_types`):
             # fewer than noise_below onsets are noise, more than trivial_above trivial, the rest
             # regular. With exclude_noise_heads the noise heads are no training targets.
@@ -1629,7 +1653,9 @@ def get_cfg(input_data):
             'anchor_source': anchor_source,
             'anchor_subset_seed': anchor_seed,
             "unique_atoms_file": input_data["unique_atoms_file"],
-            'training_data_file': input_data["output_dir"] / "training_data.pt",
+            'training_data_file': shared_data_file(input_data["output_dir"] / "training_data.pt",
+                                                   {"data_cache_dir": input_data.get("data_cache_dir"),
+                                                    "data_key": data_key}, "training"),
             'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",
             "extended_clause_file": input_data["output_dir"] / f"extended_clauses_{tag}.json",
             'history_file': input_data["output_dir"] / f"training_history_{tag}.json",

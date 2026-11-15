@@ -339,7 +339,7 @@ def main(input_data):
     cfg.update({
         "device": input_data["device"],
         "frame_rate": input_data["frame_rate"],
-        "test_data_file": input_data["output_dir"] / "test_data.pt",
+        "test_data_file": step05.shared_data_file(input_data["output_dir"] / "test_data.pt", cfg["step05_cfg"], "test"),
         "prior_file": input_data["output_dir"] / f"layered_priors_{suffix}.pt",
         "metrics_file": input_data["output_dir"] / f"layered_test_metrics_{suffix}.json",
         "test_clause_file": input_data["output_dir"] / f"layered_test_clauses_{suffix}.json",
@@ -367,7 +367,7 @@ def main(input_data):
                                           step05.load_grid(step05_cfg), step05.load_motion(step05_cfg),
                                           step05.load_ego_motion(step05_cfg))
         test_data["grid_tag"] = step05.grid_tag(step05_cfg)
-        torch.save(test_data, cfg["test_data_file"])
+        step05.save_data(test_data, cfg["test_data_file"])
     model = step05_layer.load_layered_rule_net(test_data, cfg)
 
     # 2. Rollout metrics per horizon; thresholds and priors from the step 05 training data.

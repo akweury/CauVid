@@ -2238,7 +2238,7 @@ def main(input_data):
         "prob_threshold": 0.5,
         "frame_rate": input_data["frame_rate"],
         "baseline_file": input_data["output_dir"] / "baselines.pt",
-        "test_data_file": input_data["output_dir"] / "test_data.pt",
+        "test_data_file": step05.shared_data_file(input_data["output_dir"] / "test_data.pt", step05_cfg, "test"),
         "metrics_file": input_data["output_dir"] / "test_metrics.json",
         # The per-head Platt calibration fitted on val (`fit_calibration`), for the episode alarms.
         "calibration_file": input_data["output_dir"] / "calibration.pt",
@@ -2267,7 +2267,7 @@ def main(input_data):
                                           step05.load_grid(step05_cfg), step05.load_motion(step05_cfg),
                                           step05.load_ego_motion(step05_cfg))
         test_data["grid_tag"] = step05.grid_tag(step05_cfg)
-        torch.save(test_data, cfg["test_data_file"])
+        step05.save_data(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)
     mlp = step05.load_onset_mlp(test_data, step05_cfg)      # None if the baseline was not trained
     # The step 05 cascade (stage-1 thresholds and the verifier), None if it was not trained.
@@ -2383,6 +2383,10 @@ def main(input_data):
     # (rule net, MLP, calibrated lookup) at a matched episode recall, and review.csv for a human review
     # (`step06_review`); skipped without a camera frame source or opencv.
     from src.exp_roadpp import step06_review
+    if not input_data.get("review_videos", False):
+        print("[Review]\t skipped (--review_videos False, the default; True renders them)")
+        print("\n--------- Step 06 Done ---------------\n")
+        return
     step06_review.main(model, mlp, baselines, calibration, test_data, step05_cfg,
                        {**cfg, "test_box_file": input_data.get("test_box_file")}, input_data["output_dir"] / "review",
                        input_data.get("frame_dir"), input_data.get("video_dir"),

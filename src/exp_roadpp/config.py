@@ -353,8 +353,11 @@ def get_step_05_input(args):
         # and the motion atoms.
         "grid": str(getattr(args, "grid", "True")) == "True",
         "require_self": str(getattr(args, "require_self", "True")) == "True",
-        "motion": str(getattr(args, "motion", "True")) == "True",
+        "motion": str(getattr(args, "motion", "False")) == "True",
         "ego_motion": str(getattr(args, "ego_motion", "False")) == "True",
+        # Prepared datasets (training_data / test_data), shared by the runs of this exp with the same
+        # data settings instead of one copy per run (`step05.shared_data_file`).
+        "data_cache_dir": args.output_dir / "data_cache",
         # Ablation settings (`ablation.py`); the defaults are the main model.
         "anchor_source": getattr(args, "anchor_source", "causal"),
         "anchor_subset_seed": int(getattr(args, "anchor_subset_seed", 0)),
@@ -385,6 +388,7 @@ def get_step_06_input(args):
         # Score from this frame on at least (0: the model's memory), so variants with other memories
         # are evaluated on the same frames and events (`ablation.py`).
         "eval_min_context": int(getattr(args, "eval_min_context", 0) or 0),
+        "review_videos": str(getattr(args, "review_videos", "False")) == "True",
     }
     return input_data
 

@@ -275,7 +275,8 @@ def main(input_data):
     out_dir = input_data["output_dir"]
     step05_cfg = step05.get_cfg(input_data["step05_input"])
     step05_cfg["device"] = input_data["device"]
-    test_file, baseline_file, cal_file = out_dir / "test_data.pt", out_dir / "baselines.pt", out_dir / "calibration.pt"
+    test_file = step05.shared_data_file(out_dir / "test_data.pt", step05_cfg, "test")
+    baseline_file, cal_file = out_dir / "baselines.pt", out_dir / "calibration.pt"
     metrics_file, events_file = out_dir / "paper_metrics.json", out_dir / "paper_events.csv"
     if not (os.path.exists(test_file) and os.path.exists(baseline_file) and os.path.exists(step05_cfg["model_file"])):
         print("[Paper]\t skipped: run step 06 first (test_data.pt, baselines.pt)")

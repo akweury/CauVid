@@ -179,6 +179,219 @@ def per_head_counts(m, events, budget, variant, top=20):
     return header, rows
 
 
+# Driving scenarios of the focus table: label regex over "<class>:<action>" (every agent class).
+FOCUS_GROUPS = [
+    ("Braking", r":Brake$"),
+    ("Stopping (other agents)", r"^(?!av:).+:Stop$"),
+    ("Ego stops", r"^av:AV-Stop$"),
+    ("Ego starts", r"^av:AV-Mov$"),
+    ("Lane change / indicator", r":(MovLft|MovRht|IncatLft|IncatRht|Ovtak)$"),
+    ("Turns (other agents)", r"^(?!av:).+:(TurLft|TurRht)$"),
+    ("Ego turns", r"^av:AV-(TurLft|TurRht|MovLft|MovRht)$"),
+    ("Pedestrian crossing", r"^Ped:(Xing|XingFmLft|XingFmRht|Wait2X)$"),
+]
+
+
+def _group_heads(m, scorer, pattern):
+    import re
+    per_head = m["scorers"][scorer]["ap"]["per_head"]
+    return {h: v for h, v in per_head.items() if re.search(pattern, h)}
+
+
+def focus_table(m, events, budget, variant):
+    """Per scenario: test events, then per model the AP (mean over the scenario's heads weighted by
+    their onset rows) and the events detected at the budget."""
+    names = [(label, scorer_name(m, base, variant)) for base, label in ROWS if base != "prior"
+             and scorer_name(m, base, variant) in m["scorers"]]
+    header = ["Scenario", "Heads", "Events"] + [f"AP {l}" for l, _n in names] + [f"Det. {l}" for l, _n in names]
+    rows = []
+    for g, pattern in FOCUS_GROUPS:
+        import re
+        ev = [e for e in events if re.search(pattern, e["label"])]
+        aps = []
+        for _l, nm in names:
+            heads = {h: v for h, v in _group_heads(m, nm, pattern).items() if v["ap"] is not None and v["onset_rows"] > 0}
+            w = sum(v["onset_rows"] for v in heads.values())
+            aps.append(fmt(sum(v["ap"] * v["onset_rows"] for v in heads.values()) / w) if w else "–")
+        n_heads = len({e["label"] for e in ev})
+        det = [str(sum(e.get(f"{nm}@{budget}") not in (None, "", "None") for e in ev)) for _l, nm in names]
+        rows.append([g, str(n_heads), str(len(ev))] + aps + det)
+    return header, rows
+
+
+def focus_head_table(m, events, budget, variant, min_events=5):
+    """The heads of the focus scenarios with >= min_events test events: AP and detections per model."""
+    import re
+    names = [(label, scorer_name(m, base, variant)) for base, label in ROWS if base != "prior"
+             and scorer_name(m, base, variant) in m["scorers"]]
+    base = m["scorers"][names[-1][1]]["ap"]["per_head"]
+    header = ["Scenario", "Head", "Events"] + [f"AP {l}" for l, _n in names] + [f"Det. {l}" for l, _n in names]
+    rows = []
+    for g, pattern in FOCUS_GROUPS:
+        for h in sorted(base):
+            if not re.search(pattern, h):
+                continue
+            ev = [e for e in events if e["label"] == h]
+            if len(ev) < min_events:
+                continue
+            rows.append([g, h, str(len(ev))] + [fmt(m["scorers"][nm]["ap"]["per_head"].get(h, {}).get("ap")) for _l, nm in names]
+                        + [str(sum(e.get(f"{nm}@{budget}") not in (None, "", "None") for e in ev)) for _l, nm in names])
+    return header, rows
+
+
+def focus_ablation_table(main_runs, ablations, budget, variant):
+    """The rule net's AP per focus scenario in every variant (Δ to the main run in brackets)."""
+    def group_ap(m, pattern):
+        nm = scorer_name(m, "model", variant)
+        heads = {h: v for h, v in _group_heads(m, nm, pattern).items() if v["ap"] is not None and v["onset_rows"] > 0}
+        w = sum(v["onset_rows"] for v in heads.values())
+        return sum(v["ap"] * v["onset_rows"] for v in heads.values()) / w if w else None
+
+    def mean_ap(runs, pattern):
+        return _mean_std([group_ap(m, pattern) for m, _e in runs])[0]
+    header = ["Variant"] + [g for g, _p in FOCUS_GROUPS]
+    ref = [mean_ap(main_runs, p) for _g, p in FOCUS_GROUPS]
+    rows = [["Full model"] + [fmt(r) for r in ref]]
+    for label, runs in ablations:
+        vals = [mean_ap(runs, p) for _g, p in FOCUS_GROUPS]
+        rows.append([label] + [fmt(v) + (f" ({v - r:+.3f})" if v is not None and r is not None else "")
+                               for v, r in zip(vals, ref)])
+    return header, rows
+
+
+# Head classes (`predictability_table`): a head is "near chance" if the best model's AP is below
+# CHANCE_LIFT x its base rate (the prior's AP: a constant score's AP is the base rate); else a model
+# "wins" if its AP is >= WIN_RATIO x the next best and >= WIN_ABS above it; else the models are tied.
+# Also unpredictable if the best AP is below MIN_AP: for a very rare head a large lift over its tiny
+# base rate (e.g. 0.007 vs 0.0003) is still useless.
+CHANCE_LIFT, MIN_AP, WIN_RATIO, WIN_ABS, MIN_EVENTS, FEW_EVENTS = 5.0, 0.03, 1.25, 0.02, 5, 20
+COMPARED = [("lookup", "lookup"), ("mlp", "MLP"), ("model", "rule net")]
+
+
+def classify_heads(m, events, budget, variant):
+    """[{head, scenario, events, base, ap {model}, det {model}, best, lift, cls}] of the heads with
+    >= MIN_EVENTS test events."""
+    import re
+    names = [(short, scorer_name(m, base, variant)) for base, short in COMPARED if scorer_name(m, base, variant) in m["scorers"]]
+    if "prior" not in m["scorers"]:
+        return []                                  # no base rate: no classes
+    prior = m["scorers"]["prior"]["ap"]["per_head"]
+    by_head = {}
+    for e in events:
+        by_head.setdefault(e["label"], []).append(e)
+    out = []
+    for h, ev in by_head.items():
+        if len(ev) < MIN_EVENTS or prior.get(h, {}).get("ap") is None:
+            continue
+        base = prior[h]["ap"]
+        ap = {short: m["scorers"][nm]["ap"]["per_head"].get(h, {}).get("ap") or 0.0 for short, nm in names}
+        det = {short: sum(e.get(f"{nm}@{budget}") not in (None, "", "None") for e in ev) for short, nm in names}
+        order = sorted(ap, key=lambda k: -ap[k])
+        best, second = ap[order[0]], ap[order[1]] if len(order) > 1 else 0.0
+        lift = best / base if base else None
+        if lift is None or lift < CHANCE_LIFT or best < MIN_AP:
+            cls = "unpredictable"
+        elif best >= WIN_RATIO * second and best - second >= WIN_ABS:
+            cls = f"{order[0]} best"
+        else:
+            tied = [k for k in order if ap[k] * WIN_RATIO >= best or best - ap[k] < WIN_ABS]
+            cls = ("tie incl. lookup" if "lookup" in tied else "tie MLP / rule net") + " (" + ", ".join(tied) + ")"
+        scenario = next((g for g, pattern in FOCUS_GROUPS if re.search(pattern, h)), "other")
+        out.append({"head": h, "scenario": scenario, "events": len(ev), "base": base, "ap": ap, "det": det,
+                    "best": best, "lift": lift, "cls": cls})
+    return sorted(out, key=lambda r: (r["cls"], -r["events"]))
+
+
+def predictability_table(m, events, budget, variant):
+    """Summary: per class the heads, their test events and the events each model detects at the budget."""
+    rows_h = classify_heads(m, events, budget, variant)
+    models = [short for _b, short in COMPARED]
+    header = ["Class", "Heads", "Events"] + [f"Det. {k}" for k in models] + ["Heads (test events)"]
+    groups = {}
+    for r in rows_h:
+        key = r["cls"].split(" (")[0]
+        groups.setdefault(key, []).append(r)
+    order = ["rule net best", "MLP best", "lookup best", "tie MLP / rule net", "tie incl. lookup", "unpredictable"]
+    keys = sorted(groups, key=lambda k: order.index(k) if k in order else len(order))
+    rows = []
+    for k in keys:
+        g = groups[k]
+        rows.append([k, str(len(g)), str(sum(r["events"] for r in g))]
+                    + [str(sum(r["det"].get(x, 0) for r in g)) for x in models]
+                    + [", ".join(f"{r['head']} ({r['events']}{'*' if r['events'] < FEW_EVENTS else ''})" for r in g)])
+    return header, rows
+
+
+def predictability_head_table(m, events, budget, variant):
+    rows_h = classify_heads(m, events, budget, variant)
+    models = [short for _b, short in COMPARED]
+    header = ["Head", "Scenario", "Events", "Base rate"] + [f"AP {k}" for k in models] + ["Best / base"] + [
+        f"Det. {k}" for k in models] + ["Class"]
+    rows = [[r["head"], r["scenario"], str(r["events"]) + ("*" if r["events"] < FEW_EVENTS else ""), f"{r['base']:.4f}"]
+            + [fmt(r["ap"].get(k)) for k in models] + [f"{r['lift']:.0f}x" if r["lift"] else "–"]
+            + [str(r["det"].get(k, 0)) for k in models] + [r["cls"]] for r in rows_h]
+    return header, rows
+
+
+def _head_ap(m, head):
+    """The rule net's AP of one head (raw scores: the per-head calibration is monotone, the same AP)."""
+    v = m["scorers"]["model"]["ap"]["per_head"].get(head, {}).get("ap")
+    return v
+
+
+def variant_head_tables(main_runs, ablations, budget, variant):
+    """The ablation per head instead of averaged: the learnable heads (Table 5: not unpredictable, >=
+    MIN_EVENTS test events in the main run), the rule net's AP in every variant. A head counts as better
+    / worse in a variant if its AP changes by more than its noise (the spread of the AP over the runs of
+    the multi-run variants, e.g. the random filter draws), WIN_ABS and WIN_RATIO. Returns the summary
+    (per variant: heads better / same / worse and which) and the per-head matrix."""
+    m0, ev0 = main_runs[0]
+    heads = [r for r in classify_heads(m0, ev0, budget, variant) if r["cls"] != "unpredictable"]
+    heads.sort(key=lambda r: (r["scenario"], -r["events"]))
+    ref = {r["head"]: _mean_std([_head_ap(m, r["head"]) for m, _e in main_runs])[0] for r in heads}
+    noise = {}
+    for _label, runs in ablations:
+        if len(runs) > 1:
+            for r in heads:
+                v = [x for x in (_head_ap(m, r["head"]) for m, _e in runs) if x is not None]
+                if len(v) > 1:
+                    noise[r["head"]] = max(noise.get(r["head"], 0.0), max(v) - min(v))
+    singles = [(label, runs) for label, runs in ablations]
+
+    def verdict(h, v):
+        r0 = ref[h]
+        if v is None or r0 is None:
+            return 0
+        margin = max(noise.get(h, 0.0), WIN_ABS)
+        if v - r0 > margin and v >= WIN_RATIO * r0:
+            return 1
+        if r0 - v > margin and r0 >= WIN_RATIO * v:
+            return -1
+        return 0
+    sum_header = ["Variant", "Better", "Same", "Worse", "Heads better (Δ AP)", "Heads worse (Δ AP)"]
+    sum_rows = []
+    for label, runs in singles:
+        vals = {r["head"]: _mean_std([_head_ap(m, r["head"]) for m, _e in runs])[0] for r in heads}
+        verd = {h: verdict(h, v) for h, v in vals.items()}
+        better = [h for h, x in verd.items() if x > 0]
+        worse = [h for h, x in verd.items() if x < 0]
+        sum_rows.append([label, str(len(better)), str(len(heads) - len(better) - len(worse)), str(len(worse)),
+                         ", ".join(f"{h} ({vals[h] - ref[h]:+.3f})" for h in better) or "–",
+                         ", ".join(f"{h} ({vals[h] - ref[h]:+.3f})" for h in worse) or "–"])
+    mat_header = ["Scenario", "Head", "Events", "Main", "Noise"] + [label for label, _r in singles]
+    mat_rows = []
+    for r in heads:
+        h = r["head"]
+        row = [r["scenario"], h, str(r["events"]) + ("*" if r["events"] < FEW_EVENTS else ""), fmt(ref[h]),
+               fmt(noise.get(h)) if h in noise else "–"]
+        for _label, runs in singles:
+            v = _mean_std([_head_ap(m, h) for m, _e in runs])[0]
+            x = verdict(h, v)
+            row.append(fmt(v) + (" ▲" if x > 0 else " ▼" if x < 0 else ""))
+        mat_rows.append(row)
+    return (sum_header, sum_rows), (mat_header, mat_rows)
+
+
 def markdown(title, header, rows):
     out = [f"### {title}", "", "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     out += ["| " + " | ".join(r) + " |" for r in rows]
@@ -222,6 +435,27 @@ def main(argv=None):
                        *ablation_table(main_runs, ablations, budget, args.variant)))
     tables.append((f"Table 3: test events detected per model ({sub}; run {args.main.split(',')[0]})",
                    *count_table(m0, main_runs[0][1], budget, args.variant)))
+    tables.append((f"Table 4: driving scenarios, AP (onset-weighted over the scenario's heads) and events detected ({sub})",
+                   *focus_table(m0, main_runs[0][1], budget, args.variant)))
+    tables.append((f"Table 4b: the scenario heads with >= 5 test events ({sub})",
+                   *focus_head_table(m0, main_runs[0][1], budget, args.variant)))
+    note = (f"unpredictable: best AP < {MIN_AP:g} or < {CHANCE_LIFT:g}x base rate; a model is best with AP >= {WIN_RATIO:g}x and "
+            f">= {WIN_ABS:g} above the next; heads with >= {MIN_EVENTS} test events, * fewer than {FEW_EVENTS}")
+    tables.append((f"Table 5: heads by predictability and the best model ({sub}; {note})",
+                   *predictability_table(m0, main_runs[0][1], budget, args.variant)))
+    tables.append((f"Table 5b: every head of Table 5 ({sub})",
+                   *predictability_head_table(m0, main_runs[0][1], budget, args.variant)))
+    if ablations:
+        tables.append((f"Table 4c: rule net AP per scenario in every variant ({sub})",
+                       *focus_ablation_table(main_runs, ablations, budget, args.variant)))
+    if ablations:
+        (h6, r6), (h6b, r6b) = variant_head_tables(main_runs, ablations, budget, args.variant)
+        rule = (f"rule net AP per learnable head (Table 5: not unpredictable, >= {MIN_EVENTS} test events); better / "
+                f"worse: |Δ| > max(noise, {WIN_ABS:g}) and >= {WIN_RATIO:g}x; noise: AP spread over the runs of the "
+                f"multi-run variants (random filter draws)")
+        tables.append((f"Table 6: ablation per head ({sub}; {rule})", h6, r6))
+        tables.append((f"Table 6b: rule net AP per head and variant (▲ better, ▼ worse; * < {FEW_EVENTS} test events)",
+                       h6b, r6b))
     tables.append((f"Table 3b: events per head, top 20 ({sub})", *per_head_counts(m0, main_runs[0][1], budget,
                                                                                   args.variant)))
     out = Path(args.out) if args.out else ROOT / args.exp / "paper_tables"

@@ -812,7 +812,7 @@ def main(input_data):
     step05_cfg["device"] = input_data["device"]
     scfg = step05_state.get_cfg(step05_cfg)
     out = input_data["output_dir"]
-    test_file = out / "test_data.pt"
+    test_file = step05.shared_data_file(out / "test_data.pt", step05_cfg, "test")
     if not os.path.exists(test_file):
         print(f"[State]\t skipped: no {test_file} (run step 06 first)")
         return
@@ -862,6 +862,10 @@ def main(input_data):
         plot_comparison(metrics, h, cfg["frame_rate"], out / ("state_compare" + (f"_h{h}" if len(horizons) > 1 else "")))
 
     # 3. Review videos of the StateMLP, the lookup and the onset models.
+    if not input_data.get("review_videos", False):
+        print("[State review]\t skipped (--review_videos False, the default; True renders them)")
+        print("\n--------- Step 06 (state) Done ---------------\n")
+        return
     review_videos(model, test_data, ckpt, cfg, thresholds, label_names, counted, out / "state_review",
                   input_data.get("frame_dir"), input_data.get("video_dir"), input_data["test_atoms_file"],
                   input_data["test_box_file"], onset_scorers, lookup)
