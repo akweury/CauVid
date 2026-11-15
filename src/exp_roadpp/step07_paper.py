@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
-VERSION = "paper_v1"
+VERSION = "paper_v2"
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
     "headline_budget": 5,
@@ -302,6 +302,7 @@ def main(input_data):
         raise ValueError(f"{len(training_data['val_videos'])} val videos < {len(test_data['videos'])} test videos: "
                          "the val split must be at least as large as test for the thresholds chosen on it.")
     head_types_all = training_data["event_types"]["types"]
+    train_onsets = _train_onsets(training_data)
     counted = [step06.EVENT_TYPES.index(t) for t in step06.COUNTED_TYPES]
     heads = torch.nonzero(torch.isin(head_types_all, torch.tensor(counted))).flatten()
     vocab = step05.load_vocabulary({**step05_cfg, "unique_atoms_file": input_data["unique_atoms_file"]})
@@ -333,6 +334,9 @@ def main(input_data):
                                                     for nm, c in chosen.items()})
     fps = cfg["frame_rate"]
     out = {"version": VERSION, "settings": _settings(), "window": cfg["window"], "frame_rate": fps,
+           "train_fraction": step05_cfg.get("train_fraction", 1.0),
+           "num_train_videos": len(train_onsets["videos"]),
+           "train_onsets": {label_names[i]: int(train_onsets["counts"][int(h)]) for i, h in enumerate(heads)},
            "min_context": min_context, "counted_types": list(step06.COUNTED_TYPES),
            "num_test_videos": len(test_data["videos"]), "scorers": {}, "videos": {}}
     for nm in val_curve:
@@ -357,6 +361,19 @@ def main(input_data):
     print_summary(out)
     print(f"[Paper]\t {metrics_file}\n[Paper]\t {events_file}")
     print("\n--------- Step 07 Done ---------------\n")
+
+
+def _train_onsets(training_data):
+    """{"videos": the train videos the models learned from, "counts": (A,) onsets per head in them}."""
+    A, m = training_data["num_atoms"], training_data["min_off_frames"]
+    counts = torch.zeros(A)
+    for v in training_data["train_videos"]:
+        X = step05._video_from_cells(training_data["videos"][v], A, "cpu")
+        onsets = step05.atom_onsets(X, m)
+        onsets[0] = False
+        onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
+        counts += onsets.sum(dim=(0, 1)).float()
+    return {"videos": list(training_data["train_videos"]), "counts": counts}
 
 
 def _settings():

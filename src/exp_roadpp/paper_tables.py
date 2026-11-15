@@ -392,6 +392,82 @@ def variant_head_tables(main_runs, ablations, budget, variant):
     return (sum_header, sum_rows), (mat_header, mat_rows)
 
 
+# -------------- Learning curve --------------
+SATURATION = 0.9                        # a head is saturated at the smallest share reaching this share of its full-data AP
+
+
+def curve_runs(main_runs, ablations):
+    """[(train share, label, runs)] of the main run (share 1) and the variants trained on a share of the
+    train videos (step 07 "train_fraction" < 1), smallest share first."""
+    out = [(main_runs[0][0].get("train_fraction", 1.0), "100%", main_runs)]
+    for label, runs in ablations:
+        f = runs[0][0].get("train_fraction", 1.0)
+        if f < 1:
+            out.append((f, label, runs))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _ap_of(m, base, variant, head=None):
+    nm = scorer_name(m, base, variant)
+    s = m["scorers"].get(nm)
+    if s is None:
+        return None
+    return s["ap"]["micro"] if head is None else s["ap"]["per_head"].get(head, {}).get("ap")
+
+
+def learning_curve_table(points, budget, variant):
+    header = ["Train share", "Train videos", "AP rule net", "mAP rule net", "AP MLP", "mAP MLP", "AP lookup",
+              "Recall rule net", "Recall MLP", "FA/min rule net"] + [f"AP {g}" for g, _p in FOCUS_GROUPS]
+    rows = []
+    for f, _label, runs in points:
+        m = runs[0][0]
+        rv = row_values(m, scorer_name(m, "model", variant), budget) or {}
+        mv = row_values(m, scorer_name(m, "mlp", variant), budget) or {}
+        groups = []
+        for _g, pattern in FOCUS_GROUPS:
+            heads = {h: v for h, v in _group_heads(m, scorer_name(m, "model", variant), pattern).items()
+                     if v["ap"] is not None and v["onset_rows"] > 0}
+            w = sum(v["onset_rows"] for v in heads.values())
+            groups.append(fmt(sum(v["ap"] * v["onset_rows"] for v in heads.values()) / w) if w else "–")
+        rows.append([f"{f:.0%}", str(m.get("num_train_videos", "–")), fmt(rv.get("ap")), fmt(rv.get("map")),
+                     fmt(mv.get("ap")), fmt(mv.get("map")), fmt(_ap_of(m, "lookup", variant)), fmt(rv.get("recall")),
+                     fmt(mv.get("recall")), fmt(rv.get("fa"), p=1)] + groups)
+    return header, rows
+
+
+def saturation_table(points, budget, variant):
+    """Per learnable head (Table 5 of the full-data run): the rule net's AP at every train share (with the
+    head's train onsets at that share), and the smallest share (and its train onsets) where the rule net
+    and the MLP reach SATURATION of their full-data AP."""
+    m_full, ev_full = points[-1][2][0]
+    heads = [r for r in classify_heads(m_full, ev_full, budget, variant) if r["cls"] != "unpredictable"]
+    heads.sort(key=lambda r: (r["scenario"], -r["events"]))
+    header = ["Scenario", "Head", "Test events"] + [f"{f:.0%}" for f, _l, _r in points] + [
+        f"{SATURATION:.0%} rule net at", f"{SATURATION:.0%} MLP at"]
+    rows = []
+    for r in heads:
+        h = r["head"]
+        cells, reach = [], {}
+        for base in ("model", "mlp"):
+            full = _ap_of(m_full, base, variant, h)
+            reach[base] = "–"
+            if full:
+                for f, _l, runs in points:
+                    v = _ap_of(runs[0][0], base, variant, h)
+                    if v is not None and v >= SATURATION * full:
+                        n = runs[0][0].get("train_onsets", {}).get(h)
+                        reach[base] = f"{f:.0%}" + (f" ({n} onsets)" if n is not None else "")
+                        break
+        for f, _l, runs in points:
+            m = runs[0][0]
+            v = _ap_of(m, "model", variant, h)
+            n = m.get("train_onsets", {}).get(h)
+            cells.append(fmt(v) + (f" ({n})" if n is not None else ""))
+        rows.append([r["scenario"], h, str(r["events"]) + ("*" if r["events"] < FEW_EVENTS else "")] + cells
+                    + [reach["model"], reach["mlp"]])
+    return header, rows
+
+
 def markdown(title, header, rows):
     out = [f"### {title}", "", "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     out += ["| " + " | ".join(r) + " |" for r in rows]
@@ -456,6 +532,13 @@ def main(argv=None):
         tables.append((f"Table 6: ablation per head ({sub}; {rule})", h6, r6))
         tables.append((f"Table 6b: rule net AP per head and variant (▲ better, ▼ worse; * < {FEW_EVENTS} test events)",
                        h6b, r6b))
+    points = curve_runs(main_runs, ablations)
+    if len(points) > 1:
+        tables.append((f"Table 7: learning curve, models trained on a share of the train videos ({sub})",
+                       *learning_curve_table(points, budget, args.variant)))
+        tables.append((f"Table 7b: rule net AP per learnable head and train share (train onsets of the head in "
+                       f"brackets), and the share where the rule net / MLP reach {SATURATION:.0%} of their "
+                       f"full-data AP ({sub})", *saturation_table(points, budget, args.variant)))
     tables.append((f"Table 3b: events per head, top 20 ({sub})", *per_head_counts(m0, main_runs[0][1], budget,
                                                                                   args.variant)))
     out = Path(args.out) if args.out else ROOT / args.exp / "paper_tables"

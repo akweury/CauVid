@@ -33,6 +33,120 @@ def _split_example_indices(num_examples, train_fraction=0.7, val_fraction=0.15, 
     return train_indices, val_indices, test_indices
 
 
+# -------------- Stratified split --------------
+# Splits by video (the atoms of one video never cross splits), but so that the onsets of every head
+# fall into train / val / test in the split fractions as far as possible: iterative stratification
+# (Sechidis et al. 2011, rarest head first), with the onset counts as weights. A plain random split of
+# videos gives the rare heads 0 or 1 test events by chance.
+SPLIT_FRACTIONS = {"train": 0.7, "val": 0.15, "test": 0.15}
+STRATIFIED_VERSION = "strat_v1"
+MIN_OFF_FRAMES = 10                 # as step 05: an atom back on after a shorter gap is no new onset
+
+
+def head_onsets(interval_atoms):
+    """{head "<class>:<label>": onsets} of one video's interval atoms: an interval of an agent's atom that
+    starts after the agent is seen (not its first frame: entering the scene is no event) and at least
+    MIN_OFF_FRAMES after the previous interval of the same atom ended."""
+    from collections import Counter, defaultdict
+    first = {}
+    by_atom = defaultdict(list)
+    for atom in interval_atoms:
+        tube = atom.get("tube_uid") or "ego"
+        start, end = int(atom["start_frame"]), int(atom["end_frame"])
+        first[tube] = min(first.get(tube, start), start)
+        label = atom.get("action_id_label") or atom.get("location_name_label")
+        by_atom[(tube, str(atom.get("agent_class_label")) + ":" + str(label))].append((start, end))
+    counts = Counter()
+    for (tube, head), spans in by_atom.items():
+        last_end = None
+        for start, end in sorted(spans):
+            if start > first[tube] and (last_end is None or start - last_end >= MIN_OFF_FRAMES):
+                counts[head] += 1
+            last_end = end if last_end is None else max(last_end, end)
+    return counts
+
+
+def stratified_split(video_counts, fractions=None, seed=7):
+    """{split: [video ids]} by iterative stratification of the per-video head onset counts
+    video_counts {video: Counter}: the rarest head with unassigned videos first, each of its videos
+    (randomly ordered) to the split that still needs most of that head's onsets (ties: the split that
+    needs most videos, then random); videos without onsets fill the splits up to their sizes."""
+    fractions = fractions or SPLIT_FRACTIONS
+    rng = random.Random(int(seed))
+    videos = sorted(video_counts)
+    total = {}
+    for v in videos:
+        for h, c in video_counts[v].items():
+            total[h] = total.get(h, 0) + c
+    need = {sp: {h: f * n for h, n in total.items()} for sp, f in fractions.items()}
+    need_n = {sp: f * len(videos) for sp, f in fractions.items()}
+    out = {sp: [] for sp in fractions}
+    left = set(videos)
+
+    def assign(v, sp):
+        out[sp].append(v)
+        left.discard(v)
+        need_n[sp] -= 1
+        for h, c in video_counts[v].items():
+            need[sp][h] -= c
+    while True:
+        remaining = {}
+        for v in left:
+            for h, c in video_counts[v].items():
+                remaining[h] = remaining.get(h, 0) + c
+        if not remaining:
+            break
+        head = min(remaining, key=lambda h: (remaining[h], h))
+        cands = sorted(v for v in left if video_counts[v].get(head))
+        rng.shuffle(cands)
+        for v in cands:
+            best = max(fractions, key=lambda sp: (need[sp][head], need_n[sp], rng.random()))
+            assign(v, best)
+    rest = sorted(left)
+    rng.shuffle(rest)
+    for v in rest:
+        assign(v, max(fractions, key=lambda sp: (need_n[sp], rng.random())))
+    # The thresholds are chosen on val (step 07): val never smaller than test (both have the same share).
+    if "val" in out and "test" in out and len(out["val"]) < len(out["test"]):
+        out["val"], out["test"] = out["test"], out["val"]
+    return {sp: sorted(vs) for sp, vs in out.items()}
+
+
+def split_report(video_counts, splits):
+    """{head: {split: onsets}}."""
+    report = {}
+    for sp, vs in splits.items():
+        for v in vs:
+            for h, c in video_counts[v].items():
+                report.setdefault(h, {s: 0 for s in splits})[sp] += c
+    return report
+
+
+def _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, dataset_labels):
+    """The split atom files of the stratified split: the atoms of every video (all_atoms.json), the head
+    onsets per video, `stratified_split`, then each split's file cut out of all_atoms.json; split.json
+    keeps the assignment and the onsets per head and split."""
+    split_files = {sp: atoms_folder / f"{sp}_atoms.json" for sp in SPLIT_FRACTIONS}
+    if all(f.exists() for f in split_files.values()) and (atoms_folder / "split.json").exists():
+        print("[Split] stratified split files already exist.")
+        return
+    ids = [Path(f).stem.replace("_gt", "") for f in all_track_files]
+    all_atoms = _tracks_to_atoms(track_dir, ids, language_model, atoms_folder / "all_atoms.json", dataset_labels)
+    counts = {v: head_onsets(all_atoms[v]["interval_atoms"]) for v in ids if v in all_atoms}
+    splits = stratified_split(counts)
+    for sp, vs in splits.items():
+        utils_data.save_json({v: all_atoms[v] for v in vs}, split_files[sp])
+    report = split_report(counts, splits)
+    utils_data.save_json({"version": STRATIFIED_VERSION, "fractions": SPLIT_FRACTIONS, "splits": splits,
+                          "onsets": report}, atoms_folder / "split.json")
+    n = {sp: len(vs) for sp, vs in splits.items()}
+    total = {sp: sum(r[sp] for r in report.values()) for sp in splits}
+    print(f"[Split] stratified by the onsets of {len(report)} heads: videos {n}, onsets {total}")
+    missing = sorted(h for h, r in report.items() if sum(r.values()) >= 5 and min(r["val"], r["test"]) == 0)
+    if missing:
+        print(f"[Split] heads with >= 5 onsets but none in val or test: {missing}")
+
+
 def get_frame_pairs(interval_atoms, dataset_labels):
     frame_pairs = []
     atoms_per_start_frame = {}
@@ -269,7 +383,10 @@ def prepare_per_frame_atoms(language_model, cfg):
     data_num = cfg["data_num"]
     track_dir = cfg["track_dir"]
     output_dir = cfg["output_dir"]
+    split_mode = cfg.get("split", "random")
     all_track_files =[os.path.join(track_dir, f) for f in os.listdir(track_dir) if f.endswith("_gt.json")]
+    if split_mode == "stratified":
+        all_track_files = sorted(all_track_files)       # listdir order differs between file systems
     if data_num != 'full':
         all_track_files = all_track_files[:int(data_num)]
 
@@ -278,24 +395,28 @@ def prepare_per_frame_atoms(language_model, cfg):
     os.makedirs(atoms_folder, exist_ok=True)
     version_file = atoms_folder / "atoms_version.txt"
     version = version_file.read_text().strip() if version_file.exists() else None
-    if version != ATOMS_VERSION:
+    expected = ATOMS_VERSION if split_mode == "random" else f"{ATOMS_VERSION}_{STRATIFIED_VERSION}"
+    if version != expected:
         stale = [atoms_folder / f"{split}_atoms{suffix}.json" for split in ("train", "val", "test")
                  for suffix in ("", "_compressed")] + [atoms_folder / "unique_atoms.json"]
         stale = [f for f in stale if f.exists()]
         if stale:
-            print(f"[Per Frame Atoms] atom files of version {version} (now {ATOMS_VERSION}): rebuilding "
+            print(f"[Per Frame Atoms] atom files of version {version} (now {expected}): rebuilding "
                   + ", ".join(f.name for f in stale))
             for f in stale:
                 f.unlink()
 
     splits = {"train": train_indices, "val": val_indices, "test": test_indices}
-    for split_name, indices in splits.items():
-        split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
-        split_file = atoms_folder / f"{split_name}_atoms.json"
-        if not os.path.exists(split_file):
-            _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
-        else:
-            print(f"[Per Frame Atoms] {split_file} already exists.")
+    if split_mode == "stratified":
+        _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, cfg["dataset_labels"])
+    else:
+        for split_name, indices in splits.items():
+            split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
+            split_file = atoms_folder / f"{split_name}_atoms.json"
+            if not os.path.exists(split_file):
+                _tracks_to_atoms(track_dir, split_ids, language_model, split_file, cfg["dataset_labels"])
+            else:
+                print(f"[Per Frame Atoms] {split_file} already exists.")
 
     # One vocabulary for all splits; compressed files index into it, so rebuild them with it.
     unique_atoms_file = atoms_folder / "unique_atoms.json"
@@ -313,7 +434,7 @@ def prepare_per_frame_atoms(language_model, cfg):
         else:
             print(f"[Per Frame Atoms Compressed] {compressed_file} already exists.")
 
-    version_file.write_text(ATOMS_VERSION + "\n")
+    version_file.write_text(expected + "\n")
 
     # The agents' boxes per frame (step 05 agent roles), for the videos of each split's atom file.
     for split_name in splits:
@@ -389,6 +510,7 @@ def main(input_data):
         "data_num": input_data["data_num"],
         "device": input_data["device"],
         "delay_windows": input_data["delay_windows"],
+        "split": input_data.get("split", "random"),
         "dataset_labels": json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
         
     }

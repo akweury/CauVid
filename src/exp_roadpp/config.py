@@ -361,6 +361,8 @@ def get_step_05_input(args):
         # Ablation settings (`ablation.py`); the defaults are the main model.
         "anchor_source": getattr(args, "anchor_source", "causal"),
         "anchor_subset_seed": int(getattr(args, "anchor_subset_seed", 0)),
+        "train_fraction": float(getattr(args, "train_fraction", 1.0)),
+        "train_subset_seed": int(getattr(args, "train_subset_seed", 0)),
         "truncate_prob": float(getattr(args, "truncate_prob", 0.5)),
         "num_slots": int(getattr(args, "num_slots", 3)),
         "num_free_rules": getattr(args, "num_free_rules", None),
@@ -401,5 +403,8 @@ def get_step_dataset_input(args):
         "device": args.device,
         "data_num": args.data_num,
         "delay_windows": args.delay_windows,
+        # random: the old 70 / 15 / 15 split of the videos; stratified: by the onsets of every head
+        # (`step_dataset.stratified_split`). Set per exp (exp_config/<exp>.json "split").
+        "split": getattr(args, "split", "random"),
     }
     return input_data

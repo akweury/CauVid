@@ -49,6 +49,11 @@ VARIANTS = {
     "memory_1": ("memory 1 s (1 slot)", "structure", ["--num_slots", "1"]),
     "memory_5": ("memory 5 s (5 slots)", "structure", ["--num_slots", "5"]),
     "type_balance": ("+ event type balance", "structure", ["--type_balance", "True"]),
+    # Learning curve: nested shares of the train videos (val, test, heads unchanged; `step05.subsample_train_videos`).
+    "train_5": ("5% of the train videos", "data", ["--train_fraction", "0.05"]),
+    "train_10": ("10% of the train videos", "data", ["--train_fraction", "0.1"]),
+    "train_25": ("25% of the train videos", "data", ["--train_fraction", "0.25"]),
+    "train_50": ("50% of the train videos", "data", ["--train_fraction", "0.5"]),
 }
 # Variants not run by default: the existing results already settle them (medium suite 20261113-1635,
 # full suite 20261113-1636 and the earlier full ablations); --preset all or --variants runs them anyway.
@@ -67,6 +72,8 @@ PRESETS = {
     # ablation moved the results (grid: recall; own-agent atom and partial facts: every metric).
     "paper": ["main", "no_causal_filter", "random_filter_0", "random_filter_1", "random_filter_2", "no_anchors",
               "no_grid", "no_require_self", "no_partial"],
+    # The learning curve: how much train data the models need (main = 100%).
+    "data": ["main", "train_5", "train_10", "train_25", "train_50"],
     "all": list(VARIANTS),
 }
 # Only the main variant trains what the tables do not need (the layered rule net).
@@ -109,8 +116,9 @@ def main():
     ap.add_argument("--machine", default="dgx-jing")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--suite", default=None, help="suite id to resume (default: a new one)")
-    ap.add_argument("--preset", choices=list(PRESETS), default="paper",
-                    help="variant set: paper (default; the variants the existing results do not settle), all")
+    ap.add_argument("--preset", default="paper",
+                    help="variant set(s), comma separated: paper (default; the variants the existing results do not "
+                         "settle), data (the learning curve), all; e.g. paper,data")
     ap.add_argument("--variants", default=None, help="comma separated variant names (overrides --preset)")
     ap.add_argument("--budget", type=float, default=5, help="false alarms / min of the tables")
     ap.add_argument("--variant_scores", choices=("cal", "raw"), default="cal")
@@ -119,13 +127,20 @@ def main():
     args, passthrough = ap.parse_known_args()     # anything else (e.g. --num_epochs 50) goes to every run
     if args.list:
         for name, (label, group, a) in VARIANTS.items():
-            mark = "" if name in PRESETS["paper"] else "  [skipped by default]"
+            mark = ("" if name in PRESETS["paper"] else "  [preset data]" if name in PRESETS["data"]
+                    else "  [skipped by default]")
             print(f"{name:<18} {group:<10} {label:<45} {' '.join(a)}{mark}")
         print("\nSkipped by default (run with --preset all or --variants):")
         for name, why in SKIPPED.items():
             print(f"  {name:<16} {why}")
         return
-    names = args.variants.split(",") if args.variants else PRESETS[args.preset]
+    if args.variants:
+        names = args.variants.split(",")
+    else:
+        unknown_presets = [p for p in args.preset.split(",") if p not in PRESETS]
+        if unknown_presets:
+            raise SystemExit(f"Unknown presets {unknown_presets}; one of {list(PRESETS)}")
+        names = list(dict.fromkeys(n for p in args.preset.split(",") for n in PRESETS[p]))
     unknown = [n for n in names if n not in VARIANTS]
     if unknown:
         raise SystemExit(f"Unknown variants {unknown}; see --list")

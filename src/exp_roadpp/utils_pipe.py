@@ -55,6 +55,11 @@ def get_parser():
                         help="Step 05: anchor clauses seeding the rules: causal (step 04 filter, default), all (every "
                              "LLM anchor, no causal filter), random (random LLM anchors, as many as causal), none")
     parser.add_argument("--anchor_subset_seed", type=int, default=0, help="Seed of --anchor_source random")
+    parser.add_argument("--train_fraction", type=float, default=1.0,
+                        help="Step 05: learning curve, train on this share of the train videos (nested subsets; "
+                             "val, test and the head types unchanged; each epoch visits the share 1 / share times, the "
+                             "same steps per epoch), default 1")
+    parser.add_argument("--train_subset_seed", type=int, default=0, help="Seed of the --train_fraction subset")
     parser.add_argument("--num_free_rules", type=int, default=None,
                         help="Step 05: unseeded rules (default 128; with --anchor_source none 128 + the causal seeds)")
     parser.add_argument("--truncate_prob", type=float, default=0.5,
@@ -68,6 +73,9 @@ def get_parser():
                              "default False; True to render them (e.g. later for one run: --run_id <run> --review_videos True)")
     parser.add_argument("--eval_min_context", type=int, default=0,
                         help="Step 06/07: score from this frame on at least (0: the model's memory)")
+    parser.add_argument("--split", type=str, default="random", choices=["random", "stratified"],
+                        help="Video split of step_dataset: random (the old one, exps medium / full) or stratified by "
+                             "the onsets of every head (exps medium_s / full_s); set in exp_config/<exp>.json")
     parser.add_argument("--run_id", type=str, default=None,
                         help="Resume this run (folder output/<exp>/runs/<run_id>) instead of starting a new one, "
                              "e.g. to redo step 06 of a trained model; default: a new run folder")

@@ -556,6 +556,25 @@ def shared_data_file(local_file, cfg, kind):
     return cfg["data_cache_dir"] / f"{kind}_data_{cfg['data_key']}.pt"
 
 
+def subsample_train_videos(data, cfg):
+    """Learning curve (--train_fraction f < 1): keep only a share f of the train videos, nested (the
+    videos of a smaller share are in every larger one: one shuffle by train_subset_seed, its first f N
+    videos). The val videos and the event types of the heads (counted over all train + val videos, before
+    this) stay the same, so every share is scored on the same heads and events."""
+    f = float(cfg.get("train_fraction", 1.0))
+    data["train_fraction"] = f
+    if f >= 1.0:
+        return data
+    import random
+    videos = sorted(data["train_videos"])
+    random.Random(int(cfg.get("train_subset_seed", 0))).shuffle(videos)
+    keep = max(1, int(round(f * len(videos))))
+    data["train_videos"] = sorted(videos[:keep])
+    print(f"[Videos]\t learning curve: {keep} of {len(videos)} train videos (train_fraction {f:g}, "
+          f"seed {cfg.get('train_subset_seed', 0)})")
+    return data
+
+
 def load_training_data(cfg):
     """training_data.pt, (re)built by `prepare_training_data` if it is missing,
     has another min_off_frames, other agent roles or geometry or was split another way. Adds the event
@@ -569,6 +588,7 @@ def load_training_data(cfg):
         data = prepare_training_data(cfg)
         save_data(data, cfg["training_data_file"])
     data["event_types"] = head_event_types(data, load_vocabulary(cfg), cfg)
+    subsample_train_videos(data, cfg)
     types = data["event_types"]["types"]
     noise, inputs = types == EVENT_TYPES.index("noise"), types == EVENT_TYPES.index("input")
     data["target_heads"] = ~inputs & (~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise))
@@ -790,7 +810,8 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
         frames = _sample_frames(training_data, video_id, cfg["frames_per_video"], cfg["positive_frame_ratio"],
                                 generator, max(cfg["windows"]))
         val_frames[video_id] = (frames, sample_history(frames, cfg, generator))
-    train_videos = training_data["train_videos"]
+    # Learning curve: each video of a share f of the train data round(1 / f) times per epoch (`get_cfg`).
+    train_videos = list(training_data["train_videos"]) * cfg.get("epoch_repeat", 1)
     best_val_loss, best_state = float("inf"), None
     history = []
     for epoch in range(cfg["num_epochs"]):
@@ -1510,11 +1531,20 @@ def get_cfg(input_data):
         num_free_rules += causal_bodies * num_slots
     # Partial facts: the share of training frames with a truncated history (--truncate_prob, default 0.5).
     truncate_prob = float(input_data.get("truncate_prob", 0.5))
+    # Learning curve (--train_fraction, default 1): train on a share f of the train videos
+    # (`subsample_train_videos`). An epoch then visits each of them round(1 / f) times, so it has as many
+    # gradient steps as one on all the data: the epoch counts, early stopping, warm-up, lr schedule and
+    # the val evaluations (once per epoch) are the same for every share.
+    train_fraction = float(input_data.get("train_fraction", 1.0))
+    train_subset_seed = int(input_data.get("train_subset_seed", 0))
+    epoch_repeat = 1 if train_fraction >= 1 else max(1, int(round(1 / train_fraction)))
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if truncate_prob != 0.5:
         base_tag += f"{truncate_prob:g}"
     if anchor_source != "causal":
         base_tag += f"_a{anchor_source}" + (str(anchor_seed) if anchor_source == "random" else "")
+    if train_fraction < 1:
+        base_tag += f"_tf{train_fraction:g}s{train_subset_seed}"
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
     if roles:
@@ -1589,6 +1619,9 @@ def get_cfg(input_data):
             'gate_eps': 1e-20,
             # Training: batches of target frames sampled from a few videos at a time.
             'num_epochs': input_data['num_epochs'],
+            'train_fraction': train_fraction,
+            'train_subset_seed': train_subset_seed,
+            'epoch_repeat': epoch_repeat,
             'lr': 0.01,
             'videos_per_batch': 4,
             'frames_per_video': 32,
