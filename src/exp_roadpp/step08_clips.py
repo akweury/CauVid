@@ -55,7 +55,7 @@ CLIPS = {
     "side_width": 640,
     "label_rows": 8,                          # label timeline rows of the agent (+ 4 of the ego)
     "seed": 0,
-    "version": "clips_v1",
+    "version": "clips_v2",           # bump on any drawing change: re-renders
 }
 NAMES = {"model_cal": "rule net", "mlp_cal": "MLP", "lookup_cal": "lookup"}
 COLOR = {"model_cal": (0, 140, 255), "mlp_cal": (255, 80, 255), "lookup_cal": (255, 210, 0)}     # BGR
