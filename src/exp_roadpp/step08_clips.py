@@ -193,8 +193,9 @@ def render_clip(spec, X, L, label_names, boxes, classes, ego, reader, fps, windo
             cv2.rectangle(plot, (px(max(a, t0)), yb), (px(min(b, t1)), yb + 4), COLOR[s], -1)
     if onset is not None:
         cv2.line(plot, (px(onset), p_top - 4), (px(onset), p_bot), C_EVENT, 2)
-    _text(cv2, plot, f"P(event within {window / fps:g} s)", 8, 20, WHITE, 0.55, bg=False, thick=1)
-    x = 260
+    _text(cv2, plot, f"P({spec['label'].split(':', 1)[-1]} within {window / fps:g} s)", 8, 20, WHITE, 0.55,
+          bg=False, thick=1)
+    x = 290
     for s in CLIPS["scorers"]:
         _text(cv2, plot, NAMES[s], x, 20, COLOR[s], 0.55, bg=False, thick=2)
         x += 20 + 11 * len(NAMES[s])
