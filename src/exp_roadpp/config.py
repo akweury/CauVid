@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+from src.exp_roadpp import ego_flow
+
 # -------------- Settings --------------
 ALLOW_MODEL_DOWNLOAD = True
 
@@ -355,6 +357,14 @@ def get_step_05_input(args):
         "require_self": str(getattr(args, "require_self", "True")) == "True",
         "motion": str(getattr(args, "motion", "False")) == "True",
         "ego_motion": str(getattr(args, "ego_motion", "False")) == "True",
+        # Ego flow atoms (`ego_flow.py`): the raw flow per video is cached once for every exp
+        # (<output root>/roadpp/ego_flow_cache/<version>), decoded from the camera videos.
+        "ego_flow": str(getattr(args, "ego_flow", "False")) == "True",
+        "ego_flow_cache_dir": args.output_dir.parent / "ego_flow_cache" / ego_flow.VERSION,
+        "ego_flow_workers": int(getattr(args, "ego_flow_workers", 16)),
+        "frame_dir": args.dataset_path / "frames",
+        "video_dir": args.dataset_path / "videos",
+        "frame_rate": args.frame_rate,
         # Prepared datasets (training_data / test_data), shared by the runs of this exp with the same
         # data settings instead of one copy per run (`step05.shared_data_file`).
         "data_cache_dir": args.output_dir / "data_cache",

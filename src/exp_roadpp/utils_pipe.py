@@ -48,6 +48,10 @@ def get_parser():
                              "no effect on medium or full); True for the ablation or to resume a run trained with them")
     parser.add_argument("--ego_motion", type=str, default="False",
                         help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
+    parser.add_argument("--ego_flow", type=str, default="False",
+                        help="Step 05: ego yaw / speed atoms read from the camera image (ego_flow.py), default False")
+    parser.add_argument("--ego_flow_workers", type=int, default=16,
+                        help="Processes decoding the videos for the ego flow cache (CPU)")
     parser.add_argument("--require_self", type=str, default="True",
                         help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
     # Ablation settings (`ablation.py` runs the whole suite); the defaults are the main model.

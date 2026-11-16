@@ -171,3 +171,120 @@ def denoised_series(raw, step=STEP):
         r = np.array([raw[t][k] if t in raw else np.nan for t in grid])
         out[s] = (grid, r, denoise(r, FLOOR[s]))
     return out
+
+
+# -------------- Symbolic atoms (`step05`, --ego_flow) --------------
+# Level cuts of the denoised signals (medium_s train + val, ego_flow_diag 2026-11-16):
+#   yaw: "straight" = the control (straight AV-Mov) q10..q90 (-0.018, 0.024), rounded to +-0.025;
+#        strong = the q5 / q95 of all samples (-0.149, 0.165), rounded to +-0.15 (lane changes peak
+#        ~0.08, turns ~0.48).
+#   speed: still < 0.02 (all-sample q10 0.004); the AV-Stop precursor (< control q10 0.062) falls in
+#        slow; the control median 0.16 in cruise.
+YAW_CUTS = (-0.15, -0.025, 0.025, 0.15)
+SPEED_CUTS = (0.02, 0.08, 0.20)
+YAW_ATOMS = ("yaw_left_strong", "yaw_left", "yaw_straight", "yaw_right", "yaw_right_strong")
+SPEED_ATOMS = ("speed_still", "speed_slow", "speed_cruise", "speed_fast")
+ATOMS = YAW_ATOMS + SPEED_ATOMS
+DEBOUNCE = 2                 # samples a new level must hold before it replaces the held one (0.4 s)
+
+
+def tag():
+    return f"_ef{VERSION.replace('flow_', '')}y{len(YAW_ATOMS)}s{len(SPEED_ATOMS)}d{DEBOUNCE}"
+
+
+def vocabulary():
+    """Signatures of the ego flow atoms; `step05._atom_name` reads them as "av:yaw_right"."""
+    return [["pred", "ego_flow", "ego_flow_label", a, "agent_class_label", "av"] for a in ATOMS]
+
+
+def _levels(v, cuts):
+    """(n, len(cuts) + 1) bool: the level of each value (NaN: none)."""
+    ok = ~np.isnan(v)
+    edges = [-np.inf, *cuts, np.inf]
+    return np.stack([ok & (v >= lo) & (v < hi) for lo, hi in zip(edges[:-1], edges[1:])], axis=1)
+
+
+def _debounce(L, n=DEBOUNCE):
+    """(n_samples, K) one-hot levels -> debounced: the held level switches to a new one only after the new
+    one held n samples in a row (no flicker at a cut, no gap between two levels); a sample without a
+    level (NaN) clears it, and the first level after a gap also needs n samples."""
+    out = np.zeros_like(L)
+    cur, cand, run = None, None, 0
+    for i in range(len(L)):
+        k = int(L[i].argmax()) if L[i].any() else None
+        if k is None:
+            cur, cand, run = None, None, 0
+        elif k == cur:
+            cand, run = None, 0
+        else:
+            run = run + 1 if k == cand else 1
+            cand = k
+            if run >= n:
+                cur, cand, run = k, None, 0
+        if cur is not None:
+            out[i, cur] = True
+    return out
+
+
+def flow_atoms(raw, T, step=STEP):
+    """(T, len(ATOMS)) bool atoms of one video from its cached raw samples {"frames": (n,), "raw": (n, 3)}:
+    denoised (`denoised_series`), cut into levels, debounced over the samples, and held from each
+    sample frame t to the next one (frames t .. t + step - 1; a sample at t reads frames t - 1, t)."""
+    out = np.zeros((T, len(ATOMS)), dtype=bool)
+    frames = np.asarray(raw["frames"]).astype(int)
+    if len(frames) == 0:
+        return out
+    ser = denoised_series({int(t): tuple(v) for t, v in zip(frames, np.asarray(raw["raw"]))}, step)
+    grid = ser["yaw"][0]
+    L = np.concatenate([_debounce(_levels(ser["yaw"][2], YAW_CUTS)),
+                        _debounce(_levels(ser["speed"][2], SPEED_CUTS))], axis=1)
+    for i, t in enumerate(grid):
+        a, b = int(t), min(int(t) + step, T)
+        if a < T:
+            out[a:b] = L[i]
+    return out
+
+
+# -------------- Cache (raw samples per video, shared by the exps) --------------
+def cache_file(cache_dir, video_id):
+    return os.path.join(cache_dir, f"{video_id}.npz")
+
+
+def _cache_job(job):
+    import cv2
+    cv2.setNumThreads(1)
+    video_id, T, boxes_by_frame, frame_dir, video_dir, fps, out = job
+    raw = raw_series(cv2, video_id, frame_dir, video_dir, range(STEP, T, STEP),
+                     lambda t: boxes_by_frame.get(t, ()), fps)
+    ts = sorted(raw)
+    arr = np.array([raw[t] for t in ts], dtype=np.float32).reshape(-1, 3)
+    tmp = out + ".tmp.npz"
+    np.savez_compressed(tmp, frames=np.array(ts, dtype=np.int32), raw=arr)
+    os.replace(tmp, out)
+    return video_id, len(ts), int(np.isnan(arr[:, 0]).sum()) if len(arr) else 0
+
+
+def ensure_cache(jobs, cache_dir, frame_dir, video_dir, fps, workers):
+    """Compute the raw samples of the videos missing in cache_dir. jobs: [(video_id, T, {frame: [boxes]})],
+    the boxes (normalized, the agents' GT boxes) masked out of the flow."""
+    from multiprocessing import Pool
+    from tqdm import tqdm
+    os.makedirs(cache_dir, exist_ok=True)
+    todo = [(v, T, b, str(frame_dir), str(video_dir), fps, cache_file(cache_dir, v)) for v, T, b in jobs
+            if not os.path.exists(cache_file(cache_dir, v))]
+    if not todo:
+        return
+    samples = failed = 0
+    with Pool(max(1, workers)) as pool:
+        for _v, n, nan in tqdm(pool.imap_unordered(_cache_job, todo), total=len(todo), desc="Ego flow (decode)"):
+            samples, failed = samples + n, failed + nan
+    print(f"[Ego flow]\t {len(todo)} videos computed into {cache_dir}: {samples} samples, "
+          f"{failed / max(samples, 1):.1%} without a valid fit")
+
+
+def load_cache(cache_dir, video_id):
+    f = cache_file(cache_dir, video_id)
+    if not os.path.exists(f):
+        return None
+    z = np.load(f)
+    return {"frames": z["frames"], "raw": z["raw"]}

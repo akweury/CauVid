@@ -41,6 +41,7 @@ VARIANTS = {
     "no_grid": ("− grid atoms", "inputs", ["--grid", "False"]),
     "motion": ("+ motion atoms", "inputs", ["--motion", "True"]),
     "ego_motion": ("+ ego motion atoms", "inputs", ["--ego_motion", "True"]),
+    "ego_flow": ("+ ego flow atoms (image yaw / speed)", "inputs", ["--ego_flow", "True"]),
     "roles": ("+ agent roles (ahead, near ped.)", "inputs", ["--roles", "ahead,near_ped"]),
     "geometry": ("+ geometry atoms", "inputs", ["--geometry", "True"]),
     # Structure and training.
