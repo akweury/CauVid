@@ -41,7 +41,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import config, ego_flow, rtpt_utils, step05, utils_data
+from src.exp_roadpp import config, ego_flow, rtpt_utils, step05, step_dataset, utils_data, utils_pipe
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins
 
@@ -344,6 +344,16 @@ def rule_report(model, train, test, heads, names, cfg):
 
 
 # -------------- Main --------------
+def ensure_dataset(exp, machine, device):
+    """Run step_dataset for the exp (its exp_config: split, far-vehicle filter, split_from) if its atoms
+    are missing, e.g. an exp whose pipeline has not run yet; it skips the files it already has."""
+    pargs = utils_pipe.get_parser().parse_args(["--exp", exp, "--machine", machine, "--device", device])
+    for key, value in utils_data.load_json(config.exp_config_path / f"{exp}.json").items():
+        setattr(pargs, key, value)
+    pargs = config.machine_setup(pargs)
+    step_dataset.main(config.get_step_dataset_input(pargs))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--exp", default="medium_sn")
@@ -365,6 +375,10 @@ def main():
     tag = f"s{args.num_steps}m{args.min_step}r{args.num_rules}_{ego_flow.tag().lstrip('_')}_seed{args.seed}"
     out_dir = setup.output_dir / "seq" / tag
     os.makedirs(out_dir, exist_ok=True)
+    if not all(os.path.exists(atoms_dir / f) for f in ["unique_atoms.json"]
+               + [f"{sp}_atoms_compressed.json" for sp in SPLITS] + [f"{sp}_boxes.pt" for sp in SPLITS]):
+        print(f"[Seq] the step_dataset output of {args.exp} is missing: preparing it")
+        ensure_dataset(args.exp, args.machine, args.device)
     unique_atoms = utils_data.load_json(atoms_dir / "unique_atoms.json")
     L = len(unique_atoms)
     names = [step05._atom_name(sig) for sig in unique_atoms] + [f"av:{a}" for a in ego_flow.ATOMS]
