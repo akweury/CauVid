@@ -32,7 +32,12 @@ Rules (`rule_stats`): each (rule, ego head) pair gets its lift (train precision 
 a kind: "rule" (lift > 1), "below" (lift <= 1: it only reorders inside the head) or "always" (fires on
 >= 90% of the at-risk rows: a bias). rules.md keeps the "rule" pairs with train support >= 10, duplicate
 bodies merged; rules_all.md lists all. A pruning check zeroes the head weights of the "below" (and
-"always") pairs and re-evaluates: if the metrics hold, those pairs were noise.
+"always") pairs and re-evaluates: if the metrics hold, those pairs were noise. Readable rules (rules.md)
+also predict >= --min_rule_hits train onsets. The rule list (`rule_list_scores`) predicts with them alone
+(the largest train precision of the firing rules of a head, else its base rate), so its metrics are
+those of the readable rules, apart from the rule net that found them.
+
+Re-evaluate saved models without training: add --eval_only (loads <tag>_seed<s>/rule_net.pt, mlp.pt).
 
 Run (server; GPU optional, decodes the videos once for the ego flow cache if missing):
   ./run_roadpp_docker.sh --gpu 6 --seq -- --exp full_sn
@@ -409,6 +414,7 @@ def rule_stats(model, train, test, heads, names, cfg):
                 risk = rows["at_risk"][:, h]
                 f = fired[split][:, r] & risk
                 e[f"{split}_fires"] = int(f.sum())
+                e[f"{split}_hits"] = int(rows["targets"][f, h].sum())
                 e[f"{split}_precision"] = float(rows["targets"][f, h].float().mean()) if f.any() else None
                 e[f"{split}_base"] = float(rows["targets"][risk, h].float().mean()) if risk.any() else None
                 e[f"{split}_coverage"] = float(f.sum()) / max(int(risk.sum()), 1)
@@ -417,7 +423,7 @@ def rule_stats(model, train, test, heads, names, cfg):
             e["kind"] = ("always" if e["train_coverage"] >= TAUTOLOGY
                          else "rule" if e["lift"] is not None and e["lift"] > 1 else "below")
             out.append(e)
-    return out
+    return out, fired
 
 
 def _merge(entries):
@@ -433,32 +439,53 @@ def _merge(entries):
     return list(merged.values())
 
 
+def _is_clean(e, cfg):
+    """A readable rule: above the head's base rate, train support >= min_rule_support and >= min_rule_hits
+    train onsets it predicts (a rare head's lift is large on a handful of hits)."""
+    return (e["kind"] == "rule" and e["train_fires"] >= cfg["min_rule_support"]
+            and e["train_hits"] >= cfg["min_rule_hits"])
+
+
 def rule_report(stats, cfg):
-    """Markdown of the rules: the clean table (kind "rule", train support >= min_rule_support, duplicates
-    merged, sorted by head then lift) and the full table with every kind."""
+    """Markdown of the rules: the clean table (`_is_clean`, duplicates merged, sorted by head then lift)
+    and the full table with every kind."""
     fmt = lambda v: "–" if v is None else f"{v:.2f}"
     rows = _merge(stats)
-    clean = sorted((e for e in rows if e["kind"] == "rule" and e["train_fires"] >= cfg["min_rule_support"]),
-                   key=lambda e: (e["head"], -e["lift"]))
-    head = ["| Head | Rule (body ⇒ next step) | Weight | Train fires | Train prec. | Base | Lift | Test fires | Test prec. |",
-            "|---|---|---|---|---|---|---|---|---|"]
+    clean = sorted((e for e in rows if _is_clean(e, cfg)), key=lambda e: (e["head"], -e["lift"]))
+    head = ["| Head | Rule (body ⇒ next step) | Weight | Train fires | Train hits | Train prec. | Base | Lift | Test fires "
+            "| Test prec. |", "|---|---|---|---|---|---|---|---|---|---|"]
     def row(e):
         copies = f" (×{e['copies']})" if e["copies"] > 1 else ""
         return (f"| {e['head']} | {e['body']}{copies} | {e['weight']:.2f} | {e['train_fires']} | "
-                f"{fmt(e['train_precision'])} | {fmt(e['train_base'])} | {fmt(e['lift'])} | {e['test_fires']} | "
+                f"{e['train_hits']} | {fmt(e['train_precision'])} | {fmt(e['train_base'])} | {fmt(e['lift'])} | {e['test_fires']} | "
                 f"{fmt(e['test_precision'])} |")
     count = Counter(e["kind"] for e in stats)
     dup = len(stats) - len(rows)
-    low = sum(1 for e in rows if e["kind"] == "rule" and e["train_fires"] < cfg["min_rule_support"])
+    low = sum(1 for e in rows if e["kind"] == "rule" and not _is_clean(e, cfg))
     summary = (f"{len(stats)} (rule, ego head) pairs with weight > 0.1: {count['rule']} above the base rate, "
                f"{count['below']} at or below it (or never firing on train), {count['always']} always on "
                f"(a bias: the body fires on >= {TAUTOLOGY:.0%} of the head's at-risk rows); {dup} duplicates merged; "
-               f"{low} above-base rules with train support < {cfg['min_rule_support']} left out. Kept: {len(clean)}.")
+               f"{low} above-base rules with train support < {cfg['min_rule_support']} or < {cfg['min_rule_hits']} "
+               f"train hits left out. Kept: {len(clean)}.")
     clean_lines = [summary, ""] + head + [row(e) for e in clean]
     full = sorted(rows, key=lambda e: (e["head"], e["kind"], -(e["lift"] or 0)))
     full_lines = [summary, "", head[0].replace("| Head |", "| Head | Kind |"), "|---" + head[1]]
     full_lines += [row(e).replace(f"| {e['head']} |", f"| {e['head']} | {e['kind']} |", 1) for e in full]
     return clean, clean_lines, full_lines
+
+
+def rule_list_scores(stats, fired, train, cfg):
+    """Scores of the readable rules alone (`_is_clean`): per row and ego head, the largest train precision
+    of the clean rules of the head whose body holds, else the head's train base rate. Every score is a
+    rule of rules.md (or the base rate), so the metrics of this predictor are those of the rule list."""
+    risk, tgt = train["at_risk"], train["targets"] & train["at_risk"]
+    base = tgt.sum(dim=0).float() / risk.sum(dim=0).clamp(min=1).float()
+    scores = base[None].repeat(len(fired), 1)
+    for e in stats:
+        if _is_clean(e, cfg):
+            h, f = e["head_index"], fired[:, e["rule"]]
+            scores[f, h] = torch.maximum(scores[f, h], torch.tensor(e["train_precision"]))
+    return scores
 
 
 @torch.no_grad()
@@ -500,6 +527,7 @@ def _model_table(results):
 
 
 RULE_NET, MLP, MARKOV1, MARKOV2 = "Rule net (ours)", "OnsetMLP", "Markov-1 (current state)", "Markov-2 (last two states)"
+RULE_LIST = "Rule list (readable rules only)"
 
 
 def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamples, out_dir, device, rtpt):
@@ -510,31 +538,42 @@ def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamp
     os.makedirs(out_dir, exist_ok=True)
     heads_d = heads.to(device)
     cfg = {"device": device, "seed": seed, "epochs": args.epochs, "warmup": 10, "patience": 20, "batch": 512,
-           "l0_lambda": 1e-3, "pos_weight": 1.0, "min_rule_support": 10}
-    print(f"[Seq] seed {seed}: rule net")
+           "l0_lambda": 1e-3, "pos_weight": 1.0, "min_rule_support": 10, "min_rule_hits": args.min_rule_hits}
     rule_net = TemporalRuleNet(A, 1, args.num_steps, args.num_rules, -11.0, "sigmoid", (1,), require_self=True,
                                ranges=True).to(device)
-    rule_net = fit(rule_net, rows["train"], rows["val"], heads_d, cfg, True)
-    rtpt_utils.step(rtpt, f"seed {seed} rule net")
-    print(f"[Seq] seed {seed}: MLP")
     mlp = OnsetMLP(A, 1, args.num_steps, args.num_rules, 0.2, (1,), open_memory=True).to(device)
-    mlp = fit(mlp, rows["train"], rows["val"], heads_d, cfg, False)
-    rtpt_utils.step(rtpt, f"seed {seed} mlp")
-    torch.save(rule_net.state_dict(), out_dir / "rule_net.pt")
-    torch.save(mlp.state_dict(), out_dir / "mlp.pt")
+    saved = (out_dir / "rule_net.pt").exists() and (out_dir / "mlp.pt").exists()
+    if args.eval_only and saved:
+        print(f"[Seq] seed {seed}: loading the trained models of {out_dir}")
+        rule_net.load_state_dict(torch.load(out_dir / "rule_net.pt", map_location=device))
+        mlp.load_state_dict(torch.load(out_dir / "mlp.pt", map_location=device))
+        rule_net.eval(), mlp.eval()
+    else:
+        if args.eval_only:
+            print(f"[Seq] seed {seed}: no saved models in {out_dir}, training")
+        print(f"[Seq] seed {seed}: rule net")
+        rule_net = fit(rule_net, rows["train"], rows["val"], heads_d, cfg, True)
+        rtpt_utils.step(rtpt, f"seed {seed} rule net")
+        print(f"[Seq] seed {seed}: MLP")
+        mlp = fit(mlp, rows["train"], rows["val"], heads_d, cfg, False)
+        rtpt_utils.step(rtpt, f"seed {seed} mlp")
+        torch.save(rule_net.state_dict(), out_dir / "rule_net.pt")
+        torch.save(mlp.state_dict(), out_dir / "mlp.pt")
 
     test = rows["test"]
+    stats, fired = rule_stats(rule_net, rows["train"], test, heads, names, cfg)
+    clean, clean_lines, full_lines = rule_report(stats, cfg)
     scores = dict(base_scores)
     scores[MLP] = model_scores(mlp, test, device)
     scores[RULE_NET] = model_scores(rule_net, test, device)
+    scores[RULE_LIST] = rule_list_scores(stats, fired["test"], rows["train"], cfg)
     ev = lambda s: evaluate(s, test, heads, label_heads, names, resamples)
     results = {name: ev(s) for name, s in scores.items()}
     pb = lambda a, b: paired_bootstrap([scores[a]], scores[b], test, heads, label_heads, names, resamples)
     paired = {f"{RULE_NET} − {MARKOV2}": pb(RULE_NET, MARKOV2), f"{RULE_NET} − {MARKOV1}": pb(RULE_NET, MARKOV1),
-              f"{RULE_NET} − {MLP}": pb(RULE_NET, MLP), f"{MLP} − {MARKOV2}": pb(MLP, MARKOV2)}
+              f"{RULE_NET} − {MLP}": pb(RULE_NET, MLP), f"{MLP} − {MARKOV2}": pb(MLP, MARKOV2),
+              f"{RULE_LIST} − {MARKOV2}": pb(RULE_LIST, MARKOV2), f"{RULE_LIST} − {RULE_NET}": pb(RULE_LIST, RULE_NET)}
 
-    stats = rule_stats(rule_net, rows["train"], test, heads, names, cfg)
-    clean, clean_lines, full_lines = rule_report(stats, cfg)
     pruned = {"all rules": results[RULE_NET],
               "without below-base": ev(pruned_scores(rule_net, stats, {"below"}, test, device)),
               "without below-base and always-on": ev(pruned_scores(rule_net, stats, {"below", "always"}, test, device))}
@@ -559,14 +598,16 @@ def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamp
            "| Rule net | Top-1 | Label top-1 | mAP | Micro AP |", "|---|---|---|---|---|"]
     md += [f"| {k} | {_fmt(r['top1'])} | {_fmt(r['label_top1'])} | {_fmt(r['map'])} | {_fmt(r['micro_ap'])} |"
            for k, r in pruned.items()]
-    md += ["", f"## 5. Rules of the rule net (above the base rate, train support >= {cfg['min_rule_support']})\n"]
+    md += ["", f"## 5. Rules of the rule net (above the base rate, train support >= {cfg['min_rule_support']}, "
+           f">= {cfg['min_rule_hits']} train hits; the rules of the rule list)\n"]
     md += clean_lines + ["", "All pairs with their kind: rules_all.md."]
     (out_dir / "rules.md").write_text("\n".join(clean_lines) + "\n")
     (out_dir / "rules_all.md").write_text("\n".join(full_lines) + "\n")
     (out_dir / "results.json").write_text(json.dumps({"args": vars(args), "seed": seed, "results": results,
                                                       "paired": paired, "pruned": pruned, "rules": stats},
                                                      indent=1, default=str))
-    return {"md": md, "results": results, "scores": {RULE_NET: scores[RULE_NET], MLP: scores[MLP]},
+    return {"md": md, "results": results,
+            "scores": {RULE_NET: scores[RULE_NET], MLP: scores[MLP], RULE_LIST: scores[RULE_LIST]},
             "clean": clean}
 
 
@@ -586,7 +627,9 @@ def summary_md(per_seed, base_scores, rows, heads, label_heads, names, resamples
                                            label_heads, names, resamples)
     paired = {f"{RULE_NET} (seed mean) − {MARKOV2}": pooled(RULE_NET, MARKOV2),
               f"{RULE_NET} (seed mean) − {MARKOV1}": pooled(RULE_NET, MARKOV1),
-              f"{MLP} (seed mean) − {MARKOV2}": pooled(MLP, MARKOV2)}
+              f"{MLP} (seed mean) − {MARKOV2}": pooled(MLP, MARKOV2),
+              f"{RULE_LIST} (seed mean) − {MARKOV2}": pooled(RULE_LIST, MARKOV2),
+              f"{RULE_LIST} (seed mean) − {MARKOV1}": pooled(RULE_LIST, MARKOV1)}
     md += ["", "Paired bootstrap of the seed-averaged metric (the same video resamples for every seed and the "
            "baseline):\n"] + _paired_lines(paired)
     seen = defaultdict(list)
@@ -615,6 +658,9 @@ def main():
     ap.add_argument("--seeds", default="0,1,2", help="comma-separated training seeds")
     ap.add_argument("--boot", type=int, default=1000, help="bootstrap resamples of the test videos")
     ap.add_argument("--ego_flow_workers", type=int, default=16)
+    ap.add_argument("--min_rule_hits", type=int, default=5, help="train onsets a readable rule must predict")
+    ap.add_argument("--eval_only", action="store_true",
+                    help="load the saved rule_net.pt / mlp.pt of each seed instead of training")
     args, _unknown = ap.parse_known_args()
     seeds = [int(s) for s in str(args.seeds).split(",") if s.strip()]
     setup = config.machine_setup(args)
