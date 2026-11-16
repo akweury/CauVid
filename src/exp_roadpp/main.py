@@ -3,7 +3,7 @@ import numpy as np
 
 from src.exp_roadpp import utils_pipe
 from src.exp_roadpp import step01, step02, step03, step04, step05, step05_causal, step05_rules, step05_motif, step05_layer, step06, step06_layer, step_dataset, step_baselines
-from src.exp_roadpp import step05_state, step06_state, step07_paper
+from src.exp_roadpp import step05_state, step06_state, step07_paper, step08_clips
 from src.exp_roadpp import config
 
 
@@ -58,6 +58,9 @@ def main():
     # paper numbers: every onset model at fixed false-alarm budgets (thresholds on val), the test events per model
     if args.paper == "True":
         step07_paper.main(step06_input)
+    # event clips around single test events and false alarms, for a human review of predictability
+    if args.event_clips == "True":
+        step08_clips.main(step06_input)
 
     return  # the baselines below are not part of the pipeline run
     # run baseline methods

@@ -71,6 +71,10 @@ def get_parser():
     parser.add_argument("--review_videos", type=str, default="False",
                         help="Step 06: render the review videos (review/, state_review/; ~1.4 GB each on full, slow), "
                              "default False; True to render them (e.g. later for one run: --run_id <run> --review_videos True)")
+    parser.add_argument("--event_clips", type=str, default="False",
+                        help="Step 08: short clips around single test events and false alarms for a human review of "
+                             "predictability (step06_output/clips, packs/clips_<run>.tar.gz), default False; "
+                             "e.g. for a finished run: --run_id <run> --event_clips True")
     parser.add_argument("--eval_min_context", type=int, default=0,
                         help="Step 06/07: score from this frame on at least (0: the model's memory)")
     parser.add_argument("--split", type=str, default="random", choices=["random", "stratified"],
