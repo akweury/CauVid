@@ -93,6 +93,10 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.ego_flow_diag"
     elif [[ "$arg" == "--box_stats" ]]; then
         ENTRY_MODULE="src.exp_roadpp.box_stats"
+    elif [[ "$arg" == "--sumo_gen" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.synth.sumo.run"
+    elif [[ "$arg" == "--sumo_render" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.synth.sumo.render"
     elif [[ "$arg" == "--ablation" ]]; then
         ENTRY_MODULE="src.exp_roadpp.ablation"
     else
@@ -103,10 +107,12 @@ EXTRA_ARGS=("${PY_ARGS[@]}")
 
 ROADPP_DATA_HOST="${CAUVID_ROADPP_DATA_HOST:-/storage-01/ml-jsha/CauVid_Data/roadpp}"
 ROADPP_OUTPUT_HOST="${CAUVID_ROADPP_OUTPUT_HOST:-/storage-01/ml-jsha/CauVid_output}"
+# synthetic datasets (exps with "dataset_name", src/exp_roadpp/synth): next to roadpp, as config.py expects
+SYNTH_DATA_HOST="${CAUVID_SYNTH_DATA_HOST:-$(dirname "$ROADPP_DATA_HOST")/synthetic}"
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
 MACHINE="${CAUVID_ROADPP_MACHINE:-dgx-jing}"
 
-mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST"
+mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST" "$SYNTH_DATA_HOST"
 
 # W&B key: the container is removed after each run (--rm, HOME=/tmp), so a key
 # typed at the login prompt is lost; forward it from the host instead.
@@ -174,6 +180,7 @@ docker run --rm -it \
     -v "$SCRIPT_DIR/src:/app/src" \
     -v "$SCRIPT_DIR/configs:/app/configs" \
     -v "$ROADPP_DATA_HOST:$ROADPP_DATA_HOST" \
+    -v "$SYNTH_DATA_HOST:$SYNTH_DATA_HOST" \
     -v "$ROADPP_OUTPUT_HOST:$ROADPP_OUTPUT_HOST" \
     -v "$TORCH_CACHE_HOST:/.cache/torch" \
     -e PYTHONPATH=/app \

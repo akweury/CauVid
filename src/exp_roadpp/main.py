@@ -22,14 +22,17 @@ def main():
     rtpt = rtpt_utils.start(f"roadpp-{args.exp}" + (f"-{variant}" if variant else ""), stages)
     # step 1: detect objects masks, labels, depths in
     # each frame of the video, cache the results as intermediate files
-    step01_input = config.get_step_01_input(args)
-    step01.main(step01_input)
-    rtpt_utils.step(rtpt, "step01")
+    # A synthetic dataset (exp_config "synthetic": true) has its ground truth already in gt/ and no
+    # videos: steps 01 and 02 are skipped.
+    if not getattr(args, "synthetic", False):
+        step01_input = config.get_step_01_input(args)
+        step01.main(step01_input)
+        rtpt_utils.step(rtpt, "step01")
 
-    # step 2: estimate the 3D pose of each object in each frame.
-    step02_input = config.get_step_02_input(args)
-    step02.main(step02_input)
-    rtpt_utils.step(rtpt, "step02")
+        # step 2: estimate the 3D pose of each object in each frame.
+        step02_input = config.get_step_02_input(args)
+        step02.main(step02_input)
+        rtpt_utils.step(rtpt, "step02")
 
     step_dataset_input = config.get_step_dataset_input(args)
     step_dataset.main(step_dataset_input)

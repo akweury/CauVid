@@ -51,3 +51,10 @@ uvicorn
 typer
 safetensors
 hdbscan
+
+# SUMO traffic simulation (synthetic datasets, src/exp_roadpp/synth/sumo); sumo-data pinned with it
+eclipse-sumo==1.27.1
+sumo-data==1.27.1
+libsumo==1.27.1
+traci==1.27.1
+sumolib==1.27.1

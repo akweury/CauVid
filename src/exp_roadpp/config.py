@@ -30,6 +30,25 @@ def step_0_setup(args):
     return setup_run(machine_setup(args))
 
 
+def roadpp_dataset_path(machine):
+    """The roadpp dataset folder of a machine."""
+    paths = {"ml-pulsar": Path('/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp'),
+             "dgx-flo": Path('/workspaces/CauVid/data/roadpp'),
+             "dgx-jing": Path('/storage-01/ml-jsha/CauVid_Data/roadpp'),
+             "macbook-pro": root / 'data' / 'roadpp',
+             "jst": root / 'data' / 'roadpp'}
+    if machine not in paths:
+        raise ValueError(f"Add your own machine settings in config.py to setup device, output_dir, and dataset_path. "
+                         f"Current machine: {machine}")
+    return paths[machine]
+
+
+def synthetic_dataset_path(machine, name):
+    """A synthetic dataset (`synth/sumo/run.py`): <roadpp folder>/../synthetic/<name>, with gt/label.json and
+    gt/{vid}_gt.json as roadpp."""
+    return roadpp_dataset_path(machine).parent / "synthetic" / name
+
+
 def machine_setup(args):
     """args.device, args.dataset_path and args.output_dir of args.machine and args.exp (no run folder;
     `step_0_setup` adds it). Diagnostics that only read the shared step outputs use this alone."""
@@ -38,16 +57,16 @@ def machine_setup(args):
     if args.machine == "ml-pulsar":
         print("\n##### Running on ml-pulsar #####\n")
         args.device = "cuda:0"
-        args.dataset_path = Path('/home/sha/mnt/remote/dgx-g/storage-01/CauVid_Data/roadpp')
+        args.dataset_path = roadpp_dataset_path(args.machine)
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
     # dgx
     elif args.machine == "dgx-flo":
         args.device = "cuda:0"
-        args.dataset_path = Path('/workspaces/CauVid/data/roadpp')
+        args.dataset_path = roadpp_dataset_path(args.machine)
         args.output_dir = root / 'output'/ 'roadpp' / args.exp
     elif args.machine == "dgx-jing":
         print("\n##### Running on DGX #####\n")
-        args.dataset_path = Path('/storage-01/ml-jsha/CauVid_Data/roadpp')
+        args.dataset_path = roadpp_dataset_path(args.machine)
         args.output_dir = Path(f'/storage-01/ml-jsha/CauVid_output/roadpp/{args.exp}')
         args.device = f'{args.device}'
         print(f"\n##### Output directory: {args.output_dir} #####\n")
@@ -57,7 +76,7 @@ def machine_setup(args):
     elif args.machine == "macbook-pro":
         print("\n##### Running on MacBook Pro #####\n")
         args.device = "cpu"
-        args.dataset_path = root / 'data' / 'roadpp'
+        args.dataset_path = roadpp_dataset_path(args.machine)
         args.output_dir = root / 'output' / 'roadpp' / args.exp
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(args.dataset_path, exist_ok=True)
@@ -66,7 +85,7 @@ def machine_setup(args):
     elif args.machine == "jst":
         print("\n##### Running on JST #####\n")
         args.device = "cuda:0"
-        args.dataset_path = root / 'data' / 'roadpp'
+        args.dataset_path = roadpp_dataset_path(args.machine)
         args.output_dir = root / 'output' / 'roadpp' / args.exp
         os.makedirs(root / 'output', exist_ok=True)
         os.makedirs(root / 'output' / 'roadpp', exist_ok=True)
@@ -75,6 +94,10 @@ def machine_setup(args):
         raise ValueError(f"Add your own machine settings in config.py to setup device, output_dir, and dataset_path. "
                          f"Current machine: {args.machine}")
 
+
+    # a synthetic dataset instead of roadpp: exp_config "dataset_name" (exps synthetic_*)
+    if getattr(args, "dataset_name", None):
+        args.dataset_path = synthetic_dataset_path(args.machine, args.dataset_name)
 
     # test the dataset path
     if os.path.exists(args.dataset_path):
