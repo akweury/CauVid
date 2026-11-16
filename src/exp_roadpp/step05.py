@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data, roles as agent_roles, geometry as agent_geometry, grid as agent_grid
 from src.exp_roadpp import motion as agent_motion, ego_motion as agent_ego_motion, ego_flow as agent_ego_flow
-from src.exp_roadpp.cauvid import TemporalRuleNet
+from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins, slot_spans
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
 
 
@@ -937,7 +937,7 @@ def _seeded_rule_net(training_data, cfg):
                             len(anchors) * cfg["num_slots"] + cfg["num_free_rules"], cfg["init_log_alpha"],
                             cfg["mask_type"], cfg["windows"], roles=cfg["roles"],
                             input_mask=rule_input_mask(training_data, cfg, 2 + len(cfg["roles"])),
-                            require_self=cfg.get("require_self", False))
+                            require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False))
     num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
     print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
           f"{cfg['mask_type']} mask")
@@ -984,10 +984,12 @@ def train_temporal_rule_net(training_data, cfg, run=None):
                          cfg["history_file"], run)
 
 
-def _saved_roles(num_inputs, num_atoms, cfg):
+def _saved_roles(num_inputs, num_atoms, cfg, per_scope=None):
     """The roles of a saved model with num_inputs memory inputs: none for a model of
     the two scopes (own, others; trained before the roles), else cfg["roles"]."""
-    num_scopes = num_inputs // (cfg["num_slots"] * num_atoms)
+    # per_scope: the inputs per scope and atom (the rule net: its spans; the MLP: its packed slots)
+    per_scope = per_scope or len(slot_spans(cfg["num_slots"], cfg.get("slot_ranges", False)))
+    num_scopes = num_inputs // (per_scope * num_atoms)
     if num_scopes == 2:
         return ()
     if num_scopes != 2 + len(cfg["roles"]):
@@ -1009,7 +1011,7 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
                             state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"],
                             roles=roles, input_mask=rule_input_mask(training_data, cfg, 2 + len(roles)),
-                            require_self=cfg.get("require_self", False))
+                            require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False))
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -1091,7 +1093,8 @@ def train_onset_mlp(training_data, cfg, run=None):
     rule nodes of the TemporalRuleNet, so both have about as many parameters."""
     hidden_size = cfg["mlp_hidden_size"] or len(anchor_rules(cfg)) * cfg["num_slots"] + cfg["num_free_rules"]
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], hidden_size, cfg["mlp_dropout"],
-                     cfg["windows"], cfg["mlp_activation"], roles=cfg["roles"]).to(cfg["device"])
+                     cfg["windows"], cfg["mlp_activation"], roles=cfg["roles"],
+                     open_memory=cfg.get("slot_ranges", False)).to(cfg["device"])
     print(f"[Baseline] OnsetMLP with {hidden_size} {cfg['mlp_activation']} hidden units, lr {cfg['mlp_lr']}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["mlp_lr"], weight_decay=cfg["mlp_weight_decay"])
     mlp_cfg = {**cfg, "grad_clip": cfg["mlp_grad_clip"], "lr_patience": cfg["mlp_lr_patience"],
@@ -1113,7 +1116,9 @@ def load_onset_mlp(training_data, cfg):
     state = torch.load(cfg["mlp_model_file"], map_location="cpu")
     model = OnsetMLP(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], state["hidden.weight"].shape[0],
                      windows=cfg["windows"], activation=cfg["mlp_activation"],
-                     roles=_saved_roles(state["hidden.weight"].shape[1] // 2, training_data["num_atoms"], cfg))
+                     roles=_saved_roles(state["hidden.weight"].shape[1] // 2, training_data["num_atoms"], cfg,
+                                        len(memory_bins(cfg["num_slots"], cfg.get("slot_ranges", False)))),
+                     open_memory=cfg.get("slot_ranges", False))
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -1202,7 +1207,9 @@ def _temporal_clause_text(clause, unique_atoms):
     def atom(atom_index, slot):
         return f"{_atom_name(unique_atoms[atom_index])}({names[slot] if slot < len(names) else f'X{slot}'})"
     size = clause.get("slot_size", 10)
-    body = " -> ".join(f"{atom(a, slot)}@-{size * j}..-{size * (j - 1)}f" for a, slot, j in clause["bodies"])
+    frames = clause.get("span_frames") or [(size * (j - 1), size * j) for _a, _slot, j in clause["bodies"]]
+    body = " -> ".join(f"{atom(a, slot)}@-{'inf' if far is None else far}..-{near}f"
+                       for (a, slot, _j), (near, far) in zip(clause["bodies"], frames))
     return f"{body} => {atom(*clause['head'])}"
 
 
@@ -1244,7 +1251,7 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
             if support < cfg["min_support"] or num_videos < cfg["min_videos"]:
                 continue
             partial = []
-            for f in range(max(offsets)):
+            for f in range(min(max(offsets), model.num_slots)):
                 partial.append({
                     "unseen_slots": f,
                     "known_bodies": sum(j > f for j in offsets),
@@ -1254,6 +1261,10 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
                 })
             clauses.append({
                 "bodies": [list(b) for b in rule["bodies"]],
+                # The slots a..b before the head's each body may hold in (a == b == j without slot ranges).
+                "spans": [list(sp) for sp in rule.get("spans", [(j, j) for _a, _s, j in rule["bodies"]])],
+                # The frames near..far before the head's slot of each body (far None: any known time before).
+                "span_frames": [list(sp) for sp in rule.get("span_frames", [])] or None,
                 "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
                 "scope_names": scope_names(model),
                 "head": [h, 0],
@@ -1576,6 +1587,10 @@ def get_cfg(input_data):
     # (80% / 94% of the onsets 1-2 s before, 15% of the controls), the speed falls before AV-Stop.
     # Off until an ablation shows a clear gain.
     ego_flow = input_data.get("ego_flow", False)              # --ego_flow (default False)
+    # Slot ranges (`TemporalRuleNet` ranges): a body reads a span of slots a..b ("slowing down 2-4 s before")
+    # instead of one 1 s slot, so the steps of a sequence may last more or less long. Off until an
+    # ablation shows a clear gain.
+    slot_ranges = input_data.get("slot_ranges", False)        # --slot_ranges (default False)
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
     require_self = input_data.get("require_self", True)       # --require_self (default True)
@@ -1624,11 +1639,11 @@ def get_cfg(input_data):
                 + grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion, "ego_flow": ego_flow}))
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
-    tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "")
+    tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "") + ("_rng" if slot_ranges else "")
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
-    mlp_tag = f"{base_tag}_lr{mlp_lr:g}_{mlp_activation}"
+    mlp_tag = f"{base_tag}_lr{mlp_lr:g}_{mlp_activation}" + ("_older" if slot_ranges else "")
     return {
             'device': input_data['device'],
             'seed': 0,
@@ -1741,6 +1756,7 @@ def get_cfg(input_data):
             # The ego motion level cuts fitted on the train split (`fit_ego_motion`).
             'ego_motion_file': input_data["output_dir"] / f"ego_motion_spec{agent_ego_motion.tag()}.json",
             'ego_flow': ego_flow,
+            'slot_ranges': slot_ranges,
             # The raw flow samples per video (`ego_flow.ensure_cache`), shared by every exp and run.
             'ego_flow_cache_dir': input_data.get("ego_flow_cache_dir"),
             'ego_flow_workers': int(input_data.get("ego_flow_workers", 16)),

@@ -1,6 +1,6 @@
 import torch
 
-from src.exp_roadpp.cauvid import TemporalRuleNet
+from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins
 
 
 class OnsetMLP(torch.nn.Module):
@@ -30,16 +30,19 @@ class OnsetMLP(torch.nn.Module):
     ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "relu": torch.relu}
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, hidden_size=256, dropout=0.2, windows=(10,),
-                 activation="gelu", roles=()):
+                 activation="gelu", roles=(), open_memory=False):
         super().__init__()
         self.num_atoms = num_atoms
         # The memory slots of TemporalRuleNet.
         self.slot_size, self.num_slots = slot_size, num_slots
         self.num_lags = slot_size * num_slots
+        # The rule net's "older" slot of slot ranges (every known frame before the slots): the packed
+        # rows are shared, so the MLP reads it too.
+        self.open_memory = bool(open_memory)
         # The scopes of TemporalRuleNet: the agent itself, some other agent, one per role.
         self.roles = tuple(roles)
         self.num_scopes = 2 + len(self.roles)
-        self.num_inputs = self.num_scopes * num_slots * num_atoms
+        self.num_inputs = self.num_scopes * len(memory_bins(num_slots, self.open_memory)) * num_atoms
         self.windows = list(windows)
         self.hidden = torch.nn.Linear(2 * self.num_inputs, hidden_size)
         self.dropout = torch.nn.Dropout(dropout)

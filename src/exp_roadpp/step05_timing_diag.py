@@ -434,6 +434,8 @@ def main():
     parser.add_argument("--fps", type=int, default=FPS)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    from src.exp_roadpp import rtpt_utils
+    rtpt_utils.start(f"roadpp-{args.exp}-timing_diag", 1)        # process title on the server
     if args.atoms_dir is None:
         from src.exp_roadpp import config
         args.atoms_dir = config.machine_setup(args).output_dir / "step_dataset_output" / "atoms"

@@ -360,6 +360,8 @@ def get_step_05_input(args):
         # Ego flow atoms (`ego_flow.py`): the raw flow per video is cached once for every exp
         # (<output root>/roadpp/ego_flow_cache/<version>), decoded from the camera videos.
         "ego_flow": str(getattr(args, "ego_flow", "False")) == "True",
+        # Slot ranges of the rule bodies (`TemporalRuleNet` ranges): a body holds somewhere in slots a..b.
+        "slot_ranges": str(getattr(args, "slot_ranges", "False")) == "True",
         "ego_flow_cache_dir": args.output_dir.parent / "ego_flow_cache" / ego_flow.VERSION,
         "ego_flow_workers": int(getattr(args, "ego_flow_workers", 16)),
         "frame_dir": args.dataset_path / "frames",

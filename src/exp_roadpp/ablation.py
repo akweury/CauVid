@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from src.exp_roadpp import config, paper_tables
+from src.exp_roadpp import config, paper_tables, rtpt_utils
 
 # name: (table label, group, main.py args). The groups order Table 2.
 VARIANTS = {
@@ -42,6 +42,11 @@ VARIANTS = {
     "motion": ("+ motion atoms", "inputs", ["--motion", "True"]),
     "ego_motion": ("+ ego motion atoms", "inputs", ["--ego_motion", "True"]),
     "ego_flow": ("+ ego flow atoms (image yaw / speed)", "inputs", ["--ego_flow", "True"]),
+    # Sequences of steps with variable durations (slow down, move right, turn right): bodies over slot
+    # ranges a..b and the whole known memory (open spans "a s ago or any time before").
+    "slot_ranges": ("+ slot ranges, all known memory", "structure", ["--slot_ranges", "True"]),
+    "ego_flow_ranges": ("+ ego flow, slot ranges, all known memory", "structure",
+                        ["--ego_flow", "True", "--slot_ranges", "True"]),
     "roles": ("+ agent roles (ahead, near ped.)", "inputs", ["--roles", "ahead,near_ped"]),
     "geometry": ("+ geometry atoms", "inputs", ["--geometry", "True"]),
     # Structure and training.
@@ -159,6 +164,8 @@ def main():
     def save():
         json.dump(state, open(state_file, "w"), indent=2)
     print(f"[Suite] {suite}: {len(names)} variants ({', '.join(names)}), scored from frame {eval_min_context}")
+    # RTPT title of the suite process (one iteration per variant); every variant run names itself too (main.py).
+    rtpt = rtpt_utils.start(f"roadpp-{args.exp}-suite", len(names))
     for i, name in enumerate(names):
         label, group, extra = VARIANTS[name]
         run_id = f"{suite}_{name}"
@@ -168,6 +175,7 @@ def main():
             print(f"[Suite] ({i + 1}/{len(names)}) {name}: done, skipped")
             entry["status"] = "done"
             save()
+            rtpt_utils.step(rtpt, name)
             continue
         cmd = [sys.executable, "-m", "src.exp_roadpp.main", "--exp", args.exp, "--machine", args.machine,
                "--device", args.device, "--run_id", run_id, "--eval_min_context", str(eval_min_context),
@@ -187,6 +195,7 @@ def main():
                       "minutes": round((time.time() - t0) / 60, 1)})
         save()
         print(f"[Suite] {name}: {entry['status']}, {entry['minutes']} min")
+        rtpt_utils.step(rtpt, name)
 
     # Tables of every finished variant.
     done = [n for n in names if state["variants"].get(n, {}).get("status") == "done"]

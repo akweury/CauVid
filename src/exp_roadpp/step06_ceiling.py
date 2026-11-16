@@ -64,8 +64,8 @@ def collect(model, mlp, data, cfg, ce, calibration=None):
     w_index = torch.tensor([list(model.windows).index(w) for w in windows], device=device)
     k_head = list(model.windows).index(cfg["headline_window"])
     window_sizes = torch.tensor(model.windows, device=device)
-    M = model.num_inputs
-    own = model.num_slots * model.num_atoms                                     # scope 0 comes first
+    M = getattr(model, "num_memory_inputs", model.num_inputs)                  # the packed per-slot inputs
+    own = getattr(model, "num_memory_slots", model.num_slots) * model.num_atoms  # scope 0 comes first
     # Inputs (B, 2M): the true part, then the known part; each (scopes, slots, atoms), the last slot first.
     labels = data.get("num_label_atoms", A)
     columns = {"inputs": torch.arange(2 * M, device=device),

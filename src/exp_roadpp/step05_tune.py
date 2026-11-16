@@ -94,6 +94,8 @@ def plot_sweeps(results, base_cfg, plot_file):
 def main():
     args = utils_pipe.parse_args()
     args = config.step_0_setup(args)
+    from src.exp_roadpp import rtpt_utils
+    rtpt_utils.start(f"roadpp-{args.exp}-tune05", 1)           # process title on the server
     step05_input = config.get_step_05_input(args)
     val_atoms_file = config.get_step_06_input(args)["val_atoms_file"]
     base_cfg = step05.get_cfg(step05_input)

@@ -144,6 +144,30 @@ class CauVid:
         
     
 
+def memory_bins(num_slots, open_memory=False):
+    """The memory slots of a TemporalRuleNet as (first, last) slot of slot_size frames before the head's
+    slot: the num_slots single slots, then with open_memory coarser bins over every known frame before
+    them, doubling in width (J+1..2J, 2J+1..4J) and the last one open (4J+1..None: any known time
+    before, back to the start of the known history). With J = 3: 1, 2, 3, 3-6, 6-12, > 12 s.
+    The bins are bounded so a far step keeps its order: an open "any time before" alone is true in
+    almost every row of a long video (synthetic check: no gain with one open slot)."""
+    bins = [(j, j) for j in range(1, num_slots + 1)]
+    if open_memory:
+        bins += [(num_slots + 1, 2 * num_slots), (2 * num_slots + 1, 4 * num_slots), (4 * num_slots + 1, None)]
+    return bins
+
+
+def slot_spans(num_slots, ranges=False):
+    """The body spans (a, b) of a TemporalRuleNet, over the indices 1..n of its `memory_bins`: the single
+    bins (j, j) first, then with ranges (whose memory is open, every known frame) every longer
+    contiguous a..b (shortest first)."""
+    n = len(memory_bins(num_slots, ranges))
+    spans = [(j, j) for j in range(1, n + 1)]
+    if ranges:
+        spans += [(a, a + w - 1) for w in range(2, n + 1) for a in range(1, n - w + 2)]
+    return spans
+
+
 class TemporalRuleNet(torch.nn.Module):
     """Slot rule network: predicts, for every agent visible in frame t, how likely
     each atom switches on within the next W frames (W = 10, 20, ..., one window
@@ -184,10 +208,31 @@ class TemporalRuleNet(torch.nn.Module):
     mask_type "hard_concrete": a stochastic L0 mask while training. "sigmoid": the
     deterministic mask sigmoid(log_alpha) of `LayeredRuleNet`, started near 0 so
     every input gets a gradient, kept sparse by an L1 loss.
+
+    ranges (`slot_spans`): a body input reads a span of slots j = a..b instead of one slot j: true
+    if the atom was seen in any slot of the span, false if every slot of it is known and the atom
+    absent. The spans are every contiguous a..b (the single slots first, then the longer ones),
+    so the rule learns how far back and how wide each step lies: "slowing down 2-4 s before,
+    moving right 1-2 s before" covers a sequence whose steps last more or less long, which a
+    body tied to one 1 s slot splits into many rules. Bodies in different spans still give the
+    order of the steps. The packed inputs (`layer_inputs`) stay per slot; `split_inputs` turns
+    them into the span inputs (so the OnsetMLP and every scorer see the same packed rows). Rule
+    inputs are indexed (scope, span, atom); num_inputs counts them, num_memory_inputs the packed
+    per-slot ones. Aligned to a future slot f, a span a..b lies in past slots a-f..b-f: fully
+    past if a > f, unknown if b <= f, and in between (a <= f < b) it reads the past part 1..b-f
+    and may still come true in the future, so "absent so far" is unknown, not false.
+    With ranges the memory is every known frame, not only the num_slots slots: the packed inputs get
+    the coarser `memory_bins` after the J slots (J = 3: 3-6 s, 6-12 s, > 12 s; the last one open, back
+    to the start of the known history), and a span may cover single slots and bins ("slowing down
+    3-12 s before"). A bin is false if all of it is known and the atom absent (the open one: if some of
+    it is known), unknown if part of it is not known and the atom not seen. Aligned to a future slot
+    f, the slots of a span move f slots back as above; the coarse bins are not moved (approximation:
+    the f <= J - 1 slots of the shift are small next to their 3 s+ width).
     """
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
-                 mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None, require_self=False):
+                 mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None, require_self=False,
+                 ranges=False):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
@@ -201,7 +246,14 @@ class TemporalRuleNet(torch.nn.Module):
         self.num_lags = slot_size * num_slots          # frames of memory
         self.roles = tuple(roles)
         self.num_scopes = 2 + len(self.roles)
-        self.num_inputs = self.num_scopes * num_slots * num_atoms
+        self.ranges = bool(ranges)
+        self.open_memory = self.ranges                             # coarse bins: all known memory
+        self.bins = memory_bins(num_slots, self.open_memory)
+        self.num_memory_slots = len(self.bins)
+        self.spans = slot_spans(num_slots, self.ranges)            # [(a, b)], the single slots first
+        self.num_spans = len(self.spans)
+        self.num_memory_inputs = self.num_scopes * self.num_memory_slots * num_atoms   # packed, per slot
+        self.num_inputs = self.num_scopes * self.num_spans * num_atoms       # rule inputs, per span
         self.windows = windows
         num_future = len(windows)
         # Very negative so only a few random inputs per rule start non-zero.
@@ -213,8 +265,14 @@ class TemporalRuleNet(torch.nn.Module):
         self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
         # (M,) bool: the memory inputs a rule may learn (None: all), e.g. not the grid position
         # atoms of the other agents (`step05.rule_input_mask`). Not saved: rebuilt from the data.
-        if input_mask is not None and input_mask.shape != (self.num_inputs,):
-            raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
+        # The mask of `step05.rule_input_mask` is per (scope, slot, atom); it depends on the scope and
+        # the atom only, so the span inputs take the one of the span's first slot.
+        if input_mask is not None:
+            if input_mask.shape != (self.num_inputs,) and input_mask.numel() % (self.num_scopes * num_atoms) == 0:
+                per_scope = input_mask.bool().view(self.num_scopes, -1, num_atoms)[:, 0]     # (scopes, A)
+                input_mask = per_scope[:, None, :].expand(-1, self.num_spans, -1).reshape(-1)
+            if input_mask.shape != (self.num_inputs,):
+                raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
         self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None
                              else input_mask.bool().clone(), persistent=False)
         # require_self: every rule must hold an atom of the agent itself (scope 0). Its activation is
@@ -222,26 +280,68 @@ class TemporalRuleNet(torch.nn.Module):
         # (`forward`): ~1 for a rule with own-agent atoms (they all hold when it fires), ~0 for a rule
         # of the other agents only, which would otherwise fire for every agent of the scene alike.
         self.require_self = require_self
-        self.register_buffer("self_inputs", torch.arange(self.num_inputs) < num_slots * num_atoms,
+        self.register_buffer("self_inputs", torch.arange(self.num_inputs) < self.num_spans * num_atoms,
                              persistent=False)
-        # Slot offset j of every input; and for each future slot f, the memory input each rule
-        # input (atom, slot type, j) reads (past slot j - f), or M (unknown) for j <= f.
-        j = (torch.arange(self.num_inputs) // num_atoms) % num_slots + 1
-        self.register_buffer("input_offset", j)
-        shift = []
+        # Nearest slot a of every input's span (its slot offset j for single slots): the input is
+        # fully in the memory for a head in future slot f iff a > f. For each f, the input each rule
+        # input reads (its span moved f slots back, `class doc`), M (unknown) if all of it is in the
+        # future, and partial_future: the span is partly in the future (absent so far = unknown).
+        span_of = {sp: i for i, sp in enumerate(self.spans)}
+        m = torch.arange(self.num_inputs)
+        scope, span, atom = m // (self.num_spans * num_atoms), (m // num_atoms) % self.num_spans, m % num_atoms
+        a = torch.tensor([self.spans[i][0] for i in span.tolist()])
+        b = torch.tensor([self.spans[i][1] for i in span.tolist()])
+        self.register_buffer("input_offset", a)
+        shift, partial = [], []
         for f in range(min(num_future, num_slots)):
-            shift.append(torch.where(j > f, torch.arange(self.num_inputs) - f * num_atoms, self.num_inputs))
+            index = torch.full((self.num_inputs,), self.num_inputs, dtype=torch.long)
+            part = torch.zeros(self.num_inputs, dtype=torch.bool)
+            for i in range(self.num_inputs):
+                lo, hi = int(a[i]) - f, int(b[i]) - f
+                if int(a[i]) > num_slots:                        # coarse bins only: not moved
+                    lo, hi = int(a[i]), int(b[i])
+                elif int(b[i]) > num_slots:                      # slots and bins: the slots move
+                    hi = int(b[i])
+                if hi < 1:
+                    continue
+                target = span_of[(max(lo, 1), hi)]
+                index[i] = (int(scope[i]) * self.num_spans + target) * num_atoms + int(atom[i])
+                part[i] = lo < 1
+            shift.append(index)
+            partial.append(part)
         self.register_buffer("shift_index", torch.stack(shift))
+        self.register_buffer("partial_future", torch.stack(partial), persistent=False)
+        # (num_spans, num_slots) float: the slots of each span (`split_inputs`).
+        cover = torch.zeros((self.num_spans, self.num_memory_slots))
+        for i, (lo, hi) in enumerate(self.spans):
+            cover[i, lo - 1:hi] = 1.0
+        self.register_buffer("span_cover", cover, persistent=False)
 
-    def input_index(self, atom, slot, offset):
-        """Input node of `decode_input`'s (atom, slot type (scope), slot offset j = 1..num_slots)."""
+    def input_index(self, atom, slot, offset, end=None):
+        """Input node of (atom, slot type (scope), slots offset..end before the head; end default offset,
+        a single slot j = 1..num_slots; end "older" (or num_slots + 1): open, any known time before)."""
         if not 0 <= slot < self.num_scopes:
             raise ValueError(f"Scope {slot} outside 0..{self.num_scopes - 1}.")
-        return slot * self.num_slots * self.num_atoms + (offset - 1) * self.num_atoms + atom
+        end = offset if end is None else (self.num_memory_slots if end == "older" else end)
+        span = self.spans.index((offset, end))
+        return (slot * self.num_spans + span) * self.num_atoms + atom
 
     def split_inputs(self, inputs):
-        """Packed inputs (B, 2M) -> truth values x (B, M), known flags k (B, M)."""
-        return inputs[:, :self.num_inputs], inputs[:, self.num_inputs:]
+        """Packed inputs (B, 2 * num_memory_inputs) of `layer_inputs` -> the rule inputs: truth values
+        x (B, M) and known flags k (B, M), per span (`class doc`; the slots themselves without ranges)."""
+        P = self.num_memory_inputs
+        x, k = inputs[:, :P], inputs[:, P:]
+        if not self.ranges:
+            return x, k
+        B, J, A = len(inputs), self.num_memory_slots, self.num_atoms
+        x = x.reshape(B, self.num_scopes, J, A)
+        k = k.reshape(B, self.num_scopes, J, A)
+        cover = self.span_cover.to(x.dtype)
+        seen = torch.einsum("sj,bcja->bcsa", cover, x)                          # slots of the span seen
+        unknown = torch.einsum("sj,bcja->bcsa", cover, 1 - k)                   # slots of it not known
+        xs = (seen > 0).to(x.dtype)
+        ks = torch.maximum(xs, (unknown == 0).to(x.dtype))
+        return xs.reshape(B, -1), ks.reshape(B, -1)
 
     @torch.no_grad()
     def seed_rules(self, anchors, head_weight=1.0):
@@ -284,16 +384,31 @@ class TemporalRuleNet(torch.nn.Module):
         same order (row f * N + n of the full output, the kept ones), saving memory.
         """
         J, S, A = self.num_slots, self.slot_size, self.num_atoms
+        bins = memory_bins(J, getattr(self, "open_memory", False))   # the J slots, then the coarse bins
+        JM = len(bins)
         N, F = X.shape[1], len(frames)
         history = frames if history is None else torch.minimum(history.to(frames.device), frames)
         lags = torch.arange(1, J * S + 1, device=X.device)
         past = frames[:, None] - lags                                          # (F, L)
         observed = lags[None, :] <= history.clamp(min=0)[:, None]              # (F, L), implies past >= 0
         # The atoms seen in each slot, one slot at a time ((F, S, N, A) at most, not (F, L, N, A)).
-        own = torch.zeros((F, J, N, A), dtype=torch.bool, device=X.device)
+        own = torch.zeros((F, JM, N, A), dtype=torch.bool, device=X.device)
         for j in range(J):
             lag = slice(j * S, (j + 1) * S)
             own[:, j] = (X[past[:, lag].clamp(min=0)] & observed[:, lag, None, None]).any(dim=1)
+        coarse_known = []
+        if JM > J:
+            # Coarse bin (first, last) slot: the known frames with lags (first-1)*S+1 .. last*S (prefix sums).
+            cum = torch.cat([torch.zeros((1, N, A), dtype=torch.int32, device=X.device),
+                             X.int().cumsum(dim=0, dtype=torch.int32)])           # cum[u]: frames < u
+            T, h = X.shape[0], history.clamp(min=0)
+            for i, (first, last) in enumerate(bins[J:], start=J):
+                near = (first - 1) * S + 1                                       # smallest lag of the bin
+                far = h if last is None else torch.minimum(h, torch.full_like(h, last * S))
+                lo = (frames - far).clamp(0, T)
+                hi = (frames - near + 1).clamp(0, T)
+                own[:, i] = ((cum[hi] - cum[lo]) > 0) & ((far >= near) & (hi > lo))[:, None, None]
+                coarse_known.append(h >= near if last is None else h >= last * S)
         holders = own.sum(dim=2, keepdim=True)
         others = (holders - own.int()) > 0
         channels = [own, others]
@@ -305,17 +420,20 @@ class TemporalRuleNet(torch.nn.Module):
             partner = torch.where((last >= 0)[:, None, None], partner, -1)
             for k in range(len(self.roles)):
                 p = partner[:, :, k]                                           # (F, N)
-                index = p.clamp(min=0)[:, None, :, None].expand(F, J, N, A)
+                index = p.clamp(min=0)[:, None, :, None].expand(F, JM, N, A)
                 channels.append(own.gather(2, index) & (p >= 0)[:, None, :, None])
         x = torch.stack(channels, dim=1)                                       # (F, scopes, J, N, A)
         slot_known = (torch.arange(1, J + 1, device=X.device) * S)[None, :] <= history.clamp(min=0)[:, None]
+        if coarse_known:                                        # bounded bins: all known; the open one: some
+            slot_known = torch.cat([slot_known, torch.stack(coarse_known, dim=1)], dim=1)
         k = x | slot_known[:, None, :, None, None]
         x = x.permute(0, 3, 1, 2, 4)                                           # (F, N, scopes, J, A)
         k = k.permute(0, 3, 1, 2, 4)
         if keep is not None:
             x, k = x[keep], k[keep]
-        x = x.reshape(-1, self.num_inputs)
-        k = k.reshape(-1, self.num_inputs)
+        packed = getattr(self, "num_memory_inputs", self.num_inputs)           # the OnsetMLP: num_inputs
+        x = x.reshape(-1, packed)
+        k = k.reshape(-1, packed)
         return torch.cat([x, k], dim=1).float()
 
     def training_rows(self, X, frames, min_off_frames=1, history=None, roles=None):
@@ -412,10 +530,16 @@ class TemporalRuleNet(torch.nn.Module):
         for f in range(len(self.windows)):
             if f < self.num_slots:
                 index = self.shift_index[f]
-                rules = torch.exp(false[:, index] @ log_false.T + unknown[:, index] @ log_unknown.T)
+                false_f, unknown_f = false[:, index], unknown[:, index]
+                if self.ranges and self.partial_future[f].any():
+                    # A span partly in the future: absent so far is unknown, not false.
+                    part = self.partial_future[f].to(false_f.dtype)
+                    unknown_f = unknown_f + false_f * part
+                    false_f = false_f * (1 - part)
+                rules = torch.exp(false_f @ log_false.T + unknown_f @ log_unknown.T)
                 if self.require_self:
                     rules = rules * -torch.expm1(true[:, index] @ log_self_true.T
-                                                 + unknown[:, index] @ log_self_unknown.T)
+                                                 + unknown_f @ log_self_unknown.T)
             else:
                 # Every body lies in the future: the same activation for every row.
                 if all_unknown is None:
@@ -480,9 +604,21 @@ class TemporalRuleNet(torch.nn.Module):
     def decode_input(self, m):
         """Input node m -> (atom, slot type, j): slot type 0 the agent itself, 1
         another agent, 2 + k the agent of role self.roles[k]; the atom holds in
-        the slot j slots before the head's slot."""
-        J, A = self.num_slots, self.num_atoms
-        return m % A, m // (J * A), (m // A) % J + 1
+        the slot j slots before the head's slot (for a span a..b, j = a, its nearest slot;
+        `decode_span`)."""
+        S, A = self.num_spans, self.num_atoms
+        return m % A, m // (S * A), self.spans[(m // A) % S][0]
+
+    def decode_span(self, m):
+        """Input node m -> its span (a, b) of `memory_bins` indices: the atom holds in some bin a..b."""
+        return self.spans[(m // self.num_atoms) % self.num_spans]
+
+    def span_frames(self, m):
+        """Input node m -> (near, far): the atom holds near..far frames before the head's slot (far None:
+        any known time before)."""
+        a, b = self.decode_span(m)
+        last = self.bins[b - 1][1]
+        return (self.bins[a - 1][0] - 1) * self.slot_size, None if last is None else last * self.slot_size
 
     @torch.no_grad()
     def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1):
@@ -501,8 +637,10 @@ class TemporalRuleNet(torch.nn.Module):
                 continue
             if self.require_self and not self.self_inputs[inputs].any():
                 continue                                    # muted by the self gate (`forward`)
-            bodies = sorted((self.decode_input(m) for m in inputs), key=lambda b: -b[2])
-            rules.append({"rule": r, "bodies": bodies,
+            inputs = sorted(inputs, key=lambda m: (-self.decode_span(m)[1], -self.decode_span(m)[0]))
+            rules.append({"rule": r, "bodies": [self.decode_input(m) for m in inputs],
+                          "spans": [self.decode_span(m) for m in inputs],
+                          "span_frames": [self.span_frames(m) for m in inputs],
                           "heads": [(h, self.head_weight[h, r].item()) for h in heads]})
         return rules
 

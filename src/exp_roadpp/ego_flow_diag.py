@@ -39,7 +39,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import config, ego_flow, utils_data
+from src.exp_roadpp import config, ego_flow, rtpt_utils, utils_data
 
 FPS = 10
 MIN_OFF_FRAMES = 10
@@ -168,6 +168,7 @@ def main():
     parser.add_argument("--fps", type=int, default=FPS)
     parser.add_argument("--seed", type=int, default=0)
     args, _unknown = parser.parse_known_args()
+    rtpt_utils.start(f"roadpp-{args.exp}-flow_diag", 1)        # process title on the server
     setup = config.machine_setup(args)
     atoms_dir = setup.output_dir / "step_dataset_output" / "atoms"
     frame_dir, video_dir = setup.dataset_path / "frames", setup.dataset_path / "videos"

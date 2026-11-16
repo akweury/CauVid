@@ -50,6 +50,8 @@ def get_parser():
                         help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
     parser.add_argument("--ego_flow", type=str, default="False",
                         help="Step 05: ego yaw / speed atoms read from the camera image (ego_flow.py), default False")
+    parser.add_argument("--slot_ranges", type=str, default="False",
+                        help="Step 05: rule bodies over a span of slots a..b (variable step durations), default False")
     parser.add_argument("--ego_flow_workers", type=int, default=16,
                         help="Processes decoding the videos for the ego flow cache (CPU)")
     parser.add_argument("--require_self", type=str, default="True",

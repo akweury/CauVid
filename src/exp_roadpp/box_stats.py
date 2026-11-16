@@ -20,7 +20,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import torch
 
-from src.exp_roadpp import config, step05, utils_data, utils_pipe
+from src.exp_roadpp import config, rtpt_utils, step05, utils_data, utils_pipe
 
 VEHICLES = ("Car", "MedVeh", "LarVeh", "Bus", "EmVeh", "SmalVeh")   # 4-wheel vehicles: filtered by size
 THRESHOLDS = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10]             # box height / frame height
@@ -73,6 +73,7 @@ def _pct(values, qs=(0.1, 0.25, 0.5, 0.75, 0.9)):
 
 def main():
     args = config.machine_setup(utils_pipe.parse_args())
+    rtpt_utils.start(f"roadpp-{args.exp}-box_stats", 1)        # process title on the server
     atoms_dir = args.output_dir / "step_dataset_output" / "atoms"
     out_dir = args.output_dir / "box_stats"
     os.makedirs(out_dir, exist_ok=True)

@@ -262,7 +262,7 @@ class RuleSetScorer:
     the memory), 0 if none. selection: the step 05c file; level: per window the
     precision level of the set (default the val-chosen one)."""
 
-    def __init__(self, selection, num_inputs, num_atoms, device, levels=None):
+    def __init__(self, selection, num_inputs, num_atoms, device, levels=None, split=None):
         windows = selection["windows"]
         precision = torch.tensor(selection["precision"]["train"])                      # (W, P)
         items = []                                                                      # (pair, window, head, precision)
@@ -271,6 +271,7 @@ class RuleSetScorer:
             for h, ps in selection["levels"][level]["selection"].get(str(k), {}).items():
                 items += [(p, k, int(h), precision[k, p].item()) for p in ps]
         self.num_inputs, self.shape = num_inputs, (len(windows), num_atoms)
+        self.split = split          # the rule net's `split_inputs` (the span inputs of slot ranges)
         pairs = selection["pairs"]
         self.body = torch.zeros((len(items), num_inputs), device=device)
         for i, (p, _k, _h, _prec) in enumerate(items):
@@ -283,7 +284,7 @@ class RuleSetScorer:
         B = len(inputs)
         out = torch.zeros((B, self.shape[0] * self.shape[1]), device=inputs.device)
         if len(self.index):
-            x = inputs[:, :self.num_inputs]
+            x = self.split(inputs)[0] if self.split is not None else inputs[:, :self.num_inputs]
             fired = ((x @ self.body.T) >= self.size) & (self.size > 0)                     # (B, S)
             values = fired.float() * self.value
             out.scatter_reduce_(1, self.index.expand(B, -1), values, reduce="amax")

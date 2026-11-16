@@ -2285,7 +2285,8 @@ def main(input_data):
     selection_file = step05_rules.selection_file_of(step05_cfg)
     selection = utils_data.load_json(selection_file) if os.path.exists(selection_file) else None
     if selection is not None:
-        extra["rule_set"] = step05_rules.RuleSetScorer(selection, model.num_inputs, model.num_atoms, cfg["device"])
+        extra["rule_set"] = step05_rules.RuleSetScorer(selection, model.num_inputs, model.num_atoms, cfg["device"],
+                                                       split=model.split_inputs)
     cfg["rule_set"] = selection is not None
     # The step 05d MotifRuleNet (its own 2-frame inputs, memory 60 frames), if it was trained.
     motif_file, motif_cfg = step05_motif.model_file_of(step05_cfg)
