@@ -406,5 +406,9 @@ def get_step_dataset_input(args):
         # random: the old 70 / 15 / 15 split of the videos; stratified: by the onsets of every head
         # (`step_dataset.stratified_split`). Set per exp (exp_config/<exp>.json "split").
         "split": getattr(args, "split", "random"),
+        # Far vehicles dropped (`step_dataset.near_tubes`): boxes below this share of the frame height
+        # (0: keep all); and the video split of another exp (e.g. "full_s"). Set per exp (exps *_sn).
+        "min_vehicle_height": float(getattr(args, "min_vehicle_height", 0.0) or 0.0),
+        "split_from": getattr(args, "split_from", None) or None,
     }
     return input_data

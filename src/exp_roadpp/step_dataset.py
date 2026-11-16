@@ -122,7 +122,8 @@ def split_report(video_counts, splits):
     return report
 
 
-def _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, dataset_labels):
+def _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, dataset_labels,
+                            min_height=0.0, split_from=None):
     """The split atom files of the stratified split: the atoms of every video (all_atoms.json), the head
     onsets per video, `stratified_split`, then each split's file cut out of all_atoms.json; split.json
     keeps the assignment and the onsets per head and split."""
@@ -131,9 +132,16 @@ def _stratified_split_files(track_dir, all_track_files, language_model, atoms_fo
         print("[Split] stratified split files already exist.")
         return
     ids = [Path(f).stem.replace("_gt", "") for f in all_track_files]
-    all_atoms = _tracks_to_atoms(track_dir, ids, language_model, atoms_folder / "all_atoms.json", dataset_labels)
+    all_atoms = _tracks_to_atoms(track_dir, ids, language_model, atoms_folder / "all_atoms.json", dataset_labels,
+                                 min_height)
     counts = {v: head_onsets(all_atoms[v]["interval_atoms"]) for v in ids if v in all_atoms}
-    splits = stratified_split(counts)
+    if split_from:
+        # The video split of another exp (e.g. full_s for full_sn): the same videos per split, so the
+        # results differ only by the dataset change.
+        splits = {sp: [v for v in vs if v in all_atoms] for sp, vs in utils_data.load_json(split_from)["splits"].items()}
+        print(f"[Split] the video split of {split_from}")
+    else:
+        splits = stratified_split(counts)
     for sp, vs in splits.items():
         utils_data.save_json({v: all_atoms[v] for v in vs}, split_files[sp])
     report = split_report(counts, splits)
@@ -169,7 +177,66 @@ def get_frame_pairs(interval_atoms, dataset_labels):
 
 
 
-def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels):
+# -------------- Near vehicles --------------
+# Far vehicles (small GT boxes) are dropped from the dataset (--min_vehicle_height h > 0, exps *_sn): a
+# vehicle of VEHICLE_CLASSES exists only in the frames where its box is at least h of the frame height,
+# with hysteresis (it appears at >= h and leaves below NEAR_HYSTERESIS h; frames without a readable box
+# keep the state) and gaps of at most NEAR_FILL_GAP dropped frames between kept ones filled. Dropped
+# entirely: neither a prediction target nor the context of other agents. Each run of kept frames becomes a
+# tube of its own with the same tube_uid (so the same agent): it disappears while far, and a re-entry
+# is no onset (step 05 needs the agent seen in the frame before). Pedestrians, cyclists, motorbikes and
+# traffic lights are small when near too: kept.
+VEHICLE_CLASSES = ("Car", "MedVeh", "LarVeh", "Bus", "EmVeh", "SmalVeh")
+NEAR_HYSTERESIS = 0.8
+NEAR_FILL_GAP = 5
+
+
+def near_runs(tube, frames, dataset_labels, min_height):
+    """The annos ({frame_id: box_id}) of one agent tube that are kept, as a list of runs (one dict per
+    run of kept frames); [all annos] for a class that is not filtered or without min_height."""
+    annos = tube.get("annos", {})
+    if not min_height or dataset_labels["agent_labels"][tube["label_id"]] not in VEHICLE_CLASSES:
+        return [annos]
+    items = sorted(annos.items(), key=lambda kv: int(kv[0]))
+    keep, near = [], False
+    for frame_id, box_id in items:
+        frame = frames.get(str(frame_id), {})
+        box = _normalized_box(frame.get("annos", {}).get(box_id, {}).get("box"), frame)
+        if box is not None:
+            h = box[3] - box[1]
+            near = h >= (NEAR_HYSTERESIS * min_height if near else min_height)
+        keep.append(near)
+    kept = [i for i, k in enumerate(keep) if k]
+    for a, b in zip(kept, kept[1:]):
+        if 1 < b - a <= NEAR_FILL_GAP + 1:
+            for i in range(a + 1, b):
+                keep[i] = True
+    runs, cur = [], {}
+    for (frame_id, box_id), k in zip(items, keep):
+        if k:
+            cur[frame_id] = box_id
+        elif cur:
+            runs.append(cur)
+            cur = {}
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def near_tubes(agent_tubes, frames, dataset_labels, min_height):
+    """agent_tubes with the far frames of the vehicles dropped (`near_runs`): a tube split by dropped
+    frames becomes one tube per run ("<id>~<j>", same tube_uid); a tube that is never near is gone."""
+    if not min_height:
+        return agent_tubes
+    out = {}
+    for tube_id, tube in agent_tubes.items():
+        runs = near_runs(tube, frames, dataset_labels, min_height)
+        for j, annos in enumerate(runs):
+            out[tube_id if len(runs) == 1 else f"{tube_id}~{j}"] = {**tube, "annos": annos}
+    return out
+
+
+def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels, min_height=0.0):
     video_atoms = utils_data.load_json(atom_file) if atom_file.exists() else {}
 
     missing_ids = [vid for vid in video_ids if vid not in video_atoms]
@@ -182,9 +249,9 @@ def _tracks_to_atoms(track_dir, video_ids, lang, atom_file, dataset_labels):
 
             track_data = utils_data.load_json(track_file)       
 
-            agent_tubes = track_data["data"]["agent_tubes"]
-            segments_by_ego_actions = track_data["data"]["av_action_tubes"]
             frames = track_data["data"]["frames"]
+            agent_tubes = near_tubes(track_data["data"]["agent_tubes"], frames, dataset_labels, min_height)
+            segments_by_ego_actions = track_data["data"]["av_action_tubes"]
 
             interval_atoms = []
             interval_atoms.extend(lang.video2atoms("av", segments_by_ego_actions, frames))
@@ -222,7 +289,7 @@ def _normalized_box(box, frame):
     return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
 
 
-def _tracks_to_boxes(track_dir, video_ids, box_file, dataset_labels):
+def _tracks_to_boxes(track_dir, video_ids, box_file, dataset_labels, min_height=0.0):
     """Per-frame boxes of every agent tube, for the agent roles of step 05 (`roles.py`).
 
     Saves {video_id: {tube_uid: {"label": agent class label, "frames": (K,) long,
@@ -238,11 +305,14 @@ def _tracks_to_boxes(track_dir, video_ids, box_file, dataset_labels):
         data = utils_data.load_json(track_file)["data"]
         frames = data["frames"]
         tubes = {}
-        for tube in data["agent_tubes"].values():
+        for tube in near_tubes(data["agent_tubes"], frames, dataset_labels, min_height).values():
             _start, _end, tube_uid = utils_data.get_start_end_frame(tube, frames)
             if tube_uid is None:
                 continue
             frame_ids, boxes = [], []
+            if tube_uid in tubes:                       # a near-vehicle run of a split tube: append
+                frame_ids = tubes[tube_uid]["frames"].tolist()
+                boxes = tubes[tube_uid]["boxes"].tolist()
             for frame_id, box_id in tube.get("annos", {}).items():
                 frame = frames.get(str(frame_id), {})
                 box = _normalized_box(frame.get("annos", {}).get(box_id, {}).get("box"), frame)
@@ -396,6 +466,18 @@ def prepare_per_frame_atoms(language_model, cfg):
     version_file = atoms_folder / "atoms_version.txt"
     version = version_file.read_text().strip() if version_file.exists() else None
     expected = ATOMS_VERSION if split_mode == "random" else f"{ATOMS_VERSION}_{STRATIFIED_VERSION}"
+    min_height = float(cfg.get("min_vehicle_height") or 0.0)
+    split_from = None
+    if cfg.get("split_from"):
+        if split_mode != "stratified":
+            raise ValueError("split_from needs split stratified")
+        split_from = Path(output_dir).parent.parent / cfg["split_from"] / "step_dataset_output" / "atoms" / "split.json"
+        if not split_from.exists():
+            raise FileNotFoundError(f"split_from {cfg['split_from']}: no {split_from} (run that exp's step_dataset first)")
+    if min_height:
+        expected += f"_near{min_height:g}"
+        if split_mode != "stratified":
+            raise ValueError("min_vehicle_height is implemented for split stratified (exps *_sn)")
     if version != expected:
         stale = [atoms_folder / f"{split}_atoms{suffix}.json" for split in ("train", "val", "test")
                  for suffix in ("", "_compressed")] + [atoms_folder / "unique_atoms.json"]
@@ -408,7 +490,8 @@ def prepare_per_frame_atoms(language_model, cfg):
 
     splits = {"train": train_indices, "val": val_indices, "test": test_indices}
     if split_mode == "stratified":
-        _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, cfg["dataset_labels"])
+        _stratified_split_files(track_dir, all_track_files, language_model, atoms_folder, cfg["dataset_labels"],
+                                min_height, split_from)
     else:
         for split_name, indices in splits.items():
             split_ids = [Path(all_track_files[i]).stem.replace("_gt", "") for i in indices]
@@ -441,7 +524,7 @@ def prepare_per_frame_atoms(language_model, cfg):
         box_file = atoms_folder / f"{split_name}_boxes.pt"
         if not os.path.exists(box_file):
             video_ids = list(utils_data.load_json(atoms_folder / f"{split_name}_atoms_compressed.json"))
-            _tracks_to_boxes(track_dir, video_ids, box_file, cfg["dataset_labels"])
+            _tracks_to_boxes(track_dir, video_ids, box_file, cfg["dataset_labels"], min_height)
         else:
             print(f"[Boxes] {box_file} already exists.")
 
@@ -511,6 +594,8 @@ def main(input_data):
         "device": input_data["device"],
         "delay_windows": input_data["delay_windows"],
         "split": input_data.get("split", "random"),
+        "min_vehicle_height": input_data.get("min_vehicle_height", 0.0),
+        "split_from": input_data.get("split_from"),
         "dataset_labels": json.load(open(input_data["dataset_path"] / "gt" / "label.json", 'r'))
         
     }

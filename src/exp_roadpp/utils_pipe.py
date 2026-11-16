@@ -80,6 +80,11 @@ def get_parser():
     parser.add_argument("--split", type=str, default="random", choices=["random", "stratified"],
                         help="Video split of step_dataset: random (the old one, exps medium / full) or stratified by "
                              "the onsets of every head (exps medium_s / full_s); set in exp_config/<exp>.json")
+    parser.add_argument("--min_vehicle_height", type=float, default=0.0,
+                        help="step_dataset: drop the frames where a vehicle's (Car, MedVeh, LarVeh, Bus, EmVeh) GT box "
+                             "is below this share of the frame height (far vehicles); 0 keeps all; set in exp_config (*_sn)")
+    parser.add_argument("--split_from", type=str, default=None,
+                        help="step_dataset: take the video split of this exp (e.g. full_s) instead of a new one")
     parser.add_argument("--run_id", type=str, default=None,
                         help="Resume this run (folder output/<exp>/runs/<run_id>) instead of starting a new one, "
                              "e.g. to redo step 06 of a trained model; default: a new run folder")

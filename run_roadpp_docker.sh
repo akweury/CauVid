@@ -87,6 +87,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.step05_tune"
     elif [[ "$arg" == "--timing_diag" ]]; then
         ENTRY_MODULE="src.exp_roadpp.step05_timing_diag"
+    elif [[ "$arg" == "--box_stats" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.box_stats"
     elif [[ "$arg" == "--ablation" ]]; then
         ENTRY_MODULE="src.exp_roadpp.ablation"
     else
