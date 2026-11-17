@@ -17,9 +17,9 @@ drivers, signal offset and ego route), the ego's first 20 s as the video.
 --maps 0: the one junction of sumo_junction_v0..v3; --maps K: K random junctions (`scenario.random_spec`),
 video i on map i % K.
 
-Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v4 --maps 40 --num 500 --workers 16
-Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v4
-(stratified split over all maps) and --exp sumo_maps_v4_unseen (test on unseen maps)."""
+Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v5 --maps 40 --num 500 --workers 16
+Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v5
+(stratified split over all maps) and --exp sumo_maps_v5_unseen (test on unseen maps)."""
 import argparse
 import gzip
 import json
@@ -109,6 +109,28 @@ def summary(results):
             "onsets": dict(onsets.most_common()), "firings": dict(sorted(firings.items()))}
 
 
+def _check_version(out):
+    """A dataset folder is only resumed (videos that exist are skipped) by the generator version that made
+    it: sumo_maps_v4 was made by sumo_v5, then "resumed" by sumo_v6, which skipped all 492 videos and only
+    rewrote the metadata as sumo_v6. meta/version.txt holds the version of the videos."""
+    if not (out / "gt").exists() or not any((out / "gt").glob("sumo_*_gt.json")):
+        return                                      # a new dataset
+    version_file = out / "meta" / "version.txt"
+    made_by = version_file.read_text().strip() if version_file.exists() else "unknown (before sumo_v6)"
+    if made_by != VERSION:
+        raise SystemExit(f"[SUMO] {out} has videos of generator {made_by}, this is {VERSION}: generate into a new "
+                         f"dataset (--name), or delete the folder first.")
+
+
+def _merge_earlier(out, results):
+    """The per-video results of an earlier run of the same version for the videos this run skipped."""
+    gen_file = out / "meta" / "generation.json"
+    if not gen_file.exists():
+        return results
+    earlier = {r["vid"]: r for r in json.loads(gen_file.read_text()).get("videos", []) if r.get("status") == "ok"}
+    return [earlier.get(r["vid"], r) if r["status"] == "exists" else r for r in results]
+
+
 def _write_map_split(out, maps, assign):
     """meta/map_split.json: the generated videos (also those of an earlier, resumed run) split by map
     (`scenario.map_split`), in the layout of step_dataset's split.json."""
@@ -125,7 +147,7 @@ def _write_map_split(out, maps, assign):
 def main():
     from src.exp_roadpp import config
     parser = argparse.ArgumentParser(description="SUMO synthetic dataset in the roadpp layout")
-    parser.add_argument("--name", default="sumo_maps_v4")
+    parser.add_argument("--name", default="sumo_maps_v5")
     parser.add_argument("--maps", type=int, default=40, help="random junctions; 0: the v0-v3 junction")
     parser.add_argument("--num", type=int, default=500, help="simulations (videos)")
     parser.add_argument("--seed", type=int, default=0)
@@ -138,8 +160,10 @@ def main():
 
     out = Path(args.out) if args.out else config.synthetic_dataset_path(args.machine, args.name)
     label_src = Path(args.label_json) if args.label_json else config.roadpp_dataset_path(args.machine) / "gt" / "label.json"
+    _check_version(out)
     for d in ("gt", "sumo", "meta/firings", "meta/world"):
         (out / d).mkdir(parents=True, exist_ok=True)
+    (out / "meta" / "version.txt").write_text(VERSION)
     if not (out / "gt" / "label.json").exists():
         shutil.copy(label_src, out / "gt" / "label.json")
     labels_json = json.loads((out / "gt" / "label.json").read_text())
@@ -164,6 +188,7 @@ def main():
             results.append(r)
             if len(results) % 20 == 0 or len(results) == len(jobs):
                 print(f"[SUMO] {len(results)}/{len(jobs)} ({time.time() - start:.0f} s)")
+    results = _merge_earlier(out, results)
     results.sort(key=lambda r: r["vid"])
     report = summary(results)
     gen_file = out / "meta" / "generation.json"
