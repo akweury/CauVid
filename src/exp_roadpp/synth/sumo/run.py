@@ -140,6 +140,11 @@ def _write_map_split(out, maps, assign):
     for vid, m in assign.items():
         if (out / "gt" / f"{vid}_gt.json").exists():
             splits[split_of[m]].append(vid)
+    if len(splits["val"]) < len(splits["test"]):
+        # step07 chooses the thresholds on val and needs val >= test videos (maps have 12 or 13 videos,
+        # minus the dropped ones); val and test maps are dealt symmetrically, so they may swap
+        by_map["val"], by_map["test"] = by_map["test"], by_map["val"]
+        splits["val"], splits["test"] = splits["test"], splits["val"]
     (out / "meta" / "map_split.json").write_text(json.dumps({"maps": by_map, "splits": splits}, indent=1))
     print("[SUMO] map split: " + ", ".join(f"{sp} {len(by_map[sp])} maps / {len(v)} videos" for sp, v in splits.items()))
 
@@ -156,9 +161,15 @@ def main():
     parser.add_argument("--label_json", default=None, help="default: the roadpp gt/label.json of the machine")
     parser.add_argument("--machine", default="dgx-jing")
     parser.add_argument("--device", default="cpu", help="unused (docker script)")
+    parser.add_argument("--split_only", action="store_true",
+                        help="only rewrite meta/map_split.json of an existing multi-map dataset (no simulation)")
     args = parser.parse_args()
 
     out = Path(args.out) if args.out else config.synthetic_dataset_path(args.machine, args.name)
+    if args.split_only:
+        index = json.loads((out / "meta" / "maps.json").read_text())
+        _write_map_split(out, index["maps"], index["videos"])
+        return
     label_src = Path(args.label_json) if args.label_json else config.roadpp_dataset_path(args.machine) / "gt" / "label.json"
     _check_version(out)
     for d in ("gt", "sumo", "meta/firings", "meta/world"):
