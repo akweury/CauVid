@@ -83,7 +83,7 @@ def get_parser():
     parser.add_argument("--truncate_prob", type=float, default=0.5,
                         help="Step 05: share of training frames with a truncated history (partial facts), default 0.5")
     parser.add_argument("--num_slots", type=int, default=3, help="Step 05: memory slots of 10 frames, default 3")
-    parser.add_argument("--roles", type=str, default="", help="Step 05: agent roles, e.g. ahead,near_ped (default none)")
+    parser.add_argument("--roles", type=str, default="", help="Step 05: agent roles, e.g. ahead,near_ped,xing_ped (default none)")
     parser.add_argument("--geometry", type=str, default="False", help="Step 05: geometry atoms, default False")
     parser.add_argument("--type_balance", type=str, default="False", help="Step 05: event type balance, default False")
     parser.add_argument("--review_videos", type=str, default="False",

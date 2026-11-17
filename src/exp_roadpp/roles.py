@@ -19,6 +19,12 @@ ROLES (the order of the role channels is the order of cfg["roles"]):
             farther one: an order, no distance). Only the ego has this role: for
             another agent, "ahead of it" needs its heading and depth, which 2D boxes
             do not give.
+  xing_ped: the ego's crossing pedestrian: of the pedestrians labelled on a crossing (location
+            "xing" or a crossing action, CROSSING_LABELS), the nearest one, the largest y2 (the
+            crossing in front of the ego is the lowest in the image; the far crossings of the
+            junction stand higher). Only the ego has this role (as "ahead"). "Some pedestrian
+            crosses" (the others channel) also fires for crossings of the other arms, which do not
+            concern the ego (SUMO R1: a pedestrian crossing in front makes the ego brake).
   near_ped: the nearest pedestrian (agent class "Ped") whose ground point (bottom
             centre) is within NEAR_PED_MAX_HEIGHTS times the larger box height of
             the two (scale-aware: a fixed image distance would span metres near
@@ -30,21 +36,23 @@ in the "others" channel, as no other agent holds them.
 """
 import torch
 
-ROLES = ("ahead", "near_ped")
+ROLES = ("ahead", "near_ped", "xing_ped")
 EGO_BOX = (0.35, 1.0, 0.65, 1.0)          # where the ego stands: bottom centre of the image
 EGO_LANE_LABELS = ("VehLane",)
+CROSSING_LABELS = ("xing", "Xing", "XingFmLft", "XingFmRht")     # location / action labels of a crossing pedestrian
 NEAR_PED_MAX_HEIGHTS = 1.0
 PEDESTRIAN_CLASSES = ("Ped",)
 NON_GROUND_CLASSES = ("TL", "OthTL")
 
 
-def role_partners(boxes, classes, ego, roles=ROLES, in_ego_lane=None):
+def role_partners(boxes, classes, ego, roles=ROLES, in_ego_lane=None, crossing=None):
     """(T, N, K) long: the agent filling role k of agent n in frame t, -1 if none.
 
     boxes (T, N, 4) float, NaN where the agent has no box in that frame; classes
     [N] agent class labels (None if unknown); ego: the ego agent's index or None;
     in_ego_lane (T, N) bool: the agent is labelled in the ego's lane (`ego_lane`),
-    needed for "ahead".
+    needed for "ahead"; crossing (T, N) bool: the agent is labelled on a crossing (`on_crossing`),
+    needed for "xing_ped".
     An agent without a box in frame t (other than the ego) has no partners then,
     and is no partner of anyone."""
     T, N, _ = boxes.shape
@@ -73,6 +81,14 @@ def role_partners(boxes, classes, ego, roles=ROLES, in_ego_lane=None):
                 ok[:, ego, :] = candidate[:, ego, :] & in_ego_lane.cpu().bool()
             # The nearest of them: the largest y2 (lowest in the image).
             score = torch.where(ok, y2[:, None, :], -float("inf"))
+        elif role == "xing_ped":
+            if crossing is None:
+                raise ValueError('The role "xing_ped" needs crossing (T, N) bool.')
+            ped = torch.tensor([c in PEDESTRIAN_CLASSES for c in classes], dtype=torch.bool)
+            ok = torch.zeros_like(candidate)
+            if ego is not None:
+                ok[:, ego, :] = candidate[:, ego, :] & crossing.cpu().bool() & ped[None, :]
+            score = torch.where(ok, y2[:, None, :], -float("inf"))
         elif role == "near_ped":
             ped = torch.tensor([c in PEDESTRIAN_CLASSES for c in classes], dtype=torch.bool)
             gx, gy = (x1 + x2) / 2, y2                                                  # ground points
@@ -88,14 +104,23 @@ def role_partners(boxes, classes, ego, roles=ROLES, in_ego_lane=None):
     return out
 
 
+def _holds_any(X, unique_atoms, labels, keys):
+    cols = [a for a, sig in enumerate(unique_atoms)
+            if any(dict(zip(sig[0::2], sig[1::2])).get(k) in labels for k in keys)]
+    if not cols:
+        return torch.zeros(X.shape[:2], dtype=torch.bool)
+    return X[:, :, cols].any(dim=2).cpu()
+
+
 def ego_lane(X, unique_atoms):
     """(T, N) bool: agent n holds a location atom of EGO_LANE_LABELS in frame t
     (X (T, N, A) bool label atoms, unique_atoms the label vocabulary)."""
-    lane = [a for a, sig in enumerate(unique_atoms)
-            if dict(zip(sig[0::2], sig[1::2])).get("location_name_label") in EGO_LANE_LABELS]
-    if not lane:
-        return torch.zeros(X.shape[:2], dtype=torch.bool)
-    return X[:, :, lane].any(dim=2).cpu()
+    return _holds_any(X, unique_atoms, EGO_LANE_LABELS, ("location_name_label",))
+
+
+def on_crossing(X, unique_atoms):
+    """(T, N) bool: agent n holds a location or action atom of CROSSING_LABELS in frame t."""
+    return _holds_any(X, unique_atoms, CROSSING_LABELS, ("location_name_label", "action_id_label"))
 
 
 def video_boxes(video_boxes_entry, agent_ids, num_frames):

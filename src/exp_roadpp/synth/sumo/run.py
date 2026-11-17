@@ -1,5 +1,6 @@
 """Generates a SUMO synthetic dataset in the roadpp layout: one simulation per video (its own traffic,
-drivers, signal offset and ego route), the ego's first 20 s as the video.
+drivers, signal offset and ego route), 20 s of the ego as the video, ending shortly after it enters the
+junction (`simulate.clip_window`).
 
     <data root>/synthetic/<name>/
         gt/label.json                   the roadpp label.json (same vocabulary)
@@ -17,9 +18,9 @@ drivers, signal offset and ego route), the ego's first 20 s as the video.
 --maps 0: the one junction of sumo_junction_v0..v3; --maps K: K random junctions (`scenario.random_spec`),
 video i on map i % K.
 
-Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v5 --maps 40 --num 500 --workers 16
-Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v5
-(stratified split over all maps) and --exp sumo_maps_v5_unseen (test on unseen maps)."""
+Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v6 --maps 40 --num 500 --workers 16
+Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v6
+(stratified split over all maps) and --exp sumo_maps_v6_unseen (test on unseen maps)."""
 import argparse
 import gzip
 import json
@@ -33,10 +34,12 @@ from pathlib import Path
 from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-VERSION = "sumo_v6"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
+VERSION = "sumo_v7"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
                                 # v4: E1 rule set (R1 crossing pedestrian, R2, R3 lead brake; random depart lane)
                                 # v5: multi-map (--maps), rules as v4
                                 # v6: the ego's signal head past the far side of the junction (in view while waiting)
+                                # v7: the clip ends 1.5-5 s after the ego enters the junction (`simulate.clip_window`),
+                                #     so it holds the wait at a red light and the change to green
 
 
 def _clip_firings(log, frames, num_frames, visible):
@@ -92,6 +95,7 @@ def generate_one(job):
     tmp.rename(gt_file)                         # last: a video exists only when complete
     agents_per_frame = sum(len(fr["annos"]) for fr in video["data"]["frames"].values()) / num_frames
     return {"vid": vid, "status": "ok", "seed": seed, "map": map_id, "frames": num_frames, "ego_route": info["ego_route"],
+            "clip": sim["clip"],
             "agents_per_frame": round(agents_per_frame, 2), "onsets": dict(_onsets(video, labels_json)),
             "firings": Counter(f"{f['rule']}:{'executed' if f.get('executed') else 'fired' if f['fired'] else 'not_fired'}"
                                + (":visible" if f["body_visible"] and f["agent_visible"] else "") for f in firings)}
@@ -106,6 +110,8 @@ def summary(results):
     return {"videos": len(ok), "dropped": Counter(r["status"] for r in results if r["status"] != "ok"),
             "mean_frames": round(sum(r["frames"] for r in ok) / max(1, len(ok)), 1),
             "mean_agents_per_frame": round(sum(r["agents_per_frame"] for r in ok) / max(1, len(ok)), 2),
+            "clip": {"entered_junction": sum(r.get("clip", {}).get("enter_s") is not None for r in ok),
+                     "mean_start_s": round(sum(r.get("clip", {}).get("start_s", 0) for r in ok) / max(1, len(ok)), 1)},
             "onsets": dict(onsets.most_common()), "firings": dict(sorted(firings.items()))}
 
 
@@ -152,7 +158,7 @@ def _write_map_split(out, maps, assign):
 def main():
     from src.exp_roadpp import config
     parser = argparse.ArgumentParser(description="SUMO synthetic dataset in the roadpp layout")
-    parser.add_argument("--name", default="sumo_maps_v5")
+    parser.add_argument("--name", default="sumo_maps_v6")
     parser.add_argument("--maps", type=int, default=40, help="random junctions; 0: the v0-v3 junction")
     parser.add_argument("--num", type=int, default=500, help="simulations (videos)")
     parser.add_argument("--seed", type=int, default=0)

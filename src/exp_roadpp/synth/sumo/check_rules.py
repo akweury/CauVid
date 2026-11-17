@@ -38,6 +38,7 @@ TESTS = {
     "N1": ("ego: the vehicle ahead in VehLane starts (MovAway) while AV-Stop -> AV-Mov", (5, 30), False),
     "N2": ("ego and vehicles: MovRht -> TurRht within 10 s", (1, 100), False),
     "N3": ("ego: its TL turns Red in view while AV-Mov -> AV-Brake within 8 s", (1, 80), False),
+    "N4": ("ego: its TL turns Green in view while AV-Stop -> AV-Mov within 5 s", (1, 50), False),
 }
 
 
@@ -108,6 +109,7 @@ def check_video(lf, first, stats):
     for r in ("R1", "R3", "N3"):
         _control(stats, r, sorted(mov), av["AV-Brake"])
     _control(stats, "N1", sorted(stop), av["AV-Mov"])
+    _control(stats, "N4", sorted(stop), av["AV-Mov"])
     _control(stats, "N2", sorted(mov), av["AV-TurRht"])
     for t in av["AV-MovRht"]:
         _event(stats, "N2", _hit(av["AV-TurRht"], t, win["N2"]))
@@ -122,11 +124,14 @@ def check_video(lf, first, stats):
                 start = next((f for f in crossing if s <= f <= s + 50 and f in mov), None)
                 if start is not None:
                     _event(stats, "R1", _hit(av["AV-Brake"], start, win["R1"]))
-        # N3: the ego's signal turns Red in view while the ego moves
+        # N3: the ego's signal turns Red in view while the ego moves; N4: Green while the ego stands
         if per.get("cls:TL"):
             for s in run_starts(per.get("Red", [])):
                 if s in mov:
                     _event(stats, "N3", _hit(av["AV-Brake"], s, win["N3"]))
+            for s in run_starts(per.get("Green", [])):
+                if s > first[uid] and s in stop:              # a change in view, not the light coming into view
+                    _event(stats, "N4", _hit(av["AV-Mov"], s, win["N4"]))
         if not any(per.get("cls:" + c) for c in VEHICLES):
             continue
         vehlane = set(per.get("loc:VehLane", []))

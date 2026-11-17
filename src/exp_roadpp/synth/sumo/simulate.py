@@ -1,6 +1,12 @@
 """One SUMO simulation at 10 Hz: the injected rules act every step; from the ego's departure on, the world
-state of every step is recorded (all vehicles, pedestrians and the ego's next signal), until the ego
-leaves the network or the clip and a margin are recorded."""
+state of every step is recorded (all vehicles, pedestrians and the ego's next signal), until the clip and
+a margin are recorded, the ego leaves the network or MAX_RECORD_S pass.
+
+The clip (`clip_window`, since sumo_v7) ends POST_JUNCTION_S after the ego enters the junction, so it holds
+the approach and, at a red light, the wait and the change to green (signal cycles of 90 s: the ego's red
+lasts 40-50 s, the first 20 s after the departure ended while it still waited); it starts CLIP_FRAMES
+before, and at the departure if the ego reaches the junction sooner. An ego that never enters the
+junction keeps its last CLIP_FRAMES frames."""
 import math
 
 from src.exp_roadpp.synth.sumo import scenario, traffic
@@ -11,6 +17,9 @@ DT = 0.1                    # s per step = per frame (roadpp: 10 fps)
 CLIP_FRAMES = 200           # 20 s, as the roadpp videos
 MARGIN_FRAMES = 10          # recorded after the clip: labels that look ahead (lane changes)
 MAX_INSERT_WAIT = 60.0      # s the ego may wait for its insertion
+MAX_RECORD_S = 150.0        # s recorded at most after the departure (queues at a red light)
+POST_JUNCTION_S = (1.5, 5.0)    # s the clip goes on after the ego enters the junction (uniform)
+JUNCTION = ":C"             # internal edges of the junction node C (`scenario.build_network`)
 
 
 def _traci():
@@ -81,8 +90,20 @@ def ego_signal(traci, ego):
             "far_x": round(x + hx * across, 2), "far_y": round(y + hy * across, 2)}
 
 
+def clip_window(num_recorded, enter, post_frames):
+    """(start, end) frame indices of the clip (end exclusive, without the margin) in the recorded frames;
+    enter: the first frame of the ego in the junction, or None."""
+    available = num_recorded - MARGIN_FRAMES
+    if enter is None:
+        end = available                                     # never reached the junction: the last frames
+    else:
+        end = min(available, max(enter + post_frames, CLIP_FRAMES))
+    return max(0, end - CLIP_FRAMES), end
+
+
 def simulate(net_file, route_file, seed, rng, ego_depart):
-    """{"frames": [world state per step from the ego's departure], "firings": rule log}."""
+    """{"frames": [world state per step of the clip and its margin], "firings": rule log,
+    "clip": {"start_s": clip start after the departure, "enter_s": ego in the junction (or None)}}."""
     traci = _traci()
     cmd = [scenario.sumo_binary("sumo"), "-n", str(net_file), "-r", str(route_file),
            "--step-length", str(DT), "--seed", str(seed), "--lanechange.duration", "2",
@@ -93,9 +114,10 @@ def simulate(net_file, route_file, seed, rng, ego_depart):
         for tls in traci.trafficlight.getIDList():         # random signal offset per simulation
             phases = traci.trafficlight.getAllProgramLogics(tls)[0].phases
             traci.trafficlight.setPhase(tls, rng.randrange(len(phases)))
+        post_frames = int(round(rng.uniform(*POST_JUNCTION_S) / DT))
         engine = RuleEngine(traci, rng)
-        lane_len, frames = {}, []
-        t_end = ego_depart + MAX_INSERT_WAIT + (CLIP_FRAMES + MARGIN_FRAMES) * DT
+        lane_len, frames, enter = {}, [], None
+        t_end = ego_depart + MAX_INSERT_WAIT + MAX_RECORD_S
         while traci.simulation.getTime() < t_end:
             traci.simulationStep()
             world = query_world(traci, traci.simulation.getTime(), lane_len)
@@ -103,10 +125,15 @@ def simulate(net_file, route_file, seed, rng, ego_depart):
             if "ego" in world["veh"]:
                 world["tl"] = ego_signal(traci, world["veh"]["ego"])
                 frames.append(world)
-                if len(frames) >= CLIP_FRAMES + MARGIN_FRAMES:
+                if enter is None and world["veh"]["ego"]["road"].startswith(JUNCTION):
+                    enter = len(frames) - 1
+                if enter is not None and len(frames) >= max(enter + post_frames, CLIP_FRAMES) + MARGIN_FRAMES:
                     break
             elif frames:
                 break                                       # the ego left the network
     finally:
         traci.close()
-    return {"frames": frames, "firings": engine.log}
+    start, end = clip_window(len(frames), enter, post_frames)
+    clip = {"start_s": round(start * DT, 1), "enter_s": None if enter is None else round(enter * DT, 1),
+            "recorded_s": round(len(frames) * DT, 1)}
+    return {"frames": frames[start:end + MARGIN_FRAMES], "firings": engine.log, "clip": clip}

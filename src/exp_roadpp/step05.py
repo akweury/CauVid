@@ -507,7 +507,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
             video_boxes, classes, has_box = _agent_boxes(boxes, video_id, video_atoms, X)
         if roles:
             in_ego_lane = agent_roles.ego_lane(X, unique_atoms) if "ahead" in roles else None
-            partners = agent_roles.role_partners(video_boxes, classes, ego, roles, in_ego_lane)
+            crossing = agent_roles.on_crossing(X, unique_atoms) if "xing_ped" in roles else None
+            partners = agent_roles.role_partners(video_boxes, classes, ego, roles, in_ego_lane, crossing)
             partners[~visible.cpu()] = -1
             role_stats += (partners >= 0).sum(dim=(0, 1)).float()
         if geometry:
