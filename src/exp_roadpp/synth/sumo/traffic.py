@@ -46,18 +46,22 @@ def _vtype(type_id, cls, rng):
     return "<vType " + " ".join(f"{k}={quoteattr(str(v))}" for k, v in attrs.items()) + "/>"
 
 
-def write_routes(route_file, rng, params=None):
-    """Writes the route file of one simulation; returns {"ego_route": (in, out), "ego_depart": s}."""
+def write_routes(route_file, rng, params=None, spec=None):
+    """Writes the route file of one simulation on the junction spec (`scenario`, default: the v0-v3
+    junction); returns {"ego_route": (in, out), "ego_depart": s}. The vehicle rate is per four arms (a
+    T junction gets 3/4 of it)."""
     p = {**DEFAULTS, **(params or {})}
+    arms = len((spec or scenario.DEFAULT_SPEC)["arms"])
+    vehicle_rate = p["vehicle_rate"] * arms / 4
     end = p["warmup"] + p["duration"]
     classes = list(VEHICLE_CLASSES)
     shares = [VEHICLE_CLASSES[c][1] for c in classes]
-    all_routes = scenario.routes()
+    all_routes = scenario.routes(spec)
     types, items = [], []
 
     t, k = 0.0, 0
     while True:
-        t += rng.expovariate(p["vehicle_rate"])
+        t += rng.expovariate(vehicle_rate)
         if t >= end:
             break
         cls = rng.choices(classes, shares)[0]

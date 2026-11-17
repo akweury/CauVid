@@ -9,10 +9,17 @@ drivers, signal offset and ego route), the ego's first 20 s as the video.
         meta/world/{vid}.json.gz        world state per frame (oracle, debugging)
         meta/generation.json            settings, counts per video, summary
         meta/rule_check.json            the rules' lift in the labels (`check_rules`)
-        sumo/                           network and route files (reproducible inputs)
+        meta/maps.json                  multi-map datasets: {"maps": {map id: spec}, "videos": {vid: map id}}
+        meta/map_split.json             multi-map datasets: the videos split by map (unseen test maps),
+                                        for step_dataset "split_from": "meta/map_split.json"
+        sumo/                           network(s) and route files (reproducible inputs)
 
-Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_junction_v3 --num 500 --workers 16
-Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_junction_v3"""
+--maps 0: the one junction of sumo_junction_v0..v3; --maps K: K random junctions (`scenario.random_spec`),
+video i on map i % K.
+
+Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v4 --maps 40 --num 500 --workers 16
+Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v4
+(stratified split over all maps) and --exp sumo_maps_v4_unseen (test on unseen maps)."""
 import argparse
 import gzip
 import json
@@ -26,8 +33,9 @@ from pathlib import Path
 from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-VERSION = "sumo_v4"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
+VERSION = "sumo_v5"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
                                 # v4: E1 rule set (R1 crossing pedestrian, R2, R3 lead brake; random depart lane)
+                                # v5: multi-map (--maps), rules as v4
 
 
 def _clip_firings(log, frames, num_frames, visible):
@@ -60,14 +68,14 @@ def _onsets(video, labels_json):
 
 
 def generate_one(job):
-    i, out, net_file, labels_json, seed = job
+    i, out, net_file, spec, map_id, labels_json, seed = job
     vid = f"sumo_{i:05d}"
     gt_file = out / "gt" / f"{vid}_gt.json"
     if gt_file.exists():
         return {"vid": vid, "status": "exists"}
     rng = random.Random(seed)
     route_file = out / "sumo" / f"{vid}.rou.xml"
-    info = traffic.write_routes(route_file, rng)
+    info = traffic.write_routes(route_file, rng, spec=spec)
     sim = simulate.simulate(net_file, route_file, seed, rng, info["ego_depart"])
     frames = sim["frames"]
     num_frames = min(simulate.CLIP_FRAMES, len(frames))
@@ -82,7 +90,7 @@ def generate_one(job):
     tmp.write_text(json.dumps(video))
     tmp.rename(gt_file)                         # last: a video exists only when complete
     agents_per_frame = sum(len(fr["annos"]) for fr in video["data"]["frames"].values()) / num_frames
-    return {"vid": vid, "status": "ok", "seed": seed, "frames": num_frames, "ego_route": info["ego_route"],
+    return {"vid": vid, "status": "ok", "seed": seed, "map": map_id, "frames": num_frames, "ego_route": info["ego_route"],
             "agents_per_frame": round(agents_per_frame, 2), "onsets": dict(_onsets(video, labels_json)),
             "firings": Counter(f"{f['rule']}:{'executed' if f.get('executed') else 'fired' if f['fired'] else 'not_fired'}"
                                + (":visible" if f["body_visible"] and f["agent_visible"] else "") for f in firings)}
@@ -100,10 +108,24 @@ def summary(results):
             "onsets": dict(onsets.most_common()), "firings": dict(sorted(firings.items()))}
 
 
+def _write_map_split(out, maps, assign):
+    """meta/map_split.json: the generated videos (also those of an earlier, resumed run) split by map
+    (`scenario.map_split`), in the layout of step_dataset's split.json."""
+    by_map = scenario.map_split(maps)
+    split_of = {m: sp for sp, ms in by_map.items() for m in ms}
+    splits = {"train": [], "val": [], "test": []}
+    for vid, m in assign.items():
+        if (out / "gt" / f"{vid}_gt.json").exists():
+            splits[split_of[m]].append(vid)
+    (out / "meta" / "map_split.json").write_text(json.dumps({"maps": by_map, "splits": splits}, indent=1))
+    print("[SUMO] map split: " + ", ".join(f"{sp} {len(by_map[sp])} maps / {len(v)} videos" for sp, v in splits.items()))
+
+
 def main():
     from src.exp_roadpp import config
     parser = argparse.ArgumentParser(description="SUMO synthetic dataset in the roadpp layout")
-    parser.add_argument("--name", default="sumo_junction_v3")
+    parser.add_argument("--name", default="sumo_maps_v4")
+    parser.add_argument("--maps", type=int, default=40, help="random junctions; 0: the v0-v3 junction")
     parser.add_argument("--num", type=int, default=500, help="simulations (videos)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
@@ -122,10 +144,19 @@ def main():
     labels_json = json.loads((out / "gt" / "label.json").read_text())
     (out / "meta" / "gt_rules.json").write_text(json.dumps(
         {"version": VERSION, "rules": rules.GT_RULES, "natural_rules": rules.NATURAL_RULES}, indent=2))
-    net_file = scenario.build_network(out / "sumo")
+    if args.maps:
+        maps = scenario.build_maps(out / "sumo", args.maps, args.seed)
+        assign = {f"sumo_{i:05d}": f"map_{i % args.maps:03d}" for i in range(args.num)}
+        (out / "meta" / "maps.json").write_text(json.dumps({"maps": maps, "videos": assign}, indent=1))
+        jobs = [(i, out, out / "sumo" / maps[m]["net"], maps[m]["spec"], m, labels_json, args.seed * 1_000_003 + i)
+                for i, m in enumerate(assign.values())]
+        kinds = Counter(maps[m]["spec"]["control"] + f"/{len(maps[m]['spec']['arms'])}arm" for m in maps)
+        print(f"[SUMO] {args.maps} maps: {dict(kinds)}")
+    else:
+        net_file = scenario.build_network(out / "sumo")
+        jobs = [(i, out, net_file, None, None, labels_json, args.seed * 1_000_003 + i) for i in range(args.num)]
     print(f"[SUMO] {args.num} simulations -> {out}")
 
-    jobs = [(i, out, net_file, labels_json, args.seed * 1_000_003 + i) for i in range(args.num)]
     start, results = time.time(), []
     with Pool(args.workers) as pool:
         for r in pool.imap_unordered(generate_one, jobs):
@@ -136,10 +167,15 @@ def main():
     report = summary(results)
     gen_file = out / "meta" / "generation.json"
     gen = {"version": VERSION, "args": {k: v for k, v in vars(args).items() if k != "device"},
-           "settings": {"traffic": traffic.DEFAULTS, "R1": rules.R1, "R2": rules.R2, "R3": rules.R3,
+           "settings": {"traffic": traffic.DEFAULTS, "maps": args.maps,
+                        "map_family": {"p_three_arms": scenario.P_THREE_ARMS, "angle_jitter": scenario.ANGLE_JITTER,
+                                       "lanes": scenario.LANES, "speeds": scenario.SPEEDS,
+                                       "approach_s": scenario.APPROACH_S, "controls": scenario.CONTROLS}, "R1": rules.R1, "R2": rules.R2, "R3": rules.R3,
                         "clip_frames": simulate.CLIP_FRAMES, "dt": simulate.DT},
            "summary": report, "videos": results}
     gen_file.write_text(json.dumps(gen, indent=1, default=list))
+    if args.maps:
+        _write_map_split(out, maps, assign)
     print(json.dumps(report, indent=1, default=list))
     print(f"[SUMO] done: {gen_file}")
     check_rules.print_report(check_rules.check(out))

@@ -2,7 +2,7 @@
 rendering): left the top view (roads, every agent, the ego's field of view; agents the camera sees in
 colour, the others grey), right the camera view with exactly the boxes and labels of {vid}_gt.json.
 
-    python -m src.exp_roadpp.synth.sumo.render --dataset <dataset dir> --num 4 [--vid sumo_00003 --frames 50 120]
+    python -m src.exp_roadpp.synth.sumo.render --dataset <dataset dir> --num 4 [--vid sumo_00003 --frames 50 120] [--maps]
     ./run_roadpp_docker.sh --gpu none --sumo_render -- --dataset /storage-01/ml-jsha/CauVid_Data/synthetic/sumo_junction_v0
 Without --frames, frames with something to see are picked: R1 / R2 executions the ego sees, turns,
 red-light stops. Images: <dataset>/render/<vid>_f<frame>.png"""
@@ -36,6 +36,7 @@ def _offset(shape, d):
 
 
 def draw_network(ax, net_file):
+    """Draws the network; returns the position of junction C (netconvert shifts the coordinates)."""
     import sumolib
     net = sumolib.net.readNet(str(net_file), withInternal=True, withPedestrianConnections=True)
     for edge in net.getEdges(withInternal=True):
@@ -53,6 +54,35 @@ def draw_network(ax, net_file):
                 ax.add_patch(Polygon(poly, closed=True, fc="#d9d9d9", ec="none", zorder=1))
             else:
                 ax.add_patch(Polygon(poly, closed=True, fc="#555555", ec="#777777", lw=0.2, zorder=1))
+    return net.getNode("C").getCoord()
+
+
+def network_of(dataset, vid):
+    """(net file, map name or None) of a video: its map in a multi-map dataset, else the one junction."""
+    index = dataset / "meta" / "maps.json"
+    if index.exists():
+        maps = json.loads(index.read_text())
+        m = maps["videos"][vid]
+        return dataset / "sumo" / maps["maps"][m]["net"], f"{m} {maps['maps'][m]['name']}"
+    return dataset / "sumo" / "junction.net.xml", None
+
+
+def render_maps(dataset, out_file, cols=8):
+    """All junctions of a multi-map dataset in one image (top views, 2 x 120 m)."""
+    maps = json.loads((dataset / "meta" / "maps.json").read_text())["maps"]
+    rows = math.ceil(len(maps) / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(2.6 * cols, 2.8 * rows))
+    for ax, (m, info) in zip(axes.flat, maps.items()):
+        cx, cy = draw_network(ax, dataset / "sumo" / info["net"])
+        ax.set_xlim(cx - 120, cx + 120); ax.set_ylim(cy - 120, cy + 120)
+        ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"{m}\n{info['name']} {info['spec']['speed']} m/s", fontsize=7)
+    for ax in list(axes.flat)[len(maps):]:
+        ax.axis("off")
+    fig.tight_layout()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_file, dpi=90)
+    plt.close(fig)
 
 
 def _short(labels, ids, kind):
@@ -72,7 +102,8 @@ def render(dataset, vid, frame, out_file):
 
     fig, (top, cam_ax) = plt.subplots(1, 2, figsize=(16, 6.4), gridspec_kw={"width_ratios": [1, 1.5]})
     # -------------- top view --------------
-    draw_network(top, dataset / "sumo" / "junction.net.xml")
+    net_file, map_name = network_of(dataset, vid)
+    draw_network(top, net_file)
     ego = world["veh"]["ego"]
     cam = observe.Camera(ego)
     yaw = 90 - ego["angle"]                                     # SUMO angle -> matplotlib degrees
@@ -107,7 +138,8 @@ def render(dataset, vid, frame, out_file):
     top.set_ylim(ego["y"] + hy * 25 - half, ego["y"] + hy * 25 + half)
     top.set_aspect("equal")
     top.set_xticks([]); top.set_yticks([])
-    top.set_title(f"{vid} frame {frame} (t={world['t']:.1f} s)  ego: {av}, {ego['speed']:.1f} m/s", fontsize=10)
+    top.set_title(f"{vid} frame {frame} (t={world['t']:.1f} s)  ego: {av}, {ego['speed']:.1f} m/s"
+                  + (f"\n{map_name}" if map_name else ""), fontsize=10)
 
     # -------------- camera view (the GT boxes) --------------
     W, H = observe.W_IMG, observe.H_IMG
@@ -142,12 +174,12 @@ def render(dataset, vid, frame, out_file):
 def interesting(dataset, num):
     """[(vid, frame)]: frames a few frames after an executed R1 / R2 the ego sees, turns, red stops."""
     labels = json.loads((dataset / "gt" / "label.json").read_text())
-    picks = {"R1": [], "R2": [], "turn": [], "red": []}
+    picks = {"R1": [], "R2": [], "R3": [], "turn": [], "red": []}
     for gt in sorted((dataset / "gt").glob("*_gt.json")):
         vid = gt.name[:-len("_gt.json")]
         for f in json.loads((dataset / "meta" / "firings" / f"{vid}.json").read_text()):
             if f.get("executed") and f["body_visible"] and f["agent_visible"] and f["frame_fire"] <= 195:
-                picks[f["rule"]].append((vid, f["frame_fire"] + 3))
+                picks.setdefault(f["rule"], []).append((vid, f["frame_fire"] + 3))
         frames = json.loads(gt.read_text())["data"]["frames"]
         av = [labels["av_action_labels"][frames[str(k)]["av_action_ids"][0]] for k in range(1, len(frames) + 1)]
         turns = [k + 1 for k, a in enumerate(av) if a in ("AV-TurLft", "AV-TurRht")]
@@ -162,7 +194,7 @@ def interesting(dataset, num):
                 break
     out = []
     while len(out) < num and any(picks.values()):
-        for key in ("R1", "R2", "turn", "red"):
+        for key in picks:
             if picks[key] and len(out) < num:
                 out.append(picks[key].pop(0))
     return out
@@ -174,8 +206,13 @@ def main():
     parser.add_argument("--num", type=int, default=4)
     parser.add_argument("--vid", default=None)
     parser.add_argument("--frames", type=int, nargs="*", default=None)
+    parser.add_argument("--maps", action="store_true", help="also one image of all junctions (multi-map datasets)")
     args, _unknown = parser.parse_known_args()             # the docker script adds --device / --machine
     dataset = Path(args.dataset)
+    if args.maps and (dataset / "meta" / "maps.json").exists():
+        out = dataset / "render" / "maps.png"
+        render_maps(dataset, out)
+        print(out)
     jobs = [(args.vid, f) for f in args.frames] if args.vid and args.frames else interesting(dataset, args.num)
     for vid, frame in jobs:
         out = dataset / "render" / f"{vid}_f{frame:03d}.png"

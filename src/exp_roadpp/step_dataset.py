@@ -471,7 +471,10 @@ def prepare_per_frame_atoms(language_model, cfg):
     if cfg.get("split_from"):
         if split_mode != "stratified":
             raise ValueError("split_from needs split stratified")
-        split_from = Path(output_dir).parent.parent / cfg["split_from"] / "step_dataset_output" / "atoms" / "split.json"
+        if cfg["split_from"].endswith(".json"):             # a split file of the dataset (SUMO: meta/map_split.json)
+            split_from = Path(track_dir).parent / cfg["split_from"]
+        else:                                               # the split of another exp
+            split_from = Path(output_dir).parent.parent / cfg["split_from"] / "step_dataset_output" / "atoms" / "split.json"
         if not split_from.exists():
             raise FileNotFoundError(f"split_from {cfg['split_from']}: no {split_from} (run that exp's step_dataset first)")
     if min_height:
