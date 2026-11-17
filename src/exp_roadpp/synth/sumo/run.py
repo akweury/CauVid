@@ -11,8 +11,8 @@ drivers, signal offset and ego route), the ego's first 20 s as the video.
         meta/rule_check.json            the rules' lift in the labels (`check_rules`)
         sumo/                           network and route files (reproducible inputs)
 
-Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_junction_v2 --num 500 --workers 16
-Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_junction_v2"""
+Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_junction_v3 --num 500 --workers 16
+Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_junction_v3"""
 import argparse
 import gzip
 import json
@@ -26,7 +26,8 @@ from pathlib import Path
 from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-VERSION = "sumo_v3"             # v2: R1 on the driver's camera view; v3: p = 1, no R1 refractory, Mov in the junction
+VERSION = "sumo_v4"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
+                                # v4: E1 rule set (R1 crossing pedestrian, R2, R3 lead brake; random depart lane)
 
 
 def _clip_firings(log, frames, num_frames, visible):
@@ -102,7 +103,7 @@ def summary(results):
 def main():
     from src.exp_roadpp import config
     parser = argparse.ArgumentParser(description="SUMO synthetic dataset in the roadpp layout")
-    parser.add_argument("--name", default="sumo_junction_v2")
+    parser.add_argument("--name", default="sumo_junction_v3")
     parser.add_argument("--num", type=int, default=500, help="simulations (videos)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
@@ -120,7 +121,7 @@ def main():
         shutil.copy(label_src, out / "gt" / "label.json")
     labels_json = json.loads((out / "gt" / "label.json").read_text())
     (out / "meta" / "gt_rules.json").write_text(json.dumps(
-        {"version": VERSION, "rules": rules.GT_RULES, "approx_rules": rules.APPROX_RULES}, indent=2))
+        {"version": VERSION, "rules": rules.GT_RULES, "natural_rules": rules.NATURAL_RULES}, indent=2))
     net_file = scenario.build_network(out / "sumo")
     print(f"[SUMO] {args.num} simulations -> {out}")
 
@@ -135,7 +136,7 @@ def main():
     report = summary(results)
     gen_file = out / "meta" / "generation.json"
     gen = {"version": VERSION, "args": {k: v for k, v in vars(args).items() if k != "device"},
-           "settings": {"traffic": traffic.DEFAULTS, "R1": rules.R1, "R2": rules.R2,
+           "settings": {"traffic": traffic.DEFAULTS, "R1": rules.R1, "R2": rules.R2, "R3": rules.R3,
                         "clip_frames": simulate.CLIP_FRAMES, "dt": simulate.DT},
            "summary": report, "videos": results}
     gen_file.write_text(json.dumps(gen, indent=1, default=list))

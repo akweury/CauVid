@@ -18,6 +18,8 @@ PED_SIZE = (0.5, 0.5, 1.75)             # length, width, height
 TL_SIZE = (0.4, 0.4, 1.0)               # signal head; its bottom at TL_BOTTOM
 TL_BOTTOM = 4.0
 
+# Vehicles (the ego too) depart in a random lane, so those in the wrong lane for their turn change lanes
+# before the junction (natural rule N2: Mov -> MovRht -> TurRht); with "best" they started in the turn lane.
 DEFAULTS = {
     "vehicle_rate": 0.8,        # vehicles per s entering the network (all routes)
     "person_rate": 0.15,        # pedestrians per s
@@ -62,13 +64,13 @@ def write_routes(route_file, rng, params=None):
         type_id = f"{cls}__{k}"
         types.append(_vtype(type_id, cls, rng))
         a, b = rng.choice(all_routes)
-        items.append((t, f'<vehicle id="v{k}" type="{type_id}" depart="{t:.1f}" departLane="best" '
+        items.append((t, f'<vehicle id="v{k}" type="{type_id}" depart="{t:.1f}" departLane="random" '
                          f'departSpeed="max"><route edges="{a} {b}"/></vehicle>'))
         k += 1
 
     ego_route = rng.choice(all_routes)
     types.append(_vtype("Car__ego", "Car", rng))
-    items.append((p["warmup"], f'<vehicle id="ego" type="Car__ego" depart="{p["warmup"]:.1f}" departLane="best" '
+    items.append((p["warmup"], f'<vehicle id="ego" type="Car__ego" depart="{p["warmup"]:.1f}" departLane="random" '
                                 f'departSpeed="max"><route edges="{ego_route[0]} {ego_route[1]}"/></vehicle>'))
 
     edges = [e for r in all_routes for e in r]
