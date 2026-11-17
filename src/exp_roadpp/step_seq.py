@@ -28,14 +28,16 @@ AP per head, mAP; a bootstrap over the test videos for top-1. Significance: a pa
 resamples of the test videos for both methods) of the difference of top-1, label top-1, mAP and micro AP,
 per seed and for the seed-averaged models (`--seeds`, default 0,1,2).
 
-Rules (`rule_stats`): each (rule, ego head) pair gets its lift (train precision / the head's base rate) and
-a kind: "rule" (lift > 1), "below" (lift <= 1: it only reorders inside the head) or "always" (fires on
->= 90% of the at-risk rows: a bias). rules.md keeps the "rule" pairs with train support >= 10, duplicate
-bodies merged; rules_all.md lists all. A pruning check zeroes the head weights of the "below" (and
-"always") pairs and re-evaluates: if the metrics hold, those pairs were noise. Readable rules (rules.md)
-also predict >= --min_rule_hits train onsets. The rule list (`rule_list_scores`) predicts with them alone
-(the largest train precision of the firing rules of a head, else its base rate), so its metrics are
-those of the readable rules, apart from the rule net that found them.
+Rules (`rule_stats`): rule bodies that hold at the same rows are one group; each (group, ego head) pair
+with |weight| >= 0.1 gets a leave-one-out importance on val (`loo_importance`: the rise of the head's
+val loss when the pair's weight is 0 in the rule net) and, as a description, its precision and lift
+(precision / base rate; a pair below the base rate can still help: it corrects the other rules of its
+head). Kept pairs (importance > 1e-4, fire on train) form the scorecard: per head, P(onset next) =
+sigmoid(bias + the weights of its kept rules whose body holds), hard 0/1 bodies. Two scorecards: the
+rule net's weights, and weights refit by a logistic regression on train (`refit_scorecard`); a reader
+recomputes every score from rules.md. Checks: the rule net with the kept pairs only (if it holds, the
+others were not needed); the rule list (`rule_list_scores`, reference: the best single rule above the
+base rate, >= --min_rule_hits train onsets) shows what one rule alone predicts.
 
 Re-evaluate saved models without training: add --eval_only (loads <tag>_seed<s>/rule_net.pt, mlp.pt).
 
@@ -368,6 +370,8 @@ def _paired_lines(tests):
 
 # -------------- Rules --------------
 TAUTOLOGY = 0.9         # a body that fires on >= 90% of a head's at-risk train rows is a bias, not a rule
+MIN_WEIGHT = 0.1        # (rule, head) pairs with |weight| below this are left out of the rules and the scorecards
+MIN_IMPORTANCE = 1e-4   # a pair is kept if removing it raises its head's mean val loss by more than this
 
 
 def _span_text(model, m):
@@ -383,123 +387,245 @@ def _span_text(model, m):
 
 
 @torch.no_grad()
-def rule_stats(model, train, test, heads, names, cfg):
-    """Every (rule, ego head) of the rule net: its body, weight, and on train / test its fires (the body
-    holds at an at-risk row of the head), precision (the head switches on next), the head's base rate,
-    coverage (fires / at-risk rows); lift = train precision / train base rate; kind:
-      "rule"   lift > 1 (the body makes the head more likely than its base rate),
-      "below"  lift <= 1 or no train fire (the rule ranks inside the head at best),
-      "always" the body fires on >= TAUTOLOGY of the at-risk train rows (a bias term)."""
+def rule_groups(model, names):
+    """The distinct rule bodies (inputs with mask > 0.5) of the rule net: [{"rules": [r, ...], "text"}].
+    Rules with the same body are one group (their head weights add up); a body without an own-ego input is
+    left out (the self gate of `require_self` mutes it)."""
     body = model.rule_mask() > 0.5
-    fired = {}
-    for split, rows in (("train", train), ("test", test)):
-        b = body.float()
-        f = []
-        for i in range(0, len(rows["targets"]), 2048):
-            x, _k = model.split_inputs(rows["inputs"][i:i + 2048].to(cfg["device"]))
-            f.append(((x @ b.T >= b.sum(dim=1)) & (b.sum(dim=1) > 0)).cpu())   # (B, R)
-        fired[split] = torch.cat(f) if f else torch.zeros((0, len(b)), dtype=torch.bool)
-    out = []
-    for rule in model.extract_rules(0.5, 0.1):
-        r = rule["rule"]
+    groups = {}
+    for r in range(body.shape[0]):
         inputs = torch.nonzero(body[r]).flatten().tolist()
-        inputs.sort(key=lambda m: (-model.decode_span(m)[1], -model.decode_span(m)[0]))
+        if not inputs or (model.require_self and not model.self_inputs[inputs].any()):
+            continue
+        groups.setdefault(tuple(inputs), []).append(r)
+    out = []
+    for inputs, rules in groups.items():
+        inputs = sorted(inputs, key=lambda m: (-model.decode_span(m)[1], -model.decode_span(m)[0]))
         text = " ∧ ".join(f"{names[model.decode_input(m)[0]]}({'ego' if model.decode_input(m)[1] == 0 else 'scene'}"
                           f", {_span_text(model, m)})" for m in inputs)
-        for h, w in rule["heads"]:
-            if not heads[h]:
+        out.append({"rules": rules, "inputs": list(inputs), "text": text})
+    return out
+
+
+@torch.no_grad()
+def group_fires(model, groups, rows, device):
+    """(B, G) bool: the body of each group holds (every input true) at each row."""
+    if not groups:
+        return torch.zeros((len(rows["targets"]), 0), dtype=torch.bool)
+    b = torch.zeros((len(groups), model.num_inputs), device=device)
+    for g, grp in enumerate(groups):
+        b[g, grp["inputs"]] = 1.0
+    out = []
+    for i in range(0, len(rows["targets"]), 2048):
+        x, _k = model.split_inputs(rows["inputs"][i:i + 2048].to(device))
+        out.append((x @ b.T >= b.sum(dim=1)).cpu())
+    return torch.cat(out)
+
+
+def _membership(groups, R):
+    M = torch.zeros((R, len(groups)))
+    for g, grp in enumerate(groups):
+        M[grp["rules"], g] = 1.0
+    return M
+
+
+def _onset_bce(z, y, pos_weight):
+    """Per-row BCE of the onset probability 1 - exp(-softplus(z)) (`TemporalRuleNet.loss`, one window)."""
+    log_none = -torch.nn.functional.softplus(z)
+    log_onset = torch.log(-torch.expm1(log_none.clamp(max=-1e-7)))
+    return -torch.where(y, pos_weight * log_onset, log_none)
+
+
+@torch.no_grad()
+def loo_importance(model, groups, val, heads, cfg):
+    """(A, G) leave-one-out importance on the val rows: the increase of a head's mean val loss (over its
+    at-risk rows) when the head weights of the group are set to 0 in the rule net, the rest unchanged.
+    > 0: the group helps the head; <= 0: the head does as well (or better) without it."""
+    device = cfg["device"]
+    acts = torch.cat([model(val["inputs"][i:i + 2048].to(device))[1].cpu()
+                      for i in range(0, len(val["targets"]), 2048)])                       # (B, R) soft
+    W, b = model.head_weight.detach().cpu(), model.head_bias[0].detach().cpu()
+    M = _membership(groups, W.shape[1])
+    hz = acts @ W.T + b
+    out = torch.zeros((W.shape[0], len(groups)))
+    for h in torch.nonzero(heads).flatten().tolist():
+        risk = val["at_risk"][:, h]
+        if not risk.any():
+            continue
+        y = val["targets"][risk, h]
+        contrib = (acts[risk] * W[h][None]) @ M                                             # (n, G)
+        base = _onset_bce(hz[risk, h], y, cfg["pos_weight"]).mean()
+        alt = _onset_bce(hz[risk, h][:, None] - contrib, y[:, None], cfg["pos_weight"]).mean(dim=0)
+        out[h] = alt - base
+    return out
+
+
+def rule_stats(model, rows, heads, names, cfg):
+    """Every (group, ego head) pair with |summed head weight| >= MIN_WEIGHT: its body, weight, val
+    leave-one-out importance (`loo_importance`), and on train / test its fires (the body holds at an
+    at-risk row of the head), hits, precision, the head's base rate, coverage; lift = train precision /
+    base rate. keep: importance > MIN_IMPORTANCE and a train fire (the scorecard rules). kind (a description, not a filter):
+    "rule" lift > 1, "below" lift <= 1 or no train fire, "always" fires on >= TAUTOLOGY of the at-risk rows."""
+    groups = rule_groups(model, names)
+    fires = {sp: group_fires(model, groups, rows[sp], cfg["device"]) for sp in SPLITS}
+    # Bodies that hold at the same rows of every split (e.g. a(now) and a(now..1 back) ∧ a(now)) are one
+    # group, named by the shortest body.
+    merged = {}
+    for g in range(len(groups)):
+        key = b"".join(fires[sp][:, g].numpy().tobytes() for sp in SPLITS)
+        merged.setdefault(key, []).append(g)
+    keep_cols = []
+    for gs in merged.values():
+        main = min(gs, key=lambda g: (len(groups[g]["inputs"]), len(groups[g]["text"])))
+        groups[main]["rules"] = sorted(r for g in gs for r in groups[g]["rules"])
+        keep_cols.append(main)
+    keep_cols.sort()
+    groups = [groups[g] for g in keep_cols]
+    fires = {sp: f[:, keep_cols] for sp, f in fires.items()}
+    W = model.head_weight.detach().cpu() @ _membership(groups, model.head_weight.shape[1])     # (A, G)
+    imp = loo_importance(model, groups, rows["val"], heads, cfg)
+    out = []
+    for h in torch.nonzero(heads).flatten().tolist():
+        for g, grp in enumerate(groups):
+            w = float(W[h, g])
+            if abs(w) < MIN_WEIGHT:
                 continue
-            e = {"rule": r, "head_index": h, "head": names[h], "weight": w, "body": text}
-            for split, rows in (("train", train), ("test", test)):
-                risk = rows["at_risk"][:, h]
-                f = fired[split][:, r] & risk
+            e = {"group": g, "head_index": h, "head": names[h], "weight": w, "body": grp["text"],
+                 "copies": len(grp["rules"]), "importance": float(imp[h, g])}
+            for split in ("train", "test"):
+                r = rows[split]
+                risk = r["at_risk"][:, h]
+                f = fires[split][:, g] & risk
                 e[f"{split}_fires"] = int(f.sum())
-                e[f"{split}_hits"] = int(rows["targets"][f, h].sum())
-                e[f"{split}_precision"] = float(rows["targets"][f, h].float().mean()) if f.any() else None
-                e[f"{split}_base"] = float(rows["targets"][risk, h].float().mean()) if risk.any() else None
+                e[f"{split}_hits"] = int(r["targets"][f, h].sum())
+                e[f"{split}_precision"] = float(r["targets"][f, h].float().mean()) if f.any() else None
+                e[f"{split}_base"] = float(r["targets"][risk, h].float().mean()) if risk.any() else None
                 e[f"{split}_coverage"] = float(f.sum()) / max(int(risk.sum()), 1)
             p, b0 = e["train_precision"], e["train_base"]
             e["lift"] = p / b0 if p is not None and b0 else None
             e["kind"] = ("always" if e["train_coverage"] >= TAUTOLOGY
                          else "rule" if e["lift"] is not None and e["lift"] > 1 else "below")
+            e["keep"] = e["importance"] > MIN_IMPORTANCE and e["train_fires"] > 0
             out.append(e)
-    return out, fired
-
-
-def _merge(entries):
-    """One row per (head, body): rules with the same body (duplicates) get their weights summed."""
-    merged = {}
-    for e in entries:
-        key = (e["head"], e["body"])
-        if key in merged:
-            merged[key]["weight"] += e["weight"]
-            merged[key]["copies"] += 1
-        else:
-            merged[key] = dict(e, copies=1)
-    return list(merged.values())
+    return out, groups, fires
 
 
 def _is_clean(e, cfg):
-    """A readable rule: above the head's base rate, train support >= min_rule_support and >= min_rule_hits
-    train onsets it predicts (a rare head's lift is large on a handful of hits)."""
+    """A rule of the rule list: above the head's base rate, train support >= min_rule_support and >=
+    min_rule_hits train onsets it predicts."""
     return (e["kind"] == "rule" and e["train_fires"] >= cfg["min_rule_support"]
             and e["train_hits"] >= cfg["min_rule_hits"])
 
 
-def rule_report(stats, cfg):
-    """Markdown of the rules: the clean table (`_is_clean`, duplicates merged, sorted by head then lift)
-    and the full table with every kind."""
-    fmt = lambda v: "–" if v is None else f"{v:.2f}"
-    rows = _merge(stats)
-    clean = sorted((e for e in rows if _is_clean(e, cfg)), key=lambda e: (e["head"], -e["lift"]))
-    head = ["| Head | Rule (body ⇒ next step) | Weight | Train fires | Train hits | Train prec. | Base | Lift | Test fires "
-            "| Test prec. |", "|---|---|---|---|---|---|---|---|---|---|"]
-    def row(e):
-        copies = f" (×{e['copies']})" if e["copies"] > 1 else ""
-        return (f"| {e['head']} | {e['body']}{copies} | {e['weight']:.2f} | {e['train_fires']} | "
-                f"{e['train_hits']} | {fmt(e['train_precision'])} | {fmt(e['train_base'])} | {fmt(e['lift'])} | {e['test_fires']} | "
-                f"{fmt(e['test_precision'])} |")
-    count = Counter(e["kind"] for e in stats)
-    dup = len(stats) - len(rows)
-    low = sum(1 for e in rows if e["kind"] == "rule" and not _is_clean(e, cfg))
-    summary = (f"{len(stats)} (rule, ego head) pairs with weight > 0.1: {count['rule']} above the base rate, "
-               f"{count['below']} at or below it (or never firing on train), {count['always']} always on "
-               f"(a bias: the body fires on >= {TAUTOLOGY:.0%} of the head's at-risk rows); {dup} duplicates merged; "
-               f"{low} above-base rules with train support < {cfg['min_rule_support']} or < {cfg['min_rule_hits']} "
-               f"train hits left out. Kept: {len(clean)}.")
-    clean_lines = [summary, ""] + head + [row(e) for e in clean]
-    full = sorted(rows, key=lambda e: (e["head"], e["kind"], -(e["lift"] or 0)))
-    full_lines = [summary, "", head[0].replace("| Head |", "| Head | Kind |"), "|---" + head[1]]
-    full_lines += [row(e).replace(f"| {e['head']} |", f"| {e['head']} | {e['kind']} |", 1) for e in full]
-    return clean, clean_lines, full_lines
-
-
-def rule_list_scores(stats, fired, train, cfg):
-    """Scores of the readable rules alone (`_is_clean`): per row and ego head, the largest train precision
-    of the clean rules of the head whose body holds, else the head's train base rate. Every score is a
-    rule of rules.md (or the base rate), so the metrics of this predictor are those of the rule list."""
+def rule_list_scores(stats, fires, train, cfg):
+    """Scores of single rules (reference): per row and ego head, the largest train precision of the
+    `_is_clean` rules of the head whose body holds, else the head's train base rate."""
     risk, tgt = train["at_risk"], train["targets"] & train["at_risk"]
     base = tgt.sum(dim=0).float() / risk.sum(dim=0).clamp(min=1).float()
-    scores = base[None].repeat(len(fired), 1)
+    scores = base[None].repeat(len(fires), 1)
     for e in stats:
         if _is_clean(e, cfg):
-            h, f = e["head_index"], fired[:, e["rule"]]
+            h, f = e["head_index"], fires[:, e["group"]]
             scores[f, h] = torch.maximum(scores[f, h], torch.tensor(e["train_precision"]))
     return scores
 
 
-@torch.no_grad()
-def pruned_scores(model, stats, kinds, rows, device):
-    """Test scores of the rule net with the head weights of the (rule, head) pairs of the given kinds set
-    to 0: if the metrics hold, those pairs were noise."""
-    saved = model.head_weight.data.clone()
+def scorecard_net(model, stats, fires):
+    """The scorecard with the rule net's weights: hazard of a head = its bias + the weights of its kept
+    groups whose body holds (hard 0/1, no soft masks); the onset probability as in the rule net."""
+    A = model.head_weight.shape[0]
+    W = torch.zeros((A, fires.shape[1]))
     for e in stats:
-        if e["kind"] in kinds:
-            model.head_weight.data[e["head_index"], e["rule"]] = 0.0
+        if e["keep"]:
+            W[e["head_index"], e["group"]] = e["weight"]
+    hz = fires.float() @ W.T + model.head_bias[0].detach().cpu()
+    return TemporalRuleNet.window_probs(hz[:, None])[:, 0]
+
+
+def refit_scorecard(stats, fires_train, train, heads, l2=1e-3, steps=200):
+    """Per ego head a logistic regression (bias + one weight per kept group, L2) on the hard fires of the
+    train at-risk rows: the readable model, the rule net's bodies with relearned weights. Returns
+    {head: (bias, {group: weight}, base rate)}; a head without kept groups gets the logit of its base rate."""
+    card = {}
+    for h in torch.nonzero(heads).flatten().tolist():
+        risk = train["at_risk"][:, h]
+        if not risk.any():
+            continue
+        y = train["targets"][risk, h].float()
+        gs = sorted({e["group"] for e in stats if e["keep"] and e["head_index"] == h})
+        p0 = float(y.mean().clamp(1e-4, 1 - 1e-4))
+        bias = torch.tensor([np.log(p0 / (1 - p0))], dtype=torch.float32, requires_grad=True)
+        w = torch.zeros(len(gs), requires_grad=True)
+        if gs:
+            X = fires_train[risk][:, gs].float()
+            opt = torch.optim.LBFGS([bias, w], lr=0.5, max_iter=steps, line_search_fn="strong_wolfe")
+
+            def closure():
+                opt.zero_grad()
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(X @ w + bias, y) + l2 * (w ** 2).sum()
+                loss.backward()
+                return loss
+            opt.step(closure)
+        card[h] = (float(bias), {g: float(v) for g, v in zip(gs, w.detach())}, float(y.mean()))
+    return card
+
+
+def scorecard_scores(card, fires, A):
+    """(B, A) probabilities of a refit scorecard; heads without a card get 0."""
+    out = torch.zeros((len(fires), A))
+    for h, (bias, ws, _p0) in card.items():
+        z = torch.full((len(fires),), bias)
+        for g, v in ws.items():
+            z = z + v * fires[:, g].float()
+        out[:, h] = torch.sigmoid(z)
+    return out
+
+
+@torch.no_grad()
+def kept_net_scores(model, stats, groups, rows, device):
+    """Test scores of the (soft) rule net with only the kept (group, head) pairs: every other head weight
+    set to 0. If the metrics hold, the dropped pairs were not needed."""
+    saved = model.head_weight.data.clone()
+    keep = torch.zeros_like(saved, dtype=torch.bool)
+    for e in stats:
+        if e["keep"]:
+            keep[e["head_index"], groups[e["group"]]["rules"]] = True
+    model.head_weight.data[~keep] = 0.0
     try:
         return model_scores(model, rows, device)
     finally:
         model.head_weight.data.copy_(saved)
+
+
+def rule_report(stats, card, names, cfg):
+    """Markdown of the rules: the scorecard (kept pairs per head, by importance, with the net weight and
+    the refit weight, and the refit bias of the head) and the full table of every pair."""
+    fmt = lambda v, d=2: "–" if v is None else f"{v:.{d}f}"
+    head = ["| Head | Rule (body ⇒ next step) | Net weight | Refit weight | Δ val loss | Train fires | Train hits "
+            "| Train prec. | Lift | Test fires | Test prec. |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+
+    def row(e):
+        copies = f" (×{e['copies']})" if e["copies"] > 1 else ""
+        refit = card[e["head_index"]][1].get(e["group"]) if e["keep"] and e["head_index"] in card else None
+        return (f"| {e['head']} | {e['body']}{copies} | {e['weight']:+.2f} | {fmt(refit)} | {e['importance']:+.4f} | "
+                f"{e['train_fires']} | {e['train_hits']} | {fmt(e['train_precision'])} | {fmt(e['lift'])} | "
+                f"{e['test_fires']} | {fmt(e['test_precision'])} |")
+    kept = sorted((e for e in stats if e["keep"]), key=lambda e: (e["head"], -e["importance"]))
+    n_heads = len({e["head"] for e in kept})
+    summary = (f"{len(stats)} (rule body, ego head) pairs with |weight| >= {MIN_WEIGHT}; {len(kept)} help their head "
+               f"on val (leave-one-out Δ val loss > {MIN_IMPORTANCE}) and fire on train; they form the scorecard of {n_heads} heads; "
+               f"{len(stats) - len(kept)} do not.")
+    bias_lines = ["| Head | Refit bias | Base rate (train) | Rules |", "|---|---|---|---|"]
+    for h, (bias, ws, p0) in sorted(card.items(), key=lambda kv: names[kv[0]]):
+        bias_lines.append(f"| {names[h]} | {bias:+.2f} | {p0:.3f} | {len(ws)} |")
+    clean_lines = [summary, "",
+                   "Scorecard: P(head switches on next) = sigmoid(refit bias + sum of the refit weights of its rules "
+                   "whose body holds).", ""] + head + [row(e) for e in kept] + ["", "Refit bias per head:", ""] + bias_lines
+    full = sorted(stats, key=lambda e: (e["head"], not e["keep"], -e["importance"]))
+    full_lines = [summary, "", head[0].replace("| Head |", "| Head | Kept | Kind |"), "|---|---" + head[1]]
+    full_lines += [row(e).replace(f"| {e['head']} |", f"| {e['head']} | {'yes' if e['keep'] else 'no'} | {e['kind']} |", 1)
+                   for e in full]
+    return kept, clean_lines, full_lines
 
 
 # -------------- Main --------------
@@ -527,7 +653,9 @@ def _model_table(results):
 
 
 RULE_NET, MLP, MARKOV1, MARKOV2 = "Rule net (ours)", "OnsetMLP", "Markov-1 (current state)", "Markov-2 (last two states)"
-RULE_LIST = "Rule list (readable rules only)"
+RULE_LIST = "Rule list (best single rule)"
+CARD_NET = "Scorecard (net weights)"
+CARD_FIT = "Scorecard (refit weights)"
 
 
 def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamples, out_dir, device, rtpt):
@@ -561,28 +689,29 @@ def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamp
         torch.save(mlp.state_dict(), out_dir / "mlp.pt")
 
     test = rows["test"]
-    stats, fired = rule_stats(rule_net, rows["train"], test, heads, names, cfg)
-    clean, clean_lines, full_lines = rule_report(stats, cfg)
+    stats, groups, fires = rule_stats(rule_net, rows, heads, names, cfg)
+    card = refit_scorecard(stats, fires["train"], rows["train"], heads)
+    kept, card_lines, full_lines = rule_report(stats, card, names, cfg)
     scores = dict(base_scores)
     scores[MLP] = model_scores(mlp, test, device)
     scores[RULE_NET] = model_scores(rule_net, test, device)
-    scores[RULE_LIST] = rule_list_scores(stats, fired["test"], rows["train"], cfg)
+    scores[CARD_FIT] = scorecard_scores(card, fires["test"], A)
+    scores[CARD_NET] = scorecard_net(rule_net, stats, fires["test"])
+    scores[RULE_LIST] = rule_list_scores(stats, fires["test"], rows["train"], cfg)
     ev = lambda s: evaluate(s, test, heads, label_heads, names, resamples)
     results = {name: ev(s) for name, s in scores.items()}
     pb = lambda a, b: paired_bootstrap([scores[a]], scores[b], test, heads, label_heads, names, resamples)
     paired = {f"{RULE_NET} − {MARKOV2}": pb(RULE_NET, MARKOV2), f"{RULE_NET} − {MARKOV1}": pb(RULE_NET, MARKOV1),
               f"{RULE_NET} − {MLP}": pb(RULE_NET, MLP), f"{MLP} − {MARKOV2}": pb(MLP, MARKOV2),
-              f"{RULE_LIST} − {MARKOV2}": pb(RULE_LIST, MARKOV2), f"{RULE_LIST} − {RULE_NET}": pb(RULE_LIST, RULE_NET)}
-
-    pruned = {"all rules": results[RULE_NET],
-              "without below-base": ev(pruned_scores(rule_net, stats, {"below"}, test, device)),
-              "without below-base and always-on": ev(pruned_scores(rule_net, stats, {"below", "always"}, test, device))}
-    kinds = Counter(e["kind"] for e in stats)
+              f"{CARD_FIT} − {MARKOV2}": pb(CARD_FIT, MARKOV2), f"{CARD_FIT} − {RULE_NET}": pb(CARD_FIT, RULE_NET),
+              f"{CARD_NET} − {MARKOV2}": pb(CARD_NET, MARKOV2)}
+    kept_net = ev(kept_net_scores(rule_net, stats, groups, test, device))
     rtpt_utils.step(rtpt, f"seed {seed} eval")
 
     md = ["## 1. Models (test change points)\n"] + _model_table(results)
     md.append(f"\nRows: {results[RULE_NET]['rows']}; label rows (the next step changes the action label): "
-              f"{results[RULE_NET]['label_rows']}.\n")
+              f"{results[RULE_NET]['label_rows']}. Scorecards: the kept rules (section 4) with hard 0/1 bodies; "
+              "rule list: the best single rule above the base rate (reference).\n")
     md += ["## 2. Paired bootstrap (same test videos resampled for both sides)\n",
            f"Difference of the first minus the second method, 95% CI over {len(resamples)} resamples of the test "
            "videos, two-sided bootstrap p.\n"] + _paired_lines(paired) + [""]
@@ -591,24 +720,22 @@ def run_seed(seed, args, rows, A, heads, label_heads, names, base_scores, resamp
     for h in sorted(results[RULE_NET]["per_head"], key=lambda h: -results[RULE_NET]["per_head"][h]["onsets"]):
         cells = [_fmt(results[n]["per_head"].get(h, {}).get("ap")) for n in results]
         md.append(f"| {h} | {results[RULE_NET]['per_head'][h]['onsets']} | " + " | ".join(cells) + " |")
-    md += ["", "## 4. Pruning check: the rule net without the noise rules\n",
-           "Head weights of the (rule, head) pairs of a kind set to 0 (`rule_stats`): if the metrics hold, those "
-           f"pairs were noise. Pairs: {kinds['rule']} above base, {kinds['below']} below base, "
-           f"{kinds['always']} always on.\n",
-           "| Rule net | Top-1 | Label top-1 | mAP | Micro AP |", "|---|---|---|---|---|"]
-    md += [f"| {k} | {_fmt(r['top1'])} | {_fmt(r['label_top1'])} | {_fmt(r['map'])} | {_fmt(r['micro_ap'])} |"
-           for k, r in pruned.items()]
-    md += ["", f"## 5. Rules of the rule net (above the base rate, train support >= {cfg['min_rule_support']}, "
-           f">= {cfg['min_rule_hits']} train hits; the rules of the rule list)\n"]
-    md += clean_lines + ["", "All pairs with their kind: rules_all.md."]
-    (out_dir / "rules.md").write_text("\n".join(clean_lines) + "\n")
+    md += ["", "## 4. Leave-one-out pruning: which rules the rule net needs\n",
+           "Each (rule body, head) pair is removed alone on the val rows (head weight 0); kept if the head's mean val "
+           f"loss rises by > {MIN_IMPORTANCE} and the body fires on train. The rule net with only the kept pairs (soft, as trained):\n",
+           "| Rule net | Pairs | Top-1 | Label top-1 | mAP | Micro AP |", "|---|---|---|---|---|---|"]
+    for k, r, n in (("all pairs", results[RULE_NET], len(stats)), ("kept pairs only", kept_net, len(kept))):
+        md.append(f"| {k} | {n} | {_fmt(r['top1'])} | {_fmt(r['label_top1'])} | {_fmt(r['map'])} | {_fmt(r['micro_ap'])} |")
+    md += ["", "## 5. Scorecard rules (kept pairs, by val importance)\n"] + card_lines + ["", "All pairs: rules_all.md."]
+    (out_dir / "rules.md").write_text("\n".join(card_lines) + "\n")
     (out_dir / "rules_all.md").write_text("\n".join(full_lines) + "\n")
-    (out_dir / "results.json").write_text(json.dumps({"args": vars(args), "seed": seed, "results": results,
-                                                      "paired": paired, "pruned": pruned, "rules": stats},
-                                                     indent=1, default=str))
-    return {"md": md, "results": results,
-            "scores": {RULE_NET: scores[RULE_NET], MLP: scores[MLP], RULE_LIST: scores[RULE_LIST]},
-            "clean": clean}
+    (out_dir / "results.json").write_text(json.dumps(
+        {"args": vars(args), "seed": seed, "results": results, "paired": paired, "kept_net": kept_net,
+         "rules": stats, "scorecard": {names[h]: {"bias": c[0], "base_rate": c[2],
+                                                  "rules": {groups[g]["text"]: v for g, v in c[1].items()}}
+                                       for h, c in card.items()}}, indent=1, default=str))
+    return {"md": md, "results": results, "clean": kept,
+            "scores": {k: scores[k] for k in (RULE_NET, MLP, CARD_FIT, CARD_NET, RULE_LIST)}}
 
 
 def summary_md(per_seed, base_scores, rows, heads, label_heads, names, resamples, seeds):
@@ -628,21 +755,25 @@ def summary_md(per_seed, base_scores, rows, heads, label_heads, names, resamples
     paired = {f"{RULE_NET} (seed mean) − {MARKOV2}": pooled(RULE_NET, MARKOV2),
               f"{RULE_NET} (seed mean) − {MARKOV1}": pooled(RULE_NET, MARKOV1),
               f"{MLP} (seed mean) − {MARKOV2}": pooled(MLP, MARKOV2),
-              f"{RULE_LIST} (seed mean) − {MARKOV2}": pooled(RULE_LIST, MARKOV2),
-              f"{RULE_LIST} (seed mean) − {MARKOV1}": pooled(RULE_LIST, MARKOV1)}
+              f"{CARD_FIT} (seed mean) − {MARKOV2}": pooled(CARD_FIT, MARKOV2),
+              f"{CARD_FIT} (seed mean) − {MARKOV1}": pooled(CARD_FIT, MARKOV1),
+              f"{CARD_NET} (seed mean) − {MARKOV2}": pooled(CARD_NET, MARKOV2)}
     md += ["", "Paired bootstrap of the seed-averaged metric (the same video resamples for every seed and the "
            "baseline):\n"] + _paired_lines(paired)
     seen = defaultdict(list)
     for s, r in zip(seeds, per_seed):
         for e in r["clean"]:
             seen[(e["head"], e["body"])].append(e)
-    stable = sorted(((k, v) for k, v in seen.items() if len(v) >= 2), key=lambda kv: (-len(kv[1]), kv[0]))
-    md += ["", f"### Rules learned in >= 2 of {len(seeds)} seeds ({len(stable)} of {len(seen)} distinct clean rules)\n",
-           "| Head | Rule | Seeds | Train prec. | Lift | Test fires | Test prec. |", "|---|---|---|---|---|---|---|"]
+    stable = sorted(((k, v) for k, v in seen.items() if len(v) >= 2),
+                    key=lambda kv: (-len(kv[1]), kv[0][0], -np.mean([x["importance"] for x in kv[1]])))
+    md += ["", f"### Rules learned in >= 2 of {len(seeds)} seeds ({len(stable)} of {len(seen)} distinct scorecard rules)\n",
+           "| Head | Rule | Seeds | Mean Δ val loss | Train prec. | Lift | Test fires | Test prec. |",
+           "|---|---|---|---|---|---|---|---|"]
     for (h, b), es in stable:
         e = es[0]          # same body and head: the same fires and precisions in every seed
-        md.append(f"| {h} | {b} | {len(es)} | {_fmt(e['train_precision'])} | {e['lift']:.2f} | {e['test_fires']} | "
-                  f"{_fmt(e['test_precision'])} |")
+        imp = np.mean([x["importance"] for x in es])
+        md.append(f"| {h} | {b} | {len(es)} | {imp:+.4f} | {_fmt(e['train_precision'])} | {_fmt(e['lift'])} | "
+                  f"{e['test_fires']} | {_fmt(e['test_precision'])} |")
     return md, paired
 
 
