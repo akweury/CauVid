@@ -34,6 +34,7 @@ from tqdm import tqdm
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
 VERSION = "paper_v2"
+VAL_MIN_RATIO = 0.9             # val videos >= 0.9 x test videos (thresholds are chosen on val)
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
     "headline_budget": 5,
@@ -297,10 +298,11 @@ def main(input_data):
     scorers = step06._scorers(model, baselines, mlp, None, step05_cfg["device"], names=names)
     calibration = {n: calibration[n] for n in PAPER["calibrated"] if n in calibration and n in scorers}
     training_data = step05.load_training_data(step05_cfg)
-    # The thresholds are chosen on val: it must not be smaller than test (step_dataset: 15% / 15%).
-    if len(training_data["val_videos"]) < len(test_data["videos"]):
-        raise ValueError(f"{len(training_data['val_videos'])} val videos < {len(test_data['videos'])} test videos: "
-                         "the val split must be at least as large as test for the thresholds chosen on it.")
+    # The thresholds are chosen on val: it must be about as large as test (step_dataset: 15% / 15%; the
+    # map split of the SUMO unseen-map exps deals whole maps, e.g. 71 val vs 76 test videos).
+    if len(training_data["val_videos"]) < VAL_MIN_RATIO * len(test_data["videos"]):
+        raise ValueError(f"{len(training_data['val_videos'])} val videos < {VAL_MIN_RATIO} x {len(test_data['videos'])} "
+                         "test videos: the val split must be about as large as test for the thresholds chosen on it.")
     head_types_all = training_data["event_types"]["types"]
     train_onsets = _train_onsets(training_data)
     counted = [step06.EVENT_TYPES.index(t) for t in step06.COUNTED_TYPES]
