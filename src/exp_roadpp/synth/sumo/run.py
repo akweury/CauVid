@@ -8,10 +8,11 @@ drivers, signal offset and ego route), the ego's first 20 s as the video.
         meta/firings/{vid}.json         every rule trigger of the clip: time, frames, fired, executed, visible
         meta/world/{vid}.json.gz        world state per frame (oracle, debugging)
         meta/generation.json            settings, counts per video, summary
+        meta/rule_check.json            the rules' lift in the labels (`check_rules`)
         sumo/                           network and route files (reproducible inputs)
 
-Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_junction_v0 --num 500 --workers 16
-Then the pipeline: ./run_roadpp_docker.sh --gpu N -- --exp sumo_junction_v0"""
+Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_junction_v1 --num 500 --workers 16
+Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_junction_v1"""
 import argparse
 import gzip
 import json
@@ -22,10 +23,10 @@ from collections import Counter
 from multiprocessing import Pool
 from pathlib import Path
 
-from src.exp_roadpp.synth.sumo import labels, rules, scenario, simulate, traffic
+from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-VERSION = "sumo_v1"
+VERSION = "sumo_v2"             # v2: R1 on the driver's camera view (v1 = sumo_junction_v0)
 
 
 def _clip_firings(log, frames, num_frames, visible):
@@ -101,7 +102,7 @@ def summary(results):
 def main():
     from src.exp_roadpp import config
     parser = argparse.ArgumentParser(description="SUMO synthetic dataset in the roadpp layout")
-    parser.add_argument("--name", default="sumo_junction_v0")
+    parser.add_argument("--name", default="sumo_junction_v1")
     parser.add_argument("--num", type=int, default=500, help="simulations (videos)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
@@ -140,6 +141,7 @@ def main():
     gen_file.write_text(json.dumps(gen, indent=1, default=list))
     print(json.dumps(report, indent=1, default=list))
     print(f"[SUMO] done: {gen_file}")
+    check_rules.print_report(check_rules.check(out))
 
 
 if __name__ == "__main__":

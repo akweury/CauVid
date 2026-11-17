@@ -95,6 +95,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.box_stats"
     elif [[ "$arg" == "--sumo_gen" ]]; then
         ENTRY_MODULE="src.exp_roadpp.synth.sumo.run"
+    elif [[ "$arg" == "--sumo_check" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.synth.sumo.check_rules"
     elif [[ "$arg" == "--sumo_render" ]]; then
         ENTRY_MODULE="src.exp_roadpp.synth.sumo.render"
     elif [[ "$arg" == "--ablation" ]]; then

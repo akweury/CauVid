@@ -8,7 +8,8 @@ import math
 from collections import defaultdict
 
 from src.exp_roadpp.synth.sumo import observe, traffic
-from src.exp_roadpp.synth.sumo.rules import SIG_EMERGENCY, SIG_LEFT, SIG_RIGHT, is_waiting, heading
+from src.exp_roadpp.synth.sumo.observe import heading
+from src.exp_roadpp.synth.sumo.rules import SIG_EMERGENCY, SIG_LEFT, SIG_RIGHT, is_waiting
 
 STOP_ON, STOP_OFF = 0.3, 0.5        # m/s: Stop below STOP_ON until above STOP_OFF
 BRAKE_ON, BRAKE_OFF = -1.5, -1.0    # m/s^2: Brake below BRAKE_ON until above BRAKE_OFF
@@ -188,17 +189,7 @@ def av_label(ego, s):
 
 def _scene_agents(w, cam):
     """Agents of one frame as `observe.visible` takes them (the ego excluded), with the ego's signal."""
-    agents = {}
-    for vid, v in w["veh"].items():
-        if vid == "ego":
-            continue
-        agents[vid] = {"x": v["x"], "y": v["y"], "z0": 0.0, "z1": v["height"], "height": v["height"],
-                       "occluder": v["cls"] not in ("Cyc",),
-                       "corners": observe.footprint(v["x"], v["y"], v["angle"], v["length"], v["width"])}
-    pl, pw, ph = traffic.PED_SIZE
-    for pid, p in w["ped"].items():
-        agents[pid] = {"x": p["x"], "y": p["y"], "z0": 0.0, "z1": ph, "height": ph, "occluder": False,
-                       "corners": observe.footprint(p["x"], p["y"], p["angle"], pl, pw)}
+    agents = observe.scene_agents(w, "ego")
     tl = w.get("tl")
     if tl and tl_label(tl["state"]):
         # the signal head on a pole 3 m right of the ego's stop line point; never occluded (height)

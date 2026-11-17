@@ -4,7 +4,8 @@ leaves the network or the clip and a margin are recorded."""
 import math
 
 from src.exp_roadpp.synth.sumo import scenario, traffic
-from src.exp_roadpp.synth.sumo.rules import RuleEngine, heading
+from src.exp_roadpp.synth.sumo.observe import heading
+from src.exp_roadpp.synth.sumo.rules import RuleEngine
 
 DT = 0.1                    # s per step = per frame (roadpp: 10 fps)
 CLIP_FRAMES = 200           # 20 s, as the roadpp videos

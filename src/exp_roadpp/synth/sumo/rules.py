@@ -2,37 +2,52 @@
 the rules SUMO's own driver model implies (APPROX_RULES, approximate: their conditions are distances and
 speeds, which the labels only partly show).
 
+An exact rule is defined on what the labels show, as the driver sees it, and fires at the onset of its
+body: R1 looks through the driver's own front camera (`observe`, the ego camera model), so for the ego
+its body is exactly the label rule Ped:Wait2X(other) ∧ AV-Mov(self). (sumo_junction_v0 used distances
+and speeds the labels do not show: no lift at the label level.)
+
 Every rule is a behaviour of every driver of its classes (the ego included), so the ego is an ordinary
 driver. The engine is stepped once per simulation step with the world state of `simulate.query_world`;
 each trigger (body newly true) is logged, whether it fires (probability p) and whether the head could be
 executed, so the exact hazard of the head is known from the log."""
 import math
 
+from src.exp_roadpp.synth.sumo import observe
+
 SIG_RIGHT, SIG_LEFT, SIG_EMERGENCY = 1, 2, 4         # SUMO vehicle signal bits
 
 MOTOR = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike")
 HAZARD_CLASSES = ("Car", "MedVeh", "LarVeh")
 
-# R1: a moving driver brakes 1-3 s after a pedestrian waiting to cross appears ahead of it (p 0.8);
-# drivers slower than trigger_speed (e.g. queued at the red light) do not react.
-R1 = {"range_m": 50.0, "half_angle_deg": 25.0, "lag_s": (1.0, 3.0), "p": 0.8, "trigger_speed": 6.0, "min_speed": 3.0,
-      "speed_drop": 5.0, "brake_s": 1.5, "refractory_s": 8.0}
+# Label Mov of a driver as `labels` gives it (not Stop, not Brake, not turning in the junction)
+MOV_SPEED = 0.5             # labels.STOP_OFF
+MOV_ACC = -1.0              # labels.BRAKE_OFF
+
+# R1: a driver whose label is Mov brakes 1-3 s after it first sees a pedestrian waiting to cross
+# (Ped:Wait2X in its front camera), p 0.8; once per (driver, pedestrian, waiting episode).
+R1 = {"lag_s": (1.0, 3.0), "p": 0.8, "min_speed": 1.5, "speed_drop": 5.0, "decel": 3.3, "refractory_s": 5.0}
 # R2: a driver that turns on the hazard lights brakes to a stop 1-2 s later (p 0.9), stays 5-12 s.
-R2 = {"rate_per_s": 0.015, "lag_s": (1.0, 2.0), "p": 0.9, "decel": 3.0, "hold_s": (5.0, 12.0),
-      "off_s": (4.0, 8.0), "min_ahead_m": 75.0, "min_speed": 3.0}
+# The hazard lights start more often on vehicles the ego sees driving in its direction (rate_seen; they
+# stay in view for the lag, oncoming ones leave it within 1-2 s): that only places the events where the
+# camera is, the rule itself (HazLit -> Brake 1-2 s later) is the same for every vehicle.
+R2 = {"rate_per_s": 0.003, "rate_seen_per_s": 0.15, "lag_s": (1.0, 2.0), "p": 0.9, "decel": 3.0,
+      "hold_s": (5.0, 12.0), "off_s": (4.0, 8.0), "min_ahead_m": 60.0, "min_speed": 3.0}
 
 GT_RULES = [
     {"id": "R1", "exact": True, "head": {"agent": "self", "label": "Brake", "av_label": "AV-Brake"},
-     "body": [{"agent": "self", "label": "moving", "where": f"speed >= {R1['trigger_speed']:g} m/s (not Stop / Brake)"},
-              {"agent": "other", "class": "Ped", "label": "Wait2X",
-               "where": f"within {R1['range_m']:g} m and {R1['half_angle_deg']:g} deg of the driver's heading"}],
+     "body": [{"agent": "self", "label": "Mov", "av_label": "AV-Mov"},
+              {"agent": "other", "class": "Ped", "label": "Wait2X", "where": "visible in the driver's front camera"}],
+     "onset": "the first frame both body atoms hold (per pedestrian waiting episode)",
      "lag_s": list(R1["lag_s"]), "p": R1["p"], "classes": list(MOTOR),
-     "notes": f"executed only at speed >= {R1['min_speed']:g} m/s (drop {R1['speed_drop']:g} m/s in "
-              f"{R1['brake_s']:g} s); one trigger per (driver, pedestrian); refractory {R1['refractory_s']:g} s"},
+     "notes": f"executed only at speed >= {R1['min_speed']:g} m/s (drop {R1['speed_drop']:g} m/s at "
+              f"{R1['decel']:g} m/s^2); refractory {R1['refractory_s']:g} s per driver"},
     {"id": "R2", "exact": True, "head": {"agent": "self", "label": "Brake"},
      "body": [{"agent": "self", "label": "HazLit"}],
+     "onset": "the hazard lights turn on",
      "lag_s": list(R2["lag_s"]), "p": R2["p"], "classes": list(HAZARD_CLASSES),
-     "notes": f"hazard lights start at random (rate {R2['rate_per_s']:g}/s per vehicle, not the ego, "
+     "notes": f"hazard lights start at random (rate {R2['rate_per_s']:g}/s per vehicle, "
+              f"{R2['rate_seen_per_s']:g}/s if the ego sees it driving in its direction; not the ego, "
               f">= {R2['min_ahead_m']:g} m before the lane end); the brake ends in Stop for "
               f"{R2['hold_s'][0]:g}-{R2['hold_s'][1]:g} s; without the brake the lights go off after "
               f"{R2['off_s'][0]:g}-{R2['off_s'][1]:g} s"},
@@ -52,10 +67,9 @@ def is_waiting(ped):
     return ped["road"].startswith(":") and "_w" in ped["road"] and ped["speed"] < 0.1
 
 
-def heading(angle_deg):
-    """Unit heading of a SUMO angle (degrees, 0 = north, clockwise)."""
-    a = math.radians(angle_deg)
-    return math.sin(a), math.cos(a)
+def is_mov(v):
+    """The driver's label is Mov (approximately: `labels` adds hysteresis and smoothing)."""
+    return v["speed"] >= MOV_SPEED and v["acc"] > MOV_ACC and not v["road"].startswith(":")
 
 
 class RuleEngine:
@@ -63,7 +77,9 @@ class RuleEngine:
         self.traci = traci
         self.rng = rng
         self.log = []                   # every trigger
-        self.seen_r1 = set()            # (driver, pedestrian)
+        self.wait_episode = {}          # pedestrian -> number of its waiting episodes so far
+        self.waiting_before = set()
+        self.seen_r1 = set()            # (driver, pedestrian, waiting episode)
         self.pending_r1 = {}            # driver -> log entry
         self.last_r1 = {}               # driver -> time of the last executed R1
         self.events_r2 = {}             # driver -> state of its hazard event
@@ -72,30 +88,38 @@ class RuleEngine:
     def step(self, t, world):
         self._r1_triggers(t, world)
         self._r1_execute(t, world)
-        self._r2(t, world)
+        ego = world["veh"].get("ego")
+        seen = observe.visible(observe.Camera(ego), observe.scene_agents(world, "ego")) if ego else {}
+        ahead = {vid for vid in seen if vid in world["veh"]
+                 and abs((world["veh"][vid]["angle"] - ego["angle"] + 180.0) % 360.0 - 180.0) < 45.0}
+        self._r2(t, world, ahead)
 
     # -------------- R1 --------------
     def _r1_triggers(self, t, world):
-        waiting = {pid: p for pid, p in world["ped"].items() if is_waiting(p)}
+        waiting = {pid for pid, p in world["ped"].items() if is_waiting(p)}
+        for pid in waiting - self.waiting_before:
+            self.wait_episode[pid] = self.wait_episode.get(pid, 0) + 1
+        self.waiting_before = waiting
         if not waiting:
             return
-        cos_max = math.cos(math.radians(R1["half_angle_deg"]))
+        agents = None
         for vid, v in world["veh"].items():
-            if v["cls"] not in MOTOR or v["speed"] < R1["trigger_speed"]:
+            if v["cls"] not in MOTOR or not is_mov(v):
                 continue
-            hx, hy = heading(v["angle"])
-            for pid, p in waiting.items():
-                if (vid, pid) in self.seen_r1:
+            new = [pid for pid in waiting if (vid, pid, self.wait_episode[pid]) not in self.seen_r1
+                   and math.hypot(world["ped"][pid]["x"] - v["x"], world["ped"][pid]["y"] - v["y"]) <= observe.MAX_RANGE]
+            if not new:
+                continue
+            if agents is None:
+                agents = observe.scene_agents(world, None)
+            seen = observe.visible(observe.Camera(v), {k: a for k, a in agents.items() if k != vid})
+            for pid in new:
+                if pid not in seen:
                     continue
-                dx, dy = p["x"] - v["x"], p["y"] - v["y"]
-                d = math.hypot(dx, dy)
-                if d > R1["range_m"] or d < 1e-6 or (dx * hx + dy * hy) / d < cos_max:
-                    continue
-                self.seen_r1.add((vid, pid))
+                self.seen_r1.add((vid, pid, self.wait_episode[pid]))
                 entry = {"rule": "R1", "agent": vid, "body_agent": pid, "t_body": t, "fired": False}
                 if self.rng.random() < R1["p"]:
-                    busy = vid in self.pending_r1 or t - self.last_r1.get(vid, -1e9) < R1["refractory_s"]
-                    if busy:
+                    if vid in self.pending_r1 or t - self.last_r1.get(vid, -1e9) < R1["refractory_s"]:
                         entry["skipped"] = "refractory"
                     else:
                         lag = self.rng.uniform(*R1["lag_s"])
@@ -111,12 +135,12 @@ class RuleEngine:
             v = world["veh"].get(vid)
             entry["executed"] = bool(v and v["speed"] >= R1["min_speed"])
             if entry["executed"]:
-                target = max(v["speed"] - R1["speed_drop"], 0.5)
-                self.traci.vehicle.slowDown(vid, target, R1["brake_s"])
+                target = max(v["speed"] - R1["speed_drop"], 0.0)
+                self.traci.vehicle.slowDown(vid, target, max(0.5, (v["speed"] - target) / R1["decel"]))
                 self.last_r1[vid] = t
 
     # -------------- R2 --------------
-    def _r2(self, t, world):
+    def _r2(self, t, world, seen_by_ego):
         tv = self.traci.vehicle
         dt = world["dt"]
         for vid, v in world["veh"].items():
@@ -124,7 +148,8 @@ class RuleEngine:
                     or v["road"].startswith(":") or v["speed"] < R2["min_speed"]
                     or v["lane_len"] - v["lane_pos"] < R2["min_ahead_m"]):
                 continue
-            if self.rng.random() < R2["rate_per_s"] * dt:
+            rate = R2["rate_seen_per_s"] if vid in seen_by_ego else R2["rate_per_s"]
+            if self.rng.random() < rate * dt:
                 self.had_r2.add(vid)
                 tv.setSignals(vid, SIG_EMERGENCY)
                 entry = {"rule": "R2", "agent": vid, "body_agent": vid, "t_body": t, "fired": False}

@@ -4,7 +4,7 @@ OCCLUDER_HEIGHT of the agent's height (1D angular z-buffer in the top view), and
 projected to normalised image boxes [x1, y1, x2, y2]."""
 import math
 
-from src.exp_roadpp.synth.sumo.rules import heading
+from src.exp_roadpp.synth.sumo import traffic
 
 W_IMG, H_IMG = 1920, 1280
 HFOV_DEG = 50.0
@@ -18,7 +18,14 @@ MIN_VISIBLE = 0.3           # share of an agent's angular extent not hidden by n
 OCCLUDER_HEIGHT = 0.8       # an occluder hides an agent only if at least this share of its height
 
 
+def heading(angle_deg):
+    """Unit heading of a SUMO angle (degrees, 0 = north, clockwise)."""
+    a = math.radians(angle_deg)
+    return math.sin(a), math.cos(a)
+
+
 class Camera:
+    """The front camera of a vehicle (the ego, or any driver for the injected rules)."""
     def __init__(self, ego):
         self.fx, self.fy = heading(ego["angle"])             # forward
         self.lx, self.ly = -self.fy, self.fx                  # left
@@ -100,3 +107,19 @@ def visible(cam, agents):
         if width <= 1e-9 or 1.0 - _covered(p["a0"], p["a1"], occluders) / width >= MIN_VISIBLE:
             out[aid] = p["box"]
     return out
+
+
+def scene_agents(world, driver):
+    """The vehicles (but the driver) and pedestrians of one world state as `visible` takes them."""
+    agents = {}
+    for vid, v in world["veh"].items():
+        if vid == driver:
+            continue
+        agents[vid] = {"x": v["x"], "y": v["y"], "z0": 0.0, "z1": v["height"], "height": v["height"],
+                       "occluder": v["cls"] != "Cyc",
+                       "corners": footprint(v["x"], v["y"], v["angle"], v["length"], v["width"])}
+    pl, pw, ph = traffic.PED_SIZE
+    for pid, p in world["ped"].items():
+        agents[pid] = {"x": p["x"], "y": p["y"], "z0": 0.0, "z1": ph, "height": ph, "occluder": False,
+                       "corners": footprint(p["x"], p["y"], p["angle"], pl, pw)}
+    return agents

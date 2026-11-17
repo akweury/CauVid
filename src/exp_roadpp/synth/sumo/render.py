@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, Rectangle, Wedge
 
 from src.exp_roadpp.synth.sumo import observe, traffic
-from src.exp_roadpp.synth.sumo.rules import heading
+from src.exp_roadpp.synth.sumo.observe import heading
 
 COLORS = {"Car": "#1f77b4", "MedVeh": "#17becf", "LarVeh": "#9467bd", "Bus": "#8c564b", "Cyc": "#2ca02c",
           "Mobike": "#bcbd22", "Ped": "#d62728", "TL": "#ff7f0e"}
