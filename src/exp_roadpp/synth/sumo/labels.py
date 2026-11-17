@@ -192,9 +192,13 @@ def _scene_agents(w, cam):
     agents = observe.scene_agents(w, "ego")
     tl = w.get("tl")
     if tl and tl_label(tl["state"]):
-        # the signal head on a pole 3 m right of the ego's stop line point; never occluded (height)
-        right_x, right_y = cam.fy, -cam.fx
-        x, y = tl["x"] + 3.0 * right_x, tl["y"] + 3.0 * right_y
+        # the signal head over the ego's lane past the far side of the junction (sumo_v6 on; it stays in
+        # view while the ego waits); older worlds: on a pole 3 m right of the stop line. Never occluded (height)
+        if "far_x" in tl:
+            x, y = tl["far_x"], tl["far_y"]
+        else:
+            right_x, right_y = cam.fy, -cam.fx
+            x, y = tl["x"] + 3.0 * right_x, tl["y"] + 3.0 * right_y
         sl, sw, sh = traffic.TL_SIZE
         agents[TL_ID] = {"x": x, "y": y, "z0": traffic.TL_BOTTOM, "z1": traffic.TL_BOTTOM + sh,
                          "height": float("inf"), "occluder": False,

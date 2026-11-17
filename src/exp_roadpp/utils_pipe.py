@@ -52,6 +52,10 @@ def get_parser():
                         help="Step 05: ego yaw / speed atoms read from the camera image (ego_flow.py), default False")
     parser.add_argument("--slot_ranges", type=str, default="False",
                         help="Step 05: rule bodies over a span of slots a..b (variable step durations), default False")
+    parser.add_argument("--durations", type=str, default="False",
+                        help="Step 05: duration atoms, how long a label has held (duration.py), default False")
+    parser.add_argument("--duration_labels", type=str, default="",
+                        help="Step 05: comma-separated labels with duration atoms (default duration.LABELS)")
     parser.add_argument("--ego_flow_workers", type=int, default=16,
                         help="Processes decoding the videos for the ego flow cache (CPU)")
     parser.add_argument("--require_self", type=str, default="True",
@@ -68,6 +72,14 @@ def get_parser():
     parser.add_argument("--train_subset_seed", type=int, default=0, help="Seed of the --train_fraction subset")
     parser.add_argument("--num_free_rules", type=int, default=None,
                         help="Step 05: unseeded rules (default 128; with --anchor_source none 128 + the causal seeds)")
+    parser.add_argument("--rule_lr", type=float, default=None,
+                        help="Step 05: lr of the rule net's head weights / biases (default 0.01; the gates keep gate_lr)")
+    parser.add_argument("--l0_lambda", type=float, default=None,
+                        help="Step 05: weight of the rule net's sparsity loss (mask L1 + head weight L1), default 1e-3")
+    parser.add_argument("--init_log_alpha", type=float, default=None,
+                        help="Step 05: initial gate logit of the rule net's masks, default -11")
+    parser.add_argument("--train_seed", type=int, default=0,
+                        help="Step 05: seed of the init and the frame sampling of the rule net and the MLP, default 0")
     parser.add_argument("--truncate_prob", type=float, default=0.5,
                         help="Step 05: share of training frames with a truncated history (partial facts), default 0.5")
     parser.add_argument("--num_slots", type=int, default=3, help="Step 05: memory slots of 10 frames, default 3")

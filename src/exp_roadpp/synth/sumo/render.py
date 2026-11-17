@@ -131,7 +131,7 @@ def render(dataset, vid, frame, out_file):
     if world.get("tl"):
         tl = world["tl"]
         c = {"r": "red", "y": "gold", "g": "green"}.get(tl["state"][0].lower(), "grey")
-        top.plot(tl["x"], tl["y"], marker="s", color=c, ms=7, mec="black", zorder=7)
+        top.plot(tl.get("far_x", tl["x"]), tl.get("far_y", tl["y"]), marker="s", color=c, ms=7, mec="black", zorder=7)
     hx, hy = heading(ego["angle"])
     half = 45
     top.set_xlim(ego["x"] + hx * 25 - half, ego["x"] + hx * 25 + half)

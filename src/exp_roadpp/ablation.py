@@ -60,6 +60,15 @@ VARIANTS = {
     "train_10": ("10% of the train videos", "data", ["--train_fraction", "0.1"]),
     "train_25": ("25% of the train videos", "data", ["--train_fraction", "0.25"]),
     "train_50": ("50% of the train videos", "data", ["--train_fraction", "0.5"]),
+    # Fit diagnostics (preset fit): why the rule net trails the MLP on the same inputs. Full 20261115-2131 / medium
+    # 20261116-1340: the rule net's best-val epoch has a higher train AND val loss than the MLP's (full 0.041 / 0.051
+    # vs 0.031 / 0.044), and the sparsity loss raises its train loss after the warm-up (0.037 -> 0.041).
+    "rule_lr_1e-3": ("rule net lr 1e-3 (the MLP's)", "fit", ["--rule_lr", "0.001"]),
+    "l0_1e-4": ("sparsity weight 1e-4", "fit", ["--l0_lambda", "0.0001"]),
+    "no_l0": ("no sparsity loss", "fit", ["--l0_lambda", "0"]),
+    "init_m6": ("mask gates start at -6 (stronger gradients)", "fit", ["--init_log_alpha", "-6"]),
+    "free_512": ("512 free rules (MLP hidden size alike)", "fit", ["--num_free_rules", "512"]),
+    "seed_1": ("train seed 1 (noise of both models)", "fit", ["--train_seed", "1"]),
 }
 # Variants not run by default: the existing results already settle them (medium suite 20261113-1635,
 # full suite 20261113-1636 and the earlier full ablations); --preset all or --variants runs them anyway.
@@ -80,6 +89,8 @@ PRESETS = {
               "no_grid", "no_require_self", "no_partial"],
     # The learning curve: how much train data the models need (main = 100%).
     "data": ["main", "train_5", "train_10", "train_25", "train_50"],
+    # Fit diagnostics: optimisation and capacity of the rule net (fit.md: train / val loss of both models).
+    "fit": ["main", "rule_lr_1e-3", "l0_1e-4", "no_l0", "init_m6", "free_512", "seed_1"],
     "all": list(VARIANTS),
 }
 # Only the main variant trains what the tables do not need (the layered rule net).
@@ -104,11 +115,49 @@ def pack(out_root, exp, suite, run_ids):
         tar.add(out_root / "suites" / suite, arcname=f"suites/{suite}")
         for run_id in run_ids:
             run = out_root / "runs" / run_id
-            for f in sorted(run.glob("run_info*.json")) + [run / x for x in PACK_FILES]:
+            history = [f for g in HISTORY_GLOBS for f in sorted(run.glob(g))]
+            for f in sorted(run.glob("run_info*.json")) + [run / x for x in PACK_FILES] + history:
                 if f.exists():
                     tar.add(f, arcname=str(f.relative_to(out_root)))
     print(f"[Suite] results packed: {out} ({out.stat().st_size / 1e6:.1f} MB); "
           f"unpack locally with tar -xzf {out.name} -C <CauVid>/src/exp_roadpp/output/roadpp/{exp}/")
+    return out
+
+
+# The per-epoch losses of both models (`step05.fit_onset_model`), for fit.md.
+HISTORY_GLOBS = ("step05_output/training_history_*.json", "step05_output/onset_mlp_history_*.json")
+
+
+def _best(history, select_from=0):
+    """The kept epoch of a loss history: the lowest val loss after select_from epochs (`fit_onset_model`)."""
+    rows = [e for e in history if e["epoch"] > select_from] or history
+    return min(rows, key=lambda e: e["val_loss"])
+
+
+def fit_table(out_root, state, names, warmup=10):
+    """fit.md: per variant, the kept epoch and its train / val loss of the rule net and the MLP, the same
+    loss on the same val frames per variant (a variant with another --train_seed samples other val frames:
+    compare the two models within a row). Rule net val / MLP val > 1: the rule net fits the val data worse."""
+    lines = ["# Fit: train / val onset loss at the kept epoch\n",
+             "Same loss and val frames for both models within a row. Gap = val - train; ratio = rule val / MLP val.\n",
+             "| Variant | Rule epochs (best) | Rule train | Rule val | Rule gap | MLP epochs (best) | MLP train | MLP val "
+             "| MLP gap | Ratio | Rule val at epoch 1 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for n in names:
+        run = Path(out_root) / "runs" / state["variants"].get(n, {}).get("run_id", "-")
+        files = {k: sorted(run.glob(g)) for k, g in zip(("rule", "mlp"), HISTORY_GLOBS)}
+        files["rule"] = [f for f in files["rule"] if "verifier" not in f.name]
+        if not files["rule"] or not files["mlp"]:
+            continue
+        rule, mlp = json.load(open(files["rule"][-1])), json.load(open(files["mlp"][-1]))
+        r, m = _best(rule, warmup), _best(mlp)
+        lines.append(f"| {VARIANTS[n][0]} | {len(rule)} ({r['epoch']}) | {r['train_loss']:.4f} | {r['val_loss']:.4f} | "
+                     f"{r['val_loss'] - r['train_loss']:+.4f} | {len(mlp)} ({m['epoch']}) | {m['train_loss']:.4f} | "
+                     f"{m['val_loss']:.4f} | {m['val_loss'] - m['train_loss']:+.4f} | {r['val_loss'] / m['val_loss']:.2f} | "
+                     f"{rule[0]['val_loss']:.4f} |")
+    out = Path(out_root) / "suites" / state["suite"] / "fit.md"
+    out.write_text("\n".join(lines) + "\n")
+    print(f"[Suite] {out}")
     return out
 
 
@@ -134,7 +183,7 @@ def main():
     if args.list:
         for name, (label, group, a) in VARIANTS.items():
             mark = ("" if name in PRESETS["paper"] else "  [preset data]" if name in PRESETS["data"]
-                    else "  [skipped by default]")
+                    else "  [preset fit]" if name in PRESETS["fit"] else "  [skipped by default]")
             print(f"{name:<18} {group:<10} {label:<45} {' '.join(a)}{mark}")
         print("\nSkipped by default (run with --preset all or --variants):")
         for name, why in SKIPPED.items():
@@ -203,6 +252,10 @@ def main():
         print("[Suite] the main variant did not finish: no tables")
         pack(out_root, args.exp, suite, [state["variants"][n]["run_id"] for n in done])
         return
+    try:
+        fit_table(out_root, state, done)
+    except Exception as e:
+        print(f"[Suite] fit.md failed ({type(e).__name__}: {e})")
     budget = int(args.budget) if float(args.budget).is_integer() else args.budget
     table_args = ["--exp", args.exp, "--root", str(Path(out_root).parent), "--main", state["variants"]["main"]["run_id"],
                   "--budget", str(budget), "--variant", args.variant_scores, "--out", str(suite_dir)]

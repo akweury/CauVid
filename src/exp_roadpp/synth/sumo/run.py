@@ -33,9 +33,10 @@ from pathlib import Path
 from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-VERSION = "sumo_v5"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
+VERSION = "sumo_v6"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
                                 # v4: E1 rule set (R1 crossing pedestrian, R2, R3 lead brake; random depart lane)
                                 # v5: multi-map (--maps), rules as v4
+                                # v6: the ego's signal head past the far side of the junction (in view while waiting)
 
 
 def _clip_firings(log, frames, num_frames, visible):

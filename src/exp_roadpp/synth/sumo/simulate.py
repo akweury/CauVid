@@ -51,14 +51,34 @@ def query_world(traci, t, lane_len):
     return {"t": round(t, 1), "dt": DT, "veh": veh, "ped": ped}
 
 
+FAR_SIDE_BEYOND = 2.0       # m past the far side of the junction: where the ego's signal head hangs
+
+
+def _far_side(traci, lane, x, y, hx, hy):
+    """Distance from the stop line (x, y) across the junction along the heading (hx, hy): the farthest
+    start of a lane the ego's lane leads to (straight on: the opposite side; at a T: the cross road's far edge)."""
+    best = None
+    for link in traci.lane.getLinks(lane):
+        sx, sy = traci.lane.getShape(link[0])[0]
+        d = (sx - x) * hx + (sy - y) * hy
+        best = d if best is None else max(best, d)
+    return best
+
+
 def ego_signal(traci, ego):
-    """The ego's next traffic light: its state char, distance and the stop line point, or None."""
+    """The ego's next traffic light: its state char, distance, the stop line point (x, y) and the point
+    where its signal head hangs (far_x, far_y): over the ego's lane, FAR_SIDE_BEYOND past the far side of
+    the junction (as US mast-arm signals), so the ego sees it while it waits at the stop line; or None."""
     nxt = traci.vehicle.getNextTLS("ego")
     if not nxt or ego["road"].startswith(":"):
         return None
     _tls, _link, dist, state = nxt[0]
     x, y = traci.lane.getShape(ego["lane"])[-1]
-    return {"state": state, "dist": round(dist, 2), "x": round(x, 2), "y": round(y, 2)}
+    hx, hy = heading(ego["angle"])
+    across = _far_side(traci, ego["lane"], x, y, hx, hy)
+    across = max(across or 0.0, 5.0) + FAR_SIDE_BEYOND
+    return {"state": state, "dist": round(dist, 2), "x": round(x, 2), "y": round(y, 2),
+            "far_x": round(x + hx * across, 2), "far_y": round(y + hy * across, 2)}
 
 
 def simulate(net_file, route_file, seed, rng, ego_depart):

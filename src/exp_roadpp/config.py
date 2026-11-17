@@ -385,6 +385,9 @@ def get_step_05_input(args):
         "ego_flow": str(getattr(args, "ego_flow", "False")) == "True",
         # Slot ranges of the rule bodies (`TemporalRuleNet` ranges): a body holds somewhere in slots a..b.
         "slot_ranges": str(getattr(args, "slot_ranges", "False")) == "True",
+        # Duration atoms (`duration.py`): how long a label has held (log-scale age bins and their unions).
+        "durations": str(getattr(args, "durations", "False")) == "True",
+        "duration_labels": str(getattr(args, "duration_labels", "") or ""),
         "ego_flow_cache_dir": args.output_dir.parent / "ego_flow_cache" / ego_flow.VERSION,
         "ego_flow_workers": int(getattr(args, "ego_flow_workers", 16)),
         "frame_dir": args.dataset_path / "frames",
@@ -401,6 +404,10 @@ def get_step_05_input(args):
         "truncate_prob": float(getattr(args, "truncate_prob", 0.5)),
         "num_slots": int(getattr(args, "num_slots", 3)),
         "num_free_rules": getattr(args, "num_free_rules", None),
+        "rule_lr": getattr(args, "rule_lr", None),
+        "l0_lambda": getattr(args, "l0_lambda", None),
+        "init_log_alpha": getattr(args, "init_log_alpha", None),
+        "train_seed": int(getattr(args, "train_seed", 0) or 0),
         "roles": tuple(r for r in str(getattr(args, "roles", "") or "").split(",") if r),
         "geometry": str(getattr(args, "geometry", "False")) == "True",
         "type_balance": str(getattr(args, "type_balance", "False")) == "True",
