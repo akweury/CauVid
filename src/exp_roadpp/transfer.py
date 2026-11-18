@@ -89,7 +89,8 @@ def prepare_target(target_atoms_dir, splits, cfg):
     for sp in splits:
         d = step05.prepare_videos(target_atoms_dir / f"{sp}_atoms_compressed.json", len(unique_atoms), "cpu",
                                   cfg["min_off_frames"], target_atoms_dir / f"{sp}_boxes.pt", cfg["roles"],
-                                  cfg["geometry"], unique_atoms, grid_spec, None, None, None, duration_spec)
+                                  cfg["geometry"], unique_atoms, grid_spec, None, None, None, duration_spec,
+                                  step05.load_predict(cfg))     # fixed camera constants: nothing fitted per dataset
         merged["videos"].update(d["videos"])
         merged["frames"].update(d["frames"])
     return merged, step05.load_vocabulary(target_cfg)

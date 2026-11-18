@@ -34,8 +34,8 @@ dataset> then cuts every long video into --cut_s clips (default 20 s) that overl
 (default 3 s = step07's min_context, so the evaluated frames of the cuts tile those of the long video
 exactly), labelled from the same world states, each in its long video's split: the paired short dataset.
 
-    ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_long_v1 --layout grid --maps 40 --workers 16
-    ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_long_v1_20s --cut_from sumo_long_v1 --workers 16
+    ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_long_v3 --layout grid --maps 40 --workers 16
+    ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_long_v3_20s --cut_from sumo_long_v3 --workers 16
 
 Server: ./run_roadpp_docker.sh --gpu none --sumo_gen -- --name sumo_maps_v7 --maps 40 --workers 16
 Then the pipeline, if the rule check at the end says ok: ./run_roadpp_docker.sh --gpu N -- --exp sumo_maps_v7
@@ -53,7 +53,10 @@ from pathlib import Path
 from src.exp_roadpp.synth.sumo import check_rules, labels, rules, scenario, simulate, traffic
 
 MIN_FRAMES = 100            # shorter ego clips (e.g. the ego never departed) are dropped
-GRID_VERSION = "sumo_grid_v1"   # long videos on grids (--layout grid); its cuts: GRID_VERSION + "/cut<s>s"
+GRID_VERSION = "sumo_grid_v3"   # long videos on grids (--layout grid); its cuts: GRID_VERSION + "/cut<s>s"
+                                # grid v1: R1-R4; v2: + R5 (a pedestrian seen, then occluded -> the ego brakes near it);
+                                # v3: R5' (brakes near a pedestrian seen at the junction ahead, in view or not)
+MEMORY_S = 3.0              # s: the rule net's memory without slot ranges; R5' instances hidden longer need more
 CUT_OVERLAP_S = 3.0         # s, as step07's min_context (3 slots of 1 s): the evaluated frames tile exactly
 VERSION = "sumo_v8"             # v2: R1 on the driver's camera view; v3: p = 1, no refractory;
                                 # v4: E1 rule set (R1 crossing pedestrian, R2, R3 lead brake; random depart lane)
@@ -109,7 +112,8 @@ def generate_one(job):
         info = traffic.write_routes(route_file, rng, spec=spec, clip_s=clip_frames * simulate.DT)
     except RuntimeError as e:                               # grids: no ego route inside the grid
         return {"vid": vid, "status": "no_route", "error": str(e)}
-    sim = simulate.simulate(net_file, route_file, seed, rng, info["ego_depart"], clip_mode, clip_frames)
+    extra = ("R5",) if scenario.is_grid(spec) else ()
+    sim = simulate.simulate(net_file, route_file, seed, rng, info["ego_depart"], clip_mode, clip_frames, extra)
     frames = sim["frames"]
     num_frames = min(clip_frames, len(frames))
     long_clip = clip_frames > simulate.CLIP_FRAMES
@@ -130,8 +134,14 @@ def _write_video(out, vid, frames, num_frames, log, labels_json, extra):
     with gzip.open(out / "meta" / "world" / f"{vid}.json.gz", "wt") as f:
         json.dump(frames, f)
     agents_per_frame = sum(len(fr["annos"]) for fr in video["data"]["frames"].values()) / num_frames
+    events = check_rules.video_events(video["data"], labels_json)
+    # injected instances the labels hold (executed, body and agent in view), for --targets: "R5:executed",
+    # and "R5:hidden3s", those whose pedestrian was out of view for >= MEMORY_S at the brake (memory needed)
+    r5 = [f for f in firings if f["rule"] == "R5" and f.get("executed") and f["body_visible"] and f["agent_visible"]]
+    events["R5:executed"] = len(r5)
+    events["R5:hidden3s"] = sum(1 for f in r5 if f.get("hidden_s", 0.0) >= MEMORY_S)
     result = {"vid": vid, "status": "ok", **extra, "frames": num_frames, "agents_per_frame": round(agents_per_frame, 2),
-              "events": check_rules.video_events(video["data"], labels_json),
+              "events": events,
               "onsets": dict(_onsets(video, labels_json)),
               "firings": Counter(f"{f['rule']}:{'executed' if f.get('executed') else 'fired' if f['fired'] else 'not_fired'}"
                                  + (":visible" if f["body_visible"] and f["agent_visible"] else "") for f in firings)}
@@ -246,7 +256,7 @@ def _write_generation(gen_file, args, targets, results, stop, version=VERSION):
                         "map_family": {"p_three_arms": scenario.P_THREE_ARMS, "angle_jitter": scenario.ANGLE_JITTER,
                                        "lanes": scenario.LANES, "speeds": scenario.SPEEDS,
                                        "approach_s": scenario.APPROACH_S, "controls": scenario.CONTROLS},
-                        "R1": rules.R1, "R2": rules.R2, "R3": rules.R3,
+                        "R1": rules.R1, "R2": rules.R2, "R3": rules.R3, "R5": rules.R5,
                         "layout": args.layout, "clip_frames": _clip_frames(args), "dt": simulate.DT,
                         "grid_family": {"rows": scenario.GRID_ROWS, "cols": scenario.GRID_COLS,
                                         "block_m": scenario.BLOCK_M, "fringe_m": scenario.FRINGE_M,
@@ -277,7 +287,7 @@ def _write_map_split(out, maps, assign):
     print("[SUMO] map split: " + ", ".join(f"{sp} {len(by_map[sp])} maps / {len(v)} videos" for sp, v in splits.items()))
 
 
-DEFAULT_GRID_TARGETS = "R1=800,R2=400,R3=800,R4=400,N4=300"
+DEFAULT_GRID_TARGETS = "R1=800,R2=400,R3=800,R4=400,R5:executed=300,R5:hidden3s=150,N4=300"
 
 
 def _clip_frames(args):

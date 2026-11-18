@@ -2269,7 +2269,7 @@ def main(input_data):
                                           step05_cfg["roles"], step05_cfg["geometry"], unique_atoms,
                                           step05.load_grid(step05_cfg), step05.load_motion(step05_cfg),
                                           step05.load_ego_motion(step05_cfg), step05.load_ego_flow(step05_cfg),
-                                          step05.load_durations(step05_cfg))
+                                          step05.load_durations(step05_cfg), step05.load_predict(step05_cfg))
         test_data["grid_tag"] = step05.grid_tag(step05_cfg)
         step05.save_data(test_data, cfg["test_data_file"])
     model = step05.load_temporal_rule_net(test_data, step05_cfg)

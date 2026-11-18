@@ -42,6 +42,16 @@ R3 = {"lag_s": (0.5, 1.5), "p": 1.0, "min_speed": 1.5, "speed_drop": 4.0, "decel
 # block: a pure order rule, the lag is the drive to the next junction incl. waiting, ~10-60 s). Applied by
 # the routes (`scenario.random_walk`), not by TraCI; for every vehicle on a grid, the ego included.
 R4 = {"p": 1.0, "free_turns": "scenario.TURN_WEIGHTS"}
+# R5' (grids, the ego only; generator sumo_grid_v3): the ego saw a pedestrian waiting at / on a crossing of
+# the junction it drives to (Ped:Wait2X / Xing*, >= min_seen_frames in view); when the ego, moving, comes
+# within d_trigger_m of it, while it is still there, the ego brakes after lag_s, whether the pedestrian is
+# in view at that moment or not (once per (ego, pedestrian)). The body is the sighting; at the brake the
+# pedestrian may be hidden (occluded, or out of the field of view) for seconds: those instances
+# ("hidden at the trigger", logged) need memory, the visible ones do not. (sumo_grid_v2's R5 braked
+# only for hidden pedestrians, which the rule language cannot say: it has no negation.)
+# Ego only: every driver's view at every step would be too slow (R1 / R3 views are computed on triggers).
+R5 = {"min_seen_frames": 5, "d_trigger_m": 15.0, "lag_s": (0.3, 0.8), "p": 1.0,
+      "min_speed": 2.0, "speed_drop": 4.0, "decel": 3.0}
 
 GT_RULES = [
     {"id": "R1", "exact": True, "form": "other -> self",
@@ -81,6 +91,17 @@ GT_RULES_GRID = [
      "lag_s": None, "p": R4["p"], "classes": "all vehicles (routes)",
      "notes": "lag = drive to the next junction incl. queues and red lights (~10-60 s); straight passes "
               "of junctions carry no label, so the next turn label after AV-TurRht is AV-TurLft"},
+    {"id": "R5", "exact": True, "form": "other (seen earlier) -> self",
+     "head": {"agent": "self", "label": "Brake", "av_label": "AV-Brake"},
+     "body": [{"agent": "self", "label": "Mov", "av_label": "AV-Mov"},
+              {"agent": "other", "class": "Ped", "label": "Wait2X / Xing / XingFmLft / XingFmRht",
+               "where": "at the junction the ego drives to, seen by the ego (visible or not at the brake)"}],
+     "onset": "the pedestrian's first frame in view; the brake comes when the ego is within "
+              f"{R5['d_trigger_m']:g} m of it (lag: the approach)",
+     "lag_s": None, "p": R5["p"], "classes": ["ego"],
+     "notes": f"brake {R5['lag_s'][0]:g}-{R5['lag_s'][1]:g} s after reaching the distance; logged: whether the "
+              "pedestrian is in view then (hidden: only memory tells); executed only at speed >= "
+              f"{R5['min_speed']:g} m/s (drop {R5['speed_drop']:g} m/s at {R5['decel']:g} m/s^2)"},
 ]
 
 NATURAL_RULES = [
@@ -107,15 +128,30 @@ def on_crossing(ped):
     return ped["road"].startswith(":") and "_c" in ped["road"]
 
 
+def next_junction(road):
+    """The junction a vehicle on `road` drives to (or is in): "C" or a grid junction "J..", else None
+    (on an edge to the network boundary)."""
+    node = road[1:].rsplit("_", 1)[0] if road.startswith(":") else road.split("2")[-1] if "2" in road else None
+    return node if node and (node == "C" or node.startswith("J")) else None
+
+
+def _at_junction(ped, node):
+    """Ped:Wait2X / Xing*: on a walking area or a crossing of `node`."""
+    return ped["road"].startswith(f":{node}_") and (is_waiting(ped) or on_crossing(ped))
+
+
 def is_mov(v):
     """The driver's label is Mov (not Stop, not Brake; turning in the junction is not told apart here)."""
     return v["speed"] >= MOV_SPEED and v["acc"] > MOV_ACC
 
 
 class RuleEngine:
-    def __init__(self, traci, rng):
+    def __init__(self, traci, rng, extra_rules=()):
+        """extra_rules: rules beyond R1-R3, e.g. ("R5",) on grids (R4 lives in the routes)."""
         self.traci = traci
         self.rng = rng
+        self.extra = set(extra_rules)
+        self.r5_mem = {}                # pedestrian -> what the ego saw of it at its next junction
         self.log = []                   # every trigger
         self.pending = []               # log entries of fired, not yet executed triggers (R1, R3)
         self.seen = set()               # (rule, driver, body agent, body episode) already triggered
@@ -137,6 +173,8 @@ class RuleEngine:
         ahead = {vid for vid in seen if vid in world["veh"]
                  and abs((world["veh"][vid]["angle"] - ego["angle"] + 180.0) % 360.0 - 180.0) < 45.0}
         self._r2(t, world, ahead)
+        if ego and "R5" in self.extra:
+            self._r5(t, world, ego, seen)
 
     # -------------- body states --------------
     def _crossings(self, world):
@@ -209,12 +247,49 @@ class RuleEngine:
         due = [e for e in self.pending if t + 1e-6 >= e["t_fire"]]
         self.pending = [e for e in self.pending if t + 1e-6 < e["t_fire"]]
         for entry in due:
-            spec = R1 if entry["rule"] == "R1" else R3
+            spec = {"R1": R1, "R3": R3, "R5": R5}[entry["rule"]]
             v = world["veh"].get(entry["agent"])
             entry["executed"] = bool(v and v["speed"] >= spec["min_speed"])
             if entry["executed"]:
                 target = max(v["speed"] - spec["speed_drop"], 0.0)
                 self.traci.vehicle.slowDown(entry["agent"], target, max(0.5, (v["speed"] - target) / spec["decel"]))
+
+    # -------------- R5': a pedestrian the ego saw at the junction ahead --------------
+    def _r5(self, t, world, ego, seen):
+        node = next_junction(ego["road"])
+        if node is None:
+            return
+        for pid, p in world["ped"].items():
+            if not _at_junction(p, node):
+                continue
+            m = self.r5_mem.get(pid)
+            if m is None or m["junction"] != node:
+                m = self.r5_mem[pid] = {"junction": node, "seen": 0, "first_seen": None, "last_seen": None,
+                                        "done": False}
+            if pid in seen:
+                m["seen"] += 1
+                m["last_seen"] = t
+                if m["first_seen"] is None:
+                    m["first_seen"] = t
+        if not is_mov(ego) or ego["speed"] < R5["min_speed"]:
+            return
+        for pid, m in self.r5_mem.items():
+            if m["done"] or m["junction"] != node or m["seen"] < R5["min_seen_frames"]:
+                continue
+            p = world["ped"].get(pid)
+            if (p is None or not _at_junction(p, node)
+                    or math.hypot(p["x"] - ego["x"], p["y"] - ego["y"]) > R5["d_trigger_m"]):
+                continue
+            m["done"] = True
+            visible = pid in seen
+            entry = {"rule": "R5", "agent": "ego", "body_agent": pid, "t_body": m["first_seen"],
+                     "t_last_seen": m["last_seen"], "t_trigger": t, "visible_at_trigger": visible,
+                     "hidden_s": 0.0 if visible else round(t - m["last_seen"], 1), "fired": False}
+            if self.rng.random() < R5["p"]:
+                lag = self.rng.uniform(*R5["lag_s"])
+                entry.update(fired=True, lag=round(t + lag - m["first_seen"], 2), t_fire=round(t + lag, 1))
+                self.pending.append(entry)
+            self.log.append(entry)
 
     # -------------- R2 --------------
     def _r2(self, t, world, seen_by_ego):

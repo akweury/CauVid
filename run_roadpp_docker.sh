@@ -105,6 +105,10 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.synth.sumo.check_rules"
     elif [[ "$arg" == "--sumo_render" ]]; then
         ENTRY_MODULE="src.exp_roadpp.synth.sumo.render"
+    elif [[ "$arg" == "--predict_check" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.predict_check"
+    elif [[ "$arg" == "--rule_events" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.rule_events"
     elif [[ "$arg" == "--ablation" ]]; then
         ENTRY_MODULE="src.exp_roadpp.ablation"
     else

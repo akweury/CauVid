@@ -115,10 +115,12 @@ def clip_window(num_recorded, enter, post_frames, mode="junction", rng=None, cli
     return max(0, end - clip_frames), end
 
 
-def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction", clip_frames=CLIP_FRAMES):
+def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction", clip_frames=CLIP_FRAMES,
+             extra_rules=()):
     """{"frames": [world state per step of the clip and its margin], "firings": rule log,
     "clip": {"mode", "start_s": clip start after the departure, "enter_s": ego in the junction (or None)}}.
-    clip_frames: CLIP_FRAMES (20 s) for the junction maps; long clips (grids) from the departure on."""
+    clip_frames: CLIP_FRAMES (20 s) for the junction maps; long clips (grids) from the departure on.
+    extra_rules: injected rules beyond R1-R3 (`rules.RuleEngine`), e.g. ("R5",) on grids."""
     traci = _traci()
     cmd = [scenario.sumo_binary("sumo"), "-n", str(net_file), "-r", str(route_file),
            "--step-length", str(DT), "--seed", str(seed), "--lanechange.duration", "2",
@@ -130,7 +132,7 @@ def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction", 
             phases = traci.trafficlight.getAllProgramLogics(tls)[0].phases
             traci.trafficlight.setPhase(tls, rng.randrange(len(phases)))
         post_frames = int(round(rng.uniform(*POST_JUNCTION_S) / DT))
-        engine = RuleEngine(traci, rng)
+        engine = RuleEngine(traci, rng, extra_rules)
         lane_len, frames, enter = {}, [], None
         t_end = ego_depart + MAX_INSERT_WAIT + max(MAX_RECORD_S, clip_frames * DT + 30.0)
         while traci.simulation.getTime() < t_end:

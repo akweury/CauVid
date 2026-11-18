@@ -22,7 +22,9 @@ MIN_OFF = 10                # frames, as step_dataset.MIN_OFF_FRAMES
 SLACK = 5                   # frames added on both sides of a lag window
 CONTROL_STEP = 10           # frames between control moments
 MIN_LIFT, MIN_P = 2.0, 0.4  # an injected rule passes above both
-MIN_LIFT_OF = {"R4": 1.5}   # an order rule between two turns: its control is ~0.5 (left or right), lift <= ~2
+MIN_LIFT_OF = {"R4": 1.5,   # an order rule between two turns: its control is ~0.5 (left or right), lift <= ~2
+               "R5": 1.5}   # long window (0-15 s) against a matched control (pavement pedestrians coming into view)
+MEMORY_S = 3.0              # s: the rule net's memory without slot ranges (R5' instances hidden longer need more)
 TURN_MERGE = 50             # frames: turn onsets of the same kind closer than this are one turn (flicker)
 VEHICLES = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike", "Cyc")
 CROSSING = ("Xing", "XingFmLft", "XingFmRht")
@@ -43,6 +45,8 @@ TESTS = {
     "N4": ("ego: its TL turns Green in view while AV-Stop -> AV-Mov within 5 s", (1, 50), False),
     # grids (long videos): the window is unused, the test is the next turn label (`_r4`)
     "R4": ("ego: AV-TurRht -> the next turn label is AV-TurLft (control: the turn after an AV-TurLft)", (1, 600), True),
+    "R5": ("ego: a pedestrian waiting / crossing comes into view while AV-Mov -> AV-Brake in 0.5-15 s "
+           "(control: pavement pedestrians coming into view)", (5, 150), True),
 }
 
 
@@ -121,12 +125,34 @@ def _r4(av, stats):
             stats["R4"]["control_hits"] += k1 == "L"
 
 
+def _r5(lf, mov, brake, stats):
+    """R5' in the labels: a pedestrian comes into view (the first frame of a run of its frames) while the
+    ego is AV-Mov; event if it is waiting / on a crossing then (Wait2X / Xing*), matched control if it
+    walks on the pavement. Hit: an AV-Brake onset in the R5 window after it. (Any junction: the labels do
+    not tell the junction ahead from others.)"""
+    for uid, per in lf.items():
+        if uid == "ego" or not per.get("cls:Ped"):
+            continue
+        frames = per["cls:Ped"]
+        waiting = set(per.get("Wait2X", [])).union(*(per.get(x, []) for x in CROSSING))
+        for f in run_starts(frames):
+            if f not in mov:
+                continue
+            hit = _hit(brake, f, TESTS["R5"][1])
+            if f in waiting:
+                _event(stats, "R5", hit)
+            else:
+                stats["R5"]["control"] += 1
+                stats["R5"]["control_hits"] += hit
+
+
 def check_video(lf, first, stats):
     win = {r: TESTS[r][1] for r in TESTS}
     ego = lf["ego"]
     mov, stop = set(ego.get("AV-Mov", [])), set(ego.get("AV-Stop", []))
     av = {k: onsets(ego.get(k, []), 1) for k in ("AV-Brake", "AV-Mov", "AV-TurRht", "AV-TurLft", "AV-MovRht")}
     _r4(av, stats)
+    _r5(lf, mov, av["AV-Brake"], stats)
     for r in ("R1", "R3", "N3"):
         _control(stats, r, sorted(mov), av["AV-Brake"])
     _control(stats, "N1", sorted(stop), av["AV-Mov"])
@@ -189,6 +215,8 @@ def check(dataset):
     labels = json.loads((dataset / "gt" / "label.json").read_text())
     stats = defaultdict(Counter)
     log = defaultdict(Counter)
+    lags = defaultdict(list)                    # s from the body's onset to the head
+    hidden = defaultdict(list)                  # R5': s the pedestrian was out of view at the brake
     for gt in sorted((dataset / "gt").glob("*_gt.json")):
         vid = gt.name[:-len("_gt.json")]
         lf, first = label_frames(json.loads(gt.read_text())["data"], labels)
@@ -205,6 +233,10 @@ def check(dataset):
                 agent = "ego" if e["agent_is_ego"] else f"{vid}-{e['agent']}"
                 head = av_brake if agent == "ego" else onsets(lf.get(agent, {}).get("Brake", []), first.get(agent, 0))
                 c["head_onset_seen"] += _hit(head, e["frame_body"], TESTS[e["rule"]][1])
+                if e.get("frame_fire") is not None:
+                    lags[e["rule"]].append((e["frame_fire"] - e["frame_body"]) / 10)
+                if "hidden_s" in e:
+                    hidden[e["rule"]].append(e["hidden_s"])
 
     report = {}
     for r, (what, _window, injected) in TESTS.items():
@@ -217,6 +249,13 @@ def check(dataset):
                      "ok": bool(lift >= MIN_LIFT_OF.get(r, MIN_LIFT) and p >= MIN_P)
                      if injected and s["events"] else None}
     report["rule_log"] = {k: dict(v) for k, v in sorted(log.items())}
+    report["lag_s"] = {r: {"n": len(v), **{f"p{q}": round(sorted(v)[min(len(v) - 1, int(q / 100 * len(v)))], 1)
+                                            for q in (10, 50, 90)}, "share_over_3s": round(sum(x > 3 for x in v) / len(v), 2)}
+                       for r, v in sorted(lags.items()) if v}
+    report["hidden_s"] = {r: {"n": len(v), "share_hidden": round(sum(x > 0 for x in v) / len(v), 2),
+                              f"share_hidden_over_{MEMORY_S:g}s": round(sum(x >= MEMORY_S for x in v) / len(v), 2),
+                              "p90": round(sorted(v)[min(len(v) - 1, int(0.9 * len(v)))], 1)}
+                          for r, v in sorted(hidden.items()) if v}
     (dataset / "meta" / "rule_check.json").write_text(json.dumps(report, indent=1))
     return report
 
@@ -231,6 +270,12 @@ def print_report(report):
     for k, c in report["rule_log"].items():
         print(f"  log {k:9s} " + ", ".join(f"{n} {c.get(n, 0)}" for n in
                                            ("triggers", "fired", "executed", "executed_and_seen", "head_onset_seen")))
+    for r, x in report.get("lag_s", {}).items():
+        print(f"  lag {r}: body onset -> head (executed and seen, n {x['n']}): p10 {x['p10']} s, median "
+              f"{x['p50']} s, p90 {x['p90']} s, > 3 s (beyond 3 slots of memory) {x['share_over_3s']:.0%}")
+    for r, x in report.get("hidden_s", {}).items():
+        print(f"  hidden {r}: pedestrian out of view at the brake {x['share_hidden']:.0%}, for >= {MEMORY_S:g} s "
+              f"{x[f'share_hidden_over_{MEMORY_S:g}s']:.0%} (memory needed), p90 {x['p90']} s (n {x['n']})")
 
 
 def main():

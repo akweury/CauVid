@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import utils_data, roles as agent_roles, geometry as agent_geometry, grid as agent_grid
 from src.exp_roadpp import motion as agent_motion, ego_motion as agent_ego_motion, ego_flow as agent_ego_flow
+from src.exp_roadpp import predict as agent_predict
 from src.exp_roadpp import duration as agent_duration
 from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins, slot_spans
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
@@ -58,7 +59,8 @@ def load_vocabulary(cfg):
     then the grid position atoms of cfg["grid"] (`grid.vocabulary`), then the motion atoms of
     cfg["motion"] (`motion.vocabulary`), then the ego motion atoms of cfg["ego_motion"]
     (`ego_motion.vocabulary`), then the ego flow atoms of cfg["ego_flow"] (`ego_flow.vocabulary`), then the
-    duration atoms of cfg["durations"] (`duration.vocabulary`)."""
+    duration atoms of cfg["durations"] (`duration.vocabulary`), then the prediction atoms of cfg["predict"]
+    (`predict.vocabulary`)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     out = unique_atoms + agent_geometry.vocabulary(unique_atoms, cfg.get("geometry", ()))
     if cfg.get("grid"):
@@ -71,12 +73,16 @@ def load_vocabulary(cfg):
         out += agent_ego_flow.vocabulary()
     if cfg.get("durations"):
         out += agent_duration.vocabulary(unique_atoms, duration_labels(cfg))
+    if cfg.get("predict"):
+        out += agent_predict.vocabulary(unique_atoms)
     return out
 
 
 def is_input_atom(signature):
-    """Geometry, grid, motion, ego motion and ego flow atoms are inputs only: no head learns or is evaluated on them."""
-    return len(signature) > 1 and signature[1] in ("geometry", "grid", "motion", "ego_motion", "ego_flow", "duration")
+    """Geometry, grid, motion, ego motion, ego flow, duration and prediction atoms are inputs only: no head
+    learns or is evaluated on them."""
+    return len(signature) > 1 and signature[1] in ("geometry", "grid", "motion", "ego_motion", "ego_flow", "duration",
+                                                   "predict")
 
 
 # -------------- Grid atoms (`grid.py`) --------------
@@ -94,6 +100,8 @@ def grid_tag(cfg):
         tag += agent_ego_flow.tag()
     if cfg.get("durations"):
         tag += agent_duration.tag(duration_labels(cfg))
+    if cfg.get("predict"):
+        tag += agent_predict.tag()
     return tag
 
 
@@ -228,6 +236,13 @@ def duration_labels(cfg):
     if isinstance(labels, str):
         labels = [x for x in labels.split(",") if x]
     return tuple(labels)
+
+
+def load_predict(cfg):
+    """The prediction atom settings (`predict.py`: fixed camera constants, nothing fitted), None without them."""
+    if not cfg.get("predict"):
+        return None
+    return {"version": agent_predict.VERSION, "camera": agent_predict.CAMERA}
 
 
 def load_durations(cfg):
@@ -420,7 +435,7 @@ def is_fresh(output_file, *source_files):
 
 def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=(), geometry=(),
                    unique_atoms=None, grid_spec=None, motion_spec=None, ego_motion_spec=None, ego_flow_spec=None,
-                   duration_spec=None):
+                   duration_spec=None, predict_spec=None):
     """Compressed atoms and frame lists of every video of one split.
     With roles (`roles.ROLES`), each video also gets "roles" (T, N, K) int16: the
     agent filling each role for each agent and frame (-1: none), from the boxes of
@@ -435,8 +450,10 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     with ego_motion_spec (`fit_ego_motion`), the ego motion atoms (`ego_motion.ego_atoms`, the ego's
     column only) follow them; with ego_flow_spec (`load_ego_flow`), the ego flow atoms (`ego_flow.flow_atoms`,
     the ego's column only, read from the camera image) follow them; with duration_spec (`load_durations`), the
-    duration atoms (`duration.duration_atoms`, from the label atoms) follow them; "grid_layout" gives their
-    [start, end) atom ranges ("position", "motion", "ego_motion", "ego_flow", "duration").
+    duration atoms (`duration.duration_atoms`, from the label atoms) follow them; with predict_spec
+    (`load_predict`), the prediction atoms (`predict.predict_atoms`: reach / conflict times of pedestrians
+    and cyclists, from the boxes) follow them; "grid_layout" gives their [start, end) atom ranges
+    ("position", "motion", "ego_motion", "ego_flow", "duration", "predict").
 
     Returns {
       "num_atoms": A, the label atoms and the geometry atoms after them,
@@ -453,7 +470,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     """
     atoms = utils_data.load_json(atom_file)
     boxes = None
-    if roles or geometry or grid_spec is not None or motion_spec is not None or ego_motion_spec is not None:
+    if (roles or geometry or grid_spec is not None or motion_spec is not None or ego_motion_spec is not None
+            or predict_spec is not None):
         if box_file is None or not os.path.exists(box_file):
             raise FileNotFoundError(f"Agent roles {roles}, geometry {geometry} and the grid need the box file "
                                     f"{box_file} (step_dataset).")
@@ -482,6 +500,10 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     num_duration = (len(agent_duration.vocabulary(unique_atoms, duration_spec["labels"]))
                     if duration_spec is not None else 0)
     duration_on = 0.0
+    predict_start = duration_start + num_duration
+    num_predict = len(agent_predict.vocabulary(unique_atoms)) if predict_spec is not None else 0
+    predict_on = 0.0
+    turn_atoms = agent_predict.ego_turn_atoms(unique_atoms) if predict_spec is not None else []
     if ego_flow_spec is not None:
         _ensure_ego_flow(atoms, boxes, ego_flow_spec)
     grid_rows = 0
@@ -548,6 +570,14 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
             D_atoms = agent_duration.duration_atoms(X_labels, unique_atoms, duration_spec["labels"])
             duration_on += float(D_atoms.any(dim=2).sum())
             X = torch.cat([X, D_atoms.to(X.device)], dim=2)
+        if predict_spec is not None:
+            turning = (X_labels[:, ego][:, turn_atoms].any(dim=1).cpu().numpy() if ego is not None and turn_atoms
+                       else None)
+            P_atoms = torch.from_numpy(agent_predict.predict_atoms(video_boxes.numpy(), has_box.numpy(), classes,
+                                                                   turning, unique_atoms, ego,
+                                                                   predict_spec["camera"]))
+            predict_on += float(P_atoms.any(dim=2).sum())
+            X = torch.cat([X, P_atoms.to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
         if roles:
             videos[video_id]["roles"] = partners.to(torch.int16)
@@ -579,15 +609,18 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     if duration_spec is not None:
         print(f"[Durations]\t {name}: {num_duration} duration atoms of the labels {list(duration_spec['labels'])}; "
               f"share of visible agents (rows) holding one: {duration_on / max(num_rows, 1):.2f}")
+    if predict_spec is not None:
+        print(f"[Predict]\t {name}: {num_predict} prediction atoms; share of visible agents (rows) holding one: "
+              f"{predict_on / max(num_rows, 1):.3f}")
     out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid + num_motion + num_ego_motion + num_ego_flow
-                        + num_duration,
+                        + num_duration + num_predict,
            "num_label_atoms": num_atoms,
            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
            "frames": frames, "positive_frames": positive_frames}
     if boxes is not None:
         out["group_tag"] = agent_grid.GROUP_TAG
     if (grid_spec is not None or motion_spec is not None or ego_motion_spec is not None or ego_flow_spec is not None
-            or duration_spec is not None):
+            or duration_spec is not None or predict_spec is not None):
         out["grid_layout"] = {}
     if grid_spec is not None:
         out["grid_layout"]["position"] = [grid_start, grid_start + num_grid]
@@ -599,6 +632,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
         out["grid_layout"]["ego_flow"] = [ego_flow_start, ego_flow_start + num_ego_flow]
     if duration_spec is not None:
         out["grid_layout"]["duration"] = [duration_start, duration_start + num_duration]
+    if predict_spec is not None:
+        out["grid_layout"]["predict"] = [predict_start, predict_start + num_predict]
     return out
 
 
@@ -614,13 +649,13 @@ def prepare_training_data(cfg):
     unique_atoms = utils_data.load_json(cfg['unique_atoms_file'])
     num_atoms = len(unique_atoms)
     grid_spec, motion_spec, ego_motion_spec = load_grid(cfg), load_motion(cfg), load_ego_motion(cfg)
-    ego_flow_spec, duration_spec = load_ego_flow(cfg), load_durations(cfg)
+    ego_flow_spec, duration_spec, predict_spec = load_ego_flow(cfg), load_durations(cfg), load_predict(cfg)
     train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
                            cfg.get("train_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
-                           motion_spec, ego_motion_spec, ego_flow_spec, duration_spec)
+                           motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec)
     val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
                          cfg.get("val_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
-                         motion_spec, ego_motion_spec, ego_flow_spec, duration_spec)
+                         motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec)
     shared = set(train["videos"]) & set(val["videos"])
     if shared:
         raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
@@ -778,6 +813,16 @@ def head_event_types(training_data, unique_atoms, cfg):
             "count_source": "train + val onsets", "num_onsets": int(counts.sum())}
 
 
+def frames_to_sample(training_data, video_id, cfg):
+    """Target frames to sample from one video per epoch: cfg["frames_per_video"] per
+    cfg["frames_per_video_ref"] frames (32 per 20 s), so a long video gets as many per second as a
+    short one (sumo_long_*: a 122 s video and its seven 20 s cuts get the same rows per second). Videos
+    up to the reference length keep frames_per_video (the roadpp and 20 s SUMO runs are unchanged)."""
+    T = training_data["videos"][video_id]["shape"][0]
+    n = cfg["frames_per_video"]
+    return max(n, round(n * T / cfg.get("frames_per_video_ref", 200)))
+
+
 def _sample_frames(training_data, video_id, num_frames, positive_ratio, generator, horizon=1):
     """(<= num_frames,) sorted target frames of one video, a share positive_ratio
     of them drawn from its frames with onsets and the rest from all its frames.
@@ -832,9 +877,18 @@ def video_rows(model, X, frames, min_off_frames=1, history=None, roles=None):
 def sample_history(frames, cfg, generator):
     """(F,) known history of target frames for training: with probability
     truncate_prob a random 0..memory frames (the model learns to predict from
-    partial facts, with lower confidence), else everything before the frame."""
-    memory = cfg["slot_size"] * cfg["num_slots"]
+    partial facts, with lower confidence), else everything before the frame.
+    With slot_ranges the memory is every known frame (the coarse bins 3-6, 6-12, > 12 s),
+    so a truncated history is drawn from 0..t (all of it known at most): capped at the
+    3 s of the single slots, half of the rows would never see a long bin known (a rule
+    "seen 3-12 s before" could not learn from them) and its unknown chance would be fit on
+    the all-unknown case only. Without slot_ranges the draws are as before."""
     truncated = torch.rand(len(frames), generator=generator) < cfg["truncate_prob"]
+    if cfg.get("slot_ranges"):
+        full = frames.cpu()
+        drawn = (torch.rand(len(frames), generator=generator) * (full + 1).float()).long().clamp(max=full)
+        return torch.where(truncated, drawn, full)
+    memory = cfg["slot_size"] * cfg["num_slots"]
     return torch.where(truncated, torch.randint(memory + 1, (len(frames),), generator=generator), frames.cpu())
 
 
@@ -908,8 +962,8 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     # Fixed validation frames and known histories, so the losses of the epochs are comparable.
     val_frames = {}
     for video_id in training_data["val_videos"]:
-        frames = _sample_frames(training_data, video_id, cfg["frames_per_video"], cfg["positive_frame_ratio"],
-                                generator, max(cfg["windows"]))
+        frames = _sample_frames(training_data, video_id, frames_to_sample(training_data, video_id, cfg),
+                                cfg["positive_frame_ratio"], generator, max(cfg["windows"]))
         val_frames[video_id] = (frames, sample_history(frames, cfg, generator))
     # Learning curve: each video of a share f of the train data round(1 / f) times per epoch (`get_cfg`).
     train_videos = list(training_data["train_videos"]) * cfg.get("epoch_repeat", 1)
@@ -919,13 +973,22 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
         model.train()
         order = torch.randperm(len(train_videos), generator=generator).tolist()
         epoch_losses = []
-        for start in range(0, len(order), cfg["videos_per_batch"]):
-            parts = []
-            for i in order[start:start + cfg["videos_per_batch"]]:
-                frames = _sample_frames(training_data, train_videos[i], cfg["frames_per_video"],
-                                        cfg["positive_frame_ratio"], generator, max(cfg["windows"]))
-                parts.append(_video_rows(model, training_data, train_videos[i], frames, device,
-                                         sample_history(frames, cfg, generator)))
+        # The epoch's target frames, in chunks of frames_per_video (a long video gives several,
+        # `frames_to_sample`); a batch holds videos_per_batch chunks, so the batch size and the steps
+        # per second of video are those of 20 s videos. The draws are in the order of the former
+        # per-batch loop: with one chunk per video (videos up to 20 s) the epoch is unchanged.
+        fpv, items = cfg["frames_per_video"], []
+        for i in order:
+            frames = _sample_frames(training_data, train_videos[i],
+                                    frames_to_sample(training_data, train_videos[i], cfg),
+                                    cfg["positive_frame_ratio"], generator, max(cfg["windows"]))
+            known = sample_history(frames, cfg, generator)
+            items += [(train_videos[i], frames[k:k + fpv], known[k:k + fpv]) for k in range(0, max(len(frames), 1), fpv)]
+        if len(items) > len(order):                         # long videos: their chunks spread over the batches
+            items = [items[j] for j in torch.randperm(len(items), generator=generator).tolist()]
+        for start in range(0, len(items), cfg["videos_per_batch"]):
+            parts = [_video_rows(model, training_data, video_id, frames, device, known)
+                     for video_id, frames, known in items[start:start + cfg["videos_per_batch"]]]
             rows = concat_rows(parts)
             if len(rows["inputs"]) == 0:
                 continue
@@ -1638,6 +1701,9 @@ def get_cfg(input_data):
     # instead of one 1 s slot, so the steps of a sequence may last more or less long. Off until an
     # ablation shows a clear gain.
     slot_ranges = input_data.get("slot_ranges", False)        # --slot_ranges (default False)
+    # Prediction atoms (`predict.py`): when the ego reaches a pedestrian / cyclist and whether their paths
+    # cross then, from the boxes; read in every scope. Off until an ablation shows a clear gain.
+    predict = input_data.get("predict", False)                # --predict (default False)
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
     require_self = input_data.get("require_self", True)       # --require_self (default True)
@@ -1673,6 +1739,8 @@ def get_cfg(input_data):
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if truncate_prob != 0.5:
         base_tag += f"{truncate_prob:g}"
+    if slot_ranges:
+        base_tag += "H"         # truncated histories drawn from all the known memory (`sample_history`)
     if anchor_source != "causal":
         base_tag += f"_a{anchor_source}" + (str(anchor_seed) if anchor_source == "random" else "")
     if train_fraction < 1:
@@ -1688,12 +1756,12 @@ def get_cfg(input_data):
     if geometry:
         base_tag += "_g" + "-".join(geometry)
     base_tag += grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion, "ego_flow": ego_flow,
-                          "durations": durations, "duration_labels": dur_labels})
+                          "durations": durations, "duration_labels": dur_labels, "predict": predict})
     # The prepared datasets depend only on these settings (`shared_data_file`).
     min_off_frames = 10
     data_key = (f"m{min_off_frames}" + ("_r" + "-".join(roles) if roles else "") + ("_g" + "-".join(geometry) if geometry else "")
                 + grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion, "ego_flow": ego_flow,
-                          "durations": durations, "duration_labels": dur_labels}))
+                          "durations": durations, "duration_labels": dur_labels, "predict": predict}))
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "") + ("_rng" if slot_ranges else "")
@@ -1767,6 +1835,8 @@ def get_cfg(input_data):
             'lr': rule_lr,
             'videos_per_batch': 4,
             'frames_per_video': 32,
+            # ... per frames_per_video_ref frames (`frames_to_sample`): longer videos get more, at the same rate.
+            'frames_per_video_ref': 200,
             # Share of sampled frames where some atom switches on (onsets are rare).
             'positive_frame_ratio': 0.5,
             'pos_weight': 20.0,
@@ -1822,6 +1892,7 @@ def get_cfg(input_data):
             'durations': durations,
             'duration_labels': dur_labels,
             'slot_ranges': slot_ranges,
+            'predict': predict,
             # The raw flow samples per video (`ego_flow.ensure_cache`), shared by every exp and run.
             'ego_flow_cache_dir': input_data.get("ego_flow_cache_dir"),
             'ego_flow_workers': int(input_data.get("ego_flow_workers", 16)),

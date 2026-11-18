@@ -385,6 +385,7 @@ def get_step_05_input(args):
         "ego_flow": str(getattr(args, "ego_flow", "False")) == "True",
         # Slot ranges of the rule bodies (`TemporalRuleNet` ranges): a body holds somewhere in slots a..b.
         "slot_ranges": str(getattr(args, "slot_ranges", "False")) == "True",
+        "predict": str(getattr(args, "predict", "False")) == "True",
         # Duration atoms (`duration.py`): how long a label has held (log-scale age bins and their unions).
         "durations": str(getattr(args, "durations", "False")) == "True",
         "duration_labels": str(getattr(args, "duration_labels", "") or ""),
