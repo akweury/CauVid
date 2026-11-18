@@ -48,10 +48,12 @@ NB = 2001                                       # score bins of logit(p) in [-14
 
 def threshold_grid():
     """Score thresholds: log-spaced 1e-5..0.5 (the lookup and prior scores are small rates) and
-    linear 0.5..0.995."""
+    linear 0.5..0.995, and a tail 1 - 10^-2.5..10^-6: a Platt-calibrated score with a steep slope
+    saturates (sumo_maps_v7 mlp_cal: 24 FA/min on val even at 0.995, so no budget had a threshold)."""
     low = torch.logspace(-5, torch.log10(torch.tensor(0.5)).item(), 80)
     high = torch.linspace(0.5, 0.995, 41)[1:]
-    return [round(float(x), 6) for x in torch.cat([low, high])]
+    tail = 1 - torch.logspace(-2.5, -6, 15, dtype=torch.float64)
+    return [round(float(x), 7) for x in torch.cat([low.double(), high.double(), tail])]
 
 
 def _logit_bins(p):
