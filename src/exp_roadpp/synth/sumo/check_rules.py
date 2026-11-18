@@ -25,6 +25,8 @@ MIN_LIFT, MIN_P = 2.0, 0.4  # an injected rule passes above both
 MIN_LIFT_OF = {"R4": 1.5,   # an order rule between two turns: its control is ~0.5 (left or right), lift <= ~2
                "R5": 1.5}   # long window (0-15 s) against a matched control (pavement pedestrians coming into view)
 MEMORY_S = 3.0              # s: the rule net's memory without slot ranges (R5' instances hidden longer need more)
+R5_MEMORY = 150             # frames after a waiting pedestrian came into view that count for R5' (its lag p90 ~20 s)
+MIN_P_OF = {"R5": 0.0}      # R5' is a rate per frame: no minimum p
 TURN_MERGE = 50             # frames: turn onsets of the same kind closer than this are one turn (flicker)
 VEHICLES = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike", "Cyc")
 CROSSING = ("Xing", "XingFmLft", "XingFmRht")
@@ -45,8 +47,8 @@ TESTS = {
     "N4": ("ego: its TL turns Green in view while AV-Stop -> AV-Mov within 5 s", (1, 50), False),
     # grids (long videos): the window is unused, the test is the next turn label (`_r4`)
     "R4": ("ego: AV-TurRht -> the next turn label is AV-TurLft (control: the turn after an AV-TurLft)", (1, 600), True),
-    "R5": ("ego: a pedestrian waiting / crossing comes into view while AV-Mov -> AV-Brake in 0.5-15 s "
-           "(control: pavement pedestrians coming into view)", (5, 150), True),
+    "R5": ("ego: AV-Brake onsets per moving frame within 15 s after a waiting / crossing pedestrian came into "
+           "view (control: the other moving frames; events = frames)", (5, 150), True),
 }
 
 
@@ -126,24 +128,28 @@ def _r4(av, stats):
 
 
 def _r5(lf, mov, brake, stats):
-    """R5' in the labels: a pedestrian comes into view (the first frame of a run of its frames) while the
-    ego is AV-Mov; event if it is waiting / on a crossing then (Wait2X / Xing*), matched control if it
-    walks on the pavement. Hit: an AV-Brake onset in the R5 window after it. (Any junction: the labels do
-    not tell the junction ahead from others.)"""
+    """R5' in the labels, as a hazard ratio: the ego's AV-Brake onsets per frame while it moves (AV-Mov, or
+    the onset frame itself) in the R5_MEMORY frames after a pedestrian waiting / on a crossing (Wait2X /
+    Xing*) came into view, against the other moving frames. (A window test fails here: the lag is long and
+    varies with the distance, and within 15 s the ego nearly always brakes for some reason, sumo_long_test_v3:
+    0.92 vs 0.91.) The labels do not tell the junction ahead from others, nor R1's brakes for the same
+    pedestrians: the ratio is a lower bound of R5's own effect only roughly; the rule log has its instances.
+    Events and hits here are frames and onsets (p: onsets per frame)."""
+    after = set()
     for uid, per in lf.items():
         if uid == "ego" or not per.get("cls:Ped"):
             continue
-        frames = per["cls:Ped"]
         waiting = set(per.get("Wait2X", [])).union(*(per.get(x, []) for x in CROSSING))
-        for f in run_starts(frames):
-            if f not in mov:
-                continue
-            hit = _hit(brake, f, TESTS["R5"][1])
+        for f in run_starts(per["cls:Ped"]):
             if f in waiting:
-                _event(stats, "R5", hit)
-            else:
-                stats["R5"]["control"] += 1
-                stats["R5"]["control_hits"] += hit
+                after.update(range(f, f + R5_MEMORY + 1))
+    onset = set(brake)
+    for f in sorted(set(mov) | onset):
+        if f in after:
+            _event(stats, "R5", f in onset)
+        else:
+            stats["R5"]["control"] += 1
+            stats["R5"]["control_hits"] += f in onset
 
 
 def check_video(lf, first, stats):
@@ -246,7 +252,7 @@ def check(dataset):
         lift = p / base if base else float("inf")
         report[r] = {"what": what, "injected": injected, "events": s["events"], "p_head_after_body": round(p, 3),
                      "p_head_control": round(base, 3), "lift": round(lift, 2),
-                     "ok": bool(lift >= MIN_LIFT_OF.get(r, MIN_LIFT) and p >= MIN_P)
+                     "ok": bool(lift >= MIN_LIFT_OF.get(r, MIN_LIFT) and p >= MIN_P_OF.get(r, MIN_P))
                      if injected and s["events"] else None}
     report["rule_log"] = {k: dict(v) for k, v in sorted(log.items())}
     report["lag_s"] = {r: {"n": len(v), **{f"p{q}": round(sorted(v)[min(len(v) - 1, int(q / 100 * len(v)))], 1)
