@@ -95,6 +95,10 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.duration_check"
     elif [[ "$arg" == "--box_stats" ]]; then
         ENTRY_MODULE="src.exp_roadpp.box_stats"
+    elif [[ "$arg" == "--transfer" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.transfer"
+    elif [[ "$arg" == "--label_stats" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.label_stats"
     elif [[ "$arg" == "--sumo_gen" ]]; then
         ENTRY_MODULE="src.exp_roadpp.synth.sumo.run"
     elif [[ "$arg" == "--sumo_check" ]]; then

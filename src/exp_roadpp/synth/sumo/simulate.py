@@ -89,6 +89,8 @@ def ego_signal(traci, ego):
     if not nxt or ego["road"].startswith(":"):
         return None
     _tls, _link, dist, state = nxt[0]
+    if dist > ego["lane_len"] - ego["lane_pos"] + 1.0:
+        return None                                         # grids: the next signal is at a later junction
     x, y = traci.lane.getShape(ego["lane"])[-1]
     hx, hy = heading(ego["angle"])
     across = _far_side(traci, ego["lane"], x, y, hx, hy)
@@ -97,25 +99,26 @@ def ego_signal(traci, ego):
             "far_x": round(x + hx * across, 2), "far_y": round(y + hy * across, 2)}
 
 
-def clip_window(num_recorded, enter, post_frames, mode="junction", rng=None):
+def clip_window(num_recorded, enter, post_frames, mode="junction", rng=None, clip_frames=CLIP_FRAMES):
     """(start, end) frame indices of the clip (end exclusive, without the margin) in the recorded frames;
     enter: the first frame of the ego in the junction, or None; rng draws the end of a "random" clip."""
     available = num_recorded - MARGIN_FRAMES
     if mode == "depart":
-        end = min(available, CLIP_FRAMES)
+        end = min(available, clip_frames)
     else:
-        latest = available if enter is None else min(available, max(enter + post_frames, CLIP_FRAMES))
+        latest = available if enter is None else min(available, max(enter + post_frames, clip_frames))
         end = latest                                        # junction; never entered: the last frames
         if mode == "random":
-            end = rng.randint(min(CLIP_FRAMES, latest), latest)
+            end = rng.randint(min(clip_frames, latest), latest)
         elif mode != "junction":
             raise ValueError(f"clip mode {mode!r}, known: {CLIP_MODES}")
-    return max(0, end - CLIP_FRAMES), end
+    return max(0, end - clip_frames), end
 
 
-def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction"):
+def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction", clip_frames=CLIP_FRAMES):
     """{"frames": [world state per step of the clip and its margin], "firings": rule log,
-    "clip": {"mode", "start_s": clip start after the departure, "enter_s": ego in the junction (or None)}}."""
+    "clip": {"mode", "start_s": clip start after the departure, "enter_s": ego in the junction (or None)}}.
+    clip_frames: CLIP_FRAMES (20 s) for the junction maps; long clips (grids) from the departure on."""
     traci = _traci()
     cmd = [scenario.sumo_binary("sumo"), "-n", str(net_file), "-r", str(route_file),
            "--step-length", str(DT), "--seed", str(seed), "--lanechange.duration", "2",
@@ -129,7 +132,7 @@ def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction"):
         post_frames = int(round(rng.uniform(*POST_JUNCTION_S) / DT))
         engine = RuleEngine(traci, rng)
         lane_len, frames, enter = {}, [], None
-        t_end = ego_depart + MAX_INSERT_WAIT + MAX_RECORD_S
+        t_end = ego_depart + MAX_INSERT_WAIT + max(MAX_RECORD_S, clip_frames * DT + 30.0)
         while traci.simulation.getTime() < t_end:
             traci.simulationStep()
             world = query_world(traci, traci.simulation.getTime(), lane_len)
@@ -139,15 +142,15 @@ def simulate(net_file, route_file, seed, rng, ego_depart, clip_mode="junction"):
                 frames.append(world)
                 if enter is None and world["veh"]["ego"]["road"].startswith(JUNCTION):
                     enter = len(frames) - 1
-                if clip_mode == "depart" and len(frames) >= CLIP_FRAMES + MARGIN_FRAMES:
+                if clip_mode == "depart" and len(frames) >= clip_frames + MARGIN_FRAMES:
                     break
-                if enter is not None and len(frames) >= max(enter + post_frames, CLIP_FRAMES) + MARGIN_FRAMES:
+                if enter is not None and len(frames) >= max(enter + post_frames, clip_frames) + MARGIN_FRAMES:
                     break
             elif frames:
                 break                                       # the ego left the network
     finally:
         traci.close()
-    start, end = clip_window(len(frames), enter, post_frames, clip_mode, rng)
+    start, end = clip_window(len(frames), enter, post_frames, clip_mode, rng, clip_frames)
     clip = {"mode": clip_mode, "start_s": round(start * DT, 1), "enter_s": None if enter is None else round(enter * DT, 1),
             "recorded_s": round(len(frames) * DT, 1)}
     return {"frames": frames[start:end + MARGIN_FRAMES], "firings": engine.log, "clip": clip}

@@ -9,8 +9,19 @@ def load_json(file_path):
     return data
 
 def save_json(data, file_path):
-    with open(file_path, 'w') as f:
-        json.dump(data, f, indent=2)
+    """Written to a temporary file next to it, then renamed (atomic): runs of one exp started together
+    share step_dataset_output, and a reader must never see a half-written file (sumo_maps_v7: a
+    JSONDecodeError in all_atoms.json while another run still wrote it)."""
+    import os
+    file_path = Path(file_path)
+    tmp = file_path.with_name(f".{file_path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, file_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def load_atoms(compressed_file):

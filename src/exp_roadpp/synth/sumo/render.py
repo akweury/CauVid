@@ -36,7 +36,8 @@ def _offset(shape, d):
 
 
 def draw_network(ax, net_file):
-    """Draws the network; returns the position of junction C (netconvert shifts the coordinates)."""
+    """Draws the network; returns the position of junction C, or the centre of a grid (netconvert shifts
+    the coordinates)."""
     import sumolib
     net = sumolib.net.readNet(str(net_file), withInternal=True, withPedestrianConnections=True)
     for edge in net.getEdges(withInternal=True):
@@ -54,7 +55,10 @@ def draw_network(ax, net_file):
                 ax.add_patch(Polygon(poly, closed=True, fc="#d9d9d9", ec="none", zorder=1))
             else:
                 ax.add_patch(Polygon(poly, closed=True, fc="#555555", ec="#777777", lw=0.2, zorder=1))
-    return net.getNode("C").getCoord()
+    if net.hasNode("C"):
+        return net.getNode("C").getCoord()
+    (x0, y0), (x1, y1) = net.getBBoxXY()
+    return (x0 + x1) / 2, (y0 + y1) / 2
 
 
 def network_of(dataset, vid):
@@ -74,7 +78,8 @@ def render_maps(dataset, out_file, cols=8):
     fig, axes = plt.subplots(rows, cols, figsize=(2.6 * cols, 2.8 * rows))
     for ax, (m, info) in zip(axes.flat, maps.items()):
         cx, cy = draw_network(ax, dataset / "sumo" / info["net"])
-        ax.set_xlim(cx - 120, cx + 120); ax.set_ylim(cy - 120, cy + 120)
+        half = 520 if info["spec"].get("layout") == "grid" else 120
+        ax.set_xlim(cx - half, cx + half); ax.set_ylim(cy - half, cy + half)
         ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
         ax.set_title(f"{m}\n{info['name']} {info['spec']['speed']} m/s", fontsize=7)
     for ax in list(axes.flat)[len(maps):]:

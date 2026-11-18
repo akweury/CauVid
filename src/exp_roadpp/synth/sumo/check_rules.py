@@ -22,6 +22,8 @@ MIN_OFF = 10                # frames, as step_dataset.MIN_OFF_FRAMES
 SLACK = 5                   # frames added on both sides of a lag window
 CONTROL_STEP = 10           # frames between control moments
 MIN_LIFT, MIN_P = 2.0, 0.4  # an injected rule passes above both
+MIN_LIFT_OF = {"R4": 1.5}   # an order rule between two turns: its control is ~0.5 (left or right), lift <= ~2
+TURN_MERGE = 50             # frames: turn onsets of the same kind closer than this are one turn (flicker)
 VEHICLES = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike", "Cyc")
 CROSSING = ("Xing", "XingFmLft", "XingFmRht")
 
@@ -39,6 +41,8 @@ TESTS = {
     "N2": ("ego and vehicles: MovRht -> TurRht within 10 s", (1, 100), False),
     "N3": ("ego: its TL turns Red in view while AV-Mov -> AV-Brake within 8 s", (1, 80), False),
     "N4": ("ego: its TL turns Green in view while AV-Stop -> AV-Mov within 5 s", (1, 50), False),
+    # grids (long videos): the window is unused, the test is the next turn label (`_r4`)
+    "R4": ("ego: AV-TurRht -> the next turn label is AV-TurLft (control: the turn after an AV-TurLft)", (1, 600), True),
 }
 
 
@@ -101,11 +105,28 @@ def _control(stats, rule, moments, head_onsets):
         stats[rule]["control_hits"] += _hit(head_onsets, t, (1, 1 + width))
 
 
+def _r4(av, stats):
+    """R4 on the ego's turn sequence: after a right turn the next turn is left; control: the turn after a
+    left turn (free: left or right). Only pairs of turns inside the video count."""
+    turns = []
+    for t, kind in sorted([(t, "R") for t in av["AV-TurRht"]] + [(t, "L") for t in av["AV-TurLft"]]):
+        if turns and turns[-1][1] == kind and t - turns[-1][0] < TURN_MERGE:
+            continue
+        turns.append((t, kind))
+    for (_t0, k0), (_t1, k1) in zip(turns, turns[1:]):
+        if k0 == "R":
+            _event(stats, "R4", k1 == "L")
+        else:
+            stats["R4"]["control"] += 1
+            stats["R4"]["control_hits"] += k1 == "L"
+
+
 def check_video(lf, first, stats):
     win = {r: TESTS[r][1] for r in TESTS}
     ego = lf["ego"]
     mov, stop = set(ego.get("AV-Mov", [])), set(ego.get("AV-Stop", []))
-    av = {k: onsets(ego.get(k, []), 1) for k in ("AV-Brake", "AV-Mov", "AV-TurRht", "AV-MovRht")}
+    av = {k: onsets(ego.get(k, []), 1) for k in ("AV-Brake", "AV-Mov", "AV-TurRht", "AV-TurLft", "AV-MovRht")}
+    _r4(av, stats)
     for r in ("R1", "R3", "N3"):
         _control(stats, r, sorted(mov), av["AV-Brake"])
     _control(stats, "N1", sorted(stop), av["AV-Mov"])
@@ -193,7 +214,8 @@ def check(dataset):
         lift = p / base if base else float("inf")
         report[r] = {"what": what, "injected": injected, "events": s["events"], "p_head_after_body": round(p, 3),
                      "p_head_control": round(base, 3), "lift": round(lift, 2),
-                     "ok": bool(lift >= MIN_LIFT and p >= MIN_P) if injected else None}
+                     "ok": bool(lift >= MIN_LIFT_OF.get(r, MIN_LIFT) and p >= MIN_P)
+                     if injected and s["events"] else None}
     report["rule_log"] = {k: dict(v) for k, v in sorted(log.items())}
     (dataset / "meta" / "rule_check.json").write_text(json.dumps(report, indent=1))
     return report
@@ -203,7 +225,7 @@ def print_report(report):
     print("[Rule check] P(head in the rule's window | body onset) vs control moments")
     for r in TESTS:
         x = report[r]
-        flag = ("ok  " if x["ok"] else "WEAK") if x["injected"] else "info"
+        flag = "n/a " if x["injected"] and not x["events"] else ("ok  " if x["ok"] else "WEAK") if x["injected"] else "info"
         print(f"  {r} {flag} lift {x['lift']:5.2f}  p {x['p_head_after_body']:.2f} vs {x['p_head_control']:.2f}"
               f"  ({x['events']} events)  {x['what']}")
     for k, c in report["rule_log"].items():

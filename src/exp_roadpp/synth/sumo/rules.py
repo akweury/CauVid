@@ -38,6 +38,11 @@ R2 = {"rate_per_s": 0.003, "rate_seen_per_s": 0.15, "lag_s": (1.0, 2.0), "p": 1.
 # (VehLane) start to brake; once per (driver, vehicle ahead, brake onset). Brakes spread back a queue.
 R3 = {"lag_s": (0.5, 1.5), "p": 1.0, "min_speed": 1.5, "speed_drop": 4.0, "decel": 3.5}
 
+# R4 (grids, long videos): a driver that turned right turns left at the next junction (it goes round a
+# block: a pure order rule, the lag is the drive to the next junction incl. waiting, ~10-60 s). Applied by
+# the routes (`scenario.random_walk`), not by TraCI; for every vehicle on a grid, the ego included.
+R4 = {"p": 1.0, "free_turns": "scenario.TURN_WEIGHTS"}
+
 GT_RULES = [
     {"id": "R1", "exact": True, "form": "other -> self",
      "head": {"agent": "self", "label": "Brake", "av_label": "AV-Brake"},
@@ -66,6 +71,16 @@ GT_RULES = [
      "lag_s": list(R3["lag_s"]), "p": R3["p"], "classes": list(MOTOR),
      "notes": f"executed only at speed >= {R3['min_speed']:g} m/s (drop {R3['speed_drop']:g} m/s at "
               f"{R3['decel']:g} m/s^2)"},
+]
+
+GT_RULES_GRID = [
+    {"id": "R4", "exact": True, "form": "self sequence (order, variable lag)",
+     "head": {"agent": "self", "label": "TurLft", "av_label": "AV-TurLft"},
+     "body": [{"agent": "self", "label": "TurRht", "av_label": "AV-TurRht", "when": "at the previous junction"}],
+     "onset": "the right turn; the head is the next junction's turn (no turn label in between)",
+     "lag_s": None, "p": R4["p"], "classes": "all vehicles (routes)",
+     "notes": "lag = drive to the next junction incl. queues and red lights (~10-60 s); straight passes "
+              "of junctions carry no label, so the next turn label after AV-TurRht is AV-TurLft"},
 ]
 
 NATURAL_RULES = [

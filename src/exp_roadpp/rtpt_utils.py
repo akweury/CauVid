@@ -7,8 +7,28 @@ Usage:
     rtpt_utils.step(rtpt, "step05")          # after each stage
 """
 import os
+import re
 
 INITIALS = os.environ.get("RTPT_INITIALS", "JI")     # the initials of exp_driving_videos' RTPT
+MAX_NAME = 22               # characters of the experiment name in the title
+MAX_SUBTITLE = 10           # characters of the stage
+# (pattern, replacement) shortening the names; the ETA ("#h:mm:ss") is appended by rtpt and kept
+_SHORT = [(r"^roadpp-", ""), (r"sumo_maps_", "sm"), (r"sumo_junction_", "sj"), (r"_unseen", "_u"),
+          (r"-[a-z0-9-]+?_([0-9a-f]{6})$", r"-\1"),          # "-dgx-jing_975fa2" -> "-975fa2" (the run token)
+          (r"timing_diag", "tdiag"), (r"flow_diag", "fdiag"), (r"box_stats", "boxes")]
+
+
+def short_name(name, limit=MAX_NAME):
+    """The process title's experiment name, e.g. "roadpp-sumo_maps_v7-dgx-jing_975fa2" -> "smv7-975fa2"."""
+    for pattern, repl in _SHORT:
+        name = re.sub(pattern, repl, name)
+    return name[:limit]
+
+
+def short_stage(subtitle, limit=MAX_SUBTITLE):
+    """The stage in the title, e.g. "step05_causal" -> "s5causal", "dataset" -> "data"."""
+    subtitle = re.sub(r"step0*(\d+)_?", r"s\1", str(subtitle)).replace("dataset", "data")
+    return subtitle.replace(" ", "")[:limit]
 
 
 def start(experiment_name, max_iterations):
@@ -19,7 +39,7 @@ def start(experiment_name, max_iterations):
         print("[RTPT] rtpt unavailable; the process keeps its default name.")
         return None
     try:
-        rtpt = RTPT(name_initials=INITIALS, experiment_name=str(experiment_name),
+        rtpt = RTPT(name_initials=INITIALS, experiment_name=short_name(str(experiment_name)),
                     max_iterations=max(1, int(max_iterations)))
         rtpt.start()
         return rtpt
@@ -33,6 +53,6 @@ def step(rtpt, subtitle=""):
     if rtpt is None:
         return
     try:
-        rtpt.step(subtitle=str(subtitle))
+        rtpt.step(subtitle=short_stage(subtitle) or None)
     except Exception as e:
         print(f"[RTPT] step failed ({type(e).__name__}: {e})")

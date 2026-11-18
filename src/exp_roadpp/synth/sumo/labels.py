@@ -7,7 +7,7 @@ pavements). Rare roadpp labels (Rev, PushObj, Ovtak, EmVeh, bus / cycle lanes, p
 import math
 from collections import defaultdict
 
-from src.exp_roadpp.synth.sumo import observe, traffic
+from src.exp_roadpp.synth.sumo import observe, scenario, traffic
 from src.exp_roadpp.synth.sumo.observe import heading
 from src.exp_roadpp.synth.sumo.rules import SIG_EMERGENCY, SIG_LEFT, SIG_RIGHT, is_waiting
 
@@ -142,7 +142,7 @@ def vehicle_labels(cam, v, s, ego):
         elif diff > 135:
             loc = "IncomLane"
         else:
-            loc = "IncomLane" if v["road"].endswith("2C") else "OutgoLane"
+            loc = "IncomLane" if scenario.heads_to_junction(v["road"]) else "OutgoLane"
     return acts, [loc]
 
 
