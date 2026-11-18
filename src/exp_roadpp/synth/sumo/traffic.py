@@ -54,8 +54,9 @@ GRID_DEFAULTS = {
     "warmup": 90.0,                     # s before the ego departs (the grid fills)
     "max_hops": (1, 5),                 # junctions a vehicle passes (uniform), then it leaves at the first chance
     "ego_tries": 2000,                  # random walks drawn until one stays inside for the clip
-    "ego_route_share": 0.8,             # the ego's route: clip x speed limit x this (+100 m); shorter
+    "ego_route_share": 0.6,             # the ego's route: clip x speed limit x this (+100 m); shorter
 }                                       # (stops make the drive longer) biases the turns less towards left
+                                        # (0.8: P(L | L) ~0.6, R4 lift ~1.5 in sumo_long_test; 0.6: ~0.4)
 
 
 def write_routes(route_file, rng, params=None, spec=None, clip_s=None):
@@ -119,7 +120,7 @@ def _write_grid_routes(route_file, rng, params, spec, clip_s):
     and the ego on a walk from a boundary arm that stays inside the grid for ego_route_share of the clip
     at the speed limit (an ego that leaves before the clip ends is dropped by `run.py`). Staying inside
     biases the ego's free turns towards left (rights followed by R4's left near the boundary fail): on
-    random grids P(next labelled turn left | left) ~0.54, vs 1 after a right."""
+    random grids P(next labelled turn left | left) ~0.4 (0.6 with ego_route_share 0.8), vs 1 after a right."""
     p = {**GRID_DEFAULTS, **(params or {})}
     graph = scenario.grid_graph(spec)
     junctions = [k for k in spec["nodes"] if k.startswith("J")]
