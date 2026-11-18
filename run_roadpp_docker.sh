@@ -109,6 +109,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.predict_check"
     elif [[ "$arg" == "--rule_events" ]]; then
         ENTRY_MODULE="src.exp_roadpp.rule_events"
+    elif [[ "$arg" == "--oracle_turns" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.oracle_turns"
     elif [[ "$arg" == "--ablation" ]]; then
         ENTRY_MODULE="src.exp_roadpp.ablation"
     else

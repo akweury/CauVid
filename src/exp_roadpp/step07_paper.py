@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
-VERSION = "paper_v3"             # v3: threshold grid with a tail up to 1 - 1e-6
+VERSION = "paper_v4"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen")
 VAL_MIN_RATIO = 0.9             # val videos >= 0.9 x test videos (thresholds are chosen on val)
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
@@ -44,6 +44,12 @@ PAPER = {
     "calibrated": ("model", "mlp", "lookup"),
 }
 NB = 2001                                       # score bins of logit(p) in [-14, 14] (AP histograms)
+# Exclusion: a score at or below a cut says "this head will not start within the window". The cut of each
+# violation budget (the share of excluded cells where the head starts anyway) is chosen on val, as the alarm
+# thresholds; coverage = the share of the candidate cells excluded. Non-trivial heads: base rate (the prior
+# scorer) >= prior_min within the window (ruling out what hardly ever happens is no feat).
+EXCLUSION = {"budgets": [0.005, 0.01, 0.02], "headline": 0.01, "prior_min": 0.05}
+EGO_SCORERS = ("model_cal", "mlp_cal", "lookup_cal", "model", "mlp", "lookup", "prior")
 
 
 def threshold_grid():
@@ -114,7 +120,10 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
     e_t, e_n, e_h = torch.nonzero(onsets, as_tuple=True)
     next_gone = torch.cat([step06_episodes._next_index(~is_row),
                            torch.full((1, N), T, dtype=torch.long, device=device)])
-    return {"dense": dense, "is_row": is_row, "at_risk": at_risk, "ap_rows": ap_rows, "T": T, "N": N,
+    ego_heads = cfg.get("ego_heads")
+    holds = X[:, :, ego_heads].any(dim=(0, 2)) if ego_heads is not None and len(ego_heads) else None
+    ego = int(torch.nonzero(holds)[0]) if holds is not None and bool(holds.any()) else None
+    return {"dense": dense, "is_row": is_row, "at_risk": at_risk, "ap_rows": ap_rows, "T": T, "N": N, "ego": ego,
             "events": (e_t, e_n, e_h), "next_gone": next_gone, "minutes": (T - cfg["min_context"]) / cfg["frame_rate"] / 60}
 
 
@@ -199,7 +208,75 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
                     for i, r in enumerate(record):
                         r[f"{nm}@{bd}"] = round(int(lead[i]) / cfg["frame_rate"], 2) if bool(det[i]) else None
         events += record
+        store = cfg.get("ego_scores")
+        if store is not None and v["ego"] is not None:
+            e, sel = v["ego"], is_ego.to(v["is_row"].device)
+            store[video_id] = {"known": (v["is_row"][:, e, None] & v["at_risk"][:, e][:, sel]).cpu(),
+                               **{nm: v["dense"][nm][:, e][:, sel].half().cpu() for nm in names if nm in EGO_SCORERS}}
     return curve, hist, per_video, events
+
+
+def _cut(h, v):
+    """Largest score bin k with (cumulative positives / cells) of the bins <= k at most v, -1 if none:
+    h (2, NB) negatives, positives of the candidate cells."""
+    cells = h.sum(0).double().cumsum(0)
+    pos = h[1].double().cumsum(0)
+    ok = (cells > 0) & (pos <= v * cells)
+    idx = torch.nonzero(ok).flatten()
+    return int(idx.max()) if len(idx) else -1
+
+
+def _bin_p(k):
+    """Upper score of bin k (`_logit_bins`): an exclusion threshold in probability."""
+    z = (k + 0.5) / (NB - 1) * 28 - 14
+    return float(torch.sigmoid(torch.tensor(z)))
+
+
+def exclusion_report(val_hist, test_hist, groups, label_names):
+    """Exclusion per scorer, head group and violation budget: the cut chosen on val, and on test the
+    excluded cells, violations, violation rate, coverage (excluded / candidates) and the share of the cells
+    where the head does not start that are excluded; per non-trivial head at the headline budget."""
+    out = {}
+    for nm in test_hist:
+        out[nm] = {}
+        for g, mask in groups.items():
+            if not bool(mask.any()):
+                continue
+            vh, th = val_hist[nm][mask].sum(0), test_hist[nm][mask].sum(0)
+            total, negatives = float(th.sum()), float(th[0].sum())
+            row = {"candidates": total}
+            for b in EXCLUSION["budgets"]:
+                k = _cut(vh, b)
+                ex = float(th[:, :k + 1].sum()) if k >= 0 else 0.0
+                viol = float(th[1, :k + 1].sum()) if k >= 0 else 0.0
+                row[str(b)] = {"cut_bin": k, "threshold": _bin_p(k) if k >= 0 else None, "excluded": ex,
+                               "violations": viol, "violation_rate": viol / ex if ex else None,
+                               "coverage": ex / total if total else None,
+                               "non_occurrence_recall": (ex - viol) / negatives if negatives else None}
+            out[nm][g] = row
+        k = _cut(val_hist[nm][groups["nontrivial"]].sum(0), EXCLUSION["headline"]) if bool(groups["nontrivial"].any()) else -1
+        per = {}
+        for i in torch.nonzero(groups["nontrivial"]).flatten().tolist():
+            th = test_hist[nm][i]
+            ex = float(th[:, :k + 1].sum()) if k >= 0 else 0.0
+            per[label_names[i]] = {"coverage": ex / float(th.sum()) if float(th.sum()) else None,
+                                   "violation_rate": float(th[1, :k + 1].sum()) / ex if ex else None}
+        out[nm]["per_head_nontrivial"] = per
+    return out
+
+
+def print_exclusion(report, scorers=("model_cal", "mlp_cal", "lookup_cal", "prior")):
+    print(f"[Exclusion] coverage of the candidate cells at a violation budget (cut on val; test violation rate)")
+    for g in ("nontrivial", "ego_nontrivial", "all"):
+        for b in EXCLUSION["budgets"]:
+            cells = []
+            for nm in scorers:
+                x = report.get(nm, {}).get(g, {}).get(str(b))
+                if x:
+                    vr = "-" if x["violation_rate"] is None else f"{x['violation_rate']:.4f}"
+                    cells.append(f"{nm} {x['coverage']:.3f} ({vr})")
+            if cells:
+                print(f"  {g:15s} {b:<6g} " + "  ".join(cells))
 
 
 def _curve_json(curve):
@@ -320,20 +397,23 @@ def main(input_data):
     cfg = {"device": step05_cfg["device"], "frame_rate": input_data["frame_rate"], "min_context": min_context,
            "frames_per_video": step05_cfg["frames_per_video"], "window": 20}
     heads_d = heads.to(cfg["device"])
+    cfg["ego_heads"] = heads_d[is_ego.to(cfg["device"])]
     grid = threshold_grid()
 
     # 1. Val: the false alarms per minute of every threshold; the threshold of each budget.
     val_data = step06._subset(training_data, training_data["val_videos"])
     del training_data
-    val_curve, _, _, _ = run_pass(model, scorers, calibration, val_data, sorted(val_data["videos"]), heads_d,
-                                  head_type, is_ego, {**cfg, "desc": "Paper metrics (val)"}, grid)
+    val_curve, val_hist, _, _ = run_pass(model, scorers, calibration, val_data, sorted(val_data["videos"]), heads_d,
+                                         head_type, is_ego, {**cfg, "desc": "Paper metrics (val)"}, grid)
     del val_data
     chosen = {nm: choose_thresholds(c, PAPER["budgets"]) for nm, c in val_curve.items()}
 
     # 2. Test at those thresholds (and the whole test curve).
+    ego_scores = {}
     test_curve, hist, per_video, events = run_pass(model, scorers, calibration, test_data,
                                                    sorted(test_data["videos"]), heads_d, head_type, is_ego,
-                                                   {**cfg, "desc": "Paper metrics (test)"}, grid,
+                                                   {**cfg, "desc": "Paper metrics (test)", "ego_scores": ego_scores},
+                                                   grid,
                                                    {nm: {b: th for b, th in c.items() if th is not None}
                                                     for nm, c in chosen.items()})
     fps = cfg["frame_rate"]
@@ -353,6 +433,16 @@ def main(input_data):
                                  "test": summarize(per_video[nm][b], fps) if th is not None else None}
                         for b, th in chosen[nm].items()}}
         out["videos"][nm] = {str(b): per_video[nm][b] for b in per_video[nm]}
+    # Exclusion: "this head will not start within the window", at violation budgets (cuts on val).
+    k = model.windows.index(cfg["window"])
+    prior = baselines["prior"][k, heads.cpu()].float()
+    nontrivial = prior >= EXCLUSION["prior_min"]
+    groups = {"all": torch.ones(len(heads), dtype=torch.bool), "nontrivial": nontrivial,
+              "ego_nontrivial": nontrivial & is_ego}
+    out["exclusion"] = {"settings": EXCLUSION, "nontrivial_heads": [label_names[i] for i in torch.nonzero(nontrivial).flatten().tolist()],
+                        "scorers": exclusion_report(val_hist, hist, groups, label_names)}
+    torch.save({"heads": [n for n, e in zip(label_names, is_ego.tolist()) if e], "frame_rate": fps,
+                "window": cfg["window"], "min_context": min_context, "videos": ego_scores}, out_dir / "ego_scores.pt")
     utils_data.save_json(out, metrics_file)
     columns = ["video", "frame", "agent", "head", "label", "type", "ego"] + [
         f"{nm}@{b}" for nm in val_curve for b in PAPER["budgets"]]
@@ -363,7 +453,8 @@ def main(input_data):
             writer.writerow({**{c: r.get(c) for c in columns},
                              "label": label_names[int((heads == r["head"]).nonzero()[0])]})
     print_summary(out)
-    print(f"[Paper]\t {metrics_file}\n[Paper]\t {events_file}")
+    print_exclusion(out["exclusion"]["scorers"])
+    print(f"[Paper]\t {metrics_file}\n[Paper]\t {events_file}\n[Paper]\t {out_dir / 'ego_scores.pt'}")
     print("\n--------- Step 07 Done ---------------\n")
 
 

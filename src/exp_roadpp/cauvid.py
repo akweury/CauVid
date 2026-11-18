@@ -621,10 +621,12 @@ class TemporalRuleNet(torch.nn.Module):
         return (self.bins[a - 1][0] - 1) * self.slot_size, None if last is None else last * self.slot_size
 
     @torch.no_grad()
-    def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1):
+    def extract_rules(self, mask_threshold=0.5, weight_threshold=0.1, negative=False):
         """Rules [{"rule": r, "bodies": [(atom, slot type, j)], "heads": [(atom, weight)]}].
 
-        Bodies are sorted earliest first (largest j), the order the atoms happen.
+        Bodies are sorted earliest first (largest j), the order the atoms happen. negative: the heads with
+        a weight below -weight_threshold instead (inhibitors: the body makes the head less likely, "body ->
+        not head"; `step05.extract_temporal_clauses` keeps those that hold).
         """
         body = self.rule_mask() > mask_threshold
         rules = []
@@ -632,7 +634,8 @@ class TemporalRuleNet(torch.nn.Module):
             inputs = torch.nonzero(body[r]).flatten().tolist()
             if not inputs:
                 continue
-            heads = torch.nonzero(self.head_weight[:, r] > weight_threshold).flatten().tolist()
+            w = self.head_weight[:, r]
+            heads = torch.nonzero(w < -weight_threshold if negative else w > weight_threshold).flatten().tolist()
             if not heads:
                 continue
             if self.require_self and not self.self_inputs[inputs].any():

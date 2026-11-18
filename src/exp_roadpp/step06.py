@@ -1303,6 +1303,30 @@ def evaluate_clauses(model, data, clauses, step05_cfg):
     return evaluated
 
 
+def evaluate_inhibitors(model, data, inhibitors, step05_cfg):
+    """The step 05 inhibitors ("bodies -> not head") with their test counts (`evaluate_clauses`) and
+    test_violation_rate (the head starts after all bodies anyway), test_suppression (/ the test base rate).
+    Sorted by test suppression."""
+    out = []
+    for c in evaluate_clauses(model, data, inhibitors, step05_cfg):
+        rate, base = c["test_confidence"], c["test_base_rate"]
+        out.append({**c, "test_violation_rate": rate,
+                    "test_suppression": rate / base if rate is not None and base else None})
+    out.sort(key=lambda c: (c["test_suppression"] if c["test_suppression"] is not None else 9.0, -c["test_fires"]))
+    return out
+
+
+def print_inhibitors(inhibitors, step05_cfg, vocab, top=15):
+    """The inhibitors that hold on test: violation rate and suppression (vs the head's base rate)."""
+    firing = [c for c in inhibitors if c["test_fires"] >= step05_cfg.get("min_inhibitor_fires", 50)]
+    strong = [c for c in firing if c["test_suppression"] is not None and c["test_suppression"] <= 0.2]
+    print(f"[Inhibitors] {len(inhibitors)} (val-kept), {len(firing)} fire on test >= "
+          f"{step05_cfg.get('min_inhibitor_fires', 50)} times, {len(strong)} hold there (head rate <= 0.2 x base)")
+    for c in strong[:top]:
+        print(f"  NOT  {step05._temporal_clause_text(c, vocab)}   violation {c['test_violation_rate']:.4f} "
+              f"vs base {c['test_base_rate']:.3f} (fires {c['test_fires']})")
+
+
 # -------------- Results --------------
 def _strip_detection(d):
     """A detection entry without its curves and per-event values (also in by_type)."""
@@ -2243,6 +2267,7 @@ def main(input_data):
         # The per-head Platt calibration fitted on val (`fit_calibration`), for the episode alarms.
         "calibration_file": input_data["output_dir"] / "calibration.pt",
         "test_clause_file": input_data["output_dir"] / "test_clauses.json",
+        "test_inhibitor_file": input_data["output_dir"] / "test_inhibitors.json",
         "results_file": input_data["output_dir"] / "test_results.json",
         "figure_dir": input_data["output_dir"] / "figures",
     }
@@ -2254,6 +2279,7 @@ def main(input_data):
     cfg["ego_flow"] = step05_cfg.get("ego_flow", False)                                     # then the ego flow atoms
     cfg["durations"] = step05_cfg.get("durations", False)                                   # then the duration atoms
     cfg["duration_labels"] = step05_cfg.get("duration_labels")
+    cfg["predict"] = step05_cfg.get("predict", False)                                       # then the prediction atoms
     assert cfg["headline_window"] in step05_cfg["windows"]
 
     # 1. Test videos in the format of the step 05 training data, with the same min_off_frames.
@@ -2364,6 +2390,12 @@ def main(input_data):
         clauses = utils_data.load_json(step05_cfg["extended_clause_file"])
         utils_data.save_json(evaluate_clauses(model, test_data, clauses, step05_cfg), cfg["test_clause_file"])
     test_clauses = utils_data.load_json(cfg["test_clause_file"])
+    inhibitor_file = step05_cfg.get("inhibitor_clause_file")
+    if inhibitor_file is not None and os.path.exists(inhibitor_file):
+        if not step05.is_fresh(cfg["test_inhibitor_file"], inhibitor_file, cfg["test_data_file"]):
+            utils_data.save_json(evaluate_inhibitors(model, test_data, utils_data.load_json(inhibitor_file), step05_cfg),
+                                 cfg["test_inhibitor_file"])
+        print_inhibitors(utils_data.load_json(cfg["test_inhibitor_file"]), step05_cfg, step05.load_vocabulary(cfg))
 
     # 5. The main results (JSON) and the figures (one PDF each), on every run.
     utils_data.save_json(build_results(metrics, test_clauses), cfg["results_file"])

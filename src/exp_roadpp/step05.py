@@ -1319,7 +1319,7 @@ def _temporal_clause_text(clause, unique_atoms):
     return f"{body} => {atom(*clause['head'])}"
 
 
-def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=None):
+def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=None, inhibitor_file=None):
     """Clauses of the trained model, one per (rule node, head) pair with a large
     head weight, kept if the rule hits the head in at least min_support training
     frames of at least min_videos videos (every body seen, head in the next slot).
@@ -1336,6 +1336,7 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
     them), with the base rate: how the confidence grows as more bodies are seen.
     Sorted by confidence. With candidates (the verifier), all counts are over
     the stage-1 candidate cells.
+    inhibitor_file: also the inhibitors (`inhibitor_clauses`, from the same counts) are saved there.
     """
     def ratio(a, b):
         return float(a) / float(b) if b > 0 else None
@@ -1392,6 +1393,8 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
                 "partial": partial,
             })
     clauses.sort(key=lambda c: (-c["confidence"], -c["support"]))
+    if inhibitor_file is not None:
+        utils_data.save_json(inhibitor_clauses(model, train, val, cfg), inhibitor_file)
 
     print(f"[Rules] {len(rules)} rule nodes with heads -> {len(clauses)} clauses kept")
     if run is not None:
@@ -1405,6 +1408,50 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
         run.summary["num_clauses"] = len(clauses)
         run.summary["num_rules_with_heads"] = len(rules)
     return clauses
+
+
+def inhibitor_clauses(model, train, val, cfg):
+    """Inhibitors "bodies -> not head": the (rule node, head) pairs with a head weight below
+    -weight_threshold (`TemporalRuleNet.extract_rules(negative=True)`), from the `_rule_head_counts` of
+    train and val. Kept if the bodies fire in >= min_inhibitor_fires training rows where the head could
+    start (at risk) and the head is not rare there (base rate >= min_inhibitor_base: ruling out what
+    hardly ever happens says nothing). Each: the clause fields of `extract_temporal_clauses` with
+    violation_rate = P(head starts in the next slot | bodies) (its confidence), base_rate and
+    suppression = violation_rate / base_rate (0: the bodies rule the head out), on train and val.
+    Sorted by val suppression, then train fires."""
+    def ratio(a, b):
+        return float(a) / float(b) if b > 0 else None
+
+    rules = model.extract_rules(cfg["mask_threshold"], cfg["weight_threshold"], negative=True)
+    out = []
+    for rule in rules:
+        r = rule["rule"]
+        for h, weight in rule["heads"]:
+            fires = int(train["fires"][r, 0, h])
+            base = ratio(train["onsets"][0, h], train["at_risk"][0, h])
+            if fires < cfg.get("min_inhibitor_fires", 50) or not base or base < cfg.get("min_inhibitor_base", 0.01):
+                continue
+            rate = ratio(train["hits"][r, 0, h], fires)
+            val_rate = ratio(val["hits"][r, 0, h], val["fires"][r, 0, h])
+            val_base = ratio(val["onsets"][0, h], val["at_risk"][0, h])
+            out.append({
+                "bodies": [list(b) for b in rule["bodies"]],
+                "spans": [list(sp) for sp in rule.get("spans", [(j, j) for _a, _s, j in rule["bodies"]])],
+                "span_frames": [list(sp) for sp in rule.get("span_frames", [])] or None,
+                "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
+                "scope_names": scope_names(model),
+                "head": [h, 0], "negated": True, "slot_size": model.slot_size, "rule": r, "weight": weight,
+                "fires": fires, "support": int(train["hits"][r, 0, h]), "confidence": rate,
+                "violation_rate": rate, "base_rate": base, "suppression": rate / base if rate is not None else None,
+                "val_fires": int(val["fires"][r, 0, h]), "val_support": int(val["hits"][r, 0, h]),
+                "val_confidence": val_rate, "val_violation_rate": val_rate, "val_base_rate": val_base,
+                "val_suppression": val_rate / val_base if val_rate is not None and val_base else None,
+                "partial": [],
+            })
+    out.sort(key=lambda c: (c["val_suppression"] if c["val_suppression"] is not None else 9.0, -c["fires"]))
+    print(f"[Inhibitors] {len(rules)} rule nodes with negative heads -> {len(out)} inhibitors kept "
+          f"({sum(1 for c in out if (c['val_suppression'] or 9) <= 0.2)} with val suppression <= 0.2)")
+    return out
 
 
 # -------------- Plot helpers (shared with step 06) --------------
@@ -1914,6 +1961,10 @@ def get_cfg(input_data):
                                                     "data_key": data_key}, "training"),
             'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",
             "extended_clause_file": input_data["output_dir"] / f"extended_clauses_{tag}.json",
+            # Inhibitors "bodies -> not head" (negative head weights, `inhibitor_clauses`).
+            "inhibitor_clause_file": input_data["output_dir"] / f"inhibitor_clauses_{tag}.json",
+            'min_inhibitor_fires': 50,
+            'min_inhibitor_base': 0.01,
             'history_file': input_data["output_dir"] / f"training_history_{tag}.json",
             'mlp_model_file': input_data["output_dir"] / f"onset_mlp_{mlp_tag}.pt",
             'mlp_history_file': input_data["output_dir"] / f"onset_mlp_history_{mlp_tag}.json",
@@ -1934,7 +1985,8 @@ def main(input_data):
     #    min_off_frames or the split changes. The model and clauses are redone after it.
     training_data = load_training_data(cfg)
     model_fresh = is_fresh(cfg["model_file"], cfg["training_data_file"])
-    clauses_fresh = model_fresh and is_fresh(cfg["extended_clause_file"], cfg["model_file"])
+    clauses_fresh = (model_fresh and is_fresh(cfg["extended_clause_file"], cfg["model_file"])
+                     and is_fresh(cfg["inhibitor_clause_file"], cfg["model_file"]))
 
     # One W&B run for the training and extraction below, only if any is not cached.
     run = None
@@ -1952,7 +2004,8 @@ def main(input_data):
 
         # 3. Read the learned rules (ordered bodies with lags -> heads) out of the model.
         if not clauses_fresh:
-            extended_clauses = extract_temporal_clauses(model, training_data, cfg, run)
+            extended_clauses = extract_temporal_clauses(model, training_data, cfg, run,
+                                                        inhibitor_file=cfg["inhibitor_clause_file"])
             utils_data.save_json(extended_clauses, cfg["extended_clause_file"])
     finally:
         if run is not None:
