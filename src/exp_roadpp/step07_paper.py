@@ -33,7 +33,8 @@ from tqdm import tqdm
 
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
-VERSION = "paper_v4"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen")
+VERSION = "paper_v5"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
+                                  # v5: ego_scores.pt also holds the window targets (oracle checks)
 VAL_MIN_RATIO = 0.9             # val videos >= 0.9 x test videos (thresholds are chosen on val)
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
@@ -93,6 +94,7 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
     dense = {name: torch.zeros((T, N, H), device=device) for name in names}
     is_row = torch.zeros((T, N), dtype=torch.bool, device=device)
     at_risk = torch.zeros((T, N, H), dtype=torch.bool, device=device)
+    window_target = torch.zeros((T, N, H), dtype=torch.bool, device=device)        # onset within window k
     ap_rows = {name: [] for name in names}
     for begin in range(cfg["min_context"], T, cfg["frames_per_video"]):
         frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
@@ -105,6 +107,7 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
         stage1 = model.window_probs(model(rows["inputs"])[0])
         scored = rows["at_risk"][:, heads] & rows["known"][:, k, heads]                 # (B, H)
         target = rows["targets"][:, k, heads]
+        window_target[t, n] = target
         for name, score in scorers.items():
             p = score(rows["inputs"], stage1)                                              # (B, W, A)
             outs = {name: p[:, k, heads]}
@@ -124,6 +127,7 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
     holds = X[:, :, ego_heads].any(dim=(0, 2)) if ego_heads is not None and len(ego_heads) else None
     ego = int(torch.nonzero(holds)[0]) if holds is not None and bool(holds.any()) else None
     return {"dense": dense, "is_row": is_row, "at_risk": at_risk, "ap_rows": ap_rows, "T": T, "N": N, "ego": ego,
+            "target": window_target,
             "events": (e_t, e_n, e_h), "next_gone": next_gone, "minutes": (T - cfg["min_context"]) / cfg["frame_rate"] / 60}
 
 
@@ -212,6 +216,7 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
         if store is not None and v["ego"] is not None:
             e, sel = v["ego"], is_ego.to(v["is_row"].device)
             store[video_id] = {"known": (v["is_row"][:, e, None] & v["at_risk"][:, e][:, sel]).cpu(),
+                               "target": v["target"][:, e][:, sel].cpu(),
                                **{nm: v["dense"][nm][:, e][:, sel].half().cpu() for nm in names if nm in EGO_SCORERS}}
     return curve, hist, per_video, events
 
