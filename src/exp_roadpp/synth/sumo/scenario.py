@@ -248,7 +248,13 @@ def build_maps(sumo_dir, num_maps, seed, layout="junction"):
 def map_split(maps, fractions=(0.7, 0.15, 0.15)):
     """{"train", "val", "test": [map ids]}: the maps sorted by kind (control, arms) and dealt out in turn,
     so that every split has every kind."""
-    order = sorted(maps, key=lambda m: (maps[m]["spec"]["control"], len(maps[m]["spec"]["arms"]), m))
+    def kind(m):
+        spec = maps[m]["spec"]
+        if is_grid(spec):                             # grids: by size, e.g. "grid4x5"
+            return (maps[m]["name"].split("_")[0], 0)
+        return (spec["control"], len(spec["arms"]))
+
+    order = sorted(maps, key=lambda m: (*kind(m), m))
     period = round(1 / min(fractions[1:]))            # e.g. every 7th map to val, the next to test
     out = {"train": [], "val": [], "test": []}
     for k, m in enumerate(order):
