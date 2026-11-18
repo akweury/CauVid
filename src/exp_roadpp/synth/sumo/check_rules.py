@@ -154,6 +154,15 @@ def check_video(lf, first, stats):
             _event(stats, "N2", _hit(tur, t, win["N2"]))
 
 
+def video_events(data, labels):
+    """{rule: number of body events} of one ROAD++ video (its "data"): the instances of each tested rule
+    that the labels hold, hit or not (`run.py` samples videos until each rule has enough)."""
+    lf, first = label_frames(data, labels)
+    stats = defaultdict(Counter)
+    check_video(lf, first, stats)
+    return {r: stats[r]["events"] for r in TESTS}
+
+
 def check(dataset):
     dataset = Path(dataset)
     labels = json.loads((dataset / "gt" / "label.json").read_text())
