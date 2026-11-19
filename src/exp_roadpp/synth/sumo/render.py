@@ -3,13 +3,21 @@ rendering): left the top view (roads, every agent, the ego's field of view; agen
 colour, the others grey), right the camera view with exactly the boxes and labels of {vid}_gt.json.
 
     python -m src.exp_roadpp.synth.sumo.render --dataset <dataset dir> --num 4 [--vid sumo_00003 --frames 50 120] [--maps]
+    python -m src.exp_roadpp.synth.sumo.render --dataset <dataset dir> --video [--vid sumo_00003] [--fps 10]
+--video: every frame of one video (default: the first one with an executed rule the ego sees) as an mp4
+(ffmpeg), <dataset>/render/<vid>.mp4.
     ./run_roadpp_docker.sh --gpu none --sumo_render -- --dataset /storage-01/ml-jsha/CauVid_Data/synthetic/sumo_junction_v0
 Without --frames, frames with something to see are picked: R1 / R2 executions the ego sees, turns,
 red-light stops. Images: <dataset>/render/<vid>_f<frame>.png"""
 import argparse
+import functools
 import gzip
 import json
 import math
+import shutil
+import subprocess
+import tempfile
+import textwrap
 from pathlib import Path
 
 import matplotlib
@@ -35,11 +43,27 @@ def _offset(shape, d):
     return out
 
 
+@functools.lru_cache(maxsize=4)
+def _read_net(net_file):
+    import sumolib
+    return sumolib.net.readNet(str(net_file), withInternal=True, withPedestrianConnections=True)
+
+
+@functools.lru_cache(maxsize=2)
+def _video(dataset, vid):
+    """(labels, gt data, world states, firings) of one video, read once for all its frames."""
+    labels = json.loads((dataset / "gt" / "label.json").read_text())
+    data = json.loads((dataset / "gt" / f"{vid}_gt.json").read_text())["data"]
+    with gzip.open(dataset / "meta" / "world" / f"{vid}.json.gz", "rt") as f:
+        world = json.load(f)
+    firings = json.loads((dataset / "meta" / "firings" / f"{vid}.json").read_text())
+    return labels, data, world, firings
+
+
 def draw_network(ax, net_file):
     """Draws the network; returns the position of junction C, or the centre of a grid (netconvert shifts
     the coordinates)."""
-    import sumolib
-    net = sumolib.net.readNet(str(net_file), withInternal=True, withPedestrianConnections=True)
+    net = _read_net(str(net_file))
     for edge in net.getEdges(withInternal=True):
         func = edge.getFunction()
         for lane in edge.getLanes():
@@ -96,11 +120,8 @@ def _short(labels, ids, kind):
 
 def render(dataset, vid, frame, out_file):
     """One image of frame (1-based) of video vid."""
-    labels = json.loads((dataset / "gt" / "label.json").read_text())
-    data = json.loads((dataset / "gt" / f"{vid}_gt.json").read_text())["data"]
-    with gzip.open(dataset / "meta" / "world" / f"{vid}.json.gz", "rt") as f:
-        world = json.load(f)[frame - 1]
-    firings = json.loads((dataset / "meta" / "firings" / f"{vid}.json").read_text())
+    labels, data, worlds, firings = _video(dataset, vid)
+    world = worlds[frame - 1]
     annos = data["frames"][str(frame)]["annos"]
     av = labels["av_action_labels"][data["frames"][str(frame)]["av_action_ids"][0]]
     seen = {a["tube_uid"].split("-", 1)[1] for a in annos.values()}
@@ -165,12 +186,16 @@ def render(dataset, vid, frame, out_file):
     cam_ax.set_xlim(0, W); cam_ax.set_ylim(H, 0)
     cam_ax.set_aspect("equal")
     cam_ax.set_xticks([]); cam_ax.set_yticks([])
-    near = [f for f in firings if f.get("frame_fire") and abs(f["frame_fire"] - frame) <= 30 and f.get("executed")
-            and (f["agent_is_ego"] or f["agent_visible"])]
+    # The executed rules of the ego / visible agents firing within +-1 s, the ego's first, at most 4.
+    near = sorted((f for f in firings if f.get("frame_fire") and abs(f["frame_fire"] - frame) <= 10
+                   and f.get("executed") and (f["agent_is_ego"] or f["agent_visible"])),
+                  key=lambda f: (not f["agent_is_ego"], abs(f["frame_fire"] - frame)))[:4]
     note = "; ".join(f"{f['rule']} {f['agent']} fires f{f['frame_fire']} (body {f['body_agent']} f{f['frame_body']})"
                      for f in near)
-    cam_ax.set_title(f"camera view: {len(annos)} GT boxes" + (f"\n{note}" if note else ""), fontsize=9)
-    fig.tight_layout()
+    cam_ax.set_title(f"camera view: {len(annos)} GT boxes\n" + (textwrap.fill(note, 110) if note else ""), fontsize=9,
+                     loc="left")
+    # A fixed layout (not tight_layout): every frame of a video has the same geometry.
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.86, wspace=0.04)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_file, dpi=110)
     plt.close(fig)
@@ -205,6 +230,21 @@ def interesting(dataset, num):
     return out
 
 
+def render_video(dataset, vid, out_file, fps=10):
+    """Every frame of video vid (`render`) as an mp4 (H.264, ffmpeg)."""
+    num_frames = len(_video(dataset, vid)[1]["frames"])
+    with tempfile.TemporaryDirectory() as tmp:
+        for frame in range(1, num_frames + 1):
+            render(dataset, vid, frame, Path(tmp) / f"{frame:05d}.png")
+            if frame % 25 == 0 or frame == num_frames:
+                print(f"[Render] {vid}: {frame}/{num_frames} frames")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([shutil.which("ffmpeg") or "ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                        "-i", str(Path(tmp) / "%05d.png"), "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out_file)], check=True)
+    return out_file
+
+
 def main():
     parser = argparse.ArgumentParser(description="Schematic images of SUMO synthetic videos")
     parser.add_argument("--dataset", required=True)
@@ -212,8 +252,14 @@ def main():
     parser.add_argument("--vid", default=None)
     parser.add_argument("--frames", type=int, nargs="*", default=None)
     parser.add_argument("--maps", action="store_true", help="also one image of all junctions (multi-map datasets)")
+    parser.add_argument("--video", action="store_true", help="every frame of one video as an mp4 (--vid)")
+    parser.add_argument("--fps", type=int, default=10)
     args, _unknown = parser.parse_known_args()             # the docker script adds --device / --machine
     dataset = Path(args.dataset)
+    if args.video:
+        vid = args.vid or interesting(dataset, 1)[0][0]
+        print(render_video(dataset, vid, dataset / "render" / f"{vid}.mp4", args.fps))
+        return
     if args.maps and (dataset / "meta" / "maps.json").exists():
         out = dataset / "render" / "maps.png"
         render_maps(dataset, out)
