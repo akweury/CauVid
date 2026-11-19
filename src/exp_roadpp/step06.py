@@ -1304,14 +1304,26 @@ def evaluate_clauses(model, data, clauses, step05_cfg):
 
 
 def evaluate_inhibitors(model, data, inhibitors, step05_cfg):
-    """The step 05 inhibitors ("bodies -> not head") with their test counts (`evaluate_clauses`) and
-    test_violation_rate (the head starts after all bodies anyway), test_suppression (/ the test base rate).
-    Sorted by test suppression."""
+    """The step 05 inhibitors ("bodies -> not head") on the test videos, counted as in step 05 only on the
+    rows of agents of the head's class (`step05.class_possible`): test_fires, test_support (the head
+    starts after all bodies anyway), test_violation_rate, test_base_rate, test_suppression (rate / base)
+    and test_kind (`step05.inhibitor_kind`). Sorted by test suppression."""
+    def ratio(a, b):
+        return float(a) / float(b) if b > 0 else None
+
+    possible = step05.class_possible(data, step05.load_vocabulary(step05_cfg), step05_cfg["device"])
+    counts = step05._rule_head_counts(model, data, list(data["videos"]), step05_cfg,
+                                      desc="Counting inhibitor firings (test)", possible=possible)
     out = []
-    for c in evaluate_clauses(model, data, inhibitors, step05_cfg):
-        rate, base = c["test_confidence"], c["test_base_rate"]
-        out.append({**c, "test_violation_rate": rate,
-                    "test_suppression": rate / base if rate is not None and base else None})
+    for c in inhibitors:
+        r, h = c["rule"], c["head"][0]
+        rate = ratio(counts["possible_hits"][r, 0, h], counts["possible_fires"][r, 0, h])
+        base = ratio(counts["possible_onsets"][0, h], counts["possible_at_risk"][0, h])
+        suppression = rate / base if rate is not None and base else None
+        out.append({**c, "test_fires": int(counts["possible_fires"][r, 0, h]),
+                    "test_support": int(counts["possible_hits"][r, 0, h]), "test_violation_rate": rate,
+                    "test_confidence": rate, "test_base_rate": base, "test_suppression": suppression,
+                    "test_kind": step05.inhibitor_kind(suppression, step05_cfg)})
     out.sort(key=lambda c: (c["test_suppression"] if c["test_suppression"] is not None else 9.0, -c["test_fires"]))
     return out
 
@@ -1320,8 +1332,12 @@ def print_inhibitors(inhibitors, step05_cfg, vocab, top=15):
     """The inhibitors that hold on test: violation rate and suppression (vs the head's base rate)."""
     firing = [c for c in inhibitors if c["test_fires"] >= step05_cfg.get("min_inhibitor_fires", 50)]
     strong = [c for c in firing if c["test_suppression"] is not None and c["test_suppression"] <= 0.2]
-    print(f"[Inhibitors] {len(inhibitors)} (val-kept), {len(firing)} fire on test >= "
-          f"{step05_cfg.get('min_inhibitor_fires', 50)} times, {len(strong)} hold there (head rate <= 0.2 x base)")
+    both = [c for c in strong if c.get("kind") == "inhibitor"]
+    print(f"[Inhibitors] counted on the agents of the head's class: {len(inhibitors)} kept on train / val "
+          f"({sum(1 for c in inhibitors if c.get('kind') == 'inhibitor')} inhibitors by val suppression, "
+          f"{sum(1 for c in inhibitors if c.get('kind') == 'correction')} corrections), {len(firing)} fire on test >= "
+          f"{step05_cfg.get('min_inhibitor_fires', 50)} times, {len(strong)} hold there (head rate <= 0.2 x base), "
+          f"{len(both)} of them also on val")
     for c in strong[:top]:
         print(f"  NOT  {step05._temporal_clause_text(c, vocab)}   violation {c['test_violation_rate']:.4f} "
               f"vs base {c['test_base_rate']:.3f} (fires {c['test_fires']})")

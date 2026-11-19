@@ -33,9 +33,10 @@ from tqdm import tqdm
 
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
-VERSION = "paper_v6"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
+VERSION = "paper_v7"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
                                   # v5: ego_scores.pt also holds the window targets (oracle checks);
-                                  # v6: exclusion per head, relative to its base rate
+                                  # v6: exclusion per head, relative to its base rate;
+                                  # v7: exclusion only on the cells of agents of the head's class
 VAL_MIN_RATIO = 0.9             # val videos >= 0.9 x test videos (thresholds are chosen on val)
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
@@ -52,7 +53,9 @@ NB = 2001                                       # score bins of logit(p) in [-14
 # sumo_maps_v7: every head's cell base rate < 5%, all heads pooled 0.3%, so prior covered 100% at 0.5%). Coverage =
 # the share of the head's candidate cells excluded. Heads with fewer than min_onsets val or test onsets are
 # left out (the cut and the rate need them). edge_share: the top share of the excluded cells (by score) whose
-# suppression shows whether the cut is near its budget at the edge.
+# suppression shows whether the cut is near its budget at the edge. Only the cells of agents of the head's
+# class count (paper_v7): over every agent, a Car "excluded" from Ped:Mov made up most of the coverage (run
+# ad9e0b: lookup 0.93 at rho 0.1).
 EXCLUSION = {"suppression": [0.05, 0.1, 0.2], "headline": 0.1, "min_onsets": 20, "edge_share": 0.1}
 EGO_SCORERS = ("model_cal", "mlp_cal", "lookup_cal", "model", "mlp", "lookup", "prior")
 
@@ -100,6 +103,9 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
     at_risk = torch.zeros((T, N, H), dtype=torch.bool, device=device)
     window_target = torch.zeros((T, N, H), dtype=torch.bool, device=device)        # onset within window k
     ap_rows = {name: [] for name in names}
+    # Exclusion counts only the cells of agents that can hold the head at all (its class, `step05.possible_cells`).
+    possible = (step05.possible_cells(video, cfg["atom_class"], cfg["num_classes"])[:, heads]
+                if cfg.get("atom_class") is not None else torch.ones((N, H), dtype=torch.bool, device=device))
     for begin in range(cfg["min_context"], T, cfg["frames_per_video"]):
         frames = torch.arange(begin, min(begin + cfg["frames_per_video"], T), device=device)
         rows = step05.video_rows(model, X, frames, m, None, roles)
@@ -119,7 +125,7 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
                 outs[f"{name}_cal"] = step06.calibrate(p[:, :, heads], calibration[name], heads)[:, k]
             for nm, q in outs.items():
                 dense[nm][t, n] = q
-                ap_rows[nm].append((q, target, scored))
+                ap_rows[nm].append((q, target, scored, possible[n]))
     onsets = step05.atom_onsets(X[..., heads], m)
     onsets[0] = False
     onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
@@ -167,7 +173,8 @@ def _new_count(types):
 def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_ego, cfg, grid, chosen=None):
     """Over the videos: per scorer the curve over the threshold grid {th: counts}, the AP
     histograms (H, 2, NB) and, with chosen {name: {budget: th}}, the per-video counts and the
-    per-event detections at those thresholds."""
+    per-event detections at those thresholds. Also the histograms of the exclusion: as the AP ones, only
+    the cells of agents of the head's class."""
     ep = step06_episodes._default_cfg(cfg["frame_rate"])
     k = model.windows.index(cfg["window"])
     w, tol, H = cfg["window"], int(round(PAPER["tolerance_s"] * cfg["frame_rate"])), len(heads)
@@ -176,6 +183,7 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
     names = list(scorers) + [f"{n}_cal" for n in calibration]
     curve = {nm: {th: _new_count(types) for th in grid} for nm in names}
     hist = {nm: torch.zeros((H, 2, NB), dtype=torch.float64) for nm in names}
+    hist_ex = {nm: torch.zeros((H, 2, NB), dtype=torch.float64) for nm in names}
     per_video = {nm: {b: [] for b in (chosen or {}).get(nm, {})} for nm in names}
     events = []
     for video_id in tqdm(video_ids, desc=cfg.get("desc", "Paper metrics")):
@@ -189,12 +197,14 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
                    "type": types[type_names.index(int(ty))] if int(ty) in type_names else str(int(ty)),
                    "ego": bool(eg)} for t, n, h, ty, eg in zip(e_t, e_n, e_h, e_type, e_ego)]
         for nm in names:
-            for q, target, scored in v["ap_rows"][nm]:
+            for q, target, scored, can in v["ap_rows"][nm]:
                 b = _logit_bins(q)
                 for y in (0, 1):
                     cell = scored & (target == bool(y))
                     idx = (torch.arange(H, device=b.device)[None, :] * NB + b)[cell]
                     hist[nm][:, y] += torch.bincount(idx.cpu(), minlength=H * NB).view(H, NB).double()
+                    idx = (torch.arange(H, device=b.device)[None, :] * NB + b)[cell & can]
+                    hist_ex[nm][:, y] += torch.bincount(idx.cpu(), minlength=H * NB).view(H, NB).double()
             budgets_at = {th: [bd for bd, t in (chosen or {}).get(nm, {}).items() if t == th] for th in grid}
             for th in grid:
                 det, lead, n_correct, n_false = episode_outcome(v, nm, th, H, w, tol, ep)
@@ -222,7 +232,7 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
             store[video_id] = {"known": (v["is_row"][:, e, None] & v["at_risk"][:, e][:, sel]).cpu(),
                                "target": v["target"][:, e][:, sel].cpu(),
                                **{nm: v["dense"][nm][:, e][:, sel].half().cpu() for nm in names if nm in EGO_SCORERS}}
-    return curve, hist, per_video, events
+    return curve, hist, per_video, events, hist_ex
 
 
 def _cut(h, v):
@@ -441,19 +451,21 @@ def main(input_data):
            "frames_per_video": step05_cfg["frames_per_video"], "window": 20}
     heads_d = heads.to(cfg["device"])
     cfg["ego_heads"] = heads_d[is_ego.to(cfg["device"])]
+    atom_class, class_names = step05.atom_classes(vocab, step05.label_atom_count(test_data), test_data["num_atoms"])
+    cfg["atom_class"], cfg["num_classes"] = atom_class.to(cfg["device"]), len(class_names)
     grid = threshold_grid()
 
     # 1. Val: the false alarms per minute of every threshold; the threshold of each budget.
     val_data = step06._subset(training_data, training_data["val_videos"])
     del training_data
-    val_curve, val_hist, _, _ = run_pass(model, scorers, calibration, val_data, sorted(val_data["videos"]), heads_d,
+    val_curve, _val_hist, _, _, val_hist = run_pass(model, scorers, calibration, val_data, sorted(val_data["videos"]), heads_d,
                                          head_type, is_ego, {**cfg, "desc": "Paper metrics (val)"}, grid)
     del val_data
     chosen = {nm: choose_thresholds(c, PAPER["budgets"]) for nm, c in val_curve.items()}
 
     # 2. Test at those thresholds (and the whole test curve).
     ego_scores = {}
-    test_curve, hist, per_video, events = run_pass(model, scorers, calibration, test_data,
+    test_curve, hist, per_video, events, hist_ex = run_pass(model, scorers, calibration, test_data,
                                                    sorted(test_data["videos"]), heads_d, head_type, is_ego,
                                                    {**cfg, "desc": "Paper metrics (test)", "ego_scores": ego_scores},
                                                    grid,
@@ -479,11 +491,11 @@ def main(input_data):
     # Exclusion: "this head will not start within the window", at violation budgets (cuts on val).
     any_nm = next(iter(hist))
     eligible = ((val_hist[any_nm][:, 1].sum(1) >= EXCLUSION["min_onsets"])
-                & (hist[any_nm][:, 1].sum(1) >= EXCLUSION["min_onsets"]))
+                & (hist_ex[any_nm][:, 1].sum(1) >= EXCLUSION["min_onsets"]))
     groups = {"eligible": eligible, "ego": eligible & is_ego.cpu()}
     out["exclusion"] = {"settings": EXCLUSION,
                         "eligible_heads": [label_names[i] for i in torch.nonzero(eligible).flatten().tolist()],
-                        "scorers": exclusion_report(val_hist, hist, groups, label_names)}
+                        "scorers": exclusion_report(val_hist, hist_ex, groups, label_names)}
     torch.save({"heads": [n for n, e in zip(label_names, is_ego.tolist()) if e], "frame_rate": fps,
                 "window": cfg["window"], "min_context": min_context, "videos": ego_scores}, out_dir / "ego_scores.pt")
     utils_data.save_json(out, metrics_file)

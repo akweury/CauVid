@@ -328,6 +328,53 @@ def _atom_name(signature):
     return f"{fields.get('agent_class_label', '?')}:{'/'.join(labels) or signature[1]}"
 
 
+def atom_classes(vocab, num_label_atoms, num_atoms):
+    """(A,) long: the agent class index of every label atom (the prefix of its name, e.g. "Car" of
+    Car:Stop, "av" of av:AV-Mov), -1 for the other atoms (geometry, grid, ...); and the class names."""
+    names, index = [], {}
+    out = torch.full((num_atoms,), -1, dtype=torch.long)
+    for a in range(min(num_label_atoms, num_atoms, len(vocab))):
+        c = _atom_name(vocab[a]).split(":", 1)[0]
+        out[a] = index.setdefault(c, len(index))
+        if len(names) < len(index):
+            names.append(c)
+    return out, names
+
+
+def possible_cells(video, atom_class, num_classes):
+    """(N, A) bool of one stored video: the atom can hold for the agent at all, i.e. its class
+    (`atom_classes`, on atom_class's device) is the agent's class (the class of most of the label atoms the
+    agent holds in the video; the ego holds the av: atoms) or the atom is not a label atom. Agents without
+    a label atom: no label atom is possible."""
+    device = atom_class.device
+    N, C = int(video["shape"][1]), max(num_classes, 1)
+    _t, n, a = video["cells"].to(device).long().T
+    keep = a < len(atom_class)
+    n, cls = n[keep], atom_class[a[keep]]
+    n, cls = n[cls >= 0], cls[cls >= 0]
+    counts = torch.zeros(N * C, device=device).index_add_(0, n * C + cls, torch.ones(len(n), device=device))
+    counts = counts.view(N, C)
+    agent = torch.where(counts.sum(1) > 0, counts.argmax(1), torch.full((N,), -2, dtype=torch.long, device=device))
+    return (atom_class[None, :] == agent[:, None]) | (atom_class[None, :] < 0)
+
+
+def class_possible(data, vocab, device):
+    """possible(video_id) -> (N, A) bool (`possible_cells`) of the videos of data. A Car never starts
+    Ped:Mov, only the ego starts av:AV-Mov: counted over every agent, "bodies -> not head" and exclusion
+    rates mostly measure the agent's class (sumo_maps_v7 run ad9e0b: inhibitors such as
+    Car:Stop(X0) -> not AV-Mov with violation 0)."""
+    atom_class, names = atom_classes(vocab, label_atom_count(data), data["num_atoms"])
+    atom_class = atom_class.to(device)
+    cache = {}
+
+    def possible(video_id):
+        if video_id not in cache:
+            cache.clear()                                   # one video at a time
+            cache[video_id] = possible_cells(data["videos"][video_id], atom_class, len(names))
+        return cache[video_id]
+    return possible
+
+
 _WANDB_CLOUD_HOST = "https://api.wandb.ai"
 
 
@@ -1230,7 +1277,8 @@ def load_onset_mlp(training_data, cfg):
 
 
 @torch.no_grad()
-def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule firings", candidates=None):
+def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule firings", candidates=None,
+                      possible=None):
     """Counts of every rule r and head atom h over all frames of the given videos
     (with their full history; only the cells candidates(inputs) flags, if given:
     the verifier's rules are judged on the stage-1 candidates they filter), for
@@ -1247,6 +1295,9 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
       anchor_fires / anchor_hits (R, J, A): the same for the anchor input of r
           alone (its fixed input, without the learned extra atoms; 0 for free rules);
       onsets (J, A) / at_risk (J, A): the hits and fires of an empty body (the base rate).
+    possible(video_id) -> (N, A) bool (`class_possible`), if given: also possible_fires, possible_hits
+    (R, J, A) and possible_onsets, possible_at_risk (J, A), the same counted only on the rows of agents
+    the head can hold at all (its class; the inhibitors are judged on them).
     """
     J, S = model.num_slots, model.slot_size
     num_rules, num_atoms = model.log_alpha.shape[0], model.num_atoms
@@ -1256,6 +1307,12 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
               for name in ("fires", "hits", "videos", "anchor_fires", "anchor_hits")}
     counts["onsets"] = torch.zeros(J * num_atoms, device=device)
     counts["at_risk"] = torch.zeros(J * num_atoms, device=device)
+    if possible is not None:
+        counts["possible_fires"] = torch.zeros(shape, device=device)
+        counts["possible_hits"] = torch.zeros(shape, device=device)
+        counts["possible_onsets"] = torch.zeros(J * num_atoms, device=device)
+        counts["possible_at_risk"] = torch.zeros(J * num_atoms, device=device)
+
     def in_memory(rule_inputs, f):
         # Bodies with j > f, moved to the past slot p = j - f they lie in for a head in slot f.
         memory = torch.zeros((num_rules, model.num_inputs + 1), device=device)
@@ -1276,6 +1333,7 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
                 at_risk = at_risk & candidates(rows["inputs"])
             x, _k = model.split_inputs(rows["inputs"])
             first = rows["first"]
+            can = possible(video_id)[rows["rows"][:, 1]].float() if possible is not None else None    # (B, A)
             for f in range(J):
                 risk = (at_risk & (first >= f * S) & rows["known"][:, f]).float()          # (B, A)
                 onset = (at_risk & (first >= f * S) & (first < (f + 1) * S)).float()
@@ -1290,12 +1348,19 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
                         video_hits[:, cols] += fired.T @ onset
                 counts["onsets"][cols] += onset.sum(dim=0)
                 counts["at_risk"][cols] += risk.sum(dim=0)
+                if can is not None:
+                    b = known_bodies[f]
+                    size = b.sum(dim=1)
+                    fired = ((x @ b.T >= size) & (size > 0)).float()
+                    counts["possible_fires"][:, cols] += fired.T @ (risk * can)
+                    counts["possible_hits"][:, cols] += fired.T @ (onset * can)
+                    counts["possible_onsets"][cols] += (onset * can).sum(dim=0)
+                    counts["possible_at_risk"][cols] += (risk * can).sum(dim=0)
         counts["hits"] += video_hits
         counts["videos"] += video_hits > 0
-    out = {name: value.view(num_rules, J, num_atoms) for name, value in counts.items()
-           if name not in ("onsets", "at_risk")}
-    out["onsets"] = counts["onsets"].view(J, num_atoms)
-    out["at_risk"] = counts["at_risk"].view(J, num_atoms)
+    per_head = ("onsets", "at_risk", "possible_onsets", "possible_at_risk")
+    out = {name: value.view(num_rules, J, num_atoms) for name, value in counts.items() if name not in per_head}
+    out.update({name: counts[name].view(J, num_atoms) for name in per_head if name in counts})
     return {name: value.cpu() for name, value in out.items()}
 
 
@@ -1342,10 +1407,12 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
         return float(a) / float(b) if b > 0 else None
 
     rules = model.extract_rules(cfg["mask_threshold"], cfg["weight_threshold"])
+    possible = (class_possible(training_data, load_vocabulary(cfg), cfg["device"])
+                if inhibitor_file is not None else None)
     train = _rule_head_counts(model, training_data, training_data["train_videos"], cfg,
-                              desc="Counting rule firings (train)", candidates=candidates)
+                              desc="Counting rule firings (train)", candidates=candidates, possible=possible)
     val = _rule_head_counts(model, training_data, training_data["val_videos"], cfg,
-                            desc="Counting rule firings (val)", candidates=candidates)
+                            desc="Counting rule firings (val)", candidates=candidates, possible=possible)
 
     clauses = []
     for rule in rules:
@@ -1410,30 +1477,45 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
     return clauses
 
 
+def inhibitor_kind(suppression, cfg):
+    """"inhibitor" (the head's rate after the bodies <= max_inhibitor_suppression x its base rate),
+    "correction" (>= 1: the head is not rarer after the bodies; the negative weight offsets other rules)
+    or "weak"; None without a rate."""
+    if suppression is None:
+        return None
+    if suppression <= cfg.get("max_inhibitor_suppression", 0.5):
+        return "inhibitor"
+    return "correction" if suppression >= 1.0 else "weak"
+
+
 def inhibitor_clauses(model, train, val, cfg):
     """Inhibitors "bodies -> not head": the (rule node, head) pairs with a head weight below
-    -weight_threshold (`TemporalRuleNet.extract_rules(negative=True)`), from the `_rule_head_counts` of
-    train and val. Kept if the bodies fire in >= min_inhibitor_fires training rows where the head could
-    start (at risk) and the head is not rare there (base rate >= min_inhibitor_base: ruling out what
-    hardly ever happens says nothing). Each: the clause fields of `extract_temporal_clauses` with
-    violation_rate = P(head starts in the next slot | bodies) (its confidence), base_rate and
-    suppression = violation_rate / base_rate (0: the bodies rule the head out), on train and val.
-    Sorted by val suppression, then train fires."""
+    -weight_threshold (`TemporalRuleNet.extract_rules(negative=True)`), judged on the possible_ counts of
+    `_rule_head_counts` (only the rows of agents of the head's class: a body that only says "this agent
+    is of another class" fires there never and is dropped). Kept if the bodies fire in >= min_inhibitor_fires
+    such training rows where the head could start (at risk) and the head is not rare there (base rate >=
+    min_inhibitor_base: ruling out what hardly ever happens says nothing). Each: the clause fields of
+    `extract_temporal_clauses` with violation_rate = P(head starts in the next slot | bodies) (its
+    confidence), base_rate and suppression = violation_rate / base_rate (0: the bodies rule the head
+    out), on train and val, and kind (`inhibitor_kind`, by val suppression). Sorted by val suppression,
+    then train fires."""
     def ratio(a, b):
         return float(a) / float(b) if b > 0 else None
 
     rules = model.extract_rules(cfg["mask_threshold"], cfg["weight_threshold"], negative=True)
-    out = []
+    out, dropped = [], 0
     for rule in rules:
         r = rule["rule"]
         for h, weight in rule["heads"]:
-            fires = int(train["fires"][r, 0, h])
-            base = ratio(train["onsets"][0, h], train["at_risk"][0, h])
+            fires = int(train["possible_fires"][r, 0, h])
+            base = ratio(train["possible_onsets"][0, h], train["possible_at_risk"][0, h])
             if fires < cfg.get("min_inhibitor_fires", 50) or not base or base < cfg.get("min_inhibitor_base", 0.01):
+                dropped += 1
                 continue
-            rate = ratio(train["hits"][r, 0, h], fires)
-            val_rate = ratio(val["hits"][r, 0, h], val["fires"][r, 0, h])
-            val_base = ratio(val["onsets"][0, h], val["at_risk"][0, h])
+            rate = ratio(train["possible_hits"][r, 0, h], fires)
+            val_rate = ratio(val["possible_hits"][r, 0, h], val["possible_fires"][r, 0, h])
+            val_base = ratio(val["possible_onsets"][0, h], val["possible_at_risk"][0, h])
+            val_suppression = val_rate / val_base if val_rate is not None and val_base else None
             out.append({
                 "bodies": [list(b) for b in rule["bodies"]],
                 "spans": [list(sp) for sp in rule.get("spans", [(j, j) for _a, _s, j in rule["bodies"]])],
@@ -1441,16 +1523,18 @@ def inhibitor_clauses(model, train, val, cfg):
                 "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
                 "scope_names": scope_names(model),
                 "head": [h, 0], "negated": True, "slot_size": model.slot_size, "rule": r, "weight": weight,
-                "fires": fires, "support": int(train["hits"][r, 0, h]), "confidence": rate,
+                "fires": fires, "support": int(train["possible_hits"][r, 0, h]), "confidence": rate,
                 "violation_rate": rate, "base_rate": base, "suppression": rate / base if rate is not None else None,
-                "val_fires": int(val["fires"][r, 0, h]), "val_support": int(val["hits"][r, 0, h]),
+                "val_fires": int(val["possible_fires"][r, 0, h]), "val_support": int(val["possible_hits"][r, 0, h]),
                 "val_confidence": val_rate, "val_violation_rate": val_rate, "val_base_rate": val_base,
-                "val_suppression": val_rate / val_base if val_rate is not None and val_base else None,
+                "val_suppression": val_suppression, "kind": inhibitor_kind(val_suppression, cfg),
                 "partial": [],
             })
     out.sort(key=lambda c: (c["val_suppression"] if c["val_suppression"] is not None else 9.0, -c["fires"]))
-    print(f"[Inhibitors] {len(rules)} rule nodes with negative heads -> {len(out)} inhibitors kept "
-          f"({sum(1 for c in out if (c['val_suppression'] or 9) <= 0.2)} with val suppression <= 0.2)")
+    kinds = {k: sum(1 for c in out if c["kind"] == k) for k in ("inhibitor", "weak", "correction")}
+    print(f"[Inhibitors] {sum(len(r['heads']) for r in rules)} negative (rule, head) pairs; {dropped} dropped (bodies "
+          f"fire < {cfg.get('min_inhibitor_fires', 50)} times on agents of the head's class, or the head is rare "
+          f"there); kept {len(out)}: by val suppression {kinds}")
     return out
 
 
@@ -1961,8 +2045,11 @@ def get_cfg(input_data):
                                                     "data_key": data_key}, "training"),
             'model_file': input_data["output_dir"] / f"temporal_rule_net_{tag}.pt",
             "extended_clause_file": input_data["output_dir"] / f"extended_clauses_{tag}.json",
-            # Inhibitors "bodies -> not head" (negative head weights, `inhibitor_clauses`).
-            "inhibitor_clause_file": input_data["output_dir"] / f"inhibitor_clauses_{tag}.json",
+            # Inhibitors "bodies -> not head" (negative head weights, `inhibitor_clauses`); v2: counted on the
+            # agents of the head's class only (`class_possible`).
+            "inhibitor_clause_file": input_data["output_dir"] / f"inhibitor_clauses_v2_{tag}.json",
+            # kind "inhibitor": val suppression <= this (else "weak", or "correction" if >= 1).
+            'max_inhibitor_suppression': 0.5,
             'min_inhibitor_fires': 50,
             'min_inhibitor_base': 0.01,
             'history_file': input_data["output_dir"] / f"training_history_{tag}.json",
