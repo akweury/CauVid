@@ -113,6 +113,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.oracle_turns"
     elif [[ "$arg" == "--oracle_junction" ]]; then
         ENTRY_MODULE="src.exp_roadpp.oracle_junction"
+    elif [[ "$arg" == "--anchor_support" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.anchor_support"
     elif [[ "$arg" == "--ablation" ]]; then
         ENTRY_MODULE="src.exp_roadpp.ablation"
     else
