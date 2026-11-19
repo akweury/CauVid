@@ -6,6 +6,7 @@ import time
 
 from collections import Counter
 from collections import defaultdict
+from collections import deque
 
 from src.exp_roadpp.logic import Clause
 from src.exp_roadpp import utils_data
@@ -194,27 +195,64 @@ def load_atoms(atom_file):
 
 
 
+# v2: also the own-agent clauses "my X -> my Y" (`SELF_WINDOW`); v1 had only other-agent clauses and the
+# self-loops "my X -> my X", so no anchor could seed e.g. SUMO R2 (my HazLit -> my Brake) or N5.
+ANCHOR_VERSION = "v2_self"
+# Own-agent anchors: when atom Y switches on for an agent (on in frame t + 1, off in t, the agent seen in
+# t), every other atom X the same agent held in the SELF_WINDOW frames up to t gives "my X -> my Y"
+# (the rule net's memory: 3 slots of 10 frames). An onset, not a co-occurrence: an agent's atoms mostly
+# hold together (Mov with OutgoLane), and only what came before Y's start can predict it.
+SELF_WINDOW = 30
+
+
 def build_anchor_clauses(cfg):
     atoms = utils_data.load_json(cfg["train_atom_file"])
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     unique_atoms = [tuple(atom) for atom in unique_atoms]
     anchor_clauses = []
     seen_clauses = set()
+
+    def add(clause):
+        if clause not in seen_clauses:
+            seen_clauses.add(clause)
+            anchor_clauses.append(clause)
+
+    num_self = 0
     for vid, video_atoms in atoms.items():
         per_frame_atoms = video_atoms["per_frame_atoms"]
+        history = deque(maxlen=SELF_WINDOW)         # {agent: {atom}} of the last SELF_WINDOW frames up to t
         for current_frame, next_frame in tqdm(per_frame_atoms):
+            current_by_agent, next_by_agent = defaultdict(set), defaultdict(set)
+            for atom in current_frame:
+                current_by_agent[atom[-1]].add(atom[0])
+            for atom in next_frame:
+                next_by_agent[atom[-1]].add(atom[0])
+            history.append(current_by_agent)
+            # Own agent: the onsets of frame t + 1 and the atoms the agent held before them.
+            for agent, next_atoms in next_by_agent.items():
+                if agent not in current_by_agent:
+                    continue                        # the agent enters the scene: appearances, not onsets
+                onsets = next_atoms - current_by_agent[agent]
+                if not onsets:
+                    continue
+                before = set().union(*(frame.get(agent, ()) for frame in history))
+                for head in onsets:
+                    for body in before - {head}:
+                        clause = Clause(head, [body], [0])
+                        if clause not in seen_clauses:
+                            num_self += 1
+                        add(clause)
             if not (len(current_frame) > 0 and len(next_frame) > 0):
                 continue
             current_signatures = list(set([tuple(atom) for atom in current_frame]))
-            next_signatures = list(set([tuple(atom) for atom in next_frame]))            
+            next_signatures = list(set([tuple(atom) for atom in next_frame]))
             for body in current_signatures:
                 for head in next_signatures:
                     if body[-1] != head[-1]:
-                        clause = Clause(head[0], [body[0]], [1])
-                        if clause not in seen_clauses:
-                            seen_clauses.add(clause)
-                            anchor_clauses.append(clause)
-    
+                        add(Clause(head[0], [body[0]], [1]))
+    print(f"[Step 03] {len(anchor_clauses)} anchor clauses: {num_self} own-agent (my X -> my Y), "
+          f"{len(anchor_clauses) - num_self} other-agent")
+
     # add self-loop clauses for each unique atom
     for i in range(len(unique_atoms)):
         clause = Clause(i, [i], [0])
@@ -232,15 +270,22 @@ def main(input_data):
         "output_dir": input_data["output_dir"]
     }
     anchor_clause_file = cfg["output_dir"] / "anchor_clauses.json"
-    # Anchors hold atom indices: rebuilt whenever the vocabulary (or the train atoms) is newer.
+    version_file = cfg["output_dir"] / "anchor_clauses_version.txt"
+    # Anchors hold atom indices: rebuilt whenever the vocabulary (or the train atoms) is newer, or they were
+    # built by another ANCHOR_VERSION (step 04 then rebuilds its causal clauses: their file is older).
     stale = anchor_clause_file.exists() and any(
         os.path.getmtime(f) > os.path.getmtime(anchor_clause_file)
         for f in (cfg["unique_atoms_file"], cfg["train_atom_file"]) if os.path.exists(f))
     if stale:
         print(f"[Step 03] {anchor_clause_file} is older than the atoms: rebuilding")
+    old_version = version_file.read_text().strip() if version_file.exists() else "v1"
+    if anchor_clause_file.exists() and old_version != ANCHOR_VERSION:
+        print(f"[Step 03] {anchor_clause_file} is {old_version}, not {ANCHOR_VERSION}: rebuilding")
+        stale = True
     if not anchor_clause_file.exists() or stale:
         # Convert atoms to anchor clauses
         anchor_data = build_anchor_clauses(cfg)
         utils_data.save_json(anchor_data, anchor_clause_file)
+        version_file.write_text(ANCHOR_VERSION)
 
 

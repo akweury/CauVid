@@ -1086,14 +1086,31 @@ def _seeded_rule_net(training_data, cfg):
     """A TemporalRuleNet with one rule node per (anchor body, slot offset), plus
     num_free_rules unseeded ones, on cfg["device"]."""
     anchors = anchor_rules(cfg)
+    per_head = cfg.get("per_head_rules", False)
+    if per_head:
+        # One rule per (anchor body, learned head, slot, copy), plus free rules per learned head.
+        heads = torch.nonzero(training_data["target_heads"]).flatten().tolist()
+        num_rules = TemporalRuleNet.per_head_rule_count(anchors, heads, cfg["num_slots"], cfg["rule_copies"],
+                                                        cfg["free_rules_per_head"])
+    else:
+        num_rules = len(anchors) * cfg["num_slots"] + cfg["num_free_rules"]
     model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
-                            len(anchors) * cfg["num_slots"] + cfg["num_free_rules"], cfg["init_log_alpha"],
+                            num_rules, cfg["init_log_alpha"],
                             cfg["mask_type"], cfg["windows"], roles=cfg["roles"],
                             input_mask=rule_input_mask(training_data, cfg, 2 + len(cfg["roles"])),
                             require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False))
-    num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
-    print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
-          f"{cfg['mask_type']} mask")
+    if per_head:
+        generator = torch.Generator().manual_seed(cfg["seed"])
+        num_seeded = model.seed_rules_per_head(anchors, heads, cfg["rule_copies"], cfg["free_rules_per_head"],
+                                               cfg["seed_head_weight"], cfg["copy_input_share"], generator)
+        print(f"[Model] per-head rules: {num_seeded} seeded ({len(anchors)} anchor bodies x their learned heads x "
+              f"{cfg['num_slots']} slots x {cfg['rule_copies']} copies), {num_rules - num_seeded} free "
+              f"({cfg['free_rules_per_head']} per head, {len(heads)} heads), copies > 0 learn a random "
+              f"{cfg['copy_input_share']:g} of the inputs, {cfg['mask_type']} mask")
+    else:
+        num_seeded = model.seed_rules(anchors, cfg["seed_head_weight"])
+        print(f"[Model] {num_seeded} rules seeded from {len(anchors)} anchor bodies, {cfg['num_free_rules']} free, "
+              f"{cfg['mask_type']} mask")
     return model.to(cfg["device"])
 
 
@@ -1867,6 +1884,15 @@ def get_cfg(input_data):
     l0_lambda = float(input_data["l0_lambda"]) if input_data.get("l0_lambda") is not None else 1e-3
     init_log_alpha = float(input_data["init_log_alpha"]) if input_data.get("init_log_alpha") is not None else -11.0
     train_seed = int(input_data.get("train_seed") or 0)
+    # Per-head rules (`TemporalRuleNet.seed_rules_per_head`, --per_head_rules): every rule serves one head;
+    # rule_copies rules per (anchor body, head, slot), the copies after the first learn a random
+    # copy_input_share of the inputs; free_rules_per_head free rules per learned head (num_free_rules unused).
+    # The MLP keeps its hidden size (the shared-rule count), so its model and file stay the same.
+    per_head_rules = bool(input_data.get("per_head_rules", False))
+    rule_copies = int(input_data.get("rule_copies") or 2)
+    free_rules_per_head = int(input_data.get("free_rules_per_head") if input_data.get("free_rules_per_head")
+                              is not None else 4)
+    copy_input_share = float(input_data.get("copy_input_share") or 0.5)
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if truncate_prob != 0.5:
         base_tag += f"{truncate_prob:g}"
@@ -1902,6 +1928,8 @@ def get_cfg(input_data):
         tag += f"_l0{l0_lambda:g}"
     if init_log_alpha != -11.0:
         tag += f"_ia{init_log_alpha:g}"
+    if per_head_rules:
+        tag += f"_ph{rule_copies}c{free_rules_per_head}f{copy_input_share:g}s"
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
@@ -1951,6 +1979,10 @@ def get_cfg(input_data):
             # so heads without an anchor (about a quarter of the onsets) can be recalled.
             'num_free_rules': num_free_rules,
             'seed_head_weight': 1.0,
+            'per_head_rules': per_head_rules,
+            'rule_copies': rule_copies,
+            'free_rules_per_head': free_rules_per_head,
+            'copy_input_share': copy_input_share,
             # Mask of the rule bodies: "sigmoid" (deterministic, init_log_alpha -11 so
             # every input gets a gradient; its gates learn at gate_lr) or
             # "hard_concrete" (the stochastic L0 mask; use init_log_alpha -6).
@@ -1994,9 +2026,11 @@ def get_cfg(input_data):
             'cascade_min_positives': 20,
             'verifier_pos_weight': 5.0,
             # Black-box baseline: an OnsetMLP on the same inputs and targets, trained after the
-            # rule net; hidden size None = the number of rule nodes (about as many parameters).
+            # rule net; hidden size None = the number of shared-rule nodes (anchor bodies x slots + free rules).
+            # Fixed at 830 since the step 03 v2 anchors (own-agent clauses): about that count with them
+            # (~236 bodies x 3 + 128), and no longer tied to the anchors or to --per_head_rules.
             'mlp_baseline': True,
-            'mlp_hidden_size': None,
+            'mlp_hidden_size': 830,
             'mlp_dropout': 0.2,
             'mlp_weight_decay': 1e-4,
             'mlp_lr': mlp_lr,

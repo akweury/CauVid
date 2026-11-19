@@ -275,6 +275,12 @@ class TemporalRuleNet(torch.nn.Module):
                 raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
         self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None
                              else input_mask.bool().clone(), persistent=False)
+        # Per-head rules (`seed_rules_per_head`): head_mask (A, R) bool, the heads rule r may feed (all by
+        # default); rule_inputs (R, M) bool, the inputs rule r may learn (all by default; the extra copies of
+        # a seed get a random share, so they grow different bodies). Saved with the weights; a model saved
+        # before them loads with the defaults (`_load_from_state_dict`).
+        self.register_buffer("head_mask", torch.ones((num_atoms, num_rules), dtype=torch.bool))
+        self.register_buffer("rule_inputs", torch.ones((num_rules, self.num_inputs), dtype=torch.bool))
         # require_self: every rule must hold an atom of the agent itself (scope 0). Its activation is
         # multiplied by the self gate, the chance that at least one of its own-agent body atoms holds
         # (`forward`): ~1 for a rule with own-agent atoms (they all hold when it fires), ~0 for a rule
@@ -316,6 +322,19 @@ class TemporalRuleNet(torch.nn.Module):
         for i, (lo, hi) in enumerate(self.spans):
             cover[i, lo - 1:hi] = 1.0
         self.register_buffer("span_cover", cover, persistent=False)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        # A model saved before head_mask / rule_inputs: keep the defaults (every head, every input).
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                                      error_msgs)
+        for name in ("head_mask", "rule_inputs"):
+            if prefix + name in missing_keys:
+                missing_keys.remove(prefix + name)
+
+    def head_weights(self):
+        """(A, R) head weights, zero outside head_mask."""
+        return self.head_weight * self.head_mask
 
     def input_index(self, atom, slot, offset, end=None):
         """Input node of (atom, slot type (scope), slots offset..end before the head; end default offset,
@@ -363,6 +382,62 @@ class TemporalRuleNet(torch.nn.Module):
                 self.fixed_inputs[r, self.input_index(atom, min(slot, 1), j)] = True
                 self.head_weight[:, r] = 0.0
                 self.head_weight[list(heads), r] = head_weight
+        return num_seeded
+
+    @staticmethod
+    def per_head_rule_count(anchors, heads, num_slots, copies, free_per_head):
+        """Number of rule nodes of `seed_rules_per_head`."""
+        heads = set(heads)
+        seeded = sum(len(heads.intersection(anchor_heads)) for _body, anchor_heads in anchors)
+        return seeded * num_slots * copies + len(heads) * free_per_head
+
+    @torch.no_grad()
+    def seed_rules_per_head(self, anchors, heads, copies=2, free_per_head=4, head_weight=1.0, input_share=0.5,
+                            generator=None):
+        """Seed rules that each serve one head, instead of one rule per anchor body shared by its heads
+        (`seed_rules`): a body shared by several heads cannot grow the different extra atoms each head
+        needs, and one rule per (body, head) cannot grow several explanations of the head.
+
+        anchors: [((atom, slot), [head atom])] as `seed_rules`; heads: the learned heads (others are
+        skipped). For every anchor body, head h of it in heads, slot offset j = 1..num_slots and copy
+        c = 0..copies-1: one rule with the body j slots before the head as a fixed input, feeding only h
+        (head_mask), head weight head_weight / copies (the copies together start as one seeded rule).
+        Then free_per_head unseeded rules per head in heads (head weight ~0.01). Symmetry: copy 0 (of a
+        seed, and the first free rule of a head) may learn every input; the others only a random share
+        input_share of them (rule_inputs), so the copies cannot all grow the same body (with the sign-like
+        Adam steps of the gates, a small random init alone does not split identical rules).
+        Returns the number of seeded rules (the first ones; the free rules follow).
+        """
+        J, R, M = self.num_slots, self.log_alpha.shape[0], self.num_inputs
+        heads = [int(h) for h in heads]
+        head_set = set(heads)
+        rule_head, rule_fixed, rule_copy = [], [], []
+        for (atom, slot), anchor_heads in anchors:
+            for h in sorted(head_set.intersection(int(x) for x in anchor_heads)):
+                for j in range(1, J + 1):
+                    m = self.input_index(atom, min(slot, 1), j)
+                    for c in range(copies):
+                        rule_head.append(h), rule_fixed.append(m), rule_copy.append(c)
+        num_seeded = len(rule_head)
+        for h in heads:
+            for c in range(free_per_head):
+                rule_head.append(h), rule_fixed.append(-1), rule_copy.append(c)
+        if len(rule_head) != R:
+            raise ValueError(f"{len(rule_head)} per-head rules do not match the {R} rule nodes "
+                             f"(`per_head_rule_count`).")
+        r = torch.arange(R)
+        h = torch.tensor(rule_head, dtype=torch.long)
+        fixed = torch.tensor(rule_fixed, dtype=torch.long)
+        copy = torch.tensor(rule_copy, dtype=torch.long)
+        self.head_mask.zero_()
+        self.head_mask[h, r] = True
+        self.head_weight.zero_()
+        seeded = fixed >= 0
+        self.head_weight[h[seeded], r[seeded]] = head_weight / copies
+        self.head_weight[h[~seeded], r[~seeded]] = 0.01 * torch.randn(int((~seeded).sum()), generator=generator)
+        self.fixed_inputs[r[seeded], fixed[seeded]] = True
+        sub = copy > 0
+        self.rule_inputs[sub] = torch.rand((int(sub.sum()), M), generator=generator) < input_share
         return num_seeded
 
     # -------- inputs and targets of one video ----------------------------------
@@ -503,7 +578,7 @@ class TemporalRuleNet(torch.nn.Module):
             mask = torch.sigmoid(self.log_alpha)
         else:
             mask = self.hard_concrete_mask(self.log_alpha, training=self.training)
-        return (mask * self.input_mask).masked_fill(self.fixed_inputs, 1.0)
+        return (mask * (self.input_mask & self.rule_inputs)).masked_fill(self.fixed_inputs, 1.0)
 
     def forward(self, inputs):
         """Hazard logits (B, W, A) of the future slots and the rule activations
@@ -527,6 +602,7 @@ class TemporalRuleNet(torch.nn.Module):
             log_self_unknown = torch.log1p(-mask_self * torch.sigmoid(self.unknown_logit))
             true = torch.cat([x * k, x.new_zeros((B, 1))], dim=1)
         hazards, rules_now, all_unknown = [], None, None
+        head_weight = self.head_weights()
         for f in range(len(self.windows)):
             if f < self.num_slots:
                 index = self.shift_index[f]
@@ -549,7 +625,7 @@ class TemporalRuleNet(torch.nn.Module):
                 rules = all_unknown
             if f == 0:
                 rules_now = rules
-            hazards.append(rules @ self.head_weight.T + self.head_bias[f])
+            hazards.append(rules @ head_weight.T + self.head_bias[f])
         return torch.stack(hazards, dim=1), rules_now
 
     @staticmethod
@@ -578,8 +654,9 @@ class TemporalRuleNet(torch.nn.Module):
         """Expected number of active inputs per rule (L0 of the hard-concrete mask;
         L1 of the sigmoid mask), the fixed inputs left out, plus the L1 of the head weights."""
         shift = beta * torch.log(torch.tensor(-gamma / zeta)) if self.mask_type == "hard_concrete" else 0.0
-        l0 = (torch.sigmoid(self.log_alpha - shift) * (~self.fixed_inputs & self.input_mask)).sum(dim=1).mean()
-        return l0 + self.head_weight.abs().sum(dim=1).mean()
+        learnable = ~self.fixed_inputs & self.input_mask & self.rule_inputs
+        l0 = (torch.sigmoid(self.log_alpha - shift) * learnable).sum(dim=1).mean()
+        return l0 + self.head_weights().abs().sum(dim=1).mean()
 
     # -------- use after training ----------------------------------
     @torch.no_grad()
@@ -629,12 +706,13 @@ class TemporalRuleNet(torch.nn.Module):
         not head"; `step05.extract_temporal_clauses` keeps those that hold).
         """
         body = self.rule_mask() > mask_threshold
+        weights = self.head_weights()
         rules = []
         for r in range(body.shape[0]):
             inputs = torch.nonzero(body[r]).flatten().tolist()
             if not inputs:
                 continue
-            w = self.head_weight[:, r]
+            w = weights[:, r]
             heads = torch.nonzero(w < -weight_threshold if negative else w > weight_threshold).flatten().tolist()
             if not heads:
                 continue
@@ -644,7 +722,7 @@ class TemporalRuleNet(torch.nn.Module):
             rules.append({"rule": r, "bodies": [self.decode_input(m) for m in inputs],
                           "spans": [self.decode_span(m) for m in inputs],
                           "span_frames": [self.span_frames(m) for m in inputs],
-                          "heads": [(h, self.head_weight[h, r].item()) for h in heads]})
+                          "heads": [(h, w[h].item()) for h in heads]})
         return rules
 
 

@@ -75,6 +75,15 @@ def get_parser():
     parser.add_argument("--train_subset_seed", type=int, default=0, help="Seed of the --train_fraction subset")
     parser.add_argument("--num_free_rules", type=int, default=None,
                         help="Step 05: unseeded rules (default 128; with --anchor_source none 128 + the causal seeds)")
+    parser.add_argument("--per_head_rules", type=str, default="False",
+                        help="Step 05: every rule serves one head (rule_copies per anchor body, head and slot, "
+                             "free_rules_per_head free rules per learned head), default False")
+    parser.add_argument("--rule_copies", type=int, default=2,
+                        help="Step 05 (--per_head_rules): rules per (anchor body, head, slot), default 2")
+    parser.add_argument("--free_rules_per_head", type=int, default=4,
+                        help="Step 05 (--per_head_rules): free rules per learned head, default 4")
+    parser.add_argument("--copy_input_share", type=float, default=0.5,
+                        help="Step 05 (--per_head_rules): share of the inputs the extra copies may learn, default 0.5")
     parser.add_argument("--rule_lr", type=float, default=None,
                         help="Step 05: lr of the rule net's head weights / biases (default 0.01; the gates keep gate_lr)")
     parser.add_argument("--l0_lambda", type=float, default=None,
