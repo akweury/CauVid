@@ -9,8 +9,8 @@ ego enters each junction (where a turn would start within the window):
   free_right / free_other   no R4: the ego does / does not turn right there (excluding a right turn that
             comes is a violation);
   exit      the edges after the last junction: AV-TurRht and AV-TurLft impossible.
-Excluded: score <= the exclusion threshold step 07 chose on val (group ego_nontrivial, else nontrivial, at
-the headline violation budget). Also the mean score and the AUC forced vs free_right (does the score drop
+Excluded: score <= the head's exclusion threshold step 07 chose on val (paper_v5: per head, the excluded
+cells' onset rate <= the headline rho x the head's base rate). Also the mean score and the AUC forced vs free_right (does the score drop
 after a right turn?). Cuts of a long dataset (`run.py --cut_from`) are mapped to their long video: the R4
 status comes from the full route, also when the right turn lies before the cut (the short model cannot
 know it then: cause_in_clip).
@@ -40,16 +40,24 @@ def junction_entries(world):
     return out
 
 
-def thresholds(metrics, budget):
-    ex = metrics.get("exclusion", {}).get("scorers", {})
+def thresholds(metrics):
+    """(rho, {scorer: {head: exclusion threshold}}) of step 07 (paper_v5: per head, chosen on val at the
+    headline rho = the excluded cells' onset rate relative to the head's base rate); heads without a cut
+    (too few onsets, or nothing excludable) are missing."""
+    ex = metrics.get("exclusion", {})
+    rho = str(ex.get("settings", {}).get("headline", 0.1))
     out = {}
-    for nm, groups in ex.items():
-        for g in ("ego_nontrivial", "nontrivial"):
-            x = groups.get(g, {}).get(str(budget))
-            if x and x.get("threshold") is not None:
-                out[nm] = x["threshold"]
-                break
-    return out
+    for nm, per in ex.get("scorers", {}).items():
+        out[nm] = {h: x[rho]["threshold"] for h, x in per.get("per_head", {}).items()
+                   if x.get(rho, {}).get("threshold") is not None}
+    return rho, out
+
+
+def excluded_share(xs, th):
+    """Share of the scores at or below th (None without a threshold: the head is never excluded)."""
+    if not xs:
+        return None
+    return 0.0 if th is None else sum(x <= th for x in xs) / len(xs)
 
 
 def auc(pos, neg):
@@ -65,8 +73,7 @@ def evaluate(run_dir, dataset):
     out_dir = run_dir / "step06_output"
     ego = torch.load(out_dir / "ego_scores.pt", map_location="cpu")
     metrics = json.loads((out_dir / "paper_metrics.json").read_text())
-    budget = metrics.get("exclusion", {}).get("settings", {}).get("headline", 0.01)
-    th = thresholds(metrics, budget)
+    budget, th = thresholds(metrics)
     split = dataset / "meta" / "video_split.json"
     parent_name = json.loads(split.read_text()).get("from") if split.exists() else None
     long_ds = dataset.parent / parent_name if parent_name else dataset
@@ -124,7 +131,7 @@ def evaluate(run_dir, dataset):
     for (cat, head), per in sorted(scores.items()):
         row = {"head": heads[head], "frames": len(next(iter(per.values()), []))}
         for nm, xs in per.items():
-            ex = sum(x <= th[nm] for x in xs) / len(xs) if nm in th and xs else None
+            ex = excluded_share(xs, th.get(nm, {}).get(heads[head]))
             row[nm] = {"mean_score": round(sum(xs) / len(xs), 4) if xs else None,
                        "excluded": round(ex, 3) if ex is not None else None}
         report["categories"][f"{cat}:{heads[head]}"] = row
@@ -136,7 +143,7 @@ def evaluate(run_dir, dataset):
 
 
 def print_report(r):
-    print(f"[Oracle turns] exclusion at violation budget {r['budget']} (thresholds from val): share of frames "
+    print(f"[Oracle turns] exclusion at rho {r['budget']} x the base rate (per-head thresholds from val): share of frames "
           f"excluded (mean score)")
     for cat, row in r["categories"].items():
         cells = "  ".join(f"{nm} {x['excluded']} ({x['mean_score']})" for nm, x in row.items()

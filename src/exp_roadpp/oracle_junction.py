@@ -14,8 +14,8 @@ before t, world index t - 2 is the last one) and ego head, the frames fall into 
                        the route's turn (from the arm angles): straight -> no turn label can start
                        (impossible, but the route is hidden; a lane change at most hints at it); the head
                        of the route's own turn comes (free).
-Per category and scorer: the share of frames excluded (score <= the exclusion threshold step 07 chose on
-val, group ego_nontrivial, else nontrivial, headline budget), the mean score, and the oracle's own
+Per category and scorer: the share of frames excluded (score <= the head's exclusion threshold step 07
+chose on val: the excluded cells' onset rate <= the headline rho x the head's base rate), the mean score, and the oracle's own
 violations (frames where the head did start: should be 0 for red_hold / exit; for approach_straight it
 shows bends the turn labels count as turns). AUCs: does the score drop where the head is impossible
 (stopped_go vs red_hold for AV-Mov; approach_right vs approach_straight for AV-TurRht, left likewise)?
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import torch
 
-from src.exp_roadpp.oracle_turns import SCORERS, auc, thresholds
+from src.exp_roadpp.oracle_turns import SCORERS, auc, excluded_share, thresholds
 
 STOP_ON = 0.3          # m/s, as synth/sumo/labels.py (Stop below it)
 FIRST_M = 5.0          # m to the stop line: first in the queue (the next car waits ~7.5 m back)
@@ -59,8 +59,7 @@ def evaluate(run_dir, dataset):
     out_dir = run_dir / "step06_output"
     ego = torch.load(out_dir / "ego_scores.pt", map_location="cpu")
     metrics = json.loads((out_dir / "paper_metrics.json").read_text())
-    budget = metrics.get("exclusion", {}).get("settings", {}).get("headline", 0.01)
-    th = thresholds(metrics, budget)
+    budget, th = thresholds(metrics)
     index = json.loads((dataset / "meta" / "maps.json").read_text())
     maps, video_map = index["maps"], index.get("videos", {})
     heads, W = ego["heads"], ego["window"]
@@ -126,7 +125,7 @@ def evaluate(run_dir, dataset):
         row = {"frames": len(next(iter(per.values()), [])),
                "oracle_violation": round(started / n, 4) if n else None}
         for nm, xs in per.items():
-            ex = sum(x <= th[nm] for x in xs) / len(xs) if nm in th and xs else None
+            ex = excluded_share(xs, th.get(nm, {}).get(head))
             row[nm] = {"mean_score": round(sum(xs) / len(xs), 4) if xs else None,
                        "excluded": round(ex, 3) if ex is not None else None}
         report["categories"][f"{cat}:{head}"] = row
@@ -145,8 +144,8 @@ def evaluate(run_dir, dataset):
 
 
 def print_report(r):
-    print(f"[Oracle junction] W {r['window']} frames, exclusion at violation budget {r['budget']} (thresholds "
-          f"from val); routes {r['routes']}. Per category: frames, the oracle's own violations (should be 0 "
+    print(f"[Oracle junction] W {r['window']} frames, exclusion at rho {r['budget']} x the base rate (per-head "
+          f"thresholds from val); routes {r['routes']}. Per category: frames, the oracle's own violations (should be 0 "
           f"where impossible), share excluded (mean score) per scorer")
     for cat, row in r["categories"].items():
         cells = "  ".join(f"{nm} {x['excluded']} ({x['mean_score']})" for nm, x in row.items()

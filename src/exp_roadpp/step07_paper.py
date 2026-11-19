@@ -33,8 +33,9 @@ from tqdm import tqdm
 
 from src.exp_roadpp import step05, step06, step06_episodes, utils_data
 
-VERSION = "paper_v5"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
-                                  # v5: ego_scores.pt also holds the window targets (oracle checks)
+VERSION = "paper_v6"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
+                                  # v5: ego_scores.pt also holds the window targets (oracle checks);
+                                  # v6: exclusion per head, relative to its base rate
 VAL_MIN_RATIO = 0.9             # val videos >= 0.9 x test videos (thresholds are chosen on val)
 PAPER = {
     "budgets": [1, 2, 5, 10, 20],               # false alarms per minute (all agents and counted heads)
@@ -45,11 +46,14 @@ PAPER = {
     "calibrated": ("model", "mlp", "lookup"),
 }
 NB = 2001                                       # score bins of logit(p) in [-14, 14] (AP histograms)
-# Exclusion: a score at or below a cut says "this head will not start within the window". The cut of each
-# violation budget (the share of excluded cells where the head starts anyway) is chosen on val, as the alarm
-# thresholds; coverage = the share of the candidate cells excluded. Non-trivial heads: base rate (the prior
-# scorer) >= prior_min within the window (ruling out what hardly ever happens is no feat).
-EXCLUSION = {"budgets": [0.005, 0.01, 0.02], "headline": 0.01, "prior_min": 0.05}
+# Exclusion: a score at or below a cut says "this head will not start within the window". Per head, the cut is
+# chosen on val so that the onset rate of the excluded cells is at most rho x the head's base rate (relative:
+# an absolute violation budget above a head's base rate lets "exclude everything" pass; run ad9e0b on
+# sumo_maps_v7: every head's cell base rate < 5%, all heads pooled 0.3%, so prior covered 100% at 0.5%). Coverage =
+# the share of the head's candidate cells excluded. Heads with fewer than min_onsets val or test onsets are
+# left out (the cut and the rate need them). edge_share: the top share of the excluded cells (by score) whose
+# suppression shows whether the cut is near its budget at the edge.
+EXCLUSION = {"suppression": [0.05, 0.1, 0.2], "headline": 0.1, "min_onsets": 20, "edge_share": 0.1}
 EGO_SCORERS = ("model_cal", "mlp_cal", "lookup_cal", "model", "mlp", "lookup", "prior")
 
 
@@ -237,51 +241,85 @@ def _bin_p(k):
     return float(torch.sigmoid(torch.tensor(z)))
 
 
+def _head_exclusion(vh, th, rho, edge_share):
+    """One head: the cut chosen on val (vh (2, NB)) where the excluded cells' onset rate is at most rho x
+    the head's val base rate, and on test (th): coverage, excluded, violations, expected (the violations
+    at the test base rate), suppression = violations / expected, and the same for the edge, the
+    edge_share of the excluded cells with the highest scores (is the cut near its budget there?)."""
+    base_v = float(vh[1].sum()) / max(float(vh.sum()), 1.0)
+    k = _cut(vh, rho * base_v)
+    cells_t, base_t = float(th.sum()), float(th[1].sum()) / max(float(th.sum()), 1.0)
+    row = {"cut_bin": k, "threshold": _bin_p(k) if k >= 0 else None, "base_val": base_v, "base_test": base_t,
+           "cells": cells_t, "excluded": 0.0, "violations": 0.0, "edge_cells": 0.0, "edge_violations": 0.0}
+    if k >= 0:
+        per_bin = th[:, :k + 1].sum(0).double()
+        row["excluded"], row["violations"] = float(per_bin.sum()), float(th[1, :k + 1].sum())
+        if row["excluded"] > 0:
+            top = torch.flip(per_bin, [0]).cumsum(0)                 # cells in the bins j..k, from k down
+            j = k - int(torch.nonzero(top >= edge_share * row["excluded"])[0])
+            row["edge_cells"], row["edge_violations"] = float(per_bin[j:].sum()), float(th[1, j:k + 1].sum())
+    row["coverage"] = row["excluded"] / cells_t if cells_t else None
+    row["expected"] = row["excluded"] * base_t
+    row["suppression"] = row["violations"] / row["expected"] if row["expected"] else None
+    row["edge_suppression"] = (row["edge_violations"] / (row["edge_cells"] * base_t)
+                               if row["edge_cells"] and base_t else None)
+    return row
+
+
 def exclusion_report(val_hist, test_hist, groups, label_names):
-    """Exclusion per scorer, head group and violation budget: the cut chosen on val, and on test the
-    excluded cells, violations, violation rate, coverage (excluded / candidates) and the share of the cells
-    where the head does not start that are excluded; per non-trivial head at the headline budget."""
+    """Exclusion ("this head will not start within the window") per head, relative to its base rate: per
+    scorer, head and rho, the cut on val keeps the onset rate of the excluded cells at most rho x the
+    head's base rate (`_head_exclusion`), so excluding everything (or a constant score, the prior) covers
+    nothing, whatever the base rate. Per head group (eligible heads only): the mean coverage over the
+    heads (macro), the pooled coverage, and the pooled test suppression (sum of violations / sum expected)
+    with that of the edge cells."""
     out = {}
     for nm in test_hist:
-        out[nm] = {}
+        per_head = {}
+        for i, name in enumerate(label_names):
+            if bool(groups["eligible"][i]):
+                per_head[name] = {str(r): _head_exclusion(val_hist[nm][i], test_hist[nm][i], r,
+                                                          EXCLUSION["edge_share"])
+                                  for r in EXCLUSION["suppression"]}
+        out[nm] = {"per_head": per_head}
         for g, mask in groups.items():
-            if not bool(mask.any()):
+            names = [label_names[i] for i in torch.nonzero(mask).flatten().tolist() if label_names[i] in per_head]
+            if not names:
                 continue
-            vh, th = val_hist[nm][mask].sum(0), test_hist[nm][mask].sum(0)
-            total, negatives = float(th.sum()), float(th[0].sum())
-            row = {"candidates": total}
-            for b in EXCLUSION["budgets"]:
-                k = _cut(vh, b)
-                ex = float(th[:, :k + 1].sum()) if k >= 0 else 0.0
-                viol = float(th[1, :k + 1].sum()) if k >= 0 else 0.0
-                row[str(b)] = {"cut_bin": k, "threshold": _bin_p(k) if k >= 0 else None, "excluded": ex,
-                               "violations": viol, "violation_rate": viol / ex if ex else None,
-                               "coverage": ex / total if total else None,
-                               "non_occurrence_recall": (ex - viol) / negatives if negatives else None}
-            out[nm][g] = row
-        k = _cut(val_hist[nm][groups["nontrivial"]].sum(0), EXCLUSION["headline"]) if bool(groups["nontrivial"].any()) else -1
-        per = {}
-        for i in torch.nonzero(groups["nontrivial"]).flatten().tolist():
-            th = test_hist[nm][i]
-            ex = float(th[:, :k + 1].sum()) if k >= 0 else 0.0
-            per[label_names[i]] = {"coverage": ex / float(th.sum()) if float(th.sum()) else None,
-                                   "violation_rate": float(th[1, :k + 1].sum()) / ex if ex else None}
-        out[nm]["per_head_nontrivial"] = per
+            out[nm][g] = {}
+            for r in map(str, EXCLUSION["suppression"]):
+                rows = [per_head[n][r] for n in names]
+
+                def total(key):
+                    return sum(x[key] for x in rows)
+
+                out[nm][g][r] = {
+                    "heads": len(rows),
+                    "macro_coverage": sum(x["coverage"] or 0.0 for x in rows) / len(rows),
+                    "pooled_coverage": total("excluded") / total("cells") if total("cells") else None,
+                    "suppression": total("violations") / total("expected") if total("expected") else None,
+                    "edge_suppression": (total("edge_violations") / sum(x["edge_cells"] * x["base_test"] for x in rows)
+                                         if sum(x["edge_cells"] * x["base_test"] for x in rows) else None)}
     return out
 
 
 def print_exclusion(report, scorers=("model_cal", "mlp_cal", "lookup_cal", "prior")):
-    print(f"[Exclusion] coverage of the candidate cells at a violation budget (cut on val; test violation rate)")
-    for g in ("nontrivial", "ego_nontrivial", "all"):
-        for b in EXCLUSION["budgets"]:
+    print(f"[Exclusion] per head, cut on val: onset rate of the excluded cells <= rho x the head's base rate "
+          f"(heads with >= {EXCLUSION['min_onsets']} val and test onsets). Per scorer: macro / pooled coverage "
+          f"(test suppression = violations / expected at the base rate, edge: the top {EXCLUSION['edge_share']:g} "
+          f"of the excluded cells; both should stay <= rho)")
+    for g in ("eligible", "ego"):
+        for r in map(str, EXCLUSION["suppression"]):
             cells = []
             for nm in scorers:
-                x = report.get(nm, {}).get(g, {}).get(str(b))
+                x = report.get(nm, {}).get(g, {}).get(r)
                 if x:
-                    vr = "-" if x["violation_rate"] is None else f"{x['violation_rate']:.4f}"
-                    cells.append(f"{nm} {x['coverage']:.3f} ({vr})")
+                    sup = "-" if x["suppression"] is None else f"{x['suppression']:.2f}"
+                    edge = "-" if x["edge_suppression"] is None else f"{x['edge_suppression']:.2f}"
+                    cells.append(f"{nm} {x['macro_coverage']:.3f}/{x['pooled_coverage']:.3f} ({sup}, {edge})")
             if cells:
-                print(f"  {g:15s} {b:<6g} " + "  ".join(cells))
+                n = next(iter(report.values())).get(g, {}).get(r, {}).get("heads", 0)
+                print(f"  {g:8s} {n:3d} heads  rho {r:5s} " + "  ".join(cells))
 
 
 def _curve_json(curve):
@@ -439,12 +477,12 @@ def main(input_data):
                         for b, th in chosen[nm].items()}}
         out["videos"][nm] = {str(b): per_video[nm][b] for b in per_video[nm]}
     # Exclusion: "this head will not start within the window", at violation budgets (cuts on val).
-    k = model.windows.index(cfg["window"])
-    prior = baselines["prior"][k, heads.cpu()].float()
-    nontrivial = prior >= EXCLUSION["prior_min"]
-    groups = {"all": torch.ones(len(heads), dtype=torch.bool), "nontrivial": nontrivial,
-              "ego_nontrivial": nontrivial & is_ego}
-    out["exclusion"] = {"settings": EXCLUSION, "nontrivial_heads": [label_names[i] for i in torch.nonzero(nontrivial).flatten().tolist()],
+    any_nm = next(iter(hist))
+    eligible = ((val_hist[any_nm][:, 1].sum(1) >= EXCLUSION["min_onsets"])
+                & (hist[any_nm][:, 1].sum(1) >= EXCLUSION["min_onsets"]))
+    groups = {"eligible": eligible, "ego": eligible & is_ego.cpu()}
+    out["exclusion"] = {"settings": EXCLUSION,
+                        "eligible_heads": [label_names[i] for i in torch.nonzero(eligible).flatten().tolist()],
                         "scorers": exclusion_report(val_hist, hist, groups, label_names)}
     torch.save({"heads": [n for n, e in zip(label_names, is_ego.tolist()) if e], "frame_rate": fps,
                 "window": cfg["window"], "min_context": min_context, "videos": ego_scores}, out_dir / "ego_scores.pt")
