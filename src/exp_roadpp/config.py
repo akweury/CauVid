@@ -402,6 +402,7 @@ def get_step_05_input(args):
         "negation": str(getattr(args, "negation", "True")) == "True",
         "literal_groups": str(getattr(args, "literal_groups", "True")) == "True",
         "clause_slots": int(getattr(args, "clause_slots", 2)),
+        "videos_per_batch": getattr(args, "videos_per_batch", None),
         "mine_min_lift": getattr(args, "mine_min_lift", None),
         "mine_max_rules": getattr(args, "mine_max_rules", None),
         "mine_roots": getattr(args, "mine_roots", None),

@@ -71,9 +71,10 @@ def collect(model, training_data, video_ids, head_mask, possible, cfg, desc):
     device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
     A = model.num_atoms
     elig, pos = torch.zeros(A, device=device), torch.zeros(A, device=device)
+    chunk = int(cfg.get("mine_chunk", 256))         # frames per row batch (larger: fewer, bigger GPU calls)
     for video_id in tqdm(video_ids, desc=f"{desc}: counting"):
         can = possible(video_id)
-        for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
+        for frames in training_data["frames"][video_id].split(chunk):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
             if len(rows["inputs"]) == 0:
                 continue
@@ -86,7 +87,7 @@ def collect(model, training_data, video_ids, head_mask, possible, cfg, desc):
     packed, parts, offset = [], {k: [] for k in ("head", "row", "y", "weight", "video", "event")}, 0
     for vi, video_id in enumerate(tqdm(video_ids, desc=f"{desc}: sampling")):
         can = possible(video_id)
-        for frames in training_data["frames"][video_id].split(cfg["frames_per_video"]):
+        for frames in training_data["frames"][video_id].split(chunk):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
             if len(rows["inputs"]) == 0:
                 continue

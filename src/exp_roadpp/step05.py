@@ -1969,6 +1969,7 @@ def get_cfg(input_data):
     free_rules_per_head = int(input_data.get("free_rules_per_head") if input_data.get("free_rules_per_head")
                               is not None else 4)
     copy_input_share = float(input_data.get("copy_input_share") or 0.5)
+    videos_per_batch = int(input_data.get("videos_per_batch") or 4)        # --videos_per_batch (default 4)
     base_tag = f"slots{slot_size}x{num_slots}_w{len(windows)}_{mask_type}_f{num_free_rules}_partial"
     if truncate_prob != 0.5:
         base_tag += f"{truncate_prob:g}"
@@ -2014,10 +2015,14 @@ def get_cfg(input_data):
         tag += "_grp"
     if clause_slots != 1:
         tag += f"_cs{clause_slots}"
+    if videos_per_batch != 4:
+        tag += f"_vb{videos_per_batch}"
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
     mlp_tag = f"{base_tag}_lr{mlp_lr:g}_{mlp_activation}" + ("_older" if slot_ranges else "")
+    if videos_per_batch != 4:
+        mlp_tag += f"_vb{videos_per_batch}"
     return {
             'device': input_data['device'],
             'seed': train_seed,
@@ -2100,7 +2105,9 @@ def get_cfg(input_data):
             'train_subset_seed': train_subset_seed,
             'epoch_repeat': epoch_repeat,
             'lr': rule_lr,
-            'videos_per_batch': 4,
+            # Chunks of frames_per_video target frames per gradient step (default 4; larger: better GPU use, fewer
+            # and larger steps per epoch, a different optimisation: compare before changing the default).
+            'videos_per_batch': videos_per_batch,
             'frames_per_video': 32,
             # ... per frames_per_video_ref frames (`frames_to_sample`): longer videos get more, at the same rate.
             'frames_per_video_ref': 200,

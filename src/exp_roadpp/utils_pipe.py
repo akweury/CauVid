@@ -74,6 +74,9 @@ def get_parser():
                         help="Step 05: negated literals !X (X known absent) in the rule bodies, default True")
     parser.add_argument("--literal_groups", type=str, default="True",
                         help="Step 05: group literals 'any motor vehicle X' in the rule bodies, default True")
+    parser.add_argument("--videos_per_batch", type=int, default=None,
+                        help="Step 05: video chunks per gradient step of the rule net and the MLP (default 4; e.g. 16 "
+                             "for better GPU use, a different optimisation)")
     parser.add_argument("--clause_slots", type=int, default=2,
                         help="Step 05: a clause hits its head if it switches on within this many slots (default 2 = 2 s)")
     parser.add_argument("--mine_min_lift", type=float, default=None,
