@@ -123,14 +123,16 @@ def event_context(dataset, vid, onset, maps):
     the injected rules the ego executed within 2 s before .. 0.5 s after (`meta/firings`)."""
     labels, data, world, firings = sumo_render._video(dataset, vid)
     res = json.loads((dataset / "meta" / "results" / f"{vid}.json").read_text())
-    spec = maps["maps"].get(res.get("map") or maps.get("videos", {}).get(vid))
+    entry = maps["maps"].get(res.get("map") or maps.get("videos", {}).get(vid)) or {}
+    spec = entry.get("spec", entry)                               # maps.json: {map id: {name, net, spec}}
     k = int(CONTEXT_S * 10)
     w_on = min(max(onset - 1, 0), len(world) - 1)                 # world index of the onset frame
     w_before = max(w_on - 10, 0)                                  # 1 s before
     e = world[w_before]["veh"].get("ego")
     if e is None:
         return None
-    turn = route_turn(spec, res["ego_route"]) if spec and spec.get("layout") != "grid" and res.get("ego_route") else None
+    grid = "grid" in (entry.get("layout"), spec.get("layout")) or "arms" not in spec
+    turn = route_turn(spec, res["ego_route"]) if not grid and res.get("ego_route") else None
     after = bool(res.get("ego_route")) and e["road"] == res["ego_route"][-1]
     tl_names = {i for i, n in enumerate(labels["agent_labels"]) if n in ("TL", "OthTL")}
     shown, shown_veh, shown_ped = set(), set(), set()

@@ -71,8 +71,9 @@ def evaluate(run_dir, dataset):
     routes = defaultdict(int)
     for vid, v in ego["videos"].items():
         res = json.loads((dataset / "meta" / "results" / f"{vid}.json").read_text())
-        spec = maps.get(res.get("map") or video_map.get(vid))
-        if spec is None or spec.get("layout") == "grid":
+        entry = maps.get(res.get("map") or video_map.get(vid))
+        spec = None if entry is None else entry.get("spec", entry)     # maps.json: {map id: {name, net, spec}}
+        if spec is None or "grid" in (entry.get("layout"), spec.get("layout")) or "arms" not in spec:
             continue
         with gzip.open(dataset / "meta" / "world" / f"{vid}.json.gz", "rt") as f:
             world = json.load(f)
