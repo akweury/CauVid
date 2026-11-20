@@ -94,6 +94,7 @@ def collect(model, training_data, video_ids, head, root, possible, groups, cfg, 
     literal values (inputs true, inputs false and known, groups true, groups false and known), y (R,) hit,
     v (R,) video index, e (R,) event id of a hit (-1 otherwise); and the totals of all at-risk rows."""
     device, S = cfg["device"], model.slot_size
+    w = cfg.get("hit_slots", 1)                     # a hit: the head switches on within the next w slots
     index_of = [torch.tensor([model.input_index(a, s, j) for a in atoms], device=device)
                 for atoms, s, j, _p in root]
     group_idx = [torch.tensor(idx, device=device) for _name, idx in groups]
@@ -108,8 +109,8 @@ def collect(model, training_data, video_ids, head, root, possible, groups, cfg, 
                 continue
             x, k = model.split_inputs(rows["inputs"])
             first, at_risk = rows["first"][:, head], rows["at_risk"][:, head]
-            keep = at_risk & can[rows["rows"][:, 1]] & (first >= 0) & rows["known"][:, 0, head]
-            y = keep & (first < S)
+            keep = at_risk & can[rows["rows"][:, 1]] & (first >= 0) & rows["known"][:, w - 1, head]
+            y = keep & (first < w * S)
             total_rows += int(keep.sum())
             total_hits += int(y.sum())
             t, n = rows["rows"].T
@@ -292,6 +293,8 @@ def main():
     parser.add_argument("--min_events", type=int, default=20, help="distinct onsets a literal's branch / rule hits")
     parser.add_argument("--target_prec", type=float, default=None,
                         help="cover: precision a sub-rule must reach (default 2 x the root's train precision)")
+    parser.add_argument("--hit_slots", type=int, default=1,
+                        help="a hit: the head switches on within the next hit_slots slots (1: as the clause counts)")
     parser.add_argument("--max_len", type=int, default=5, help="cover: literals per sub-rule")
     parser.add_argument("--max_rules", type=int, default=200, help="cover: sub-rules")
     parser.add_argument("--min_lift", type=float, default=1.2,
@@ -303,6 +306,7 @@ def main():
     args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
         else args.output_dir / "rule_tree"
     cfg = step05.get_cfg(config.get_step_05_input(args))
+    cfg["hit_slots"] = args.hit_slots
     device = cfg["device"]
     training_data = step05.load_training_data(cfg)
     vocab = step05.load_vocabulary(cfg)
@@ -353,6 +357,7 @@ def main():
     share = lambda st, r: prec(st["hits"], r["hits"])
 
     result = {"exp": args.exp, "head": args.head, "root": root_text, "roles": list(cfg["roles"]),
+              "hit_slots": args.hit_slots,
               "min_events": args.min_events, "min_videos": cfg["min_videos"], "num_groups": G,
               "train": {"root": root_train, "total_rows": train["total_rows"], "total_hits": train["total_hits"],
                         "total_events": train["total_events"]},
@@ -461,7 +466,8 @@ def main():
     out_dir = args.output_dir / "rule_tree"
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = re.sub(r"[^A-Za-z0-9]+", "_", root_text).strip("_")[:80]
-    out_file = out_dir / f"{args.head.replace(':', '_')}__{tag}{'_r' + '-'.join(cfg['roles']) if cfg['roles'] else ''}.json"
+    out_file = out_dir / (f"{args.head.replace(':', '_')}__{tag}{'_r' + '-'.join(cfg['roles']) if cfg['roles'] else ''}"
+                          f"{f'_w{args.hit_slots}' if args.hit_slots != 1 else ''}_{args.mode}.json")
     utils_data.save_json(result, out_file)
     print(f"  -> {out_file}")
 
