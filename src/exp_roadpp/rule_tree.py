@@ -21,6 +21,10 @@ Two modes (--mode, default both):
          not yet covered, remove the rows it covers, repeat until none is kept or fewer than --min_events
          events are left. What is left at the end is the residual nothing explains. The coverage curve gives,
          per precision level p, the share of the root hits the sub-rules of train precision >= p cover.
+  list   a rule list of short rules: grow a tree of depth <= --list_depth on the rows not yet covered, take
+         the leaf (a path, negated literals included) with the most hits among those of train precision
+         >= --min_prec (default 1.5 x the root's), remove its rows and repeat: rule k is searched in
+         "root & not r1 & ... & not r(k-1)", the earlier rules negated as a whole.
 
 Report: per leaf / sub-rule train and val rows, hits, events, precision, share of the root hits; cover: the
 cumulative share of the root hits explained (val); the val AP of scoring the rows by their leaf / sub-rule's
@@ -173,11 +177,12 @@ def supported(s, allowed, cfg, args):
     return allowed & (s["events"] >= args.min_events) & (s["videos"] >= cfg["min_videos"]) & (s["hits"] > 0)
 
 
-def grow(data, idx, depth, allowed, cfg, args, device):
+def grow(data, idx, depth, allowed, cfg, args, device, max_depth=None):
     """Tree mode: a node {stats, split: {feature, yes, no} | None} of the train rows idx (long tensor)."""
+    max_depth = args.max_depth if max_depth is None else max_depth
     node = {**node_stats(data, idx), "split": None}
     n, h = node["rows"], node["hits"]
-    if depth >= args.max_depth or node["events"] < 2 * args.min_events or h == n:
+    if depth >= max_depth or node["events"] < 2 * args.min_events or h == n:
         return node
     F, s = literal_stats(data, idx, device)
     n1, h1 = s["rows"], s["hits"]
@@ -191,8 +196,8 @@ def grow(data, idx, depth, allowed, cfg, args, device):
         return node
     mask = F[:, best].bool().cpu()
     node["split"] = {"feature": best, "gain": float(gain[best]),
-                     "yes": grow(data, idx[mask], depth + 1, allowed, cfg, args, device),
-                     "no": grow(data, idx[~mask], depth + 1, allowed, cfg, args, device)}
+                     "yes": grow(data, idx[mask], depth + 1, allowed, cfg, args, device, max_depth),
+                     "no": grow(data, idx[~mask], depth + 1, allowed, cfg, args, device, max_depth)}
     return node
 
 
@@ -257,6 +262,32 @@ def cover(data, allowed, cfg, args, target, device):
     return rules, node_stats(data, residual)
 
 
+def rule_list(data, allowed, cfg, args, min_prec, device):
+    """List mode: [(path, train stats on the rows it covers in list order)] and the residual stats.
+    Each step grows a tree of depth <= list_depth on the rows not yet covered and takes the leaf (a path of
+    literals, negated ones included) with the most hits among those with >= min_events events and train
+    precision >= min_prec; the rows it covers are removed (the next rule is searched in "root & not r1 &
+    ... & not r_k"). Ends when no leaf qualifies or fewer than min_events events are left."""
+    residual = torch.arange(len(data["y"]))
+    rules = []
+    for _ in tqdm(range(args.max_rules), desc="Rule list"):
+        if node_stats(data, residual)["events"] < args.min_events:
+            break
+        tree = grow(data, residual, 0, allowed, cfg, args, device, max_depth=args.list_depth)
+        best = None
+        for path, node in tree_leaves(tree, []):
+            if not path or node["events"] < args.min_events or node["hits"] / max(node["rows"], 1) < min_prec:
+                continue
+            if best is None or node["hits"] > best[1]["hits"]:
+                best = (path, node)
+        if best is None:
+            break
+        mask = holds_path(data, residual, best[0])
+        rules.append((list(best[0]), node_stats(data, residual[mask])))
+        residual = residual[~mask]
+    return rules, node_stats(data, residual)
+
+
 def average_precision(scores, labels):
     """AP with tied scores grouped (a tie block counts as one threshold)."""
     if labels.sum() == 0:
@@ -287,7 +318,11 @@ def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--head", type=str, default="av:AV-Brake", help="head atom name")
     parser.add_argument("--root", type=str, default=None, help="root body (module doc); default per head")
-    parser.add_argument("--mode", type=str, default="both", choices=("tree", "cover", "both"))
+    parser.add_argument("--mode", type=str, default="both", choices=("tree", "cover", "list", "both"),
+                        help="both: tree and cover; list: the rule list of short rules (module doc)")
+    parser.add_argument("--list_depth", type=int, default=3, help="list: literals per rule (tree depth per step)")
+    parser.add_argument("--min_prec", type=float, default=None,
+                        help="list: train precision a rule must reach (default 1.5 x the root's train precision)")
     parser.add_argument("--max_depth", type=int, default=3, help="tree: depth")
     parser.add_argument("--min_gain", type=float, default=1e-3, help="tree: entropy gain (nats per row) to split")
     parser.add_argument("--min_events", type=int, default=20, help="distinct onsets a literal's branch / rule hits")
@@ -460,6 +495,46 @@ def main():
                   f"{f(c['train_precision']):>7s} | {f(c['val_share']):>8s} {f(c['val_precision']):>7s} "
                   f"{f(c['val_recall_all_onsets']):>22s}")
         ap = result["cover"]["val_ap"]
+        print(f"  val AP within the root: {f(ap['within_root']['root'])} -> {f(ap['within_root']['refined'])}; "
+              f"over all at-risk rows: {f(ap['all_rows']['root'])} -> {f(ap['all_rows']['refined'])}")
+
+    if args.mode == "list":
+        min_prec = args.min_prec if args.min_prec is not None else 1.5 * root_rate
+        rules, residual = rule_list(train, allowed, cfg, args, min_prec, device)
+        out, score = [], torch.zeros(len(val["y"]))
+        left, all_val = torch.arange(len(val["y"])), torch.arange(len(val["y"]))
+        explained_train = explained_val = 0
+        for k, (path, st) in enumerate(rules):
+            m = holds_path(val, left, path)
+            vst = node_stats(val, left[m])
+            alone = node_stats(val, all_val[holds_path(val, all_val, path)])
+            score[left[m]] = st["hits"] / max(st["rows"], 1)
+            left = left[~m]
+            explained_train += st["hits"]
+            explained_val += vst["hits"]
+            out.append({"rule": path_text(path), "given_not": [f"r{i + 1}" for i in range(k)],
+                        "literals": [[a, b] for a, b in path], "train": row(st, root_train),
+                        "val": row(vst, root_val), "val_alone": row(alone, root_val),
+                        "cum_train_share": explained_train / root_train["hits"],
+                        "cum_val_share": explained_val / max(root_val["hits"], 1)})
+        rest_val = node_stats(val, left)
+        score[left] = residual["hits"] / max(residual["rows"], 1)
+        result["list"] = {"min_prec": min_prec, "list_depth": args.list_depth, "rules": out,
+                          "residual": {"train": row(residual, root_train), "val": row(rest_val, root_val)},
+                          "val_ap": ap_report(val, score, root_rate, rest_rate)}
+        print(f"\n  == rule list (rule k is searched in root & not r1 & ... & not r(k-1); <= {args.list_depth} "
+              f"literals, train precision >= {min_prec:.3f}, >= {args.min_events} events) ==")
+        print(f"  {'#':>3s} {'rule body (root & not earlier rules & ...)':70s} {'tr rows':>7s} {'tr hits':>7s} "
+              f"{'tr prec':>7s} | {'va rows':>7s} {'va hits':>7s} {'va prec':>7s} {'cum va':>6s} | {'alone va':>8s}")
+        for k, r in enumerate(out):
+            t, v = r["train"], r["val"]
+            print(f"  r{k + 1:<2d} {r['rule']:70s} {t['rows']:7d} {t['hits']:7d} {f(t['precision']):>7s} | "
+                  f"{v['rows']:7d} {v['hits']:7d} {f(v['precision']):>7s} {f(r['cum_val_share']):>6s} | "
+                  f"{f(r['val_alone']['precision']):>8s}")
+        rt, rv = result["list"]["residual"]["train"], result["list"]["residual"]["val"]
+        print(f"  {'res':3s} {'(not r1 & ... : no rule)':70s} {rt['rows']:7d} {rt['hits']:7d} {f(rt['precision']):>7s} | "
+              f"{rv['rows']:7d} {rv['hits']:7d} {f(rv['precision']):>7s}")
+        ap = result["list"]["val_ap"]
         print(f"  val AP within the root: {f(ap['within_root']['root'])} -> {f(ap['within_root']['refined'])}; "
               f"over all at-risk rows: {f(ap['all_rows']['root'])} -> {f(ap['all_rows']['refined'])}")
 
