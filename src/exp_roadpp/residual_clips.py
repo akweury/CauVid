@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 from src.exp_roadpp import config, step05, utils_data, utils_pipe
 from src.exp_roadpp.cauvid import TemporalRuleNet
+from src.exp_roadpp.oracle_junction import route_turn
 from src.exp_roadpp.rule_tree import parse_root, vehicle_groups
 from src.exp_roadpp.synth.sumo import render as sumo_render
 
@@ -91,6 +92,105 @@ def classify_events(model, training_data, video_ids, head, root, rules, groups, 
     return out
 
 
+NEAR_M = 30.0              # m to the junction (stop line): "near"
+CONTEXT_S = 2.0            # s before the onset the scene is checked over
+DIST_BINS = ((0.0, 15.0), (15.0, 30.0), (30.0, 60.0), (60.0, float("inf")))
+
+
+def junction_distance(e):
+    """m from the ego's front to the end of its lane (the stop line on an incoming edge), 0 inside the
+    junction (an internal lane ":..."); the SUMO lane position is the front."""
+    if e["road"].startswith(":"):
+        return 0.0
+    return max(e["lane_len"] - e["lane_pos"], 0.0)
+
+
+def leader_gap(world_frame, e):
+    """m of free gap to the nearest vehicle ahead on the ego's own lane (lane_pos ahead), None if none."""
+    best = None
+    for vid, v in world_frame["veh"].items():
+        if vid == "ego" or v["lane"] != e["lane"] or v["lane_pos"] <= e["lane_pos"]:
+            continue
+        gap = v["lane_pos"] - v["length"] - e["lane_pos"]
+        best = gap if best is None else min(best, gap)
+    return best
+
+
+def event_context(dataset, vid, onset, maps):
+    """What the simulator knows around an ego onset at (1-based) frame onset: the junction distance, inside /
+    after the junction, the route's turn, a traffic light ahead, the agents the camera shows (GT boxes, not
+    traffic lights) over the CONTEXT_S before, the leader on the ego's lane, the ego's speed 1 s before, and
+    the injected rules the ego executed within 2 s before .. 0.5 s after (`meta/firings`)."""
+    labels, data, world, firings = sumo_render._video(dataset, vid)
+    res = json.loads((dataset / "meta" / "results" / f"{vid}.json").read_text())
+    spec = maps["maps"].get(res.get("map") or maps.get("videos", {}).get(vid))
+    k = int(CONTEXT_S * 10)
+    w_on = min(max(onset - 1, 0), len(world) - 1)                 # world index of the onset frame
+    w_before = max(w_on - 10, 0)                                  # 1 s before
+    e = world[w_before]["veh"].get("ego")
+    if e is None:
+        return None
+    turn = route_turn(spec, res["ego_route"]) if spec and spec.get("layout") != "grid" and res.get("ego_route") else None
+    after = bool(res.get("ego_route")) and e["road"] == res["ego_route"][-1]
+    tl_names = {i for i, n in enumerate(labels["agent_labels"]) if n in ("TL", "OthTL")}
+    shown, shown_veh, shown_ped = set(), set(), set()
+    for frame in range(max(1, onset - k), onset):
+        for a in data["frames"].get(str(frame), {}).get("annos", {}).values():
+            cls = a["agent_ids"][0]
+            if cls in tl_names:
+                continue
+            shown.add(a["tube_uid"])
+            name = labels["agent_labels"][cls]
+            (shown_ped if name == "Ped" else shown_veh).add(a["tube_uid"])
+    tl = any(world[i].get("tl") for i in range(max(0, w_on - k), w_on + 1))
+    rules = sorted({f["rule"] for f in firings if f.get("agent_is_ego") and f.get("executed") and f.get("frame_fire")
+                    and -5 <= onset - f["frame_fire"] <= 20})
+    return {"dist_m": round(junction_distance(e), 1), "inside": e["road"].startswith(":"), "after": after,
+            "turn": turn, "tl": tl, "agents_shown": len(shown), "vehicles_shown": len(shown_veh),
+            "peds_shown": len(shown_ped), "leader_gap_m": leader_gap(world[w_before], e),
+            "speed_1s_before": e["speed"], "rules_fired": rules}
+
+
+def context_summary(events, contexts):
+    """Per event group: counts of the scene categories, incl. "empty junction approach" (near or inside the
+    junction, before leaving it, no agent shown, no traffic light, no leader within NEAR_M, no injected rule)."""
+    out = {}
+    for group in ("explained", "root_only", "no_root", "all"):
+        keys = [k for k, e in events.items() if group == "all" or e["group"] == group]
+        cs = [contexts[k] for k in keys if contexts.get(k) is not None]
+        n = len(cs)
+        if not n:
+            continue
+        near = [c for c in cs if not c["after"] and c["dist_m"] <= NEAR_M]
+        empty = lambda c: c["agents_shown"] == 0
+        no_lead = lambda c: c["leader_gap_m"] is None or c["leader_gap_m"] > NEAR_M
+        row = {"events": n, "with_context": n,
+               "dist_bins": {f"{lo:g}-{hi:g} m": 0 for lo, hi in DIST_BINS},
+               "inside_junction": sum(c["inside"] for c in cs),
+               "after_junction": sum(c["after"] for c in cs),
+               "near_junction": len(near),
+               "no_agent_shown": sum(empty(c) for c in cs),
+               "traffic_light": sum(c["tl"] for c in cs),
+               "rule_fired": sum(bool(c["rules_fired"]) for c in cs),
+               "near_and_no_agent": sum(empty(c) for c in near),
+               "near_no_agent_no_tl": sum(empty(c) and not c["tl"] for c in near),
+               "empty_junction_approach": sum(empty(c) and not c["tl"] and no_lead(c) and not c["rules_fired"]
+                                              for c in near),
+               "turn_of_empty": {}, "leader_within_near_m": sum(not no_lead(c) for c in cs)}
+        for c in cs:
+            if c["after"]:
+                continue
+            for lo, hi in DIST_BINS:
+                if lo <= c["dist_m"] < hi or (hi == float("inf") and c["dist_m"] >= lo):
+                    row["dist_bins"][f"{lo:g}-{hi:g} m"] += 1
+                    break
+        for c in near:
+            if empty(c) and not c["tl"] and no_lead(c) and not c["rules_fired"]:
+                row["turn_of_empty"][str(c["turn"])] = row["turn_of_empty"].get(str(c["turn"]), 0) + 1
+        out[group] = row
+    return out
+
+
 def render_clip(dataset, vid, onset, first_frame, last_frame, out_file, label, fps=10):
     """Frames first_frame..last_frame of vid as an mp4, the title noting the time to the onset."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -114,6 +214,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--before_s", type=float, default=5.0)
     parser.add_argument("--after_s", type=float, default=2.0)
+    parser.add_argument("--no_render", action="store_true", help="only the event counts and the scene statistics")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
@@ -162,6 +263,21 @@ def main():
         print(f"  r{r} holds on a hit row of {per_rule[r]} events: {texts[r - 1]}")
 
     dataset = Path(args.dataset_path)                       # config.machine_setup: the synthetic dataset folder
+    maps = json.loads((dataset / "meta" / "maps.json").read_text())
+    contexts = {k: event_context(dataset, k[0], k[2], maps) for k in tqdm(sorted(events), desc="Scene context")}
+    summary = context_summary(events, contexts)
+    print(f"\n  scene of the ego's onsets ({CONTEXT_S:g} s before; near = <= {NEAR_M:g} m to the stop line or "
+          f"inside the junction, before leaving it; agents = GT boxes shown, traffic lights not counted):")
+    for group, r in summary.items():
+        n = r["events"]
+        pct = lambda x: f"{x} ({x / n:.0%})"
+        print(f"  [{group}] {n} events: near junction {pct(r['near_junction'])} (inside {r['inside_junction']}, "
+              f"after {r['after_junction']}), no agent shown {pct(r['no_agent_shown'])}, traffic light "
+              f"{pct(r['traffic_light'])}, leader <= {NEAR_M:g} m {pct(r['leader_within_near_m'])}, "
+              f"injected rule fired {pct(r['rule_fired'])}")
+        print(f"      near & no agent {pct(r['near_and_no_agent'])}, & no light {pct(r['near_no_agent_no_tl'])}, "
+              f"EMPTY JUNCTION APPROACH (also no leader, no rule) {pct(r['empty_junction_approach'])}, its turns "
+              f"{r['turn_of_empty']}; distance bins {r['dist_bins']}")
     out_dir = args.output_dir / "residual_clips" / args.clip_split
     rng = random.Random(args.seed)
     pick = lambda g, num: rng.sample(sorted(k for k, e in events.items() if e["group"] == g),
@@ -169,6 +285,8 @@ def main():
     chosen = [("root_only", k) for k in pick("root_only", args.num)] + \
              [("explained", k) for k in pick("explained", args.controls)]
     rendered = []
+    if args.no_render:
+        chosen = []
     for group, (vid, agent, onset) in chosen:
         num_frames = len(sumo_render._video(dataset, vid)[1]["frames"])
         lo, hi = max(1, onset - int(args.before_s * 10)), min(num_frames, onset + int(args.after_s * 10))
@@ -180,7 +298,9 @@ def main():
     utils_data.save_json({"exp": args.exp, "split": args.clip_split, "rule_list": str(args.rule_list), "root": rl["root"],
                           "rules": texts, "hit_slots": hit_slots, "counts": dict(counts),
                           "per_rule_events": {f"r{r}": c for r, c in per_rule.items()}, "rendered": rendered,
-                          "events": [{"video": v, "agent": a, "onset_frame": f, **e} for (v, a, f), e in events.items()]},
+                          "scene_summary": summary,
+                          "events": [{"video": v, "agent": a, "onset_frame": f, **e, "scene": contexts.get((v, a, f))}
+                                     for (v, a, f), e in events.items()]},
                          out_dir / "events.json")
     print(f"  -> {out_dir}")
 
