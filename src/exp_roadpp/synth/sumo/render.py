@@ -118,8 +118,8 @@ def _short(labels, ids, kind):
     return [labels[kind][i] for i in ids]
 
 
-def render(dataset, vid, frame, out_file):
-    """One image of frame (1-based) of video vid."""
+def render(dataset, vid, frame, out_file, note=None):
+    """One image of frame (1-based) of video vid; note: an extra line for the title of the top view."""
     labels, data, worlds, firings = _video(dataset, vid)
     world = worlds[frame - 1]
     annos = data["frames"][str(frame)]["annos"]
@@ -165,7 +165,7 @@ def render(dataset, vid, frame, out_file):
     top.set_aspect("equal")
     top.set_xticks([]); top.set_yticks([])
     top.set_title(f"{vid} frame {frame} (t={world['t']:.1f} s)  ego: {av}, {ego['speed']:.1f} m/s"
-                  + (f"\n{map_name}" if map_name else ""), fontsize=10)
+                  + (f"\n{map_name}" if map_name else "") + (f"\n{note}" if note else ""), fontsize=10)
 
     # -------------- camera view (the GT boxes) --------------
     W, H = observe.W_IMG, observe.H_IMG
