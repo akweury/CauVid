@@ -14,7 +14,7 @@ the tensor frame index, used as the 1-based GT frame (as `rule_events`).
 
     ./run_roadpp_docker.sh --gpu 0 --residual_clips -- --exp sumo_maps_v7 --machine dgx-jing --roles ahead \\
         --rule_list <output_dir>/rule_tree/av_AV-Brake__av_AV_Mov_own_1_rahead_w2_list.json
-    options: --split val --num 12 --controls 3 --seed 0 --before_s 5 --after_s 2
+    options: --clip_split val --num 12 --controls 3 --seed 0 --before_s 5 --after_s 2
 Writes <output_dir>/residual_clips/<split>/<group>_<vid>_f<frame>.mp4 and events.json (every event, its group
 and the rules that held).
 """
@@ -107,7 +107,8 @@ def render_clip(dataset, vid, onset, first_frame, last_frame, out_file, label, f
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--rule_list", type=Path, required=True, help="JSON of rule_tree --mode list")
-    parser.add_argument("--split", type=str, default="val", choices=("train", "val"))
+    parser.add_argument("--clip_split", type=str, default="val", choices=("train", "val"),
+                        help="videos to take the events from (--split is the pipeline's data split)")
     parser.add_argument("--num", type=int, default=12, help="root_only events to render")
     parser.add_argument("--controls", type=int, default=3, help="explained events to render for comparison")
     parser.add_argument("--seed", type=int, default=0)
@@ -143,7 +144,7 @@ def main():
     possible = step05.class_possible(training_data, vocab, device)
     hit_slots = int(rl.get("hit_slots", 1))
 
-    events = classify_events(model, training_data, training_data[f"{args.split}_videos"], head, root, rules, groups,
+    events = classify_events(model, training_data, training_data[f"{args.clip_split}_videos"], head, root, rules, groups,
                              possible, cfg, hit_slots)
     counts = defaultdict(int)
     for e in events.values():
@@ -153,7 +154,7 @@ def main():
         for r in e["rules"]:
             per_rule[r] += 1
     total = max(len(events), 1)
-    print(f"\n[residual_clips] {args.exp} {args.split}: {len(events)} {rl['head']} onset events "
+    print(f"\n[residual_clips] {args.exp} {args.clip_split}: {len(events)} {rl['head']} onset events "
           f"(hit within {hit_slots} slot(s)), root {rl['root']}")
     for g in ("explained", "root_only", "no_root"):
         print(f"  {g:10s} {counts[g]:5d} ({counts[g] / total:.0%})")
@@ -161,7 +162,7 @@ def main():
         print(f"  r{r} holds on a hit row of {per_rule[r]} events: {texts[r - 1]}")
 
     dataset = Path(cfg["dataset_label_file"]).parent.parent
-    out_dir = args.output_dir / "residual_clips" / args.split
+    out_dir = args.output_dir / "residual_clips" / args.clip_split
     rng = random.Random(args.seed)
     pick = lambda g, num: rng.sample(sorted(k for k, e in events.items() if e["group"] == g),
                                      min(num, counts[g]))
@@ -176,7 +177,7 @@ def main():
         render_clip(dataset, vid, onset, lo, hi, out_file, rl["head"])
         rendered.append({"group": group, "video": vid, "agent": agent, "onset_frame": onset,
                          "rules": events[(vid, agent, onset)]["rules"], "file": out_file.name})
-    utils_data.save_json({"exp": args.exp, "split": args.split, "rule_list": str(args.rule_list), "root": rl["root"],
+    utils_data.save_json({"exp": args.exp, "split": args.clip_split, "rule_list": str(args.rule_list), "root": rl["root"],
                           "rules": texts, "hit_slots": hit_slots, "counts": dict(counts),
                           "per_rule_events": {f"r{r}": c for r, c in per_rule.items()}, "rendered": rendered,
                           "events": [{"video": v, "agent": a, "onset_frame": f, **e} for (v, a, f), e in events.items()]},
