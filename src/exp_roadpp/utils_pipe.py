@@ -46,8 +46,9 @@ def get_parser():
     parser.add_argument("--motion", type=str, default="False",
                         help="Step 05: motion atoms of the own 2D box (motion.py), default False (off since 2026-11-15: "
                              "no effect on medium or full); True for the ablation or to resume a run trained with them")
-    parser.add_argument("--ego_motion", type=str, default="False",
-                        help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py), default False; True for the ablation")
+    parser.add_argument("--ego_motion", type=str, default="True",
+                        help="Step 05: ego motion atoms read from the scene boxes (ego_motion.py: speed, the lead's size "
+                             "and closing speed, the traffic light), default True (SUMO v7 rule mining 2026-11-20)")
     parser.add_argument("--ego_flow", type=str, default="False",
                         help="Step 05: ego yaw / speed atoms read from the camera image (ego_flow.py), default False")
     parser.add_argument("--slot_ranges", type=str, default="False",
@@ -64,9 +65,23 @@ def get_parser():
     parser.add_argument("--require_self", type=str, default="True",
                         help="Step 05: every rule must hold an own-agent atom (TemporalRuleNet require_self), default True")
     # Ablation settings (`ablation.py` runs the whole suite); the defaults are the main model.
-    parser.add_argument("--anchor_source", type=str, default="causal", choices=["causal", "all", "random", "none"],
-                        help="Step 05: anchor clauses seeding the rules: causal (step 04 filter, default), all (every "
-                             "LLM anchor, no causal filter), random (random LLM anchors, as many as causal), none")
+    parser.add_argument("--anchor_source", type=str, default="mined",
+                        choices=["mined", "causal", "all", "random", "none"],
+                        help="Step 05: what seeds the rules: mined (short rules mined per head from the train data, "
+                             "step05_mine, default), causal (step 04 filter of the LLM anchors), all (every LLM "
+                             "anchor), random (random LLM anchors, as many as causal), none")
+    parser.add_argument("--negation", type=str, default="True",
+                        help="Step 05: negated literals !X (X known absent) in the rule bodies, default True")
+    parser.add_argument("--literal_groups", type=str, default="True",
+                        help="Step 05: group literals 'any motor vehicle X' in the rule bodies, default True")
+    parser.add_argument("--clause_slots", type=int, default=2,
+                        help="Step 05: a clause hits its head if it switches on within this many slots (default 2 = 2 s)")
+    parser.add_argument("--mine_min_lift", type=float, default=None,
+                        help="Step 05 mining: a mined rule's precision >= this x its root's (default 2.0)")
+    parser.add_argument("--mine_max_rules", type=int, default=None, help="Step 05 mining: rules per root (default 8)")
+    parser.add_argument("--mine_roots", type=int, default=None, help="Step 05 mining: roots per head (default 2)")
+    parser.add_argument("--mine_min_events", type=int, default=None,
+                        help="Step 05 mining: onsets a mined rule must hit (default 20)")
     parser.add_argument("--anchor_subset_seed", type=int, default=0, help="Seed of --anchor_source random")
     parser.add_argument("--train_fraction", type=float, default=1.0,
                         help="Step 05: learning curve, train on this share of the train videos (nested subsets; "
@@ -95,7 +110,9 @@ def get_parser():
     parser.add_argument("--truncate_prob", type=float, default=0.5,
                         help="Step 05: share of training frames with a truncated history (partial facts), default 0.5")
     parser.add_argument("--num_slots", type=int, default=3, help="Step 05: memory slots of 10 frames, default 3")
-    parser.add_argument("--roles", type=str, default="", help="Step 05: agent roles, e.g. ahead,near_ped,xing_ped (default none)")
+    parser.add_argument("--roles", type=str, default="ahead",
+                        help="Step 05: agent roles, e.g. ahead,near_ped,xing_ped (default ahead: the lead in the "
+                             "agent's lane; \"\" for none)")
     parser.add_argument("--geometry", type=str, default="False", help="Step 05: geometry atoms, default False")
     parser.add_argument("--type_balance", type=str, default="False", help="Step 05: event type balance, default False")
     parser.add_argument("--review_videos", type=str, default="False",

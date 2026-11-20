@@ -96,7 +96,7 @@ def collect_rows(model, training_data, video_ids, cfg):
                                  roles=step05.video_roles(training_data["videos"][video_id], device))
         if len(rows["inputs"]) == 0:
             continue
-        x, _k = model.split_inputs(rows["inputs"])
+        x = model.literal_values(rows["inputs"])                     # (B, L): the body literals (inputs first)
         t = rows["rows"][:, 0]
         parts["x"].append((x > 0.5).cpu())
         parts["at_risk"].append(rows["at_risk"].cpu())
@@ -211,6 +211,7 @@ def run_tests(model, table, cfg):
         t["kept"] = q <= cfg["fdr"] and t["coef"] > 0
     for t in tests:
         t["atom"], t["slot"], t["offset"] = model.decode_input(t["input"])
+        t["kind"] = model.literal_info(t["input"])["kind"]
     return tests
 
 

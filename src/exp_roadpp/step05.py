@@ -1084,9 +1084,55 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
     return model
 
 
+MOTOR_CLASSES = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike")
+
+
+def literal_groups(training_data, cfg):
+    """[(label, [atom index])] of the group literals (`TemporalRuleNet` groups): every label atom
+    ("Brake", "VehLane", ...) held by >= 2 motor vehicle classes, as "any motor vehicle X"; [] without
+    cfg["literal_groups"]."""
+    if not cfg.get("literal_groups"):
+        return []
+    vocab = load_vocabulary(cfg)
+    num_labels = training_data.get("num_label_atoms", len(vocab))
+    by_label = {}
+    for i, sig in enumerate(vocab[:num_labels]):
+        cls, _, label = _atom_name(sig).partition(":")
+        if cls in MOTOR_CLASSES:
+            by_label.setdefault(label, []).append(i)
+    return [(label, atoms) for label, atoms in sorted(by_label.items()) if len(atoms) >= 2]
+
+
+def build_rule_net(training_data, cfg, num_rules, roles=None, literals=True):
+    """A TemporalRuleNet of cfg (slots, windows, roles, input mask, self gate) with num_rules rule nodes,
+    and with literals the negated / group literals of cfg["negation"] / cfg["literal_groups"]."""
+    roles = tuple(cfg["roles"]) if roles is None else tuple(roles)
+    return TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"], num_rules,
+                           cfg["init_log_alpha"], cfg["mask_type"], cfg["windows"], roles=roles,
+                           input_mask=rule_input_mask(training_data, cfg, 2 + len(roles)),
+                           require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False),
+                           negation=bool(cfg.get("negation")) and literals,
+                           groups=literal_groups(training_data, cfg) if literals else None)
+
+
 def _seeded_rule_net(training_data, cfg):
     """A TemporalRuleNet with one rule node per (anchor body, slot offset), plus
-    num_free_rules unseeded ones, on cfg["device"]."""
+    num_free_rules unseeded ones, on cfg["device"]; with anchor_source "mined" one rule per mined seed
+    (`step05_mine`) plus free_rules_per_head free rules per learned head."""
+    if cfg.get("anchor_source") == "mined":
+        from src.exp_roadpp import step05_mine
+        heads = torch.nonzero(training_data["target_heads"]).flatten().tolist()
+        seeds = step05_mine.load_or_mine(training_data, cfg)
+        num_rules = TemporalRuleNet.mined_rule_count(seeds, heads, cfg["free_rules_per_head"])
+        model = build_rule_net(training_data, cfg, num_rules)
+        generator = torch.Generator().manual_seed(cfg["seed"])
+        num_seeded = model.seed_rules_mined(seeds, heads, cfg["free_rules_per_head"], cfg["seed_head_weight"],
+                                            generator)
+        print(f"[Model] mined rules: {num_seeded} seeded (`step05_mine`), {num_rules - num_seeded} free "
+              f"({cfg['free_rules_per_head']} per head, {len(heads)} heads); {model.num_literals} literals "
+              f"({model.num_inputs} inputs, negation {model.negation}, {model.num_groups} groups), "
+              f"{cfg['mask_type']} mask")
+        return model.to(cfg["device"])
     anchors = anchor_rules(cfg)
     per_head = cfg.get("per_head_rules", False)
     if per_head:
@@ -1096,11 +1142,7 @@ def _seeded_rule_net(training_data, cfg):
                                                         cfg["free_rules_per_head"])
     else:
         num_rules = len(anchors) * cfg["num_slots"] + cfg["num_free_rules"]
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
-                            num_rules, cfg["init_log_alpha"],
-                            cfg["mask_type"], cfg["windows"], roles=cfg["roles"],
-                            input_mask=rule_input_mask(training_data, cfg, 2 + len(cfg["roles"])),
-                            require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False))
+    model = build_rule_net(training_data, cfg, num_rules)
     if per_head:
         generator = torch.Generator().manual_seed(cfg["seed"])
         num_seeded = model.seed_rules_per_head(anchors, heads, cfg["rule_copies"], cfg["free_rules_per_head"],
@@ -1179,11 +1221,12 @@ def load_temporal_rule_net(training_data, cfg, model_file=None):
     saved weights) before its weights, and its seeded anchor inputs, are loaded.
     """
     state = torch.load(model_file or cfg["model_file"], map_location="cpu")
-    roles = _saved_roles(state["log_alpha"].shape[1], training_data["num_atoms"], cfg)
-    model = TemporalRuleNet(training_data["num_atoms"], cfg["slot_size"], cfg["num_slots"],
-                            state["log_alpha"].shape[0], mask_type=cfg["mask_type"], windows=cfg["windows"],
-                            roles=roles, input_mask=rule_input_mask(training_data, cfg, 2 + len(roles)),
-                            require_self=cfg.get("require_self", False), ranges=cfg.get("slot_ranges", False))
+    R, width = state["log_alpha"].shape
+    model = build_rule_net(training_data, cfg, R)
+    if width != model.num_literals:
+        # A model of the inputs only (trained before the negated / group literals), possibly without roles.
+        roles = _saved_roles(width, training_data["num_atoms"], cfg)
+        model = build_rule_net(training_data, cfg, R, roles=roles, literals=False)
     model.load_state_dict(state)
     return model.to(cfg["device"]).eval()
 
@@ -1321,6 +1364,9 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
     J, S = model.num_slots, model.slot_size
     num_rules, num_atoms = model.log_alpha.shape[0], model.num_atoms
     device = cfg["device"]
+    # A hit: the head switches on within clause_slots slots from slot f (2: within 2 s, the reaction lag
+    # of the injected rules; 1: the next slot only).
+    w = int(cfg.get("clause_slots", 1))
     shape = (num_rules, J * num_atoms)
     counts = {name: torch.zeros(shape, device=device)
               for name in ("fires", "hits", "videos", "anchor_fires", "anchor_hits")}
@@ -1332,11 +1378,12 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
         counts["possible_onsets"] = torch.zeros(J * num_atoms, device=device)
         counts["possible_at_risk"] = torch.zeros(J * num_atoms, device=device)
 
-    def in_memory(rule_inputs, f):
-        # Bodies with j > f, moved to the past slot p = j - f they lie in for a head in slot f.
-        memory = torch.zeros((num_rules, model.num_inputs + 1), device=device)
-        memory[:, model.shift_index[f]] = (rule_inputs & (model.input_offset > f)).float()
-        return memory[:, :-1]
+    offset = getattr(model, "literal_offset", model.input_offset)
+
+    def in_memory(rule_literals, f):
+        # Body literals with j > f (in the memory for a head in slot f); `literal_values(inputs, f)` moves the
+        # inputs f slots back, so these columns read the past slots j - f.
+        return (rule_literals & (offset > f)).float()
 
     body = model.rule_mask() > cfg["mask_threshold"]
     known_bodies = [in_memory(body, f) for f in range(J)]
@@ -1350,12 +1397,14 @@ def _rule_head_counts(model, training_data, video_ids, cfg, desc="Counting rule 
             at_risk = rows["at_risk"]
             if candidates is not None:
                 at_risk = at_risk & candidates(rows["inputs"])
-            x, _k = model.split_inputs(rows["inputs"])
             first = rows["first"]
             can = possible(video_id)[rows["rows"][:, 1]].float() if possible is not None else None    # (B, A)
+            last_window = rows["known"].shape[1] - 1
             for f in range(J):
-                risk = (at_risk & (first >= f * S) & rows["known"][:, f]).float()          # (B, A)
-                onset = (at_risk & (first >= f * S) & (first < (f + 1) * S)).float()
+                x = model.literal_values(rows["inputs"], f) if hasattr(model, "literal_values") \
+                    else model.split_inputs(rows["inputs"])[0]
+                risk = (at_risk & (first >= f * S) & rows["known"][:, min(f + w - 1, last_window)]).float()
+                onset = (at_risk & (first >= f * S) & (first < (f + w) * S)).float()
                 cols = slice(f * num_atoms, (f + 1) * num_atoms)
                 for prefix, b in (("", known_bodies[f]), ("anchor_", known_anchors[f])):
                     size = b.sum(dim=1)
@@ -1394,12 +1443,17 @@ def _temporal_clause_text(clause, unique_atoms):
     # "Car:MovAway(X0)@-30..-20f -> Car:Brake(ahead)@-10..0f => Car:Stop(X0)".
     names = clause.get("scope_names") or ["X0", "X1"]
 
-    def atom(atom_index, slot):
-        return f"{_atom_name(unique_atoms[atom_index])}({names[slot] if slot < len(names) else f'X{slot}'})"
+    def atom(atom_index, slot, lit=None):
+        scope = names[slot] if slot < len(names) else f'X{slot}'
+        if lit and lit.get("kind") in ("G", "!G"):
+            return f"{'!' if lit['kind'] == '!G' else ''}veh:{lit['group']}({scope})"
+        neg = "!" if lit and lit.get("kind") == "!X" else ""
+        return f"{neg}{_atom_name(unique_atoms[atom_index])}({scope})"
     size = clause.get("slot_size", 10)
     frames = clause.get("span_frames") or [(size * (j - 1), size * j) for _a, _slot, j in clause["bodies"]]
-    body = " -> ".join(f"{atom(a, slot)}@-{'inf' if far is None else far}..-{near}f"
-                       for (a, slot, _j), (near, far) in zip(clause["bodies"], frames))
+    lits = clause.get("literals") or [None] * len(clause["bodies"])
+    body = " -> ".join(f"{atom(a, slot, lit)}@-{'inf' if far is None else far}..-{near}f"
+                       for (a, slot, _j), (near, far), lit in zip(clause["bodies"], frames, lits))
     return f"{body} => {atom(*clause['head'])}"
 
 
@@ -1463,6 +1517,11 @@ def extract_temporal_clauses(model, training_data, cfg, run=None, candidates=Non
                 "head": [h, 0],
                 "slot_size": model.slot_size,
                 "anchor": anchor,
+                # Each body literal: kind "X" (holds), "!X" (known absent), "G" / "!G" (a group: any motor vehicle
+                # class holds / none does), with its group label.
+                "literals": rule.get("literals"),
+                "seed": [model.literal_info(m) for m in anchor_inputs] if hasattr(model, "literal_info") else None,
+                "clause_slots": int(cfg.get("clause_slots", 1)),
                 "rule": r,
                 "weight": weight,
                 "support": support,
@@ -1542,6 +1601,7 @@ def inhibitor_clauses(model, train, val, cfg):
                 "body_scopes": [slot for _atom, slot, _j in rule["bodies"]],
                 "scope_names": scope_names(model),
                 "head": [h, 0], "negated": True, "slot_size": model.slot_size, "rule": r, "weight": weight,
+                "literals": rule.get("literals"),
                 "fires": fires, "support": int(train["possible_hits"][r, 0, h]), "confidence": rate,
                 "violation_rate": rate, "base_rate": base, "suppression": rate / base if rate is not None else None,
                 "val_fires": int(val["possible_fires"][r, 0, h]), "val_support": int(val["possible_hits"][r, 0, h]),
@@ -1775,13 +1835,16 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
               f"{_temporal_clause_text(clause, unique_atoms)}")
 
 
+MINE_VERSION = "m1"            # `step05_mine`: bump when the mining changes (new seeds, new model files)
+
+
 def anchor_file_of(input_data, source, seed=0):
     """The anchor clause file of an anchor source ({clause_id: {"anchor": {"head", "body"}}}, the step 04
     format): "causal" the step 04 file itself; the others are written once into the run's step05_output:
     "all" every step 03 LLM anchor, "random" as many of them as the causal file holds, drawn with seed,
     "none" no anchor."""
     causal = input_data["causal_anchor_clause_file"]
-    if source == "causal":
+    if source in ("causal", "mined"):                   # mined: the anchors are not used to seed (`step05_mine`)
         return causal
     out = input_data["output_dir"] / (f"anchors_{source}" + (f"{seed}" if source == "random" else "") + ".json")
     if not os.path.exists(out):
@@ -1863,8 +1926,19 @@ def get_cfg(input_data):
     # "none" (no anchors: free rules only, as many more as the causal anchors seed, the same capacity).
     anchor_source = input_data.get("anchor_source", "causal")
     anchor_seed = input_data.get("anchor_subset_seed", 0)
-    if anchor_source not in ("causal", "all", "random", "none"):
+    if anchor_source not in ("causal", "all", "random", "none", "mined"):
         raise ValueError(f"Unknown anchor_source {anchor_source}")
+    # Literals of the rule bodies (`TemporalRuleNet` negation / groups): "!X" (X known absent: "the car ahead
+    # has not stopped", "no pedestrian crossed 2-3 s ago") and "any motor vehicle X". The SUMO v7 rule mining
+    # (`rule_tree`, 2026-11-20) needed both for the injected rules R1 / R3 (precision 0.47 -> 0.73).
+    negation = bool(input_data.get("negation", True))                     # --negation (default True)
+    groups_on = bool(input_data.get("literal_groups", True))              # --literal_groups (default True)
+    if slot_ranges and (negation or groups_on):
+        raise ValueError("--slot_ranges does not support the negated / group literals: pass --negation False "
+                         "--literal_groups False")
+    # A clause hits its head if the head switches on within clause_slots slots (2: 2 s, the reaction lag of the
+    # injected rules; 1 s cut R3 off: its precision 0.46 at 1 s, 0.61 at 2 s).
+    clause_slots = int(input_data.get("clause_slots", 2))                 # --clause_slots (default 2)
     anchor_file = anchor_file_of(input_data, anchor_source, anchor_seed)
     if input_data.get("num_free_rules") is not None:
         num_free_rules = int(input_data["num_free_rules"])
@@ -1900,7 +1974,7 @@ def get_cfg(input_data):
         base_tag += f"{truncate_prob:g}"
     if slot_ranges:
         base_tag += "H"         # truncated histories drawn from all the known memory (`sample_history`)
-    if anchor_source != "causal":
+    if anchor_source not in ("causal", "mined"):
         base_tag += f"_a{anchor_source}" + (str(anchor_seed) if anchor_source == "random" else "")
     if train_fraction < 1:
         base_tag += f"_tf{train_fraction:g}s{train_subset_seed}"
@@ -1930,8 +2004,16 @@ def get_cfg(input_data):
         tag += f"_l0{l0_lambda:g}"
     if init_log_alpha != -11.0:
         tag += f"_ia{init_log_alpha:g}"
-    if per_head_rules:
+    if anchor_source == "mined":
+        tag += f"_mined{MINE_VERSION}f{free_rules_per_head}"
+    elif per_head_rules:
         tag += f"_ph{rule_copies}c{free_rules_per_head}f{copy_input_share:g}s"
+    if negation:
+        tag += "_neg"
+    if groups_on:
+        tag += "_grp"
+    if clause_slots != 1:
+        tag += f"_cs{clause_slots}"
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
@@ -1982,6 +2064,26 @@ def get_cfg(input_data):
             'num_free_rules': num_free_rules,
             'seed_head_weight': 1.0,
             'per_head_rules': per_head_rules,
+            'negation': negation,
+            'literal_groups': groups_on,
+            'clause_slots': clause_slots,
+            # Rule mining (`step05_mine`, anchor_source "mined"): per learned head, short rules (<= mine_depth
+            # literals after a root own-agent literal) mined on a sample of the train rows (<= mine_pos_cap hit
+            # rows, <= mine_neg_cap others, weighted back), kept if they reach mine_min_lift x the root's
+            # precision with >= mine_min_events onsets in >= min_videos videos, and hold on val (mine_val_lift).
+            'mine_pos_cap': int(input_data.get("mine_pos_cap") or 5000),
+            'mine_neg_cap': int(input_data.get("mine_neg_cap") or 10000),
+            'mine_depth': int(input_data.get("mine_depth") or 3),
+            'mine_min_events': int(input_data.get("mine_min_events") or 20),
+            'mine_min_lift': float(input_data.get("mine_min_lift") or 2.0),
+            'mine_val_lift': float(input_data.get("mine_val_lift") or 1.5),
+            'mine_max_rules': int(input_data.get("mine_max_rules") or 8),
+            'mine_roots': int(input_data.get("mine_roots") or 2),
+            'mine_root_min_cover': 0.2,
+            'mine_min_gain': 1e-3,
+            'mined_seed_file': input_data["output_dir"] / f"mined_seeds_{base_tag}_{MINE_VERSION}"
+                                                          f"{'_neg' if negation else ''}{'_grp' if groups_on else ''}"
+                                                          f"_cs{clause_slots}.json",
             'rule_copies': rule_copies,
             'free_rules_per_head': free_rules_per_head,
             'copy_input_share': copy_input_share,

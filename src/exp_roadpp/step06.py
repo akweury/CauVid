@@ -101,9 +101,16 @@ def fit_baselines(model, training_data, step05_cfg):
     and the rules help."""
     device = step05_cfg["device"]
     R, W, A = model.log_alpha.shape[0], len(model.windows), model.num_atoms
-    is_anchor_head = torch.zeros((R, A), dtype=torch.bool)
-    for i, (_body, heads) in enumerate(step05.anchor_rules(step05_cfg)):
-        is_anchor_head[i * model.num_bins:(i + 1) * model.num_bins, heads] = True
+    # The seeded rules and the heads they were seeded for: per-head / mined rules (head_mask restricted) feed
+    # one head; the shared layout (rules i * num_bins.. of anchor i) feeds the anchor's heads.
+    seeded = model.fixed_inputs.any(dim=1).cpu()
+    head_mask = getattr(model, "head_mask", None)
+    if head_mask is not None and not bool(head_mask.all()):
+        is_anchor_head = head_mask.T.cpu() & seeded[:, None]
+    else:
+        is_anchor_head = torch.zeros((R, A), dtype=torch.bool)
+        for i, (_body, heads) in enumerate(step05.anchor_rules(step05_cfg)):
+            is_anchor_head[i * model.num_bins:(i + 1) * model.num_bins, heads] = True
     anchor_body = model.fixed_inputs.float()
     anchor_size = anchor_body.sum(dim=1)
     hits, fires = torch.zeros((R, W * A), device=device), torch.zeros((R, W * A), device=device)
@@ -118,9 +125,10 @@ def fit_baselines(model, training_data, step05_cfg):
             if len(rows["inputs"]) == 0:
                 continue
             x, _k = model.split_inputs(rows["inputs"])
+            lit = model.literal_values(rows["inputs"]) if hasattr(model, "literal_values") else x
             risk = (rows["at_risk"][:, None, :] & rows["known"]).flatten(1).float()
             onset = rows["targets"].flatten(1).float()
-            fired = ((x @ anchor_body.T >= anchor_size) & (anchor_size > 0)).float()
+            fired = ((lit @ anchor_body.T >= anchor_size) & (anchor_size > 0)).float()
             fires += fired.T @ risk
             hits += fired.T @ onset
             onsets += onset.sum(dim=0)
@@ -157,7 +165,7 @@ def fit_baselines(model, training_data, step05_cfg):
 def _anchor_scores(model, inputs, baselines, chunk_size=8):
     """(B, W, A) anchor baseline score of each row: the highest confidence of the
     anchors seen in the memory for the head and window, or the prior if none."""
-    x, _k = model.split_inputs(inputs)
+    x = model.literal_values(inputs) if hasattr(model, "literal_values") else model.split_inputs(inputs)[0]
     confidence = baselines["anchor_confidence"]
     used = (confidence >= 0).flatten(1).any(dim=1)
     confidence = confidence[used]
@@ -2330,8 +2338,9 @@ def main(input_data):
     selection_file = step05_rules.selection_file_of(step05_cfg)
     selection = utils_data.load_json(selection_file) if os.path.exists(selection_file) else None
     if selection is not None:
-        extra["rule_set"] = step05_rules.RuleSetScorer(selection, model.num_inputs, model.num_atoms, cfg["device"],
-                                                       split=model.split_inputs)
+        extra["rule_set"] = step05_rules.RuleSetScorer(selection, getattr(model, "num_literals", model.num_inputs),
+                                                       model.num_atoms, cfg["device"],
+                                                       split=lambda inputs: (model.literal_values(inputs),))
     cfg["rule_set"] = selection is not None
     # The step 05d MotifRuleNet (its own 2-frame inputs, memory 60 frames), if it was trained.
     motif_file, motif_cfg = step05_motif.model_file_of(step05_cfg)

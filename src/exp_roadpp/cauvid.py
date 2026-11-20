@@ -228,11 +228,20 @@ class TemporalRuleNet(torch.nn.Module):
     it is known), unknown if part of it is not known and the atom not seen. Aligned to a future slot
     f, the slots of a span move f slots back as above; the coarse bins are not moved (approximation:
     the f <= J - 1 slots of the shift are small next to their 3 s+ width).
+
+    Literals: a rule body is a conjunction of literals, not only of inputs. The L literals are the M
+    inputs "X", with negation also their negations "!X" (true if the slot is known and X absent, false
+    if X seen, else unknown: "the car ahead has not stopped", "no pedestrian crossed 2-3 s ago"), and
+    with groups the group literals "G" / "!G" of a group of atoms (e.g. Brake of any motor vehicle
+    class) in one non-own scope and slot: G true if some member is true, false if all are false and
+    known; !G the opposite. Layout: [inputs | negated inputs | groups | negated groups]; the rule masks,
+    fixed inputs and unknown chances are per literal. Without negation and groups L = M and the model is
+    the one of the inputs. Negation and groups need ranges=False.
     """
 
     def __init__(self, num_atoms, slot_size=10, num_slots=5, num_rules=256, init_log_alpha=-6.0,
                  mask_type="hard_concrete", windows=(10,), roles=(), input_mask=None, require_self=False,
-                 ranges=False):
+                 ranges=False, negation=False, groups=None):
         super().__init__()
         if mask_type not in ("hard_concrete", "sigmoid"):
             raise ValueError(f"Unknown mask_type {mask_type}.")
@@ -256,13 +265,41 @@ class TemporalRuleNet(torch.nn.Module):
         self.num_inputs = self.num_scopes * self.num_spans * num_atoms       # rule inputs, per span
         self.windows = windows
         num_future = len(windows)
-        # Very negative so only a few random inputs per rule start non-zero.
-        self.log_alpha = torch.nn.Parameter(torch.full((num_rules, self.num_inputs), init_log_alpha))
-        self.unknown_logit = torch.nn.Parameter(torch.full((self.num_inputs,), -4.0))
+        if (negation or groups) and self.ranges:
+            raise ValueError("Negated and group literals need ranges=False.")
+        # Literals (`class doc`): the inputs, their negations, the groups and their negations.
+        self.negation = bool(negation)
+        M = self.num_inputs
+        group_names, group_members, group_offset = [], [], []
+        for label, atoms in (groups or []):
+            for scope in range(1, self.num_scopes):
+                for j in range(1, num_slots + 1):
+                    group_names.append((label, scope, j))
+                    group_members.append([(scope * self.num_spans + j - 1) * num_atoms + a for a in atoms])
+                    group_offset.append(j)
+        self.group_names = group_names
+        self.num_groups = len(group_names)
+        width = max((len(g) for g in group_members), default=1)
+        members = torch.full((self.num_groups, width), M, dtype=torch.long)       # padded with M
+        for i, g in enumerate(group_members):
+            members[i, :len(g)] = torch.tensor(g)
+        self.register_buffer("group_members", members, persistent=False)
+        self.num_literals = M * (2 if self.negation else 1) + 2 * self.num_groups
+        L = self.num_literals
+        m_all = torch.arange(M)
+        kind = [torch.zeros(M, dtype=torch.long)] + ([torch.ones(M, dtype=torch.long)] if self.negation else []) \
+            + [torch.full((self.num_groups,), 2, dtype=torch.long), torch.full((self.num_groups,), 3, dtype=torch.long)]
+        base = [m_all] + ([m_all] if self.negation else []) + [members[:, 0], members[:, 0]]
+        self.register_buffer("literal_kind", torch.cat(kind), persistent=False)     # 0 X, 1 !X, 2 G, 3 !G
+        self.register_buffer("literal_base", torch.cat(base), persistent=False)     # an input of the literal
+        self.group_index = {name: i for i, name in enumerate(group_names)}
+        # Very negative so only a few random literals per rule start non-zero.
+        self.log_alpha = torch.nn.Parameter(torch.full((num_rules, L), init_log_alpha))
+        self.unknown_logit = torch.nn.Parameter(torch.full((L,), -4.0))
         self.head_weight = torch.nn.Parameter(0.01 * torch.randn(num_atoms, num_rules))
         self.head_bias = torch.nn.Parameter(torch.full((num_future, num_atoms), -6.0))
         # Inputs always in their rule (mask 1, no sparsity cost): the seeded anchors.
-        self.register_buffer("fixed_inputs", torch.zeros((num_rules, self.num_inputs), dtype=torch.bool))
+        self.register_buffer("fixed_inputs", torch.zeros((num_rules, L), dtype=torch.bool))
         # (M,) bool: the memory inputs a rule may learn (None: all), e.g. not the grid position
         # atoms of the other agents (`step05.rule_input_mask`). Not saved: rebuilt from the data.
         # The mask of `step05.rule_input_mask` is per (scope, slot, atom); it depends on the scope and
@@ -273,21 +310,26 @@ class TemporalRuleNet(torch.nn.Module):
                 input_mask = per_scope[:, None, :].expand(-1, self.num_spans, -1).reshape(-1)
             if input_mask.shape != (self.num_inputs,):
                 raise ValueError(f"input_mask {tuple(input_mask.shape)} does not match the {self.num_inputs} inputs.")
-        self.register_buffer("input_mask", torch.ones(self.num_inputs, dtype=torch.bool) if input_mask is None
-                             else input_mask.bool().clone(), persistent=False)
+        input_mask = torch.ones(M, dtype=torch.bool) if input_mask is None else input_mask.bool().clone()
+        # Per literal: an input's mask for it and its negation; a group if all its members may be learned.
+        padded = torch.cat([input_mask, torch.ones(1, dtype=torch.bool)])
+        group_ok = padded[members].all(dim=1) if self.num_groups else torch.zeros(0, dtype=torch.bool)
+        self.register_buffer("input_mask", torch.cat([input_mask] + ([input_mask] if self.negation else [])
+                                                     + [group_ok, group_ok]), persistent=False)
         # Per-head rules (`seed_rules_per_head`): head_mask (A, R) bool, the heads rule r may feed (all by
         # default); rule_inputs (R, M) bool, the inputs rule r may learn (all by default; the extra copies of
         # a seed get a random share, so they grow different bodies). Saved with the weights; a model saved
         # before them loads with the defaults (`_load_from_state_dict`).
         self.register_buffer("head_mask", torch.ones((num_atoms, num_rules), dtype=torch.bool))
-        self.register_buffer("rule_inputs", torch.ones((num_rules, self.num_inputs), dtype=torch.bool))
+        self.register_buffer("rule_inputs", torch.ones((num_rules, L), dtype=torch.bool))
         # require_self: every rule must hold an atom of the agent itself (scope 0). Its activation is
         # multiplied by the self gate, the chance that at least one of its own-agent body atoms holds
         # (`forward`): ~1 for a rule with own-agent atoms (they all hold when it fires), ~0 for a rule
         # of the other agents only, which would otherwise fire for every agent of the scene alike.
         self.require_self = require_self
-        self.register_buffer("self_inputs", torch.arange(self.num_inputs) < self.num_spans * num_atoms,
-                             persistent=False)
+        # The own-agent literals of the self gate: the positive own inputs (a negated one, "I do not brake",
+        # does not tie the rule to the agent).
+        self.register_buffer("self_inputs", torch.arange(L) < self.num_spans * num_atoms, persistent=False)
         # Nearest slot a of every input's span (its slot offset j for single slots): the input is
         # fully in the memory for a head in future slot f iff a > f. For each f, the input each rule
         # input reads (its span moved f slots back, `class doc`), M (unknown) if all of it is in the
@@ -298,6 +340,10 @@ class TemporalRuleNet(torch.nn.Module):
         a = torch.tensor([self.spans[i][0] for i in span.tolist()])
         b = torch.tensor([self.spans[i][1] for i in span.tolist()])
         self.register_buffer("input_offset", a)
+        # Slot offset of every literal (a group: its slot j): it is in the memory for a head in slot f iff > f.
+        self.register_buffer("literal_offset", torch.cat([a] + ([a] if self.negation else [])
+                                                         + [torch.tensor(group_offset, dtype=torch.long)] * 2),
+                             persistent=False)
         shift, partial = [], []
         for f in range(min(num_future, num_slots)):
             index = torch.full((self.num_inputs,), self.num_inputs, dtype=torch.long)
@@ -408,7 +454,7 @@ class TemporalRuleNet(torch.nn.Module):
         Adam steps of the gates, a small random init alone does not split identical rules).
         Returns the number of seeded rules (the first ones; the free rules follow).
         """
-        J, R, M = self.num_slots, self.log_alpha.shape[0], self.num_inputs
+        J, R, M = self.num_slots, self.log_alpha.shape[0], self.num_literals
         heads = [int(h) for h in heads]
         head_set = set(heads)
         rule_head, rule_fixed, rule_copy = [], [], []
@@ -439,6 +485,103 @@ class TemporalRuleNet(torch.nn.Module):
         sub = copy > 0
         self.rule_inputs[sub] = torch.rand((int(sub.sum()), M), generator=generator) < input_share
         return num_seeded
+
+    @staticmethod
+    def mined_rule_count(seeds, heads, free_per_head):
+        """Number of rule nodes of `seed_rules_mined`."""
+        heads = set(int(h) for h in heads)
+        return sum(int(sd["head"]) in heads for sd in seeds) + len(heads) * free_per_head
+
+    @torch.no_grad()
+    def seed_rules_mined(self, seeds, heads, free_per_head=4, head_weight=1.0, generator=None):
+        """One rule per mined seed (`step05_mine`): {"head": h, "literals": [literal index]} gets the
+        literals as fixed inputs and feeds only h (head_mask), head weight head_weight; training may add
+        literals. Then free_per_head unseeded rules per head in heads (head weight ~0.01).
+        Returns the number of seeded rules (the first ones)."""
+        heads = [int(h) for h in heads]
+        head_set = set(heads)
+        rule_head, rule_fixed = [], []
+        for sd in seeds:
+            if int(sd["head"]) in head_set:
+                rule_head.append(int(sd["head"]))
+                rule_fixed.append([int(m) for m in sd["literals"]])
+        num_seeded = len(rule_head)
+        for h in heads:
+            rule_head += [h] * free_per_head
+            rule_fixed += [[]] * free_per_head
+        R = self.log_alpha.shape[0]
+        if len(rule_head) != R:
+            raise ValueError(f"{len(rule_head)} mined / free rules do not match the {R} rule nodes "
+                             f"(`mined_rule_count`).")
+        r = torch.arange(R)
+        h = torch.tensor(rule_head, dtype=torch.long)
+        self.head_mask.zero_()
+        self.head_mask[h, r] = True
+        self.head_weight.zero_()
+        seeded = torch.arange(R) < num_seeded
+        self.head_weight[h[seeded], r[seeded]] = head_weight
+        self.head_weight[h[~seeded], r[~seeded]] = 0.01 * torch.randn(int((~seeded).sum()), generator=generator)
+        for i, lits in enumerate(rule_fixed[:num_seeded]):
+            self.fixed_inputs[i, lits] = True
+        return num_seeded
+
+    # -------- literals ----------------------------------
+    def aligned_inputs(self, inputs, f=0):
+        """Truth x and known k (B, M) of the rule inputs for a head in future slot f: each input moved f
+        slots back (`shift_index`); an input wholly in the future is unknown (x = k = 0)."""
+        x, k = self.split_inputs(inputs)
+        if f == 0:
+            return x, k
+        pad = x.new_zeros((len(x), 1))
+        index = self.shift_index[f]
+        return torch.cat([x, pad], dim=1)[:, index], torch.cat([k, pad], dim=1)[:, index]
+
+    def literal_truth(self, x, k):
+        """(true, false) (B, L) of the literals from the aligned inputs x, k (`aligned_inputs`); unknown is
+        1 - true - false."""
+        false_x = (1 - x) * k
+        true, false = [x], [false_x]
+        if self.negation:
+            true.append(false_x)
+            false.append(x)
+        if self.num_groups:
+            members = self.group_members
+            gt = torch.cat([x, x.new_zeros((len(x), 1))], dim=1)[:, members].amax(dim=2)
+            gf = torch.cat([false_x, x.new_ones((len(x), 1))], dim=1)[:, members].amin(dim=2)
+            true += [gt, gf]
+            false += [gf, gt]
+        return torch.cat(true, dim=1), torch.cat(false, dim=1)
+
+    def literal_values(self, inputs, f=0):
+        """(B, L) float: 1 where a literal is known true, for a head in future slot f (f = 0: every body in
+        the memory). The literal counterpart of `split_inputs(inputs)[0]` (equal to it without negation
+        and groups) for counting where rule bodies hold."""
+        return self.literal_truth(*self.aligned_inputs(inputs, f))[0]
+
+    def literal_info(self, m):
+        """{"kind": "X" / "!X" / "G" / "!G", "atom", "scope", "j", "group"} of literal m (atom: the input's
+        atom; for a group its first member's, group: the group label)."""
+        kind = ("X", "!X", "G", "!G")[int(self.literal_kind[m])]
+        atom, scope, j = self.decode_input(m)
+        group = None
+        if kind in ("G", "!G"):
+            g = (int(m) - self.num_inputs * (2 if self.negation else 1)) % max(self.num_groups, 1)
+            group, scope, j = self.group_names[g]
+        return {"kind": kind, "atom": int(atom), "scope": int(scope), "j": int(j), "group": group}
+
+    def literal_of(self, kind, atom=None, scope=0, j=1, group=None):
+        """Literal index of (kind "X" / "!X" / "G" / "!G", atom, scope, slot j) or (kind, group label, scope, j)."""
+        M = self.num_inputs
+        if kind in ("X", "!X"):
+            m = self.input_index(atom, scope, j)
+            if kind == "X":
+                return m
+            if not self.negation:
+                raise ValueError("This model has no negated literals.")
+            return M + m
+        g = self.group_index[(group, scope, j)]
+        start = M * (2 if self.negation else 1)
+        return start + g + (self.num_groups if kind == "!G" else 0)
 
     # -------- inputs and targets of one video ----------------------------------
     def layer_inputs(self, X, frames, history=None, roles=None, keep=None):
@@ -585,37 +728,37 @@ class TemporalRuleNet(torch.nn.Module):
         (B, R) of the head slot f = 0 (every body in the memory), of packed inputs
         (B, 2M); `window_probs` turns the hazards into onset-within-window probabilities.
 
-        In the log domain a rule is two matmuls: the confirmed-false inputs times
-        log(1 - m) and the unknown inputs times log(1 - m (1 - pi)).
+        In the log domain a rule is two matmuls: the confirmed-false literals times
+        log(1 - m) and the unknown literals times log(1 - m (1 - pi)).
         """
         x, k = self.split_inputs(inputs)
         B = len(inputs)
-        mask = self.rule_mask().clamp(max=1 - 1e-6)
-        log_false = torch.log1p(-mask)                                          # (R, M)
-        log_unknown = torch.log1p(-mask * (1 - torch.sigmoid(self.unknown_logit)))
-        false = torch.cat([(1 - x) * k, x.new_zeros((B, 1))], dim=1)            # column M: a future body
-        unknown = torch.cat([1 - k, x.new_ones((B, 1))], dim=1)
+        mask = self.rule_mask().clamp(max=1 - 1e-6)                             # (R, L)
+        pi = torch.sigmoid(self.unknown_logit)
+        log_false = torch.log1p(-mask)
+        log_unknown = torch.log1p(-mask * (1 - pi))
         if self.require_self:
-            # Self gate 1 - prod_i (1 - m_i p_i) over the own-agent inputs, p_i = 1 if true, pi if unknown, 0 if false.
+            # Self gate 1 - prod_i (1 - m_i p_i) over the own-agent literals, p_i = 1 if true, pi if unknown, 0 if false.
             mask_self = mask * self.self_inputs
             log_self_true = torch.log1p(-mask_self)
-            log_self_unknown = torch.log1p(-mask_self * torch.sigmoid(self.unknown_logit))
-            true = torch.cat([x * k, x.new_zeros((B, 1))], dim=1)
+            log_self_unknown = torch.log1p(-mask_self * pi)
+        pad = x.new_zeros((B, 1))
+        x_pad, k_pad = torch.cat([x, pad], dim=1), torch.cat([k, pad], dim=1)
         hazards, rules_now, all_unknown = [], None, None
         head_weight = self.head_weights()
         for f in range(len(self.windows)):
             if f < self.num_slots:
                 index = self.shift_index[f]
-                false_f, unknown_f = false[:, index], unknown[:, index]
+                true_f, false_f = self.literal_truth(x_pad[:, index], k_pad[:, index])
+                unknown_f = (1 - true_f - false_f).clamp(min=0)
                 if self.ranges and self.partial_future[f].any():
-                    # A span partly in the future: absent so far is unknown, not false.
+                    # A span partly in the future: absent so far is unknown, not false (positive literals only).
                     part = self.partial_future[f].to(false_f.dtype)
                     unknown_f = unknown_f + false_f * part
                     false_f = false_f * (1 - part)
                 rules = torch.exp(false_f @ log_false.T + unknown_f @ log_unknown.T)
                 if self.require_self:
-                    rules = rules * -torch.expm1(true[:, index] @ log_self_true.T
-                                                 + unknown_f @ log_self_unknown.T)
+                    rules = rules * -torch.expm1(true_f @ log_self_true.T + unknown_f @ log_self_unknown.T)
             else:
                 # Every body lies in the future: the same activation for every row.
                 if all_unknown is None:
@@ -674,7 +817,7 @@ class TemporalRuleNet(torch.nn.Module):
     def partial_activation(self, inputs, threshold=0.5):
         """(B, R) share of each rule's body inputs that hold in the memory (the
         head in the next slot), in [0, 1]: a rule with 3 of its 4 bodies seen is 0.75 active."""
-        x, _k = self.split_inputs(inputs)
+        x = self.literal_values(inputs)
         body = (self.rule_mask() > threshold).float()
         return (x @ body.T) / body.sum(dim=1).clamp(min=1)
 
@@ -684,10 +827,14 @@ class TemporalRuleNet(torch.nn.Module):
         the slot j slots before the head's slot (for a span a..b, j = a, its nearest slot;
         `decode_span`)."""
         S, A = self.num_spans, self.num_atoms
+        if m >= self.num_inputs:
+            m = int(self.literal_base[m])
         return m % A, m // (S * A), self.spans[(m // A) % S][0]
 
     def decode_span(self, m):
         """Input node m -> its span (a, b) of `memory_bins` indices: the atom holds in some bin a..b."""
+        if m >= self.num_inputs:
+            m = int(self.literal_base[m])
         return self.spans[(m // self.num_atoms) % self.num_spans]
 
     def span_frames(self, m):
@@ -722,6 +869,7 @@ class TemporalRuleNet(torch.nn.Module):
             rules.append({"rule": r, "bodies": [self.decode_input(m) for m in inputs],
                           "spans": [self.decode_span(m) for m in inputs],
                           "span_frames": [self.span_frames(m) for m in inputs],
+                          "literals": [self.literal_info(m) for m in inputs], "literal_ids": inputs,
                           "heads": [(h, w[h].item()) for h in heads]})
         return rules
 

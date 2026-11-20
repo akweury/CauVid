@@ -379,7 +379,7 @@ def get_step_05_input(args):
         "grid": str(getattr(args, "grid", "True")) == "True",
         "require_self": str(getattr(args, "require_self", "True")) == "True",
         "motion": str(getattr(args, "motion", "False")) == "True",
-        "ego_motion": str(getattr(args, "ego_motion", "False")) == "True",
+        "ego_motion": str(getattr(args, "ego_motion", "True")) == "True",
         # Ego flow atoms (`ego_flow.py`): the raw flow per video is cached once for every exp
         # (<output root>/roadpp/ego_flow_cache/<version>), decoded from the camera videos.
         "ego_flow": str(getattr(args, "ego_flow", "False")) == "True",
@@ -398,7 +398,14 @@ def get_step_05_input(args):
         # data settings instead of one copy per run (`step05.shared_data_file`).
         "data_cache_dir": args.output_dir / "data_cache",
         # Ablation settings (`ablation.py`); the defaults are the main model.
-        "anchor_source": getattr(args, "anchor_source", "causal"),
+        "anchor_source": getattr(args, "anchor_source", "mined"),
+        "negation": str(getattr(args, "negation", "True")) == "True",
+        "literal_groups": str(getattr(args, "literal_groups", "True")) == "True",
+        "clause_slots": int(getattr(args, "clause_slots", 2)),
+        "mine_min_lift": getattr(args, "mine_min_lift", None),
+        "mine_max_rules": getattr(args, "mine_max_rules", None),
+        "mine_roots": getattr(args, "mine_roots", None),
+        "mine_min_events": getattr(args, "mine_min_events", None),
         "anchor_subset_seed": int(getattr(args, "anchor_subset_seed", 0)),
         "train_fraction": float(getattr(args, "train_fraction", 1.0)),
         "train_subset_seed": int(getattr(args, "train_subset_seed", 0)),
@@ -413,7 +420,7 @@ def get_step_05_input(args):
         "l0_lambda": getattr(args, "l0_lambda", None),
         "init_log_alpha": getattr(args, "init_log_alpha", None),
         "train_seed": int(getattr(args, "train_seed", 0) or 0),
-        "roles": tuple(r for r in str(getattr(args, "roles", "") or "").split(",") if r),
+        "roles": tuple(r for r in str(getattr(args, "roles", "ahead") or "").split(",") if r),
         "geometry": str(getattr(args, "geometry", "False")) == "True",
         "type_balance": str(getattr(args, "type_balance", "False")) == "True",
     }

@@ -31,6 +31,14 @@ from src.exp_roadpp import config, paper_tables, rtpt_utils
 # name: (table label, group, main.py args). The groups order Table 2.
 VARIANTS = {
     "main": ("Full model", "main", []),
+    # The rule seeds and literals (main since 2026-11-20: mined seeds, negated / group literals, 2 s clauses,
+    # the lead role and the ego motion atoms; SUMO v7 rule mining `rule_tree`).
+    "anchors_causal": ("seeds: causal LLM anchors instead of mined rules", "seeds", ["--anchor_source", "causal"]),
+    "no_negation": ("− negated literals", "seeds", ["--negation", "False"]),
+    "no_groups": ("− group literals (any motor vehicle)", "seeds", ["--literal_groups", "False"]),
+    "clause_1s": ("clauses within 1 s (not 2 s)", "seeds", ["--clause_slots", "1"]),
+    "no_roles": ("− lead role (ahead)", "inputs", ["--roles", ""]),
+    "no_ego_motion": ("− ego motion atoms", "inputs", ["--ego_motion", "False"]),
     # The causal step: what the causal filter of the LLM anchors adds, and against chance.
     "no_causal_filter": ("− causal filter (all LLM anchors)", "causal", ["--anchor_source", "all"]),
     "random_filter_0": ("random filter, same size (draw 0)", "causal", ["--anchor_source", "random", "--anchor_subset_seed", "0"]),
@@ -40,14 +48,15 @@ VARIANTS = {
     # Inputs.
     "no_grid": ("− grid atoms", "inputs", ["--grid", "False"]),
     "motion": ("+ motion atoms", "inputs", ["--motion", "True"]),
-    "ego_motion": ("+ ego motion atoms", "inputs", ["--ego_motion", "True"]),
     "ego_flow": ("+ ego flow atoms (image yaw / speed)", "inputs", ["--ego_flow", "True"]),
     # Sequences of steps with variable durations (slow down, move right, turn right): bodies over slot
     # ranges a..b and the whole known memory (open spans "a s ago or any time before").
-    "slot_ranges": ("+ slot ranges, all known memory", "structure", ["--slot_ranges", "True"]),
+    # Slot ranges do not support the negated / group literals.
+    "slot_ranges": ("+ slot ranges, all known memory", "structure",
+                    ["--slot_ranges", "True", "--negation", "False", "--literal_groups", "False"]),
     "ego_flow_ranges": ("+ ego flow, slot ranges, all known memory", "structure",
-                        ["--ego_flow", "True", "--slot_ranges", "True"]),
-    "roles": ("+ agent roles (ahead, near ped.)", "inputs", ["--roles", "ahead,near_ped"]),
+                        ["--ego_flow", "True", "--slot_ranges", "True", "--negation", "False", "--literal_groups", "False"]),
+    "roles": ("+ near pedestrian role", "inputs", ["--roles", "ahead,near_ped"]),
     "geometry": ("+ geometry atoms", "inputs", ["--geometry", "True"]),
     # Structure and training.
     "no_require_self": ("− own-agent atom per rule", "structure", ["--require_self", "False"]),
@@ -75,7 +84,6 @@ VARIANTS = {
 SKIPPED = {
     "motion": "off in the main model since 2026-11-15: medium suite 20261113-1635 no change in any metric without it; "
               "full 78e420: the own-label lookup matched the models without it",
-    "ego_motion": "full a2765e vs f45174: no clear gain (AP@W20 0.071 vs 0.069, more false alarms); medium: AP up, recall down",
     "roles": "earlier: val loss unchanged; medium: AP +0.005, recall unchanged",
     "geometry": "earlier: worse; medium: recall -0.044",
     "type_balance": "earlier: inflates regular / rare scores into false alarms; medium: mixed",
@@ -85,7 +93,8 @@ SKIPPED = {
 PRESETS = {
     # The paper ablation: the causal step (with 3 random draws for its noise), and the modules whose medium
     # ablation moved the results (grid: recall; own-agent atom and partial facts: every metric).
-    "paper": ["main", "no_causal_filter", "random_filter_0", "random_filter_1", "random_filter_2", "no_anchors",
+    "paper": ["main", "anchors_causal", "no_negation", "no_groups", "clause_1s", "no_roles", "no_ego_motion",
+              "no_causal_filter", "random_filter_0", "random_filter_1", "random_filter_2", "no_anchors",
               "no_grid", "no_require_self", "no_partial"],
     # The learning curve: how much train data the models need (main = 100%).
     "data": ["main", "train_5", "train_10", "train_25", "train_50"],

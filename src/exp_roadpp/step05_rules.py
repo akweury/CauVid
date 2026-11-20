@@ -87,7 +87,7 @@ def rule_statistics(model, pairs, data, video_ids, cfg, selections=None):
     device = cfg["device"]
     A, W, top = data["num_atoms"], len(model.windows), max(model.windows)
     memory = model.slot_size * model.num_slots
-    body, size = _body_matrix(pairs, model.num_inputs, device)
+    body, size = _body_matrix(pairs, getattr(model, "num_literals", model.num_inputs), device)
     heads = torch.tensor([h for _r, h, _i in pairs], device=device)
     head_onehot = torch.nn.functional.one_hot(heads, A).float() if len(pairs) else torch.zeros((0, A), device=device)
     selected = {}
@@ -113,7 +113,7 @@ def rule_statistics(model, pairs, data, video_ids, cfg, selections=None):
                                      roles=step05.video_roles(data["videos"][video_id], device))
             if len(rows["inputs"]) == 0:
                 continue
-            x, _k = model.split_inputs(rows["inputs"])
+            x = model.literal_values(rows["inputs"])                                    # (B, L) literals
             fired = (x @ body.T >= size) & (size > 0)                                   # (B, P)
             t, n = rows["rows"].T
             fired_dense[t, n] = fired
