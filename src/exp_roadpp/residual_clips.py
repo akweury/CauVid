@@ -161,7 +161,7 @@ def main():
     for r in sorted(per_rule):
         print(f"  r{r} holds on a hit row of {per_rule[r]} events: {texts[r - 1]}")
 
-    dataset = Path(cfg["dataset_label_file"]).parent.parent
+    dataset = Path(args.dataset_path)                       # config.machine_setup: the synthetic dataset folder
     out_dir = args.output_dir / "residual_clips" / args.clip_split
     rng = random.Random(args.seed)
     pick = lambda g, num: rng.sample(sorted(k for k, e in events.items() if e["group"] == g),
