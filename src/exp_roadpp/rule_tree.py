@@ -46,6 +46,7 @@ import torch
 from tqdm import tqdm
 
 from src.exp_roadpp import config, step05, utils_data, utils_pipe
+from src.exp_roadpp import ego_motion as agent_ego_motion
 from src.exp_roadpp.cauvid import TemporalRuleNet
 
 MOTOR = ("Car", "MedVeh", "LarVeh", "Bus", "Mobike")
@@ -576,7 +577,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = re.sub(r"[^A-Za-z0-9]+", "_", root_text).strip("_")[:80]
     out_file = out_dir / (f"{args.head.replace(':', '_')}__{tag}{'_r' + '-'.join(cfg['roles']) if cfg['roles'] else ''}"
-                          f"{f'_w{args.hit_slots}' if args.hit_slots != 1 else ''}{'_inv' if args.invert else ''}_{args.mode}.json")
+                          f"{f'_w{args.hit_slots}' if args.hit_slots != 1 else ''}{'_inv' if args.invert else ''}"
+                          f"{'_ego' + agent_ego_motion.VERSION if cfg.get('ego_motion') else ''}_{args.mode}.json")
     utils_data.save_json(result, out_file)
     print(f"  -> {out_file}")
 

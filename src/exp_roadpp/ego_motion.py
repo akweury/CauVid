@@ -16,7 +16,13 @@ Signals per frame (`signals`; NaN where undefined):
   ahead_log_area, ahead_scale: the ego's lead agent (`roles.role_partners` "ahead"): its box size
                 (near / far) and growth rate (closing in);
   near_rate:    the change per frame of the ground distance (in box heights) from the ego (at
-                roles.EGO_BOX) to its nearest ground agent, to that same agent K frames earlier.
+                roles.EGO_BOX) to its nearest ground agent, to that same agent K frames earlier;
+  tl_log_area, tl_scale, tl_lateral, tl_vertical: the traffic light in view (class in TL_CLASSES; with
+                several, the largest box): its box size (near / far), growth rate (> 0: the ego comes
+                closer), horizontal drift (box widths per frame, > 0 right) and vertical drift of its box
+                bottom (box heights per frame, > 0 down) (`motion.signals`). Traffic lights are not
+                ground agents, so no other signal sees them. A box cut by the image border (`motion.EDGE`)
+                has no rates there (its size and centre are cut), only a size.
 The rate signals are averaged over the last SMOOTH frames.
 Atoms (only the ego holds them; inputs only, never heads, `step05.is_input_atom`), each a level of
 one signal, the levels cut at the train tertiles (`fit`):
@@ -24,7 +30,11 @@ one signal, the levels cut at the train tertiles (`fit`):
       "speed_fast" by the tertiles of scene_scale over the train frames that are not still;
   "ahead_near" / "ahead_mid" / "ahead_far": the lead agent's box size;
   "ahead_closing_fast" / "ahead_closing_slow" / "ahead_steady": its growth rate (high: closing in);
-  "near_closing_fast" / "near_closing_slow" / "near_steady": the distance change (low: closing in).
+  "near_closing_fast" / "near_closing_slow" / "near_steady": the distance change (low: closing in);
+  "tl_far" / "tl_mid" / "tl_near": the traffic light's box size (train tertiles);
+Signed atoms of the traffic light's rates (SIGNED, a dead band SIGNED_BAND around 0, not tertiles: the
+direction is the fact): "tl_shrink" / "tl_size_steady" / "tl_grow", "tl_left" / "tl_lateral_steady" /
+"tl_right", "tl_up" / "tl_vertical_steady" / "tl_down" (in the image).
 A level holds at t only if it held in the motion.DEBOUNCE frames up to t (no flicker at a cut).
 The rules read the levels per memory slot, so a change ("fast 3 s ago, slow now") is a rule of
 two atoms in two slots. The ego's atoms are not pooled away in the other-agent scope (only the ego
@@ -38,15 +48,27 @@ SMOOTH = 5                                  # frames of the moving average of th
 STILL = {"scene_scale": 0.002, "scene_outflow": 0.004}  # the median of many boxes jitters less than one
 QUANTILES = (1 / 3, 2 / 3)
 MAX_SAMPLES = 1_000_000
-VERSION = "v1"
-SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate")
+VERSION = "v2"                              # v2: the traffic light atoms
+TL_CLASSES = ("TL",)                        # the ego's traffic light (ROAD++ "OthTL": the other directions)
+SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate",
+           "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical")
 LEVELS = {                                  # signal: atom names from low to high values
     "scene_scale": ("speed_slow", "speed_medium", "speed_fast"),
     "ahead_log_area": ("ahead_far", "ahead_mid", "ahead_near"),
     "ahead_scale": ("ahead_steady", "ahead_closing_slow", "ahead_closing_fast"),
     "near_rate": ("near_closing_fast", "near_closing_slow", "near_steady"),
+    "tl_log_area": ("tl_far", "tl_mid", "tl_near"),
 }
-ATOMS = ("speed_still",) + tuple(a for levels in LEVELS.values() for a in levels)
+SIGNED = {                                  # signal: atom names (below -band, within the band, above +band)
+    "tl_scale": ("tl_shrink", "tl_size_steady", "tl_grow"),
+    "tl_lateral": ("tl_left", "tl_lateral_steady", "tl_right"),
+    "tl_vertical": ("tl_up", "tl_vertical_steady", "tl_down"),
+}
+# Dead bands of the smoothed rates, per frame: motion.STILL (the jitter of a GT box that stands still).
+SIGNED_BAND = {"tl_scale": agent_motion.STILL["scale"], "tl_lateral": agent_motion.STILL["lateral"],
+               "tl_vertical": agent_motion.STILL["vertical"]}
+ATOMS = (("speed_still",) + tuple(a for levels in LEVELS.values() for a in levels)
+         + tuple(a for levels in SIGNED.values() for a in levels))
 
 
 def tag():
@@ -123,6 +145,14 @@ def signals(boxes, has_box, classes, ego, X_labels, unique_atoms):
     out["ahead_log_area"] = torch.where(has & ok[frames, idx], log_area[frames, idx], float("nan"))
     out["ahead_scale"] = smooth(torch.where(has, scale[frames, idx], float("nan")))
     out["near_rate"] = smooth(nearest_rate(boxes, ok, ground, ego))
+    # The traffic light in view: the largest box of a TL_CLASSES agent per frame.
+    is_tl = torch.tensor([c in TL_CLASSES for c in classes], dtype=torch.bool)
+    tl_area = torch.where(ok & is_tl[None], log_area, float("-inf"))
+    best, m = tl_area.max(dim=1)
+    has_tl = torch.isfinite(best)
+    out["tl_log_area"] = torch.where(has_tl, best, float("nan"))
+    for name, i in (("tl_scale", 0), ("tl_lateral", 2), ("tl_vertical", 3)):
+        out[name] = smooth(torch.where(has_tl, sig[frames, m, i], float("nan")))
     return out
 
 
@@ -157,5 +187,8 @@ def ego_atoms(sig, spec):
         v, (lo, hi) = sig[s], spec["cuts"][s]
         moving = ~still if s == "scene_scale" else torch.ones_like(still)
         cond += [moving & (v < lo), moving & (v >= lo) & (v < hi), moving & (v >= hi)]   # NaN: all False
+    for s in SIGNED:
+        v, band = sig[s], SIGNED_BAND[s]
+        cond += [v < -band, v.abs() <= band, v > band]                             # NaN: all False
     cond = torch.stack(cond, dim=1)[:, None]                                        # (T, 1, M)
     return agent_motion._debounce(cond)[:, 0]
