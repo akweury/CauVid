@@ -29,7 +29,10 @@ Mining per head:
       enough onsets; remove the rows it covers; repeat up to mine_max_rules times;
   val check: a rule is kept as a seed only if its val precision is >= mine_val_lift x the root's val
       precision (it holds on unseen videos), else its rows are still removed (the search moves on).
-Each seed: {"head", "literals": [root, ...], "text", train / val precision and onsets}.
+  root seeds: every root is also a seed of its own ("root": True), the head's default rule; the first
+      root of a head is taken if it covers any hit, and a head with < mine_min_events onsets gets its
+      roots but no mined rules (so every head with train onsets starts from at least one rule).
+Each seed: {"head", "literals": [root, ...], "text", train / val precision and onsets[, "root"]}.
 """
 import math
 import os
@@ -207,8 +210,7 @@ def mine_head(model, names, head, train, val, cfg, device):
     L, A, S_ = model.num_literals, model.num_atoms, model.num_spans
     tr, va = _pool_of(train, head, L, device), _pool_of(val, head, L, device)
     report = {"train_rows": len(tr["y"]), "train_events": _stats(tr, torch.ones_like(tr["y"]))["events"], "roots": []}
-    if report["train_events"] < cfg["mine_min_events"]:
-        return [], report
+    mine_rules = report["train_events"] >= cfg["mine_min_events"]
     base = model.literal_base.to(device)
     scope = base // (S_ * A)
     allowed = model.input_mask.to(device) & ~((base % A == head) & (scope == 0))     # not the head itself
@@ -220,17 +222,27 @@ def mine_head(model, names, head, train, val, cfg, device):
         cover = ((tr["w"] * remaining) @ tr["F"]) / max(total, 1e-9)
         cover = torch.where(own_pos, cover, torch.full_like(cover, -1.0))
         root = int(cover.argmax())
-        if float(cover[root]) < cfg["mine_root_min_cover"]:
+        # The first root only needs to cover some hits (it is the head's default rule); further roots
+        # need mine_root_min_cover of the hits not yet covered.
+        if float(cover[root]) <= 0 or (report["roots"] and float(cover[root]) < cfg["mine_root_min_cover"]):
             break
         remaining &= tr["F"][:, root] <= 0.5
         root_tr, root_va = _holds(tr, [root]), _holds(va, [root])
         st_root, sv_root = _stats(tr, root_tr), _stats(va, root_va)
         p_root = st_root["hits"] / max(st_root["rows"], 1e-9)
         p_root_val = sv_root["hits"] / max(sv_root["rows"], 1e-9)
-        root_report = {"root": literal_text(model, names, root), "cover": float(cover[root]), "precision": p_root,
-                       "val_precision": p_root_val, "rules": 0, "rejected_val": 0}
+        root_report = {"root": literal_text(model, names, root), "literal": root, "cover": float(cover[root]),
+                       "precision": p_root, "val_precision": p_root_val, "rules": 0, "rejected_val": 0}
+        # The root alone is a seed too (the head's default rule, "root": True): it keeps the recall of the
+        # rows no mined rule covers, and a head too rare to mine still starts from a rule (an unseeded rule
+        # starts with every gate closed and its self gate ~0, so it gets almost no gradient).
+        seeds.append({"head": int(head), "literals": [int(root)], "root": True,
+                      "text": f"{literal_text(model, names, root)} => {names[head]}",
+                      "precision": p_root, "events": st_root["events"], "videos": st_root["videos"],
+                      "val_precision": p_root_val, "val_events": sv_root["events"], "root_precision": p_root,
+                      "root_val_precision": p_root_val})
         residual = torch.nonzero(root_tr).flatten()
-        for _k in range(cfg["mine_max_rules"]):
+        for _k in range(cfg["mine_max_rules"] if mine_rules else 0):
             left = _stats(tr, _mask_of(tr, residual))
             if left["events"] < cfg["mine_min_events"] or left["hits"] <= 0:
                 break
@@ -289,12 +301,14 @@ def mine(training_data, cfg):
     for head in tqdm(torch.nonzero(head_mask).flatten().tolist(), desc="Mining rules"):
         s, rep = mine_head(model, names, head, train, val, cfg, device)
         seeds += s
-        reports[names[head]] = {**rep, "seeds": len(s)}
-    covered = sum(1 for r in reports.values() if r["seeds"])
-    print(f"[Mining] {len(seeds)} rules for {covered} of {len(reports)} heads ({model.num_literals} literals: "
+        reports[names[head]] = {**rep, "seeds": len(s), "mined": sum(1 for sd in s if not sd.get("root"))}
+    covered = sum(1 for r in reports.values() if r["mined"])
+    num_roots = sum(1 for sd in seeds if sd.get("root"))
+    print(f"[Mining] {len(seeds) - num_roots} rules for {covered} of {len(reports)} heads, plus {num_roots} root "
+          f"rules for {sum(1 for r in reports.values() if r['roots'])} heads ({model.num_literals} literals: "
           f"{model.num_inputs} inputs, negation {model.negation}, {model.num_groups} groups; hits within "
           f"{cfg.get('clause_slots', 1)} slot(s))")
-    for sd in sorted(seeds, key=lambda x: -x["events"])[:30]:
+    for sd in sorted((sd for sd in seeds if not sd.get("root")), key=lambda x: -x["events"])[:30]:
         print(f"  {sd['precision']:.2f} / val {sd['val_precision']:.2f}  {sd['events']:5d} onsets  {sd['text']}")
     return {"version": step05.MINE_VERSION, "num_literals": model.num_literals, "seeds": seeds, "heads": reports,
             "settings": {k: cfg[k] for k in cfg if k.startswith("mine_")} | {"clause_slots": cfg.get("clause_slots")}}

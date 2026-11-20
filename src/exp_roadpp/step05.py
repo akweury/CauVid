@@ -1128,7 +1128,9 @@ def _seeded_rule_net(training_data, cfg):
         generator = torch.Generator().manual_seed(cfg["seed"])
         num_seeded = model.seed_rules_mined(seeds, heads, cfg["free_rules_per_head"], cfg["seed_head_weight"],
                                             generator)
-        print(f"[Model] mined rules: {num_seeded} seeded (`step05_mine`), {num_rules - num_seeded} free "
+        num_roots = sum(1 for sd in seeds if sd.get("root") and int(sd["head"]) in set(heads))
+        print(f"[Model] mined rules: {num_seeded} seeded (`step05_mine`, {num_roots} of them root rules), "
+              f"{num_rules - num_seeded} free "
               f"({cfg['free_rules_per_head']} per head, {len(heads)} heads); {model.num_literals} literals "
               f"({model.num_inputs} inputs, negation {model.negation}, {model.num_groups} groups), "
               f"{cfg['mask_type']} mask")
@@ -1835,7 +1837,7 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
               f"{_temporal_clause_text(clause, unique_atoms)}")
 
 
-MINE_VERSION = "m1"            # `step05_mine`: bump when the mining changes (new seeds, new model files)
+MINE_VERSION = "m2"            # `step05_mine`: bump when the mining changes (new seeds, new model files); m2: root seeds, free-rule symmetry, positive-only learned literals
 
 
 def anchor_file_of(input_data, source, seed=0):

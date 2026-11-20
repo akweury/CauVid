@@ -493,10 +493,17 @@ class TemporalRuleNet(torch.nn.Module):
         return sum(int(sd["head"]) in heads for sd in seeds) + len(heads) * free_per_head
 
     @torch.no_grad()
-    def seed_rules_mined(self, seeds, heads, free_per_head=4, head_weight=1.0, generator=None):
+    def seed_rules_mined(self, seeds, heads, free_per_head=4, head_weight=1.0, generator=None, input_share=0.5,
+                         learn_negated=False):
         """One rule per mined seed (`step05_mine`): {"head": h, "literals": [literal index]} gets the
         literals as fixed inputs and feeds only h (head_mask), head weight head_weight; training may add
         literals. Then free_per_head unseeded rules per head in heads (head weight ~0.01).
+
+        Symmetry: the first free rule of a head may learn every literal, the others only a random share
+        input_share of them (rule_inputs); identical free rules otherwise grow the same body.
+        learn_negated False: training adds positive input literals only; the negated and group literals
+        come from the mining alone (fixed inputs). "X is absent" holds on almost every row, so a learned
+        one costs little loss and the rules grew ~20 of them (SUMO v7, 2026-11-20).
         Returns the number of seeded rules (the first ones)."""
         heads = [int(h) for h in heads]
         head_set = set(heads)
@@ -523,6 +530,12 @@ class TemporalRuleNet(torch.nn.Module):
         self.head_weight[h[~seeded], r[~seeded]] = 0.01 * torch.randn(int((~seeded).sum()), generator=generator)
         for i, lits in enumerate(rule_fixed[:num_seeded]):
             self.fixed_inputs[i, lits] = True
+        free_copy = torch.tensor([-1] * num_seeded + list(range(free_per_head)) * len(heads))
+        sub = free_copy > 0
+        L = self.num_literals
+        self.rule_inputs[sub] = torch.rand((int(sub.sum()), L), generator=generator) < input_share
+        if not learn_negated:
+            self.rule_inputs[:, self.literal_kind != 0] = False
         return num_seeded
 
     # -------- literals ----------------------------------

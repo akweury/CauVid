@@ -28,6 +28,14 @@ Traffic light atoms (`ego_motion` v2/v3) showed no effect on AV-Brake / AV-Stop.
   - Rule list: depth-3 tree, every node a candidate, FOIL gain, a "not" branch becomes the complementary literal.
   - A rule is kept if precision >= 2x the root's and it holds on val (>= 1.5x the root's val precision).
   - Cached in `mined_seeds_*.json` in the run's `step05_output`; the log prints the top rules.
+  - Since m2: every root is also a seed ("root": True), the head's default rule. A head too rare to mine still
+    gets its root. (Run a4e02b, m1: the 52 heads without a mined rule had only free rules, which start with every
+    gate closed and a self gate ~0, get no gradient, and ended at AP ~0; macro AP fell 0.199 -> 0.173.)
+- **`seed_rules_mined`** (since m2):
+  - The 2nd+ free rules of a head learn only a random half of the literals (`rule_inputs`); before, the
+    free rules of a head grew the same body (3x `AV-Mov@2` on AV-Brake).
+  - Training adds positive input literals only (`learn_negated=False`): negated and group literals come from
+    the mining. In a4e02b, learned `!X` literals grew to ~20 per rule.
 - **`step05`**:
   - `anchor_source "mined"` (default) seeds the net from the mined rules plus `free_rules_per_head` free rules.
   - Clause counts use literals and `clause_slots` (default 2).
