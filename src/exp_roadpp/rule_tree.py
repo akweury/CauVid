@@ -102,7 +102,7 @@ def collect(model, training_data, video_ids, head, root, possible, groups, cfg, 
     index_of = [torch.tensor([model.input_index(a, s, j) for a in atoms], device=device)
                 for atoms, s, j, _p in root]
     group_idx = [torch.tensor(idx, device=device) for _name, idx in groups]
-    F, Y, V, E = [], [], [], []
+    F, Y, V, E, FI, W = [], [], [], [], [], []
     total_rows = total_hits = 0
     events = set()
     for vi, video_id in enumerate(tqdm(video_ids, desc=desc)):
@@ -135,11 +135,15 @@ def collect(model, training_data, video_ids, head, root, possible, groups, cfg, 
             Y.append(yh.cpu())
             V.append(torch.full((int(holds.sum()),), vi, dtype=torch.long))
             E.append(torch.where(yh, event[holds], torch.full_like(event[holds], -1)).cpu())
+            FI.append(first[holds].long().cpu())
+            # Miss episodes (for --invert): the rows of one agent in one 2 s block of the video.
+            W.append(((vi << 40) | (n.long() << 20) | (t.long() // (2 * S)))[holds].cpu())
     width = 2 * model.num_inputs + 2 * len(groups)
     cat = lambda parts, empty: torch.cat(parts) if parts else empty
     return {"F": cat(F, torch.zeros((0, width), dtype=torch.uint8)), "y": cat(Y, torch.zeros(0, dtype=torch.bool)),
             "v": cat(V, torch.zeros(0, dtype=torch.long)), "e": cat(E, torch.zeros(0, dtype=torch.long)),
-            "total_rows": total_rows, "total_hits": total_hits, "total_events": len(events)}
+            "first": cat(FI, torch.zeros(0, dtype=torch.long)), "w": cat(W, torch.zeros(0, dtype=torch.long)),
+            "horizon": max(model.windows), "slot_size": S, "total_rows": total_rows, "total_hits": total_hits, "total_events": len(events)}
 
 
 def distinct(ids, F_hit, device):
@@ -328,6 +332,9 @@ def main():
     parser.add_argument("--min_events", type=int, default=20, help="distinct onsets a literal's branch / rule hits")
     parser.add_argument("--target_prec", type=float, default=None,
                         help="cover: precision a sub-rule must reach (default 2 x the root's train precision)")
+    parser.add_argument("--invert", action="store_true",
+                        help="search rules of NO onset within the root (exceptions / inhibitors): the misses are the "
+                             "targets; their support counts 2 s miss episodes instead of onsets")
     parser.add_argument("--hit_slots", type=int, default=1,
                         help="a hit: the head switches on within the next hit_slots slots (1: as the clause counts)")
     parser.add_argument("--max_len", type=int, default=5, help="cover: literals per sub-rule")
@@ -384,6 +391,27 @@ def main():
     val = collect(model, training_data, training_data["val_videos"], head, root, possible, groups, cfg, "Rows (val)")
     if len(train["y"]) == 0:
         raise SystemExit("the root never holds on the train rows")
+    # Where the root's misses go: frames from the row to the head's next onset (on the original labels).
+    timing = {}
+    for split, d in (("train", train), ("val", val)):
+        miss_first = d["first"][~d["y"]]
+        S_, H = d["slot_size"], d["horizon"]
+        edges = [args.hit_slots * S_, 3 * S_, 5 * S_, H]
+        bins = {}
+        lo = edges[0]
+        for hi in edges[1:]:
+            if hi > lo:
+                bins[f"onset in {lo / S_:g}-{hi / S_:g} s"] = int(((miss_first >= lo) & (miss_first < hi)).sum())
+            lo = max(lo, hi)
+        bins[f"no onset within {H / S_:g} s"] = int((miss_first >= H).sum())
+        timing[split] = {"misses": int(len(miss_first)), "bins": bins}
+    if args.invert:
+        # Search rules of "no onset" within the root: the misses are the targets, counted in miss episodes.
+        for d in (train, val):
+            d["y"] = ~d["y"]
+            d["e"] = torch.where(d["y"], d["w"], torch.full_like(d["w"], -1))
+            d["total_hits"] = d["total_rows"] - d["total_hits"]
+            d["total_events"] = int(d["e"][d["y"]].unique().numel())
     root_train, root_val = node_stats(train, torch.arange(len(train["y"]))), node_stats(val, torch.arange(len(val["y"])))
     root_rate = root_train["hits"] / root_train["rows"]
     rest_rate = (train["total_hits"] - root_train["hits"]) / max(train["total_rows"] - root_train["rows"], 1)
@@ -392,7 +420,7 @@ def main():
     share = lambda st, r: prec(st["hits"], r["hits"])
 
     result = {"exp": args.exp, "head": args.head, "root": root_text, "roles": list(cfg["roles"]),
-              "hit_slots": args.hit_slots,
+              "hit_slots": args.hit_slots, "invert": args.invert, "miss_timing": timing,
               "min_events": args.min_events, "min_videos": cfg["min_videos"], "num_groups": G,
               "train": {"root": root_train, "total_rows": train["total_rows"], "total_hits": train["total_hits"],
                         "total_events": train["total_events"]},
@@ -401,6 +429,12 @@ def main():
     f = lambda v, p=3: "  -  " if v is None else f"{v:.{p}f}"
     print(f"\n[rule_tree] {args.exp} head {args.head}, roles {list(cfg['roles']) or 'none'}, {G} vehicle groups")
     print(f"  root: {root_text}")
+    for split in ("train", "val"):
+        tm = timing[split]
+        print(f"  {split} misses of the root (no onset within {args.hit_slots} slot(s)): {tm['misses']} rows -> "
+              + ", ".join(f"{k}: {v} ({v / max(tm['misses'], 1):.0%})" for k, v in tm["bins"].items()))
+    if args.invert:
+        print("  --invert: 'hits' below are the MISSES (no onset), 'events' are 2 s miss episodes")
     for split, r, d in (("train", root_train, train), ("val", root_val, val)):
         print(f"  {split}: root rows {r['rows']} hits {r['hits']} events {r['events']} precision "
               f"{f(prec(r['hits'], r['rows']))} recall {f(prec(r['hits'], d['total_hits']))} "
@@ -542,7 +576,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = re.sub(r"[^A-Za-z0-9]+", "_", root_text).strip("_")[:80]
     out_file = out_dir / (f"{args.head.replace(':', '_')}__{tag}{'_r' + '-'.join(cfg['roles']) if cfg['roles'] else ''}"
-                          f"{f'_w{args.hit_slots}' if args.hit_slots != 1 else ''}_{args.mode}.json")
+                          f"{f'_w{args.hit_slots}' if args.hit_slots != 1 else ''}{'_inv' if args.invert else ''}_{args.mode}.json")
     utils_data.save_json(result, out_file)
     print(f"  -> {out_file}")
 
