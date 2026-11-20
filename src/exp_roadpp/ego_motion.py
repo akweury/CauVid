@@ -19,10 +19,12 @@ Signals per frame (`signals`; NaN where undefined):
                 roles.EGO_BOX) to its nearest ground agent, to that same agent K frames earlier;
   tl_log_area, tl_scale, tl_lateral, tl_vertical: the traffic light in view (class in TL_CLASSES; with
                 several, the largest box): its box size (near / far), growth rate (> 0: the ego comes
-                closer), horizontal drift (box widths per frame, > 0 right) and vertical drift of its box
-                bottom (box heights per frame, > 0 down) (`motion.signals`). Traffic lights are not
-                ground agents, so no other signal sees them. A box cut by the image border (`motion.EDGE`)
-                has no rates there (its size and centre are cut), only a size.
+                closer), horizontal and vertical drift of its box centre (> 0 right / down). A traffic
+                light box is small: over motion.K = 0.5 s it barely changes and a few pixels of jitter
+                divided by its width look like a large move. So its rates are taken over TL_K frames
+                (2 s), the drifts in image fractions (not box widths), per frame, then smoothed over SMOOTH
+                frames. Traffic lights are not ground agents, so no other signal sees them. A box cut by
+                the image border (`motion.EDGE`) has no rates there, only a size.
 The rate signals are averaged over the last SMOOTH frames.
 Atoms (only the ego holds them; inputs only, never heads, `step05.is_input_atom`), each a level of
 one signal, the levels cut at the train tertiles (`fit`):
@@ -32,8 +34,9 @@ one signal, the levels cut at the train tertiles (`fit`):
   "ahead_closing_fast" / "ahead_closing_slow" / "ahead_steady": its growth rate (high: closing in);
   "near_closing_fast" / "near_closing_slow" / "near_steady": the distance change (low: closing in);
   "tl_far" / "tl_mid" / "tl_near": the traffic light's box size (train tertiles);
-Signed atoms of the traffic light's rates (SIGNED, a dead band SIGNED_BAND around 0, not tertiles: the
-direction is the fact): "tl_shrink" / "tl_size_steady" / "tl_grow", "tl_left" / "tl_lateral_steady" /
+Signed atoms of the traffic light's rates (SIGNED: the direction is the fact; the dead band around 0 is the
+SIGNED_Q quantile of |rate| over the train frames with a traffic light, `fit`, so it follows the size of
+these small changes instead of a fixed jitter band): "tl_shrink" / "tl_size_steady" / "tl_grow", "tl_left" / "tl_lateral_steady" /
 "tl_right", "tl_up" / "tl_vertical_steady" / "tl_down" (in the image).
 A level holds at t only if it held in the motion.DEBOUNCE frames up to t (no flicker at a cut).
 The rules read the levels per memory slot, so a change ("fast 3 s ago, slow now") is a rule of
@@ -48,7 +51,7 @@ SMOOTH = 5                                  # frames of the moving average of th
 STILL = {"scene_scale": 0.002, "scene_outflow": 0.004}  # the median of many boxes jitters less than one
 QUANTILES = (1 / 3, 2 / 3)
 MAX_SAMPLES = 1_000_000
-VERSION = "v2"                              # v2: the traffic light atoms
+VERSION = "v3"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands
 TL_CLASSES = ("TL",)                        # the ego's traffic light (ROAD++ "OthTL": the other directions)
 SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate",
            "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical")
@@ -64,9 +67,8 @@ SIGNED = {                                  # signal: atom names (below -band, w
     "tl_lateral": ("tl_left", "tl_lateral_steady", "tl_right"),
     "tl_vertical": ("tl_up", "tl_vertical_steady", "tl_down"),
 }
-# Dead bands of the smoothed rates, per frame: motion.STILL (the jitter of a GT box that stands still).
-SIGNED_BAND = {"tl_scale": agent_motion.STILL["scale"], "tl_lateral": agent_motion.STILL["lateral"],
-               "tl_vertical": agent_motion.STILL["vertical"]}
+TL_K = 20                                   # frames (2 s) of the traffic light's rate differences
+SIGNED_Q = 1 / 3                            # dead band: this quantile of |rate| (train frames with a light)
 ATOMS = (("speed_still",) + tuple(a for levels in LEVELS.values() for a in levels)
          + tuple(a for levels in SIGNED.values() for a in levels))
 
@@ -151,9 +153,29 @@ def signals(boxes, has_box, classes, ego, X_labels, unique_atoms):
     best, m = tl_area.max(dim=1)
     has_tl = torch.isfinite(best)
     out["tl_log_area"] = torch.where(has_tl, best, float("nan"))
-    for name, i in (("tl_scale", 0), ("tl_lateral", 2), ("tl_vertical", 3)):
-        out[name] = smooth(torch.where(has_tl, sig[frames, m, i], float("nan")))
+    out.update(tl_rates(boxes, ok, best, m, has_tl))
     return out
+
+
+def tl_rates(boxes, ok, log_area_best, m, has_tl, k=TL_K):
+    """{tl_scale, tl_lateral, tl_vertical: (T,)} of the traffic light m[t] (the largest at t): the change of
+    its log box area and of its box centre (image fractions) from t - k to t, per frame, if the same agent had
+    an uncut box then (and has one now); smoothed over SMOOTH frames."""
+    T = len(m)
+    E = agent_motion.EDGE
+    x1, y1, x2, y2 = boxes.unbind(dim=2)
+    uncut = ok & (x1 >= E) & (y1 >= E) & (x2 <= 1 - E) & (y2 <= 1 - E)
+    W, H = agent_motion.FRAME_SIZE_PX
+    log_area = torch.log(((x2 - x1) * W).clamp(min=1.0) * ((y2 - y1) * H).clamp(min=1.0))
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    out = {n: torch.full((T,), float("nan")) for n in ("tl_scale", "tl_lateral", "tl_vertical")}
+    if T > k:
+        t = torch.arange(k, T)
+        mm = m[k:]
+        valid = has_tl[k:] & uncut[t, mm] & uncut[t - k, mm]
+        for name, v in (("tl_scale", log_area), ("tl_lateral", cx), ("tl_vertical", cy)):
+            out[name][k:] = torch.where(valid, (v[t, mm] - v[t - k, mm]) / k, float("nan"))
+    return {n: smooth(v) for n, v in out.items()}
 
 
 # -------------- Thresholds and atoms --------------
@@ -176,6 +198,13 @@ def fit(samples):
             v = v[torch.randperm(len(v), generator=generator)[:MAX_SAMPLES]]
         spec["counts"][s] = len(v)
         spec["cuts"][s] = torch.quantile(v, torch.tensor(QUANTILES)).tolist() if len(v) else [0.0, 0.0]
+    spec["bands"] = {}
+    for s in SIGNED:
+        v = samples[s][~torch.isnan(samples[s])].abs()
+        if len(v) > MAX_SAMPLES:
+            v = v[torch.randperm(len(v), generator=generator)[:MAX_SAMPLES]]
+        spec["counts"][s] = len(v)
+        spec["bands"][s] = float(torch.quantile(v, SIGNED_Q)) if len(v) else 0.0
     return spec
 
 
@@ -188,7 +217,7 @@ def ego_atoms(sig, spec):
         moving = ~still if s == "scene_scale" else torch.ones_like(still)
         cond += [moving & (v < lo), moving & (v >= lo) & (v < hi), moving & (v >= hi)]   # NaN: all False
     for s in SIGNED:
-        v, band = sig[s], SIGNED_BAND[s]
+        v, band = sig[s], spec["bands"][s]
         cond += [v < -band, v.abs() <= band, v > band]                             # NaN: all False
     cond = torch.stack(cond, dim=1)[:, None]                                        # (T, 1, M)
     return agent_motion._debounce(cond)[:, 0]

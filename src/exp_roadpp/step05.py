@@ -215,6 +215,8 @@ def fit_ego_motion(cfg):
     spec = agent_ego_motion.fit({s: torch.cat(v) if v else torch.zeros(0) for s, v in samples.items()})
     for s, cuts in spec["cuts"].items():
         print(f"[Ego motion]\t {s}: cuts {[round(c, 4) for c in cuts]} ({spec['counts'][s]} train frames)")
+    for s, band in spec.get("bands", {}).items():
+        print(f"[Ego motion]\t {s}: dead band +-{band:.5f} ({spec['counts'][s]} train frames)")
     return {**spec, "smooth": agent_ego_motion.SMOOTH, "version": agent_ego_motion.VERSION}
 
 
