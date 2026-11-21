@@ -81,6 +81,8 @@ def get_parser():
                         help="Step 05: a clause hits its head if it switches on within this many slots (default 2 = 2 s)")
     parser.add_argument("--mine_min_lift", type=float, default=None,
                         help="Step 05 mining: a mined rule's precision >= this x its root's (default 2.0)")
+    parser.add_argument("--mine_val_lift", type=float, default=None,
+                        help="Step 05 mining: a mined rule's val precision >= this x its root's (default 1.5)")
     parser.add_argument("--mine_max_rules", type=int, default=None, help="Step 05 mining: rules per root (default 8)")
     parser.add_argument("--mine_roots", type=int, default=None, help="Step 05 mining: roots per head (default 2)")
     parser.add_argument("--mine_min_events", type=int, default=None,

@@ -1837,7 +1837,7 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
               f"{_temporal_clause_text(clause, unique_atoms)}")
 
 
-MINE_VERSION = "m2"            # `step05_mine`: bump when the mining changes (new seeds, new model files); m2: root seeds, free-rule symmetry, positive-only learned literals
+MINE_VERSION = "m3"            # `step05_mine`: bump when the mining changes (new seeds, new model files); m2: root seeds, free-rule symmetry, positive-only learned literals; m3: reproducible row sample (hash of video, frame, agent, head)
 
 
 def anchor_file_of(input_data, source, seed=0):
@@ -1862,6 +1862,18 @@ def anchor_file_of(input_data, source, seed=0):
         utils_data.save_json({str(i): {"anchor": c} for i, c in enumerate(chosen)}, out)
         print(f"[Anchors]\t {source}: {len(chosen)} of {len(llm)} LLM anchor clauses -> {out}")
     return out
+
+
+MINE_DEFAULTS = {"mine_pos_cap": 5000, "mine_neg_cap": 10000, "mine_depth": 3, "mine_min_events": 20,
+                 "mine_min_lift": 2.0, "mine_val_lift": 1.5, "mine_max_rules": 8, "mine_roots": 2}
+MINE_SHORT = {"mine_pos_cap": "pc", "mine_neg_cap": "nc", "mine_depth": "d", "mine_min_events": "me",
+              "mine_min_lift": "ml", "mine_val_lift": "vl", "mine_max_rules": "mr", "mine_roots": "rt"}
+
+
+def mine_settings_tag(settings):
+    """File-name suffix of the non-default mining settings (`MINE_DEFAULTS`), "" for the defaults: a mining
+    run with other settings must not reuse the cached seeds or the model trained from them."""
+    return "".join(f"_{MINE_SHORT[k]}{settings[k]:g}" for k in MINE_DEFAULTS if settings[k] != MINE_DEFAULTS[k])
 
 
 def get_cfg(input_data):
@@ -2000,6 +2012,18 @@ def get_cfg(input_data):
                           "durations": durations, "duration_labels": dur_labels, "predict": predict}))
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
+    # Rule mining (`step05_mine`): the non-default settings go into the seed file and model names.
+    mine_settings = {
+        'mine_pos_cap': int(input_data.get("mine_pos_cap") or 5000),
+        'mine_neg_cap': int(input_data.get("mine_neg_cap") or 10000),
+        'mine_depth': int(input_data.get("mine_depth") or 3),
+        'mine_min_events': int(input_data.get("mine_min_events") or 20),
+        'mine_min_lift': float(input_data.get("mine_min_lift") or 2.0),
+        'mine_val_lift': float(input_data.get("mine_val_lift") or 1.5),
+        'mine_max_rules': int(input_data.get("mine_max_rules") or 8),
+        'mine_roots': int(input_data.get("mine_roots") or 2),
+    }
+    mine_tag = mine_settings_tag(mine_settings)
     tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "") + ("_rng" if slot_ranges else "")
     if rule_lr != 0.01:
         tag += f"_lr{rule_lr:g}"
@@ -2008,7 +2032,7 @@ def get_cfg(input_data):
     if init_log_alpha != -11.0:
         tag += f"_ia{init_log_alpha:g}"
     if anchor_source == "mined":
-        tag += f"_mined{MINE_VERSION}f{free_rules_per_head}"
+        tag += f"_mined{MINE_VERSION}f{free_rules_per_head}" + mine_tag
     elif per_head_rules:
         tag += f"_ph{rule_copies}c{free_rules_per_head}f{copy_input_share:g}s"
     if negation:
@@ -2078,19 +2102,12 @@ def get_cfg(input_data):
             # literals after a root own-agent literal) mined on a sample of the train rows (<= mine_pos_cap hit
             # rows, <= mine_neg_cap others, weighted back), kept if they reach mine_min_lift x the root's
             # precision with >= mine_min_events onsets in >= min_videos videos, and hold on val (mine_val_lift).
-            'mine_pos_cap': int(input_data.get("mine_pos_cap") or 5000),
-            'mine_neg_cap': int(input_data.get("mine_neg_cap") or 10000),
-            'mine_depth': int(input_data.get("mine_depth") or 3),
-            'mine_min_events': int(input_data.get("mine_min_events") or 20),
-            'mine_min_lift': float(input_data.get("mine_min_lift") or 2.0),
-            'mine_val_lift': float(input_data.get("mine_val_lift") or 1.5),
-            'mine_max_rules': int(input_data.get("mine_max_rules") or 8),
-            'mine_roots': int(input_data.get("mine_roots") or 2),
+            **mine_settings,
             'mine_root_min_cover': 0.2,
             'mine_min_gain': 1e-3,
             'mined_seed_file': input_data["output_dir"] / f"mined_seeds_{base_tag}_{MINE_VERSION}"
                                                           f"{'_neg' if negation else ''}{'_grp' if groups_on else ''}"
-                                                          f"_cs{clause_slots}.json",
+                                                          f"_cs{clause_slots}{mine_tag}.json",
             'rule_copies': rule_copies,
             'free_rules_per_head': free_rules_per_head,
             'copy_input_share': copy_input_share,

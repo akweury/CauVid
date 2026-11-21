@@ -14,7 +14,8 @@ The literals are those of the rule net (`TemporalRuleNet.literal_values`: inputs
 groups "any motor vehicle X" and their negations), so a mined rule is a rule node of the net.
 
 Sample: per head at most mine_pos_cap hit rows and mine_neg_cap other rows of the train videos, drawn at
-random and weighted back (weight 1 / sampling rate), so the precisions are unbiased; the same for val.
+random and weighted back (weight 1 / sampling rate), so the precisions are unbiased; the same for val. The
+draw of a row is a hash of (seed, video, frame, agent, head) (`_row_uniform`), so it is reproducible.
 The rows are kept bit-packed (one bit per literal).
 
 Mining per head:
@@ -86,7 +87,6 @@ def collect(model, training_data, video_ids, head_mask, possible, cfg, desc):
             pos += y.sum(dim=0)
     p_pos = (cfg["mine_pos_cap"] / pos.clamp(min=1)).clamp(max=1.0)
     p_neg = (cfg["mine_neg_cap"] / (elig - pos).clamp(min=1)).clamp(max=1.0)
-    generator = torch.Generator(device=device).manual_seed(cfg["seed"])
     packed, parts, offset = [], {k: [] for k in ("head", "row", "y", "weight", "video", "event")}, 0
     for vi, video_id in enumerate(tqdm(video_ids, desc=f"{desc}: sampling")):
         can = possible(video_id)
@@ -95,14 +95,15 @@ def collect(model, training_data, video_ids, head_mask, possible, cfg, desc):
             if len(rows["inputs"]) == 0:
                 continue
             keep, y = _head_rows(rows, can, head_mask, S, w)
-            r = torch.rand(keep.shape, generator=generator, device=device)
+            t, n = rows["rows"].T
+            r = _row_uniform(vi, t, n, A, int(cfg["seed"]))
             take = keep & torch.where(y, r < p_pos[None], r < p_neg[None])
             sel = take.any(dim=1)
             if not sel.any():
                 continue
             packed.append(_pack(model.literal_values(rows["inputs"][sel]) > 0.5).cpu())
             local, h = torch.nonzero(take[sel], as_tuple=True)
-            t, n = rows["rows"][sel][local].T
+            t, n = t[sel][local], n[sel][local]
             hit = y[sel][local, h]
             onset = t + rows["first"][sel][local, h]
             parts["head"].append(h.cpu())
@@ -117,6 +118,30 @@ def collect(model, training_data, video_ids, head_mask, possible, cfg, desc):
     return {"packed": torch.cat(packed) if packed else torch.zeros((0, width), dtype=torch.uint8),
             "pairs": {k: torch.cat(v) if v else torch.zeros(0) for k, v in parts.items()},
             "rate": (pos / elig.clamp(min=1)).cpu()}
+
+
+_MASK32 = 0xFFFFFFFF
+
+
+def _mix32(x):
+    """lowbias32 integer hash of (..) int64 values in [0, 2^32) (the low 32 bits of a product are exact
+    even if the int64 product wraps)."""
+    x = x ^ (x >> 16)
+    x = (x * 0x7FEB352D) & _MASK32
+    x = x ^ (x >> 15)
+    x = (x * 0x846CA68B) & _MASK32
+    return x ^ (x >> 16)
+
+
+def _row_uniform(video, t, n, A, seed):
+    """(B, A) numbers in [0, 1) fixed by (seed, video, frame t, agent n, head): the row sample no longer
+    depends on the batch size, the order of the GPU calls or the chunk size (the generator stream did:
+    the m1 and m2 runs mined from different samples, 4 vs 1 rules for AV-Brake)."""
+    h = torch.arange(A, device=t.device)[None, :]
+    x = _mix32(torch.full((len(t), 1), seed & _MASK32, dtype=torch.long, device=t.device))
+    for v in (torch.full_like(t, video)[:, None], t.long()[:, None], n.long()[:, None], h):
+        x = _mix32(x ^ (v & _MASK32))
+    return x.double() / 2 ** 32
 
 
 def _pool_of(data, head, L, device):

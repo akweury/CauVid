@@ -62,3 +62,21 @@ Traffic light atoms (`ego_motion` v2/v3) showed no effect on AV-Brake / AV-Stop.
 The first run rebuilds the training data (roles + ego motion v3), then mines (a few minutes), then trains.
 Compare with the MLP on the same inputs (it gets the role and ego motion atoms too): AP / mAP and per-head wins,
 then the paper table at the fixed false-alarm budget, then the recall of the injected rules (`rule_events`).
+
+## m3 and the mining sweep (2026-11-21)
+
+- **Reproducible sample.** Whether a row is drawn is a hash of (seed, video, frame, agent, head)
+  (`step05_mine._row_uniform`). Before, the generator stream depended on the chunk and batch order: m1 and m2
+  drew different rows and mined 4 vs 1 AV-Brake rules.
+- **Mining settings in the names.** Non-default `mine_*` settings go into the seeds file and the model tag
+  (`step05.mine_settings_tag`, e.g. `_me10_ml1.5_vl1.125`). Before, `--mine_min_lift 1.5` reused the cached
+  2.0 seeds. New flag: `--mine_val_lift`.
+- **`mine_sweep.py`** (`--mine_sweep`) compares mining settings without training the rule net.
+  - It mines once per (`mine_min_lift`, `mine_min_events`) on the train sample. The val filter uses the even
+    val videos; the rule list is scored on the odd ones.
+  - It reports micro / macro AP and the macro AP by head size in train onsets.
+  - The scorer is the same as the anchor baseline: max train precision of the holding rules, else the base rate.
+
+```bash
+./run_roadpp_docker.sh --gpu 0 --mine_sweep -- --exp sumo_maps_v7 --machine dgx-jing
+```
