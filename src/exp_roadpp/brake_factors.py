@@ -28,6 +28,15 @@ then counted on val (precision, lift, events). Pairs: "the same agent has f1 in 
 (a2, b2)" on Q2 bins per feature; synergy = the pair's gain minus the better of its two single gains
 (both on the pair's coarser bins): > 0 when size and speed (say) matter together.
 
+Triples (`triple_search`): "the same agent has a position, a size and a speed feature in their intervals"
+(Q3 bins each); synergy = the triple's gain minus the best box with one feature over its whole range (the
+best pair / single on the same bins): > 0 when all three matter together.
+
+Regions (`region_search`): the most expressive literal, "the same agent has (f1, .., fk) in a union of
+cells" (k = 1, 2, 3 features; 32 / 16 / 8 train-quantile bins per feature): several disjoint ranges per feature
+and any shape over the features, grown greedily cell by cell by the FOIL gain. Compared with the single best
+interval / box of the same features; synergy = gain minus the best region over fewer features.
+
 Round 2 (`refine`): the best roots (singles / pairs with val lift >= 1.5) get up to two more conditions,
 each from a bank of literals "some agent of a group (ahead / veh / ped / the ego) has f in (a, b]" (Q_BANK
 train-quantile bins) or its negation "no agent of the group has f in (a, b]" (e.g. "a large vehicle merges
@@ -39,6 +48,7 @@ Run (server): ./run_roadpp_docker.sh --gpu 0 --brake_factors -- --exp sumo_maps_
 Writes <output_dir>/brake_factors/brake_factors_<head>.json and prints the tables.
 """
 import gzip
+import itertools
 import json
 import math
 import os
@@ -350,12 +360,239 @@ def pair_search(train, val, group, f1, f2, device):
 
 
 
+
+# -------------- Triples: position x size x speed on the same agent --------------
+Q3 = 8                     # bins per feature of a triple (36 intervals each, 46656 boxes; 6 bins were too coarse in the planted test)
+TRIPLE_FEATURES = {
+    "img": {"position": ("img:bottom", "img:offset", "img:abs_offset"), "size": ("img:log_area", "img:height"),
+            "speed": ("img:scale", "img:accel", "img:lateral", "img:toward_centre", "img:vertical")},
+    "gt": {"position": ("gt:fwd", "gt:left", "gt:abs_left", "gt:dist"), "size": ("gt:area",),
+           "speed": ("gt:closing", "gt:lat_closing", "gt:speed")},
+}
+
+
+def triple_search(train, val, group, feats, device, bins=Q3):
+    """Best box "the same agent has f1 in (a1, b1], f2 in (a2, b2] and f3 in (a3, b3]" (bins of each feature
+    from its train quantiles) by train FOIL gain, and the best box with at least one feature over its whole
+    range (= the best pair or single on the same bins): synergy = the triple's gain minus that one."""
+    d = train[group]
+    keep = torch.ones(len(d["row"]), dtype=torch.bool)
+    for f in feats:
+        keep &= ~torch.isnan(d[f])
+    if int(keep.sum()) < 1000:
+        return None
+    rows = d["row"][keep]
+    values = [d[f][keep] for f in feats]
+    edges = [_edges(v, bins) for v in values]
+    Bs = [len(e) + 1 for e in edges]
+    R = len(train["y"])
+    y = train["y"].to(device)
+    base = float(train["y"].float().mean())
+    P = torch.zeros((R, *Bs), device=device)
+    idx = [torch.bucketize(v, e).to(device) for v, e in zip(values, edges)]
+    P[rows.to(device), idx[0], idx[1], idx[2]] = 1.0
+    C = torch.zeros((R, Bs[0] + 1, Bs[1] + 1, Bs[2] + 1), device=device)
+    C[:, 1:, 1:, 1:] = P.cumsum(dim=1).cumsum(dim=2).cumsum(dim=3)
+    del P
+    ivs = [_interval_index(B) for B in Bs]
+    n = [len(iv[0]) for iv in ivs]
+    grid = torch.cartesian_prod(torch.arange(n[0]), torch.arange(n[1]), torch.arange(n[2]))
+    lo = [ivs[k][0][grid[:, k]] for k in range(3)]                    # first bin
+    hi = [ivs[k][1][grid[:, k]] + 1 for k in range(3)]                # one past the last bin
+    full = torch.zeros(len(grid), dtype=torch.bool)
+    for k in range(3):
+        full |= (lo[k] == 0) & (hi[k] == Bs[k])
+    best = {True: (-1.0, None, 0.0, 0), False: (-1.0, None, 0.0, 0)}  # key: some feature over its full range
+    for s in range(0, len(grid), 128):
+        sl = slice(s, s + 128)
+        a0, a1, a2 = lo[0][sl], lo[1][sl], lo[2][sl]
+        c0, c1, c2 = hi[0][sl], hi[1][sl], hi[2][sl]
+        total = (C[:, c0, c1, c2] - C[:, a0, c1, c2] - C[:, c0, a1, c2] - C[:, c0, c1, a2]
+                 + C[:, a0, a1, c2] + C[:, a0, c1, a2] + C[:, c0, a1, a2] - C[:, a0, a1, a2])
+        hits, _rows, p, gain = _stats(total > 0, y, base)
+        f_sl = full[sl].to(device)
+        for is_full in (True, False):
+            g = torch.where(f_sl == is_full, gain, torch.full_like(gain, -1.0))
+            k = int(g.argmax())
+            if float(g[k]) > best[is_full][0]:
+                best[is_full] = (float(g[k]), s + k, float(p[k]), int(hits[k]))
+    gain, k, p_tr, hits_tr = best[False]
+    if k is None or gain <= 0:
+        return None
+
+    def bounds(e, a, c, B):
+        return (float(e[a - 1]) if a > 0 else -math.inf, float(e[c - 1]) if c < B else math.inf)
+    cond = [(feats[m], *bounds(edges[m], int(lo[m][k]), int(hi[m][k]), Bs[m])) for m in range(3)]
+    res = {"group": group, "features": list(feats), "conditions": [[f, a, b] for f, a, b in cond], "gain": gain,
+           "train_precision": p_tr, "train_hits": hits_tr, "best_sub_gain": best[True][0],
+           "synergy": gain - best[True][0]}
+    res.update(_val_of(val, group, cond, device))
+    return res
+
+
+# -------------- Regions: any union of cells (several disjoint ranges per feature) --------------
+Q_REGION = {1: 32, 2: 16, 3: 8}   # bins per feature of a region over 1 / 2 / 3 features (32 / 256 / 512 cells)
+REGION_MIN_NEW_HITS = 20          # a cell joins the region only if it adds >= this many positive train rows
+REGION_MARGIN_LIFT = 1.3          # ... at a precision (of the rows it adds) >= this x the base rate
+REGION_MAX_STEPS = 300
+
+
+def _cells(data, group, feats, edges):
+    """(rows, cell index) of the observations of group with every feature known (cells of the edges grid)."""
+    if group == "ego":
+        R = len(data["y"])
+        rows, cols = torch.arange(R), [data["ego"][f] for f in feats]
+    else:
+        rows, cols = data[group]["row"], [data[group][f] for f in feats]
+    keep = torch.ones(len(rows), dtype=torch.bool)
+    for c in cols:
+        keep &= ~torch.isnan(c)
+    cell = torch.zeros(int(keep.sum()), dtype=torch.long)
+    for c, e in zip(cols, edges):
+        cell = cell * (len(e) + 1) + torch.bucketize(c[keep], e)
+    return rows[keep], cell
+
+
+def _region_text(feats, edges, selected):
+    """A region as a union of boxes: per feature its bins merged into ranges along the last feature."""
+    sizes = [len(e) + 1 for e in edges]
+
+    def rng(k, a, b):                      # bins a..b of feature k
+        lo = float(edges[k][a - 1]) if a > 0 else -math.inf
+        hi = float(edges[k][b]) if b < sizes[k] - 1 else math.inf
+        return f"({_fmt(lo)}, {_fmt(hi)}]"
+    cells = sorted(selected)
+    idx = []
+    for c in cells:
+        t = []
+        for size in reversed(sizes):
+            t.append(c % size)
+            c //= size
+        idx.append(tuple(reversed(t)))
+    boxes = []                                 # merge runs along the last feature with equal other bins
+    for t in idx:
+        if boxes and boxes[-1][0] == t[:-1] and boxes[-1][2] == t[-1] - 1:
+            boxes[-1][2] = t[-1]
+        else:
+            boxes.append([t[:-1], t[-1], t[-1]])
+    more = f" ... (+{len(boxes) - 60} boxes)" if len(boxes) > 60 else ""
+    boxes = boxes[:60]
+    if len(feats) == 1:
+        return " U ".join(rng(0, b[1], b[2]) for b in boxes) + more
+    parts = []
+    for prefix, a, b in boxes:
+        parts.append(" & ".join([f"{feats[k]} {rng(k, prefix[k], prefix[k])}" for k in range(len(prefix))]
+                                + [f"{feats[-1]} {rng(len(feats) - 1, a, b)}"]))
+    return " | ".join(f"[{x}]" for x in parts) + more
+
+
+def average_precision(score, y):
+    """AP of the rows ranked by score (ties ranked together); None without a positive."""
+    y = y.float().to(score.device)
+    if float(y.sum()) == 0:
+        return None
+    order = torch.argsort(score, descending=True)
+    s, yy = score[order], y[order]
+    tp = torch.cumsum(yy, 0)
+    _, counts = torch.unique_consecutive(s, return_counts=True)
+    ends = torch.cumsum(counts, 0) - 1
+    tp_e = tp[ends]
+    precision = tp_e / (ends + 1).float()
+    gained = torch.diff(tp_e, prepend=tp_e.new_zeros(1))
+    return float((precision * gained).sum() / tp_e[-1])
+
+
+def _presence_matrix(data, group, feats, edges, n_cells, device):
+    rows, cell = _cells(data, group, feats, edges)
+    P = torch.zeros((len(data["y"]), n_cells), device=device)
+    P[rows.to(device), cell.to(device)] = 1.0
+    return P
+
+
+def region_search(train, val, group, feats, device):
+    """Greedy region "the same agent has (f1, .., fk) in a union of cells": cells of Q_REGION[k] train-quantile
+    bins per feature; from the empty region, add the cell of the largest FOIL gain of the region (hits x
+    (log p - log base), exact: one matmul per step over all cells), if it adds >= REGION_MIN_NEW_HITS positive
+    rows at a precision >= REGION_MARGIN_LIFT x base; stop when the gain no longer rises. Several disjoint
+    ranges per feature and any shape over the features (not only one interval / box)."""
+    bins = Q_REGION[len(feats)]
+    rows_tr = train["ego"][feats[0]] if group == "ego" else train[group][feats[0]]
+    if len(rows_tr) == 0:
+        return None
+    if group == "ego":
+        values = [train["ego"][f][~torch.isnan(train["ego"][f])] for f in feats]
+    else:
+        d = train[group]
+        keep = torch.ones(len(d["row"]), dtype=torch.bool)
+        for f in feats:
+            keep &= ~torch.isnan(d[f])
+        if int(keep.sum()) < 1000:
+            return None
+        values = [d[f][keep] for f in feats]
+    edges = [_edges(v, bins) for v in values]
+    n_cells = 1
+    for e in edges:
+        n_cells *= len(e) + 1
+    R = len(train["y"])
+    P = _presence_matrix(train, group, feats, edges, n_cells, device)
+    y = train["y"].to(device).float()
+    base = float(y.mean())
+    # Capacity of these features: every cell scored by its train onset rate, a row by its best agent's cell
+    # (the nested regions of all rate thresholds at once); train AP = how well they can fit, val AP = hold.
+    rate = (y @ P) / P.sum(dim=0).clamp(min=1)
+    P_va = _presence_matrix(val, group, feats, edges, n_cells, device)
+    lookup = {}
+    for name, M, yy in (("train", P, train["y"]), ("val", P_va, val["y"])):
+        score = (M * rate[None]).amax(dim=1)
+        score = torch.where(M.sum(dim=1) > 0, score, torch.full_like(score, base))
+        lookup[name] = average_precision(score, yy)
+    del P_va
+    covered = torch.zeros(R, device=device)
+    hits, cov, gain = 0.0, 0.0, 0.0
+    selected = []
+    for _step in range(REGION_MAX_STEPS):
+        free = 1.0 - covered
+        new_hits = (y * free) @ P
+        new_rows = free @ P
+        h, n = hits + new_hits, cov + new_rows
+        g = h * (torch.log((h / n.clamp(min=1)).clamp(min=1e-12)) - math.log(base))
+        ok = (new_hits >= REGION_MIN_NEW_HITS) & (new_hits / new_rows.clamp(min=1) >= REGION_MARGIN_LIFT * base)
+        if selected:
+            ok[torch.tensor(selected, device=device)] = False
+        g = torch.where(ok, g, torch.full_like(g, -1.0))
+        k = int(g.argmax())
+        if float(g[k]) <= gain:
+            break
+        selected.append(k)
+        hits, cov, gain = float(h[k]), float(n[k]), float(g[k])
+        covered = torch.clamp(covered + P[:, k], max=1.0)
+    if not selected:
+        return None
+    in_region = torch.zeros(n_cells, dtype=torch.bool)
+    in_region[torch.tensor(selected)] = True
+    member_tr = covered.cpu() > 0
+    rows_va, cell_va = _cells(val, group, feats, edges)
+    member_va = torch.zeros(len(val["y"]), dtype=torch.bool)
+    member_va[rows_va[in_region[cell_va]]] = True
+    y_va = val["y"]
+    hits_va, rows_n = int((member_va & y_va).sum()), int(member_va.sum())
+    p_va, base_va = hits_va / max(rows_n, 1), float(y_va.float().mean())
+    text = _region_text(feats, edges, selected)
+    return {"group": group, "features": list(feats), "kind": "region", "cells": len(selected), "of_cells": n_cells,
+            "text": text, "gain": gain, "train_precision": hits / max(cov, 1), "train_hits": int(hits),
+            "val_precision": p_va, "val_lift": p_va / max(base_va, 1e-12), "val_rows": rows_n, "val_hits": hits_va,
+            "val_events": int(val["event"][member_va & y_va].unique().numel()),
+            "val_recall": hits_va / max(int(y_va.sum()), 1), "train_recall": hits / max(float(y.sum()), 1),
+            "lookup_train_ap": lookup["train"], "lookup_val_ap": lookup["val"], "_member": (member_tr, member_va)}
+
 # -------------- Refinement: conditions on other agents, negated ones too --------------
 Q_BANK = 8                 # bins per feature of the literal bank
 REFINE_ROOTS = 6           # roots: the best singles / pairs (val lift >= ROOT_MIN_LIFT, >= 20 val events)
 ROOT_MIN_LIFT = 1.5
 REFINE_DEPTH = 2           # conditions added to a root
 REFINE_MIN_POS = 50        # positive rows a refined rule keeps (train)
+REFINE_MIN_VAL_EVENTS = 10 # ... and keep >= this many val onsets
+ROOT_MIN_EVENTS = 20       # val onsets of a root
 REFINE_VAL_RISE = 1.05     # an added condition must raise the val precision by >= 5% (relative): noise
                            # conditions pass a bare "rises" check (planted test: a random 3rd condition did)
 
@@ -412,7 +649,7 @@ def literal_bank(train, val):
 
 def literal_text(desc, negated=False):
     scope = {"ego": "ego", "ahead": "ahead"}.get(desc["group"], f"some {desc['group']}")
-    body = f"{desc['feature']} in ({_fmt(desc['a'])}, {_fmt(desc['b'])}]"
+    body = desc.get("body") or f"{desc['feature']} in ({_fmt(desc['a'])}, {_fmt(desc['b'])}]"
     if negated:
         return f"NOT [{scope}: {body}]" if desc["group"] in ("ego", "ahead") else f"no {desc['group']}: {body}"
     return f"{scope}: {body}"
@@ -423,14 +660,22 @@ def refine(root, train, val, bank, device):
     their negations, each the largest FOIL gain hits x (log p - log p_now) on the root's train rows still
     covered, kept only if the val precision rises by REFINE_VAL_RISE too. Returns the steps with train / val stats."""
     descs, M_tr, M_va = bank
-    if "f1" in root:
+    if "_member" in root:
+        S_tr, S_va = root["_member"]
+        text = literal_text({"group": root["group"], "body": " , ".join(root["features"]) + " in " + root["text"]})
+    elif "conditions" in root:
+        cond = [tuple(c) for c in root["conditions"]]
+        text = literal_text({"group": root["group"], "body": " & same agent ".join(
+            f"{f} in ({_fmt(lo)}, {_fmt(hi)}]" for f, lo, hi in cond)})
+    elif "f1" in root:
         cond = [(root["f1"], root["a1"], root["b1"]), (root["f2"], root["a2"], root["b2"])]
         text = (f"{literal_text({'group': root['group'], 'feature': root['f1'], 'a': root['a1'], 'b': root['b1']})}"
                 f" & same agent {root['f2']} in ({_fmt(root['a2'])}, {_fmt(root['b2'])}]")
     else:
         cond = [(root["feature"], root["a"], root["b"])]
         text = literal_text({"group": root["group"], "feature": root["feature"], "a": root["a"], "b": root["b"]})
-    S_tr, S_va = member_of(train, root["group"], cond), member_of(val, root["group"], cond)
+    if "_member" not in root:
+        S_tr, S_va = member_of(train, root["group"], cond), member_of(val, root["group"], cond)
     y_tr, y_va = train["y"], val["y"]
 
     def stats(S, y, ev):
@@ -462,7 +707,8 @@ def refine(root, train, val, bank, device):
                 col_tr, col_va = ~col_tr, ~col_va
             nxt_tr, nxt_va = S_tr & col_tr, S_va & col_va
             st_va = stats(nxt_va, y_va, val["event"])
-            if st_va["precision"] >= REFINE_VAL_RISE * now["val"]["precision"] and st_va["events"] >= 10:
+            if (st_va["precision"] >= REFINE_VAL_RISE * now["val"]["precision"]
+                    and st_va["events"] >= REFINE_MIN_VAL_EVENTS):
                 chosen = (literal_text(descs[d], neg), nxt_tr, nxt_va, st_va, float(gain[k]))
                 break
         if chosen is None:
@@ -470,6 +716,92 @@ def refine(root, train, val, bank, device):
         add, S_tr, S_va, st_va, g = chosen
         steps.append({"add": add, "gain": g, "train": stats(S_tr, y_tr, train["event"]), "val": st_va})
     return steps
+
+
+# -------------- Neural reference on the same features --------------
+NET_EPOCHS = 400           # full-batch steps
+NET_HIDDEN = 64
+
+
+def _net_inputs(data, feats_agent, feats_ego, stats, device):
+    """Standardized features with NaN -> 0 plus a known flag per feature: ego (R, 2E), ahead (R, 2F + 1),
+    veh / ped observations (n, 2F) with their rows."""
+    def prep(x, mu, sd):
+        known = ~torch.isnan(x)
+        z = torch.where(known, (x - mu) / sd, torch.zeros_like(x))
+        return torch.cat([z, known.float()], dim=1)
+    R = len(data["y"])
+    out = {"R": R}
+    E = torch.stack([data["ego"][f] for f in feats_ego], dim=1)
+    out["ego"] = prep(E, *stats["ego"]).to(device)
+    for g in ("ahead", "veh", "ped"):
+        X = torch.stack([data[g][f] for f in feats_agent], dim=1)
+        out[g] = (data[g]["row"].to(device), prep(X, *stats[g]).to(device))
+    return out
+
+
+def _stats_of(data, feats_agent, feats_ego):
+    def ms(X):
+        mu = torch.nanmean(X, dim=0)
+        sd = torch.sqrt(torch.nanmean((X - mu) ** 2, dim=0)).nan_to_num(1.0).clamp(min=1e-6)
+        return mu.nan_to_num(0.0), sd
+    st = {"ego": ms(torch.stack([data["ego"][f] for f in feats_ego], dim=1))}
+    for g in ("ahead", "veh", "ped"):
+        st[g] = ms(torch.stack([data[g][f] for f in feats_agent], dim=1))
+    return st
+
+
+class SetNet(torch.nn.Module):
+    """Per-agent MLP of each group (ahead, veh, ped), max-pooled over the row's agents, then a row MLP with the
+    ego features: the neural upper reference of what these features can fit."""
+    def __init__(self, f_agent, f_ego, h=NET_HIDDEN):
+        super().__init__()
+        mlp = lambda i: torch.nn.Sequential(torch.nn.Linear(i, h), torch.nn.GELU(), torch.nn.Linear(h, h),
+                                            torch.nn.GELU())
+        self.phi = torch.nn.ModuleDict({g: mlp(2 * f_agent) for g in ("ahead", "veh", "ped")})
+        self.head = torch.nn.Sequential(torch.nn.Linear(2 * f_ego + 3 * (h + 1), h), torch.nn.GELU(),
+                                        torch.nn.Linear(h, h), torch.nn.GELU(), torch.nn.Linear(h, 1))
+        self.h = h
+
+    def forward(self, x):
+        parts = [x["ego"]]
+        for g in ("ahead", "veh", "ped"):
+            rows, feats = x[g]
+            z = self.phi[g](feats)
+            pooled = torch.full((x["R"], self.h), -1e4, device=z.device)
+            pooled = pooled.scatter_reduce(0, rows[:, None].expand(-1, self.h), z, reduce="amax")
+            has = torch.zeros(x["R"], device=z.device).index_fill_(0, rows, 1.0)
+            parts += [torch.where(has[:, None] > 0, pooled, torch.zeros_like(pooled)), has[:, None]]
+        return self.head(torch.cat(parts, dim=1)).squeeze(1)
+
+
+def neural_reference(train, val, source, device):
+    """Train / val AP of a SetNet on the img (or img + gt) features, trained to fit train (no early stop);
+    also its best val AP over the steps."""
+    feats_agent = IMG_AGENT if source == "img" else IMG_AGENT + GT_AGENT
+    feats_ego = ("img:scene_scale",) if source == "img" else ("img:scene_scale", "gt:ego_speed")
+    st = _stats_of(train, feats_agent, feats_ego)
+    x_tr = _net_inputs(train, feats_agent, feats_ego, st, device)
+    x_va = _net_inputs(val, feats_agent, feats_ego, st, device)
+    y_tr = train["y"].float().to(device)
+    torch.manual_seed(0)
+    net = SetNet(len(feats_agent), len(feats_ego)).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+    best_val, history = 0.0, []
+    for step in range(NET_EPOCHS):
+        net.train()
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(net(x_tr), y_tr)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if (step + 1) % 50 == 0:
+            net.eval()
+            with torch.no_grad():
+                ap_tr, ap_va = average_precision(net(x_tr), train["y"]), average_precision(net(x_va), val["y"])
+            best_val = max(best_val, ap_va)
+            history.append({"step": step + 1, "loss": float(loss), "train_ap": ap_tr, "val_ap": ap_va})
+    return {"source": source, "train_ap": history[-1]["train_ap"], "val_ap": history[-1]["val_ap"],
+            "best_val_ap": best_val, "history": history}
 
 # -------------- Main --------------
 def _fmt(x):
@@ -479,7 +811,18 @@ def _fmt(x):
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--head", type=str, default="av:AV-Brake", help="the ego head")
+    parser.add_argument("--capacity", action="store_true",
+                        help="capacity mode: can the interval / region literals fit train at all? No noise guards "
+                             "(min hits, margin lift, val checks), finer region bins (64 / 32 / 16), deeper "
+                             "refinement chosen on train only; writes brake_factors_<head>_capacity.json")
     args = utils_pipe.parse_args(parser)
+    global MIN_POS, Q_REGION, REGION_MIN_NEW_HITS, REGION_MARGIN_LIFT, REGION_MAX_STEPS, REFINE_DEPTH, \
+        REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS, ROOT_MIN_LIFT, ROOT_MIN_EVENTS
+    if args.capacity:
+        MIN_POS, REGION_MIN_NEW_HITS, REGION_MARGIN_LIFT = 10, 1, 0.0
+        Q_REGION, REGION_MAX_STEPS = {1: 64, 2: 32, 3: 16}, 5000
+        REFINE_DEPTH, REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS = 4, 10, 0.0, 0
+        ROOT_MIN_LIFT, ROOT_MIN_EVENTS = 0.0, 0
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
         else args.output_dir / "brake_factors"
@@ -513,12 +856,61 @@ def main():
                     if r is not None:
                         pairs.append(r)
 
-    # Round 2: refine the best roots with conditions on any agent (other agents, negations).
-    candidates = [r for r in singles + pairs if r["val_lift"] >= ROOT_MIN_LIFT and r["val_events"] >= 20]
+    triples = []
+    for group in ("ahead", "veh"):
+        for source, cats in TRIPLE_FEATURES.items():
+            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
+            for feats in tqdm(combos, desc=f"Triples ({group}, {source})"):
+                r = triple_search(train, val, group, feats, device)
+                if r is not None:
+                    triples.append(r)
+
+    # Regions: any union of cells, over 1 / 2 / 3 features of the same agent.
+    regions = {1: [], 2: [], 3: []}
+    for group in GROUPS:
+        feats = ("img:scene_scale", "gt:ego_speed") if group == "ego" else IMG_AGENT + GT_AGENT
+        for f in tqdm(feats, desc=f"Regions 1 ({group})"):
+            r = region_search(train, val, group, (f,), device)
+            if r is not None:
+                regions[1].append(r)
+    for group in ("ahead", "veh"):
+        for feats in (IMG_AGENT, GT_AGENT):
+            combos = [(feats[a], feats[b]) for a in range(len(feats)) for b in range(a + 1, len(feats))]
+            for fs in tqdm(combos, desc=f"Regions 2 ({group})"):
+                r = region_search(train, val, group, fs, device)
+                if r is not None:
+                    regions[2].append(r)
+        for source, cats in TRIPLE_FEATURES.items():
+            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
+            for fs in tqdm(combos, desc=f"Regions 3 ({group}, {source})"):
+                r = region_search(train, val, group, fs, device)
+                if r is not None:
+                    regions[3].append(r)
+    # Synergy of a region: its gain minus the best region over a strict subset of its features.
+    best_of = {(r["group"], tuple(sorted(r["features"]))): r["gain"] for k in regions for r in regions[k]}
+    for k in (2, 3):
+        for r in regions[k]:
+            fs = r["features"]
+            subs = [tuple(sorted(c)) for m in range(1, k) for c in itertools.combinations(fs, m)]
+            r["best_sub_gain"] = max([best_of.get((r["group"], c), 0.0) for c in subs] + [0.0])
+            r["synergy"] = r["gain"] - r["best_sub_gain"]
+    box_of = {(r["group"], r["feature"]): r for r in singles}
+
+    # Round 2: refine the best roots (boxes and regions) with conditions on any agent (other agents, negations).
+    candidates = [r for r in singles + pairs + triples + regions[1] + regions[2] + regions[3]
+                  if r["val_lift"] >= ROOT_MIN_LIFT and r["val_events"] >= ROOT_MIN_EVENTS]
     roots = sorted(candidates, key=lambda r: -r["gain"])[:REFINE_ROOTS]
     bank = literal_bank(train, val)
+    # The single-feature regions join the bank as literals (several ranges of one feature, and their negation).
+    descs, M_tr, M_va = bank
+    region_cols = regions[1]
+    bank = (descs + [{"group": r["group"], "body": f"{r['features'][0]} in {r['text']}"} for r in region_cols],
+            torch.cat([M_tr] + [r["_member"][0][:, None] for r in region_cols], dim=1),
+            torch.cat([M_va] + [r["_member"][1][:, None] for r in region_cols], dim=1))
     print(f"[Refine] {len(bank[0])} literals (+ their negations), {len(roots)} roots")
     refined = [{"root": r, "steps": refine(r, train, val, bank, device)} for r in tqdm(roots, desc="Refining")]
+
+    nets = [neural_reference(train, val, source, device) for source in ("img", "all")]
 
     base_tr, base_va = float(train["y"].float().mean()), float(val["y"].float().mean())
     print(f"\n[Brake factors] {args.head}: train {len(train['y'])} rows, base {base_tr:.3f}; "
@@ -547,17 +939,61 @@ def main():
               f"({_fmt(r['a2'])}, {_fmt(r['b2'])}]: gain {r['gain']:.1f} (singles {r['single_gain_f1']:.1f} / "
               f"{r['single_gain_f2']:.1f}, synergy {r['synergy']:+.1f}), p_tr {r['train_precision']:.2f}, "
               f"p_val {r['val_precision']:.2f}, lift {r['val_lift']:.2f}, events {r['val_events']}")
+    print("\n== Triples position x size x speed on the same agent, by synergy (triple gain - best box with a "
+          "feature over its whole range, i.e. the best pair / single on the same bins)")
+    for r in sorted(triples, key=lambda r: -r["synergy"])[:20]:
+        text = " & ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in r["conditions"])
+        print(f"  {r['group']:5s} {text}: gain {r['gain']:.1f} (best sub {r['best_sub_gain']:.1f}, synergy "
+              f"{r['synergy']:+.1f}), p_tr {r['train_precision']:.2f}, p_val {r['val_precision']:.2f}, "
+              f"lift {r['val_lift']:.2f}, events {r['val_events']}, recall {r['val_recall']:.2f}")
+    print("\n== Single features: one interval vs a region (union of ranges), val lift and train gain")
+    for r in sorted(regions[1], key=lambda r: -r["gain"]):
+        box = box_of.get((r["group"], r["features"][0]))
+        bx = f"box gain {box['gain']:7.1f} lift {box['val_lift']:.2f}" if box else "box -"
+        print(f"  {r['group']:6s} {r['features'][0]:18s} {bx} | region gain {r['gain']:7.1f} lift {r['val_lift']:.2f} "
+              f"recall {r['val_recall']:.2f} ({r['cells']}/{r['of_cells']} cells): {r['text']}")
+    for k in (2, 3):
+        print(f"\n== Regions over {k} features of the same agent, by synergy (gain - best region over fewer features)")
+        for r in sorted(regions[k], key=lambda r: -r["synergy"])[:20]:
+            print(f"  {r['group']:5s} {' x '.join(r['features'])}: gain {r['gain']:.1f} (sub {r['best_sub_gain']:.1f}, "
+                  f"synergy {r['synergy']:+.1f}), {r['cells']}/{r['of_cells']} cells, p_tr {r['train_precision']:.2f}, "
+                  f"p_val {r['val_precision']:.2f}, lift {r['val_lift']:.2f}, events {r['val_events']}, "
+                  f"recall {r['val_recall']:.2f}")
+        top = sorted([r for r in regions[k] if r["val_events"] >= 30], key=lambda r: -r["val_lift"])[:5]
+        print(f"   best val lift (>= 30 val events):")
+        for r in top:
+            print(f"    {r['group']:5s} {' x '.join(r['features'])}: p_val {r['val_precision']:.2f}, lift "
+                  f"{r['val_lift']:.2f}, events {r['val_events']}, recall {r['val_recall']:.2f}, {r['cells']} cells")
+    print("\n== Fit: train AP (can it fit?) and val AP (does it hold?); prior AP = base rate "
+          f"{base_tr:.3f} / {base_va:.3f}")
+    for k in (1, 2, 3):
+        for src in ("img", "gt"):
+            rs = [r for r in regions[k] if r["features"][0].startswith(src) and r["lookup_train_ap"] is not None]
+            if not rs:
+                continue
+            r = max(rs, key=lambda r: r["lookup_train_ap"])
+            rv = max(rs, key=lambda r: r["lookup_val_ap"] or 0)
+            print(f"  cell lookup over {k} feature(s), {src}: best train AP {r['lookup_train_ap']:.3f} "
+                  f"({r['group']} {' x '.join(r['features'])}, val {r['lookup_val_ap']:.3f}); best val AP "
+                  f"{rv['lookup_val_ap']:.3f} ({rv['group']} {' x '.join(rv['features'])})")
+    for n in nets:
+        print(f"  SetNet ({n['source']} features, all agents): train AP {n['train_ap']:.3f}, val AP {n['val_ap']:.3f} "
+              f"(best over steps {n['best_val_ap']:.3f})")
     print("\n== Refined rules: root, then each added condition (train / val precision, val events, val recall)")
     for item in refined:
         for k, st in enumerate(item["steps"]):
             print(f"  {'root ' if k == 0 else '   & '}{st['add']}: p_tr {st['train']['precision']:.2f}, "
                   f"p_val {st['val']['precision']:.2f}, events {st['val']['events']}, recall {st['val']['recall']:.2f}")
         print()
-    path = out_dir / f"brake_factors_{tag}.json"
+    path = out_dir / f"brake_factors_{tag}{'_capacity' if args.capacity else ''}.json"
     utils_data.save_json({"head": args.head, "stride": STRIDE, "window": WINDOW, "bins": Q, "pair_bins": Q2,
                           "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va,
-                          "singles": singles, "pairs": pairs,
-                          "refined": [{"root": i["root"], "steps": i["steps"]} for i in refined]}, path)
+                          "capacity": bool(args.capacity), "nets": nets,
+                          "singles": singles, "pairs": pairs, "triples": triples,
+                          "regions": {str(k): [{x: v for x, v in r.items() if x != "_member"} for r in regions[k]]
+                                      for k in regions},
+                          "refined": [{"root": {x: v for x, v in i["root"].items() if x != "_member"},
+                                       "steps": i["steps"]} for i in refined]}, path)
     print(f"[Brake factors] saved {path}")
 
 
