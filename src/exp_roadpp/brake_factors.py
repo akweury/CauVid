@@ -38,8 +38,10 @@ and any shape over the features, grown greedily cell by cell by the FOIL gain. C
 interval / box of the same features; synergy = gain minus the best region over fewer features.
 
 Rule list (`rule_list`): sequential covering over every literal found (intervals, boxes, regions, their
-negations): each rule grows by FOIL gain on the rows no earlier rule covers; AP of the list (decision list
-and unordered max) on train and val by number of rules, against the SetNet (can rules fit as well?).
+negations), no cap on the number of rules: phase 1 grows rules by FOIL gain (coverage first), phase 2 collects
+the small precise rules on the rows left (Wilson lower bound of the precision); AP of the list (decision list
+and unordered max) on train and val by number of rules and without the large / mid / small rules, against the
+SetNet (can rules fit as well? do the many small rules add up?).
 
 Round 2 (`refine`): the best roots (singles / pairs with val lift >= 1.5) get up to two more conditions,
 each from a bank of literals "some agent of a group (ahead / veh / ped / the ego) has f in (a, b]" (Q_BANK
@@ -724,10 +726,22 @@ def refine(root, train, val, bank, device):
 
 
 # -------------- Rule list by sequential covering --------------
-LIST_MAX_RULES = 30        # rules of the list (capacity mode: 100)
+LIST_MAX_RULES = 100000    # no cap: the FOIL phase runs until no rule keeps LIST_MIN_HITS positive rows
 LIST_DEPTH = 3             # literals per rule (capacity mode: 5)
-LIST_MIN_HITS = 30         # positive rows a rule keeps on the rows still uncovered (capacity mode: 5)
-LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100)
+LIST_MIN_HITS = 30         # positive rows a FOIL rule keeps on the rows still uncovered (capacity mode: 5)
+# Phase 2, small precise rules on the rows the FOIL rules leave: each grows by the Wilson lower bound of its
+# precision (z = SMALL_Z) instead of the FOIL gain (which prefers coverage), and is kept if that bound is
+# >= SMALL_LB_LIFT x the train base rate with >= SMALL_MIN_HITS positive rows in >= SMALL_MIN_EVENTS onsets.
+# No cap: until no rule passes. "Many small rules add up" (user, 2026-11-21).
+SMALL_Z = 1.96
+SMALL_LB_LIFT = 1.5        # also the bar of a phase-1 rule: without it the uncapped FOIL phase covers every
+                           # positive with ever broader rules (planted test: precision 0.48 at the end, 98% covered)
+                           # and leaves nothing to phase 2
+SMALL_MIN_HITS = 5
+SMALL_MIN_EVENTS = 3
+SMALL_MAX_FAILS = 50       # phase 2 stops after this many rules in a row failed SMALL_MIN_EVENTS
+RECALL_GROUPS = (("large", 0.05, 2.0), ("mid", 0.01, 0.05), ("small", 0.0, 0.01))
+LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000)
 
 
 def full_bank(train, val, bank, singles, pairs, triples, regions):
@@ -779,39 +793,120 @@ def _best_literal(S, y, M, p_now, min_hits, device, used):
     return k, float(gain[k]), int(hits[k]), int(rows[k])
 
 
+def _wilson_lb(hits, rows, z=SMALL_Z):
+    n = rows.clamp(min=1)
+    p = hits / n
+    return (p + z * z / (2 * n) - z * torch.sqrt((p * (1 - p) / n + z * z / (4 * n * n)).clamp(min=0))) / (1 + z * z / n)
+
+
+def _best_literal_lb(S, y, M, lb_now, min_hits, device, used):
+    """The literal (or negation) of the largest Wilson lower bound of the precision on the rows S."""
+    s, ys = S.to(device).float(), (S & y).to(device).float()
+    hits_pos = torch.cat([ys @ M[:, c:c + 2048].float() for c in range(0, M.shape[1], 2048)])
+    rows_pos = torch.cat([s @ M[:, c:c + 2048].float() for c in range(0, M.shape[1], 2048)])
+    hits = torch.cat([hits_pos, ys.sum() - hits_pos])
+    rows = torch.cat([rows_pos, s.sum() - rows_pos])
+    lb = _wilson_lb(hits, rows)
+    ok = hits >= min_hits
+    if used:
+        ok[torch.tensor(used, device=device)] = False
+    lb = torch.where(ok, lb, torch.full_like(lb, -1.0))
+    k = int(lb.argmax())
+    if float(lb[k]) <= lb_now:
+        return None
+    return k, float(lb[k]), int(hits[k]), int(rows[k])
+
+
 def rule_list(train, val, bank, device):
-    """Sequential covering: each rule grows literal by literal (FOIL gain, up to LIST_DEPTH) on the train rows
-    no earlier rule covers, then its rows are removed; up to LIST_MAX_RULES rules. Scores: decision list (the
-    first rule that fires gives its train precision; none: the base rate of the rows left) and unordered (the
-    highest precision of the rules that fire). Train / val AP after each number of rules in LIST_CURVE."""
+    """Rule list without a cap on the number of rules, in three phases on the train rows no earlier rule covers
+    (a rule's rows are removed once it is learned):
+      1 + 2, rule by rule: a FOIL rule (grown by the FOIL gain, up to LIST_DEPTH literals, >= LIST_MIN_HITS
+        positive rows) if the Wilson lower bound of its precision is >= SMALL_LB_LIFT x base; else a small
+        precise rule (grown by that lower bound, >= SMALL_MIN_HITS hits) if it clears the same bar, kept with
+        >= SMALL_MIN_EVENTS onsets (its rows removed either way); stop when neither clears the bar;
+      3: broad FOIL rules without the bar (low precision, still above the rows left), until none keeps
+        LIST_MIN_HITS positive rows.
+    Scores: decision list (the first rule that fires gives its train precision; none: the onset rate of the
+    rows left) and unordered (the highest precision of the rules that fire). Train / val AP by number of rules,
+    and by recall group (large / mid / small rules): their count, coverage and the AP without them."""
     descs, M_tr, M_va = bank
     n = len(descs)
     M_dev = M_tr.to(device)
     y_tr, y_va = train["y"], val["y"]
+    base = float(y_tr.float().mean())
+    total_pos = max(int(y_tr.sum()), 1)
     left = torch.ones(len(y_tr), dtype=torch.bool)
     rules = []
-    for _r in tqdm(range(LIST_MAX_RULES), desc="Rule list"):
+
+    def add_rule(lits, S, phase):
+        hits, rows = int((S & y_tr).sum()), int(S.sum())
+        events = int(train["event"][S & y_tr].unique().numel())
+        rules.append({"literals": lits, "phase": phase, "precision": hits / max(rows, 1), "hits": hits,
+                      "rows": rows, "events": events, "train_recall": hits / total_pos,
+                      "text": " & ".join(literal_text(descs[k % n], k >= n) for k in lits)})
+
+    def grow_foil(min_hits):
         S = left.clone()
         p_now = float((S & y_tr).sum()) / max(int(S.sum()), 1)
         lits, used = [], []
         for _d in range(LIST_DEPTH):
-            best = _best_literal(S, y_tr, M_dev, p_now, LIST_MIN_HITS, device, used)
+            best = _best_literal(S, y_tr, M_dev, p_now, min_hits, device, used)
             if best is None:
                 break
             k, _gain, hits, rows = best
-            col = M_tr[:, k % n] if k < n else ~M_tr[:, k % n]
-            S = S & col
+            S = S & (M_tr[:, k % n] if k < n else ~M_tr[:, k % n])
             p_now = hits / max(rows, 1)
             lits.append(k)
             used += [k % n, k % n + n]
-        if not lits:
-            break
-        hits, rows = int((S & y_tr).sum()), int(S.sum())
-        text = " & ".join(literal_text(descs[k % n], k >= n) for k in lits)
-        rules.append({"literals": lits, "text": text, "precision": hits / max(rows, 1), "hits": hits, "rows": rows})
-        left &= ~S
-        if int((left & y_tr).sum()) < LIST_MIN_HITS:
-            break
+        return lits, S
+
+    def grow_lb():
+        S = left.clone()
+        lb_now, lits, used = -1.0, [], []
+        for _d in range(LIST_DEPTH + 1):
+            best = _best_literal_lb(S, y_tr, M_dev, lb_now, SMALL_MIN_HITS, device, used)
+            if best is None:
+                break
+            k, lb_now, _hits, _rows = best
+            S = S & (M_tr[:, k % n] if k < n else ~M_tr[:, k % n])
+            lits.append(k)
+            used += [k % n, k % n + n]
+        return lits, S, lb_now
+
+    def lb_of(S):
+        return float(_wilson_lb(torch.tensor(float((S & y_tr).sum())), torch.tensor(float(S.sum()))))
+    bar_lb = SMALL_LB_LIFT * base
+    fails = 0
+    # Phases 1 + 2, rule by rule: a FOIL rule if it is clearly above base, else the most precise small rule.
+    with tqdm(desc="Rule list (FOIL / small precise)") as bar:
+        while int((left & y_tr).sum()) >= SMALL_MIN_HITS and fails < SMALL_MAX_FAILS and len(rules) < LIST_MAX_RULES:
+            lits, S = grow_foil(LIST_MIN_HITS) if int((left & y_tr).sum()) >= LIST_MIN_HITS else ([], None)
+            if lits and lb_of(S) >= bar_lb:
+                add_rule(lits, S, "foil")
+                left &= ~S
+                bar.update(1)
+                continue
+            lits, S, lb = grow_lb()
+            if not lits or lb < bar_lb:
+                break
+            events = int(train["event"][S & y_tr].unique().numel())
+            left &= ~S                                           # its rows are removed either way
+            if events < SMALL_MIN_EVENTS:
+                fails += 1
+                continue
+            fails = 0
+            add_rule(lits, S, "small")
+            bar.update(1)
+    # Phase 3: the broad rules (FOIL, no bar) on the rows left, until none keeps LIST_MIN_HITS positive rows:
+    # low precision, but still above the rows left, so they rank them above the default.
+    with tqdm(desc="Rule list (broad)") as bar:
+        while int((left & y_tr).sum()) >= LIST_MIN_HITS and len(rules) < LIST_MAX_RULES:
+            lits, S = grow_foil(LIST_MIN_HITS)
+            if not lits:
+                break
+            add_rule(lits, S, "broad")
+            left &= ~S
+            bar.update(1)
 
     def fires(M, rule):
         f = torch.ones(M.shape[0], dtype=torch.bool)
@@ -820,29 +915,58 @@ def rule_list(train, val, bank, device):
         return f
     F_tr = [fires(M_tr, r) for r in rules]
     F_va = [fires(M_va, r) for r in rules]
-    curve = []
-    for m in sorted(set([c for c in LIST_CURVE if c <= len(rules)] + [len(rules)])):
-        out = {"rules": m}
+    for r, f in zip(rules, F_va):
+        hits = int((f & y_va).sum())
+        r["val_precision"] = hits / max(int(f.sum()), 1)
+        r["val_hits"], r["val_rows"] = hits, int(f.sum())
+
+    def evaluate(keep):
+        """AP of the rules with keep[i] (in list order), on train and val."""
+        idx = [i for i in range(len(rules)) if keep[i]]
         left_m = torch.ones(len(y_tr), dtype=torch.bool)
-        for f in F_tr[:m]:
-            left_m &= ~f
+        for i in idx:
+            left_m &= ~F_tr[i]
         default = float(y_tr[left_m].float().mean()) if bool(left_m.any()) else 0.0
+        out = {}
         for name, F, y in (("train", F_tr, y_tr), ("val", F_va, y_va)):
             first = torch.full((len(y),), -1.0)
             best = torch.full((len(y),), -1.0)
-            for r, f in zip(rules[:m], F[:m]):
-                first = torch.where((first < 0) & f, torch.tensor(r["precision"]), first)
-                best = torch.where(f, torch.clamp(best, min=r["precision"]), best)
+            for i in idx:
+                p = torch.tensor(rules[i]["precision"])
+                first = torch.where((first < 0) & F[i], p, first)
+                best = torch.where(F[i], torch.clamp(best, min=p), best)
             covered = first >= 0
             out[f"{name}_ap_list"] = average_precision(torch.where(covered, first, torch.tensor(default)), y)
             out[f"{name}_ap_max"] = average_precision(torch.where(covered, best, torch.tensor(default)), y)
             out[f"{name}_coverage"] = float((covered & y).sum()) / max(int(y.sum()), 1)
-        curve.append(out)
-    for r, f in zip(rules, F_va):
-        hits = int((f & y_va).sum())
-        r["val_precision"] = hits / max(int(f.sum()), 1)
-        r["val_hits"] = hits
-    return {"rules": rules, "curve": curve}
+        return out
+    curve = []
+    for m in sorted(set([c for c in LIST_CURVE if c <= len(rules)] + [len(rules)])):
+        curve.append({"rules": m, **evaluate([i < m for i in range(len(rules))])})
+    groups = {}
+    full = evaluate([True] * len(rules))
+    for name, lo, hi in RECALL_GROUPS:
+        member = [lo <= r["train_recall"] < hi for r in rules]
+        g = [r for r, m in zip(rules, member) if m]
+        cov_tr = torch.zeros(len(y_tr), dtype=torch.bool)
+        cov_va = torch.zeros(len(y_va), dtype=torch.bool)
+        for f_tr, f_va, m in zip(F_tr, F_va, member):
+            if m:
+                cov_tr |= f_tr
+                cov_va |= f_va
+        without = evaluate([not m for m in member])
+        groups[name] = {"rules": len(g), "phase_small": sum(r["phase"] == "small" for r in g),
+                        "phase_broad": sum(r["phase"] == "broad" for r in g),
+                        "train_coverage": float((cov_tr & y_tr).sum()) / total_pos,
+                        "val_coverage": float((cov_va & y_va).sum()) / max(int(y_va.sum()), 1),
+                        "train_precision": float((cov_tr & y_tr).sum()) / max(int(cov_tr.sum()), 1),
+                        "val_precision": float((cov_va & y_va).sum()) / max(int(cov_va.sum()), 1),
+                        "without": without,
+                        "ap_drop_val_list": full["val_ap_list"] - without["val_ap_list"],
+                        "ap_drop_train_list": full["train_ap_list"] - without["train_ap_list"]}
+    return {"rules": rules, "curve": curve, "full": full, "groups": groups,
+            "phases": {ph: sum(r["phase"] == ph for r in rules) for ph in ("foil", "small", "broad")}}
+
 
 # -------------- Neural reference on the same features --------------
 NET_EPOCHS = 400           # full-batch steps
@@ -942,7 +1066,7 @@ def main():
                              "(min hits, margin lift, val checks), finer region bins (64 / 32 / 16), deeper "
                              "refinement chosen on train only; writes brake_factors_<head>_capacity.json")
     args = utils_pipe.parse_args(parser)
-    global LIST_MAX_RULES, LIST_DEPTH, LIST_MIN_HITS
+    global LIST_DEPTH, LIST_MIN_HITS
     global MIN_POS, Q_REGION, REGION_MIN_NEW_HITS, REGION_MARGIN_LIFT, REGION_MAX_STEPS, REFINE_DEPTH, \
         REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS, ROOT_MIN_LIFT, ROOT_MIN_EVENTS
     if args.capacity:
@@ -950,7 +1074,7 @@ def main():
         Q_REGION, REGION_MAX_STEPS = {1: 64, 2: 32, 3: 16}, 5000
         REFINE_DEPTH, REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS = 4, 10, 0.0, 0
         ROOT_MIN_LIFT, ROOT_MIN_EVENTS = 0.0, 0
-        LIST_MAX_RULES, LIST_DEPTH, LIST_MIN_HITS = 100, 5, 5
+        LIST_DEPTH, LIST_MIN_HITS = 5, 5
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
         else args.output_dir / "brake_factors"
@@ -1115,15 +1239,29 @@ def main():
     print(f"\n== Rule list (sequential covering, <= {LIST_DEPTH} literals per rule, >= {LIST_MIN_HITS} positive rows): "
           f"AP by number of rules; list = first rule that fires, max = best rule that fires; coverage = share of "
           f"the positive rows some rule covers")
+    print(f"  rules: {rlist['phases']['foil']} FOIL + {rlist['phases']['small']} small precise + "
+          f"{rlist['phases']['broad']} broad (no cap)")
     for c in rlist["curve"]:
-        print(f"  {c['rules']:4d} rules: train AP list {c['train_ap_list']:.3f} / max {c['train_ap_max']:.3f} "
+        print(f"  {c['rules']:5d} rules: train AP list {c['train_ap_list']:.3f} / max {c['train_ap_max']:.3f} "
               f"(coverage {c['train_coverage']:.2f}) | val AP list {c['val_ap_list']:.3f} / max {c['val_ap_max']:.3f} "
               f"(coverage {c['val_coverage']:.2f})")
     for n_ in nets:
         print(f"  SetNet ({n_['source']}): train AP {n_['train_ap']:.3f}, val AP {n_['val_ap']:.3f}")
+    print("  by rule size (train recall of the rule: large >= 5%, mid 1-5%, small < 1%):")
+    for name, g in rlist["groups"].items():
+        print(f"   {name:5s}: {g['rules']:4d} rules ({g['phase_small']} from phase 2), cover {g['train_coverage']:.2f} "
+              f"train / {g['val_coverage']:.2f} val of the positives at precision {g['train_precision']:.2f} / "
+              f"{g['val_precision']:.2f}; without them AP list train {g['without']['train_ap_list']:.3f} "
+              f"(-{g['ap_drop_train_list']:.3f}), val {g['without']['val_ap_list']:.3f} (-{g['ap_drop_val_list']:.3f})")
+    small = [r for r in rlist["rules"] if r["phase"] == "small"]
+    if small:
+        print("  phase-2 rules (first 15):")
+        for r in small[:15]:
+            print(f"    p_tr {r['precision']:.2f} ({r['hits']} hits, {r['events']} onsets) p_val {r['val_precision']:.2f} "
+                  f"({r['val_hits']}/{r['val_rows']}): {r['text'][:200]}")
     print("  first rules:")
     for i, r in enumerate(rlist["rules"][:20]):
-        print(f"   {i + 1:3d}. p_tr {r['precision']:.2f} ({r['hits']} hits) p_val {r['val_precision']:.2f}: {r['text'][:220]}")
+        print(f"   {i + 1:3d}. [{r['phase']}] p_tr {r['precision']:.2f} ({r['hits']} hits) p_val {r['val_precision']:.2f}: {r['text'][:220]}")
     print("\n== Refined rules: root, then each added condition (train / val precision, val events, val recall)")
     for item in refined:
         for k, st in enumerate(item["steps"]):
