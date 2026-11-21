@@ -66,7 +66,12 @@ def _score_bins(scores, edges):
 # test videos, already matched the models' AP (0.034 vs rule net 0.039, MLP 0.045): a model or module
 # is worth it only if it clearly beats this baseline. Changing it: bump BASELINE_VERSION.
 LOOKUP_PRIOR_ROWS = 20
-BASELINE_VERSION = "prior_anchor_lookup_v1"
+# Anchor baseline: a rule's confidence (onset share of the rows it fires on) shrunk toward the head's prior
+# with ANCHOR_PRIOR_ROWS rows (Bayes): a rule seen on few rows had a raw confidence above the big rules by
+# luck and ranked first across heads (`mine_sweep`, SUMO v7, 2026-11-21: micro AP 0.265 -> 0.233 with
+# rules of >= 5 onsets). ~200 rows: about 20 onsets of ~1 s each, as step05_mine's mine_prior.
+ANCHOR_PRIOR_ROWS = 200
+BASELINE_VERSION = "prior_anchor_lookup_v2"
 
 
 def _lookup_weights(num_labels, device="cpu"):
@@ -90,8 +95,9 @@ def fit_baselines(model, training_data, step05_cfg):
           k, the same for every row;
       anchor_confidence (R, W, A): for each seeded rule r (anchor body in one slot)
           and each head of its anchor clause, the confidence of the anchor input
-          alone (seen in the memory) for an onset within window k; -1 for other
-          heads, free rules and anchors that never fire;
+          alone (seen in the memory) for an onset within window k, shrunk toward the
+          prior with ANCHOR_PRIOR_ROWS rows; -1 for other heads, free rules and
+          anchors that never fire;
       lookup_keys (K,) long sorted, lookup_rates (K, W, A), lookup_weights (L, 2): the lookup
           baseline (LOOKUP_PRIOR_ROWS): the smoothed onset share per context of the own last-slot
           label atoms (`_lookup_scores`); contexts not seen in train get the prior.
@@ -154,7 +160,8 @@ def fit_baselines(model, training_data, step05_cfg):
     print(f"[Baselines]\t lookup: {K} contexts of the own last-slot label atoms in the train rows")
     return {
         "prior": prior,
-        "anchor_confidence": torch.where(valid, hits / fires.clamp(min=1), -1.0),
+        "anchor_confidence": torch.where(valid, (hits + ANCHOR_PRIOR_ROWS * prior[None])
+                                         / (fires + ANCHOR_PRIOR_ROWS), -1.0),
         "lookup_keys": keys[order],
         "lookup_rates": (pos + LOOKUP_PRIOR_ROWS * prior[None]) / (n + LOOKUP_PRIOR_ROWS),
         "lookup_weights": weights.cpu(),

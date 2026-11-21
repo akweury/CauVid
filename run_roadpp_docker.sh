@@ -115,6 +115,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.oracle_junction"
     elif [[ "$arg" == "--residual_clips" ]]; then
         ENTRY_MODULE="src.exp_roadpp.residual_clips"
+    elif [[ "$arg" == "--brake_factors" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.brake_factors"
     elif [[ "$arg" == "--mine_sweep" ]]; then
         ENTRY_MODULE="src.exp_roadpp.mine_sweep"
     elif [[ "$arg" == "--rule_tree" ]]; then

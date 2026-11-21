@@ -33,7 +33,8 @@ Mining per head:
   root seeds: every root is also a seed of its own ("root": True), the head's default rule; the first
       root of a head is taken if it covers any hit, and a head with < mine_min_events onsets gets its
       roots but no mined rules (so every head with train onsets starts from at least one rule).
-Each seed: {"head", "literals": [root, ...], "text", train / val precision and onsets[, "root"]}.
+Each seed: {"head", "literals": [root, ...], "text", train / val precision and onsets, "confidence"
+(the train precision shrunk to the root's with mine_prior onsets, `shrunk_confidence`)[, "root"]}.
 """
 import math
 import os
@@ -230,6 +231,19 @@ def literal_text(model, names, m):
     return f"{'!' if info['kind'] == '!X' else ''}{names[info['atom']]}({scope})@{info['j']}"
 
 
+def shrunk_confidence(precision, events, root_precision, prior):
+    """A rule's confidence: its train precision shrunk to its root's with `prior` onsets of weight.
+
+    The rule fired on about events / precision independent episodes (its distinct onsets over its precision),
+    so (events + prior x root) / (events / precision + prior). A rule of 5 onsets at 0.9 over a root at 0.1
+    gets 0.27, one of 370 onsets at 0.80 gets 0.77. Why: with mine_min_events 5 the raw precision of the
+    small rules was too high (luck), they ranked above every head's rows and the micro AP fell 0.265 -> 0.233
+    (`mine_sweep`, SUMO v7, 2026-11-21). prior 0 gives the raw precision."""
+    if prior <= 0 or precision <= 0:
+        return float(precision)
+    return float((events + prior * root_precision) / (events / precision + prior))
+
+
 def mine_head(model, names, head, train, val, cfg, device):
     """Seeds [{"head", "literals", "text", ...}] of one head (module doc) and a report."""
     L, A, S_ = model.num_literals, model.num_atoms, model.num_spans
@@ -265,7 +279,7 @@ def mine_head(model, names, head, train, val, cfg, device):
                       "text": f"{literal_text(model, names, root)} => {names[head]}",
                       "precision": p_root, "events": st_root["events"], "videos": st_root["videos"],
                       "val_precision": p_root_val, "val_events": sv_root["events"], "root_precision": p_root,
-                      "root_val_precision": p_root_val})
+                      "root_val_precision": p_root_val, "confidence": p_root})
         residual = torch.nonzero(root_tr).flatten()
         for _k in range(cfg["mine_max_rules"] if mine_rules else 0):
             left = _stats(tr, _mask_of(tr, residual))
@@ -305,7 +319,8 @@ def mine_head(model, names, head, train, val, cfg, device):
                           "text": " & ".join(literal_text(model, names, m) for m in literals) + f" => {names[head]}",
                           "precision": p, "events": st["events"], "videos": st["videos"],
                           "val_precision": p_val, "val_events": sv["events"], "root_precision": p_root,
-                          "root_val_precision": p_root_val})
+                          "root_val_precision": p_root_val,
+                          "confidence": shrunk_confidence(p, st["events"], p_root, cfg.get("mine_prior", 0))})
             root_report["rules"] += 1
         report["roots"].append(root_report)
     return seeds, report
@@ -334,7 +349,8 @@ def mine(training_data, cfg):
           f"{model.num_inputs} inputs, negation {model.negation}, {model.num_groups} groups; hits within "
           f"{cfg.get('clause_slots', 1)} slot(s))")
     for sd in sorted((sd for sd in seeds if not sd.get("root")), key=lambda x: -x["events"])[:30]:
-        print(f"  {sd['precision']:.2f} / val {sd['val_precision']:.2f}  {sd['events']:5d} onsets  {sd['text']}")
+        print(f"  {sd['precision']:.2f} / val {sd['val_precision']:.2f} / conf {sd['confidence']:.2f}  "
+              f"{sd['events']:5d} onsets  {sd['text']}")
     return {"version": step05.MINE_VERSION, "num_literals": model.num_literals, "seeds": seeds, "heads": reports,
             "settings": {k: cfg[k] for k in cfg if k.startswith("mine_")} | {"clause_slots": cfg.get("clause_slots")}}
 

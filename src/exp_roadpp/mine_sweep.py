@@ -10,8 +10,10 @@ Rows: the `step05_mine.collect` sample (hits within clause_slots, weighted back 
 rows mine; the val videos are split in two halves by video: "check" for the miner's val filter
 (mine_val_lift = val_ratio x mine_min_lift), "eval" for the scores. The test split is not touched.
 
-Scorer of a rule list (as step06's anchor baseline): a row's score for a head is the highest train precision
-of the head's rules (mined rules and roots) that hold on it, else the head's train base rate. Reported per
+Scorer of a rule list (as step06's anchor baseline): a row's score for a head is the highest confidence of the
+head's rules (mined rules and roots) that hold on it, else the head's train base rate. The confidence is the
+train precision shrunk to the root's with k onsets (`step05_mine.shrunk_confidence`), for each k in --priors
+(k0 = the raw precision); the rules are mined once per setting, the priors only change the scores. Reported per
 setting: rules, literals per rule, heads with mined rules, the weighted AP per head on the eval half (macro
 over heads, by head size in train onsets), and the micro AP (all heads' rows pooled), all heads and without
 the small ones. "roots" is the list of the roots alone (no mined rules) for reference.
@@ -21,6 +23,7 @@ Writes <output_dir>/mine_sweep/mine_sweep_<tag>.json; the sampled rows are cache
 """
 import math
 import os
+import re
 from collections import defaultdict
 
 import torch
@@ -54,16 +57,24 @@ def subset(data, keep_video):
     return {"packed": data["packed"], "pairs": {k: v[sel] for k, v in pairs.items()}, "rate": data["rate"]}
 
 
-def score_rows(pool, rules, base):
-    """(n,) score of the rows of one head's pool: max train precision of the rules holding, else base."""
+def rule_score(rule, prior):
+    """A rule's score: its train precision shrunk to its root's with prior onsets (0: the raw precision)."""
+    if rule.get("root"):
+        return float(rule["precision"])
+    return step05_mine.shrunk_confidence(rule["precision"], rule["events"], rule["root_precision"], prior)
+
+
+def score_rows(pool, rules, base, prior=0.0):
+    """(n,) score of the rows of one head's pool: max confidence (`rule_score`) of the rules holding, else
+    base."""
     score = torch.full((len(pool["y"]),), float(base), device=pool["y"].device)
     for rule in rules:
         holds = step05_mine._holds(pool, rule["literals"])
-        score = torch.where(holds, torch.clamp(score, min=rule["precision"]), score)
+        score = torch.where(holds, torch.clamp(score, min=rule_score(rule, prior)), score)
     return score
 
 
-def evaluate(model, seeds, heads, train_events, evaluation, rate, device, small_below=100):
+def evaluate(model, seeds, heads, train_events, evaluation, rate, device, small_below=100, prior=0.0):
     """AP of the rule list seeds on the evaluation sample: per head, macro by size group, micro."""
     L = model.num_literals
     by_head = defaultdict(list)
@@ -74,7 +85,7 @@ def evaluate(model, seeds, heads, train_events, evaluation, rate, device, small_
         pool = step05_mine._pool_of(evaluation, head, L, device)
         if len(pool["y"]) == 0:
             continue
-        score = score_rows(pool, by_head.get(head, []), rate[head])
+        score = score_rows(pool, by_head.get(head, []), rate[head], prior)
         ap = weighted_ap(score, pool["y"], pool["w"])
         if ap is not None:
             per_head[head] = ap
@@ -95,6 +106,8 @@ def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--lifts", type=str, default="1.2,1.5,2.0", help="mine_min_lift values")
     parser.add_argument("--min_events_list", type=str, default="20,10,5", help="mine_min_events values")
+    parser.add_argument("--priors", type=str, default="0,10,20,50",
+                        help="rule confidence shrunk to the root's with this many onsets (0 = raw precision)")
     parser.add_argument("--val_ratio", type=float, default=0.75,
                         help="mine_val_lift = val_ratio x mine_min_lift (default 0.75: 2.0 -> 1.5, as the main run)")
     args = utils_pipe.parse_args(parser)
@@ -116,7 +129,9 @@ def main():
     possible = step05.class_possible(training_data, vocab, device)
 
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
-    rows_file = out_dir / f"rows_{tag}_s{cfg['seed']}.pt"
+    # The row sample does not depend on the mining version or the rule settings (only on the caps, which stay
+    # in the tag): the cache name leaves the version out, so a new version reuses it.
+    rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}_s{cfg['seed']}.pt"
     if os.path.exists(rows_file) and step05.is_fresh(rows_file, cfg["training_data_file"]):
         train, val = torch.load(rows_file, map_location="cpu")
     else:
@@ -139,6 +154,7 @@ def main():
                                           for me in [int(x) for x in args.min_events_list.split(",")]
                                           for lift in [float(x) for x in args.lifts.split(",")]]
     results, root_seeds = {}, None
+    priors = [float(x) for x in args.priors.split(",")]
     for name, lift, me in settings:
         if name == "roots":
             continue
@@ -150,12 +166,13 @@ def main():
         if root_seeds is None:
             root_seeds = [sd for sd in seeds if sd.get("root")]
         mined = [sd for sd in seeds if not sd.get("root")]
-        res = evaluate(model, seeds, heads, train_events, evaluation, rate, device)
-        res.update({"rules": len(mined), "heads_mined": len({sd["head"] for sd in mined}),
-                    "literals_per_rule": sum(len(sd["literals"]) for sd in mined) / max(len(mined), 1),
-                    "lift": lift, "val_lift": args.val_ratio * lift, "min_events": me,
-                    "rules_text": [sd["text"] for sd in mined]})
-        results[name] = res
+        for prior in priors:
+            res = evaluate(model, seeds, heads, train_events, evaluation, rate, device, prior=prior)
+            res.update({"rules": len(mined), "heads_mined": len({sd["head"] for sd in mined}),
+                        "literals_per_rule": sum(len(sd["literals"]) for sd in mined) / max(len(mined), 1),
+                        "lift": lift, "val_lift": args.val_ratio * lift, "min_events": me, "prior": prior,
+                        "rules_text": [sd["text"] for sd in mined]})
+            results[f"{name}_k{prior:g}"] = res
     res = evaluate(model, root_seeds, heads, train_events, evaluation, rate, device)
     res.update({"rules": 0, "heads_mined": 0, "literals_per_rule": 0.0})
     results = {"roots": res, **results}
@@ -164,15 +181,15 @@ def main():
     print(f"\n[Sweep] eval = odd val videos ({len(range(1, num_val, 2))}); train onsets per head group: "
           + ", ".join(f"{g} {sum(1 for h in heads if lo <= train_events[h] < hi)} heads"
                       for g, lo, hi in SIZE_GROUPS))
-    print(f"{'setting':16s} {'rules':>5s} {'heads':>5s} {'lits':>5s} {'micro':>6s} {'mic100':>6s} {'macro':>6s} "
+    print(f"{'setting':22s} {'rules':>5s} {'heads':>5s} {'lits':>5s} {'micro':>6s} {'mic100':>6s} {'macro':>6s} "
           + " ".join(f"{g:>8s}" for g in groups))
     for name, r in results.items():
-        print(f"{name:16s} {r['rules']:5d} {r['heads_mined']:5d} {r['literals_per_rule']:5.2f} {r['micro']:6.3f} "
+        print(f"{name:22s} {r['rules']:5d} {r['heads_mined']:5d} {r['literals_per_rule']:5.2f} {r['micro']:6.3f} "
               f"{r['micro_ge100']:6.3f} {r['macro']:6.3f} "
               + " ".join(f"{r['by_size'][g]['macro']:8.3f}" if r['by_size'][g]['macro'] is not None else f"{'-':>8s}"
                          for g in groups))
     path = out_dir / f"mine_sweep_{tag}_s{cfg['seed']}.json"
-    utils_data.save_json({"settings": {"lifts": args.lifts, "min_events": args.min_events_list,
+    utils_data.save_json({"settings": {"lifts": args.lifts, "min_events": args.min_events_list, "priors": args.priors,
                                        "val_ratio": args.val_ratio, "seed": cfg["seed"]},
                           "names": {h: names[h] for h in heads}, "train_events": train_events,
                           "results": {k: {**v, "per_head": {names[h]: ap for h, ap in v["per_head"].items()}}

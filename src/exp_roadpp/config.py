@@ -408,6 +408,7 @@ def get_step_05_input(args):
         "mine_roots": getattr(args, "mine_roots", None),
         "mine_min_events": getattr(args, "mine_min_events", None),
         "mine_val_lift": getattr(args, "mine_val_lift", None),
+        "mine_prior": getattr(args, "mine_prior", None),
         "anchor_subset_seed": int(getattr(args, "anchor_subset_seed", 0)),
         "train_fraction": float(getattr(args, "train_fraction", 1.0)),
         "train_subset_seed": int(getattr(args, "train_subset_seed", 0)),

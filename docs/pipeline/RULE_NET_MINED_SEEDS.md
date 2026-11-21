@@ -80,3 +80,20 @@ then the paper table at the fixed false-alarm budget, then the recall of the inj
 ```bash
 ./run_roadpp_docker.sh --gpu 0 --mine_sweep -- --exp sumo_maps_v7 --machine dgx-jing
 ```
+
+## m4: sweep defaults and shrunk confidence (2026-11-21)
+
+The first `mine_sweep` (v7, odd val videos, row-level weighted AP):
+
+| setting | rules | heads mined | micro | macro |
+|---|---|---|---|---|
+| lift 2.0 / 20 onsets (m3) | 129 | 59 | 0.258 | 0.117 |
+| lift 1.2 / 10 | 274 | 79 | 0.265 | 0.131 |
+| lift 1.2 / 5 | 354 | 92 | 0.233 | 0.140 |
+
+- **New defaults:** `mine_min_lift` 1.2, `mine_val_lift` 0.9, `mine_min_events` 10.
+- **Shrunk confidence.** With 5 onsets the small rules' raw precision ranks them first across heads, and the micro AP falls.
+  - Each seed now carries `"confidence"` = (events + k x root precision) / (events / precision + k), with k = `--mine_prior` (20).
+  - The step06 anchor baseline shrinks toward the head prior with `ANCHOR_PRIOR_ROWS` = 200 rows (`BASELINE_VERSION` v2).
+  - `mine_sweep --priors 0,10,20,50` scores every setting with each k.
+- **Not yet used.** The rule net still seeds every rule with head weight `seed_head_weight`; it does not read the confidence yet.

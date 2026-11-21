@@ -80,13 +80,16 @@ def get_parser():
     parser.add_argument("--clause_slots", type=int, default=2,
                         help="Step 05: a clause hits its head if it switches on within this many slots (default 2 = 2 s)")
     parser.add_argument("--mine_min_lift", type=float, default=None,
-                        help="Step 05 mining: a mined rule's precision >= this x its root's (default 2.0)")
+                        help="Step 05 mining: a mined rule's precision >= this x its root's (default 1.2)")
     parser.add_argument("--mine_val_lift", type=float, default=None,
-                        help="Step 05 mining: a mined rule's val precision >= this x its root's (default 1.5)")
+                        help="Step 05 mining: a mined rule's val precision >= this x its root's (default 0.9)")
+    parser.add_argument("--mine_prior", type=float, default=None,
+                        help="Step 05 mining: shrink a rule's confidence to its root's precision with this many "
+                             "onsets (default 20; 0 = the raw train precision)")
     parser.add_argument("--mine_max_rules", type=int, default=None, help="Step 05 mining: rules per root (default 8)")
     parser.add_argument("--mine_roots", type=int, default=None, help="Step 05 mining: roots per head (default 2)")
     parser.add_argument("--mine_min_events", type=int, default=None,
-                        help="Step 05 mining: onsets a mined rule must hit (default 20)")
+                        help="Step 05 mining: onsets a mined rule must hit (default 10)")
     parser.add_argument("--anchor_subset_seed", type=int, default=0, help="Seed of --anchor_source random")
     parser.add_argument("--train_fraction", type=float, default=1.0,
                         help="Step 05: learning curve, train on this share of the train videos (nested subsets; "

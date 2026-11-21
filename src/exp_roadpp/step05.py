@@ -1837,7 +1837,7 @@ def _print_summary(clauses, training_data, cfg, num_examples=15, title="Step 05 
               f"{_temporal_clause_text(clause, unique_atoms)}")
 
 
-MINE_VERSION = "m3"            # `step05_mine`: bump when the mining changes (new seeds, new model files); m2: root seeds, free-rule symmetry, positive-only learned literals; m3: reproducible row sample (hash of video, frame, agent, head)
+MINE_VERSION = "m4"            # `step05_mine`: bump when the mining changes (new seeds, new model files); m2: root seeds, free-rule symmetry, positive-only learned literals; m3: reproducible row sample (hash of video, frame, agent, head); m4: lift 1.2 / 10 onsets / val 0.9, shrunk rule confidence
 
 
 def anchor_file_of(input_data, source, seed=0):
@@ -1864,10 +1864,14 @@ def anchor_file_of(input_data, source, seed=0):
     return out
 
 
-MINE_DEFAULTS = {"mine_pos_cap": 5000, "mine_neg_cap": 10000, "mine_depth": 3, "mine_min_events": 20,
-                 "mine_min_lift": 2.0, "mine_val_lift": 1.5, "mine_max_rules": 8, "mine_roots": 2}
+# Since m4 (mine_sweep, SUMO v7, 2026-11-21): lift 1.2 and 10 onsets beat 2.0 / 20 (micro 0.258 -> 0.265,
+# macro 0.117 -> 0.131, 59 -> 79 heads with mined rules); val lift 0.75 x the lift. mine_prior: the rule
+# confidence is shrunk to the root's precision with this many onsets (`step05_mine.shrunk_confidence`).
+MINE_DEFAULTS = {"mine_pos_cap": 5000, "mine_neg_cap": 10000, "mine_depth": 3, "mine_min_events": 10,
+                 "mine_min_lift": 1.2, "mine_val_lift": 0.9, "mine_max_rules": 8, "mine_roots": 2, "mine_prior": 20}
 MINE_SHORT = {"mine_pos_cap": "pc", "mine_neg_cap": "nc", "mine_depth": "d", "mine_min_events": "me",
-              "mine_min_lift": "ml", "mine_val_lift": "vl", "mine_max_rules": "mr", "mine_roots": "rt"}
+              "mine_min_lift": "ml", "mine_val_lift": "vl", "mine_max_rules": "mr", "mine_roots": "rt",
+              "mine_prior": "pr"}
 
 
 def mine_settings_tag(settings):
@@ -2017,11 +2021,13 @@ def get_cfg(input_data):
         'mine_pos_cap': int(input_data.get("mine_pos_cap") or 5000),
         'mine_neg_cap': int(input_data.get("mine_neg_cap") or 10000),
         'mine_depth': int(input_data.get("mine_depth") or 3),
-        'mine_min_events': int(input_data.get("mine_min_events") or 20),
-        'mine_min_lift': float(input_data.get("mine_min_lift") or 2.0),
-        'mine_val_lift': float(input_data.get("mine_val_lift") or 1.5),
+        'mine_min_events': int(input_data.get("mine_min_events") or MINE_DEFAULTS["mine_min_events"]),
+        'mine_min_lift': float(input_data.get("mine_min_lift") or MINE_DEFAULTS["mine_min_lift"]),
+        'mine_val_lift': float(input_data.get("mine_val_lift") or MINE_DEFAULTS["mine_val_lift"]),
         'mine_max_rules': int(input_data.get("mine_max_rules") or 8),
         'mine_roots': int(input_data.get("mine_roots") or 2),
+        'mine_prior': float(input_data["mine_prior"] if input_data.get("mine_prior") is not None
+                            else MINE_DEFAULTS["mine_prior"]),
     }
     mine_tag = mine_settings_tag(mine_settings)
     tag = base_tag + type_balance_tag(type_balance) + ("_self" if require_self else "") + ("_rng" if slot_ranges else "")
