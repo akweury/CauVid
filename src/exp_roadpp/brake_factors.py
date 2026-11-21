@@ -849,7 +849,7 @@ SMALL_MIN_EVENTS = 3
 SMALL_MAX_FAILS = 50       # phase 2 stops after this many rules in a row failed SMALL_MIN_EVENTS
 RECALL_GROUPS = (("large", 0.05, 2.0), ("mid", 0.01, 0.05), ("small", 0.0, 0.01))
 SHRINK_ROWS = 50           # list_shrunk: a rule's precision shrunk to the base rate with this many rows
-LOGIT_L2 = (1e-4, 1e-3, 1e-2)
+LOGIT_L2 = (0.0, 1e-5, 1e-4, 1e-3, 1e-2)   # 0 / 1e-5 since the test run (smaller L2 was better)
 LOGIT_STEPS = 500
 LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000)
 
@@ -1119,6 +1119,140 @@ def rule_list(train, val, test, bank, device):
             "phases": {ph: sum(r["phase"] == ph for r in rules) for ph in ("foil", "small", "broad")}}
 
 
+# -------------- Boosted rules: each rule learned on all rows, on the residual of the rules so far --------------
+# Sequential covering removes a rule's rows, so no later rule can rank the rows inside it (test 2026-11-21:
+# 10 -> 200 rules raised the test AP only 0.506 -> 0.530; rule list + logit 0.609 vs SetNet 0.664). Boosting
+# (as RuleFit / SLIPPER): round by round, on all train rows, the rule (<= BOOST_DEPTH literals or negations of
+# the same bank) of the largest Newton gain G^2 / (H + lambda) on the current logistic score, G / H the sums of
+# the gradient y - p and of p (1 - p) over its rows; its weight is BOOST_SHRINK x G / (H + lambda) (negative
+# weights too: a rule can lower the score inside an earlier rule). The rounds stop by the val AP.
+BOOST_ROUNDS = 2000
+BOOST_SHRINK = 0.1
+BOOST_LAMBDA = 5.0
+BOOST_DEPTH = 3
+BOOST_MIN_ROWS = 30         # train rows a rule holds on
+BOOST_MIN_RISE = 1.01       # a further literal must raise the rule's gain by >= 1%
+BOOST_EVAL = 50             # rounds between AP checks
+BOOST_PATIENCE = 10         # checks without a better val AP before stopping
+
+
+def _col_sums(V, M):
+    """(k, L) = V (k, R) float @ M (R, L) bool, in column chunks."""
+    return torch.cat([V @ M[:, c:c + 2048].float() for c in range(0, M.shape[1], 2048)], dim=1)
+
+
+def boosted_rules(train, val, test, bank, device, use=None):
+    """Boosted rule ensemble on the literal bank (the columns use only, if given). Returns the rules (with
+    weights), the AP curve by round, the train / val / test AP at the best val round, and a refit: an L2
+    logistic regression on the firings of the distinct rules up to that round (L2 chosen on val)."""
+    descs, M_tr, M_va, M_te = bank
+    if use is not None:
+        idx = torch.tensor(use, dtype=torch.long)
+        descs, M_tr, M_va, M_te = [descs[i] for i in use], M_tr[:, idx], M_va[:, idx], M_te[:, idx]
+    n = len(descs)
+    M_dev = M_tr.to(device)
+    ys = {"train": train["y"], "val": val["y"], "test": test["y"]}
+    y = ys["train"].float().to(device)
+    base = float(y.mean())
+    f0 = math.log(base / (1 - base))
+    F = {"train": torch.full((len(y),), f0, device=device), "val": torch.full((len(ys["val"]),), f0),
+         "test": torch.full((len(ys["test"]),), f0)}
+    Ms = {"val": M_va, "test": M_te}
+
+    def fires(M, lits):
+        f = torch.ones(M.shape[0], dtype=torch.bool, device=M.device)
+        for k in lits:
+            f &= M[:, k % n] if k < n else ~M[:, k % n]
+        return f
+    rules, curve = [], []
+    best = {"round": 0, "val_ap": -1.0}
+    fails = 0
+    for rnd in tqdm(range(BOOST_ROUNDS), desc="Boosted rules"):
+        p = torch.sigmoid(F["train"])
+        g, h = y - p, p * (1 - p)
+        S = torch.ones(len(y), dtype=torch.bool, device=device)
+        lits, used, now = [], [], 0.0
+        for _d in range(BOOST_DEPTH):
+            Sf = S.float()
+            tot = torch.stack([(g * Sf).sum(), (h * Sf).sum(), Sf.sum()])
+            pos = _col_sums(torch.stack([g * Sf, h * Sf, Sf]), M_dev)
+            sums = torch.cat([pos, tot[:, None] - pos], dim=1)                 # literals, then negations
+            gain = sums[0] ** 2 / (sums[1] + BOOST_LAMBDA)
+            ok = sums[2] >= BOOST_MIN_ROWS
+            if used:
+                ok[torch.tensor(used, device=device)] = False
+            gain = torch.where(ok, gain, torch.full_like(gain, -1.0))
+            k = int(gain.argmax())
+            if float(gain[k]) <= now * BOOST_MIN_RISE:
+                break
+            S = S & (M_dev[:, k % n] if k < n else ~M_dev[:, k % n])
+            lits.append(k)
+            used += [k % n, k % n + n]
+            now = float(gain[k])
+        if not lits:
+            break
+        Sf = S.float()
+        G, H = float((g * Sf).sum()), float((h * Sf).sum())
+        w = BOOST_SHRINK * G / (H + BOOST_LAMBDA)
+        F["train"] += w * Sf
+        for split in ("val", "test"):
+            F[split] += w * fires(Ms[split], lits).float()
+        hits, rows = int((S & ys["train"].to(device)).sum()), int(S.sum())
+        rules.append({"literals": lits, "weight": w, "rows": rows, "hits": hits, "precision": hits / max(rows, 1),
+                      "text": " & ".join(literal_text(descs[k % n], k >= n) for k in lits)})
+        if (rnd + 1) % BOOST_EVAL == 0:
+            point = {"rounds": rnd + 1, **{f"{s}_ap": average_precision(F[s].cpu(), ys[s]) for s in F}}
+            curve.append(point)
+            if point["val_ap"] > best["val_ap"]:
+                best, fails = dict(point), 0
+            else:
+                fails += 1
+                if fails >= BOOST_PATIENCE:
+                    break
+    if not curve or curve[-1]["rounds"] != len(rules):                        # the last partial check
+        point = {"rounds": len(rules), **{f"{s}_ap": average_precision(F[s].cpu(), ys[s]) for s in F}}
+        curve.append(point)
+        if point["val_ap"] > best["val_ap"]:
+            best = dict(point)
+    kept = rules[:best["rounds"]]
+
+    # Distinct rules up to the best round (a rule can be chosen in several rounds): summed weight; the refit.
+    distinct = {}
+    for r in kept:
+        key = tuple(sorted(r["literals"]))
+        if key in distinct:
+            distinct[key]["weight"] += r["weight"]
+            distinct[key]["rounds"] += 1
+        else:
+            distinct[key] = {**r, "rounds": 1}
+    uniq = list(distinct.values())
+    for r in uniq:
+        for split in ("val", "test"):
+            f = fires(Ms[split], r["literals"])
+            r[f"{split}_rows"] = int(f.sum())
+            r[f"{split}_precision"] = int((f & ys[split]).sum()) / max(int(f.sum()), 1)
+    refit = {}
+    if uniq:
+        X = {"train": torch.stack([fires(M_dev, r["literals"]) for r in uniq], dim=1).float()}
+        for split in ("val", "test"):
+            X[split] = torch.stack([fires(Ms[split], r["literals"]) for r in uniq], dim=1).float().to(device)
+        for l2 in LOGIT_L2:
+            w = torch.tensor([r["weight"] for r in uniq], device=device, requires_grad=True)   # boosted init
+            b = torch.tensor([f0], device=device, requires_grad=True)
+            opt = torch.optim.Adam([w, b], lr=0.02)
+            for _ in range(LOGIT_STEPS):
+                loss = torch.nn.functional.binary_cross_entropy_with_logits(X["train"] @ w + b, y) + l2 * (w * w).sum()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            with torch.no_grad():
+                refit[f"{l2:g}"] = {f"{s}_ap": average_precision((X[s] @ w + b).cpu(), ys[s]) for s in X}
+    uniq.sort(key=lambda r: -abs(r["weight"]) * r["rows"])
+    return {"literals": n, "rounds": len(rules), "best": best, "curve": curve, "refit": refit,
+            "distinct_rules": len(uniq), "positive_rules": sum(r["weight"] > 0 for r in uniq),
+            "rules": uniq}
+
+
 # -------------- Neural reference on the same features --------------
 NET_EPOCHS = 400           # full-batch steps
 NET_HIDDEN = 64
@@ -1335,6 +1469,12 @@ def main():
     print(f"[Rule list] {len(big_bank[0])} literals (+ their negations)")
     rlist = rule_list(train, val, test, big_bank, device)
 
+    # Boosted rules on the same bank: all literals, and the image ones only (no SUMO ground truth: what the
+    # main model has on real video; compare with SetNet img).
+    img_cols = [i for i, d_ in enumerate(big_bank[0]) if "gt:" not in literal_text(d_)]
+    boosted = {"all": boosted_rules(train, val, test, big_bank, device),
+               "img": boosted_rules(train, val, test, big_bank, device, use=img_cols)}
+
     nets = [neural_reference(train, val, test, source, device) for source in ("img", "all")]
 
     # Final comparison on test: every model's settings chosen on val (rule scorer / L2; SetNet step).
@@ -1346,6 +1486,15 @@ def main():
     for label, k in (("rule list, best scorer on val", pick(scorer_keys)), ("rule list + logit, L2 on val", pick(logit_keys))):
         comparison.append({"model": label, "setting": k, "train_ap": full.get(f"train_ap_{k}"),
                            "val_ap": full.get(f"val_ap_{k}"), "test_ap": full.get(f"test_ap_{k}")})
+    for src, bo in boosted.items():
+        b_ = bo["best"]
+        comparison.append({"model": f"boosted rules {src}, rounds on val", "setting": f"{b_['rounds']} rounds",
+                           "train_ap": b_.get("train_ap"), "val_ap": b_["val_ap"], "test_ap": b_.get("test_ap")})
+        if bo["refit"]:
+            k = max(bo["refit"], key=lambda k: bo["refit"][k]["val_ap"] or -1.0)
+            r_ = bo["refit"][k]
+            comparison.append({"model": f"boosted rules {src} + refit", "setting": f"L2 {k}",
+                               "train_ap": r_["train_ap"], "val_ap": r_["val_ap"], "test_ap": r_["test_ap"]})
     for n_ in nets:
         comparison.append({"model": f"SetNet {n_['source']}, step on val", "setting": "early stop",
                            "train_ap": None, "val_ap": n_["best_val_ap"], "test_ap": n_["test_ap_at_best_val"]})
@@ -1457,6 +1606,18 @@ def main():
             print(f"  {'root ' if k == 0 else '   & '}{st['add']}: p_tr {st['train']['precision']:.2f}, "
                   f"p_val {st['val']['precision']:.2f}, events {st['val']['events']}, recall {st['val']['recall']:.2f}")
         print()
+    for src, bo in boosted.items():
+        print(f"\n== Boosted rules ({src}: {bo['literals']} literals): {bo['rounds']} rounds, best val at "
+              f"{bo['best']['rounds']}, {bo['distinct_rules']} distinct rules ({bo['positive_rules']} raise the score)")
+        print("  rounds  train / val / test AP")
+        for c in bo["curve"][::2]:
+            print(f"  {c['rounds']:6d}  {c['train_ap']:.3f} / {c['val_ap']:.3f} / {c['test_ap']:.3f}")
+        print("  refit (logistic on the distinct rules): " + ", ".join(
+            f"L2 {k}: {v['train_ap']:.3f} / {v['val_ap']:.3f} / {v['test_ap']:.3f}" for k, v in bo["refit"].items()))
+        print("  rules of the largest |weight| x rows:")
+        for r in bo["rules"][:25]:
+            print(f"    w {r['weight']:+.2f} x{r['rounds']:3d} rows {r['rows']:6d} p_tr {r['precision']:.2f} "
+                  f"p_val {r['val_precision']:.2f} p_test {r['test_precision']:.2f}: {r['text'][:180]}")
     print(f"\n== Test comparison (settings chosen on val; test untouched until here; prior AP ~ {base_te:.3f})")
     for c in comparison:
         f3 = lambda x: f"{x:.3f}" if x is not None else "  -  "
@@ -1466,6 +1627,7 @@ def main():
     utils_data.save_json({"head": args.head, "stride": STRIDE, "window": WINDOW, "bins": Q, "pair_bins": Q2,
                           "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va, "test_base": base_te,
                           "comparison": comparison,
+                          "boosted": {k: {**v, "rules": v["rules"][:500]} for k, v in boosted.items()},
                           "capacity": bool(args.capacity), "nets": nets, "rule_list": rlist,
                           "singles": singles, "pairs": pairs, "triples": triples,
                           "regions": {str(k): [{x: v for x, v in r.items() if not x.startswith("_")} for r in regions[k]]
