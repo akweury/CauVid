@@ -37,6 +37,10 @@ cells" (k = 1, 2, 3 features; 32 / 16 / 8 train-quantile bins per feature): seve
 and any shape over the features, grown greedily cell by cell by the FOIL gain. Compared with the single best
 interval / box of the same features; synergy = gain minus the best region over fewer features.
 
+Rule list (`rule_list`): sequential covering over every literal found (intervals, boxes, regions, their
+negations): each rule grows by FOIL gain on the rows no earlier rule covers; AP of the list (decision list
+and unordered max) on train and val by number of rules, against the SetNet (can rules fit as well?).
+
 Round 2 (`refine`): the best roots (singles / pairs with val lift >= 1.5) get up to two more conditions,
 each from a bank of literals "some agent of a group (ahead / veh / ped / the ego) has f in (a, b]" (Q_BANK
 train-quantile bins) or its negation "no agent of the group has f in (a, b]" (e.g. "a large vehicle merges
@@ -718,6 +722,128 @@ def refine(root, train, val, bank, device):
     return steps
 
 
+
+# -------------- Rule list by sequential covering --------------
+LIST_MAX_RULES = 30        # rules of the list (capacity mode: 100)
+LIST_DEPTH = 3             # literals per rule (capacity mode: 5)
+LIST_MIN_HITS = 30         # positive rows a rule keeps on the rows still uncovered (capacity mode: 5)
+LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100)
+
+
+def full_bank(train, val, bank, singles, pairs, triples, regions):
+    """Every literal found so far as membership columns: the interval bank (and single-feature regions) of
+    round 2, plus each single / pair / triple box and each 1 / 2 / 3-feature region on the same agent."""
+    descs, M_tr, M_va = bank
+    descs = list(descs)
+    extra_tr, extra_va = [], []
+
+    def add(text, group, tr, va):
+        descs.append({"group": group, "body": text})
+        extra_tr.append(tr[:, None])
+        extra_va.append(va[:, None])
+    for r in singles:
+        cond = [(r["feature"], r["a"], r["b"])]
+        add(f"{r['feature']} in ({_fmt(r['a'])}, {_fmt(r['b'])}]", r["group"],
+            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+    for r in pairs:
+        cond = [(r["f1"], r["a1"], r["b1"]), (r["f2"], r["a2"], r["b2"])]
+        add(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"],
+            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+    for r in triples:
+        cond = [tuple(c) for c in r["conditions"]]
+        add(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"],
+            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+    for k in (2, 3):
+        for r in regions[k]:
+            add(f"{' x '.join(r['features'])} in region ({r['cells']} cells)", r["group"], *r["_member"])
+    return descs, torch.cat([M_tr] + extra_tr, dim=1), torch.cat([M_va] + extra_va, dim=1)
+
+
+def _best_literal(S, y, M, p_now, min_hits, device, used):
+    """The literal (or its negation: index >= n) of the largest FOIL gain hits x (log p - log p_now) on the
+    rows S, with >= min_hits hits and p > p_now; (index, gain, hits, rows) or None."""
+    s, ys = S.to(device).float(), (S & y).to(device).float()
+    hits_pos = torch.cat([ys @ M[:, c:c + 2048].float() for c in range(0, M.shape[1], 2048)])
+    rows_pos = torch.cat([s @ M[:, c:c + 2048].float() for c in range(0, M.shape[1], 2048)])
+    hits = torch.cat([hits_pos, ys.sum() - hits_pos])
+    rows = torch.cat([rows_pos, s.sum() - rows_pos])
+    p = hits / rows.clamp(min=1)
+    gain = hits * (torch.log(p.clamp(min=1e-12)) - math.log(max(p_now, 1e-12)))
+    ok = (hits >= min_hits) & (p > p_now)
+    if used:
+        ok[torch.tensor(used, device=device)] = False
+    gain = torch.where(ok, gain, torch.full_like(gain, -1.0))
+    k = int(gain.argmax())
+    if float(gain[k]) <= 0:
+        return None
+    return k, float(gain[k]), int(hits[k]), int(rows[k])
+
+
+def rule_list(train, val, bank, device):
+    """Sequential covering: each rule grows literal by literal (FOIL gain, up to LIST_DEPTH) on the train rows
+    no earlier rule covers, then its rows are removed; up to LIST_MAX_RULES rules. Scores: decision list (the
+    first rule that fires gives its train precision; none: the base rate of the rows left) and unordered (the
+    highest precision of the rules that fire). Train / val AP after each number of rules in LIST_CURVE."""
+    descs, M_tr, M_va = bank
+    n = len(descs)
+    M_dev = M_tr.to(device)
+    y_tr, y_va = train["y"], val["y"]
+    left = torch.ones(len(y_tr), dtype=torch.bool)
+    rules = []
+    for _r in tqdm(range(LIST_MAX_RULES), desc="Rule list"):
+        S = left.clone()
+        p_now = float((S & y_tr).sum()) / max(int(S.sum()), 1)
+        lits, used = [], []
+        for _d in range(LIST_DEPTH):
+            best = _best_literal(S, y_tr, M_dev, p_now, LIST_MIN_HITS, device, used)
+            if best is None:
+                break
+            k, _gain, hits, rows = best
+            col = M_tr[:, k % n] if k < n else ~M_tr[:, k % n]
+            S = S & col
+            p_now = hits / max(rows, 1)
+            lits.append(k)
+            used += [k % n, k % n + n]
+        if not lits:
+            break
+        hits, rows = int((S & y_tr).sum()), int(S.sum())
+        text = " & ".join(literal_text(descs[k % n], k >= n) for k in lits)
+        rules.append({"literals": lits, "text": text, "precision": hits / max(rows, 1), "hits": hits, "rows": rows})
+        left &= ~S
+        if int((left & y_tr).sum()) < LIST_MIN_HITS:
+            break
+
+    def fires(M, rule):
+        f = torch.ones(M.shape[0], dtype=torch.bool)
+        for k in rule["literals"]:
+            f &= M[:, k % n] if k < n else ~M[:, k % n]
+        return f
+    F_tr = [fires(M_tr, r) for r in rules]
+    F_va = [fires(M_va, r) for r in rules]
+    curve = []
+    for m in sorted(set([c for c in LIST_CURVE if c <= len(rules)] + [len(rules)])):
+        out = {"rules": m}
+        left_m = torch.ones(len(y_tr), dtype=torch.bool)
+        for f in F_tr[:m]:
+            left_m &= ~f
+        default = float(y_tr[left_m].float().mean()) if bool(left_m.any()) else 0.0
+        for name, F, y in (("train", F_tr, y_tr), ("val", F_va, y_va)):
+            first = torch.full((len(y),), -1.0)
+            best = torch.full((len(y),), -1.0)
+            for r, f in zip(rules[:m], F[:m]):
+                first = torch.where((first < 0) & f, torch.tensor(r["precision"]), first)
+                best = torch.where(f, torch.clamp(best, min=r["precision"]), best)
+            covered = first >= 0
+            out[f"{name}_ap_list"] = average_precision(torch.where(covered, first, torch.tensor(default)), y)
+            out[f"{name}_ap_max"] = average_precision(torch.where(covered, best, torch.tensor(default)), y)
+            out[f"{name}_coverage"] = float((covered & y).sum()) / max(int(y.sum()), 1)
+        curve.append(out)
+    for r, f in zip(rules, F_va):
+        hits = int((f & y_va).sum())
+        r["val_precision"] = hits / max(int(f.sum()), 1)
+        r["val_hits"] = hits
+    return {"rules": rules, "curve": curve}
+
 # -------------- Neural reference on the same features --------------
 NET_EPOCHS = 400           # full-batch steps
 NET_HIDDEN = 64
@@ -816,6 +942,7 @@ def main():
                              "(min hits, margin lift, val checks), finer region bins (64 / 32 / 16), deeper "
                              "refinement chosen on train only; writes brake_factors_<head>_capacity.json")
     args = utils_pipe.parse_args(parser)
+    global LIST_MAX_RULES, LIST_DEPTH, LIST_MIN_HITS
     global MIN_POS, Q_REGION, REGION_MIN_NEW_HITS, REGION_MARGIN_LIFT, REGION_MAX_STEPS, REFINE_DEPTH, \
         REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS, ROOT_MIN_LIFT, ROOT_MIN_EVENTS
     if args.capacity:
@@ -823,6 +950,7 @@ def main():
         Q_REGION, REGION_MAX_STEPS = {1: 64, 2: 32, 3: 16}, 5000
         REFINE_DEPTH, REFINE_MIN_POS, REFINE_VAL_RISE, REFINE_MIN_VAL_EVENTS = 4, 10, 0.0, 0
         ROOT_MIN_LIFT, ROOT_MIN_EVENTS = 0.0, 0
+        LIST_MAX_RULES, LIST_DEPTH, LIST_MIN_HITS = 100, 5, 5
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
         else args.output_dir / "brake_factors"
@@ -910,6 +1038,11 @@ def main():
     print(f"[Refine] {len(bank[0])} literals (+ their negations), {len(roots)} roots")
     refined = [{"root": r, "steps": refine(r, train, val, bank, device)} for r in tqdm(roots, desc="Refining")]
 
+    # The rule list: can a set of such rules fit train as the SetNet does?
+    big_bank = full_bank(train, val, bank, singles, pairs, triples, regions)
+    print(f"[Rule list] {len(big_bank[0])} literals (+ their negations)")
+    rlist = rule_list(train, val, big_bank, device)
+
     nets = [neural_reference(train, val, source, device) for source in ("img", "all")]
 
     base_tr, base_va = float(train["y"].float().mean()), float(val["y"].float().mean())
@@ -979,6 +1112,18 @@ def main():
     for n in nets:
         print(f"  SetNet ({n['source']} features, all agents): train AP {n['train_ap']:.3f}, val AP {n['val_ap']:.3f} "
               f"(best over steps {n['best_val_ap']:.3f})")
+    print(f"\n== Rule list (sequential covering, <= {LIST_DEPTH} literals per rule, >= {LIST_MIN_HITS} positive rows): "
+          f"AP by number of rules; list = first rule that fires, max = best rule that fires; coverage = share of "
+          f"the positive rows some rule covers")
+    for c in rlist["curve"]:
+        print(f"  {c['rules']:4d} rules: train AP list {c['train_ap_list']:.3f} / max {c['train_ap_max']:.3f} "
+              f"(coverage {c['train_coverage']:.2f}) | val AP list {c['val_ap_list']:.3f} / max {c['val_ap_max']:.3f} "
+              f"(coverage {c['val_coverage']:.2f})")
+    for n_ in nets:
+        print(f"  SetNet ({n_['source']}): train AP {n_['train_ap']:.3f}, val AP {n_['val_ap']:.3f}")
+    print("  first rules:")
+    for i, r in enumerate(rlist["rules"][:20]):
+        print(f"   {i + 1:3d}. p_tr {r['precision']:.2f} ({r['hits']} hits) p_val {r['val_precision']:.2f}: {r['text'][:220]}")
     print("\n== Refined rules: root, then each added condition (train / val precision, val events, val recall)")
     for item in refined:
         for k, st in enumerate(item["steps"]):
@@ -988,7 +1133,7 @@ def main():
     path = out_dir / f"brake_factors_{tag}{'_capacity' if args.capacity else ''}.json"
     utils_data.save_json({"head": args.head, "stride": STRIDE, "window": WINDOW, "bins": Q, "pair_bins": Q2,
                           "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va,
-                          "capacity": bool(args.capacity), "nets": nets,
+                          "capacity": bool(args.capacity), "nets": nets, "rule_list": rlist,
                           "singles": singles, "pairs": pairs, "triples": triples,
                           "regions": {str(k): [{x: v for x, v in r.items() if x != "_member"} for r in regions[k]]
                                       for k in regions},
