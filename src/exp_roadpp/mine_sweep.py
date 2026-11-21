@@ -99,6 +99,9 @@ def main():
                         help="mine_val_lift = val_ratio x mine_min_lift (default 0.75: 2.0 -> 1.5, as the main run)")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
+    # The step 05 files (ego motion / grid specs, ...) of a run with --run_id, else of the sweep folder.
+    args.run_dir = args.output_dir / "runs" / args.run_id if getattr(args, "run_id", None) \
+        else args.output_dir / "mine_sweep"
     cfg = step05.get_cfg(config.get_step_05_input(args))
     device = cfg["device"]
     out_dir = args.output_dir / "mine_sweep"
