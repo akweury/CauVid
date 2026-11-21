@@ -678,7 +678,16 @@ def region_search(train, val, group, feats, device):
             "val_precision": p_va, "val_lift": p_va / max(base_va, 1e-12), "val_rows": rows_n, "val_hits": hits_va,
             "val_events": int(val["event"][member_va & y_va].unique().numel()),
             "val_recall": hits_va / max(int(y_va.sum()), 1), "train_recall": hits / max(float(y.sum()), 1),
-            "lookup_train_ap": lookup["train"], "lookup_val_ap": lookup["val"], "_member": (member_tr, member_va)}
+            "lookup_train_ap": lookup["train"], "lookup_val_ap": lookup["val"], "_member": (member_tr, member_va),
+            "_edges": edges, "_in_region": in_region}
+
+
+def region_member(data, r):
+    """(R,) bool: the rows of data (any split) where some agent of r's group lies in the region r."""
+    rows, cell = _cells(data, r["group"], r["features"], r["_edges"])
+    member = torch.zeros(len(data["y"]), dtype=torch.bool)
+    member[rows[r["_in_region"][cell]]] = True
+    return member
 
 # -------------- Refinement: conditions on other agents, negated ones too --------------
 Q_BANK = 8                 # bins per feature of the literal bank
@@ -710,20 +719,21 @@ def member_of(data, group, conditions):
     return member
 
 
-def literal_bank(train, val):
+def literal_bank(train, val, test):
     """Literals "some agent of a group has f in (a, b]" for every group, feature and interval of Q_BANK
-    train-quantile bins: [description], (R_train, n) bool, (R_val, n) bool. The negation of a literal
+    train-quantile bins: [description], (R_train, n), (R_val, n), (R_test, n) bool. The negation of a literal
     ("no agent of the group has f in (a, b]") is its complement, taken in `refine`."""
-    descs, cols_tr, cols_va = [], [], []
+    descs, cols_tr, cols_va, cols_te = [], [], [], []
     for group in GROUPS:
         # The labels (0/1): "some agent of the group holds label X (s seconds ago)", one literal each.
         for f in features_of(train, group, "label"):
-            per_split = [member_of(data, group, [(f, 0.5, math.inf)]) for data in (train, val)]
+            per_split = [member_of(data, group, [(f, 0.5, math.inf)]) for data in (train, val, test)]
             if int(per_split[0].sum()) < 10:
                 continue
             descs.append({"group": group, "feature": f, "body": f"{f}"})
             cols_tr.append(per_split[0][:, None])
             cols_va.append(per_split[1][:, None])
+            cols_te.append(per_split[2][:, None])
         for f in features_of(train, group, "cont"):
             rows, v = _obs(train, group, f)
             if len(v) < 1000:
@@ -732,7 +742,7 @@ def literal_bank(train, val):
             B = len(edges) + 1
             i, j = _interval_index(B)
             per_split = []
-            for data in (train, val):
+            for data in (train, val, test):
                 r, x = _obs(data, group, f)
                 P = _presence(r, torch.bucketize(x, edges), len(data["y"]), B, "cpu")
                 C = torch.cat([torch.zeros((len(data["y"]), 1)), P.cumsum(dim=1)], dim=1)
@@ -746,7 +756,8 @@ def literal_bank(train, val):
             keep = ~((i == 0) & (j == B - 1))
             cols_tr.append(per_split[0][:, keep])
             cols_va.append(per_split[1][:, keep])
-    return descs, torch.cat(cols_tr, dim=1), torch.cat(cols_va, dim=1)
+            cols_te.append(per_split[2][:, keep])
+    return descs, torch.cat(cols_tr, dim=1), torch.cat(cols_va, dim=1), torch.cat(cols_te, dim=1)
 
 
 def literal_text(desc, negated=False):
@@ -761,7 +772,7 @@ def refine(root, train, val, bank, device):
     """Greedy refinement of a root (a single or pair result): up to REFINE_DEPTH literals of the bank or
     their negations, each the largest FOIL gain hits x (log p - log p_now) on the root's train rows still
     covered, kept only if the val precision rises by REFINE_VAL_RISE too. Returns the steps with train / val stats."""
-    descs, M_tr, M_va = bank
+    descs, M_tr, M_va = bank[:3]
     if "_member" in root:
         S_tr, S_va = root["_member"]
         text = literal_text({"group": root["group"], "body": " , ".join(root["features"]) + " in " + root["text"]})
@@ -843,33 +854,34 @@ LOGIT_STEPS = 500
 LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000)
 
 
-def full_bank(train, val, bank, singles, pairs, triples, regions):
-    """Every literal found so far as membership columns: the interval bank (and single-feature regions) of
-    round 2, plus each single / pair / triple box and each 1 / 2 / 3-feature region on the same agent."""
-    descs, M_tr, M_va = bank
+def full_bank(train, val, test, bank, singles, pairs, triples, regions):
+    """Every literal found so far as membership columns (train / val / test): the interval bank (and
+    single-feature regions) of round 2, plus each single / pair / triple box and each 1 / 2 / 3-feature region
+    on the same agent. All of them are chosen on train only."""
+    descs, M_tr, M_va, M_te = bank
     descs = list(descs)
-    extra_tr, extra_va = [], []
+    extra = ([], [], [])
 
-    def add(text, group, tr, va):
+    def add(text, group, *cols):
         descs.append({"group": group, "body": text})
-        extra_tr.append(tr[:, None])
-        extra_va.append(va[:, None])
+        for e, c in zip(extra, cols):
+            e.append(c[:, None])
+
+    def add_box(text, group, cond):
+        add(text, group, *[member_of(d, group, cond) for d in (train, val, test)])
     for r in singles:
-        cond = [(r["feature"], r["a"], r["b"])]
-        add(f"{r['feature']} in ({_fmt(r['a'])}, {_fmt(r['b'])}]", r["group"],
-            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+        add_box(f"{r['feature']} in ({_fmt(r['a'])}, {_fmt(r['b'])}]", r["group"], [(r["feature"], r["a"], r["b"])])
     for r in pairs:
         cond = [(r["f1"], r["a1"], r["b1"]), (r["f2"], r["a2"], r["b2"])]
-        add(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"],
-            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+        add_box(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"], cond)
     for r in triples:
         cond = [tuple(c) for c in r["conditions"]]
-        add(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"],
-            member_of(train, r["group"], cond), member_of(val, r["group"], cond))
+        add_box(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"], cond)
     for k in (2, 3):
         for r in regions[k]:
-            add(f"{' x '.join(r['features'])} in region ({r['cells']} cells)", r["group"], *r["_member"])
-    return descs, torch.cat([M_tr] + extra_tr, dim=1), torch.cat([M_va] + extra_va, dim=1)
+            add(f"{' x '.join(r['features'])} in region ({r['cells']} cells)", r["group"], *r["_member"],
+                region_member(test, r))
+    return (descs,) + tuple(torch.cat([M] + e, dim=1) for M, e in zip((M_tr, M_va, M_te), extra))
 
 
 def _best_literal(S, y, M, p_now, min_hits, device, used):
@@ -916,7 +928,7 @@ def _best_literal_lb(S, y, M, lb_now, min_hits, device, used):
     return k, float(lb[k]), int(hits[k]), int(rows[k])
 
 
-def rule_list(train, val, bank, device):
+def rule_list(train, val, test, bank, device):
     """Rule list without a cap on the number of rules, in three phases on the train rows no earlier rule covers
     (a rule's rows are removed once it is learned):
       1 + 2, rule by rule: a FOIL rule (grown by the FOIL gain, up to LIST_DEPTH literals, >= LIST_MIN_HITS
@@ -928,10 +940,10 @@ def rule_list(train, val, bank, device):
     Scores: decision list (the first rule that fires gives its train precision; none: the onset rate of the
     rows left) and unordered (the highest precision of the rules that fire). Train / val AP by number of rules,
     and by recall group (large / mid / small rules): their count, coverage and the AP without them."""
-    descs, M_tr, M_va = bank
+    descs, M_tr, M_va, M_te = bank
     n = len(descs)
     M_dev = M_tr.to(device)
-    y_tr, y_va = train["y"], val["y"]
+    y_tr, y_va, y_te = train["y"], val["y"], test["y"]
     base = float(y_tr.float().mean())
     total_pos = max(int(y_tr.sum()), 1)
     left = torch.ones(len(y_tr), dtype=torch.bool)
@@ -1014,20 +1026,24 @@ def rule_list(train, val, bank, device):
         return f
     F_tr = [fires(M_tr, r) for r in rules]
     F_va = [fires(M_va, r) for r in rules]
-    for r, f in zip(rules, F_va):
+    F_te = [fires(M_te, r) for r in rules]
+    for r, f, g in zip(rules, F_va, F_te):
         hits = int((f & y_va).sum())
         r["val_precision"] = hits / max(int(f.sum()), 1)
         r["val_hits"], r["val_rows"] = hits, int(f.sum())
+        r["test_precision"] = int((g & y_te).sum()) / max(int(g.sum()), 1)
+        r["test_rows"] = int(g.sum())
 
     for r in rules:
         r["lb"] = float(_wilson_lb(torch.tensor(float(r["hits"])), torch.tensor(float(r["rows"]))))
         r["shrunk"] = (r["hits"] + SHRINK_ROWS * base) / (r["rows"] + SHRINK_ROWS)
     X_tr_all = torch.stack(F_tr, dim=1).float().to(device) if rules else None
     X_va_all = torch.stack(F_va, dim=1).float().to(device) if rules else None
+    X_te_all = torch.stack(F_te, dim=1).float().to(device) if rules else None
 
     def logistic(idx, l2):
-        """Train / val scores of an L2 logistic regression on the firings of the rules idx (fit on train)."""
-        X_tr, X_va = X_tr_all[:, idx], X_va_all[:, idx]
+        """Train / val / test scores of an L2 logistic regression on the firings of the rules idx (fit on train)."""
+        X_tr, X_va, X_te = X_tr_all[:, idx], X_va_all[:, idx], X_te_all[:, idx]
         w = torch.zeros(len(idx), device=device, requires_grad=True)
         b = torch.tensor([math.log(base / (1 - base))], device=device, requires_grad=True)
         opt = torch.optim.Adam([w, b], lr=0.05)
@@ -1038,7 +1054,7 @@ def rule_list(train, val, bank, device):
             loss.backward()
             opt.step()
         with torch.no_grad():
-            return (X_tr @ w + b).cpu(), (X_va @ w + b).cpu()
+            return (X_tr @ w + b).cpu(), (X_va @ w + b).cpu(), (X_te @ w + b).cpu()
 
     def evaluate(keep, logit=True):
         """AP of the rules with keep[i] (in list order), on train and val, per scorer:
@@ -1052,7 +1068,7 @@ def rule_list(train, val, bank, device):
             left_m &= ~F_tr[i]
         default = float(y_tr[left_m].float().mean()) if bool(left_m.any()) else 0.0
         out = {}
-        for name, F, y in (("train", F_tr, y_tr), ("val", F_va, y_va)):
+        for name, F, y in (("train", F_tr, y_tr), ("val", F_va, y_va), ("test", F_te, y_te)):
             for key, value in (("", "precision"), ("_lb", "lb"), ("_shrunk", "shrunk")):
                 first = torch.full((len(y),), -1.0)
                 best = torch.full((len(y),), -1.0)
@@ -1069,9 +1085,10 @@ def rule_list(train, val, bank, device):
                     out[f"{name}_coverage"] = float((covered & y).sum()) / max(int(y.sum()), 1)
         if logit and idx:
             for l2 in LOGIT_L2:
-                s_tr, s_va = logistic(idx, l2)
+                s_tr, s_va, s_te = logistic(idx, l2)
                 out[f"train_ap_logit{l2:g}"] = average_precision(s_tr, y_tr)
                 out[f"val_ap_logit{l2:g}"] = average_precision(s_va, y_va)
+                out[f"test_ap_logit{l2:g}"] = average_precision(s_te, y_te)
         return out
     curve = []
     for m in sorted(set([c for c in LIST_CURVE if c <= len(rules)] + [len(rules)])):
@@ -1160,9 +1177,9 @@ class SetNet(torch.nn.Module):
         return self.head(torch.cat(parts, dim=1)).squeeze(1)
 
 
-def neural_reference(train, val, source, device):
-    """Train / val AP of a SetNet on the img (or img + gt) features, trained to fit train (no early stop);
-    also its best val AP over the steps."""
+def neural_reference(train, val, test, source, device):
+    """Train / val / test AP of a SetNet on the img (or img + gt) features, trained to fit train (no early
+    stop); also its best val AP over the steps and the test AP at that step (early stop chosen on val)."""
     f = train["features"]
     keep = (lambda name: not name.startswith("gt:")) if source == "img" else (lambda name: True)
     feats_agent = [x for x in f["agent_cont"] + f["agent_label"] if keep(x)]
@@ -1170,11 +1187,12 @@ def neural_reference(train, val, source, device):
     st = _stats_of(train, feats_agent, feats_ego)
     x_tr = _net_inputs(train, feats_agent, feats_ego, st, device)
     x_va = _net_inputs(val, feats_agent, feats_ego, st, device)
+    x_te = _net_inputs(test, feats_agent, feats_ego, st, device)
     y_tr = train["y"].float().to(device)
     torch.manual_seed(0)
     net = SetNet(len(feats_agent), len(feats_ego)).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-    best_val, history = 0.0, []
+    best_val, best_test, history = -1.0, None, []
     for step in range(NET_EPOCHS):
         net.train()
         loss = torch.nn.functional.binary_cross_entropy_with_logits(net(x_tr), y_tr)
@@ -1185,10 +1203,14 @@ def neural_reference(train, val, source, device):
             net.eval()
             with torch.no_grad():
                 ap_tr, ap_va = average_precision(net(x_tr), train["y"]), average_precision(net(x_va), val["y"])
-            best_val = max(best_val, ap_va)
-            history.append({"step": step + 1, "loss": float(loss), "train_ap": ap_tr, "val_ap": ap_va})
+                ap_te = average_precision(net(x_te), test["y"])
+            if ap_va > best_val:
+                best_val, best_test = ap_va, ap_te
+            history.append({"step": step + 1, "loss": float(loss), "train_ap": ap_tr, "val_ap": ap_va,
+                            "test_ap": ap_te})
     return {"source": source, "train_ap": history[-1]["train_ap"], "val_ap": history[-1]["val_ap"],
-            "best_val_ap": best_val, "history": history}
+            "test_ap": history[-1]["test_ap"], "best_val_ap": best_val, "test_ap_at_best_val": best_test,
+            "history": history}
 
 # -------------- Main --------------
 def _fmt(x):
@@ -1228,6 +1250,16 @@ def main():
         train = collect(cfg, "train", dataset, args.head)
         val = collect(cfg, "val", dataset, args.head)
         torch.save((train, val), cache)
+    # The test split: only for the final comparison (rule list + logit vs SetNet, each with its settings chosen
+    # on val). Its own cache, so the train / val cache stays valid.
+    test_cache = out_dir / f"rows_{tag}_s{STRIDE}w{WINDOW}_{ROWS_VERSION}_test.pt"
+    if os.path.exists(test_cache):
+        test = torch.load(test_cache, map_location="cpu")
+    else:
+        atoms_dir = args.output_dir / "step_dataset_output" / "atoms"
+        test = collect({**cfg, "test_atom_file": atoms_dir / "test_atoms_compressed.json",
+                        "test_box_file": atoms_dir / "test_boxes.pt"}, "test", dataset, args.head)
+        torch.save(test, test_cache)
 
     singles = []
     for group in GROUPS:
@@ -1287,26 +1319,43 @@ def main():
     candidates = [r for r in singles + pairs + triples + regions[1] + regions[2] + regions[3]
                   if r["val_lift"] >= ROOT_MIN_LIFT and r["val_events"] >= ROOT_MIN_EVENTS]
     roots = sorted(candidates, key=lambda r: -r["gain"])[:REFINE_ROOTS]
-    bank = literal_bank(train, val)
+    bank = literal_bank(train, val, test)
     # The single-feature regions join the bank as literals (several ranges of one feature, and their negation).
-    descs, M_tr, M_va = bank
+    descs, M_tr, M_va, M_te = bank
     region_cols = regions[1]
     bank = (descs + [{"group": r["group"], "body": f"{r['features'][0]} in {r['text']}"} for r in region_cols],
             torch.cat([M_tr] + [r["_member"][0][:, None] for r in region_cols], dim=1),
-            torch.cat([M_va] + [r["_member"][1][:, None] for r in region_cols], dim=1))
+            torch.cat([M_va] + [r["_member"][1][:, None] for r in region_cols], dim=1),
+            torch.cat([M_te] + [region_member(test, r)[:, None] for r in region_cols], dim=1))
     print(f"[Refine] {len(bank[0])} literals (+ their negations), {len(roots)} roots")
     refined = [{"root": r, "steps": refine(r, train, val, bank, device)} for r in tqdm(roots, desc="Refining")]
 
     # The rule list: can a set of such rules fit train as the SetNet does?
-    big_bank = full_bank(train, val, bank, singles, pairs, triples, regions)
+    big_bank = full_bank(train, val, test, bank, singles, pairs, triples, regions)
     print(f"[Rule list] {len(big_bank[0])} literals (+ their negations)")
-    rlist = rule_list(train, val, big_bank, device)
+    rlist = rule_list(train, val, test, big_bank, device)
 
-    nets = [neural_reference(train, val, source, device) for source in ("img", "all")]
+    nets = [neural_reference(train, val, test, source, device) for source in ("img", "all")]
+
+    # Final comparison on test: every model's settings chosen on val (rule scorer / L2; SetNet step).
+    full = rlist["full"]
+    scorer_keys = ["list", "max", "list_lb", "max_lb", "list_shrunk"] + [f"logit{l:g}" for l in LOGIT_L2]
+    logit_keys = [f"logit{l:g}" for l in LOGIT_L2]
+    pick = lambda keys: max(keys, key=lambda k: full.get(f"val_ap_{k}") or -1.0)
+    comparison = []
+    for label, k in (("rule list, best scorer on val", pick(scorer_keys)), ("rule list + logit, L2 on val", pick(logit_keys))):
+        comparison.append({"model": label, "setting": k, "train_ap": full.get(f"train_ap_{k}"),
+                           "val_ap": full.get(f"val_ap_{k}"), "test_ap": full.get(f"test_ap_{k}")})
+    for n_ in nets:
+        comparison.append({"model": f"SetNet {n_['source']}, step on val", "setting": "early stop",
+                           "train_ap": None, "val_ap": n_["best_val_ap"], "test_ap": n_["test_ap_at_best_val"]})
+        comparison.append({"model": f"SetNet {n_['source']}, last step", "setting": f"{NET_EPOCHS} steps",
+                           "train_ap": n_["train_ap"], "val_ap": n_["val_ap"], "test_ap": n_["test_ap"]})
 
     base_tr, base_va = float(train["y"].float().mean()), float(val["y"].float().mean())
+    base_te = float(test["y"].float().mean())
     print(f"\n[Brake factors] {args.head}: train {len(train['y'])} rows, base {base_tr:.3f}; "
-          f"val {len(val['y'])} rows, base {base_va:.3f}")
+          f"val {len(val['y'])} rows, base {base_va:.3f}; test {len(test['y'])} rows, base {base_te:.3f}")
     print("\n== Best single interval per (group, feature), by train gain")
     print(f"{'group':6s} {'feature':18s} {'cat':9s} {'(a, b]':>20s} {'gain':>7s} {'p_tr':>5s} {'p_val':>5s} "
           f"{'lift':>5s} {'recall':>6s} {'events':>6s}")
@@ -1408,14 +1457,20 @@ def main():
             print(f"  {'root ' if k == 0 else '   & '}{st['add']}: p_tr {st['train']['precision']:.2f}, "
                   f"p_val {st['val']['precision']:.2f}, events {st['val']['events']}, recall {st['val']['recall']:.2f}")
         print()
+    print(f"\n== Test comparison (settings chosen on val; test untouched until here; prior AP ~ {base_te:.3f})")
+    for c in comparison:
+        f3 = lambda x: f"{x:.3f}" if x is not None else "  -  "
+        print(f"  {c['model']:34s} {c['setting']:14s} train {f3(c['train_ap'])}  val {f3(c['val_ap'])}  "
+              f"test {f3(c['test_ap'])}")
     path = out_dir / f"brake_factors_{tag}{'_capacity' if args.capacity else ''}.json"
     utils_data.save_json({"head": args.head, "stride": STRIDE, "window": WINDOW, "bins": Q, "pair_bins": Q2,
-                          "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va,
+                          "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va, "test_base": base_te,
+                          "comparison": comparison,
                           "capacity": bool(args.capacity), "nets": nets, "rule_list": rlist,
                           "singles": singles, "pairs": pairs, "triples": triples,
-                          "regions": {str(k): [{x: v for x, v in r.items() if x != "_member"} for r in regions[k]]
+                          "regions": {str(k): [{x: v for x, v in r.items() if not x.startswith("_")} for r in regions[k]]
                                       for k in regions},
-                          "refined": [{"root": {x: v for x, v in i["root"].items() if x != "_member"},
+                          "refined": [{"root": {x: v for x, v in i["root"].items() if not x.startswith("_")},
                                        "steps": i["steps"]} for i in refined]}, path)
     print(f"[Brake factors] saved {path}")
 
