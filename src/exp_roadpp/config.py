@@ -448,6 +448,9 @@ def get_step_06_input(args):
         # are evaluated on the same frames and events (`ablation.py`).
         "eval_min_context": int(getattr(args, "eval_min_context", 0) or 0),
         "review_videos": str(getattr(args, "review_videos", "False")) == "True",
+        # Boosted rule heads (`step06_boost`): the heads, and the fitted rules / scores shared by every run.
+        "boost_heads": str(getattr(args, "boost_heads", "") or ""),
+        "boost_dir": args.output_dir / "boost",
     }
     return input_data
 

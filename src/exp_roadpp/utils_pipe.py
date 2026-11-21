@@ -86,6 +86,10 @@ def get_parser():
     parser.add_argument("--mine_prior", type=float, default=None,
                         help="Step 05 mining: shrink a rule's confidence to its root's precision with this many "
                              "onsets (default 20; 0 = the raw train precision)")
+    parser.add_argument("--boost_heads", type=str, default="",
+                        help="Step 06: ego heads (comma-separated, e.g. av:AV-Brake) scored by boosted rules on image "
+                             "features (`step06_boost`), reported as the scorer 'boost' (the rule net with those "
+                             "heads replaced); default none")
     parser.add_argument("--mine_max_rules", type=int, default=None, help="Step 05 mining: rules per root (default 8)")
     parser.add_argument("--mine_roots", type=int, default=None, help="Step 05 mining: roots per head (default 2)")
     parser.add_argument("--mine_min_events", type=int, default=None,

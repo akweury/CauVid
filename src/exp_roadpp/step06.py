@@ -25,7 +25,7 @@ events and heads; the noise events are reported on their own.
 import os
 import torch
 from tqdm import tqdm
-from src.exp_roadpp import step05, step05_causal, step05_motif, step05_rules, utils_data
+from src.exp_roadpp import step05, step05_causal, step05_motif, step05_rules, step06_boost, utils_data
 
 
 def compute_metrics(tp, fp, fn):
@@ -206,7 +206,8 @@ def _lookup_scores(model, inputs, baselines):
 # "net_pruned": the rule net after the step 05b causal pruning, if it was made; "rule_set":
 # the step 05c rule set (each rule precise, the set covering the events), if it was made.
 # "motif_net": the step 05d two-level MotifRuleNet, if it was trained.
-DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp", "lookup", "anchor", "candidate",
+# "boost": the rule net with the --boost_heads ego heads scored by boosted rules (`step06_boost`).
+DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "boost", "mlp", "lookup", "anchor", "candidate",
                      "cascade")
 # Scorers detected at a fixed threshold instead of cfg["detected_th"]: their scores are no
 # probabilities. The candidates are 0 / 1; the rule set detects whenever one of its rules
@@ -218,12 +219,12 @@ HISTORY_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "mlp")
 SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange", "prior": "tab:gray",
                  "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
                  "rule_set": "tab:olive", "motif_net": "tab:pink", "model_cal": "navy", "mlp_cal": "darkgreen",
-                 "lookup": "#1baf7a", "lookup_cal": "#127a55"}
+                 "lookup": "#1baf7a", "lookup_cal": "#127a55", "boost": "tab:red"}
 SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
                  "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
                  "rule_set": "rule set", "motif_net": "motif net", "model_cal": "rule net (calibrated)",
                  "mlp_cal": "MLP (calibrated)", "lookup": "own-label lookup",
-                 "lookup_cal": "own-label lookup (calibrated)"}
+                 "lookup_cal": "own-label lookup (calibrated)", "boost": "rule net + boosted heads"}
 # The scorers of the per-head rank (`head_rank.pdf`), with their marker (identity never by color alone).
 HEAD_RANK_SCORERS = ("model", "mlp", "lookup")
 HEAD_RANK_MARKERS = {"model": "o", "mlp": "s", "lookup": "D"}
@@ -279,7 +280,9 @@ def _scorers(model, baselines, mlp=None, cascade=None, device="cpu", names=None,
         scorers["cascade"] = lambda inputs, stage1: torch.where(
             stage1[:, -1:] >= thresholds, verifier.window_probs(verifier(inputs)[0]), 0.0)
     for name, other in (extra or {}).items():
-        if getattr(other, "own_inputs", False):
+        if getattr(other, "video_scorer", False):            # scores of the current video (`step06_boost`)
+            scorers[name] = lambda inputs, stage1, other=other: other(context, stage1)
+        elif getattr(other, "own_inputs", False):
             scorers[name] = lambda inputs, stage1, other=other: other.window_probs(
                 other(_own_inputs(other, context, len(inputs)))[0])
         elif hasattr(other, "window_probs"):
@@ -400,7 +403,8 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             F = len(frames)
             known = None if history is None else frames.clamp(max=history)
             rows = step05.video_rows(model, X, frames, data["min_off_frames"], known, roles)
-            context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"], roles=roles)
+            context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"], roles=roles,
+                           video_id=video_id, rows=rows["rows"])
             t, n = rows["rows"].T
             targets = rows["targets"]
             # A row counts (rows, alarms) only if its outcome is observable: the window does not
@@ -834,7 +838,7 @@ def _alarm_filter_comparison(model, data, baselines, cfg, minutes, fps):
 
 # -------------- Per-head calibration (Platt scaling on val) --------------
 # The scorers whose scores are probabilities, calibrated per window and head.
-CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "mlp", "cascade", "lookup")
+CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "boost", "mlp", "cascade", "lookup")
 
 
 def _bin_scores():
@@ -1091,7 +1095,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
            "gate_min_events": cfg["gate_min_events"], "gate_min_precision": cfg["gate_min_precision"],
            "gate_min_correct": cfg["gate_min_correct"],
            "net_pruned": cfg.get("net_pruned", False), "rule_set": cfg.get("rule_set", False),
-           "motif_net": cfg.get("motif_net", False),
+           "motif_net": cfg.get("motif_net", False), "boost": cfg.get("boost", ""),
            "baselines": BASELINE_VERSION, "head_rank_windows": cfg["head_rank_windows"],
            "threshold_from": f"detected_th {cfg['detected_th']} (fixed: {FIXED_THRESHOLDS})",
            "event_types": {key: v for key, v in cfg["event_types"].items() if key != "types"}, "results": {}}
@@ -1246,7 +1250,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
 
     out["trajectory"] = {name: {"mean": (tr["sum"] / tr["count"].clamp(min=1)).tolist(), "count": tr["count"].tolist()}
                          for name, tr in scores["trajectory"].items()
-                         if name in ("model", "net_pruned", "rule_set", "motif_net", "mlp", "cascade")}
+                         if name in ("model", "net_pruned", "rule_set", "motif_net", "boost", "mlp", "cascade")}
 
     # The same rows knowing only part of the memory: how the confidence grows with the known facts.
     out["history"] = {}
@@ -1941,7 +1945,7 @@ def _print_per_head_detection(metrics, sec, headline):
         return
     print(f"[Per head event detection] heads with >= {metrics['per_head_min_test_events']} test events; "
           f"recall / alarm precision / mean prediction time (s), at the detection threshold")
-    names = [n for n in ("model", "motif_net", "mlp", "rule_set", "cascade") if n in per_head]
+    names = [n for n in ("model", "boost", "motif_net", "mlp", "rule_set", "cascade") if n in per_head]
     for w in (headline, str(max(metrics["windows"]))):
         heads = {h: d for h, d in per_head["model"][w].items() if d["reliable"]}
         print(f"  W={w}  {'head':<20}{'type':<9}{'events':>7}" + "".join(f"{SCORER_LABELS[n]:>24}" for n in names))
@@ -2357,6 +2361,11 @@ def main(input_data):
         # Every model is evaluated with its full memory: the rows need the longest one before them.
         cfg["min_context"] = max(cfg["min_context"], motif.num_lags)
     cfg["motif_net"] = motif is not None
+    # The boosted rule heads (`step06_boost`, --boost_heads): the rule net with those ego heads replaced.
+    boost_heads = [h for h in str(input_data.get("boost_heads") or "").split(",") if h]
+    cfg["boost"] = f"{','.join(boost_heads)}:{step06_boost.VERSION}" if boost_heads else ""
+    if boost_heads:
+        extra["boost"] = step06_boost.load_scorer(boost_heads, step05_cfg, input_data, cfg["device"])
 
     # 2. Baselines fitted on the step 05 training videos: the window prior and the anchor rules alone.
     baselines = (torch.load(cfg["baseline_file"], map_location="cpu", weights_only=False)
@@ -2386,11 +2395,13 @@ def main(input_data):
                 "gate_min_correct": cfg["gate_min_correct"],
                 "net_pruned": cfg["net_pruned"], "rule_set": cfg["rule_set"], "motif_net": cfg["motif_net"],
                 "baselines": BASELINE_VERSION, "head_rank_windows": cfg["head_rank_windows"]}
+    if cfg["boost"]:                       # only then: the cached metrics of runs without it stay valid
+        settings["boost"] = cfg["boost"]
     if (not step05.is_fresh(cfg["metrics_file"], step05_cfg["model_file"], cfg["test_data_file"],
                             cfg["baseline_file"], step05_cfg["training_data_file"], step05_cfg["mlp_model_file"],
                             step05_cfg["candidate_threshold_file"], step05_cfg["verifier_model_file"],
                             step05_causal.get_cfg_from_step05(step05_cfg)["pruned_model_file"], selection_file,
-                            motif_file)
+                            motif_file, *step06_boost.model_files(boost_heads, input_data))
             or settings != {key: metrics.get(key) for key in settings}):
         training_data = step05.load_training_data(step05_cfg)
         cfg["event_types"] = training_data["event_types"]
@@ -2409,6 +2420,8 @@ def main(input_data):
         del val_scores, val_data
         del training_data
         metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds, calibration)
+        if "boost" in extra:
+            extra["boost"].report()
         if selection is not None:
             # Every precision level's rule set on the test videos: recall vs precision of precise rules.
             metrics["rule_levels"] = step05_rules.level_tradeoff(model, selection, test_data,

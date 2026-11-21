@@ -178,9 +178,14 @@ def gt_features(world, w, aid):
     return out
 
 
-def collect(cfg, split, dataset, head_name):
+def collect(cfg, split, dataset, head_name, port=False, stride=STRIDE, use_gt=True):
     """Rows of one split: {"y": (R,) bool, "event": (R,) long, "features": {kind: [names]},
-    "ego": {feature: (R,)}, group: {"row": (n,) long, feature: (n,)} for ahead / veh / ped / tl}.
+    "ego": {feature: (R,)}, group: {"row": (n,) long, feature: (n,)} for ahead / veh / ped / tl,
+    "video": (R,) long index into "video_ids", "t": (R,) long frame, "known": (R,) bool}.
+    port (the main model's rows, `step06_boost`): every frame t >= 1 (each stride-th) where the head was off
+    in the min_off_frames frames before t (step05 `at_risk`; the ego need not move), up to the video end
+    ("known": the window t .. t + WINDOW - 1 fits in the video or the onset was seen). use_gt False: no SUMO
+    world (the gt:* features stay NaN; what the model has on real video).
     Every continuous feature and every label (class-free label of the agent, e.g. "lab:Brake"; the ego's
     "ego:AV-Mov") at the last seen frame and LAGS_S seconds before it (NaN before the video start; a label of
     an agent not in view then is 0). Per video as tensors."""
@@ -204,18 +209,21 @@ def collect(cfg, split, dataset, head_name):
     y_all, ev_all, ego_chunks = [], [], []
     chunks = {g: {"row": [], "cont": [], "label": []} for g in GROUPS[1:]}
     num_rows, gt_videos = 0, 0
+    video_of, t_of, known_of, video_ids = [], [], [], sorted(atoms)
+    ego_index, head_track = {}, {}
     nan = float("nan")
     for vi, (vid, video_atoms) in enumerate(tqdm(sorted(atoms.items()), desc=f"Rows ({split})")):
         X = step05.build_video_tensor(video_atoms, A)
         T = X.shape[0]
         agent_ids = step05.video_agent_ids(video_atoms)
         ego = agent_ids.get(None)
-        if ego is None or T <= WINDOW + motion.K + 2:
+        if ego is None or T <= (1 if port else WINDOW + motion.K + 2):
             continue
         vb, classes, has_box = step05._agent_boxes(boxes, vid, video_atoms, X)
         X = X.cpu()
         N = X.shape[1]
         moving, braking = X[:, ego, i_mov], X[:, ego, i_head]
+        ego_index[vid], head_track[vid] = ego, braking.clone()
         onset = step05.atom_onsets(X[:, ego:ego + 1, i_head:i_head + 1], cfg["min_off_frames"])[:, 0, 0]
         img = image_features(vb, has_box)
         partner = agent_roles.role_partners(vb.clone(), classes, ego, ("ahead",),
@@ -224,7 +232,7 @@ def collect(cfg, split, dataset, head_name):
         world_file = dataset / "meta" / "world" / f"{vid}.json.gz"
         gt = {k: torch.full((T, N), nan) for k in GT_AGENT}
         ego_speed = torch.full((T,), nan)
-        if world_file.exists():
+        if use_gt and world_file.exists():
             with gzip.open(world_file, "rt") as f:
                 world = json.load(f)
             gt_videos += 1
@@ -246,13 +254,19 @@ def collect(cfg, split, dataset, head_name):
         ego_cont = torch.stack([scene.float(), ego_speed], dim=1)                             # (T, 2)
         ego_lab = X[:, ego][:, av_atoms].float()                                              # (T, nav)
         os_, ys, evs = [], [], []
-        for t in range(motion.K + 2, T - WINDOW + 1, STRIDE):
+        m_off = max(int(cfg["min_off_frames"]), 1)
+        frames_t = range(1, T, stride) if port else range(motion.K + 2, T - WINDOW + 1, stride)
+        for t in frames_t:
             o = t - 1                                             # the last seen frame
-            if bool(moving[o]) and not bool(braking[o]):
+            ok = (not bool(braking[max(t - m_off, 0):t].any())) if port else (bool(moving[o]) and not bool(braking[o]))
+            if ok:
                 hit = onset[t:t + WINDOW]
                 os_.append(o)
                 ys.append(bool(hit.any()))
                 evs.append(vi * 100000 + t + int(hit.nonzero()[0]) if bool(hit.any()) else -1)
+                video_of.append(vi)
+                t_of.append(t)
+                known_of.append(t + WINDOW <= T or bool(hit.any()))
         if not os_:
             continue
         o_t = torch.tensor(os_)
@@ -288,7 +302,10 @@ def collect(cfg, split, dataset, head_name):
                 chunks[g]["row"].append(ri[m] + R0)
                 chunks[g]["cont"].append(c_obs[m])
                 chunks[g]["label"].append(l_obs[m])
-    out = {"y": torch.tensor(y_all), "event": torch.tensor(ev_all, dtype=torch.long), "features": feats}
+    out = {"y": torch.tensor(y_all), "event": torch.tensor(ev_all, dtype=torch.long), "features": feats,
+           "video": torch.tensor(video_of, dtype=torch.long), "t": torch.tensor(t_of, dtype=torch.long),
+           "known": torch.tensor(known_of, dtype=torch.bool), "video_ids": video_ids,
+           "ego_index": ego_index, "head_track": head_track}
     E = torch.cat(ego_chunks)
     names_ego = feats["ego_cont"] + feats["ego_label"]
     out["ego"] = {k: E[:, i].contiguous() for i, k in enumerate(names_ego)}
@@ -303,6 +320,20 @@ def collect(cfg, split, dataset, head_name):
           f"({len(set(e for e in ev_all if e >= 0))} onsets), SUMO world for {gt_videos} videos; "
           + ", ".join(f"{g} {len(out[g]['row'])} obs" for g in GROUPS[1:]) + f"; {len(parts)} agent labels, "
           f"{len(av_atoms)} ego labels, lags {LAGS_S} s")
+    return out
+
+
+def subset_rows(data, keep):
+    """The rows of data (`collect`) with keep (R,) bool, the agent observations re-indexed."""
+    idx = torch.nonzero(keep).flatten()
+    remap = torch.full((len(keep),), -1, dtype=torch.long)
+    remap[idx] = torch.arange(len(idx))
+    out = {k: v for k, v in data.items() if not torch.is_tensor(v) and k not in GROUPS}
+    out.update({k: data[k][keep] for k in ("y", "event", "video", "t", "known")})
+    out["ego"] = {f: v[keep] for f, v in data["ego"].items()}
+    for g in GROUPS[1:]:
+        m = keep[data[g]["row"]]
+        out[g] = {f: (remap[v[m]] if f == "row" else v[m]) for f, v in data[g].items()}
     return out
 
 
@@ -682,6 +713,19 @@ def region_search(train, val, group, feats, device):
             "_edges": edges, "_in_region": in_region}
 
 
+def region_spec(r):
+    """The spec of a region literal (`apply_spec`): its group, features, cell edges and cells."""
+    return ("region", {"group": r["group"], "features": list(r["features"]), "_edges": r["_edges"],
+                       "_in_region": r["_in_region"]})
+
+
+def apply_spec(data, spec):
+    """(R,) bool membership of a literal spec ("box", group, [(f, lo, hi)]) or ("region", r) on any rows."""
+    if spec[0] == "box":
+        return member_of(data, spec[1], spec[2])
+    return region_member(data, spec[1])
+
+
 def region_member(data, r):
     """(R,) bool: the rows of data (any split) where some agent of r's group lies in the region r."""
     rows, cell = _cells(data, r["group"], r["features"], r["_edges"])
@@ -730,7 +774,7 @@ def literal_bank(train, val, test):
             per_split = [member_of(data, group, [(f, 0.5, math.inf)]) for data in (train, val, test)]
             if int(per_split[0].sum()) < 10:
                 continue
-            descs.append({"group": group, "feature": f, "body": f"{f}"})
+            descs.append({"group": group, "feature": f, "body": f"{f}", "spec": ("box", group, [(f, 0.5, math.inf)])})
             cols_tr.append(per_split[0][:, None])
             cols_va.append(per_split[1][:, None])
             cols_te.append(per_split[2][:, None])
@@ -752,7 +796,7 @@ def literal_bank(train, val, test):
                     continue                                    # the whole range: "the agent exists"
                 lo = float(edges[i[k] - 1]) if i[k] > 0 else -math.inf
                 hi = float(edges[j[k]]) if j[k] < B - 1 else math.inf
-                descs.append({"group": group, "feature": f, "a": lo, "b": hi})
+                descs.append({"group": group, "feature": f, "a": lo, "b": hi, "spec": ("box", group, [(f, lo, hi)])})
             keep = ~((i == 0) & (j == B - 1))
             cols_tr.append(per_split[0][:, keep])
             cols_va.append(per_split[1][:, keep])
@@ -862,13 +906,13 @@ def full_bank(train, val, test, bank, singles, pairs, triples, regions):
     descs = list(descs)
     extra = ([], [], [])
 
-    def add(text, group, *cols):
-        descs.append({"group": group, "body": text})
+    def add(text, group, spec, *cols):
+        descs.append({"group": group, "body": text, "spec": spec})
         for e, c in zip(extra, cols):
             e.append(c[:, None])
 
     def add_box(text, group, cond):
-        add(text, group, *[member_of(d, group, cond) for d in (train, val, test)])
+        add(text, group, ("box", group, cond), *[member_of(d, group, cond) for d in (train, val, test)])
     for r in singles:
         add_box(f"{r['feature']} in ({_fmt(r['a'])}, {_fmt(r['b'])}]", r["group"], [(r["feature"], r["a"], r["b"])])
     for r in pairs:
@@ -879,8 +923,8 @@ def full_bank(train, val, test, bank, singles, pairs, triples, regions):
         add_box(" & same agent ".join(f"{f} in ({_fmt(a)}, {_fmt(b)}]" for f, a, b in cond), r["group"], cond)
     for k in (2, 3):
         for r in regions[k]:
-            add(f"{' x '.join(r['features'])} in region ({r['cells']} cells)", r["group"], *r["_member"],
-                region_member(test, r))
+            add(f"{' x '.join(r['features'])} in region ({r['cells']} cells)", r["group"], region_spec(r),
+                *r["_member"], region_member(test, r))
     return (descs,) + tuple(torch.cat([M] + e, dim=1) for M, e in zip((M_tr, M_va, M_te), extra))
 
 
@@ -1248,7 +1292,8 @@ def boosted_rules(train, val, test, bank, device, use=None):
             with torch.no_grad():
                 refit[f"{l2:g}"] = {f"{s}_ap": average_precision((X[s] @ w + b).cpu(), ys[s]) for s in X}
     uniq.sort(key=lambda r: -abs(r["weight"]) * r["rows"])
-    return {"literals": n, "rounds": len(rules), "best": best, "curve": curve, "refit": refit,
+    return {"literals": n, "rounds": len(rules), "best": best, "curve": curve, "refit": refit, "f0": f0,
+            "_descs": descs,
             "distinct_rules": len(uniq), "positive_rules": sum(r["weight"] > 0 for r in uniq),
             "rules": uniq}
 
@@ -1346,6 +1391,80 @@ def neural_reference(train, val, test, source, device):
             "test_ap": history[-1]["test_ap"], "best_val_ap": best_val, "test_ap_at_best_val": best_test,
             "history": history}
 
+def search_literals(train, val, device, sources=("img", "gt")):
+    """The literals of round 1, all chosen on train (val only reported): the best interval per (group,
+    feature), pairs and triples on the same agent, regions over 1 / 2 / 3 features. sources: the feature
+    families of the pairs / triples / multi-feature regions ("img", "gt")."""
+    singles = []
+    for group in GROUPS:
+        for f in tqdm(features_of(train, group, "cont"), desc=f"Intervals ({group})"):
+            r = single_search(train, val, group, f, device)
+            if r is not None:
+                singles.append(r)
+    pairs = []
+    for group in ("ahead", "veh"):
+        for feats in [f for src, f in (("img", IMG_AGENT), ("gt", GT_AGENT)) if src in sources]:
+            for a in range(len(feats)):
+                for b in range(a + 1, len(feats)):
+                    r = pair_search(train, val, group, feats[a], feats[b], device)
+                    if r is not None:
+                        pairs.append(r)
+
+    triples = []
+    for group in ("ahead", "veh"):
+        for source, cats in [(k, v) for k, v in TRIPLE_FEATURES.items() if k in sources]:
+            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
+            for feats in tqdm(combos, desc=f"Triples ({group}, {source})"):
+                r = triple_search(train, val, group, feats, device)
+                if r is not None:
+                    triples.append(r)
+
+    # Regions: any union of cells, over 1 / 2 / 3 features of the same agent.
+    regions = {1: [], 2: [], 3: []}
+    for group in GROUPS:
+        for f in tqdm(features_of(train, group, "cont"), desc=f"Regions 1 ({group})"):
+            r = region_search(train, val, group, (f,), device)
+            if r is not None:
+                regions[1].append(r)
+    for group in ("ahead", "veh"):
+        for feats in [f for src, f in (("img", IMG_AGENT), ("gt", GT_AGENT)) if src in sources]:
+            combos = [(feats[a], feats[b]) for a in range(len(feats)) for b in range(a + 1, len(feats))]
+            for fs in tqdm(combos, desc=f"Regions 2 ({group})"):
+                r = region_search(train, val, group, fs, device)
+                if r is not None:
+                    regions[2].append(r)
+        for source, cats in [(k, v) for k, v in TRIPLE_FEATURES.items() if k in sources]:
+            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
+            for fs in tqdm(combos, desc=f"Regions 3 ({group}, {source})"):
+                r = region_search(train, val, group, fs, device)
+                if r is not None:
+                    regions[3].append(r)
+    # Synergy of a region: its gain minus the best region over a strict subset of its features.
+    best_of = {(r["group"], tuple(sorted(r["features"]))): r["gain"] for k in regions for r in regions[k]}
+    for k in (2, 3):
+        for r in regions[k]:
+            fs = r["features"]
+            subs = [tuple(sorted(c)) for m in range(1, k) for c in itertools.combinations(fs, m)]
+            r["best_sub_gain"] = max([best_of.get((r["group"], c), 0.0) for c in subs] + [0.0])
+            r["synergy"] = r["gain"] - r["best_sub_gain"]
+    return singles, pairs, triples, regions
+
+
+def make_banks(train, val, test, singles, pairs, triples, regions):
+    """bank: the interval / label literals and the one-feature regions; big bank: plus every single, pair,
+    triple and region (`full_bank`). Each a tuple (descs with "spec", M_train, M_val, M_test)."""
+    bank = literal_bank(train, val, test)
+    # The single-feature regions join the bank as literals (several ranges of one feature, and their negation).
+    descs, M_tr, M_va, M_te = bank
+    region_cols = regions[1]
+    bank = (descs + [{"group": r["group"], "body": f"{r['features'][0]} in {r['text']}", "spec": region_spec(r)}
+                     for r in region_cols],
+            torch.cat([M_tr] + [r["_member"][0][:, None] for r in region_cols], dim=1),
+            torch.cat([M_va] + [r["_member"][1][:, None] for r in region_cols], dim=1),
+            torch.cat([M_te] + [region_member(test, r)[:, None] for r in region_cols], dim=1))
+    return bank, full_bank(train, val, test, bank, singles, pairs, triples, regions)
+
+
 # -------------- Main --------------
 def _fmt(x):
     return "-inf" if x == -math.inf else ("inf" if x == math.inf else f"{x:.3g}")
@@ -1395,77 +1514,18 @@ def main():
                         "test_box_file": atoms_dir / "test_boxes.pt"}, "test", dataset, args.head)
         torch.save(test, test_cache)
 
-    singles = []
-    for group in GROUPS:
-        for f in tqdm(features_of(train, group, "cont"), desc=f"Intervals ({group})"):
-            r = single_search(train, val, group, f, device)
-            if r is not None:
-                singles.append(r)
-    pairs = []
-    for group in ("ahead", "veh"):
-        for feats in (IMG_AGENT, GT_AGENT):
-            for a in range(len(feats)):
-                for b in range(a + 1, len(feats)):
-                    r = pair_search(train, val, group, feats[a], feats[b], device)
-                    if r is not None:
-                        pairs.append(r)
-
-    triples = []
-    for group in ("ahead", "veh"):
-        for source, cats in TRIPLE_FEATURES.items():
-            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
-            for feats in tqdm(combos, desc=f"Triples ({group}, {source})"):
-                r = triple_search(train, val, group, feats, device)
-                if r is not None:
-                    triples.append(r)
-
-    # Regions: any union of cells, over 1 / 2 / 3 features of the same agent.
-    regions = {1: [], 2: [], 3: []}
-    for group in GROUPS:
-        for f in tqdm(features_of(train, group, "cont"), desc=f"Regions 1 ({group})"):
-            r = region_search(train, val, group, (f,), device)
-            if r is not None:
-                regions[1].append(r)
-    for group in ("ahead", "veh"):
-        for feats in (IMG_AGENT, GT_AGENT):
-            combos = [(feats[a], feats[b]) for a in range(len(feats)) for b in range(a + 1, len(feats))]
-            for fs in tqdm(combos, desc=f"Regions 2 ({group})"):
-                r = region_search(train, val, group, fs, device)
-                if r is not None:
-                    regions[2].append(r)
-        for source, cats in TRIPLE_FEATURES.items():
-            combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
-            for fs in tqdm(combos, desc=f"Regions 3 ({group}, {source})"):
-                r = region_search(train, val, group, fs, device)
-                if r is not None:
-                    regions[3].append(r)
-    # Synergy of a region: its gain minus the best region over a strict subset of its features.
-    best_of = {(r["group"], tuple(sorted(r["features"]))): r["gain"] for k in regions for r in regions[k]}
-    for k in (2, 3):
-        for r in regions[k]:
-            fs = r["features"]
-            subs = [tuple(sorted(c)) for m in range(1, k) for c in itertools.combinations(fs, m)]
-            r["best_sub_gain"] = max([best_of.get((r["group"], c), 0.0) for c in subs] + [0.0])
-            r["synergy"] = r["gain"] - r["best_sub_gain"]
+    singles, pairs, triples, regions = search_literals(train, val, device)
     box_of = {(r["group"], r["feature"]): r for r in singles}
 
     # Round 2: refine the best roots (boxes and regions) with conditions on any agent (other agents, negations).
     candidates = [r for r in singles + pairs + triples + regions[1] + regions[2] + regions[3]
                   if r["val_lift"] >= ROOT_MIN_LIFT and r["val_events"] >= ROOT_MIN_EVENTS]
     roots = sorted(candidates, key=lambda r: -r["gain"])[:REFINE_ROOTS]
-    bank = literal_bank(train, val, test)
-    # The single-feature regions join the bank as literals (several ranges of one feature, and their negation).
-    descs, M_tr, M_va, M_te = bank
-    region_cols = regions[1]
-    bank = (descs + [{"group": r["group"], "body": f"{r['features'][0]} in {r['text']}"} for r in region_cols],
-            torch.cat([M_tr] + [r["_member"][0][:, None] for r in region_cols], dim=1),
-            torch.cat([M_va] + [r["_member"][1][:, None] for r in region_cols], dim=1),
-            torch.cat([M_te] + [region_member(test, r)[:, None] for r in region_cols], dim=1))
+    bank, big_bank = make_banks(train, val, test, singles, pairs, triples, regions)
     print(f"[Refine] {len(bank[0])} literals (+ their negations), {len(roots)} roots")
     refined = [{"root": r, "steps": refine(r, train, val, bank, device)} for r in tqdm(roots, desc="Refining")]
 
     # The rule list: can a set of such rules fit train as the SetNet does?
-    big_bank = full_bank(train, val, test, bank, singles, pairs, triples, regions)
     print(f"[Rule list] {len(big_bank[0])} literals (+ their negations)")
     rlist = rule_list(train, val, test, big_bank, device)
 
@@ -1627,7 +1687,8 @@ def main():
     utils_data.save_json({"head": args.head, "stride": STRIDE, "window": WINDOW, "bins": Q, "pair_bins": Q2,
                           "min_pos": MIN_POS, "train_base": base_tr, "val_base": base_va, "test_base": base_te,
                           "comparison": comparison,
-                          "boosted": {k: {**v, "rules": v["rules"][:500]} for k, v in boosted.items()},
+                          "boosted": {k: {**{x: y for x, y in v.items() if not x.startswith("_")},
+                                          "rules": v["rules"][:500]} for k, v in boosted.items()},
                           "capacity": bool(args.capacity), "nets": nets, "rule_list": rlist,
                           "singles": singles, "pairs": pairs, "triples": triples,
                           "regions": {str(k): [{x: v for x, v in r.items() if not x.startswith("_")} for r in regions[k]]
