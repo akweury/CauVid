@@ -741,6 +741,9 @@ SMALL_MIN_HITS = 5
 SMALL_MIN_EVENTS = 3
 SMALL_MAX_FAILS = 50       # phase 2 stops after this many rules in a row failed SMALL_MIN_EVENTS
 RECALL_GROUPS = (("large", 0.05, 2.0), ("mid", 0.01, 0.05), ("small", 0.0, 0.01))
+SHRINK_ROWS = 50           # list_shrunk: a rule's precision shrunk to the base rate with this many rows
+LOGIT_L2 = (1e-4, 1e-3, 1e-2)
+LOGIT_STEPS = 500
 LIST_CURVE = (1, 2, 3, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300, 500, 1000)
 
 
@@ -920,8 +923,33 @@ def rule_list(train, val, bank, device):
         r["val_precision"] = hits / max(int(f.sum()), 1)
         r["val_hits"], r["val_rows"] = hits, int(f.sum())
 
-    def evaluate(keep):
-        """AP of the rules with keep[i] (in list order), on train and val."""
+    for r in rules:
+        r["lb"] = float(_wilson_lb(torch.tensor(float(r["hits"])), torch.tensor(float(r["rows"]))))
+        r["shrunk"] = (r["hits"] + SHRINK_ROWS * base) / (r["rows"] + SHRINK_ROWS)
+    X_tr_all = torch.stack(F_tr, dim=1).float().to(device) if rules else None
+    X_va_all = torch.stack(F_va, dim=1).float().to(device) if rules else None
+
+    def logistic(idx, l2):
+        """Train / val scores of an L2 logistic regression on the firings of the rules idx (fit on train)."""
+        X_tr, X_va = X_tr_all[:, idx], X_va_all[:, idx]
+        w = torch.zeros(len(idx), device=device, requires_grad=True)
+        b = torch.tensor([math.log(base / (1 - base))], device=device, requires_grad=True)
+        opt = torch.optim.Adam([w, b], lr=0.05)
+        yt = y_tr.float().to(device)
+        for _ in range(LOGIT_STEPS):
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(X_tr @ w + b, yt) + l2 * (w * w).sum()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            return (X_tr @ w + b).cpu(), (X_va @ w + b).cpu()
+
+    def evaluate(keep, logit=True):
+        """AP of the rules with keep[i] (in list order), on train and val, per scorer:
+          list / max:        decision list / best firing rule, by the raw train precision of each rule;
+          list_lb / max_lb:  the same by the Wilson lower bound of the precision (small rules not overrated);
+          list_shrunk:       by the precision shrunk to the base rate with SHRINK_ROWS rows;
+          logit_<l2>:        L2 logistic regression on the rule firings (evidence of several rules adds up)."""
         idx = [i for i in range(len(rules)) if keep[i]]
         left_m = torch.ones(len(y_tr), dtype=torch.bool)
         for i in idx:
@@ -929,24 +957,34 @@ def rule_list(train, val, bank, device):
         default = float(y_tr[left_m].float().mean()) if bool(left_m.any()) else 0.0
         out = {}
         for name, F, y in (("train", F_tr, y_tr), ("val", F_va, y_va)):
-            first = torch.full((len(y),), -1.0)
-            best = torch.full((len(y),), -1.0)
-            for i in idx:
-                p = torch.tensor(rules[i]["precision"])
-                first = torch.where((first < 0) & F[i], p, first)
-                best = torch.where(F[i], torch.clamp(best, min=p), best)
-            covered = first >= 0
-            out[f"{name}_ap_list"] = average_precision(torch.where(covered, first, torch.tensor(default)), y)
-            out[f"{name}_ap_max"] = average_precision(torch.where(covered, best, torch.tensor(default)), y)
-            out[f"{name}_coverage"] = float((covered & y).sum()) / max(int(y.sum()), 1)
+            for key, value in (("", "precision"), ("_lb", "lb"), ("_shrunk", "shrunk")):
+                first = torch.full((len(y),), -1.0)
+                best = torch.full((len(y),), -1.0)
+                for i in idx:
+                    p = torch.tensor(rules[i][value])
+                    first = torch.where((first < 0) & F[i], p, first)
+                    best = torch.where(F[i], torch.clamp(best, min=p), best)
+                covered = first >= 0
+                d = torch.tensor(default if key == "" else min(default, base))
+                out[f"{name}_ap_list{key}"] = average_precision(torch.where(covered, first, d), y)
+                if key != "_shrunk":
+                    out[f"{name}_ap_max{key}"] = average_precision(torch.where(covered, best, d), y)
+                if key == "":
+                    out[f"{name}_coverage"] = float((covered & y).sum()) / max(int(y.sum()), 1)
+        if logit and idx:
+            for l2 in LOGIT_L2:
+                s_tr, s_va = logistic(idx, l2)
+                out[f"train_ap_logit{l2:g}"] = average_precision(s_tr, y_tr)
+                out[f"val_ap_logit{l2:g}"] = average_precision(s_va, y_va)
         return out
     curve = []
     for m in sorted(set([c for c in LIST_CURVE if c <= len(rules)] + [len(rules)])):
         curve.append({"rules": m, **evaluate([i < m for i in range(len(rules))])})
     groups = {}
     full = evaluate([True] * len(rules))
-    for name, lo, hi in RECALL_GROUPS:
-        member = [lo <= r["train_recall"] < hi for r in rules]
+    sets = [(name, [lo <= r["train_recall"] < hi for r in rules]) for name, lo, hi in RECALL_GROUPS]
+    sets += [(f"phase {ph}", [r["phase"] == ph for r in rules]) for ph in ("foil", "small", "broad")]
+    for name, member in sets:
         g = [r for r, m in zip(rules, member) if m]
         cov_tr = torch.zeros(len(y_tr), dtype=torch.bool)
         cov_va = torch.zeros(len(y_va), dtype=torch.bool)
@@ -954,7 +992,7 @@ def rule_list(train, val, bank, device):
             if m:
                 cov_tr |= f_tr
                 cov_va |= f_va
-        without = evaluate([not m for m in member])
+        without = evaluate([not m for m in member]) if g else full
         groups[name] = {"rules": len(g), "phase_small": sum(r["phase"] == "small" for r in g),
                         "phase_broad": sum(r["phase"] == "broad" for r in g),
                         "train_coverage": float((cov_tr & y_tr).sum()) / total_pos,
@@ -1241,18 +1279,23 @@ def main():
           f"the positive rows some rule covers")
     print(f"  rules: {rlist['phases']['foil']} FOIL + {rlist['phases']['small']} small precise + "
           f"{rlist['phases']['broad']} broad (no cap)")
+    scorers = [("list", "list"), ("max", "max"), ("list_lb", "list LB"), ("max_lb", "max LB"),
+               ("list_shrunk", "list shrunk")] + [(f"logit{l:g}", f"logit {l:g}") for l in LOGIT_L2]
+    print("  AP train / val by number of rules and scorer (list: first rule fires; max: best rule fires; LB: by the "
+          "Wilson lower bound of the precision; shrunk: precision shrunk to base; logit: logistic regression on the "
+          "rule firings):")
+    print("  " + f"{'rules':>5s} {'cov':>5s} " + " ".join(f"{lab:>13s}" for _k, lab in scorers))
     for c in rlist["curve"]:
-        print(f"  {c['rules']:5d} rules: train AP list {c['train_ap_list']:.3f} / max {c['train_ap_max']:.3f} "
-              f"(coverage {c['train_coverage']:.2f}) | val AP list {c['val_ap_list']:.3f} / max {c['val_ap_max']:.3f} "
-              f"(coverage {c['val_coverage']:.2f})")
+        print("  " + f"{c['rules']:5d} {c['val_coverage']:5.2f} " + " ".join(
+            f"{c.get('train_ap_' + k, float('nan')):6.3f}/{c.get('val_ap_' + k, float('nan')):.3f}" for k, _l in scorers))
     for n_ in nets:
         print(f"  SetNet ({n_['source']}): train AP {n_['train_ap']:.3f}, val AP {n_['val_ap']:.3f}")
-    print("  by rule size (train recall of the rule: large >= 5%, mid 1-5%, small < 1%):")
+    print("  without a group of rules (val AP per scorer; full list first):")
+    full = rlist["full"]
+    print("   " + f"{'all rules':22s} " + " ".join(f"{lab}={full.get('val_ap_' + k, float('nan')):.3f}" for k, lab in scorers))
     for name, g in rlist["groups"].items():
-        print(f"   {name:5s}: {g['rules']:4d} rules ({g['phase_small']} from phase 2), cover {g['train_coverage']:.2f} "
-              f"train / {g['val_coverage']:.2f} val of the positives at precision {g['train_precision']:.2f} / "
-              f"{g['val_precision']:.2f}; without them AP list train {g['without']['train_ap_list']:.3f} "
-              f"(-{g['ap_drop_train_list']:.3f}), val {g['without']['val_ap_list']:.3f} (-{g['ap_drop_val_list']:.3f})")
+        print(f"   {name:12s} {g['rules']:4d} rules (val prec {g['val_precision']:.2f}, val cov {g['val_coverage']:.2f}) "
+              + " ".join(f"{lab}={g['without'].get('val_ap_' + k, float('nan')):.3f}" for k, lab in scorers))
     small = [r for r in rlist["rules"] if r["phase"] == "small"]
     if small:
         print("  phase-2 rules (first 15):")
