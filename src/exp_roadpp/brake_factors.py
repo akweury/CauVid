@@ -16,6 +16,12 @@ SUMO ground truth of the same agent (the upper bound of what the boxes could tel
   size: gt:area (footprint m^2); position: gt:fwd, gt:left, gt:abs_left, gt:dist (m, ego camera frame);
   speed: gt:closing (m/s, distance shrinking), gt:lat_closing (|left| shrinking, m/s), gt:speed (m/s),
   lane: gt:same_lane (1 = the ego's lane).
+Rows v2 (`ROWS_VERSION`): every continuous feature also at LAGS_S = 1, 2, 3, 5 s before the last seen frame
+("img:scale@-2s"); the agents' labels, class-free ("lab:Brake", "lab:Red", also lagged: "lab:Red@-3s"); the
+ego's labels ("ego:AV-Mov@-1s"); the growth rate over 1 s and 2 s (img:scale_1s / _2s: a small, far box
+changes little in 0.5 s); the traffic light group "tl". The labels enter the literal bank (round 2, the rule
+list) and the SetNet; the continuous features with their lags the intervals / one-feature regions; the
+pairs / triples / multi-feature regions stay on the current frame (lag 0).
 Groups of agents: "ahead" (the ego's lead agent, `roles` ahead: one per row), "veh" (vehicles and
 cyclists), "ped". "ego": the row's own features img:scene_scale (`ego_motion`, ~ the ego's speed) and
 gt:ego_speed.
@@ -72,18 +78,37 @@ STRIDE = 2
 WINDOW = 20
 Q, Q2 = 16, 8
 MIN_POS = 100
-GROUPS = ("ego", "ahead", "veh", "ped")
+GROUPS = ("ego", "ahead", "veh", "ped", "tl")
 VEH_CLASSES = set(step05.MOTOR_CLASSES) | {"Cyc"}
+TL_GROUP_CLASSES = set(agent_roles.NON_GROUND_CLASSES)      # traffic lights (labels: their signal)
+LAGS_S = (0, 1, 2, 3, 5)       # every feature and label also 1, 2, 3 and 5 s before the last seen frame
+FPS = 10
+ROWS_VERSION = "v2"            # v2: labels, lags, 1 s / 2 s growth rates, the traffic light group
 CATEGORY = {
     "img:log_area": "size", "img:height": "size", "gt:area": "size",
     "img:bottom": "position", "img:offset": "position", "img:abs_offset": "position",
     "gt:fwd": "position", "gt:left": "position", "gt:abs_left": "position", "gt:dist": "position",
-    "img:scale": "speed", "img:accel": "speed", "img:lateral": "speed", "img:toward_centre": "speed",
+    "img:scale": "speed", "img:scale_1s": "speed", "img:scale_2s": "speed", "img:accel": "speed", "img:lateral": "speed", "img:toward_centre": "speed",
     "img:vertical": "speed", "gt:closing": "speed", "gt:lat_closing": "speed", "gt:speed": "speed",
     "gt:same_lane": "lane", "img:scene_scale": "ego speed", "gt:ego_speed": "ego speed",
 }
 IMG_AGENT = ("img:log_area", "img:height", "img:bottom", "img:offset", "img:abs_offset", "img:scale",
-             "img:accel", "img:lateral", "img:toward_centre", "img:vertical")
+             "img:scale_1s", "img:scale_2s", "img:accel", "img:lateral", "img:toward_centre", "img:vertical")
+EGO_CONT = ("img:scene_scale", "gt:ego_speed")
+
+
+def lag_name(feature, s):
+    """The name of a feature s seconds before the last seen frame ("" suffix for s = 0)."""
+    return feature if s == 0 else f"{feature}@-{s}s"
+
+
+def features_of(data, group, kind="cont"):
+    """Feature names of a group in the rows: kind "cont" (continuous, all lags), "label" (0/1, all lags),
+    "cont0" (continuous, no lag: the pairs / triples / multi-feature regions)."""
+    f = data["features"]
+    if group == "ego":
+        return {"cont": f["ego_cont"], "label": f["ego_label"], "cont0": list(EGO_CONT)}[kind]
+    return {"cont": f["agent_cont"], "label": f["agent_label"], "cont0": list(IMG_AGENT + GT_AGENT)}[kind]
 GT_AGENT = ("gt:area", "gt:fwd", "gt:left", "gt:abs_left", "gt:dist", "gt:closing", "gt:lat_closing",
             "gt:speed", "gt:same_lane")
 RATE_FRAMES = 5                        # gt rates over 0.5 s, as motion.K
@@ -100,7 +125,15 @@ def image_features(boxes, has_box):
     cx = (x1 + x2) / 2
     nan = torch.tensor(float("nan"))
     ok = has_box & ~torch.isnan(b).any(dim=2)
-    out = {"img:log_area": torch.log(((x2 - x1) * W).clamp(min=1.0) * ((y2 - y1) * H).clamp(min=1.0)),
+    log_area = torch.log(((x2 - x1) * W).clamp(min=1.0) * ((y2 - y1) * H).clamp(min=1.0))
+
+    def rate(k):                     # log area growth per frame over k frames (a small, far box needs long k)
+        r = torch.full_like(log_area, float("nan"))
+        if len(log_area) > k:
+            pair = ok[k:] & ok[:-k]
+            r[k:] = torch.where(pair, (log_area[k:] - log_area[:-k]) / k, float("nan"))
+        return r
+    out = {"img:log_area": log_area, "img:scale_1s": rate(FPS), "img:scale_2s": rate(2 * FPS),
            "img:height": y2 - y1, "img:bottom": y2, "img:offset": (cx - 0.5) / w,
            "img:abs_offset": (cx - 0.5).abs() / w,
            "img:scale": sig[..., 0], "img:accel": sig[..., 1], "img:lateral": sig[..., 2],
@@ -146,17 +179,32 @@ def gt_features(world, w, aid):
 
 
 def collect(cfg, split, dataset, head_name):
-    """Rows of one split: {"y": (R,) bool, "event": (R,) long, "ego": {feature: (R,)},
-    group: {"row": (n,) long, feature: (n,)} for ahead / veh / ped}."""
+    """Rows of one split: {"y": (R,) bool, "event": (R,) long, "features": {kind: [names]},
+    "ego": {feature: (R,)}, group: {"row": (n,) long, feature: (n,)} for ahead / veh / ped / tl}.
+    Every continuous feature and every label (class-free label of the agent, e.g. "lab:Brake"; the ego's
+    "ego:AV-Mov") at the last seen frame and LAGS_S seconds before it (NaN before the video start; a label of
+    an agent not in view then is 0). Per video as tensors."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     names = [step05._atom_name(sig) for sig in unique_atoms]
     i_head, i_mov = names.index(head_name), names.index("av:AV-Mov")
+    A = len(unique_atoms)
+    parts = sorted({n.split(":", 1)[1] for n in names if ":" in n and not n.startswith("av:")})
+    onehot = torch.zeros((A, len(parts)))
+    for a, n in enumerate(names):
+        if ":" in n and not n.startswith("av:"):
+            onehot[a, parts.index(n.split(":", 1)[1])] = 1.0
+    av_atoms = [a for a, n in enumerate(names) if n.startswith("av:")]
+    cont_base = list(IMG_AGENT + GT_AGENT)
+    feats = {"agent_cont": [lag_name(f, s) for s in LAGS_S for f in cont_base],
+             "agent_label": [lag_name(f"lab:{p}", s) for s in LAGS_S for p in parts],
+             "ego_cont": [lag_name(f, s) for s in LAGS_S for f in EGO_CONT],
+             "ego_label": [lag_name(f"ego:{names[a].split(':', 1)[1]}", s) for s in LAGS_S for a in av_atoms]}
     atoms = utils_data.load_json(cfg[f"{split}_atom_file"])
     boxes = torch.load(cfg[f"{split}_box_file"], map_location="cpu")
-    A = len(unique_atoms)
-    y_all, ev_all, ego_f = [], [], defaultdict(list)
-    obs = {g: defaultdict(list) for g in GROUPS[1:]}
+    y_all, ev_all, ego_chunks = [], [], []
+    chunks = {g: {"row": [], "cont": [], "label": []} for g in GROUPS[1:]}
     num_rows, gt_videos = 0, 0
+    nan = float("nan")
     for vi, (vid, video_atoms) in enumerate(tqdm(sorted(atoms.items()), desc=f"Rows ({split})")):
         X = step05.build_video_tensor(video_atoms, A)
         T = X.shape[0]
@@ -166,57 +214,95 @@ def collect(cfg, split, dataset, head_name):
             continue
         vb, classes, has_box = step05._agent_boxes(boxes, vid, video_atoms, X)
         X = X.cpu()
+        N = X.shape[1]
         moving, braking = X[:, ego, i_mov], X[:, ego, i_head]
         onset = step05.atom_onsets(X[:, ego:ego + 1, i_head:i_head + 1], cfg["min_off_frames"])[:, 0, 0]
-        img = {k: v.numpy() for k, v in image_features(vb, has_box).items()}
+        img = image_features(vb, has_box)
         partner = agent_roles.role_partners(vb.clone(), classes, ego, ("ahead",),
                                             agent_roles.ego_lane(X, unique_atoms))[:, ego, 0]
         scene = ego_motion.signals(vb, has_box, classes, ego, X, unique_atoms)["scene_scale"]
         world_file = dataset / "meta" / "world" / f"{vid}.json.gz"
-        world = None
+        gt = {k: torch.full((T, N), nan) for k in GT_AGENT}
+        ego_speed = torch.full((T,), nan)
         if world_file.exists():
             with gzip.open(world_file, "rt") as f:
                 world = json.load(f)
             gt_videos += 1
-        has_box_np = has_box.numpy()
-        uid_of = {n: uid for uid, n in agent_ids.items() if uid is not None}
-        group_of = ["veh" if c in VEH_CLASSES else ("ped" if c == "Ped" else None) for c in classes]
+            uid_of = {n: uid for uid, n in agent_ids.items() if uid is not None}
+            for t in range(1, min(T, len(world) + 1)):
+                w = t - 1                                         # world index of atom frame t
+                if "ego" not in world[w]["veh"]:
+                    continue
+                ego_speed[t] = world[w]["veh"]["ego"]["speed"]
+                for n in has_box[t].nonzero().flatten().tolist():
+                    if n not in uid_of:
+                        continue
+                    g = gt_features(world, w, _agent_of(uid_of[n], vid, world[w]))
+                    if g:
+                        for k in GT_AGENT:
+                            gt[k][t, n] = g[k]
+        cont = torch.stack([img[f] for f in IMG_AGENT] + [gt[f] for f in GT_AGENT], dim=2)    # (T, N, Fc)
+        labels = (X.float() @ onehot) > 0                                                     # (T, N, P)
+        ego_cont = torch.stack([scene.float(), ego_speed], dim=1)                             # (T, 2)
+        ego_lab = X[:, ego][:, av_atoms].float()                                              # (T, nav)
+        os_, ys, evs = [], [], []
         for t in range(motion.K + 2, T - WINDOW + 1, STRIDE):
             o = t - 1                                             # the last seen frame
-            if not bool(moving[o]) or bool(braking[o]):
-                continue
-            hit = onset[t:t + WINDOW]
-            r = num_rows
-            num_rows += 1
-            y_all.append(bool(hit.any()))
-            ev_all.append(vi * 100000 + t + int(hit.nonzero()[0]) if bool(hit.any()) else -1)
-            w = o - 1                                             # world index of atom frame o
-            ego_f["img:scene_scale"].append(float(scene[o]))
-            ego_speed = float("nan")
-            if world is not None and 0 <= w < len(world) and "ego" in world[w]["veh"]:
-                ego_speed = world[w]["veh"]["ego"]["speed"]
-            ego_f["gt:ego_speed"].append(ego_speed)
-            lead = int(partner[o])
-            for n in has_box_np[o].nonzero()[0].tolist():
-                groups = [g for g in (group_of[n], "ahead" if n == lead else None) if g]
-                if not groups:
-                    continue
-                values = {k: float(v[o, n]) for k, v in img.items()}          # numpy: fast scalar reads
-                gt = None
-                if world is not None and 0 <= w < len(world) and n in uid_of:
-                    gt = gt_features(world, w, _agent_of(uid_of[n], vid, world[w]))
-                for k in GT_AGENT:
-                    values[k] = gt[k] if gt else float("nan")
-                for g in groups:
-                    obs[g]["row"].append(r)
-                    for k, v in values.items():
-                        obs[g][k].append(v)
-    out = {"y": torch.tensor(y_all), "event": torch.tensor(ev_all, dtype=torch.long),
-           "ego": {k: torch.tensor(v) for k, v in ego_f.items()}}
-    for g, d in obs.items():
-        out[g] = {k: torch.tensor(v, dtype=torch.long if k == "row" else torch.float) for k, v in d.items()}
+            if bool(moving[o]) and not bool(braking[o]):
+                hit = onset[t:t + WINDOW]
+                os_.append(o)
+                ys.append(bool(hit.any()))
+                evs.append(vi * 100000 + t + int(hit.nonzero()[0]) if bool(hit.any()) else -1)
+        if not os_:
+            continue
+        o_t = torch.tensor(os_)
+        R0 = num_rows
+        num_rows += len(os_)
+        y_all += ys
+        ev_all += evs
+
+        def lagged(Fr, idx_rows, idx_agents=None):
+            """(n, F * len(LAGS_S)) values of Fr ((T, F) or (T, N, F)) at each lag, NaN before frame 0."""
+            outs = []
+            for sec in LAGS_S:
+                frame = idx_rows - sec * FPS
+                valid = frame >= 0
+                fc = frame.clamp(min=0)
+                v = Fr[fc] if idx_agents is None else Fr[fc, idx_agents]
+                outs.append(torch.where(valid[:, None], v.float(), torch.full_like(v.float(), nan)))
+            return torch.cat(outs, dim=1)
+        ego_chunks.append(torch.cat([lagged(ego_cont, o_t), lagged(ego_lab, o_t)], dim=1))
+        ri, n = has_box[o_t].nonzero(as_tuple=True)
+        if len(ri) == 0:
+            continue
+        frames = o_t[ri]
+        c_obs = lagged(cont, frames, n)
+        l_obs = lagged(labels, frames, n).nan_to_num(0.0)
+        cls = [classes[k] for k in n.tolist()]
+        member = {"veh": torch.tensor([c in VEH_CLASSES for c in cls]),
+                  "ped": torch.tensor([c == "Ped" for c in cls]),
+                  "tl": torch.tensor([c in TL_GROUP_CLASSES for c in cls]),
+                  "ahead": n == partner[frames]}
+        for g, m in member.items():
+            if bool(m.any()):
+                chunks[g]["row"].append(ri[m] + R0)
+                chunks[g]["cont"].append(c_obs[m])
+                chunks[g]["label"].append(l_obs[m])
+    out = {"y": torch.tensor(y_all), "event": torch.tensor(ev_all, dtype=torch.long), "features": feats}
+    E = torch.cat(ego_chunks)
+    names_ego = feats["ego_cont"] + feats["ego_label"]
+    out["ego"] = {k: E[:, i].contiguous() for i, k in enumerate(names_ego)}
+    for g, d in chunks.items():
+        rows = torch.cat(d["row"]) if d["row"] else torch.zeros(0, dtype=torch.long)
+        C = torch.cat(d["cont"]) if d["cont"] else torch.zeros((0, len(feats["agent_cont"])))
+        L = torch.cat(d["label"]) if d["label"] else torch.zeros((0, len(feats["agent_label"])))
+        out[g] = {"row": rows}
+        out[g].update({k: C[:, i].contiguous() for i, k in enumerate(feats["agent_cont"])})
+        out[g].update({k: L[:, i].contiguous() for i, k in enumerate(feats["agent_label"])})
     print(f"[Rows] {split}: {num_rows} rows, {int(out['y'].sum())} positive "
-          f"({len(set(e for e in ev_all if e >= 0))} onsets), SUMO world for {gt_videos} videos")
+          f"({len(set(e for e in ev_all if e >= 0))} onsets), SUMO world for {gt_videos} videos; "
+          + ", ".join(f"{g} {len(out[g]['row'])} obs" for g in GROUPS[1:]) + f"; {len(parts)} agent labels, "
+          f"{len(av_atoms)} ego labels, lags {LAGS_S} s")
     return out
 
 
@@ -265,6 +351,8 @@ def _interval_index(B):
 
 def single_search(train, val, group, feature, device, bins=Q):
     rows, v = _obs(train, group, feature)
+    if len(v) < 1000:
+        return None
     edges = _edges(v, bins)
     B = len(edges) + 1
     R = len(train["y"])
@@ -280,7 +368,7 @@ def single_search(train, val, group, feature, device, bins=Q):
         return None
     lo = float(edges[i[k] - 1]) if i[k] > 0 else -math.inf
     hi = float(edges[j[k]]) if j[k] < B - 1 else math.inf
-    res = {"group": group, "feature": feature, "category": CATEGORY.get(feature, "?"), "a": lo, "b": hi,
+    res = {"group": group, "feature": feature, "category": CATEGORY.get(feature.split("@")[0], "?"), "a": lo, "b": hi,
            "train_precision": float(p[k]), "train_hits": int(hits[k]), "train_rows": int(cov[k]),
            "gain": float(gain[k]), "train_base": base}
     res.update(_val_of(val, group, [(feature, lo, hi)], device))
@@ -371,7 +459,8 @@ def pair_search(train, val, group, f1, f2, device):
 Q3 = 8                     # bins per feature of a triple (36 intervals each, 46656 boxes; 6 bins were too coarse in the planted test)
 TRIPLE_FEATURES = {
     "img": {"position": ("img:bottom", "img:offset", "img:abs_offset"), "size": ("img:log_area", "img:height"),
-            "speed": ("img:scale", "img:accel", "img:lateral", "img:toward_centre", "img:vertical")},
+            "speed": ("img:scale", "img:scale_1s", "img:scale_2s", "img:accel", "img:lateral", "img:toward_centre",
+                      "img:vertical")},
     "gt": {"position": ("gt:fwd", "gt:left", "gt:abs_left", "gt:dist"), "size": ("gt:area",),
            "speed": ("gt:closing", "gt:lat_closing", "gt:speed")},
 }
@@ -627,8 +716,15 @@ def literal_bank(train, val):
     ("no agent of the group has f in (a, b]") is its complement, taken in `refine`."""
     descs, cols_tr, cols_va = [], [], []
     for group in GROUPS:
-        feats = ("img:scene_scale", "gt:ego_speed") if group == "ego" else IMG_AGENT + GT_AGENT
-        for f in feats:
+        # The labels (0/1): "some agent of the group holds label X (s seconds ago)", one literal each.
+        for f in features_of(train, group, "label"):
+            per_split = [member_of(data, group, [(f, 0.5, math.inf)]) for data in (train, val)]
+            if int(per_split[0].sum()) < 10:
+                continue
+            descs.append({"group": group, "feature": f, "body": f"{f}"})
+            cols_tr.append(per_split[0][:, None])
+            cols_va.append(per_split[1][:, None])
+        for f in features_of(train, group, "cont"):
             rows, v = _obs(train, group, f)
             if len(v) < 1000:
                 continue
@@ -1009,6 +1105,7 @@ def rule_list(train, val, bank, device):
 # -------------- Neural reference on the same features --------------
 NET_EPOCHS = 400           # full-batch steps
 NET_HIDDEN = 64
+NET_GROUPS = ("ahead", "veh", "ped", "tl")
 
 
 def _net_inputs(data, feats_agent, feats_ego, stats, device):
@@ -1022,7 +1119,7 @@ def _net_inputs(data, feats_agent, feats_ego, stats, device):
     out = {"R": R}
     E = torch.stack([data["ego"][f] for f in feats_ego], dim=1)
     out["ego"] = prep(E, *stats["ego"]).to(device)
-    for g in ("ahead", "veh", "ped"):
+    for g in NET_GROUPS:
         X = torch.stack([data[g][f] for f in feats_agent], dim=1)
         out[g] = (data[g]["row"].to(device), prep(X, *stats[g]).to(device))
     return out
@@ -1034,7 +1131,7 @@ def _stats_of(data, feats_agent, feats_ego):
         sd = torch.sqrt(torch.nanmean((X - mu) ** 2, dim=0)).nan_to_num(1.0).clamp(min=1e-6)
         return mu.nan_to_num(0.0), sd
     st = {"ego": ms(torch.stack([data["ego"][f] for f in feats_ego], dim=1))}
-    for g in ("ahead", "veh", "ped"):
+    for g in NET_GROUPS:
         st[g] = ms(torch.stack([data[g][f] for f in feats_agent], dim=1))
     return st
 
@@ -1046,14 +1143,14 @@ class SetNet(torch.nn.Module):
         super().__init__()
         mlp = lambda i: torch.nn.Sequential(torch.nn.Linear(i, h), torch.nn.GELU(), torch.nn.Linear(h, h),
                                             torch.nn.GELU())
-        self.phi = torch.nn.ModuleDict({g: mlp(2 * f_agent) for g in ("ahead", "veh", "ped")})
-        self.head = torch.nn.Sequential(torch.nn.Linear(2 * f_ego + 3 * (h + 1), h), torch.nn.GELU(),
+        self.phi = torch.nn.ModuleDict({g: mlp(2 * f_agent) for g in NET_GROUPS})
+        self.head = torch.nn.Sequential(torch.nn.Linear(2 * f_ego + len(NET_GROUPS) * (h + 1), h), torch.nn.GELU(),
                                         torch.nn.Linear(h, h), torch.nn.GELU(), torch.nn.Linear(h, 1))
         self.h = h
 
     def forward(self, x):
         parts = [x["ego"]]
-        for g in ("ahead", "veh", "ped"):
+        for g in NET_GROUPS:
             rows, feats = x[g]
             z = self.phi[g](feats)
             pooled = torch.full((x["R"], self.h), -1e4, device=z.device)
@@ -1066,8 +1163,10 @@ class SetNet(torch.nn.Module):
 def neural_reference(train, val, source, device):
     """Train / val AP of a SetNet on the img (or img + gt) features, trained to fit train (no early stop);
     also its best val AP over the steps."""
-    feats_agent = IMG_AGENT if source == "img" else IMG_AGENT + GT_AGENT
-    feats_ego = ("img:scene_scale",) if source == "img" else ("img:scene_scale", "gt:ego_speed")
+    f = train["features"]
+    keep = (lambda name: not name.startswith("gt:")) if source == "img" else (lambda name: True)
+    feats_agent = [x for x in f["agent_cont"] + f["agent_label"] if keep(x)]
+    feats_ego = [x for x in f["ego_cont"] + f["ego_label"] if keep(x)]
     st = _stats_of(train, feats_agent, feats_ego)
     x_tr = _net_inputs(train, feats_agent, feats_ego, st, device)
     x_va = _net_inputs(val, feats_agent, feats_ego, st, device)
@@ -1122,7 +1221,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     dataset = Path(args.dataset_path)
     tag = args.head.replace(":", "_")
-    cache = out_dir / f"rows_{tag}_s{STRIDE}w{WINDOW}.pt"
+    cache = out_dir / f"rows_{tag}_s{STRIDE}w{WINDOW}_{ROWS_VERSION}.pt"
     if os.path.exists(cache):
         train, val = torch.load(cache, map_location="cpu")
     else:
@@ -1132,8 +1231,7 @@ def main():
 
     singles = []
     for group in GROUPS:
-        feats = ("img:scene_scale", "gt:ego_speed") if group == "ego" else IMG_AGENT + GT_AGENT
-        for f in tqdm(feats, desc=f"Intervals ({group})"):
+        for f in tqdm(features_of(train, group, "cont"), desc=f"Intervals ({group})"):
             r = single_search(train, val, group, f, device)
             if r is not None:
                 singles.append(r)
@@ -1158,8 +1256,7 @@ def main():
     # Regions: any union of cells, over 1 / 2 / 3 features of the same agent.
     regions = {1: [], 2: [], 3: []}
     for group in GROUPS:
-        feats = ("img:scene_scale", "gt:ego_speed") if group == "ego" else IMG_AGENT + GT_AGENT
-        for f in tqdm(feats, desc=f"Regions 1 ({group})"):
+        for f in tqdm(features_of(train, group, "cont"), desc=f"Regions 1 ({group})"):
             r = region_search(train, val, group, (f,), device)
             if r is not None:
                 regions[1].append(r)
@@ -1213,7 +1310,7 @@ def main():
     print("\n== Best single interval per (group, feature), by train gain")
     print(f"{'group':6s} {'feature':18s} {'cat':9s} {'(a, b]':>20s} {'gain':>7s} {'p_tr':>5s} {'p_val':>5s} "
           f"{'lift':>5s} {'recall':>6s} {'events':>6s}")
-    for r in sorted(singles, key=lambda r: -r["gain"]):
+    for r in sorted(singles, key=lambda r: -r["gain"])[:60]:
         print(f"{r['group']:6s} {r['feature']:18s} {r['category']:9s} "
               f"{'(' + _fmt(r['a']) + ', ' + _fmt(r['b']) + ']':>20s} {r['gain']:7.1f} {r['train_precision']:5.2f} "
               f"{r['val_precision']:5.2f} {r['val_lift']:5.2f} {r['val_recall']:6.2f} {r['val_events']:6d}")
@@ -1242,7 +1339,7 @@ def main():
               f"{r['synergy']:+.1f}), p_tr {r['train_precision']:.2f}, p_val {r['val_precision']:.2f}, "
               f"lift {r['val_lift']:.2f}, events {r['val_events']}, recall {r['val_recall']:.2f}")
     print("\n== Single features: one interval vs a region (union of ranges), val lift and train gain")
-    for r in sorted(regions[1], key=lambda r: -r["gain"]):
+    for r in sorted(regions[1], key=lambda r: -r["gain"])[:60]:
         box = box_of.get((r["group"], r["features"][0]))
         bx = f"box gain {box['gain']:7.1f} lift {box['val_lift']:.2f}" if box else "box -"
         print(f"  {r['group']:6s} {r['features'][0]:18s} {bx} | region gain {r['gain']:7.1f} lift {r['val_lift']:.2f} "
