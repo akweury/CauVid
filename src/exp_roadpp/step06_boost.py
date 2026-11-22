@@ -516,6 +516,30 @@ class BoostScorer:
               f"videos without ego scores: {len(self.missing)}")
 
 
+class SelectScorer:
+    """step06 scorer "boost_sel": per boosted head, the scorer with the higher val AP (`step06.head_val_ap`):
+    the boosted rules (`BoostScorer`) or the rule net. use (A,) bool: the heads taken from the boosted rules."""
+    video_scorer = True
+
+    def __init__(self, boost, use, labels):
+        self.boost, self.use, self.labels = boost, use, labels
+
+    def __call__(self, context, stage1):
+        p = self.boost(context, stage1)
+        return torch.where(self.use.to(p.device)[None, None, :], p, stage1)
+
+    def report(self):
+        heads = boosted_heads(self.boost)
+        taken = [self.labels[a] for a in heads if self.use[a]]
+        print(f"[Boost select] {len(taken)} / {len(heads)} boosted heads use the boosted rules (higher val AP); "
+              f"the others keep the rule net")
+
+
+def boosted_heads(scorer):
+    """The head indices a BoostScorer replaces (fitted heads only)."""
+    return sorted({a for a, _, _ in scorer.heads})
+
+
 def expand_heads(heads, step05_cfg):
     """The head names of --boost_heads: a comma list, or "all" (every label head), "agents" (every non-ego
     head), "ego" (every av: head); mixed lists allowed."""

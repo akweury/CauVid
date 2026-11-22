@@ -119,6 +119,39 @@ How to read the scorers:
 
 `--boost_heads` always produces both scorers.
 
+## 33 heads with 0-2 rule-net clauses (run 1ca554, test, window 20)
+
+| | rule net | MLP | boost | boost_net |
+|---|---|---|---|---|
+| 31 fitted heads (macro AP) | 0.097 | 0.207 | **0.219** | 0.129 |
+
+Boost beats the rule net on 19 of the 31 heads and the MLP on 13. It wins big on Bus:IncomLane (0.64 vs MLP 0.32),
+Mobike:TurLft (0.61 vs 0.18) and Cyc:XingFmRht (0.45 vs 0.21). It collapses on Cyc:IncomLane (0.00 vs rule net
+0.42). 11 heads stay below AP 0.03 with every scorer.
+
+## Per-head selection on val and learnable heads (2026-11-22, `SELECTION_VERSION` sel_v1)
+
+- **Scorer "boost_sel"** (`step06_boost.SelectScorer`): for each boosted head, either the boosted rules or the
+  rule net, whichever has the higher val AP at the headline window (`head_val_ap`).
+  - It is still a rule model: the MLP and the SetNet are not candidates.
+  - Its val scores are added to step 06's val scores, so it gets per-head thresholds and calibration like
+    every other scorer.
+- **Learnable heads** (`learnable_heads`):
+  - A head is learnable if some scorer (rule net, MLP, boost, boost_net, lookup, anchor) reaches a val AP of at
+    least `LEARNABLE_MIN_AP` (0.05).
+  - The other heads are listed and left out of the comparison.
+  - `per_head[h]` gets `val_average_precision` and `learnable`. Every window gets
+    `macro_average_precision_learnable`.
+- **`test_metrics.json["boost_heads"]`**, printed at the end of step 06, gives for each boosted head:
+  - the test AP of model / boost / boost_sel / boost_net / mlp;
+  - the val AP;
+  - the chosen scorer.
+
+  It also gives the macro AP and the wins over the learnable heads.
+- Both are computed only with `--boost_heads`, so the cached metrics of other runs stay valid.
+- The step 06 metrics are recomputed. The fitted boost models are reused. The episode and ceiling stages are not
+  redone, because the model / mlp / lookup calibration is unchanged (`save_calibration`).
+
 ## Not yet
 
 - The step 05 OnsetMLP still has only the step 05 inputs. `boost_net` is the like-for-like neural model.
