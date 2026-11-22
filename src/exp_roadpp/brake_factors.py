@@ -323,15 +323,21 @@ def collect(cfg, split, dataset, head_name, port=False, stride=STRIDE, use_gt=Tr
     return out
 
 
+def groups_of(data):
+    """The groups of the rows: data["groups"] (agent rows, `step06_boost`), else GROUPS ("ego" first)."""
+    return tuple(data.get("groups", GROUPS))
+
+
 def subset_rows(data, keep):
     """The rows of data (`collect`) with keep (R,) bool, the agent observations re-indexed."""
     idx = torch.nonzero(keep).flatten()
     remap = torch.full((len(keep),), -1, dtype=torch.long)
     remap[idx] = torch.arange(len(idx))
-    out = {k: v for k, v in data.items() if not torch.is_tensor(v) and k not in GROUPS}
-    out.update({k: data[k][keep] for k in ("y", "event", "video", "t", "known")})
+    groups = groups_of(data)
+    out = {k: v for k, v in data.items() if not torch.is_tensor(v) and k not in groups}
+    out.update({k: data[k][keep] for k in ("y", "event", "video", "t", "known", "agent", "weight") if k in data})
     out["ego"] = {f: v[keep] for f, v in data["ego"].items()}
-    for g in GROUPS[1:]:
+    for g in groups[1:]:
         m = keep[data[g]["row"]]
         out[g] = {f: (remap[v[m]] if f == "row" else v[m]) for f, v in data[g].items()}
     return out
@@ -612,18 +618,21 @@ def _region_text(feats, edges, selected):
     return " | ".join(f"[{x}]" for x in parts) + more
 
 
-def average_precision(score, y):
-    """AP of the rows ranked by score (ties ranked together); None without a positive."""
+def average_precision(score, y, w=None):
+    """AP of the rows ranked by score (ties ranked together); None without a positive. w: (R,) row weights
+    (sampled rows: 1 / their sampling rate), else 1."""
     y = y.float().to(score.device)
     if float(y.sum()) == 0:
         return None
+    w = torch.ones_like(y) if w is None else w.float().to(score.device)
     order = torch.argsort(score, descending=True)
-    s, yy = score[order], y[order]
-    tp = torch.cumsum(yy, 0)
+    s, yy, ww = score[order], y[order], w[order]
+    tp = torch.cumsum(yy * ww, 0)
+    seen = torch.cumsum(ww, 0)
     _, counts = torch.unique_consecutive(s, return_counts=True)
     ends = torch.cumsum(counts, 0) - 1
     tp_e = tp[ends]
-    precision = tp_e / (ends + 1).float()
+    precision = tp_e / seen[ends]
     gained = torch.diff(tp_e, prepend=tp_e.new_zeros(1))
     return float((precision * gained).sum() / tp_e[-1])
 
@@ -768,7 +777,7 @@ def literal_bank(train, val, test):
     train-quantile bins: [description], (R_train, n), (R_val, n), (R_test, n) bool. The negation of a literal
     ("no agent of the group has f in (a, b]") is its complement, taken in `refine`."""
     descs, cols_tr, cols_va, cols_te = [], [], [], []
-    for group in GROUPS:
+    for group in groups_of(train):
         # The labels (0/1): "some agent of the group holds label X (s seconds ago)", one literal each.
         for f in features_of(train, group, "label"):
             per_split = [member_of(data, group, [(f, 0.5, math.inf)]) for data in (train, val, test)]
@@ -805,10 +814,11 @@ def literal_bank(train, val, test):
 
 
 def literal_text(desc, negated=False):
-    scope = {"ego": "ego", "ahead": "ahead"}.get(desc["group"], f"some {desc['group']}")
+    one = {"ego": "ego", "ahead": "ahead", "own": "own", "near_ped": "near ped"}     # one agent per row
+    scope = one.get(desc["group"], f"some {desc['group']}")
     body = desc.get("body") or f"{desc['feature']} in ({_fmt(desc['a'])}, {_fmt(desc['b'])}]"
     if negated:
-        return f"NOT [{scope}: {body}]" if desc["group"] in ("ego", "ahead") else f"no {desc['group']}: {body}"
+        return f"NOT [{scope}: {body}]" if desc["group"] in one else f"no {desc['group']}: {body}"
     return f"{scope}: {body}"
 
 
@@ -1196,8 +1206,10 @@ def boosted_rules(train, val, test, bank, device, use=None):
     n = len(descs)
     M_dev = M_tr.to(device)
     ys = {"train": train["y"], "val": val["y"], "test": test["y"]}
+    ws = {s: d.get("weight") for s, d in (("train", train), ("val", val), ("test", test))}   # sampled rows
     y = ys["train"].float().to(device)
-    base = float(y.mean())
+    wt = torch.ones_like(y) if ws["train"] is None else ws["train"].float().to(device)
+    base = float((wt * y).sum() / wt.sum())
     f0 = math.log(base / (1 - base))
     F = {"train": torch.full((len(y),), f0, device=device), "val": torch.full((len(ys["val"]),), f0),
          "test": torch.full((len(ys["test"]),), f0)}
@@ -1213,7 +1225,7 @@ def boosted_rules(train, val, test, bank, device, use=None):
     fails = 0
     for rnd in tqdm(range(BOOST_ROUNDS), desc="Boosted rules"):
         p = torch.sigmoid(F["train"])
-        g, h = y - p, p * (1 - p)
+        g, h = wt * (y - p), wt * p * (1 - p)
         S = torch.ones(len(y), dtype=torch.bool, device=device)
         lits, used, now = [], [], 0.0
         for _d in range(BOOST_DEPTH):
@@ -1245,7 +1257,7 @@ def boosted_rules(train, val, test, bank, device, use=None):
         rules.append({"literals": lits, "weight": w, "rows": rows, "hits": hits, "precision": hits / max(rows, 1),
                       "text": " & ".join(literal_text(descs[k % n], k >= n) for k in lits)})
         if (rnd + 1) % BOOST_EVAL == 0:
-            point = {"rounds": rnd + 1, **{f"{s}_ap": average_precision(F[s].cpu(), ys[s]) for s in F}}
+            point = {"rounds": rnd + 1, **{f"{s}_ap": average_precision(F[s].cpu(), ys[s], ws[s]) for s in F}}
             curve.append(point)
             if point["val_ap"] > best["val_ap"]:
                 best, fails = dict(point), 0
@@ -1254,7 +1266,7 @@ def boosted_rules(train, val, test, bank, device, use=None):
                 if fails >= BOOST_PATIENCE:
                     break
     if not curve or curve[-1]["rounds"] != len(rules):                        # the last partial check
-        point = {"rounds": len(rules), **{f"{s}_ap": average_precision(F[s].cpu(), ys[s]) for s in F}}
+        point = {"rounds": len(rules), **{f"{s}_ap": average_precision(F[s].cpu(), ys[s], ws[s]) for s in F}}
         curve.append(point)
         if point["val_ap"] > best["val_ap"]:
             best = dict(point)
@@ -1285,12 +1297,13 @@ def boosted_rules(train, val, test, bank, device, use=None):
             b = torch.tensor([f0], device=device, requires_grad=True)
             opt = torch.optim.Adam([w, b], lr=0.02)
             for _ in range(LOGIT_STEPS):
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(X["train"] @ w + b, y) + l2 * (w * w).sum()
+                loss = (torch.nn.functional.binary_cross_entropy_with_logits(X["train"] @ w + b, y, weight=wt)
+                        + l2 * (w * w).sum())
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
             with torch.no_grad():
-                refit[f"{l2:g}"] = {f"{s}_ap": average_precision((X[s] @ w + b).cpu(), ys[s]) for s in X}
+                refit[f"{l2:g}"] = {f"{s}_ap": average_precision((X[s] @ w + b).cpu(), ys[s], ws[s]) for s in X}
     uniq.sort(key=lambda r: -abs(r["weight"]) * r["rows"])
     return {"literals": n, "rounds": len(rules), "best": best, "curve": curve, "refit": refit, "f0": f0,
             "_descs": descs,
@@ -1304,7 +1317,7 @@ NET_HIDDEN = 64
 NET_GROUPS = ("ahead", "veh", "ped", "tl")
 
 
-def _net_inputs(data, feats_agent, feats_ego, stats, device):
+def _net_inputs(data, feats_agent, feats_ego, stats, device, groups=NET_GROUPS):
     """Standardized features with NaN -> 0 plus a known flag per feature: ego (R, 2E), ahead (R, 2F + 1),
     veh / ped observations (n, 2F) with their rows."""
     def prep(x, mu, sd):
@@ -1313,40 +1326,41 @@ def _net_inputs(data, feats_agent, feats_ego, stats, device):
         return torch.cat([z, known.float()], dim=1)
     R = len(data["y"])
     out = {"R": R}
-    E = torch.stack([data["ego"][f] for f in feats_ego], dim=1)
+    E = torch.stack([data["ego"][f].float() for f in feats_ego], dim=1)
     out["ego"] = prep(E, *stats["ego"]).to(device)
-    for g in NET_GROUPS:
-        X = torch.stack([data[g][f] for f in feats_agent], dim=1)
+    for g in groups:
+        X = torch.stack([data[g][f].float() for f in feats_agent], dim=1)
         out[g] = (data[g]["row"].to(device), prep(X, *stats[g]).to(device))
     return out
 
 
-def _stats_of(data, feats_agent, feats_ego):
+def _stats_of(data, feats_agent, feats_ego, groups=NET_GROUPS):
     def ms(X):
         mu = torch.nanmean(X, dim=0)
         sd = torch.sqrt(torch.nanmean((X - mu) ** 2, dim=0)).nan_to_num(1.0).clamp(min=1e-6)
         return mu.nan_to_num(0.0), sd
-    st = {"ego": ms(torch.stack([data["ego"][f] for f in feats_ego], dim=1))}
-    for g in NET_GROUPS:
-        st[g] = ms(torch.stack([data[g][f] for f in feats_agent], dim=1))
+    st = {"ego": ms(torch.stack([data["ego"][f].float() for f in feats_ego], dim=1))}
+    for g in groups:
+        st[g] = ms(torch.stack([data[g][f].float() for f in feats_agent], dim=1))
     return st
 
 
 class SetNet(torch.nn.Module):
     """Per-agent MLP of each group (ahead, veh, ped), max-pooled over the row's agents, then a row MLP with the
     ego features: the neural upper reference of what these features can fit."""
-    def __init__(self, f_agent, f_ego, h=NET_HIDDEN):
+    def __init__(self, f_agent, f_ego, h=NET_HIDDEN, groups=NET_GROUPS):
         super().__init__()
         mlp = lambda i: torch.nn.Sequential(torch.nn.Linear(i, h), torch.nn.GELU(), torch.nn.Linear(h, h),
                                             torch.nn.GELU())
-        self.phi = torch.nn.ModuleDict({g: mlp(2 * f_agent) for g in NET_GROUPS})
-        self.head = torch.nn.Sequential(torch.nn.Linear(2 * f_ego + len(NET_GROUPS) * (h + 1), h), torch.nn.GELU(),
+        self.groups = tuple(groups)
+        self.phi = torch.nn.ModuleDict({g: mlp(2 * f_agent) for g in self.groups})
+        self.head = torch.nn.Sequential(torch.nn.Linear(2 * f_ego + len(self.groups) * (h + 1), h), torch.nn.GELU(),
                                         torch.nn.Linear(h, h), torch.nn.GELU(), torch.nn.Linear(h, 1))
         self.h = h
 
     def forward(self, x):
         parts = [x["ego"]]
-        for g in NET_GROUPS:
+        for g in self.groups:
             rows, feats = x[g]
             z = self.phi[g](feats)
             pooled = torch.full((x["R"], self.h), -1e4, device=z.device)
@@ -1391,18 +1405,19 @@ def neural_reference(train, val, test, source, device):
             "test_ap": history[-1]["test_ap"], "best_val_ap": best_val, "test_ap_at_best_val": best_test,
             "history": history}
 
-def search_literals(train, val, device, sources=("img", "gt")):
+def search_literals(train, val, device, sources=("img", "gt"), same_agent=("ahead", "veh"), triples=True):
     """The literals of round 1, all chosen on train (val only reported): the best interval per (group,
     feature), pairs and triples on the same agent, regions over 1 / 2 / 3 features. sources: the feature
-    families of the pairs / triples / multi-feature regions ("img", "gt")."""
+    families of the pairs / triples / multi-feature regions ("img", "gt"); same_agent: their groups;
+    triples False: no triples and no 3-feature regions."""
     singles = []
-    for group in GROUPS:
+    for group in groups_of(train):
         for f in tqdm(features_of(train, group, "cont"), desc=f"Intervals ({group})"):
             r = single_search(train, val, group, f, device)
             if r is not None:
                 singles.append(r)
     pairs = []
-    for group in ("ahead", "veh"):
+    for group in same_agent:
         for feats in [f for src, f in (("img", IMG_AGENT), ("gt", GT_AGENT)) if src in sources]:
             for a in range(len(feats)):
                 for b in range(a + 1, len(feats)):
@@ -1411,7 +1426,7 @@ def search_literals(train, val, device, sources=("img", "gt")):
                         pairs.append(r)
 
     triples = []
-    for group in ("ahead", "veh"):
+    for group in same_agent if triples else ():
         for source, cats in [(k, v) for k, v in TRIPLE_FEATURES.items() if k in sources]:
             combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
             for feats in tqdm(combos, desc=f"Triples ({group}, {source})"):
@@ -1421,19 +1436,19 @@ def search_literals(train, val, device, sources=("img", "gt")):
 
     # Regions: any union of cells, over 1 / 2 / 3 features of the same agent.
     regions = {1: [], 2: [], 3: []}
-    for group in GROUPS:
+    for group in groups_of(train):
         for f in tqdm(features_of(train, group, "cont"), desc=f"Regions 1 ({group})"):
             r = region_search(train, val, group, (f,), device)
             if r is not None:
                 regions[1].append(r)
-    for group in ("ahead", "veh"):
+    for group in same_agent:
         for feats in [f for src, f in (("img", IMG_AGENT), ("gt", GT_AGENT)) if src in sources]:
             combos = [(feats[a], feats[b]) for a in range(len(feats)) for b in range(a + 1, len(feats))]
             for fs in tqdm(combos, desc=f"Regions 2 ({group})"):
                 r = region_search(train, val, group, fs, device)
                 if r is not None:
                     regions[2].append(r)
-        for source, cats in [(k, v) for k, v in TRIPLE_FEATURES.items() if k in sources]:
+        for source, cats in [(k, v) for k, v in TRIPLE_FEATURES.items() if k in sources and triples]:
             combos = [(p, z, v) for p in cats["position"] for z in cats["size"] for v in cats["speed"]]
             for fs in tqdm(combos, desc=f"Regions 3 ({group}, {source})"):
                 r = region_search(train, val, group, fs, device)

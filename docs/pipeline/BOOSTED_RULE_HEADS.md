@@ -49,13 +49,78 @@ Boosting beats sequential covering because a later rule can still re-rank the ro
 ./run_roadpp_docker.sh --gpu 0 -- --exp sumo_maps_v7 --machine dgx-jing --num_epochs 200 --boost_heads av:AV-Brake
 ```
 
-- The step 05 models are reused.
+- A new run retrains the step 05 models; `--run_id <run>` reuses them.
 - Step 06 fits the boosted head once and scores the val and test videos.
 - Step 06 then recomputes its metrics, because the settings now include `boost`.
 - Without `--boost_heads`, nothing changes and the cached metrics stay valid.
 
+## First result (run 1ca554, AV-Brake only, test, window 20)
+
+| Scorer | AV-Brake AP |
+|---|---|
+| Rule net | 0.409 |
+| OnsetMLP | 0.499 |
+| Rule net + boosted AV-Brake | **0.661** |
+
+Where the rule net trails the MLP (109 heads, rule net wins 18): heads with few mined seeds (no mined rule:
+0.068 vs 0.145; 1-3: 0.196 vs 0.294; 10+: 0.347 vs 0.359). The rule net is only 0-0.03 above its seeds
+(anchor), and its train loss (0.086) stays above its val loss (0.084) from epoch 9 on: it does not grow rules
+beyond the mined seeds. Largest gaps: Mobike / Cyc heads, lane and direction actions (VehLane, OutgoLane,
+MovTow, IncomLane).
+
+## All heads (2026-11-22, `AGENT_VERSION` boost_a1)
+
+`--boost_heads all` (or `agents`, `ego`, or names) boosts every head:
+- Ego heads (`av:`): as above.
+- Agent heads (e.g. `Car:Brake`):
+  - Rows: (t, agent n) of the head's class, at risk as in step 05.
+  - Groups of a row:
+    - `own`: n itself;
+    - `near_ped`: n's nearest pedestrian;
+    - `ahead`: the ego's lead;
+    - `veh` / `ped` / `tl`: some *other* agent;
+    - `ego`: the scene scale and the ego's labels.
+  - Every feature and label is also taken 1, 2, 3 and 5 s before.
+  - Train / val rows are sampled:
+    - all positives, up to 30k;
+    - negatives: 4x the positives, at least 20k;
+    - each row is weighted by 1 / its sampling rate, so the probabilities stay on the true onset rate.
+  - Literals:
+    - the bank and the 1-feature regions of every group;
+    - pairs and 2-feature regions on `own`;
+    - no triples: a depth-3 rule already combines `own` literals.
+  - Heads with fewer than 50 positive train rows are skipped; they keep the rule net's score.
+- Models and per-head val / test scores are cached in `<output_dir>/boost`.
+
+```bash
+./run_roadpp_docker.sh --gpu 0 -- --exp sumo_maps_v7 --machine dgx-jing --run_id 20261121-173934_dgx-jing_1ca554 --boost_heads all
+```
+
+## Fair neural reference: scorer "boost_net" (2026-11-22)
+
+Each boosted head also gets a SetNet (`brake_factors.SetNet`, `NET_VERSION` / `AGENT_NET_VERSION`). It shares
+these with the boosted rules:
+- the same rows and sample weights;
+- the same features and labels, with every lag;
+- the same row groups;
+- the same early-stopping criterion: the weighted val AP;
+- the same step 06 plug-in: it replaces the head's column in the rule net.
+
+The SetNet itself is a per-agent MLP for each group, max-pooled, then a row MLP. It is trained with full-batch
+Adam on the weighted BCE, for up to 2000 steps, checking the val AP every 25 steps with a patience of 8 checks.
+
+How to read the scorers:
+
+| Comparison | What it shows |
+|---|---|
+| `boost` vs `boost_net` | rules vs network, on equal inputs |
+| `boost_net` vs `mlp` | what the new features and rows add over the step 05 inputs |
+| `boost` vs `model` | the full change to the rule net |
+
+`--boost_heads` always produces both scorers.
+
 ## Not yet
 
-- The OnsetMLP does not get the new features yet. A fair comparison needs both sides to have them.
+- The step 05 OnsetMLP still has only the step 05 inputs. `boost_net` is the like-for-like neural model.
 - The step 07 paper metrics (fixed FA/min budget) do not include "boost" yet.
 - The boosted rules are not yet inside the TemporalRuleNet; for now they are a separate head scorer.
