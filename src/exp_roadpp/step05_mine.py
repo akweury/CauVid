@@ -216,6 +216,8 @@ def _complement(model, m):
     """The literal of "not m" (X <-> !X, G <-> !G), None if the model has no such literal."""
     M, G = model.num_inputs, model.num_groups
     kind = int(model.literal_kind[m])
+    if kind > 3:                    # a derived literal (`rule_lab.Derived`): no complement
+        return None
     if kind == 0:
         return M + m if model.negation else None
     if kind == 1:
@@ -224,6 +226,9 @@ def _complement(model, m):
 
 
 def literal_text(model, names, m):
+    text_of = getattr(model, "text_of", None)          # derived literals (`rule_lab.ExtModel`)
+    if text_of is not None and text_of(m) is not None:
+        return text_of(m)
     info = model.literal_info(m)
     scope = ["own", "other", *model.roles][info["scope"]]
     if info["kind"] in ("G", "!G"):

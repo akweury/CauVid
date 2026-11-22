@@ -15,7 +15,11 @@ Rule sets ("variants"), all mined on the train sample of `step05_mine.collect` (
   precise  beam search for precise conjunctions (`precise_rules`): any literal (no own root needed), any
            length up to --lab_max_len. A rule is kept if its precision is >= --lab_precise_min with
            >= --lab_min_events distinct onsets. A rule is extended while its precision can still rise;
-  m4+precise  the union.
+  a+b      the union of miners a and b (e.g. relaxed+precise);
+  ..._d    the same with the derived literals (`Derived`: X started / stopped / held, own-box motion).
+Model since 2026-11-22 (the user): relaxed / soft_logit (1ca554 lab: macro AP 0.245 vs MLP 0.283 on 86 heads,
+46 heads >= 0.9 x MLP; the m4 mined rules: 0.159, 13). Default variants: relaxed, relaxed+precise and both
+with the derived literals; default scorers max_k0, nor_k0, logit, soft_logit.
 Every rule is then recounted exactly on all train rows (`recount`). The sample's negatives carry weights of
 ~100; a rule with no sampled negative can still fire on many unsampled rows. A rule whose extension does
 not raise the exact precision over its sub-rule is dropped.
@@ -87,6 +91,154 @@ def _with_true(lits):
     return torch.cat([lits, torch.ones((len(lits), 1), dtype=torch.bool, device=lits.device)], dim=1)
 
 
+# -------------- Derived literals (second batch of facts) --------------
+class Derived:
+    """Literals derived from the rule net's literals of a row (2026-11-22). They are not stored in the data;
+    they are computed from the literal bits.
+      change  per positive input X of a single slot (any scope):
+                "X started" = X@1 & !X@2;
+                "X stopped" = X@2 & !X@1;
+                "X held"    = X@1 & X@2 (& X@3).
+              Each is one literal, so the miner does not need two tree levels to find an onset.
+      motion  per corner (TL / BR) of the agent's own box: its mean grid row / column between slot 1 and slot 2
+              (and slot 3) moved up / down / left / right by > MOVE cells. The box (BR - TL) grew / shrank
+              in height / width. The grid is 3x3, so only coarse moves show; the lane and direction heads
+              (VehLane, IncomLane, MovRht) are where the rules trail the MLP most.
+    A derived literal is allowed if all its parts are, and it has the base input of its first part, so the
+    head's own atom stays out of its rules."""
+    MOVE = 0.4
+
+    def __init__(self, model, names):
+        L, M, A = model.num_literals, model.num_inputs, model.num_atoms
+        self.L = L
+        mask = model.input_mask.cpu()
+        base = model.literal_base.cpu()
+
+        def lit(kind, a, sc, j):
+            try:
+                m = model.literal_of(kind, a, sc, j)
+            except (ValueError, KeyError, IndexError):
+                return None
+            return m if m < L else None
+        conj, text, bases, allowed = [], [], [], []
+        for m in range(M):
+            a, sc, j = model.decode_input(m)
+            if model.spans[(m // A) % model.num_spans] != (1, 1):
+                continue
+            x2, x3 = lit("X", a, sc, 2), lit("X", a, sc, 3)
+            if x2 is None:
+                continue
+            nx1, nx2 = (lit("!X", a, sc, 1), lit("!X", a, sc, 2)) if model.negation else (None, None)
+            src = step05_mine.literal_text(model, names, m).rsplit("@", 1)[0]
+            for kind, parts in (("started", [m, nx2]), ("stopped", [x2, nx1]),
+                                ("held", [m, x2] + ([x3] if x3 is not None else []))):
+                if any(x is None for x in parts):
+                    continue
+                conj.append(parts)
+                text.append(f"{kind}:{src}")
+                bases.append(int(base[m]))
+                allowed.append(bool(mask[parts].all()))
+        self.conj = _pad(conj, L) if conj else torch.zeros((0, 1), dtype=torch.long)
+        # Motion of the own box: the position literals pos:<corner>_r<i>c<j> in the own scope, per slot.
+        self.cells = {}                                  # (corner, slot) -> (literals, rows, cols)
+        for corner in ("TL", "BR"):
+            for j in (1, 2, 3):
+                lits, rows, cols = [], [], []
+                for a, nm in enumerate(names):
+                    if nm.startswith(f"pos:{corner}_r"):
+                        m = lit("X", a, 0, j)
+                        if m is not None:
+                            r, c = nm.split("_r")[1].split("c")
+                            lits.append(m)
+                            rows.append(float(r))
+                            cols.append(float(c))
+                if lits:
+                    self.cells[(corner, j)] = (torch.tensor(lits), torch.tensor(rows), torch.tensor(cols))
+        self.motion = []                                 # (kind, corner or None, j)
+        for j in (2, 3):
+            for corner in ("TL", "BR"):
+                if (corner, 1) in self.cells and (corner, j) in self.cells:
+                    for kind in ("up", "down", "left", "right"):
+                        self.motion.append((kind, corner, j))
+            if all((c, jj) in self.cells for c in ("TL", "BR") for jj in (1, j)):
+                for kind in ("grow_h", "shrink_h", "grow_w", "shrink_w"):
+                    self.motion.append((kind, None, j))
+        pos_lit = int(self.cells[("TL", 1)][0][0]) if ("TL", 1) in self.cells else 0
+        for kind, corner, j in self.motion:
+            text.append(f"box_{kind}{'_' + corner if corner else ''}(own)@1vs{j}")
+            bases.append(int(base[pos_lit]))
+            allowed.append(bool(mask[pos_lit]))
+        self.text, self.base, self.allowed = text, torch.tensor(bases, dtype=torch.long), torch.tensor(allowed)
+        self.size = len(text)
+        print(f"[Rule lab] derived literals: {len(conj)} change (started / stopped / held), "
+              f"{len(self.motion)} own-box motion")
+
+    def __call__(self, lits):
+        """(B, D) bool derived literals of literal rows lits (B, L) bool."""
+        dev = lits.device
+        parts = []
+        if len(self.conj):
+            parts.append(_holds_all(_with_true(lits), self.conj.to(dev)))
+        if self.motion:
+            mean = {}
+            for (corner, j), (idx, rows, cols) in self.cells.items():
+                x = lits[:, idx.to(dev)].float()
+                n = x.sum(dim=1)
+                mean[(corner, j)] = (n > 0, (x @ rows.to(dev)) / n.clamp(min=1), (x @ cols.to(dev)) / n.clamp(min=1))
+            out = []
+            for kind, corner, j in self.motion:
+                if corner is not None:
+                    (s1, r1, c1), (s2, r2, c2) = mean[(corner, 1)], mean[(corner, j)]
+                    d = {"up": r2 - r1, "down": r1 - r2, "left": c2 - c1, "right": c1 - c2}[kind]
+                    out.append(s1 & s2 & (d > self.MOVE))
+                else:
+                    (a1, tr1, tc1), (b1, br1, bc1) = mean[("TL", 1)], mean[("BR", 1)]
+                    (a2, tr2, tc2), (b2, br2, bc2) = mean[("TL", j)], mean[("BR", j)]
+                    h1, h2, w1, w2 = br1 - tr1, br2 - tr2, bc1 - tc1, bc2 - tc2
+                    d = {"grow_h": h1 - h2, "shrink_h": h2 - h1, "grow_w": w1 - w2, "shrink_w": w2 - w1}[kind]
+                    out.append(a1 & b1 & a2 & b2 & (d > self.MOVE))
+            parts.append(torch.stack(out, dim=1))
+        return torch.cat(parts, dim=1) if parts else torch.zeros((len(lits), 0), dtype=torch.bool, device=dev)
+
+    def extend(self, lits):
+        """(B, L + D) bool: the literals and the derived ones."""
+        return torch.cat([lits, self(lits)], dim=1)
+
+
+class ExtModel:
+    """The rule net seen with its derived literals appended (`Derived`): what `step05_mine.mine_head` and
+    `literal_text` read. use_derived False: the derived literals are not allowed (same indices)."""
+
+    def __init__(self, model, derived, use_derived):
+        self._model, self._d = model, derived
+        dev = model.input_mask.device
+        self.num_literals = model.num_literals + derived.size
+        self.literal_kind = torch.cat([model.literal_kind, torch.full((derived.size,), 4, device=dev,
+                                                                      dtype=model.literal_kind.dtype)])
+        self.literal_base = torch.cat([model.literal_base, derived.base.to(dev).to(model.literal_base.dtype)])
+        self.input_mask = torch.cat([model.input_mask, derived.allowed.to(dev) & bool(use_derived)])
+
+    def __getattr__(self, key):
+        return getattr(self._model, key)
+
+    def text_of(self, m):
+        return self._d.text[m - self._model.num_literals] if m >= self._model.num_literals else None
+
+
+def extend_rows(data, derived, L, device, chunk=50000):
+    """A `collect` sample with the derived literal bits appended to every row."""
+    packed = []
+    for i in range(0, len(data["packed"]), chunk):
+        bits = step05_mine._unpack(data["packed"][i:i + chunk], L, device) > 0.5
+        packed.append(step05_mine._pack(derived.extend(bits)).cpu())
+    return {**data, "packed": torch.cat(packed) if packed else data["packed"]}
+
+
+def literal_rows(model, inputs, derived):
+    """(B, L + D + 1) bool: a row's literals, the derived ones and the always-true one."""
+    return _with_true(derived.extend(model.literal_values(inputs) > 0.5))
+
+
 # -------------- Precise rule search --------------
 def precise_rules(pool, allowed, cfg):
     """Beam search for precise conjunctions on one head's train sample pool (`step05_mine._pool_of`).
@@ -150,11 +302,11 @@ def precise_rules(pool, allowed, cfg):
 
 # -------------- Exact counts on all train rows --------------
 @torch.no_grad()
-def recount(model, training_data, video_ids, rules, head_mask, possible, cfg):
+def recount(model, training_data, video_ids, rules, head_mask, possible, cfg, derived):
     """Exact fires (rows), hits (rows) and distinct onsets of every rule {"head", "literals"} on all at-risk
     rows of video_ids, and per head the rows and hit rows (the base rate)."""
     device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
-    A, L = model.num_atoms, model.num_literals
+    A, L = model.num_atoms, model.num_literals + derived.size
     R = len(rules)
     body = _pad([r["literals"] for r in rules], L).to(device)
     head = torch.tensor([r["head"] for r in rules], dtype=torch.long, device=device)
@@ -173,7 +325,7 @@ def recount(model, training_data, video_ids, rules, head_mask, possible, cfg):
             sel = keep.any(dim=1)
             if not sel.any() or R == 0:
                 continue
-            lits = _with_true(model.literal_values(rows["inputs"][sel]) > 0.5)
+            lits = literal_rows(model, rows["inputs"][sel], derived)
             holds = _holds_all(lits, body)                                      # (B, R)
             k_r, y_r = keep[sel][:, head], y[sel][:, head]                      # (B, R)
             fire = holds & k_r
@@ -388,7 +540,7 @@ class RuleSet:
 
 # -------------- Evaluation --------------
 @torch.no_grad()
-def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possible, cfg, k_mlp):
+def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived):
     """Score histograms {(variant, scorer) | "mlp": (pos, neg) (A, NB)} on all at-risk rows of video_ids."""
     device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
     A, NB = model.num_atoms, step07_paper.NB
@@ -410,7 +562,7 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
             keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
             if not keep.any():
                 continue
-            lits = _with_true(model.literal_values(rows["inputs"]) > 0.5)
+            lits = literal_rows(model, rows["inputs"], derived)
             if mlp is not None:
                 add("mlp", mlp.window_probs(mlp(rows["inputs"])[0])[:, k_mlp], keep, y)
             for variant, rs in rule_sets.items():
@@ -466,10 +618,55 @@ def _none(x):
 
 
 # -------------- Main --------------
+def parse_variant(name):
+    """"relaxed+precise_d" -> (["relaxed", "precise"], True): the rule sets united, with the derived literals."""
+    derived = name.endswith("_d")
+    return (name[:-2] if derived else name).split("+"), derived
+
+
+def mine_component(component, use_derived, ext, names, heads, train, check, cfg, device):
+    """The rules {"head", "literals"[, "root"]} of one miner ("m4", "relaxed", "precise") on the train sample."""
+    L, A = ext.num_literals, ext.num_atoms
+    rules = []
+    if component in ("m4", "relaxed"):
+        over = RELAXED if component == "relaxed" else {}
+        for h in tqdm(heads, desc=f"Mining {component}{' + derived' if use_derived else ''}"):
+            seeds, _ = step05_mine.mine_head(ext, names, h, train, check, {**cfg, **over}, device)
+            rules += [{"head": int(sd["head"]), "literals": list(sd["literals"]), "root": bool(sd.get("root"))}
+                      for sd in seeds]
+        return rules
+    base = ext.literal_base.to(device)
+    scope = base // (ext.num_spans * A)
+    for h in tqdm(heads, desc=f"Precise search{' + derived' if use_derived else ''}"):
+        if not bool((train["pairs"]["head"] == h).any()):
+            continue
+        allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
+        pool = step05_mine._pool_of(train, h, L, device)
+        rules += [{"head": int(h), "literals": list(key)} for key, _p, _e in precise_rules(pool, allowed, cfg)]
+    return rules
+
+
+def show_rules(texts, heads, top=8):
+    """Print the strongest rules (soft logistic weight) of some heads, with each literal's soft gate."""
+    for head in heads:
+        rs = sorted((r for r in texts if r["head"] == head), key=lambda r: -(r.get("soft_weight") or 0))[:top]
+        if not rs:
+            continue
+        print(f"  {head}:")
+        for r in rs:
+            lits = " & ".join(f"{t}[{g:.2f}]" if g is not None else t for t, g in zip(r["literals"], r["gates"]))
+            print(f"    w {r.get('soft_weight', 0):+6.2f}  p {r['precision']:.2f}  {r['events']:5d} onsets  {lits}")
+
+
 def main():
     parser = utils_pipe.get_parser()
-    parser.add_argument("--lab_variants", type=str, default="m4,relaxed,precise,m4+precise")
-    parser.add_argument("--lab_priors", type=str, default="0,2,5,20", help="confidence shrink k (onsets)")
+    parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed+precise,relaxed_d,relaxed+precise_d",
+                        help="rule sets: miners m4 / relaxed / precise joined by +, suffix _d: with the derived literals")
+    parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
+    parser.add_argument("--lab_soft", type=str, default="logit", help="soft OR modes: logit, nor")
+    parser.add_argument("--lab_show", type=str,
+                        default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
+                        help="heads whose strongest rules are printed")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
     parser.add_argument("--lab_min_events", type=int, default=2, help="precise search: distinct onsets of a rule")
     parser.add_argument("--lab_min_videos", type=int, default=1)
@@ -502,37 +699,28 @@ def main():
     head_mask = training_data["target_heads"].to(device)
     heads = torch.nonzero(head_mask).flatten().tolist()
     possible = step05.class_possible(training_data, vocab, device)
-    L, A = model.num_literals, model.num_atoms
+    A = model.num_atoms
 
+    # Literals: the rule net's and the derived ones (same indices in every variant; the variants without "_d"
+    # may not use the derived ones).
+    derived = Derived(model, names)
+    ext = {False: ExtModel(model, derived, False), True: ExtModel(model, derived, True)}
+    L = ext[True].num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     val_ids = list(training_data["val_videos"])
-    check = mine_sweep.subset(val, set(range(0, len(val_ids), 2)))
+    train = extend_rows(train, derived, model.num_literals, device)
+    check = extend_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), derived, model.num_literals, device)
+    del val
     eval_ids = val_ids[1::2]
 
-    # 1. Rule sets on the train sample.
+    # 1. Rule sets on the train sample, each miner once per literal set.
     variants = args.lab_variants.split(",")
     mined = {}
-    base_mask = model.literal_base.to(device)
-    scope = base_mask // (model.num_spans * A)
-    for name, over in (("m4", {}), ("relaxed", RELAXED)):
-        if name in variants or (name == "m4" and "m4+precise" in variants):
-            rules = []
-            for h in tqdm(heads, desc=f"Mining {name}"):
-                seeds, _ = step05_mine.mine_head(model, names, h, train, check, {**cfg, **over}, device)
-                rules += [{"head": int(sd["head"]), "literals": list(sd["literals"]), "root": bool(sd.get("root"))}
-                          for sd in seeds]
-            mined[name] = rules
-    if "precise" in variants or "m4+precise" in variants:
-        rules = []
-        for h in tqdm(heads, desc="Precise search"):
-            if not bool((train["pairs"]["head"] == h).any()):
-                continue
-            allowed = model.input_mask.to(device) & ~((base_mask % A == h) & (scope == 0))
-            pool = step05_mine._pool_of(train, h, L, device)
-            rules += [{"head": int(h), "literals": list(key)} for key, _p, _e in precise_rules(pool, allowed, cfg)]
-        mined["precise"] = rules
-    if "m4+precise" in variants:
-        mined["m4+precise"] = mined["m4"] + mined["precise"]
+    for name in variants:
+        components, use_d = parse_variant(name)
+        for c in components:
+            if (c, use_d) not in mined:
+                mined[(c, use_d)] = mine_component(c, use_d, ext[use_d], names, heads, train, check, cfg, device)
 
     # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
     unique = {}
@@ -541,36 +729,58 @@ def main():
             unique.setdefault((r["head"], tuple(sorted(r["literals"]))), r)
     keys = list(unique)
     counts = recount(model, training_data, training_data["train_videos"], [unique[k] for k in keys], head_mask,
-                     possible, cfg)
+                     possible, cfg, derived)
     exact = {k: i for i, k in enumerate(keys)}
     priors = [float(x) for x in args.lab_priors.split(",")]
+    soft_modes = [m for m in args.lab_soft.split(",") if m]
     rule_sets, texts = {}, {}
     for name in variants:
-        rs = mined[name]
+        components, use_d = parse_variant(name)
+        seen, rs = set(), []
+        for c in components:
+            for r in mined[(c, use_d)]:
+                key = (r["head"], tuple(sorted(r["literals"])))
+                if key not in seen:
+                    seen.add(key)
+                    rs.append(r)
         idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
-        final = finalize(rs, sub, 1 if name in ("m4", "relaxed") else args.lab_min_events)
-        logit = fit_logit(final, train, model, heads, device)
-        soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, model,
-                            heads, device, m) for m in ("logit", "nor")}
+        final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
+        logit = fit_logit(final, train, ext[True], heads, device)
+        soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, ext[True],
+                            heads, device, m) for m in soft_modes}
         for m, (g, _p) in soft.items():
             real = g[_pad([r["literals"] for r in final], L) != L] if final else g.flatten()
             print(f"[Rule lab] {name} soft {m}: {float((real < 0.5).float().mean()) if len(real) else 0:.1%} of the "
                   f"literals relaxed (gate < 0.5)")
         rule_sets[name] = RuleSet(final, counts["base"], priors, logit, L, A, device, soft)
-        texts[name] = [{"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
-                        "text": " & ".join(step05_mine.literal_text(model, names, m) for m in r["literals"])}
-                       for r in sorted(final, key=lambda r: (-r["precision"], -r["events"]))]
+        gate = soft["logit"][0] if "logit" in soft else None
+        soft_w = soft["logit"][1][0] if "logit" in soft else None
+        texts[name] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
+                               "literals": [step05_mine.literal_text(ext[True], names, m) for m in r["literals"]],
+                               "gates": ([round(float(x), 3) for x in gate[i][:len(r["literals"])]] if gate is not None
+                                         else [None] * len(r["literals"])),
+                               "derived": sum(m >= model.num_literals for m in r["literals"]),
+                               "weight": round(float(logit[0][i]), 3),
+                               "soft_weight": round(float(soft_w[i]), 3) if soft_w is not None else None}
+                              for i, r in enumerate(final)), key=lambda r: (r["head"], -(r["soft_weight"] or 0)))
+        n_d = sum(1 for r in texts[name] if r["derived"])
         print(f"[Rule lab] {name}: {len(final)} rules for {len({r['head'] for r in final})} heads "
-              f"(literals per rule {sum(len(r['literals']) for r in final) / max(len(final), 1):.2f})")
+              f"(literals per rule {sum(len(r['literals']) for r in final) / max(len(final), 1):.2f}; "
+              f"{n_d} with a derived literal)")
 
     # 3. Every at-risk row of the odd val videos.
-    hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp)
+    hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
     out = report(hist, names, heads, rule_sets)
+    if out["best"]:
+        best_variant = out["best"].split("/")[0]
+        print(f"\n[Rule lab] strongest rules of {best_variant} (soft logistic weight; [gate] per literal, "
+              f"1 = required, 0 = ignored):")
+        show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h])
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
-    path = out_dir / f"rule_lab_{tag}_pm{args.lab_precise_min:g}_me{args.lab_min_events}_len{args.lab_max_len}.json"
+    path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
-                          "mlp_window": model.windows[k_mlp], **out, "rules": texts}, path)
+                          "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
     print(f"[Rule lab] saved {path}")
 
 
