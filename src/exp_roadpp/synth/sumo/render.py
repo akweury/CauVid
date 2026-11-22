@@ -118,8 +118,10 @@ def _short(labels, ids, kind):
     return [labels[kind][i] for i in ids]
 
 
-def render(dataset, vid, frame, out_file, note=None):
-    """One image of frame (1-based) of video vid; note: an extra line for the title of the top view."""
+def render(dataset, vid, frame, out_file, note=None, highlight=None):
+    """One image of frame (1-based) of video vid; note: an extra line for the title of the top view;
+    highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`)."""
+    hl = highlight.split("-", 1)[1] if highlight and "-" in highlight else highlight
     labels, data, worlds, firings = _video(dataset, vid)
     world = worlds[frame - 1]
     annos = data["frames"][str(frame)]["annos"]
@@ -136,10 +138,10 @@ def render(dataset, vid, frame, out_file, note=None):
     top.add_patch(Wedge((cam.x, cam.y), observe.MAX_RANGE, yaw - observe.HFOV_DEG / 2, yaw + observe.HFOV_DEG / 2,
                         fc="#ffe680", alpha=0.35, ec="#e6b800", zorder=3))
 
-    def box(x, y, angle, length, width, color, alpha, z):
+    def box(x, y, angle, length, width, color, alpha, z, mark=False):
         corners = observe.footprint(x, y, angle, length, width)
         top.add_patch(Polygon([corners[0], corners[1], corners[3], corners[2]], closed=True, fc=color,
-                              ec="black", lw=0.4, alpha=alpha, zorder=z))
+                              ec="red" if mark else "black", lw=2.5 if mark else 0.4, alpha=alpha, zorder=z))
 
     for vid_, v in world["veh"].items():
         if vid_ == "ego":
@@ -147,13 +149,13 @@ def render(dataset, vid, frame, out_file, note=None):
             continue
         on = vid_ in seen
         box(v["x"], v["y"], v["angle"], v["length"], v["width"], COLORS[v["cls"]] if on else "#bbbbbb",
-            1.0 if on else 0.6, 5)
+            1.0 if on else 0.6, 5, mark=vid_ == hl)
         if v["signals"] & 4:
             top.plot(v["x"], v["y"], marker="*", color="orange", ms=10, zorder=7)
     for pid, p in world["ped"].items():
         on = pid in seen
-        top.add_patch(plt.Circle((p["x"], p["y"]), 0.6, fc=COLORS["Ped"] if on else "#bbbbbb", ec="black",
-                                 lw=0.3, zorder=5))
+        top.add_patch(plt.Circle((p["x"], p["y"]), 0.6, fc=COLORS["Ped"] if on else "#bbbbbb",
+                                 ec="red" if pid == hl else "black", lw=2.5 if pid == hl else 0.3, zorder=5))
     if world.get("tl"):
         tl = world["tl"]
         c = {"r": "red", "y": "gold", "g": "green"}.get(tl["state"][0].lower(), "grey")
@@ -176,7 +178,9 @@ def render(dataset, vid, frame, out_file, note=None):
         x1, y1, x2, y2 = a["box"]
         cls = labels["agent_labels"][a["agent_ids"][0]]
         col = COLORS.get(cls, "black")
-        cam_ax.add_patch(Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H, fill=False, ec=col, lw=1.6))
+        mark = highlight is not None and a.get("tube_uid") == highlight
+        cam_ax.add_patch(Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H, fill=False,
+                                   ec="red" if mark else col, lw=4.0 if mark else 1.6))
         text = cls + " " + ",".join(_short(labels, a["action_ids"], "action_labels"))
         locs = _short(labels, a["loc_ids"], "loc_labels")
         if locs:

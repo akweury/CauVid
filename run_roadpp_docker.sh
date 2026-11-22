@@ -121,6 +121,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.mine_sweep"
     elif [[ "$arg" == "--rule_lab" ]]; then
         ENTRY_MODULE="src.exp_roadpp.rule_lab"
+    elif [[ "$arg" == "--lane_clips" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.lane_clips"
     elif [[ "$arg" == "--rule_tree" ]]; then
         ENTRY_MODULE="src.exp_roadpp.rule_tree"
     elif [[ "$arg" == "--onset_cue_diag" ]]; then
