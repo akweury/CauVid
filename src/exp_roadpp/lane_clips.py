@@ -145,7 +145,7 @@ def main():
     device = cfg["device"]
     training_data = step05.load_training_data(cfg)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
-    mlp = step05.load_onset_mlp(training_data, cfg)
+    mlp = rule_lab.ensure_mlp(training_data, cfg)
     window = int(cfg.get("clause_slots", 1)) * model.slot_size
     k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
     vocab = step05.load_vocabulary(cfg)

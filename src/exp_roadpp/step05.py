@@ -8,6 +8,7 @@ from tqdm import tqdm
 from src.exp_roadpp import utils_data, roles as agent_roles, geometry as agent_geometry, grid as agent_grid
 from src.exp_roadpp import motion as agent_motion, ego_motion as agent_ego_motion, ego_flow as agent_ego_flow
 from src.exp_roadpp import predict as agent_predict
+from src.exp_roadpp import shape as agent_shape
 from src.exp_roadpp import duration as agent_duration
 from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins, slot_spans
 from src.exp_roadpp.baselines.onset_mlp import OnsetMLP
@@ -60,7 +61,7 @@ def load_vocabulary(cfg):
     cfg["motion"] (`motion.vocabulary`), then the ego motion atoms of cfg["ego_motion"]
     (`ego_motion.vocabulary`), then the ego flow atoms of cfg["ego_flow"] (`ego_flow.vocabulary`), then the
     duration atoms of cfg["durations"] (`duration.vocabulary`), then the prediction atoms of cfg["predict"]
-    (`predict.vocabulary`)."""
+    (`predict.vocabulary`), then the shape-phase atoms of cfg["shape"] (`shape.vocabulary`)."""
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     out = unique_atoms + agent_geometry.vocabulary(unique_atoms, cfg.get("geometry", ()))
     if cfg.get("grid"):
@@ -75,6 +76,8 @@ def load_vocabulary(cfg):
         out += agent_duration.vocabulary(unique_atoms, duration_labels(cfg))
     if cfg.get("predict"):
         out += agent_predict.vocabulary(unique_atoms)
+    if cfg.get("shape"):
+        out += agent_shape.vocabulary()
     return out
 
 
@@ -82,7 +85,7 @@ def is_input_atom(signature):
     """Geometry, grid, motion, ego motion, ego flow, duration and prediction atoms are inputs only: no head
     learns or is evaluated on them."""
     return len(signature) > 1 and signature[1] in ("geometry", "grid", "motion", "ego_motion", "ego_flow", "duration",
-                                                   "predict")
+                                                   "predict", "shape")
 
 
 # -------------- Grid atoms (`grid.py`) --------------
@@ -102,6 +105,8 @@ def grid_tag(cfg):
         tag += agent_duration.tag(duration_labels(cfg))
     if cfg.get("predict"):
         tag += agent_predict.tag()
+    if cfg.get("shape"):
+        tag += agent_shape.tag()
     return tag
 
 
@@ -189,6 +194,42 @@ def load_motion(cfg):
     if not os.path.exists(cfg["motion_file"]):
         utils_data.save_json(fit_motion(cfg), cfg["motion_file"])
     return utils_data.load_json(cfg["motion_file"])
+
+
+# -------------- Shape-phase atoms (`shape.py`) --------------
+def fit_shape(cfg):
+    """The shape thresholds of the train split (`shape.fit`): the signals of every train box, per class."""
+    if not cfg.get("train_box_file") or not os.path.exists(cfg["train_box_file"]):
+        raise FileNotFoundError(f"The shape atoms need the train box file {cfg.get('train_box_file')} (step_dataset).")
+    unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+    A = len(unique_atoms)
+    boxes = torch.load(cfg["train_box_file"], map_location="cpu")
+    atoms = utils_data.load_json(cfg["train_atom_file"])
+    samples = {}
+    for video_id, video_atoms in tqdm(atoms.items(), desc="Shape: train boxes"):
+        X = build_video_tensor(video_atoms, A)
+        if X.shape[0] <= agent_shape.K:
+            continue
+        video_boxes, classes, has_box = _agent_boxes(boxes, video_id, video_atoms, X)
+        sig = agent_shape.signals(video_boxes, has_box)                          # (T, N, 5)
+        for n, cls in enumerate(classes):
+            keep = has_box[:, n]
+            if cls is not None and keep.any():
+                samples.setdefault(str(cls), []).append(sig[keep, n])
+    spec = agent_shape.fit({cls: torch.cat(v) for cls, v in samples.items()})
+    for cls, t in sorted(spec["classes"].items()):
+        print(f"[Shape]\t {cls}: " + ", ".join(f"{s} {[round(v, 4) for v in t[s]]}" for s in agent_shape.SIGNALS))
+    return {**spec, "k": agent_shape.K, "debounce": agent_shape.DEBOUNCE, "version": agent_shape.VERSION}
+
+
+def load_shape(cfg):
+    """The shape thresholds of cfg["shape_file"] (fitted on the train split by `fit_shape` if missing), None
+    without the shape atoms."""
+    if not cfg.get("shape"):
+        return None
+    if not os.path.exists(cfg["shape_file"]):
+        utils_data.save_json(fit_shape(cfg), cfg["shape_file"])
+    return utils_data.load_json(cfg["shape_file"])
 
 
 # -------------- Ego motion atoms (`ego_motion.py`) --------------
@@ -293,7 +334,7 @@ def rule_input_mask(data, cfg, num_scopes=2):
     J, A = cfg["num_slots"], data["num_atoms"]
     atom = torch.arange(A)
     own_only = torch.zeros(A, dtype=torch.bool)
-    for key in ("position", "motion"):
+    for key in ("position", "motion", "shape"):
         if key in layout:
             own_only |= (atom >= layout[key][0]) & (atom < layout[key][1])
     allowed = torch.ones((num_scopes, J, A), dtype=torch.bool)
@@ -484,7 +525,7 @@ def is_fresh(output_file, *source_files):
 
 def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None, roles=(), geometry=(),
                    unique_atoms=None, grid_spec=None, motion_spec=None, ego_motion_spec=None, ego_flow_spec=None,
-                   duration_spec=None, predict_spec=None):
+                   duration_spec=None, predict_spec=None, shape_spec=None):
     """Compressed atoms and frame lists of every video of one split.
     With roles (`roles.ROLES`), each video also gets "roles" (T, N, K) int16: the
     agent filling each role for each agent and frame (-1: none), from the boxes of
@@ -502,7 +543,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     duration atoms (`duration.duration_atoms`, from the label atoms) follow them; with predict_spec
     (`load_predict`), the prediction atoms (`predict.predict_atoms`: reach / conflict times of pedestrians
     and cyclists, from the boxes) follow them; "grid_layout" gives their [start, end) atom ranges
-    ("position", "motion", "ego_motion", "ego_flow", "duration", "predict").
+    ("position", "motion", "ego_motion", "ego_flow", "duration", "predict", "shape"). With shape_spec
+    (`load_shape`), the shape-phase atoms (`shape.shape_atoms`) come last.
 
     Returns {
       "num_atoms": A, the label atoms and the geometry atoms after them,
@@ -520,7 +562,7 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     atoms = utils_data.load_json(atom_file)
     boxes = None
     if (roles or geometry or grid_spec is not None or motion_spec is not None or ego_motion_spec is not None
-            or predict_spec is not None):
+            or predict_spec is not None or shape_spec is not None):
         if box_file is None or not os.path.exists(box_file):
             raise FileNotFoundError(f"Agent roles {roles}, geometry {geometry} and the grid need the box file "
                                     f"{box_file} (step_dataset).")
@@ -552,6 +594,9 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     predict_start = duration_start + num_duration
     num_predict = len(agent_predict.vocabulary(unique_atoms)) if predict_spec is not None else 0
     predict_on = 0.0
+    shape_start = predict_start + num_predict
+    num_shape = len(agent_shape.ATOMS) if shape_spec is not None else 0
+    shape_on = torch.zeros(num_shape)
     turn_atoms = agent_predict.ego_turn_atoms(unique_atoms) if predict_spec is not None else []
     if ego_flow_spec is not None:
         _ensure_ego_flow(atoms, boxes, ego_flow_spec)
@@ -627,6 +672,10 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
                                                                    predict_spec["camera"]))
             predict_on += float(P_atoms.any(dim=2).sum())
             X = torch.cat([X, P_atoms.to(X.device)], dim=2)
+        if shape_spec is not None:
+            S_atoms = agent_shape.shape_atoms(video_boxes, has_box, classes, shape_spec)
+            shape_on += S_atoms.sum(dim=(0, 1)).float()
+            X = torch.cat([X, S_atoms.to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
         if roles:
             videos[video_id]["roles"] = partners.to(torch.int16)
@@ -661,15 +710,18 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     if predict_spec is not None:
         print(f"[Predict]\t {name}: {num_predict} prediction atoms; share of visible agents (rows) holding one: "
               f"{predict_on / max(num_rows, 1):.3f}")
+    if shape_spec is not None:
+        print(f"[Shape]\t {name}: share of visible agents (rows) holding each shape atom: "
+              + ", ".join(f"{a} {shape_on[i] / max(num_rows, 1):.3f}" for i, a in enumerate(agent_shape.ATOMS)))
     out = {"num_atoms": num_atoms + len(geometry_atoms) + num_grid + num_motion + num_ego_motion + num_ego_flow
-                        + num_duration + num_predict,
+                        + num_duration + num_predict + num_shape,
            "num_label_atoms": num_atoms,
            "min_off_frames": min_off_frames, "roles": list(roles), "geometry": list(geometry), "videos": videos,
            "frames": frames, "positive_frames": positive_frames}
     if boxes is not None:
         out["group_tag"] = agent_grid.GROUP_TAG
     if (grid_spec is not None or motion_spec is not None or ego_motion_spec is not None or ego_flow_spec is not None
-            or duration_spec is not None or predict_spec is not None):
+            or duration_spec is not None or predict_spec is not None or shape_spec is not None):
         out["grid_layout"] = {}
     if grid_spec is not None:
         out["grid_layout"]["position"] = [grid_start, grid_start + num_grid]
@@ -683,6 +735,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
         out["grid_layout"]["duration"] = [duration_start, duration_start + num_duration]
     if predict_spec is not None:
         out["grid_layout"]["predict"] = [predict_start, predict_start + num_predict]
+    if shape_spec is not None:
+        out["grid_layout"]["shape"] = [shape_start, shape_start + num_shape]
     return out
 
 
@@ -699,12 +753,13 @@ def prepare_training_data(cfg):
     num_atoms = len(unique_atoms)
     grid_spec, motion_spec, ego_motion_spec = load_grid(cfg), load_motion(cfg), load_ego_motion(cfg)
     ego_flow_spec, duration_spec, predict_spec = load_ego_flow(cfg), load_durations(cfg), load_predict(cfg)
+    shape_spec = load_shape(cfg)
     train = prepare_videos(cfg['train_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
                            cfg.get("train_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
-                           motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec)
+                           motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec, shape_spec)
     val = prepare_videos(cfg['val_atom_file'], num_atoms, cfg["device"], cfg["min_off_frames"],
                          cfg.get("val_box_file"), cfg["roles"], cfg["geometry"], unique_atoms, grid_spec,
-                         motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec)
+                         motion_spec, ego_motion_spec, ego_flow_spec, duration_spec, predict_spec, shape_spec)
     shared = set(train["videos"]) & set(val["videos"])
     if shared:
         raise ValueError(f"{len(shared)} videos are in both the train and the val split, e.g. {sorted(shared)[:3]}.")
@@ -1935,6 +1990,9 @@ def get_cfg(input_data):
     # Prediction atoms (`predict.py`): when the ego reaches a pedestrian / cyclist and whether their paths
     # cross then, from the boxes; read in every scope. Off until an ablation shows a clear gain.
     predict = input_data.get("predict", False)                # --predict (default False)
+    # Shape-phase atoms (`shape.py`): how the own box moves and changes its width / height, and the order of
+    # the last PHASES such phases, duration-free (2026-11-22). Off until the rule lab shows a clear gain.
+    shape = input_data.get("shape", False)                    # --shape_phases (default False)
     # Every rule must hold an own-agent atom (`TemporalRuleNet` require_self): without it, 75% of the
     # rules read only the other agents and fire for every agent of a scene alike (medium, grid 3x3).
     require_self = input_data.get("require_self", True)       # --require_self (default True)
@@ -2008,12 +2066,12 @@ def get_cfg(input_data):
     if geometry:
         base_tag += "_g" + "-".join(geometry)
     base_tag += grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion, "ego_flow": ego_flow,
-                          "durations": durations, "duration_labels": dur_labels, "predict": predict})
+                          "durations": durations, "duration_labels": dur_labels, "predict": predict, "shape": shape})
     # The prepared datasets depend only on these settings (`shared_data_file`).
     min_off_frames = 10
     data_key = (f"m{min_off_frames}" + ("_r" + "-".join(roles) if roles else "") + ("_g" + "-".join(geometry) if geometry else "")
                 + grid_tag({"grid": grid, "motion": motion, "ego_motion": ego_motion, "ego_flow": ego_flow,
-                          "durations": durations, "duration_labels": dur_labels, "predict": predict}))
+                          "durations": durations, "duration_labels": dur_labels, "predict": predict, "shape": shape}))
     # The main rule net (and what is derived from it: its clauses, cascade, pruning, rule set)
     # carries the type balance; the unweighted models (the MLP) keep base_tag.
     # Rule mining (`step05_mine`): the non-default settings go into the seed file and model names.
@@ -2194,6 +2252,9 @@ def get_cfg(input_data):
             'duration_labels': dur_labels,
             'slot_ranges': slot_ranges,
             'predict': predict,
+            'shape': shape,
+            # The shape thresholds fitted on the train split (`fit_shape`).
+            'shape_file': input_data["output_dir"] / f"shape_spec{agent_shape.tag()}.json",
             # The raw flow samples per video (`ego_flow.ensure_cache`), shared by every exp and run.
             'ego_flow_cache_dir': input_data.get("ego_flow_cache_dir"),
             'ego_flow_workers': int(input_data.get("ego_flow_workers", 16)),

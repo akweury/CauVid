@@ -652,13 +652,34 @@ def _none(x):
 
 # -------------- Main --------------
 def parse_variant(name):
-    """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True)): the rule sets united; flags: with the
-    derived literals (_d), without the negated literals of the other agents (_nn)."""
-    flags = {"_d": False, "_nn": False}
+    """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True, False)): the rule sets united; flags:
+    with the derived literals (_d), without the negated literals of the other agents (_nn), without the
+    shape-phase atoms (_ns, `shape.py`)."""
+    flags = {"_d": False, "_nn": False, "_ns": False}
     while any(name.endswith(f) for f in flags):
         f = next(f for f in flags if name.endswith(f))
         flags[f], name = True, name[:-len(f)]
-    return name.split("+"), (flags["_d"], flags["_nn"])
+    return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"])
+
+
+def atom_literals(model, lo, hi):
+    """(L,) bool: the literals (any kind and scope) of the atoms lo..hi - 1, e.g. the shape atoms."""
+    out = torch.zeros(model.num_literals, dtype=torch.bool)
+    for m in range(model.num_literals):
+        info = model.literal_info(m)
+        out[m] = info["kind"] in ("X", "!X") and lo <= info["atom"] < hi
+    return out
+
+
+def ensure_mlp(training_data, cfg):
+    """The run's OnsetMLP, trained (and saved) if missing: the lab needs no rule net, so a new run with new
+    atoms (e.g. --shape_phases True) only builds the data and the MLP here."""
+    mlp = step05.load_onset_mlp(training_data, cfg)
+    if mlp is None:
+        print(f"[Rule lab] no OnsetMLP at {cfg['mlp_model_file']}: training it on the same inputs")
+        torch.save(step05.train_onset_mlp(training_data, cfg).state_dict(), cfg["mlp_model_file"])
+        mlp = step05.load_onset_mlp(training_data, cfg)
+    return mlp
 
 
 def negated_others(model):
@@ -770,9 +791,7 @@ def main():
 
     training_data = step05.load_training_data(cfg)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
-    mlp = step05.load_onset_mlp(training_data, cfg)
-    if mlp is None:
-        raise ValueError(f"no OnsetMLP at {cfg['mlp_model_file']}")
+    mlp = ensure_mlp(training_data, cfg)
     window = int(cfg.get("clause_slots", 1)) * model.slot_size
     k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
     vocab = step05.load_vocabulary(cfg)
@@ -785,9 +804,19 @@ def main():
     # Literals: the rule net's and the derived ones (same indices in every variant; the variants without "_d"
     # may not use the derived ones).
     derived = Derived(model, names)
-    forbid = negated_others(model)
-    ext = {(d, nn): ExtModel(model, derived, d, forbid if nn else None) for d in (False, True) for nn in (False, True)}
-    L = ext[(True, False)].num_literals
+    forbid_nn = negated_others(model)
+    layout = training_data.get("grid_layout", {})
+    forbid_ns = (atom_literals(model, *layout["shape"]) if "shape" in layout
+                 else torch.zeros(model.num_literals, dtype=torch.bool))
+    if "shape" in layout:
+        print(f"[Rule lab] shape-phase atoms {layout['shape']}: {int(forbid_ns.sum())} literals (off in the _ns variants)")
+
+    def make_ext(flags):
+        d, nn, ns = flags
+        forbid = (forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
+        return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
+    ext = {}
+    L = make_ext((True, False, False)).num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     val_ids = list(training_data["val_videos"])
     train = extend_rows(train, derived, model.num_literals, device)
@@ -802,6 +831,8 @@ def main():
         components, flags = parse_variant(name)
         for c in components:
             if (c, flags) not in mined:
+                if flags not in ext:
+                    ext[flags] = make_ext(flags)
                 mined[(c, flags)] = mine_component(c, flags[0], ext[flags], names, heads, train, check, cfg, device)
 
     # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
@@ -828,7 +859,7 @@ def main():
         idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
-        full = ext[(True, False)]
+        full = make_ext((True, False, False))
         logit = fit_logit(final, train, full, heads, device)
         soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, full,
                             heads, device, m) for m in soft_modes}

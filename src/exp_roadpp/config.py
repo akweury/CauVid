@@ -386,6 +386,8 @@ def get_step_05_input(args):
         # Slot ranges of the rule bodies (`TemporalRuleNet` ranges): a body holds somewhere in slots a..b.
         "slot_ranges": str(getattr(args, "slot_ranges", "False")) == "True",
         "predict": str(getattr(args, "predict", "False")) == "True",
+        # Shape-phase atoms (`shape.py`): the own box's moves and width / height changes, and their order.
+        "shape": str(getattr(args, "shape_phases", "False")) == "True",
         # Duration atoms (`duration.py`): how long a label has held (log-scale age bins and their unions).
         "durations": str(getattr(args, "durations", "False")) == "True",
         "duration_labels": str(getattr(args, "duration_labels", "") or ""),

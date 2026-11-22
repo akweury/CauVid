@@ -53,6 +53,9 @@ def get_parser():
                         help="Step 05: ego yaw / speed atoms read from the camera image (ego_flow.py), default False")
     parser.add_argument("--slot_ranges", type=str, default="False",
                         help="Step 05: rule bodies over a span of slots a..b (variable step durations), default False")
+    parser.add_argument("--shape_phases", type=str, default="False",
+                        help="Step 05: shape-phase atoms (shape.py): the own box's moves and width / height changes "
+                             "and the order of the last 4 such phases; default False (rule lab test, 2026-11-22)")
     parser.add_argument("--predict", type=str, default="False",
                         help="Step 05: prediction atoms (predict.py): when the ego reaches a pedestrian / cyclist "
                              "and whether their paths cross, from the boxes; default False")
