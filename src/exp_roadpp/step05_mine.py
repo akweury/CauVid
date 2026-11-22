@@ -259,6 +259,12 @@ def mine_head(model, names, head, train, val, cfg, device):
     scope = base // (S_ * A)
     allowed = model.input_mask.to(device) & ~((base % A == head) & (scope == 0))     # not the head itself
     own_pos = allowed & (model.literal_kind.to(device) == 0) & (scope == 0)
+    # Atoms that may not be roots ([lo, hi) atom ranges, e.g. the shape atoms): an input that holds for almost
+    # every agent ("shp:app_middle") covers the most hits and became the root of 442 of 882 rules (rule lab,
+    # 2026-11-22), so every rule had to hold it. They stay usable inside the rules.
+    for lo, hi in cfg.get("mine_root_exclude") or ():
+        atom = base % A
+        own_pos &= ~((atom >= lo) & (atom < hi))
     wy = tr["w"] * tr["y"]
     total = float(wy.sum())
     seeds, remaining = [], tr["y"].clone()

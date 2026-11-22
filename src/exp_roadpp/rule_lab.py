@@ -769,6 +769,8 @@ def main():
     parser.add_argument("--lab_show", type=str,
                         default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
                         help="heads whose strongest rules are printed")
+    parser.add_argument("--lab_root_exclude", type=str, default="shape",
+                        help="atom groups of the data layout (e.g. shape, position) that may not be mining roots")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
     parser.add_argument("--lab_min_events", type=int, default=2, help="precise search: distinct onsets of a rule")
     parser.add_argument("--lab_min_videos", type=int, default=1)
@@ -806,6 +808,10 @@ def main():
     derived = Derived(model, names)
     forbid_nn = negated_others(model)
     layout = training_data.get("grid_layout", {})
+    cfg["mine_root_exclude"] = [layout[k] for k in args.lab_root_exclude.split(",") if k in layout]
+    if cfg["mine_root_exclude"]:
+        print(f"[Rule lab] no mining roots from {[k for k in args.lab_root_exclude.split(',') if k in layout]} "
+              f"(atoms {cfg['mine_root_exclude']})")
     forbid_ns = (atom_literals(model, *layout["shape"]) if "shape" in layout
                  else torch.zeros(model.num_literals, dtype=torch.bool))
     if "shape" in layout:
@@ -924,7 +930,8 @@ def main():
         print(f"\n[Rule lab] crisp rules of {key} (hard AND, logistic weight):")
         show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
-    path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}.json"
+    rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
+    path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}{'_rx' + rx if rx else ''}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
     print(f"[Rule lab] saved {path}")
