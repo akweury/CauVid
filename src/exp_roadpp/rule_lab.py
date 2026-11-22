@@ -219,14 +219,16 @@ class ExtModel:
     """The rule net seen with its derived literals appended (`Derived`): what `step05_mine.mine_head` and
     `literal_text` read. use_derived False: the derived literals are not allowed (same indices)."""
 
-    def __init__(self, model, derived, use_derived):
+    def __init__(self, model, derived, use_derived, forbid=None):
+        """forbid (L,) bool: rule net literals the miners may not use (e.g. `negated_others`)."""
         self._model, self._d = model, derived
         dev = model.input_mask.device
         self.num_literals = model.num_literals + derived.size
         self.literal_kind = torch.cat([model.literal_kind, torch.full((derived.size,), 4, device=dev,
                                                                       dtype=model.literal_kind.dtype)])
         self.literal_base = torch.cat([model.literal_base, derived.base.to(dev).to(model.literal_base.dtype)])
-        self.input_mask = torch.cat([model.input_mask, derived.allowed.to(dev) & bool(use_derived)])
+        own = model.input_mask if forbid is None else model.input_mask & ~forbid.to(dev)
+        self.input_mask = torch.cat([own, derived.allowed.to(dev) & bool(use_derived)])
 
     def __getattr__(self, key):
         return getattr(self._model, key)
@@ -650,9 +652,49 @@ def _none(x):
 
 # -------------- Main --------------
 def parse_variant(name):
-    """"relaxed+precise_d" -> (["relaxed", "precise"], True): the rule sets united, with the derived literals."""
-    derived = name.endswith("_d")
-    return (name[:-2] if derived else name).split("+"), derived
+    """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True)): the rule sets united; flags: with the
+    derived literals (_d), without the negated literals of the other agents (_nn)."""
+    flags = {"_d": False, "_nn": False}
+    while any(name.endswith(f) for f in flags):
+        f = next(f for f in flags if name.endswith(f))
+        flags[f], name = True, name[:-len(f)]
+    return name.split("+"), (flags["_d"], flags["_nn"])
+
+
+def negated_others(model):
+    """(L,) bool: the negated literals of the other agents ("!X(other)", "!veh:X(other)"). On v7 they held on
+    almost every row ("no bus is moving left"), so the relaxed miner's deep trees added them as noise
+    (lab 3, 2026-11-22: e.g. Car:TurRht w -3.33 "!Bus:MovLft(other)@2 & ...")."""
+    out = torch.zeros(model.num_literals, dtype=torch.bool)
+    for m in range(model.num_literals):
+        info = model.literal_info(m)
+        out[m] = info["kind"] in ("!X", "!G") and info["scope"] == 1
+    return out
+
+
+def crisp_rules(rules, gate, weight, pool_of, heads):
+    """The rules of a sparse soft fit made crisp: the literals with gate >= 0.5 (a hard AND), the rules with
+    |weight| >= DROP_WEIGHT, duplicates merged; precision and onsets on the train sample (pool_of(head))."""
+    out, seen = [], set()
+    for i, r in enumerate(rules):
+        if abs(float(weight[i])) < DROP_WEIGHT:
+            continue
+        lits = tuple(sorted(m for m, g in zip(r["literals"], gate[i].tolist()) if g >= 0.5))
+        if lits and (r["head"], lits) not in seen:
+            seen.add((r["head"], lits))
+            out.append({"head": r["head"], "literals": list(lits)})
+    by = defaultdict(list)
+    for r in out:
+        by[r["head"]].append(r)
+    for h, rs in by.items():
+        pool = pool_of(h)
+        F = _with_true(pool["F"] > 0.5)
+        for r in rs:
+            m = F[:, r["literals"]].all(dim=1)
+            fires, hits = float(pool["w"][m].sum()), float(pool["w"][m & pool["y"]].sum())
+            r["precision"] = hits / fires if fires > 0 else 0.0
+            r["events"] = int(pool["event"][m & pool["y"]].unique().numel())
+    return out
 
 
 def mine_component(component, use_derived, ext, names, heads, train, check, cfg, device):
@@ -680,7 +722,7 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
 def show_rules(texts, heads, mode, top=8):
     """Print the strongest rules (soft logistic weight of mode) of some heads, with each literal's gate; in a
     sparse mode the dropped literals and rules (DROP_GATE, DROP_WEIGHT) are left out."""
-    sparse = mode in SPARSE
+    sparse = mode in SPARSE or mode == "crisp"
     for head in heads:
         rs = [r for r in texts if r["head"] == head and mode in r["soft"]]
         kept = [r for r in rs if not sparse or abs(r["soft"][mode]["weight"]) >= DROP_WEIGHT]
@@ -696,10 +738,12 @@ def show_rules(texts, heads, mode, top=8):
 
 def main():
     parser = utils_pipe.get_parser()
-    parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed+precise",
+    parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed_nn,relaxed+precise_nn",
                         help="rule sets: miners m4 / relaxed / precise joined by +, suffix _d: with the derived literals")
     parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
-    parser.add_argument("--lab_soft", type=str, default="logit,sparse_a,sparse_b,sparse_c",
+    parser.add_argument("--lab_crisp", type=str, default="sparse_c",
+                        help="the sparse soft mode whose rounded gates give the crisp rules (variant ~crisp)")
+    parser.add_argument("--lab_soft", type=str, default="logit,sparse_c",
                         help="soft modes: logit, nor, and the sparse ones of SPARSE")
     parser.add_argument("--lab_show", type=str,
                         default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
@@ -741,8 +785,9 @@ def main():
     # Literals: the rule net's and the derived ones (same indices in every variant; the variants without "_d"
     # may not use the derived ones).
     derived = Derived(model, names)
-    ext = {False: ExtModel(model, derived, False), True: ExtModel(model, derived, True)}
-    L = ext[True].num_literals
+    forbid = negated_others(model)
+    ext = {(d, nn): ExtModel(model, derived, d, forbid if nn else None) for d in (False, True) for nn in (False, True)}
+    L = ext[(True, False)].num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     val_ids = list(training_data["val_videos"])
     train = extend_rows(train, derived, model.num_literals, device)
@@ -754,10 +799,10 @@ def main():
     variants = args.lab_variants.split(",")
     mined = {}
     for name in variants:
-        components, use_d = parse_variant(name)
+        components, flags = parse_variant(name)
         for c in components:
-            if (c, use_d) not in mined:
-                mined[(c, use_d)] = mine_component(c, use_d, ext[use_d], names, heads, train, check, cfg, device)
+            if (c, flags) not in mined:
+                mined[(c, flags)] = mine_component(c, flags[0], ext[flags], names, heads, train, check, cfg, device)
 
     # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
     unique = {}
@@ -772,10 +817,10 @@ def main():
     soft_modes = [m for m in args.lab_soft.split(",") if m]
     rule_sets, texts = {}, {}
     for name in variants:
-        components, use_d = parse_variant(name)
+        components, flags = parse_variant(name)
         seen, rs = set(), []
         for c in components:
-            for r in mined[(c, use_d)]:
+            for r in mined[(c, flags)]:
                 key = (r["head"], tuple(sorted(r["literals"])))
                 if key not in seen:
                     seen.add(key)
@@ -783,8 +828,9 @@ def main():
         idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
-        logit = fit_logit(final, train, ext[True], heads, device)
-        soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, ext[True],
+        full = ext[(True, False)]
+        logit = fit_logit(final, train, full, heads, device)
+        soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, full,
                             heads, device, m) for m in soft_modes}
         for m, (g, _p) in soft.items():
             real = g[_pad([r["literals"] for r in final], L) != L] if final else g.flatten()
@@ -799,13 +845,34 @@ def main():
                 rule_sets[name].size[m] = (n_eff, lits_eff, int(lens.max()) if len(lens) else 0)
                 print(f"[Rule lab] {name} {m}: {n_eff} of {len(final)} rules kept, {lits_eff:.2f} literals per rule")
         texts[name] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
-                               "literals": [step05_mine.literal_text(ext[True], names, m) for m in r["literals"]],
+                               "literals": [step05_mine.literal_text(full, names, m) for m in r["literals"]],
                                "derived": sum(m >= model.num_literals for m in r["literals"]),
                                "weight": round(float(logit[0][i]), 3),
                                "soft": {m: {"weight": round(float(par[0][i]), 3),
                                             "gates": [round(float(x), 3) for x in g[i][:len(r["literals"])]]}
                                         for m, (g, par) in soft.items() if m != "nor"}}
                               for i, r in enumerate(final)), key=lambda r: r["head"])
+        # Crisp rules: the sparse fit's gates rounded (>= 0.5: the literal is required, else dropped), then only
+        # the rule weights refit (a hard AND per rule, a logistic OR per head): readable rules, no partial gates.
+        if args.lab_crisp in soft and final:
+            g, par = soft[args.lab_crisp]
+            crisp = crisp_rules(final, g, par[0], lambda h: step05_mine._pool_of(train, h, L, device), heads)
+            c_logit = fit_logit(crisp, train, full, heads, device)
+            key = f"{name}~crisp"
+            rule_sets[key] = RuleSet(crisp, counts["base"], [], c_logit, L, A, device)
+            kept = c_logit[0].abs() >= DROP_WEIGHT
+            lens = torch.tensor([len(r["literals"]) for r in crisp])[kept] if crisp else torch.zeros(0)
+            rule_sets[key].size = {"logit": (int(kept.sum()), float(lens.float().mean()) if len(lens) else 0.0,
+                                             int(lens.max()) if len(lens) else 0)}
+            texts[key] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
+                                  "literals": [step05_mine.literal_text(full, names, m) for m in r["literals"]],
+                                  "derived": sum(m >= model.num_literals for m in r["literals"]),
+                                  "weight": round(float(c_logit[0][i]), 3),
+                                  "soft": {"crisp": {"weight": round(float(c_logit[0][i]), 3),
+                                                     "gates": [1.0] * len(r["literals"])}}}
+                                 for i, r in enumerate(crisp)), key=lambda r: r["head"])
+            print(f"[Rule lab] {key}: {int(kept.sum())} rules (|w| >= {DROP_WEIGHT}) from {args.lab_crisp}, "
+                  f"{float(lens.float().mean()) if len(lens) else 0:.2f} literals per rule")
         n_d = sum(1 for r in texts[name] if r["derived"])
         print(f"[Rule lab] {name}: {len(final)} rules for {len({r['head'] for r in final})} heads "
               f"(literals per rule {sum(len(r['literals']) for r in final) / max(len(final), 1):.2f}; "
@@ -822,6 +889,9 @@ def main():
             print(f"\n[Rule lab] strongest rules of {best_variant} / {m} (soft logistic weight; [gate] per literal, "
                   f"1 = required, 0 = ignored{'; dropped literals and rules left out' if m in SPARSE else ''}):")
             show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h], m)
+    for key in (k for k in rule_sets if k.endswith("~crisp")):
+        print(f"\n[Rule lab] crisp rules of {key} (hard AND, logistic weight):")
+        show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
