@@ -17,6 +17,10 @@ Rule sets ("variants"), all mined on the train sample of `step05_mine.collect` (
            >= --lab_min_events distinct onsets. A rule is extended while its precision can still rise;
   a+b      the union of miners a and b (e.g. relaxed+precise);
   ..._d    the same with the derived literals (`Derived`: X started / stopped / held, own-box motion).
+Lab 2 (2026-11-22): the derived literals gave nothing (relaxed_d -0.011, relaxed+precise_d +0.000, lane heads
+worse): dropped from the defaults. relaxed+precise / soft_logit 0.255 vs MLP 0.277 (88 heads); the precise rules
+helped the lane heads (IncomLane 0.25 -> 0.40, MovRht 0.02 -> 0.18). Lab 3: sparse gates (SPARSE) for readable
+rules; the plain soft gates relaxed only 2.6% of the literals, so the rules kept noise negations.
 Model since 2026-11-22 (the user): relaxed / soft_logit (1ca554 lab: macro AP 0.245 vs MLP 0.283 on 86 heads,
 46 heads >= 0.9 x MLP; the m4 mined rules: 0.159, 13). Default variants: relaxed, relaxed+precise and both
 with the derived literals; default scorers max_k0, nor_k0, logit, soft_logit.
@@ -67,6 +71,12 @@ CLOSE = 0.9                     # "close to the MLP": AP >= CLOSE x the MLP's
 MIN_EVAL_POS = 20               # heads with fewer positive eval rows are not compared
 RULE_CHUNK = 4096               # rules per gather in `_holds_all`
 SOFT_PRIOR = 5                  # confidence shrink (onsets) of the soft noisy-OR's starting q
+# Sparse soft rules (2026-11-22, readability): the gates and the rule weights are pushed toward 0, so a rule
+# keeps only the literals and the heads keep only the rules the data pays for. lambda x (the head's base loss)
+# x (mean gate + mean |weight|) is added to the loss. A literal with gate < DROP_GATE and a rule with
+# |weight| < DROP_WEIGHT count as dropped.
+SPARSE = {"sparse_a": 0.001, "sparse_b": 0.005, "sparse_c": 0.02}   # fake-data check: 0.5+ drops every rule
+DROP_GATE, DROP_WEIGHT = 0.1, 0.05
 RELAXED = {"mine_max_rules": 32, "mine_roots": 4, "mine_root_min_cover": 0.05, "mine_depth": 6,
            "mine_min_events": 2, "min_videos": 1, "mine_val_lift": 0.0}
 
@@ -430,7 +440,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
     mined hard rule) and may fall, so a rule with a literal missing still gives part of its evidence;
     gate_reg x sum(1 - g) keeps the gates near the hard rule unless the data pays for it.
     Soft OR, mode "logit": p = sigmoid(b + sum_r w_r a_r); mode "nor": p = 1 - (1 - base) prod_r (1 - q_r a_r),
-    q_r from the rule's confidence. Returns gate (R, K) and (w (R,), b (A,)) or q (R,)."""
+    q_r from the rule's confidence. Modes of SPARSE: "logit" with the gates and weights pushed toward 0
+    instead (readable rules: the literals and rules that do not pay drop). Returns gate (R, K) and
+    (w (R,), b (A,)) or q (R,)."""
+    logistic = mode != "nor"
     L = model.num_literals
     K = max((len(r["literals"]) for r in rules), default=1)
     gate = torch.ones((len(rules), K))
@@ -454,8 +467,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         y, w = pool["y"].float(), pool["w"] / pool["w"].sum()
         theta = torch.full(body.shape, 3.0, device=device, requires_grad=True)
         params = [theta]
-        if mode == "logit":
-            p0 = max(float((w * y).sum()), 1e-6)
+        p0 = min(max(float((w * y).sum()), 1e-6), 1 - 1e-6)
+        base_loss = -(p0 * math.log(p0) + (1 - p0) * math.log(1 - p0))       # BCE of the constant base rate
+        n_real = max(int((~pad).sum()), 1)
+        if logistic:
             wt = torch.zeros(len(idx), device=device, requires_grad=True)
             b0 = torch.tensor(math.log(p0 / max(1 - p0, 1e-6)), device=device, requires_grad=True)
             params += [wt, b0]
@@ -469,24 +484,38 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
             opt.zero_grad()
             g = torch.sigmoid(theta).masked_fill(pad, 0.0)
             a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R)
-            if mode == "logit":
-                loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(a @ wt + b0, y, reduction="none")).sum() \
-                    + l2 * (wt ** 2).sum()
+            if logistic:
+                loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(a @ wt + b0, y, reduction="none")).sum()
             else:
                 miss = torch.log1p(-(torch.sigmoid(phi)[None] * a).clamp(max=1 - 1e-6)).sum(dim=1)
                 p = (1 - (1 - b) * torch.exp(miss)).clamp(1e-6, 1 - 1e-6)
                 loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
-            loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
+            if mode in SPARSE:
+                loss = loss + SPARSE[mode] * base_loss * (g.sum() / n_real + wt.abs().mean())
+            else:
+                loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
+                if logistic:
+                    loss = loss + l2 * (wt ** 2).sum()
             loss.backward()
             opt.step()
         gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).cpu()
         gate[idx] = gi
-        if mode == "logit":
+        if logistic:
             weight[idx] = wt.detach().cpu()
             bias[h] = float(b0)
         else:
             q[idx] = torch.sigmoid(phi.detach()).cpu()
-    return gate, ((weight, bias) if mode == "logit" else q)
+    return gate, ((weight, bias) if logistic else q)
+
+
+def effective(rules, gate, weight):
+    """Rules and literals left after dropping (DROP_GATE, DROP_WEIGHT): (rules, literals per rule, keep mask)."""
+    lens = torch.tensor([len(r["literals"]) for r in rules])
+    real = torch.arange(gate.shape[1])[None] < lens[:, None]
+    kept_lit = (gate >= DROP_GATE) & real
+    keep = (weight.abs() >= DROP_WEIGHT) & kept_lit.any(dim=1)
+    n = int(keep.sum())
+    return n, float(kept_lit[keep].sum()) / max(n, 1), keep
 
 
 class RuleSet:
@@ -527,10 +556,10 @@ class RuleSet:
             lits_f = lits.float()
             for mode, (gate, par) in self.soft.items():
                 a = _soft_act(lits_f, self.body, gate)                           # (B, R)
-                if mode == "logit":
+                if mode != "nor":
                     w, b = par
                     z = b[None].expand(B, -1).clone().index_add(1, self.head, a * w[None])
-                    out["soft_logit"] = torch.sigmoid(z)
+                    out["soft_logit" if mode == "logit" else mode] = torch.sigmoid(z)
                 else:
                     miss = torch.zeros((B, self.A), device=lits.device).index_add(
                         1, self.head, torch.log1p(-(par[None] * a).clamp(max=1 - 1e-6)))
@@ -586,12 +615,14 @@ def report(hist, names, heads, rule_sets):
     for name in scorers:
         a = [val(name, h) for h in learnable]
         m = [val("mlp", h) for h in learnable]
-        variant = name.split("/")[0]
+        variant, scorer = name.split("/")
         rs = rule_sets[variant].rules
+        size = getattr(rule_sets[variant], "size", {}).get(scorer)          # after the drops (sparse modes)
         rows[name] = {"macro": sum(a) / max(len(a), 1), "mlp_macro": sum(m) / max(len(m), 1),
                       "close": sum(x >= CLOSE * y for x, y in zip(a, m)), "wins": sum(x > y for x, y in zip(a, m)),
-                      "rules": len(rs), "literals": sum(len(r["literals"]) for r in rs) / max(len(rs), 1),
-                      "max_literals": max((len(r["literals"]) for r in rs), default=0)}
+                      "rules": size[0] if size else len(rs),
+                      "literals": size[1] if size else sum(len(r["literals"]) for r in rs) / max(len(rs), 1),
+                      "max_literals": size[2] if size else max((len(r["literals"]) for r in rs), default=0)}
     best = max(rows, key=lambda n: rows[n]["macro"]) if rows else None
     print(f"\n[Rule lab] eval = odd val videos, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
           f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP}); MLP macro "
@@ -646,24 +677,30 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
     return rules
 
 
-def show_rules(texts, heads, top=8):
-    """Print the strongest rules (soft logistic weight) of some heads, with each literal's soft gate."""
+def show_rules(texts, heads, mode, top=8):
+    """Print the strongest rules (soft logistic weight of mode) of some heads, with each literal's gate; in a
+    sparse mode the dropped literals and rules (DROP_GATE, DROP_WEIGHT) are left out."""
+    sparse = mode in SPARSE
     for head in heads:
-        rs = sorted((r for r in texts if r["head"] == head), key=lambda r: -(r.get("soft_weight") or 0))[:top]
-        if not rs:
+        rs = [r for r in texts if r["head"] == head and mode in r["soft"]]
+        kept = [r for r in rs if not sparse or abs(r["soft"][mode]["weight"]) >= DROP_WEIGHT]
+        kept = sorted(kept, key=lambda r: -abs(r["soft"][mode]["weight"]))
+        if not kept:
             continue
-        print(f"  {head}:")
-        for r in rs:
-            lits = " & ".join(f"{t}[{g:.2f}]" if g is not None else t for t, g in zip(r["literals"], r["gates"]))
-            print(f"    w {r.get('soft_weight', 0):+6.2f}  p {r['precision']:.2f}  {r['events']:5d} onsets  {lits}")
+        print(f"  {head}: {len(kept)} of {len(rs)} rules")
+        for r in kept[:top]:
+            s = r["soft"][mode]
+            lits = " & ".join(f"{t}[{g:.2f}]" for t, g in zip(r["literals"], s["gates"]) if not sparse or g >= DROP_GATE)
+            print(f"    w {s['weight']:+6.2f}  p {r['precision']:.2f}  {r['events']:5d} onsets  {lits}")
 
 
 def main():
     parser = utils_pipe.get_parser()
-    parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed+precise,relaxed_d,relaxed+precise_d",
+    parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed+precise",
                         help="rule sets: miners m4 / relaxed / precise joined by +, suffix _d: with the derived literals")
     parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
-    parser.add_argument("--lab_soft", type=str, default="logit", help="soft OR modes: logit, nor")
+    parser.add_argument("--lab_soft", type=str, default="logit,sparse_a,sparse_b,sparse_c",
+                        help="soft modes: logit, nor, and the sparse ones of SPARSE")
     parser.add_argument("--lab_show", type=str,
                         default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
                         help="heads whose strongest rules are printed")
@@ -754,16 +791,21 @@ def main():
             print(f"[Rule lab] {name} soft {m}: {float((real < 0.5).float().mean()) if len(real) else 0:.1%} of the "
                   f"literals relaxed (gate < 0.5)")
         rule_sets[name] = RuleSet(final, counts["base"], priors, logit, L, A, device, soft)
-        gate = soft["logit"][0] if "logit" in soft else None
-        soft_w = soft["logit"][1][0] if "logit" in soft else None
+        rule_sets[name].size = {}
+        for m, (g, par) in soft.items():
+            if m in SPARSE and final:
+                n_eff, lits_eff, keep = effective(final, g, par[0])
+                lens = (g >= DROP_GATE).sum(dim=1)[keep]
+                rule_sets[name].size[m] = (n_eff, lits_eff, int(lens.max()) if len(lens) else 0)
+                print(f"[Rule lab] {name} {m}: {n_eff} of {len(final)} rules kept, {lits_eff:.2f} literals per rule")
         texts[name] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
                                "literals": [step05_mine.literal_text(ext[True], names, m) for m in r["literals"]],
-                               "gates": ([round(float(x), 3) for x in gate[i][:len(r["literals"])]] if gate is not None
-                                         else [None] * len(r["literals"])),
                                "derived": sum(m >= model.num_literals for m in r["literals"]),
                                "weight": round(float(logit[0][i]), 3),
-                               "soft_weight": round(float(soft_w[i]), 3) if soft_w is not None else None}
-                              for i, r in enumerate(final)), key=lambda r: (r["head"], -(r["soft_weight"] or 0)))
+                               "soft": {m: {"weight": round(float(par[0][i]), 3),
+                                            "gates": [round(float(x), 3) for x in g[i][:len(r["literals"])]]}
+                                        for m, (g, par) in soft.items() if m != "nor"}}
+                              for i, r in enumerate(final)), key=lambda r: r["head"])
         n_d = sum(1 for r in texts[name] if r["derived"])
         print(f"[Rule lab] {name}: {len(final)} rules for {len({r['head'] for r in final})} heads "
               f"(literals per rule {sum(len(r['literals']) for r in final) / max(len(final), 1):.2f}; "
@@ -774,9 +816,12 @@ def main():
     out = report(hist, names, heads, rule_sets)
     if out["best"]:
         best_variant = out["best"].split("/")[0]
-        print(f"\n[Rule lab] strongest rules of {best_variant} (soft logistic weight; [gate] per literal, "
-              f"1 = required, 0 = ignored):")
-        show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h])
+        for m in soft_modes:
+            if m == "nor":
+                continue
+            print(f"\n[Rule lab] strongest rules of {best_variant} / {m} (soft logistic weight; [gate] per literal, "
+                  f"1 = required, 0 = ignored{'; dropped literals and rules left out' if m in SPARSE else ''}):")
+            show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h], m)
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
