@@ -208,8 +208,9 @@ def _lookup_scores(model, inputs, baselines):
 # "motif_net": the step 05d two-level MotifRuleNet, if it was trained.
 # "boost": the rule net with the --boost_heads heads scored by boosted rules (`step06_boost`); "boost_net": the
 # same heads scored by a SetNet on the same rows and features (the fair neural reference).
-# "boost_sel": per boosted head, "boost" or "model", whichever has the higher val AP (`step06_boost.SelectScorer`).
-DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "boost", "boost_sel", "boost_net", "mlp", "lookup", "anchor", "candidate",
+# "rule_sel" (with --boost_heads): per head the rule scorer with the highest val AP, "anchor" (the mined rules),
+# "boost" (boosted heads) or "model" (`select_rules`, `step06_boost.SelectScorer`).
+DETECTION_SCORERS = ("model", "net_pruned", "rule_set", "motif_net", "boost", "rule_sel", "boost_net", "mlp", "lookup", "anchor", "candidate",
                      "cascade")
 # Scorers detected at a fixed threshold instead of cfg["detected_th"]: their scores are no
 # probabilities. The candidates are 0 / 1; the rule set detects whenever one of its rules
@@ -222,13 +223,14 @@ SCORER_COLORS = {"model": "tab:blue", "mlp": "tab:green", "anchor": "tab:orange"
                  "candidate": "tab:purple", "cascade": "tab:brown", "net_pruned": "tab:cyan",
                  "rule_set": "tab:olive", "motif_net": "tab:pink", "model_cal": "navy", "mlp_cal": "darkgreen",
                  "lookup": "#1baf7a", "lookup_cal": "#127a55", "boost": "tab:red", "boost_net": "tab:purple",
-                 "boost_sel": "darkred"}
-SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "anchor", "prior": "prior",
+                 "rule_sel": "darkred"}
+# "anchor" (key kept for the caches): the mined seed rules alone, each with its train confidence (`fit_baselines`).
+SCORER_LABELS = {"model": "rule net", "mlp": "MLP", "anchor": "mined rules", "prior": "prior",
                  "candidate": "candidates", "cascade": "cascade", "net_pruned": "net pruned",
                  "rule_set": "rule set", "motif_net": "motif net", "model_cal": "rule net (calibrated)",
                  "mlp_cal": "MLP (calibrated)", "lookup": "own-label lookup",
                  "lookup_cal": "own-label lookup (calibrated)", "boost": "rule net + boosted heads",
-                 "boost_net": "rule net + SetNet heads", "boost_sel": "rule net / boosted (val)"}
+                 "boost_net": "rule net + SetNet heads", "rule_sel": "best rule scorer (val)"}
 # The scorers of the per-head rank (`head_rank.pdf`), with their marker (identity never by color alone).
 HEAD_RANK_SCORERS = ("model", "mlp", "lookup")
 HEAD_RANK_MARKERS = {"model": "o", "mlp": "s", "lookup": "D"}
@@ -408,7 +410,7 @@ def _score_videos(model, data, baselines, cfg, mlp=None, cascade=None, history=N
             known = None if history is None else frames.clamp(max=history)
             rows = step05.video_rows(model, X, frames, data["min_off_frames"], known, roles)
             context.update(X=X, frames=frames, known=known, min_off_frames=data["min_off_frames"], roles=roles,
-                           video_id=video_id, rows=rows["rows"])
+                           video_id=video_id, rows=rows["rows"], inputs=rows["inputs"])
             t, n = rows["rows"].T
             targets = rows["targets"]
             # A row counts (rows, alarms) only if its outcome is observable: the window does not
@@ -683,7 +685,7 @@ HEAD_THRESHOLD_SOURCES = ("head", "type", "global")
 # (all below, e.g. Ped:Xing on v7) are marked and left out of the "learnable" macro AP comparison.
 LEARNABLE_MIN_AP = 0.05
 LEARNABLE_SCORERS = ("model", "mlp", "boost", "boost_net", "lookup", "anchor")
-SELECTION_VERSION = "sel_v1"
+SELECTION_VERSION = "sel_v2"            # v2: anchor / boost / model on every counted head
 
 
 def head_val_ap(val_scores, k, cfg):
@@ -702,6 +704,34 @@ def learnable_heads(val_ap):
     aps = torch.stack([val_ap[n] for n in LEARNABLE_SCORERS if n in val_ap])
     best = torch.nan_to_num(aps, nan=-1.0).amax(dim=0)
     return torch.where(torch.isnan(aps).all(dim=0), float("nan"), (best >= LEARNABLE_MIN_AP).float())
+
+
+def select_rules(val_ap, boosted, head_types):
+    """{head: "anchor" | "boost" | "model"} of every counted head: the rule scorer with the highest val AP
+    (`step06_boost.SELECT_CANDIDATES` order breaks ties; "boost" only for the boosted heads). Without val onsets:
+    "anchor" (the mined rules, the main direction since 2026-11-22)."""
+    boosted = set(boosted)
+    counted = [EVENT_TYPES.index(t) for t in COUNTED_TYPES]
+    choice = {}
+    for a in range(len(val_ap["model"])):
+        if int(head_types[a]) not in counted:
+            continue
+        cands = [c for c in step06_boost.SELECT_CANDIDATES if c in val_ap and (c != "boost" or a in boosted)]
+        aps = [float(val_ap[c][a]) for c in cands]
+        if all(x != x for x in aps):
+            choice[a] = "anchor"
+            continue
+        best = max(range(len(cands)), key=lambda i: (aps[i] if aps[i] == aps[i] else -1.0, -i))
+        choice[a] = cands[best]
+    return choice
+
+
+def rule_selector(model, baselines, boost, choice, cfg):
+    """The "rule_sel" scorer (`step06_boost.SelectScorer`) of a per-head choice (`select_rules`)."""
+    device = cfg["device"]
+    base = {name: value.to(device) for name, value in baselines.items() if torch.is_tensor(value)}
+    labels = [step05._atom_name(sig) for sig in step05.load_vocabulary(cfg)]
+    return step06_boost.SelectScorer(choice, lambda inputs: _anchor_scores(model, inputs, base), boost, labels)
 
 
 def select_head_thresholds(scores, cfg):
@@ -867,7 +897,7 @@ def _alarm_filter_comparison(model, data, baselines, cfg, minutes, fps):
 
 # -------------- Per-head calibration (Platt scaling on val) --------------
 # The scorers whose scores are probabilities, calibrated per window and head.
-CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "boost", "boost_sel", "boost_net", "mlp", "cascade", "lookup")
+CALIBRATED_SCORERS = ("model", "net_pruned", "motif_net", "boost", "rule_sel", "boost_net", "mlp", "cascade", "lookup")
 
 
 def _bin_scores():
@@ -1313,7 +1343,7 @@ def evaluate_model(model, data, baselines, cfg, mlp=None, cascade=None, extra=No
 
     out["trajectory"] = {name: {"mean": (tr["sum"] / tr["count"].clamp(min=1)).tolist(), "count": tr["count"].tolist()}
                          for name, tr in scores["trajectory"].items()
-                         if name in ("model", "net_pruned", "rule_set", "motif_net", "boost", "boost_sel", "boost_net", "mlp",
+                         if name in ("model", "net_pruned", "rule_set", "motif_net", "boost", "rule_sel", "boost_net", "mlp",
                                      "cascade")}
 
     # The same rows knowing only part of the memory: how the confidence grows with the known facts.
@@ -2001,49 +2031,59 @@ def _print_alarm_filter_calibration(metrics, sec):
         print()
 
 
-BOOST_SUMMARY_SCORERS = ("model", "boost", "boost_sel", "boost_net", "mlp")
+RULE_SUMMARY_SCORERS = ("model", "anchor", "boost", "rule_sel", "boost_net", "mlp")
 
 
-def boost_summary(metrics, select):
-    """metrics["boost_heads"]: the boosted heads (`step06_boost.SelectScorer`) with test onsets, their test AP per
-    scorer (headline window), val AP, the scorer "boost_sel" took, and the macro AP and per-head wins over the
-    learnable ones (some scorer reaches LEARNABLE_MIN_AP on val); the unlearnable heads are listed, not compared."""
+def rule_summary(metrics, select, boosted):
+    """metrics["rule_heads"]: every counted head with test onsets: test AP per scorer (headline window), val AP,
+    the rule scorer "rule_sel" took and whether the head is boosted and learnable (some scorer reaches
+    LEARNABLE_MIN_AP on val); macro AP and wins over the learnable heads (all, and the boosted ones). The
+    unlearnable heads are listed, not compared."""
+    boosted = set(boosted)
     heads = {}
-    for a in step06_boost.boosted_heads(select.boost):
+    for a, c in select.choice.items():
         m = metrics["per_head"].get(str(a))
         if m is None:
             continue
         test = {"model": m["average_precision"], **m["baseline_average_precision"]}
-        heads[m["label"]] = {"onsets": m["onsets"], "learnable": m.get("learnable"),
-                             "chosen": "boost" if bool(select.use[a]) else "model",
-                             "test_ap": {n: test.get(n) for n in BOOST_SUMMARY_SCORERS},
-                             "val_ap": {n: m.get("val_average_precision", {}).get(n) for n in BOOST_SUMMARY_SCORERS}}
+        heads[m["label"]] = {"onsets": m["onsets"], "learnable": m.get("learnable"), "chosen": c,
+                             "boosted": a in boosted,
+                             "test_ap": {n: test.get(n) for n in RULE_SUMMARY_SCORERS},
+                             "val_ap": {n: m.get("val_average_precision", {}).get(n) for n in RULE_SUMMARY_SCORERS}}
+
+    def compare(group):
+        names = [n for n in RULE_SUMMARY_SCORERS if all(d["test_ap"][n] is not None for d in group.values())]
+        return {"heads": len(group),
+                "macro_ap": {n: sum(d["test_ap"][n] for d in group.values()) / len(group) if group else None
+                             for n in names},
+                "wins": {f"{x}>{y}": sum(d["test_ap"][x] > d["test_ap"][y] for d in group.values())
+                         for x, y in (("rule_sel", "mlp"), ("rule_sel", "model"), ("anchor", "mlp"),
+                                      ("boost", "mlp"), ("boost", "boost_net")) if x in names and y in names}}
     learn = {h: d for h, d in heads.items() if d["learnable"]}
-    macro = {n: (sum(d["test_ap"][n] for d in learn.values()) / len(learn) if learn else None)
-             for n in BOOST_SUMMARY_SCORERS}
-    wins = {f"{a}>{b}": sum(d["test_ap"][a] > d["test_ap"][b] for d in learn.values())
-            for a, b in (("boost_sel", "mlp"), ("boost_sel", "model"), ("boost", "mlp"), ("boost", "boost_net"))}
-    metrics["boost_heads"] = {"learnable_min_ap": LEARNABLE_MIN_AP, "heads": heads, "num_learnable": len(learn),
-                              "unlearnable": sorted(h for h, d in heads.items() if d["learnable"] is False),
-                              "unknown": sorted(h for h, d in heads.items() if d["learnable"] is None),
-                              "macro_ap_learnable": macro, "wins_learnable": wins}
-    return metrics["boost_heads"]
+    metrics["rule_heads"] = {
+        "learnable_min_ap": LEARNABLE_MIN_AP, "heads": heads,
+        "chosen": {c: sum(d["chosen"] == c for d in heads.values()) for c in step06_boost.SELECT_CANDIDATES},
+        "learnable": compare(learn), "learnable_boosted": compare({h: d for h, d in learn.items() if d["boosted"]}),
+        "unlearnable": sorted(h for h, d in heads.items() if d["learnable"] is False),
+        "unknown": sorted(h for h, d in heads.items() if d["learnable"] is None)}
+    return metrics["rule_heads"]
 
 
-def print_boost_summary(summary):
-    names = BOOST_SUMMARY_SCORERS
-    print(f"[Boost heads] test AP (headline window); learnable: some scorer reaches val AP "
-          f">= {summary['learnable_min_ap']}; 'chosen': the scorer of boost_sel (higher val AP)")
-    print(f"  {'head':<22}{'onsets':>7}{'learn':>7}{'chosen':>8}" + "".join(f"{n:>10}" for n in names)
-          + f"{'val model':>11}{'val boost':>11}")
-    for h, d in sorted(summary["heads"].items(), key=lambda x: (x[1]["learnable"] is not True, x[0])):
+def print_rule_summary(summary, max_rows=200):
+    names = RULE_SUMMARY_SCORERS
+    print(f"[Rule heads] test AP (headline window); learnable: some scorer reaches val AP "
+          f">= {summary['learnable_min_ap']}; 'chosen': the rule scorer of rule_sel (highest val AP); "
+          f"chosen per scorer: {summary['chosen']}")
+    print(f"  {'head':<22}{'onsets':>7}{'learn':>7}{'boost':>6}{'chosen':>8}" + "".join(f"{n:>10}" for n in names))
+    rows = sorted(summary["heads"].items(), key=lambda x: (x[1]["learnable"] is not True, not x[1]["boosted"], x[0]))
+    for h, d in rows[:max_rows]:
         cells = "".join(f"{d['test_ap'][n]:>10.3f}" if d["test_ap"][n] is not None else f"{'—':>10}" for n in names)
-        val = "".join(f"{d['val_ap'][n]:>11.3f}" if d["val_ap"][n] is not None else f"{'—':>11}"
-                      for n in ("model", "boost"))
-        print(f"  {h:<22}{d['onsets']:>7}{str(d['learnable']):>7}{d['chosen']:>8}{cells}{val}")
-    macro = "  ".join(f"{n} {v:.3f}" for n, v in summary["macro_ap_learnable"].items() if v is not None)
-    print(f"  macro AP over the {summary['num_learnable']} learnable heads: {macro}")
-    print(f"  wins (learnable heads): " + "  ".join(f"{k} {v}" for k, v in summary["wins_learnable"].items()))
+        print(f"  {h:<22}{d['onsets']:>7}{str(d['learnable']):>7}{'yes' if d['boosted'] else '':>6}{d['chosen']:>8}{cells}")
+    for key, title in (("learnable", "learnable heads"), ("learnable_boosted", "learnable boosted heads")):
+        g = summary[key]
+        macro = "  ".join(f"{n} {v:.3f}" for n, v in g["macro_ap"].items() if v is not None)
+        print(f"  macro AP over the {g['heads']} {title}: {macro}")
+        print(f"     wins: " + "  ".join(f"{k} {v}" for k, v in g["wins"].items()))
     print(f"  not learnable ({len(summary['unlearnable'])}, not compared): {', '.join(summary['unlearnable'])}")
     if summary["unknown"]:
         print(f"  no val onsets ({len(summary['unknown'])}): {', '.join(summary['unknown'])}")
@@ -2058,7 +2098,7 @@ def _print_per_head_detection(metrics, sec, headline):
         return
     print(f"[Per head event detection] heads with >= {metrics['per_head_min_test_events']} test events; "
           f"recall / alarm precision / mean prediction time (s), at the detection threshold")
-    names = [n for n in ("model", "boost", "boost_sel", "boost_net", "motif_net", "mlp", "rule_set", "cascade") if n in per_head]
+    names = [n for n in ("model", "boost", "rule_sel", "boost_net", "motif_net", "mlp", "rule_set", "cascade") if n in per_head]
     for w in (headline, str(max(metrics["windows"]))):
         heads = {h: d for h, d in per_head["model"][w].items() if d["reliable"]}
         print(f"  W={w}  {'head':<20}{'type':<9}{'events':>7}" + "".join(f"{SCORER_LABELS[n]:>24}" for n in names))
@@ -2414,6 +2454,8 @@ def main(input_data):
         "metrics_file": input_data["output_dir"] / "test_metrics.json",
         # The per-head Platt calibration fitted on val (`fit_calibration`), for the episode alarms.
         "calibration_file": input_data["output_dir"] / "calibration.pt",
+        # The per-head rule scorer of "rule_sel" (`select_rules`), for step 07.
+        "rule_sel_file": input_data["output_dir"] / "rule_sel.json",
         "test_clause_file": input_data["output_dir"] / "test_clauses.json",
         "test_inhibitor_file": input_data["output_dir"] / "test_inhibitors.json",
         "results_file": input_data["output_dir"] / "test_results.json",
@@ -2529,20 +2571,18 @@ def main(input_data):
         print(f"[Alarm filter] chosen on val: k={cfg['alarm_filter'][0]}, g={cfg['alarm_filter'][1]}")
         val_scores = _score_videos(model, val_data, baselines, cfg, mlp, cascade, extra=extra)
         if cfg["boost"]:
-            # Per-head val AP (headline window): the learnable heads, and per boosted head the scorer
-            # ("boost" or the rule net) of "boost_sel"; its val scores are added for its thresholds and calibration.
+            # Per-head val AP (headline window): the learnable heads, and per head the rule scorer of "rule_sel"
+            # (saved for step 07); its val scores are added for its thresholds and calibration.
             val_ap = head_val_ap(val_scores, model.windows.index(cfg["headline_window"]), cfg)
             cfg["val_head_ap"], cfg["learnable"] = val_ap, learnable_heads(val_ap)
-            use = torch.zeros(len(val_ap["model"]), dtype=torch.bool)
-            for a in step06_boost.boosted_heads(extra["boost"]):
-                use[a] = bool(torch.nan_to_num(val_ap["boost"][a], nan=-1.0) > torch.nan_to_num(val_ap["model"][a],
-                                                                                                   nan=-1.0))
-            labels = [step05._atom_name(sig) for sig in step05.load_vocabulary(cfg)]
-            extra["boost_sel"] = step06_boost.SelectScorer(extra["boost"], use, labels)
-            sel = _score_videos(model, val_data, baselines, cfg, mlp, cascade, names=("boost_sel",),
-                                extra={"boost_sel": extra["boost_sel"]})
+            choice = select_rules(val_ap, step06_boost.boosted_heads(extra["boost"]), cfg["head_types"])
+            utils_data.save_json({"boost": cfg["boost"], "choice": {str(a): c for a, c in choice.items()}},
+                                 cfg["rule_sel_file"])
+            extra["rule_sel"] = rule_selector(model, baselines, extra["boost"], choice, cfg)
+            sel = _score_videos(model, val_data, baselines, cfg, mlp, cascade, names=("rule_sel",),
+                                extra={"rule_sel": extra["rule_sel"]})
             for key in ("rows", "starts", "events", "trajectory"):
-                val_scores[key]["boost_sel"] = sel[key]["boost_sel"]
+                val_scores[key]["rule_sel"] = sel[key]["rule_sel"]
             del sel
         head_thresholds = select_head_thresholds(val_scores, cfg)
         calibration = fit_calibration(val_scores["rows"], cfg, model.windows)
@@ -2550,11 +2590,11 @@ def main(input_data):
         del val_scores, val_data
         del training_data
         metrics = evaluate_model(model, test_data, baselines, cfg, mlp, cascade, extra, head_thresholds, calibration)
-        for name in ("boost", "boost_sel", "boost_net"):
+        for name in ("boost", "rule_sel", "boost_net"):
             if name in extra:
                 extra[name].report()
-        if "boost_sel" in extra:
-            boost_summary(metrics, extra["boost_sel"])
+        if "rule_sel" in extra:
+            rule_summary(metrics, extra["rule_sel"], step06_boost.boosted_heads(extra["boost"]))
         if selection is not None:
             # Every precision level's rule set on the test videos: recall vs precision of precise rules.
             metrics["rule_levels"] = step05_rules.level_tradeoff(model, selection, test_data,
@@ -2580,8 +2620,8 @@ def main(input_data):
     print(f"[Results]\t {cfg['results_file']}")
     plot_results(metrics, test_clauses, cfg)
     print_summary(metrics, test_clauses, cfg)
-    if metrics.get("boost_heads"):
-        print_boost_summary(metrics["boost_heads"])
+    if metrics.get("rule_heads"):
+        print_rule_summary(metrics["rule_heads"])
 
     # 6. Episode alarms: the high frames of an agent and head merged into one alarm (`step06_episodes`),
     # of the raw scores and of the probabilities calibrated on val.

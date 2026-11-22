@@ -10,7 +10,7 @@ detects nothing is false if its outcome is seen. Events: the onsets of the count
 (`step06.COUNTED_TYPES`: rare, regular, trivial; the noise heads excluded), window W = headline_window.
 
 Scorers: "model" (the TemporalRuleNet), "mlp" (OnsetMLP, same inputs), "lookup" (own-label lookup),
-"anchor" (the LLM anchor clauses alone), "prior" (base rate per head), and with the val calibration
+"anchor" (shown as "mined rules": the mined seed rules alone, each with its train confidence), "prior" (base rate per head), and with the val calibration
 of step 06 (`calibration.pt`, per-head Platt scaling) "model_cal", "mlp_cal", "lookup_cal": one
 probability threshold for every head instead of one raw score threshold.
 
@@ -31,7 +31,7 @@ import os
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import step05, step06, step06_episodes, utils_data
+from src.exp_roadpp import step05, step06, step06_boost, step06_episodes, utils_data
 
 VERSION = "paper_v7"             # v3: threshold grid with a tail up to 1 - 1e-6; v4: exclusion ("will not happen");
                                   # v5: ego_scores.pt also holds the window targets (oracle checks);
@@ -57,6 +57,11 @@ NB = 2001                                       # score bins of logit(p) in [-14
 # class count (paper_v7): over every agent, a Car "excluded" from Ped:Mov made up most of the coverage (run
 # ad9e0b: lookup 0.93 at rho 0.1).
 EXCLUSION = {"suppression": [0.05, 0.1, 0.2], "headline": 0.1, "min_onsets": 20, "edge_share": 0.1}
+# With --boost_heads (`step06_boost`): the rule net with the boosted heads (boosted rules / SetNet) and the best
+# rule scorer per head on val ("rule_sel": mined rules, boosted rules or the rule net).
+BOOST_SCORERS = ("boost", "boost_net", "rule_sel")
+# Display names of the printed table ("anchor" is the key of the mined rules in every file).
+DISPLAY = {"anchor": "mined_rules"}
 EGO_SCORERS = ("model_cal", "mlp_cal", "lookup_cal", "model", "mlp", "lookup", "prior")
 
 
@@ -112,6 +117,8 @@ def video_scores(model, scorers, calibration, video, data, heads, k, cfg):
         if len(rows["rows"]) == 0:
             continue
         t, n = rows["rows"].T
+        if cfg.get("context") is not None:                  # the video scorers (`step06_boost`) read the chunk
+            cfg["context"].update(X=X, rows=rows["rows"], inputs=rows["inputs"])
         is_row[t, n] = True
         at_risk[t, n] = rows["at_risk"][:, heads]
         stage1 = model.window_probs(model(rows["inputs"])[0])
@@ -187,6 +194,8 @@ def run_pass(model, scorers, calibration, data, video_ids, heads, head_type, is_
     per_video = {nm: {b: [] for b in (chosen or {}).get(nm, {})} for nm in names}
     events = []
     for video_id in tqdm(video_ids, desc=cfg.get("desc", "Paper metrics")):
+        if cfg.get("context") is not None:
+            cfg["context"]["video_id"] = video_id
         v = video_scores(model, scorers, calibration, data["videos"][video_id], data, heads, k, cfg)
         if v is None:
             continue
@@ -416,9 +425,19 @@ def main(input_data):
         return
     sources = [step05_cfg["model_file"], step05_cfg["mlp_model_file"], test_file, baseline_file, cal_file,
                step05_cfg["training_data_file"]]
+    # The boosted heads and the per-head rule choice of step 06 (--boost_heads): scorers "boost", "boost_net"
+    # and "rule_sel" (`step06_boost`), if step 06 saved the choice of the same boost settings.
+    boost_heads = [h for h in str(input_data.get("boost_heads") or "").split(",") if h]
+    rule_sel_file = out_dir / "rule_sel.json"
+    rule_sel = utils_data.load_json(rule_sel_file) if boost_heads and os.path.exists(rule_sel_file) else None
+    if boost_heads:
+        sources += [*step06_boost.model_files(boost_heads, input_data, step05_cfg), rule_sel_file]
+        if rule_sel is None:
+            print(f"[Paper]\t no {rule_sel_file}: run step 06 with the same --boost_heads first; rule_sel left out")
+    settings = {**_settings(), **({"boost": rule_sel["boost"]} if rule_sel else {})}
     old = utils_data.load_json(metrics_file) if os.path.exists(metrics_file) else {}
     if (step05.is_fresh(metrics_file, *sources) and os.path.exists(events_file)
-            and old.get("version") == VERSION and old.get("settings") == _settings()):
+            and old.get("version") == VERSION and old.get("settings") == settings):
         print(f"[Paper]\t cached: {metrics_file}")
         return
     test_data = torch.load(test_file, map_location="cpu")
@@ -427,7 +446,15 @@ def main(input_data):
     baselines = torch.load(baseline_file, map_location="cpu", weights_only=False)
     calibration = torch.load(cal_file, map_location="cpu") if os.path.exists(cal_file) else {}
     names = [n for n in PAPER["scorers"] if n != "mlp" or mlp is not None]
-    scorers = step06._scorers(model, baselines, mlp, None, step05_cfg["device"], names=names)
+    extra, context = {}, {}
+    if rule_sel is not None:
+        extra = step06_boost.load_scorer(boost_heads, step05_cfg, input_data, step05_cfg["device"])
+        choice = {int(a): c for a, c in rule_sel["choice"].items()}
+        extra["rule_sel"] = step06.rule_selector(model, baselines, extra["boost"], choice,
+                                                 {**step05_cfg, "unique_atoms_file": input_data["unique_atoms_file"]})
+        names += list(BOOST_SCORERS)
+    scorers = step06._scorers(model, baselines, mlp, None, step05_cfg["device"], names=names, extra=extra,
+                              context=context)
     calibration = {n: calibration[n] for n in PAPER["calibrated"] if n in calibration and n in scorers}
     training_data = step05.load_training_data(step05_cfg)
     # The thresholds are chosen on val: it must be about as large as test (step_dataset: 15% / 15%; the
@@ -448,7 +475,7 @@ def main(input_data):
     min_context = (utils_data.load_json(episodes)["min_context"] if os.path.exists(episodes)
                    else max(step05_cfg["slot_size"] * step05_cfg["num_slots"], input_data.get("eval_min_context", 0)))
     cfg = {"device": step05_cfg["device"], "frame_rate": input_data["frame_rate"], "min_context": min_context,
-           "frames_per_video": step05_cfg["frames_per_video"], "window": 20}
+           "frames_per_video": step05_cfg["frames_per_video"], "window": 20, "context": context}
     heads_d = heads.to(cfg["device"])
     cfg["ego_heads"] = heads_d[is_ego.to(cfg["device"])]
     atom_class, class_names = step05.atom_classes(vocab, step05.label_atom_count(test_data), test_data["num_atoms"])
@@ -472,7 +499,7 @@ def main(input_data):
                                                    {nm: {b: th for b, th in c.items() if th is not None}
                                                     for nm, c in chosen.items()})
     fps = cfg["frame_rate"]
-    out = {"version": VERSION, "settings": _settings(), "window": cfg["window"], "frame_rate": fps,
+    out = {"version": VERSION, "settings": settings, "window": cfg["window"], "frame_rate": fps,
            "train_fraction": step05_cfg.get("train_fraction", 1.0),
            "num_train_videos": len(train_onsets["videos"]),
            "train_onsets": {label_names[i]: int(train_onsets["counts"][int(h)]) for i, h in enumerate(heads)},
@@ -542,6 +569,6 @@ def print_summary(out):
         types = " ".join(f"{t['by_type'][x]['detected']:>3}/{t['by_type'][x]['events']:<4}" if t else f"{'-':>8}"
                          for x in step06.COUNTED_TYPES)
         ego = f"{t['ego']['detected']:>3}/{t['ego']['events']:<4}" if t else f"{'-':>8}"
-        print(f"  {nm:<11} {f(s['ap']['micro'])} {f(s['ap']['macro'])} | {f(s['budgets'][b]['threshold'], '{:.4f}'):>7} "
+        print(f"  {DISPLAY.get(nm, nm):<11} {f(s['ap']['micro'])} {f(s['ap']['macro'])} | {f(s['budgets'][b]['threshold'], '{:.4f}'):>7} "
               f"{f(t.get('fa_per_min'), '{:.1f}'):>6} {f(t.get('recall'))} {f(t.get('precision'))} "
               f"{f(t.get('median_lead_s'), '{:.1f}'):>5} | {types} {ego}")

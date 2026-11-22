@@ -102,6 +102,22 @@ def evaluate(model, seeds, heads, train_events, evaluation, rate, device, small_
     return out
 
 
+def load_rows(cfg, training_data, model, head_mask, possible, out_dir):
+    """The `step05_mine.collect` samples (train, val), cached in out_dir. The row sample does not depend on the
+    mining version or the rule settings (only on the caps, which stay in the tag): the cache name leaves the
+    version out, so a new version reuses it."""
+    tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
+    rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}_s{cfg['seed']}.pt"
+    if os.path.exists(rows_file) and step05.is_fresh(rows_file, cfg["training_data_file"]):
+        return torch.load(rows_file, map_location="cpu")
+    train = step05_mine.collect(model, training_data, training_data["train_videos"], head_mask, possible, cfg,
+                                "Rows (train)")
+    val = step05_mine.collect(model, training_data, training_data["val_videos"], head_mask, possible, cfg,
+                              "Rows (val)")
+    torch.save((train, val), rows_file)
+    return train, val
+
+
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--lifts", type=str, default="1.2,1.5,2.0", help="mine_min_lift values")
@@ -129,17 +145,7 @@ def main():
     possible = step05.class_possible(training_data, vocab, device)
 
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
-    # The row sample does not depend on the mining version or the rule settings (only on the caps, which stay
-    # in the tag): the cache name leaves the version out, so a new version reuses it.
-    rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}_s{cfg['seed']}.pt"
-    if os.path.exists(rows_file) and step05.is_fresh(rows_file, cfg["training_data_file"]):
-        train, val = torch.load(rows_file, map_location="cpu")
-    else:
-        train = step05_mine.collect(model, training_data, training_data["train_videos"], head_mask, possible, cfg,
-                                    "Sweep (train)")
-        val = step05_mine.collect(model, training_data, training_data["val_videos"], head_mask, possible, cfg,
-                                  "Sweep (val)")
-        torch.save((train, val), rows_file)
+    train, val = load_rows(cfg, training_data, model, head_mask, possible, out_dir)
     num_val = len(training_data["val_videos"])
     check = subset(val, set(range(0, num_val, 2)))
     evaluation = subset(val, set(range(1, num_val, 2)))

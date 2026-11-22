@@ -516,23 +516,32 @@ class BoostScorer:
               f"videos without ego scores: {len(self.missing)}")
 
 
+SELECT_CANDIDATES = ("anchor", "boost", "model")   # rule scorers of "rule_sel"; ties go to the earlier one
+
+
 class SelectScorer:
-    """step06 scorer "boost_sel": per boosted head, the scorer with the higher val AP (`step06.head_val_ap`):
-    the boosted rules (`BoostScorer`) or the rule net. use (A,) bool: the heads taken from the boosted rules."""
+    """step06 / step07 scorer "rule_sel": per head, the rule scorer with the highest val AP (`step06.select_rules`):
+    "anchor" (the mined rules alone), "boost" (the boosted rules, boosted heads only) or "model" (the rule net).
+    choice: {head index: candidate}; the heads not in it keep the rule net. anchor: f(inputs) -> (B, W, A)."""
     video_scorer = True
 
-    def __init__(self, boost, use, labels):
-        self.boost, self.use, self.labels = boost, use, labels
+    def __init__(self, choice, anchor, boost, labels):
+        self.choice, self.anchor, self.boost, self.labels = choice, anchor, boost, labels
+        self.heads = {c: torch.tensor(sorted(a for a, x in choice.items() if x == c), dtype=torch.long)
+                      for c in SELECT_CANDIDATES}
 
     def __call__(self, context, stage1):
-        p = self.boost(context, stage1)
-        return torch.where(self.use.to(p.device)[None, None, :], p, stage1)
+        out = stage1.clone()
+        for c, f in (("anchor", lambda: self.anchor(context["inputs"])), ("boost", lambda: self.boost(context, stage1))):
+            idx = self.heads[c]
+            if len(idx):
+                idx = idx.to(out.device)
+                out[:, :, idx] = f()[:, :, idx].to(out.dtype)
+        return out
 
     def report(self):
-        heads = boosted_heads(self.boost)
-        taken = [self.labels[a] for a in heads if self.use[a]]
-        print(f"[Boost select] {len(taken)} / {len(heads)} boosted heads use the boosted rules (higher val AP); "
-              f"the others keep the rule net")
+        counts = {c: len(v) for c, v in self.heads.items()}
+        print(f"[Rule select] heads per rule scorer (highest val AP): {counts}")
 
 
 def boosted_heads(scorer):

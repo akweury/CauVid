@@ -24,7 +24,7 @@ import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent / "output" / "roadpp"
-ROWS = [("prior", "Prior (base rate)"), ("lookup", "Own-label lookup"), ("anchor", "LLM anchor clauses"),
+ROWS = [("prior", "Prior (base rate)"), ("lookup", "Own-label lookup"), ("anchor", "Mined rules"),
         ("mlp", "OnsetMLP"), ("model", "Rule net (ours)")]
 TYPES = ("rare", "regular", "trivial")
 

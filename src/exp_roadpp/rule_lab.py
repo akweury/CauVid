@@ -1,0 +1,578 @@
+"""Rule lab: short tests of the mined-rule model ("mined rules", step 06's "anchor") against the OnsetMLP,
+per head, on val, without training the rule net (2026-11-22).
+
+Goal: most heads close to or above the MLP with rules alone. Run 1ca554 (SUMO v7): the mined rules matched
+the MLP's recall at 5 FA/min (0.109 vs 0.107), but on 13 heads only; macro AP 0.173 vs 0.267.
+
+Principle (the user, 2026-11-22): a rule that fired before only two onsets and was right both times counts,
+whatever its length; every precise rule, and every rule that may be extended into a precise one, is
+considered.
+
+Rule sets ("variants"), all mined on the train sample of `step05_mine.collect` (cached by `mine_sweep`):
+  m4       the step 05 mining (`step05_mine.mine_head`, the run's settings);
+  relaxed  the same miner with the limits opened: 32 rules per root, 4 roots, depth 6, 2 onsets in 1 video,
+           no val filter;
+  precise  beam search for precise conjunctions (`precise_rules`): any literal (no own root needed), any
+           length up to --lab_max_len. A rule is kept if its precision is >= --lab_precise_min with
+           >= --lab_min_events distinct onsets. A rule is extended while its precision can still rise;
+  m4+precise  the union.
+Every rule is then recounted exactly on all train rows (`recount`). The sample's negatives carry weights of
+~100; a rule with no sampled negative can still fire on many unsampled rows. A rule whose extension does
+not raise the exact precision over its sub-rule is dropped.
+
+Scorers of a rule set, per head:
+  max_k{k}  the highest confidence of the holding rules, else the head's base rate. The confidence is the exact
+            train precision shrunk to the base rate with k onsets: (e + k b) / (e / p + k). k = 0 is the raw
+            precision.
+  nor_k{k}  noisy-OR of the same confidences: rules that hold together add up.
+  logit     per-head logistic regression on the rules that hold (fit on the train sample, weighted); a
+            readable weight per rule.
+  soft_logit / soft_nor  soft AND and soft OR (`fit_soft`, the user's request): every literal of a rule has a gate
+            g in [0, 1] (start ~1, the hard rule). A rule's activation is prod (1 - g (1 - x)), so a rule with a
+            literal missing still counts in part. The rules are combined by a logistic sum or a noisy-OR.
+            The share of the literals relaxed (g < 0.5) is printed per variant.
+
+Evaluation: every at-risk row of the odd val videos, not a sample. The even ones are the m4 miner's val check.
+  - Label: the head switches on within clause_slots slots, as in mining.
+  - MLP: its window of clause_slots x slot_size frames, on the same rows.
+  - Per head: the AP of every (variant, scorer) and of the MLP, from score histograms.
+  - Reported:
+    - macro AP over the learnable heads (some scorer, MLP included, reaches LEARNABLE_MIN_AP);
+    - the number of heads with >= 0.9 x the MLP's AP and with more than the MLP's AP;
+    - micro AP;
+    - rules and literals per rule;
+    - per action, for the best scorer.
+  The test split is never read.
+
+Run (server, with the run's MLP and training data):
+  ./run_roadpp_docker.sh --gpu 0 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing \\
+      --run_id 20261121-173934_dgx-jing_1ca554
+Writes <output_dir>/rule_lab/rule_lab_<tag>.json.
+"""
+import math
+import os
+from collections import defaultdict
+
+import torch
+from tqdm import tqdm
+
+from src.exp_roadpp import config, mine_sweep, step05, step05_mine, step07_paper, utils_data, utils_pipe
+
+LEARNABLE_MIN_AP = 0.05
+CLOSE = 0.9                     # "close to the MLP": AP >= CLOSE x the MLP's
+MIN_EVAL_POS = 20               # heads with fewer positive eval rows are not compared
+RULE_CHUNK = 4096               # rules per gather in `_holds_all`
+SOFT_PRIOR = 5                  # confidence shrink (onsets) of the soft noisy-OR's starting q
+RELAXED = {"mine_max_rules": 32, "mine_roots": 4, "mine_root_min_cover": 0.05, "mine_depth": 6,
+           "mine_min_events": 2, "min_videos": 1, "mine_val_lift": 0.0}
+
+
+# -------------- Rules on literal rows --------------
+def _pad(rule_lits, true_lit):
+    """(R, K) long literal indices, padded with a literal that always holds."""
+    K = max((len(x) for x in rule_lits), default=1)
+    return torch.tensor([list(x) + [true_lit] * (K - len(x)) for x in rule_lits], dtype=torch.long)
+
+
+def _holds_all(lits, body):
+    """(B, R) bool: every literal of each rule holds. lits (B, L + 1) bool (last column: always true),
+    body (R, K) long."""
+    out = []
+    for i in range(0, len(body), RULE_CHUNK):
+        out.append(lits[:, body[i:i + RULE_CHUNK]].all(dim=2))
+    return torch.cat(out, dim=1) if out else torch.zeros((len(lits), 0), dtype=torch.bool, device=lits.device)
+
+
+def _with_true(lits):
+    return torch.cat([lits, torch.ones((len(lits), 1), dtype=torch.bool, device=lits.device)], dim=1)
+
+
+# -------------- Precise rule search --------------
+def precise_rules(pool, allowed, cfg):
+    """Beam search for precise conjunctions on one head's train sample pool (`step05_mine._pool_of`).
+
+    Every rule grows one literal at a time. A child is ranked by its pessimistic precision: weighted hits over
+    weighted rows plus the weight of one more negative row, so a rule seen on few rows ranks low until it has
+    support. Per node, the --lab_branch best children with >= min_events distinct onsets (in >= min_videos
+    videos) whose precision rises over the parent's go on. A child is kept as a rule if its precision is
+    >= precise_min, and grows further while it is below 1. The --lab_beam best children form the next level.
+    Returns [(literals tuple, sample precision, onsets)], best first, at most --lab_max_rules."""
+    F, y, w = pool["F"], pool["y"], pool["w"]
+    n = len(y)
+    if n == 0 or not bool(y.any()):
+        return []
+    dev = F.device
+    yf = y.float()
+    wy = w * yf
+    neg_w = w[~y]
+    lam = float(neg_w.median()) if len(neg_w) else 1.0        # weight of one more (sampled) negative row
+    beam = [((), torch.ones(n, dtype=torch.bool, device=dev), 0.0)]
+    kept, seen = {}, set()
+    for _depth in range(cfg["lab_max_len"]):
+        if not beam:
+            break
+        M = torch.stack([m for _, m, _ in beam]).float()        # (B, n)
+        n1 = (M * w) @ F                                        # (B, L) weighted rows where the child holds
+        h1 = (M * wy) @ F
+        c1 = (M * yf) @ F                                       # hit rows (unweighted)
+        prec = h1 / n1.clamp(min=1e-12)
+        score = h1 / (n1 + lam)
+        parent_rows = M.sum(dim=1, keepdim=True)
+        ok = (allowed[None] & (c1 >= cfg["lab_min_events"]) & (n1 > 0)
+              & (prec > torch.tensor([p for _, _, p in beam], device=dev)[:, None] + 1e-9)
+              & (((M @ F) < parent_rows)))                      # the literal must cut some row
+        score = torch.where(ok, score, torch.full_like(score, -1.0))
+        top = score.topk(min(cfg["lab_branch"], score.shape[1]), dim=1)
+        children = []
+        for b, (lits, mask, _p) in enumerate(beam):
+            for s, m in zip(top.values[b].tolist(), top.indices[b].tolist()):
+                if s <= 0:
+                    break
+                key = tuple(sorted(lits + (m,)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                child = mask & (F[:, m] > 0.5)
+                hit = child & y
+                events = int(pool["event"][hit].unique().numel())
+                if events < cfg["lab_min_events"] or int(pool["video"][hit].unique().numel()) < cfg["lab_min_videos"]:
+                    continue
+                p = float(prec[b, m])
+                if p >= cfg["lab_precise_min"]:
+                    kept[key] = (p, events, s)
+                if p < 1.0 - 1e-9:
+                    children.append((s, key, child, p))
+        children.sort(key=lambda x: -x[0])
+        beam = [(key, child, p) for _s, key, child, p in children[:cfg["lab_beam"]]]
+    best = sorted(kept.items(), key=lambda x: -x[1][2])[:cfg["lab_max_rules"]]
+    return [(key, p, e) for key, (p, e, _s) in best]
+
+
+# -------------- Exact counts on all train rows --------------
+@torch.no_grad()
+def recount(model, training_data, video_ids, rules, head_mask, possible, cfg):
+    """Exact fires (rows), hits (rows) and distinct onsets of every rule {"head", "literals"} on all at-risk
+    rows of video_ids, and per head the rows and hit rows (the base rate)."""
+    device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
+    A, L = model.num_atoms, model.num_literals
+    R = len(rules)
+    body = _pad([r["literals"] for r in rules], L).to(device)
+    head = torch.tensor([r["head"] for r in rules], dtype=torch.long, device=device)
+    fires, hits = torch.zeros(R, device=device), torch.zeros(R, device=device)
+    rows_h, pos_h = torch.zeros(A, device=device), torch.zeros(A, device=device)
+    pairs = []
+    for vi, video_id in enumerate(tqdm(video_ids, desc="Exact counts (train)")):
+        can = possible(video_id)
+        for frames in training_data["frames"][video_id].split(int(cfg.get("mine_chunk", 256))):
+            rows = step05._video_rows(model, training_data, video_id, frames, device)
+            if len(rows["inputs"]) == 0:
+                continue
+            keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
+            rows_h += keep.sum(dim=0)
+            pos_h += y.sum(dim=0)
+            sel = keep.any(dim=1)
+            if not sel.any() or R == 0:
+                continue
+            lits = _with_true(model.literal_values(rows["inputs"][sel]) > 0.5)
+            holds = _holds_all(lits, body)                                      # (B, R)
+            k_r, y_r = keep[sel][:, head], y[sel][:, head]                      # (B, R)
+            fire = holds & k_r
+            hit = fire & y_r
+            fires += fire.sum(dim=0)
+            hits += hit.sum(dim=0)
+            b, r = torch.nonzero(hit, as_tuple=True)
+            if len(b):
+                t, n = rows["rows"][sel][b].T
+                onset = t + rows["first"][sel][b, head[r]]
+                ev = (torch.full_like(onset, vi) << 40) | (n.long() << 20) | onset.long()
+                pairs.append(torch.unique(torch.stack([r, ev], dim=1), dim=0).cpu())
+    events = torch.zeros(R, dtype=torch.long)
+    if pairs:
+        u = torch.unique(torch.cat(pairs), dim=0)
+        events.index_add_(0, u[:, 0], torch.ones(len(u), dtype=torch.long))
+    return {"fires": fires.cpu(), "hits": hits.cpu(), "events": events,
+            "base": (pos_h / rows_h.clamp(min=1)).cpu()}
+
+
+def finalize(rules, counts, min_events):
+    """The rules with exact precision and onsets: >= min_events onsets; a rule is dropped if one of its
+    sub-rules (fewer literals, same head) is at least as precise (the extension adds nothing)."""
+    out = []
+    for i, r in enumerate(rules):
+        f, h, e = float(counts["fires"][i]), float(counts["hits"][i]), int(counts["events"][i])
+        if f <= 0 or e < min_events:
+            continue
+        out.append({**r, "precision": h / f, "events": e, "fires": f})
+    by_head = defaultdict(dict)
+    for r in out:
+        by_head[r["head"]][frozenset(r["literals"])] = r
+    keep = []
+    for r in out:
+        lits = frozenset(r["literals"])
+        same = by_head[r["head"]]
+        dominated = any(len(k) < len(lits) and k <= lits and s["precision"] >= r["precision"]
+                        for k, s in same.items())
+        if not dominated or r.get("root"):
+            keep.append(r)
+    return keep
+
+
+# -------------- Scorers --------------
+def confidence(rules, base, k):
+    p = torch.tensor([r["precision"] for r in rules], dtype=torch.float)
+    e = torch.tensor([r["events"] for r in rules], dtype=torch.float)
+    b = base[torch.tensor([r["head"] for r in rules], dtype=torch.long)] if rules else torch.zeros(0)
+    if k <= 0:
+        return p
+    return (e + k * b) / (e / p.clamp(min=1e-9) + k)
+
+
+def fit_logit(rules, train, model, heads, device, steps=500, l2=1e-5):
+    """Per head, a logistic regression on the rules that hold (weighted train sample): (R,) weights, (A,) bias."""
+    L = model.num_literals
+    weight = torch.zeros(len(rules))
+    bias = torch.full((model.num_atoms,), -10.0)
+    by = defaultdict(list)
+    for i, r in enumerate(rules):
+        by[r["head"]].append(i)
+    for h in heads:
+        if not bool((train["pairs"]["head"] == h).any()):
+            continue
+        pool = step05_mine._pool_of(train, h, L, device)
+        if not bool(pool["y"].any()):
+            continue
+        idx = by.get(h, [])
+        X = (_holds_all(_with_true(pool["F"] > 0.5), _pad([rules[i]["literals"] for i in idx], L).to(device)).float()
+             if idx else torch.zeros((len(pool["y"]), 0), device=device))
+        y, w = pool["y"].float(), pool["w"] / pool["w"].sum()
+        p0 = max(float((w * y).sum()), 1e-6)
+        wt = torch.zeros(X.shape[1], device=device, requires_grad=True)
+        b0 = torch.tensor(math.log(p0 / max(1 - p0, 1e-6)), device=device, requires_grad=True)
+        opt = torch.optim.Adam([wt, b0], lr=0.1)
+        for _ in range(steps):
+            opt.zero_grad()
+            z = X @ wt + b0
+            loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(z, y, reduction="none")).sum() \
+                + l2 * (wt ** 2).sum()
+            loss.backward()
+            opt.step()
+        weight[idx] = wt.detach().cpu()
+        bias[h] = float(b0)
+    return weight, bias
+
+
+def _soft_act(lits_f, body, gate):
+    """(B, R) soft rule activations: the product over a rule's literals of 1 - g (1 - x), x the literal (0 / 1),
+    g its gate in [0, 1] (1: required, the hard AND; 0: ignored). lits_f (B, L + 1) float, body / gate (R, K)."""
+    out = []
+    for i in range(0, len(body), RULE_CHUNK):
+        x = lits_f[:, body[i:i + RULE_CHUNK]]                                   # (B, Rc, K)
+        out.append((1 - gate[i:i + RULE_CHUNK][None] * (1 - x)).prod(dim=2))
+    return torch.cat(out, dim=1) if out else torch.zeros((len(lits_f), 0), device=lits_f.device)
+
+
+def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2=1e-5, gate_reg=1e-4):
+    """Soft AND and soft OR per head, fit on the weighted train sample (2026-11-22, the user: the AND within a
+    rule and the OR between rules should be soft, not hard).
+    Soft AND: a rule's activation a_r = prod_i (1 - g_ri (1 - x_i)); every gate g_ri starts at ~0.95 (the
+    mined hard rule) and may fall, so a rule with a literal missing still gives part of its evidence;
+    gate_reg x sum(1 - g) keeps the gates near the hard rule unless the data pays for it.
+    Soft OR, mode "logit": p = sigmoid(b + sum_r w_r a_r); mode "nor": p = 1 - (1 - base) prod_r (1 - q_r a_r),
+    q_r from the rule's confidence. Returns gate (R, K) and (w (R,), b (A,)) or q (R,)."""
+    L = model.num_literals
+    K = max((len(r["literals"]) for r in rules), default=1)
+    gate = torch.ones((len(rules), K))
+    weight, bias = torch.zeros(len(rules)), torch.full((model.num_atoms,), -10.0)
+    q = conf.clone()
+    by = defaultdict(list)
+    for i, r in enumerate(rules):
+        by[r["head"]].append(i)
+    for h in heads:
+        idx = by.get(h, [])
+        if not idx or not bool((train["pairs"]["head"] == h).any()):
+            continue
+        pool = step05_mine._pool_of(train, h, L, device)
+        if not bool(pool["y"].any()):
+            continue
+        body = _pad([rules[i]["literals"] for i in idx], L).to(device)
+        if body.shape[1] < K:
+            body = torch.cat([body, torch.full((len(idx), K - body.shape[1]), L, device=device)], dim=1)
+        X = torch.cat([pool["F"], torch.ones((len(pool["y"]), 1), device=device)], dim=1)[:, body]   # (n, R, K)
+        pad = body == L
+        y, w = pool["y"].float(), pool["w"] / pool["w"].sum()
+        theta = torch.full(body.shape, 3.0, device=device, requires_grad=True)
+        params = [theta]
+        if mode == "logit":
+            p0 = max(float((w * y).sum()), 1e-6)
+            wt = torch.zeros(len(idx), device=device, requires_grad=True)
+            b0 = torch.tensor(math.log(p0 / max(1 - p0, 1e-6)), device=device, requires_grad=True)
+            params += [wt, b0]
+        else:
+            c = conf[idx].to(device).clamp(1e-4, 1 - 1e-4)
+            phi = torch.log(c / (1 - c)).clone().requires_grad_(True)
+            params += [phi]
+            b = float(base[h])
+        opt = torch.optim.Adam(params, lr=0.1)
+        for _ in range(steps):
+            opt.zero_grad()
+            g = torch.sigmoid(theta).masked_fill(pad, 0.0)
+            a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R)
+            if mode == "logit":
+                loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(a @ wt + b0, y, reduction="none")).sum() \
+                    + l2 * (wt ** 2).sum()
+            else:
+                miss = torch.log1p(-(torch.sigmoid(phi)[None] * a).clamp(max=1 - 1e-6)).sum(dim=1)
+                p = (1 - (1 - b) * torch.exp(miss)).clamp(1e-6, 1 - 1e-6)
+                loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
+            loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
+            loss.backward()
+            opt.step()
+        gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).cpu()
+        gate[idx] = gi
+        if mode == "logit":
+            weight[idx] = wt.detach().cpu()
+            bias[h] = float(b0)
+        else:
+            q[idx] = torch.sigmoid(phi.detach()).cpu()
+    return gate, ((weight, bias) if mode == "logit" else q)
+
+
+class RuleSet:
+    """One variant's rules on device, with the scorers of the module doc."""
+
+    def __init__(self, rules, base, priors, logit, L, A, device, soft=None):
+        self.rules, self.A = rules, A
+        self.body = _pad([r["literals"] for r in rules], L).to(device)
+        self.head = torch.tensor([r["head"] for r in rules], dtype=torch.long, device=device)
+        self.base = base.to(device)
+        self.conf = {k: confidence(rules, base, k).to(device) for k in priors}
+        self.weight, self.bias = (logit[0].to(device), logit[1].to(device)) if logit else (None, None)
+        # soft {"logit": (gate, (w, b)), "nor": (gate, q)} (`fit_soft`)
+        self.soft = {m: (g.to(device), tuple(x.to(device) for x in p) if isinstance(p, tuple) else p.to(device))
+                     for m, (g, p) in (soft or {}).items()}
+
+    def scores(self, lits):
+        """{scorer: (B, A) probabilities} of literal rows lits (B, L + 1) bool."""
+        B = len(lits)
+        holds = _holds_all(lits, self.body).float() if len(self.rules) else None
+        out = {}
+        idx = self.head[None].expand(B, -1)
+        for k, conf in self.conf.items():
+            s = self.base[None].expand(B, -1).clone()
+            if holds is not None:
+                s = s.scatter_reduce(1, idx, torch.where(holds > 0, conf[None], -1.0), "amax", include_self=True)
+            out[f"max_k{k:g}"] = s
+            log_miss = torch.zeros((B, self.A), device=lits.device)
+            if holds is not None:
+                log_miss = log_miss.index_add(1, self.head, holds * torch.log1p(-conf.clamp(max=1 - 1e-6))[None])
+            out[f"nor_k{k:g}"] = 1 - (1 - self.base[None]) * torch.exp(log_miss)
+        if self.weight is not None:
+            z = self.bias[None].expand(B, -1).clone()
+            if holds is not None:
+                z = z.index_add(1, self.head, holds * self.weight[None])
+            out["logit"] = torch.sigmoid(z)
+        if self.soft and len(self.rules):
+            lits_f = lits.float()
+            for mode, (gate, par) in self.soft.items():
+                a = _soft_act(lits_f, self.body, gate)                           # (B, R)
+                if mode == "logit":
+                    w, b = par
+                    z = b[None].expand(B, -1).clone().index_add(1, self.head, a * w[None])
+                    out["soft_logit"] = torch.sigmoid(z)
+                else:
+                    miss = torch.zeros((B, self.A), device=lits.device).index_add(
+                        1, self.head, torch.log1p(-(par[None] * a).clamp(max=1 - 1e-6)))
+                    out["soft_nor"] = 1 - (1 - self.base[None]) * torch.exp(miss)
+        return out
+
+
+# -------------- Evaluation --------------
+@torch.no_grad()
+def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possible, cfg, k_mlp):
+    """Score histograms {(variant, scorer) | "mlp": (pos, neg) (A, NB)} on all at-risk rows of video_ids."""
+    device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
+    A, NB = model.num_atoms, step07_paper.NB
+    hist = {}
+
+    def add(name, p, keep, y):
+        if name not in hist:
+            hist[name] = (torch.zeros(A * NB, device=device), torch.zeros(A * NB, device=device))
+        cell = torch.arange(A, device=device)[None] * NB + step07_paper._logit_bins(p)
+        hist[name][0].add_(torch.bincount(cell[keep & y], minlength=A * NB).float())
+        hist[name][1].add_(torch.bincount(cell[keep & ~y], minlength=A * NB).float())
+
+    for video_id in tqdm(video_ids, desc="Evaluating (val)"):
+        can = possible(video_id)
+        for frames in training_data["frames"][video_id].split(int(cfg.get("mine_chunk", 256))):
+            rows = step05._video_rows(model, training_data, video_id, frames, device)
+            if len(rows["inputs"]) == 0:
+                continue
+            keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
+            if not keep.any():
+                continue
+            lits = _with_true(model.literal_values(rows["inputs"]) > 0.5)
+            if mlp is not None:
+                add("mlp", mlp.window_probs(mlp(rows["inputs"])[0])[:, k_mlp], keep, y)
+            for variant, rs in rule_sets.items():
+                for scorer, p in rs.scores(lits).items():
+                    add(f"{variant}/{scorer}", p, keep, y)
+    return {name: (pos.view(A, NB).cpu(), neg.view(A, NB).cpu()) for name, (pos, neg) in hist.items()}
+
+
+def report(hist, names, heads, rule_sets):
+    """Per head AP of every scorer; macro / close / wins over the learnable heads; per action."""
+    ap = {name: step07_paper._ap(pos, neg) for name, (pos, neg) in hist.items()}
+    npos = hist["mlp"][0].sum(dim=1)
+    compared = [h for h in heads if npos[h] >= MIN_EVAL_POS]
+    scorers = [n for n in ap if n != "mlp"]
+
+    def val(name, h):
+        x = float(ap[name][h])
+        return 0.0 if x != x else x
+    learnable = [h for h in compared if max(val(n, h) for n in ap) >= LEARNABLE_MIN_AP]
+    rows = {}
+    for name in scorers:
+        a = [val(name, h) for h in learnable]
+        m = [val("mlp", h) for h in learnable]
+        variant = name.split("/")[0]
+        rs = rule_sets[variant].rules
+        rows[name] = {"macro": sum(a) / max(len(a), 1), "mlp_macro": sum(m) / max(len(m), 1),
+                      "close": sum(x >= CLOSE * y for x, y in zip(a, m)), "wins": sum(x > y for x, y in zip(a, m)),
+                      "rules": len(rs), "literals": sum(len(r["literals"]) for r in rs) / max(len(rs), 1),
+                      "max_literals": max((len(r["literals"]) for r in rs), default=0)}
+    best = max(rows, key=lambda n: rows[n]["macro"]) if rows else None
+    print(f"\n[Rule lab] eval = odd val videos, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
+          f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP}); MLP macro "
+          f"{rows[best]['mlp_macro'] if best else float('nan'):.3f}")
+    print(f"  {'variant/scorer':<22}{'rules':>7}{'lits':>6}{'max':>5}{'macro':>8}{'close':>7}{'wins':>6}")
+    for name, r in sorted(rows.items(), key=lambda x: -x[1]["macro"]):
+        print(f"  {name:<22}{r['rules']:>7}{r['literals']:>6.2f}{r['max_literals']:>5}{r['macro']:>8.3f}"
+              f"{r['close']:>5}/{len(learnable):<3}{r['wins']:>4}")
+    if best:
+        by_action = defaultdict(list)
+        for h in learnable:
+            by_action[names[h].split(":")[-1]].append(h)
+        print(f"\n  per action, {best} vs MLP (macro AP, heads):")
+        for action, hs in sorted(by_action.items(), key=lambda x: sum(val(best, h) - val("mlp", h) for h in x[1])):
+            print(f"    {action:<12}{sum(val(best, h) for h in hs) / len(hs):>7.3f}{sum(val('mlp', h) for h in hs) / len(hs):>7.3f}"
+                  f"{len(hs):>4}")
+    per_head = {names[h]: {"learnable": h in learnable, "pos_rows": int(npos[h]),
+                           **{n: _none(float(ap[n][h])) for n in ap}} for h in compared}
+    return {"summary": rows, "best": best, "learnable": [names[h] for h in learnable], "per_head": per_head}
+
+
+def _none(x):
+    return None if x != x else x
+
+
+# -------------- Main --------------
+def main():
+    parser = utils_pipe.get_parser()
+    parser.add_argument("--lab_variants", type=str, default="m4,relaxed,precise,m4+precise")
+    parser.add_argument("--lab_priors", type=str, default="0,2,5,20", help="confidence shrink k (onsets)")
+    parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
+    parser.add_argument("--lab_min_events", type=int, default=2, help="precise search: distinct onsets of a rule")
+    parser.add_argument("--lab_min_videos", type=int, default=1)
+    parser.add_argument("--lab_max_len", type=int, default=8, help="precise search: literals per rule")
+    parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
+    parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
+    parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    args = utils_pipe.parse_args(parser)
+    args = config.machine_setup(args)
+    if not getattr(args, "run_id", None):
+        raise ValueError("--run_id is needed: the lab compares with that run's OnsetMLP")
+    args.run_dir = args.output_dir / "runs" / args.run_id
+    cfg = step05.get_cfg(config.get_step_05_input(args))
+    for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
+                "lab_max_rules"):
+        cfg[key] = getattr(args, key)
+    device = cfg["device"]
+    out_dir = args.output_dir / "rule_lab"
+    os.makedirs(out_dir, exist_ok=True)
+
+    training_data = step05.load_training_data(cfg)
+    model = step05.build_rule_net(training_data, cfg, 1).to(device)
+    mlp = step05.load_onset_mlp(training_data, cfg)
+    if mlp is None:
+        raise ValueError(f"no OnsetMLP at {cfg['mlp_model_file']}")
+    window = int(cfg.get("clause_slots", 1)) * model.slot_size
+    k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
+    vocab = step05.load_vocabulary(cfg)
+    names = [step05._atom_name(sig) for sig in vocab]
+    head_mask = training_data["target_heads"].to(device)
+    heads = torch.nonzero(head_mask).flatten().tolist()
+    possible = step05.class_possible(training_data, vocab, device)
+    L, A = model.num_literals, model.num_atoms
+
+    train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
+    val_ids = list(training_data["val_videos"])
+    check = mine_sweep.subset(val, set(range(0, len(val_ids), 2)))
+    eval_ids = val_ids[1::2]
+
+    # 1. Rule sets on the train sample.
+    variants = args.lab_variants.split(",")
+    mined = {}
+    base_mask = model.literal_base.to(device)
+    scope = base_mask // (model.num_spans * A)
+    for name, over in (("m4", {}), ("relaxed", RELAXED)):
+        if name in variants or (name == "m4" and "m4+precise" in variants):
+            rules = []
+            for h in tqdm(heads, desc=f"Mining {name}"):
+                seeds, _ = step05_mine.mine_head(model, names, h, train, check, {**cfg, **over}, device)
+                rules += [{"head": int(sd["head"]), "literals": list(sd["literals"]), "root": bool(sd.get("root"))}
+                          for sd in seeds]
+            mined[name] = rules
+    if "precise" in variants or "m4+precise" in variants:
+        rules = []
+        for h in tqdm(heads, desc="Precise search"):
+            if not bool((train["pairs"]["head"] == h).any()):
+                continue
+            allowed = model.input_mask.to(device) & ~((base_mask % A == h) & (scope == 0))
+            pool = step05_mine._pool_of(train, h, L, device)
+            rules += [{"head": int(h), "literals": list(key)} for key, _p, _e in precise_rules(pool, allowed, cfg)]
+        mined["precise"] = rules
+    if "m4+precise" in variants:
+        mined["m4+precise"] = mined["m4"] + mined["precise"]
+
+    # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
+    unique = {}
+    for rules in mined.values():
+        for r in rules:
+            unique.setdefault((r["head"], tuple(sorted(r["literals"]))), r)
+    keys = list(unique)
+    counts = recount(model, training_data, training_data["train_videos"], [unique[k] for k in keys], head_mask,
+                     possible, cfg)
+    exact = {k: i for i, k in enumerate(keys)}
+    priors = [float(x) for x in args.lab_priors.split(",")]
+    rule_sets, texts = {}, {}
+    for name in variants:
+        rs = mined[name]
+        idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
+        sub = {k: v[idx] for k, v in counts.items() if k != "base"}
+        final = finalize(rs, sub, 1 if name in ("m4", "relaxed") else args.lab_min_events)
+        logit = fit_logit(final, train, model, heads, device)
+        soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, model,
+                            heads, device, m) for m in ("logit", "nor")}
+        for m, (g, _p) in soft.items():
+            real = g[_pad([r["literals"] for r in final], L) != L] if final else g.flatten()
+            print(f"[Rule lab] {name} soft {m}: {float((real < 0.5).float().mean()) if len(real) else 0:.1%} of the "
+                  f"literals relaxed (gate < 0.5)")
+        rule_sets[name] = RuleSet(final, counts["base"], priors, logit, L, A, device, soft)
+        texts[name] = [{"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
+                        "text": " & ".join(step05_mine.literal_text(model, names, m) for m in r["literals"])}
+                       for r in sorted(final, key=lambda r: (-r["precision"], -r["events"]))]
+        print(f"[Rule lab] {name}: {len(final)} rules for {len({r['head'] for r in final})} heads "
+              f"(literals per rule {sum(len(r['literals']) for r in final) / max(len(final), 1):.2f})")
+
+    # 3. Every at-risk row of the odd val videos.
+    hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp)
+    out = report(hist, names, heads, rule_sets)
+    tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
+    path = out_dir / f"rule_lab_{tag}_pm{args.lab_precise_min:g}_me{args.lab_min_events}_len{args.lab_max_len}.json"
+    utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
+                          "mlp_window": model.windows[k_mlp], **out, "rules": texts}, path)
+    print(f"[Rule lab] saved {path}")
+
+
+if __name__ == "__main__":
+    main()

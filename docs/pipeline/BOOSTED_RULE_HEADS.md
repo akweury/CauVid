@@ -129,31 +129,36 @@ Boost beats the rule net on 19 of the 31 heads and the MLP on 13. It wins big on
 Mobike:TurLft (0.61 vs 0.18) and Cyc:XingFmRht (0.45 vs 0.21). It collapses on Cyc:IncomLane (0.00 vs rule net
 0.42). 11 heads stay below AP 0.03 with every scorer.
 
-## Per-head selection on val and learnable heads (2026-11-22, `SELECTION_VERSION` sel_v1)
+## Per-head rule scorer on val, learnable heads (2026-11-22, `SELECTION_VERSION` sel_v2)
 
-- **Scorer "boost_sel"** (`step06_boost.SelectScorer`): for each boosted head, either the boosted rules or the
-  rule net, whichever has the higher val AP at the headline window (`head_val_ap`).
-  - It is still a rule model: the MLP and the SetNet are not candidates.
-  - Its val scores are added to step 06's val scores, so it gets per-head thresholds and calibration like
-    every other scorer.
-- **Learnable heads** (`learnable_heads`):
-  - A head is learnable if some scorer (rule net, MLP, boost, boost_net, lookup, anchor) reaches a val AP of at
-    least `LEARNABLE_MIN_AP` (0.05).
-  - The other heads are listed and left out of the comparison.
+- **"anchor" is shown as "mined rules"** in figures, logs and paper tables. It scores a row with the
+  mined seed rules alone (1-4 literals each) and each rule's train confidence, shrunk toward the head
+  prior. The key stays `anchor` so the caches stay valid.
+  - Run 1ca554, 5 FA/min, test recall: mined rules 0.109, MLP 0.107, rule net 0.054.
+  - The direction since 2026-11-22: mine rules, then predict with the rules themselves.
+- **Scorer "rule_sel"** (`step06.select_rules`, `step06_boost.SelectScorer`): for every counted head, the rule
+  scorer with the highest val AP at the headline window.
+  - Candidates: mined rules (`anchor`), boosted rules (`boost`, boosted heads only) and the rule net
+    (`model`). Ties go to them in that order.
+  - Heads without val onsets take the mined rules.
+  - It is a pure rule model: the MLP and the SetNet are never candidates.
+  - Its val scores are added for its thresholds and calibration.
+  - The choice is saved in `step06_output/rule_sel.json` for step 07.
+- **Learnable heads** (`learnable_heads`): some scorer reaches a val AP of at least `LEARNABLE_MIN_AP` (0.05).
+  - The others are listed in the summary and not compared.
   - `per_head[h]` gets `val_average_precision` and `learnable`. Every window gets
     `macro_average_precision_learnable`.
-- **`test_metrics.json["boost_heads"]`**, printed at the end of step 06, gives for each boosted head:
-  - the test AP of model / boost / boost_sel / boost_net / mlp;
-  - the val AP;
-  - the chosen scorer.
-
-  It also gives the macro AP and the wins over the learnable heads.
-- Both are computed only with `--boost_heads`, so the cached metrics of other runs stay valid.
-- The step 06 metrics are recomputed. The fitted boost models are reused. The episode and ceiling stages are not
-  redone, because the model / mlp / lookup calibration is unchanged (`save_calibration`).
+- **`test_metrics.json["rule_heads"]`** is printed at the end of step 06 as `[Rule heads]`. It has:
+  - for every head: the test AP of model / anchor / boost / rule_sel / boost_net / mlp, the chosen scorer,
+    and whether the head is boosted and learnable;
+  - the macro AP and the wins over the learnable heads, and over the learnable boosted heads.
+- **Step 07** (`paper_metrics.json`): with `--boost_heads` and `rule_sel.json` present, "boost",
+  "boost_net" and "rule_sel" are evaluated at the fixed FA/min budgets too.
+- All of this needs `--boost_heads`, so the cached metrics of other runs stay valid.
+- The step 06 metrics and step 07 are redone. The episode and ceiling stages are not, because their calibration
+  is unchanged (`save_calibration`).
 
 ## Not yet
 
 - The step 05 OnsetMLP still has only the step 05 inputs. `boost_net` is the like-for-like neural model.
-- The step 07 paper metrics (fixed FA/min budget) do not include "boost" yet.
 - The boosted rules are not yet inside the TemporalRuleNet; for now they are a separate head scorer.
