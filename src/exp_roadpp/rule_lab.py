@@ -64,7 +64,7 @@ from collections import defaultdict
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import config, mine_sweep, step05, step05_mine, step07_paper, utils_data, utils_pipe
+from src.exp_roadpp import config, eventual, mine_sweep, step05, step05_mine, step07_paper, utils_data, utils_pipe
 
 LEARNABLE_MIN_AP = 0.05
 CLOSE = 0.9                     # "close to the MLP": AP >= CLOSE x the MLP's
@@ -1270,6 +1270,9 @@ def main():
                         help="quick test: only these heads (names like Car:IncomLane or actions like IncomLane)")
     parser.add_argument("--lab_mlp", type=str, default="True",
                         help="train / score the OnsetMLP as the reference (False: rule variants only, no MLP)")
+    parser.add_argument("--lab_target", type=str, default="window", choices=("window", "eventual"),
+                        help="window: an onset within the rule window (when); eventual: an onset at any later frame "
+                             "before the agent leaves the scene (whether, `eventual.py`; no MLP)")
     parser.add_argument("--lab_prepare_only", type=str, default="False",
                         help="build the training data, the OnsetMLP and the row sample, then stop (run once before "
                              "several variants in parallel)")
@@ -1313,6 +1316,11 @@ def main():
 
     training_data = step05.load_training_data(cfg)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
+    if args.lab_target == "eventual":
+        eventual.install()
+        cfg["target_tag"] = "_ev"
+        args.lab_mlp = "False"                  # the OnsetMLP is trained on the window target
+        print("[Rule lab] target: eventual (an onset at any later frame before the agent leaves the scene); no MLP")
     mlp = ensure_mlp(training_data, cfg) if args.lab_mlp == "True" else None
     window = int(cfg.get("clause_slots", 1)) * model.slot_size
     k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
@@ -1528,7 +1536,7 @@ def main():
         show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
-    path = out_dir / f"rule_lab_{tag}_{'-'.join(variants)}{'_rx' + rx if rx else ''}.json"
+    path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
     print(f"[Rule lab] saved {path}")

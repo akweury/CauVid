@@ -47,3 +47,11 @@
 ./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_prepare_only True
 
 ./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_prepare_only True --lab_mlp False
+
+
+./run_roadpp_docker.sh --gpu 3 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_mlp False --lab_variants relaxed_nn_ng --lab_root_exclude shape,gestalt 2>&1 | tee rule_lab_gst8_gpu2.log
+
+./run_roadpp_docker.sh --gpu 1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_mlp False --lab_variants relaxed_nn --lab_root_exclude shape,gestalt 2>&1 | tee rule_lab_gst8_gpu3.log
+
+
+./run_roadpp_docker.sh --gpu 3 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_mlp False --lab_variants relaxed_nn --lab_root_exclude shape 2>&1 | tee rule_lab_gst8_gpu4.log

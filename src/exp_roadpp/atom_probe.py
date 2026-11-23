@@ -31,7 +31,7 @@ from collections import Counter
 import torch
 from tqdm import tqdm
 
-from src.exp_roadpp import config, gestalt, rule_lab, step05, step05_mine, utils_data, utils_pipe
+from src.exp_roadpp import config, eventual, gestalt, rule_lab, step05, step05_mine, utils_data, utils_pipe
 
 MATE_LOOKBACK = 150                     # frames before the onset to look for group mates and their onsets
 LAG_BINS = (10, 20, 30, 50, 75, 100, 150)
@@ -46,6 +46,7 @@ def probe_rules(model, training_data, video_ids, head, rules, head_mask, possibl
     body = rule_lab._pad(rules, L).to(device)
     fires, hits = torch.zeros(len(rules)), torch.zeros(len(rules))
     covered = [set() for _ in rules]
+    leads = [[] for _ in rules]                 # frames from a hit row to its onset (the "when" of the rule)
     rows_h, hits_h, onsets = 0, 0, set()
     for vi, video_id in enumerate(tqdm(video_ids, desc="Rules")):
         can = possible(video_id)
@@ -71,10 +72,12 @@ def probe_rules(model, training_data, video_ids, head, rules, head_mask, possibl
             yk = yy[k]
             hits += (holds & yk[:, None]).sum(dim=0).float().cpu()
             ev_k = [(video_id, int(a), int(b)) for a, b in zip(n[k].tolist(), onset[k].tolist())]
+            first_k = rows["first"][k][:, head]
             for r in range(len(rules)):
                 idx = torch.nonzero(holds[:, r] & yk).flatten().tolist()
                 covered[r].update(ev_k[i] for i in idx)
-    return fires, hits, covered, rows_h, hits_h, onsets
+                leads[r].extend(first_k[holds[:, r] & yk].tolist())
+    return fires, hits, covered, rows_h, hits_h, onsets, leads
 
 
 DIST_BINS = (1.5, 2.0, 2.5, 3.0, 4.0, 6.0)   # centre distance in mean larger box sides (gestalt.NEAR = 2)
@@ -264,6 +267,8 @@ def main():
                         default="Car:IncomLane(own)@1;Car:IncomLane(own)@1 & gst:mate_new_Jun(own)@1;"
                                 "gst:mate_new_Jun(own)@1")
     parser.add_argument("--probe_split", type=str, default="val", choices=("train", "val"))
+    parser.add_argument("--probe_target", type=str, default="window", choices=("window", "eventual"),
+                        help="eventual: a hit is an onset at any later frame before the agent leaves (`eventual.py`)")
     parser.add_argument("--probe_skip_rules", type=str, default="False", help="True: no rule counts (the at-risk rows are still built)")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
@@ -294,18 +299,28 @@ def main():
     skip = str(args.probe_skip_rules).lower() in ("true", "1", "yes")
     if skip:
         rules, rule_texts = [], []
-    fires, hits, covered, rows_h, hits_h, onsets = probe_rules(model, training_data, video_ids, head, rules,
+    if args.probe_target == "eventual":
+        eventual.install()
+    fires, hits, covered, rows_h, hits_h, onsets, leads = probe_rules(model, training_data, video_ids, head, rules,
                                                                head_mask, possible, cfg)
     base = hits_h / max(rows_h, 1)
     print(f"\n[atom_probe] {args.probe_head} on the {args.probe_split} videos: {rows_h} at-risk rows, {hits_h} hit rows "
           f"(base rate {base:.4f}), {len(onsets)} onsets")
     res_rules = []
-    for rt, f, h, c in zip(rule_texts, fires.tolist(), hits.tolist(), covered):
+    win = int(cfg.get("clause_slots", 1)) * model.slot_size
+    print(f"  target: {args.probe_target} (window: an onset within {win} frames)")
+    for rt, f, h, c, ld in zip(rule_texts, fires.tolist(), hits.tolist(), covered, leads):
         p = h / f if f else 0.0
+        q = sorted(ld)
+        lead = {"median": q[len(q) // 2], "q10": q[len(q) // 10], "q25": q[len(q) // 4], "q75": q[3 * len(q) // 4],
+                "q90": q[9 * len(q) // 10], "within_window": sum(1 for x in q if x < win) / len(q)} if q else None
         res_rules.append({"rule": rt, "rows": int(f), "hit_rows": int(h), "precision": p, "lift": p / base if base else None,
-                          "onsets_covered": len(c), "onset_recall": len(c) / max(len(onsets), 1)})
+                          "onsets_covered": len(c), "onset_recall": len(c) / max(len(onsets), 1), "lead": lead})
         print(f"  {rt}\n      rows {int(f):8d}  hits {int(h):6d}  precision {p:.4f}  lift {p / base if base else 0:6.1f}  "
               f"onsets {len(c)} / {len(onsets)} ({len(c) / max(len(onsets), 1):.1%})")
+        if lead:
+            print(f"      frames from a hit row to the onset: 10% {lead['q10']}, 25% {lead['q25']}, median "
+                  f"{lead['median']}, 75% {lead['q75']}, 90% {lead['q90']}; within the window {lead['within_window']:.1%}")
 
     # 2. - 4. Timing, group context and neighbours: all onsets of the labels, and the at-risk ones (the onsets of
     # the head's at-risk rows of part 1, as the rules see them: no agents entering the scene).
@@ -323,10 +338,10 @@ def main():
                                         args.probe_head, short=True)
     out_dir = args.output_dir / "atom_probe"
     out_dir.mkdir(parents=True, exist_ok=True)
-    utils_data.save_json({"head": args.probe_head, "split": args.probe_split, "rows": rows_h, "hit_rows": hits_h,
+    utils_data.save_json({"head": args.probe_head, "split": args.probe_split, "target": args.probe_target, "rows": rows_h, "hit_rows": hits_h,
                           "base_rate": base, "onsets": len(onsets), "rules": res_rules,
                           "reports": reports,
-                          "events": timing}, out_dir / f"probe_{args.probe_head.replace(':', '_')}.json")
+                          "events": timing}, out_dir / f"probe_{args.probe_head.replace(':', '_')}{'_ev' if args.probe_target == 'eventual' else ''}.json")
     print(f"[atom_probe] -> {out_dir}")
 
 

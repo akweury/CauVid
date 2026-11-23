@@ -107,7 +107,7 @@ def load_rows(cfg, training_data, model, head_mask, possible, out_dir):
     mining version or the rule settings (only on the caps, which stay in the tag): the cache name leaves the
     version out, so a new version reuses it."""
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
-    rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}_s{cfg['seed']}.pt"
+    rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}{cfg.get('target_tag', '')}_s{cfg['seed']}.pt"
     if os.path.exists(rows_file) and step05.is_fresh(rows_file, cfg["training_data_file"]):
         return torch.load(rows_file, map_location="cpu")
     train = step05_mine.collect(model, training_data, training_data["train_videos"], head_mask, possible, cfg,

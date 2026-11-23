@@ -65,6 +65,9 @@ def _unpack(packed, L, device):
 def _head_rows(rows, can, head_mask, S, w):
     """keep (B, A) the at-risk rows of agents of the head's class, y (B, A) their hits (onset within w slots)."""
     first, at_risk = rows["first"], rows["at_risk"]
+    if "eventual" in rows:                      # `eventual.install`: an onset at any later frame
+        keep = at_risk & can[rows["rows"][:, 1]] & head_mask[None] & rows["eventual_known"]
+        return keep, keep & rows["eventual"]
     keep = at_risk & can[rows["rows"][:, 1]] & head_mask[None] & rows["known"][:, w - 1]
     return keep, keep & (first < w * S)
 
