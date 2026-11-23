@@ -448,7 +448,7 @@ def _sector(thetas):
     return int(torch.nonzero(inside & ~inside.roll(1)).flatten()[0]), int(inside.sum())
 
 
-def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max_width=180):
+def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max_width=180, forbid=None):
     """Narrow each rule's direction to where its onsets concentrate (the user, 2026-11-23: find the dense region
     inside the interval and shrink it). Per rule and direction kind (dir, path; own scope, slot 1):
       - every row's angle bin (ANGLE_STEP degrees) is read from the half circle literals (the last θ whose half
@@ -458,7 +458,8 @@ def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max
       - the best arc with >= min_events onsets and precision >= min_lift x the rule's becomes a new rule: the
         rule's other literals and the arc as two half circles.
     The new rules are added; the soft fit (`fit_soft`) weighs them against the old ones. Returns the rules and
-    the number added."""
+    the number added. forbid (L,) bool: the variant's forbidden literals; a kind with any of them is left out (bug
+    fix 2026-11-23: the _ng variants got "gst:grp_dir" arcs here)."""
     from src.exp_roadpp import shape as agent_shape
     dir_of, lit_of = direction_literals(model, names)
     if not dir_of:
@@ -475,7 +476,7 @@ def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max
         w, y = pool["w"], pool["y"]
         for kind in sorted({key[0] for key in lit_of}):
             cols = [lit_of.get((kind, t * step, 0, 1)) for t in range(nb)]
-            if any(c is None for c in cols):
+            if any(c is None for c in cols) or (forbid is not None and bool(forbid[cols].any())):
                 continue
             B = F[:, cols]                                                     # (n, nb)
             last = B & ~B.roll(-1, dims=1)
@@ -581,7 +582,7 @@ def _interval_literals(q, lo, hi, nbins, back, scope=0, j=1):
     return lits or None
 
 
-def refine_intervals(rules, model, names, pool_of, min_events=2, min_lift=1.2):
+def refine_intervals(rules, model, names, pool_of, min_events=2, min_lift=1.2, forbid=None):
     """`refine_sectors` for the fine position / size / distance quantities: per rule and quantity, the interval of
     bins inside the rule's interval (or anywhere) with the largest FOIL gain, precision >= min_lift x the rule's and
     >= min_events onsets, added as a new rule. Returns the rules and the number added."""
@@ -600,7 +601,7 @@ def refine_intervals(rules, model, names, pool_of, min_events=2, min_lift=1.2):
             n = len(ts)
             ge = [back.get((q, "ge", k, 0, 1)) for k in range(n)]
             lt0 = back.get((q, "lt", 0, 0, 1))
-            if any(c is None for c in ge) or lt0 is None:
+            if any(c is None for c in ge) or lt0 is None or (forbid is not None and bool(forbid[ge + [lt0]].any())):
                 continue
             has = F[:, ge[0]] | F[:, lt0]                                      # the quantity has a value
             bin_ = F[:, ge].long().sum(dim=1)                                  # 0 .. n
@@ -1385,13 +1386,16 @@ def main():
     if "gestalt" in layout:
         print(f"[Rule lab] gestalt atoms {layout['gestalt']}: {int(forbid_ng.sum())} literals (off in the _ng variants)")
 
-    def make_ext(flags):
+    def forbid_of(flags):
         d, nn, ns, nd, np_, ng = flags
-        forbid = ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
+        return ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
                   | forbid_old | forbid_dir_neg | (forbid_dir if nd else torch.zeros_like(forbid_dir))
                   | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs)))
                   | (forbid_ng if ng else forbid_ng_neg))
-        return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
+
+    def make_ext(flags):
+        forbid = forbid_of(flags)
+        return ExtModel(model, derived, flags[0], forbid if bool(forbid.any()) else None)
     ext = {}
     L = make_ext((True, False, False, False, False, False)).num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
@@ -1457,10 +1461,12 @@ def main():
                 return pools[h]
             n0 = len(final)
             if args.lab_refine == "True" and not flags[3]:
-                final, n_ref = refine_sectors(final, model, names, pool_of, args.lab_min_events)
+                final, n_ref = refine_sectors(final, model, names, pool_of, args.lab_min_events,
+                                              forbid=forbid_of(flags).cpu())
                 print(f"[Rule lab] {name}: {n_ref} rules with a direction narrowed to where their onsets concentrate")
             if args.lab_refine == "True" and not flags[4]:
-                final, n_ref = refine_intervals(final, model, names, pool_of, args.lab_min_events)
+                final, n_ref = refine_intervals(final, model, names, pool_of, args.lab_min_events,
+                                                forbid=forbid_of(flags).cpu())
                 print(f"[Rule lab] {name}: {n_ref} rules with a position / size / distance interval narrowed")
             final, n_merges = merge_sectors(final, model, names, pool_of, args.lab_merge_ratio)
             final, n_lin = merge_intervals(final, model, names, pool_of, args.lab_merge_ratio)

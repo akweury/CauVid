@@ -129,6 +129,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.gestalt_viz"
     elif [[ "$arg" == "--gestalt_fail_clips" ]]; then
         ENTRY_MODULE="src.exp_roadpp.gestalt_fail_clips"
+    elif [[ "$arg" == "--turn_probe" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.turn_probe"
     elif [[ "$arg" == "--atom_probe" ]]; then
         ENTRY_MODULE="src.exp_roadpp.atom_probe"
     elif [[ "$arg" == "--rule_tree" ]]; then
