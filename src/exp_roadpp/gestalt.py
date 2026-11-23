@@ -14,7 +14,8 @@ History:
     box of its own, with every shape atom (`shape.py`), and by its members' labels.
 
 Groups, per frame t (pixels of the image; the ego has no box and is never a member):
-  move     the centre's move over K frames (both boxes uncut by the image border): a direction if >= MOVE_PX;
+  move     the centre's move over K frames (v8: per axis the uncut side's move if a box is cut by the image
+           border): a direction if >= MOVE_PX, still if below;
   near     two centres closer than NEAR x the mean of the two boxes' larger sides;
   link     two agents of the same kind (KINDS: vehicles incl. two-wheelers, pedestrians; traffic lights none),
            near, both moving, directions differing by < SAME degrees, speeds (box sizes per frame over K_SPEED
@@ -57,7 +58,13 @@ STILL_SIMILAR = 1.5                     # v7: still agents link if their heights
 # v7 (the user: a queue on the oncoming lane, one car enters the junction, the others will follow): "mate_new_a",
 # a group mate within the last MATE_MEMORY frames (it may have left the group by now) started action a within the
 # last NEW_WINDOW frames (off in the NEW_OFF frames before).
-MATE_MEMORY, NEW_WINDOW, NEW_OFF = 30, 20, 5
+# v8 (atom probe 2026-11-23, Car:Jun at-risk onsets: a mate's Jun onset lies a median 23 frames before, 12% within 20
+# frames, 27% within 50): NEW_WINDOW 20 -> 50; MATE_MEMORY 30 -> 60 (>= NEW_WINDOW: the leader leaves the group as it
+# moves off, its onset must still count).
+MATE_MEMORY, NEW_WINDOW, NEW_OFF = 60, 50, 5
+# v8 (the probe: 14% of the at-risk Car:Jun onsets outside a group failed only "moving vs still": the queue's leader
+# just started, the next one still stands): an agent still within the last STARTED frames links with a still one.
+STARTED = 10
 DEBOUNCE = 3
 EDGE = 0.005
 FRAME_SIZE_PX = (1920, 1280)
@@ -65,8 +72,10 @@ QUADRANTS = ("right", "up", "left", "down")
 KINDS = ("veh", "ped")
 PED_CLASSES = ("Ped",)
 NO_KIND = ("TL",)                       # traffic lights: no motion of their own, never in a group
-VERSION = "v7"                          # v4: group = a box with every shape atom; v5: + similar speed; v6: tracked;
-                                        # v7: still groups and "mate_new" (a recent group mate just started a)
+VERSION = "v8"                          # v4: group = a box with every shape atom; v5: + similar speed; v6: tracked;
+                                        # v7: still groups and "mate_new" (a recent group mate just started a);
+                                        # v8: moves of boxes cut by the image border, mate_new over 50 frames,
+                                        # agents that just started link with still ones
 
 
 def actions(label_names):
@@ -129,6 +138,34 @@ def _components(adj, valid):
         label = new
 
 
+def _edge_move(boxes, has_box, k):
+    """(dx, dy, ok) of each box's move over k frames, (T, N) each with the first k frames unknown, in pixels.
+    v8 (atom probe: 22% of the at-risk Car:Jun onsets had a box cut by the image border, so no move): per axis the
+    centre's move if neither side touches the border in both frames, else the move of the side that does not (the
+    cut side moves with the border); unknown if both sides of an axis are cut."""
+    T, N, _ = boxes.shape
+    W, H = FRAME_SIZE_PX
+    b = boxes.nan_to_num(0.0)
+    dx, dy = torch.zeros(T, N), torch.zeros(T, N)
+    ok = torch.zeros(T, N, dtype=torch.bool)
+    if T <= k:
+        return dx, dy, ok
+    cut = torch.stack([b[..., 0] < EDGE, b[..., 1] < EDGE, b[..., 2] > 1 - EDGE, b[..., 3] > 1 - EDGE], dim=-1)
+    cut_k = cut[k:] | cut[:-k]                                               # (T-k, N, 4): cut in either frame
+    d = b[k:] - b[:-k]                                                       # (T-k, N, 4): each side's move
+
+    def axis(lo, hi, scale):
+        both = ~cut_k[..., lo] & ~cut_k[..., hi]
+        move = torch.where(both, (d[..., lo] + d[..., hi]) / 2, torch.where(cut_k[..., lo], d[..., hi], d[..., lo]))
+        return move * scale, ~(cut_k[..., lo] & cut_k[..., hi])
+
+    mx, okx = axis(0, 2, W)
+    my, oky = axis(1, 3, H)
+    dx[k:], dy[k:] = mx, my
+    ok[k:] = okx & oky & has_box[k:] & has_box[:-k]
+    return dx, dy, ok
+
+
 def groups(boxes, has_box, classes):
     """The groups of one video (module doc), as tensors: label (T, N) the component of each agent (its smallest
     member index; N: in none), in_group (T, N), size / is_group / gq (quadrant) / gkind / gdir (degrees) per
@@ -141,24 +178,19 @@ def groups(boxes, has_box, classes):
     x1, y1, x2, y2 = (boxes[..., i] for i in range(4))
     cx, cy = (b[..., 0] + b[..., 2]) / 2 * W, (b[..., 1] + b[..., 3]) / 2 * H
     side = torch.maximum(((b[..., 2] - b[..., 0]) * W).clamp(min=1.0), ((b[..., 3] - b[..., 1]) * H).clamp(min=1.0))
-    uncut = has_box & ~((x1 < EDGE) | (y1 < EDGE) | (x2 > 1 - EDGE) | (y2 > 1 - EDGE))
-    angle = torch.full((T, N), float("nan"))
-    if T > K:
-        dx, dy = cx[K:] - cx[:-K], cy[K:] - cy[:-K]
-        ok = uncut[K:] & uncut[:-K] & (torch.hypot(dx, dy) >= MOVE_PX)
-        angle[K:] = torch.where(ok, torch.rad2deg(torch.atan2(-dy, dx)) % 360, torch.full_like(dx, float("nan")))
+    # The move over K frames (v8: boxes cut by the image border too, `_edge_move`).
+    dx, dy, ok = _edge_move(boxes, has_box, K)
+    dist_k = torch.hypot(dx, dy)
+    angle = torch.where(ok & (dist_k >= MOVE_PX), torch.rad2deg(torch.atan2(-dy, dx)) % 360,
+                        torch.full((T, N), float("nan")))
     moving = ~torch.isnan(angle)
-    # Still (v7): two uncut boxes K frames apart and a move below MOVE_PX (unknown without them).
-    still = torch.zeros((T, N), dtype=torch.bool)
-    if T > K:
-        still[K:] = uncut[K:] & uncut[:-K] & (torch.hypot(cx[K:] - cx[:-K], cy[K:] - cy[:-K]) < MOVE_PX)
-    # Speed: the centre's move over K_SPEED frames (K frames where the track is shorter), in larger box sides.
+    # Still (v7): a known move over K frames below MOVE_PX.
+    still = ok & (dist_k < MOVE_PX)
+    # Speed: the move over K_SPEED frames (K frames where the track is shorter), in larger box sides.
     speed = torch.full((T, N), float("nan"))
     for k in (K, K_SPEED):
-        if T > k:
-            d = torch.hypot(cx[k:] - cx[:-k], cy[k:] - cy[:-k]) / (k * side[k:])
-            ok_k = uncut[k:] & uncut[:-k]
-            speed[k:] = torch.where(ok_k, d, speed[k:])
+        dxk, dyk, okk = _edge_move(boxes, has_box, k)
+        speed = torch.where(okk, torch.hypot(dxk, dyk) / (k * side), speed)
     speed = torch.where(moving, speed, torch.full_like(speed, float("nan")))
     kind = torch.tensor([-1 if c is None or str(c) in NO_KIND else (1 if str(c) in PED_CLASSES else 0)
                          for c in classes], dtype=torch.long)
@@ -176,7 +208,15 @@ def groups(boxes, has_box, classes):
     hgt = (b[..., 3] - b[..., 1]).clamp(min=1e-6)
     similar = (torch.log(hgt[:, :, None] / hgt[:, None, :])).abs() < torch.log(torch.tensor(STILL_SIMILAR))
     link = link | (near & same_kind[None] & still[:, :, None] & still[:, None, :] & similar)
-    member_ok = (moving | still) & (kind >= 0)[None]
+    # v8: an agent still within the last STARTED frames (it just started) links with a still one: the queue's leader
+    # moves off, the next one still waits.
+    started = still.clone()
+    for d in range(1, STARTED + 1):
+        started[d:] |= still[:-d]
+    started &= has_box
+    link = link | (near & same_kind[None] & similar
+                   & ((still[:, :, None] & started[:, None, :]) | (started[:, :, None] & still[:, None, :])))
+    member_ok = (moving | still | started) & (kind >= 0)[None]
     label = _components(link, member_ok)                                                # (T, N), N: none
     lab = label.clamp(max=N - 1)
     member = torch.nn.functional.one_hot(label, N + 1)[..., :N].bool() & member_ok[..., None]   # (T, i, g)

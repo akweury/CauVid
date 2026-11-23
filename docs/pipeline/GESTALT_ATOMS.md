@@ -89,10 +89,39 @@ The changes:
 
 The negated gestalt literals are off in the rule lab (`--lab_gst_negated False`).
 
+**v8 (atom probe, 2026-11-23).** `atom_probe.py` on the val Car:Jun onsets:
+- 864 of the 1303 label onsets are the car's first frame (it appears already in the junction). They are never at
+  risk, so the rules do not predict them.
+- The 439 at-risk onsets:
+  - 14% are in a group, 27% next to one, 59% in none; 41% had a group mate within 15 s;
+  - a mate's Jun onset lies a median 23 frames before;
+  - `mate_new_Jun` alone: precision 0.15 vs a base rate of 0.054, 22% of the onsets.
+- Of the at-risk onsets outside a group, 88% have an agent of their kind within 2 box sides. The link failed:
+  - only on an unknown motion: 51% (22% of all at-risk onsets had a box cut by the image border);
+  - only on moving vs still: 14%;
+  - only on the distance: 1%.
+
+The changes:
+- A box cut by the image border moves too: per axis, the move of the side that is not cut.
+- `mate_new`: `NEW_WINDOW` 20 -> 50 frames (27% of the at-risk onsets instead of 12%); `MATE_MEMORY` 30 -> 60.
+- An agent still within the last 10 frames (it just started) links with a still one: the leader of a queue moves
+  off, the next one still waits.
+
 ## Shape atoms v5
 
 The test runs with the shape atoms v5: v4 without the fine position, size and distance atoms (rule lab v4: no
 gain, 3x the rules).
+
+## Test v8 (gestalt roots allowed)
+
+```bash
+./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True \
+    --run_id 20261123-gestalt8_lab --lab_prepare_only True
+for spec in "2 relaxed_nn_ng shape,gestalt" "3 relaxed_nn shape,gestalt" "4 relaxed_nn shape"; do
+  set -- $spec
+  tmux new-session -d -s gst8_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_variants $2 --lab_root_exclude $3 2>&1 | tee rule_lab_gst8_gpu$1.log; read"
+done
+```
 
 ## Test (2x2: shape x gestalt, 4 GPUs)
 
