@@ -36,6 +36,9 @@ Atoms (inputs only, own agent scope, `step05.rule_input_mask`):
       the track appeared points into the half circle [θ, θ + 180). Two such literals give any sector up to 180
       degrees at a 5 degree resolution, e.g. "dir_200 & dir_060" = the move points into [200, 240) (left, a little
       down). `sector_text` prints them as one sector.
+  "shp:{q}_ge_τ" / "shp:{q}_lt_τ" (v4, `THRESHOLDS`): fine position (cx, by now and where the track appeared),
+      size, move and travel. Two of them give any interval, e.g. "app_cx_ge_0.35 & app_cx_lt_0.5"; the rule lab
+      prints them as one interval and narrows them to where the onsets concentrate.
 The rule lab lets the shape atoms be read in slot 1 only: their history is in the phases (`rule_lab`).
 The truck turning right towards the ego then reads, e.g.:
   shp:app_tall & shp:app_left & shp:p3_x_right & shp:p3_w_grow & shp:p2_h_grow & shp:p1_w_shrink & shp:p1_h_grow
@@ -53,6 +56,19 @@ YOUNG = 20                              # frames: a track younger than this is "
 ANGLE_STEP = 5                          # degrees between the half circles (72 per direction signal)
 MOVE_PX = 3.0                           # pixels over K frames: less is no move (no direction)
 PATH_MIN = 0.3                          # box heights moved since the track appeared, for a path direction
+# Fine position, size and distance (v4, the user: as fine as the directions). Atoms "q_ge_τ" / "q_lt_τ": the value
+# of q is >= τ / < τ (both False without a value). Two of them make any interval: cx_ge_0.3 & cx_lt_0.45 =
+# the box centre x in [0.3, 0.45). Quantities (image-normalized):
+#   cx, by          the box centre x and bottom y (the ground contact: lower = nearer) now;
+#   app_cx, app_by  the same where the track appeared;
+#   size            the box height / image height;
+#   move            the centre's move over the last K frames, in box heights per frame (both boxes uncut);
+#   travel          the centre's move since the track appeared, in box heights.
+GRID = [round(0.05 * i, 2) for i in range(1, 20)]
+THRESHOLDS = {"cx": GRID, "by": GRID, "app_cx": GRID, "app_by": GRID,
+              "size": [0.01, 0.015, 0.02, 0.03, 0.045, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.45],
+              "move": [0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3],
+              "travel": [0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]}
 EDGE = 0.005                            # normalized: a box this close to the border is cut
 FRAME_SIZE_PX = (1920, 1280)
 SIGNALS = ("dx", "dy", "dw", "dh", "aspect")
@@ -61,7 +77,7 @@ LOW, HIGH = 0.15, 0.85                  # train quantiles of dx, dy, dw, dh
 FLOORS = {"dx": 0.02, "dy": 0.01, "dw": 0.008, "dh": 0.008}
 MIN_CLASS_SAMPLES = 5000
 MAX_SAMPLES = 1_000_000
-VERSION = "v3"                          # v2: K 2, the order-free "recent" atoms; v3: 360-degree directions
+VERSION = "v4"                          # v2: K 2, "recent" atoms; v3: 360-degree directions; v4: fine position
 
 
 # The pairs of primitives that can hold in one phase (not the opposites of one signal), e.g. w_shrink + h_grow:
@@ -80,7 +96,18 @@ def atom_names():
     # 360 degrees (v3): the move now (over K frames, debounced) and the path since the track appeared.
     names += [f"dir_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
     names += [f"path_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
+    # Fine position, size and distance (v4): every threshold as a ">=" and a "<" atom.
+    names += [f"{q}_{op}_{t:g}" for q, ts in THRESHOLDS.items() for t in ts for op in ("ge", "lt")]
     return names
+
+
+def interval_text(q, ge, lt):
+    """"[a, b)" of a quantity's thresholds: the largest ">=" and the smallest "<" (open sides "-" / "inf")."""
+    lo = max(ge) if ge else None
+    hi = min(lt) if lt else None
+    if lo is not None and hi is not None and lo >= hi:
+        return "[empty]"
+    return f"[{'-' if lo is None else f'{lo:g}'}, {'inf' if hi is None else f'{hi:g}'})"
 
 
 def half_circles(angle):
@@ -335,4 +362,24 @@ def shape_atoms(boxes, has_box, classes, spec):
     ok = (start_of >= 0) & (torch.hypot(dxa, dya) >= PATH_MIN * hgt)
     ang_path = torch.where(ok, torch.rad2deg(torch.atan2(-dya, dxa)) % 360, torch.full_like(dxa, float("nan")))
     out[..., d0 + na:d0 + 2 * na] = half_circles(ang_path)
+    # Fine position, size and distance (v4).
+    nan = torch.full((T, N), float("nan"))
+    by = b[..., 3]
+    s0 = start_of.clamp(min=0)
+    move = nan.clone()
+    if T > K:
+        dist = torch.hypot(px[K:] - px[:-K], py[K:] - py[:-K])
+        move[K:] = torch.where(uncut[K:] & uncut[:-K], dist / (K * hgt[K:]), torch.full_like(dist, float("nan")))
+    values = {"cx": torch.where(has_box, cx, nan), "by": torch.where(has_box, by, nan),
+              "app_cx": torch.where(start_of >= 0, cx[s0, n_idx], nan),
+              "app_by": torch.where(start_of >= 0, by[s0, n_idx], nan),
+              "size": torch.where(has_box, hgt / H, nan), "move": move,
+              "travel": torch.where(start_of >= 0, torch.hypot(dxa, dya) / hgt, nan)}
+    col = d0 + 2 * na
+    for q, ts in THRESHOLDS.items():
+        v = values[q]
+        for t in ts:
+            out[..., col] = v >= t                                              # NaN compares False
+            out[..., col + 1] = v < t
+            col += 2
     return out & has_box[..., None]

@@ -62,7 +62,29 @@ This gives 8 + 24 atoms, 81 shape atoms in all.
 - Two half circles make any sector up to 180 degrees at a 5 degree resolution, also across 0:
   `dir_200 & dir_060` = [200, 240), left and a little down. The rule lab prints them merged (`dir[200, 240)`).
 
-That makes 225 shape atoms in all. In the rule lab the shape atoms are read in the newest slot
+**Fine position, size and distance (v4, 2026-11-23, the user: as fine as the directions).**
+- `shp:{q}_ge_τ` / `shp:{q}_lt_τ`: the value of q is >= τ / < τ. Both are false without a value, so no negation
+  is needed and the negated ones are off.
+- Quantities (`shape.THRESHOLDS`):
+  - `cx`, `by`: the box centre x and its bottom y (the ground contact) now, image-normalized, thresholds every
+    0.05;
+  - `app_cx`, `app_by`: the same where the track appeared;
+  - `size`: the box height / image height, 12 log-spaced thresholds;
+  - `move`: the move over the last 2 frames, in box heights per frame;
+  - `travel`: the move since the track appeared, in box heights.
+- Two such literals give any interval, e.g. `app_cx_ge_0.35 & app_cx_lt_0.5` = `app_cx[0.35, 0.5)`.
+
+225 + 216 = 441 shape atoms in all.
+
+**Data-driven ranges (rule lab).** For the directions and the intervals alike:
+- Printed merged: sectors `dir[200, 240)`, intervals `cx[0.3, 0.45)`. A soft rule prints the core (membership
+  >= 0.95) and `~` the extent (>= 0.5).
+- `refine_sectors` / `refine_intervals`: in the rows where a rule holds, the arc / interval inside the rule's
+  range where its onsets concentrate is found by FOIL gain. It must reach precision >= 1.2 x the rule's with >= 2
+  onsets, and it is added as a new rule.
+- `merge_sectors` / `merge_intervals`: rules equal but for a close range are merged into one covering range if
+  it keeps >= 0.9 x their precision on the train sample (`--lab_merge_ratio`).
+- Variants `_nd` (no directions) and `_np` (no fine position / size / distance) are the ablations. In the rule lab the shape atoms are read in the newest slot
 only (`--lab_shape_slot1`): their history is already in the phases.
 
 **Results of v1 (rule lab, run 20261122-shape_lab, roots fixed, val, 89 heads).**
@@ -79,12 +101,12 @@ only (`--lab_shape_slot1`): their history is already in the phases.
 
 ```bash
 ./run_roadpp_docker.sh --gpu 0 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True \
-    --run_id 20261123-shape2_lab --lab_variants relaxed_nn_ns,relaxed_nn,relaxed+precise_nn_ns,relaxed+precise_nn
+    --run_id 20261123-shape4_lab --lab_variants relaxed+precise_nn_nd_np,relaxed+precise_nn_nd,relaxed+precise_nn_np,relaxed+precise_nn
 ```
 
 What the run does:
 - It builds the training data with the shape atoms. This is a new data file, because the data tag has
-  `_shp2d3m3p4v3` (v1: `_shp5d3m3p4v1`).
+  `_shp2d3m3p4v4` (v1: `_shp5d3m3p4v1`).
 - It trains the OnsetMLP on the same inputs (`rule_lab.ensure_mlp`). No rule net is trained.
 - It compares the rule sets with (`relaxed_nn`) and without (`relaxed_nn_ns`) the shape literals, against an MLP
   that has them too.

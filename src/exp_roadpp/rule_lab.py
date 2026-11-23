@@ -409,6 +409,275 @@ def _sector(thetas):
     return int(torch.nonzero(inside & ~inside.roll(1)).flatten()[0]), int(inside.sum())
 
 
+def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max_width=180):
+    """Narrow each rule's direction to where its onsets concentrate (the user, 2026-11-23: find the dense region
+    inside the interval and shrink it). Per rule and direction kind (dir, path; own scope, slot 1):
+      - every row's angle bin (ANGLE_STEP degrees) is read from the half circle literals (the last θ whose half
+        circle holds before the next one does not);
+      - on the rows where the rule holds, every arc inside the rule's sector (or anywhere, for a rule without
+        that kind) is scored by FOIL gain: weighted hits x (log precision of the arc - log precision of the rule);
+      - the best arc with >= min_events onsets and precision >= min_lift x the rule's becomes a new rule: the
+        rule's other literals and the arc as two half circles.
+    The new rules are added; the soft fit (`fit_soft`) weighs them against the old ones. Returns the rules and
+    the number added."""
+    from src.exp_roadpp import shape as agent_shape
+    dir_of, lit_of = direction_literals(model, names)
+    if not dir_of:
+        return rules, 0
+    step = agent_shape.ANGLE_STEP
+    nb = 360 // step
+    added, seen = [], {(r["head"], tuple(sorted(r["literals"]))) for r in rules}
+    by_head = defaultdict(list)
+    for r in rules:
+        by_head[r["head"]].append(r)
+    for head, rs in by_head.items():
+        pool = pool_of(head)
+        F = pool["F"] > 0.5
+        w, y = pool["w"], pool["y"]
+        for kind in ("dir", "path"):
+            cols = [lit_of.get((kind, t * step, 0, 1)) for t in range(nb)]
+            if any(c is None for c in cols):
+                continue
+            B = F[:, cols]                                                     # (n, nb)
+            last = B & ~B.roll(-1, dims=1)
+            has = last.any(dim=1)
+            bin_ = last.float().argmax(dim=1)
+            for r in rs:
+                d = [m for m in r["literals"] if m in dir_of and dir_of[m][0] == kind]
+                other = [m for m in r["literals"] if m not in d]
+                holds = F[:, other].all(dim=1) if other else torch.ones(len(y), dtype=torch.bool, device=F.device)
+                if d:
+                    holds &= F[:, d].all(dim=1)
+                rows = holds & has
+                if int((rows & y).sum()) < min_events:
+                    continue
+                fires_r = float(w[holds].sum())
+                p_rule = float(w[holds & y].sum()) / max(fires_r, 1e-12)
+                if p_rule <= 0:
+                    continue
+                hw = torch.zeros(nb, device=F.device).index_add_(0, bin_[rows], w[rows])
+                hy = torch.zeros(nb, device=F.device).index_add_(0, bin_[rows], (w * y.float())[rows])
+                allowed = torch.ones(nb, dtype=torch.bool, device=F.device)
+                if d:
+                    sec = _sector([dir_of[m][1] for m in d])
+                    if sec is None:
+                        continue
+                    allowed = torch.zeros(nb, dtype=torch.bool, device=F.device)
+                    for k in range(sec[1] // step):
+                        allowed[(sec[0] // step + k) % nb] = True
+                # Every arc [start, start + width) of bins inside the allowed bins: cumulative sums on the circle.
+                cw, cy = torch.cat([hw, hw]).cumsum(0), torch.cat([hy, hy]).cumsum(0)
+                ca = torch.cat([allowed, allowed]).long().cumsum(0)
+                best = None
+                for width in range(1, max_width // step + 1):
+                    if d and width * step >= sec[1]:
+                        break
+                    starts = torch.arange(nb, device=F.device)
+                    end = starts + width - 1
+                    fw = cw[end] - torch.where(starts > 0, cw[starts - 1], torch.zeros_like(cw[0]))
+                    fy = cy[end] - torch.where(starts > 0, cy[starts - 1], torch.zeros_like(cy[0]))
+                    inside = (ca[end] - torch.where(starts > 0, ca[starts - 1], torch.zeros_like(ca[0]))) == width
+                    p = fy / fw.clamp(min=1e-12)
+                    gain = fy * (torch.log(p.clamp(min=1e-12)) - math.log(p_rule))
+                    ok = inside & (fy > 0) & (p >= min_lift * p_rule)
+                    gain = torch.where(ok, gain, torch.full_like(gain, -1.0))
+                    i = int(gain.argmax())
+                    if gain[i] > 0 and (best is None or float(gain[i]) > best[0]):
+                        best = (float(gain[i]), i, width, float(p[i]))
+                if best is None:
+                    continue
+                _g, start, width, _p = best
+                a, b = start * step % 360, (start + width) * step
+                lits = other + [lit_of[(kind, a, 0, 1)], lit_of[(kind, (b - 180) % 360, 0, 1)]]
+                mask = F[:, lits].all(dim=1)
+                events = int(pool["event"][mask & y].unique().numel())
+                key = (head, tuple(sorted(lits)))
+                if events < min_events or key in seen:
+                    continue
+                seen.add(key)
+                fires = float(w[mask].sum())
+                added.append({"head": head, "literals": lits, "refined": True, "events": events,
+                              "precision": float(w[mask & y].sum()) / fires if fires > 0 else 0.0})
+    return rules + added, len(added)
+
+
+def linear_literals(model, names):
+    """{literal: (quantity, "ge" | "lt", threshold index, scope, j)}, {key: literal} and {quantity: thresholds} of
+    the fine position / size / distance literals (`shape.THRESHOLDS`)."""
+    import re
+    from src.exp_roadpp import shape as agent_shape
+    of, back = {}, {}
+    for m in range(model.num_literals):
+        info = model.literal_info(m)
+        if info["kind"] != "X":
+            continue
+        mt = re.fullmatch(r"shp:(cx|by|app_cx|app_by|size|move|travel)_(ge|lt)_([0-9.]+)", names[info["atom"]])
+        if mt:
+            q = mt.group(1)
+            k = agent_shape.THRESHOLDS[q].index(float(mt.group(3)))
+            key = (q, mt.group(2), k, info["scope"], info["j"])
+            of[m], back[key] = key, m
+    return of, back, agent_shape.THRESHOLDS
+
+
+def _bins(lits_of_q, of):
+    """[lo, hi) in bins (bin b: thresholds b - 1 <= value < threshold b; n + 1 bins) of a rule's ">=" / "<" literals."""
+    lo, hi = 0, None
+    for m in lits_of_q:
+        q, op, k = of[m][:3]
+        if op == "ge":
+            lo = max(lo, k + 1)
+        else:
+            hi = k + 1 if hi is None else min(hi, k + 1)
+    return lo, hi
+
+
+def _interval_literals(q, lo, hi, nbins, back, scope=0, j=1):
+    """The ">=" / "<" literals of the bins [lo, hi) of quantity q, None for the whole range."""
+    lits = []
+    if lo > 0:
+        lits.append(back[(q, "ge", lo - 1, scope, j)])
+    if hi < nbins:
+        lits.append(back[(q, "lt", hi - 1, scope, j)])
+    return lits or None
+
+
+def refine_intervals(rules, model, names, pool_of, min_events=2, min_lift=1.2):
+    """`refine_sectors` for the fine position / size / distance quantities: per rule and quantity, the interval of
+    bins inside the rule's interval (or anywhere) with the largest FOIL gain, precision >= min_lift x the rule's and
+    >= min_events onsets, added as a new rule. Returns the rules and the number added."""
+    of, back, thresholds = linear_literals(model, names)
+    if not of:
+        return rules, 0
+    added, seen = [], {(r["head"], tuple(sorted(r["literals"]))) for r in rules}
+    by_head = defaultdict(list)
+    for r in rules:
+        by_head[r["head"]].append(r)
+    for head, rs in by_head.items():
+        pool = pool_of(head)
+        F = pool["F"] > 0.5
+        w, y = pool["w"], pool["y"]
+        for q, ts in thresholds.items():
+            n = len(ts)
+            ge = [back.get((q, "ge", k, 0, 1)) for k in range(n)]
+            lt0 = back.get((q, "lt", 0, 0, 1))
+            if any(c is None for c in ge) or lt0 is None:
+                continue
+            has = F[:, ge[0]] | F[:, lt0]                                      # the quantity has a value
+            bin_ = F[:, ge].long().sum(dim=1)                                  # 0 .. n
+            for r in rs:
+                mine = [m for m in r["literals"] if m in of and of[m][0] == q]
+                other = [m for m in r["literals"] if m not in mine]
+                holds = F[:, other].all(dim=1) if other else torch.ones(len(y), dtype=torch.bool, device=F.device)
+                if mine:
+                    holds &= F[:, mine].all(dim=1)
+                rows = holds & has
+                if int((rows & y).sum()) < min_events:
+                    continue
+                fires_r = float(w[holds].sum())
+                p_rule = float(w[holds & y].sum()) / max(fires_r, 1e-12)
+                if p_rule <= 0:
+                    continue
+                lo0, hi0 = _bins(mine, of) if mine else (0, n + 1)
+                hi0 = n + 1 if hi0 is None else hi0
+                hw = torch.zeros(n + 1, device=F.device).index_add_(0, bin_[rows], w[rows])
+                hy = torch.zeros(n + 1, device=F.device).index_add_(0, bin_[rows], (w * y.float())[rows])
+                cw, cy = torch.cat([torch.zeros(1, device=F.device), hw.cumsum(0)]), \
+                    torch.cat([torch.zeros(1, device=F.device), hy.cumsum(0)])
+                best = None
+                for lo in range(lo0, hi0):
+                    for hi in range(lo + 1, hi0 + 1):
+                        if (lo, hi) == (lo0, hi0) or (lo == 0 and hi == n + 1):
+                            continue
+                        fw, fy = float(cw[hi] - cw[lo]), float(cy[hi] - cy[lo])
+                        if fy <= 0 or fw <= 0:
+                            continue
+                        p = fy / fw
+                        if p < min_lift * p_rule:
+                            continue
+                        gain = fy * (math.log(p) - math.log(p_rule))
+                        if gain > 0 and (best is None or gain > best[0]):
+                            best = (gain, lo, hi)
+                if best is None:
+                    continue
+                lits = other + _interval_literals(q, best[1], best[2], n + 1, back)
+                key = (head, tuple(sorted(lits)))
+                mask = F[:, lits].all(dim=1)
+                events = int(pool["event"][mask & y].unique().numel())
+                if events < min_events or key in seen:
+                    continue
+                seen.add(key)
+                fires = float(w[mask].sum())
+                added.append({"head": head, "literals": lits, "refined": True, "events": events,
+                              "precision": float(w[mask & y].sum()) / fires if fires > 0 else 0.0})
+    return rules + added, len(added)
+
+
+def merge_intervals(rules, model, names, pool_of, ratio):
+    """`merge_sectors` for the fine position / size / distance quantities: rules equal but for the interval of one
+    quantity, intervals next to each other, merged into one covering both and the gap if the merged rule keeps
+    >= ratio x the precision of the two together. Returns the rules and the number of merges."""
+    of, back, thresholds = linear_literals(model, names)
+    if not of:
+        return rules, 0
+    groups, out = defaultdict(list), []
+    for r in rules:
+        qs = {of[m][0] for m in r["literals"] if m in of}
+        if len(qs) != 1 or r.get("root"):
+            out.append(r)
+            continue
+        q = qs.pop()
+        mine = [m for m in r["literals"] if m in of and of[m][0] == q]
+        if any(of[m][3:] != (0, 1) for m in mine):
+            out.append(r)
+            continue
+        lo, hi = _bins(mine, of)
+        hi = len(thresholds[q]) + 1 if hi is None else hi
+        other = tuple(sorted(m for m in r["literals"] if m not in mine))
+        groups[(r["head"], other, q)].append([lo, hi, r])
+    merges = 0
+    for (head, other, q), items in groups.items():
+        nb = len(thresholds[q]) + 1
+        if len(items) < 2:
+            out += [it[2] for it in items]
+            continue
+        pool = pool_of(head)
+        F = pool["F"] > 0.5
+
+        def holds(lo, hi):
+            lits = list(other) + (_interval_literals(q, lo, hi, nb, back) or [])
+            return F[:, lits].all(dim=1)
+
+        def precision(mask):
+            fires = float(pool["w"][mask].sum())
+            return float(pool["w"][mask & pool["y"]].sum()) / fires if fires > 0 else 0.0
+        changed = True
+        while changed and len(items) > 1:
+            changed = False
+            items.sort(key=lambda it: it[0])
+            for a, b in zip(items, items[1:]):
+                lo, hi = a[0], max(a[1], b[1])
+                if (lo == 0 and hi == nb) or b[1] <= a[1]:
+                    continue
+                merged = holds(lo, hi)
+                if bool(merged.any()) and precision(merged) >= ratio * precision(holds(a[0], a[1]) | holds(b[0], b[1])):
+                    lits = list(other) + _interval_literals(q, lo, hi, nb, back)
+                    items = [it for it in items if it is not a and it is not b] + \
+                        [[lo, hi, {"head": head, "literals": lits, "merged": True}]]
+                    merges += 1
+                    changed = True
+                    break
+        out += [it[2] for it in items]
+    for r in out:
+        if r.get("merged") and "precision" not in r:
+            pool = pool_of(r["head"])
+            m = (pool["F"][:, r["literals"]] > 0.5).all(dim=1)
+            fires = float(pool["w"][m].sum())
+            r["precision"] = float(pool["w"][m & pool["y"]].sum()) / fires if fires > 0 else 0.0
+            r["events"] = int(pool["event"][m & pool["y"]].unique().numel())
+    return out, merges
+
+
 def merge_sectors(rules, model, names, pool_of, ratio, max_width=180):
     """Rules equal but for the sector of one direction kind (dir or path, same scope and slot), with sectors
     next to each other on the circle, merged into one rule with the sector covering both and the gap between
@@ -755,6 +1024,32 @@ def _none(x):
 
 
 # -------------- Main --------------
+LINEAR_RE = r"shp:(cx|by|app_cx|app_by|size|move|travel)_(ge|lt)_([0-9.]+)\((\w+)\)@(\d+)"
+
+
+def _merge_linear(items):
+    """[(text, gate)] with the threshold literals of one quantity, scope and slot merged into an interval. The soft
+    AND gives a value outside a bound of gate g the membership 1 - g: the core (membership >= 0.95) keeps the bounds
+    with g > 0.05, "~" the extent (>= 0.5) those with g > 0.5, if it differs (`shape.interval_text`)."""
+    from src.exp_roadpp import shape as agent_shape
+    import re
+    groups, out = {}, []
+    for t, g in items:
+        m = re.fullmatch(LINEAR_RE, t)
+        if m:
+            groups.setdefault((m.group(1), m.group(4), m.group(5)), []).append((m.group(2), float(m.group(3)), g))
+        else:
+            out.append((t, g))
+    for (q, scope, j), lits in groups.items():
+        def text(min_g):
+            ge = [v for op, v, g in lits if op == "ge" and g >= min_g]
+            lt = [v for op, v, g in lits if op == "lt" and g >= min_g]
+            return agent_shape.interval_text(q, ge, lt)
+        core, ext = text(0.05), text(0.5)
+        out.append((f"shp:{q}{core if core == ext else core + ' ~' + ext}({scope})@{j}", max(g for _, _, g in lits)))
+    return out
+
+
 def pretty_soft(texts, gates, min_gate=None):
     """[(text, gate)] of a soft rule with the 360-degree half circles of one kind and slot merged into one soft
     sector ("shp:dir[200, 240) ~[190, 245)(own)@1", `shape.soft_sector_text`); literals below min_gate left out."""
@@ -772,7 +1067,7 @@ def pretty_soft(texts, gates, min_gate=None):
     for (kind, scope, j), tg in groups.items():
         out.append((f"shp:{kind}{agent_shape.soft_sector_text([t for t, _ in tg], [g for _, g in tg])}({scope})@{j}",
                     max(g for _, g in tg)))
-    return out
+    return _merge_linear(out)
 
 
 def pretty_literals(texts):
@@ -789,18 +1084,18 @@ def pretty_literals(texts):
             out.append(t)
     for (kind, scope, j), thetas in groups.items():
         out.append(f"shp:{kind}{agent_shape.sector_text(thetas) or '[empty]'}({scope})@{j}")
-    return out
+    return [t for t, _ in _merge_linear([(t, 1.0) for t in out])]
 
 
 def parse_variant(name):
     """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True, False)): the rule sets united; flags:
     with the derived literals (_d), without the negated literals of the other agents (_nn), without the
     shape-phase atoms (_ns, `shape.py`)."""
-    flags = {"_d": False, "_nn": False, "_ns": False}
+    flags = {"_d": False, "_nn": False, "_ns": False, "_nd": False, "_np": False}
     while any(name.endswith(f) for f in flags):
         f = next(f for f in flags if name.endswith(f))
         flags[f], name = True, name[:-len(f)]
-    return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"])
+    return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"], flags["_nd"], flags["_np"])
 
 
 def atom_literals(model, lo, hi, older_only=False):
@@ -912,6 +1207,10 @@ def main():
     parser.add_argument("--lab_show", type=str,
                         default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
                         help="heads whose strongest rules are printed")
+    parser.add_argument("--lab_dir_negated", type=str, default="False",
+                        help="allow the negated 360-degree direction literals (they also hold without a move)")
+    parser.add_argument("--lab_refine", type=str, default="True",
+                        help="add rules whose direction sector is narrowed to where their onsets concentrate")
     parser.add_argument("--lab_merge_ratio", type=float, default=0.9,
                         help="merge two rules that differ only in a close direction sector if the covering sector "
                              "keeps >= this share of their precision (0: no merging)")
@@ -969,13 +1268,32 @@ def main():
     forbid_old = (atom_literals(model, *layout["shape"], older_only=True)
                   if "shape" in layout and args.lab_shape_slot1 == "True" else torch.zeros_like(forbid_ns))
 
+    # The 360-degree direction literals: "_nd" variants go without them; their negations ("not in this half
+    # circle", which also holds without a move) are off unless --lab_dir_negated True.
+    dir_of, _ = direction_literals(model, names)
+    forbid_dir = torch.zeros_like(forbid_nn)
+    forbid_dir_neg = torch.zeros_like(forbid_nn)
+    for m in dir_of:
+        forbid_dir[m] = True
+        if model.negation:
+            forbid_dir[model.num_inputs + m] = True
+            forbid_dir_neg[model.num_inputs + m] = args.lab_dir_negated != "True"
+
+    lin_of, _, _ = linear_literals(model, names)
+    forbid_lin = torch.zeros_like(forbid_nn)
+    for m in lin_of:
+        forbid_lin[m] = True
+        if model.negation:
+            forbid_lin[model.num_inputs + m] = True       # "not >= τ" is "< τ" or no value: the "<" atoms cover it
+
     def make_ext(flags):
-        d, nn, ns = flags
+        d, nn, ns, nd, np_ = flags
         forbid = ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
-                  | forbid_old)
+                  | forbid_old | forbid_dir_neg | (forbid_dir if nd else torch.zeros_like(forbid_dir))
+                  | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs))))
         return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
     ext = {}
-    L = make_ext((True, False, False)).num_literals
+    L = make_ext((True, False, False, False, False)).num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     val_ids = list(training_data["val_videos"])
     train = extend_rows(train, derived, model.num_literals, device)
@@ -1018,7 +1336,7 @@ def main():
         idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
-        full = make_ext((True, False, False))
+        full = make_ext((True, False, False, False, False))
         if args.lab_merge_ratio > 0:
             pools = {}
 
@@ -1027,7 +1345,15 @@ def main():
                     pools[h] = step05_mine._pool_of(train, h, L, device)
                 return pools[h]
             n0 = len(final)
+            if args.lab_refine == "True" and not flags[3]:
+                final, n_ref = refine_sectors(final, model, names, pool_of, args.lab_min_events)
+                print(f"[Rule lab] {name}: {n_ref} rules with a direction narrowed to where their onsets concentrate")
+            if args.lab_refine == "True" and not flags[4]:
+                final, n_ref = refine_intervals(final, model, names, pool_of, args.lab_min_events)
+                print(f"[Rule lab] {name}: {n_ref} rules with a position / size / distance interval narrowed")
             final, n_merges = merge_sectors(final, model, names, pool_of, args.lab_merge_ratio)
+            final, n_lin = merge_intervals(final, model, names, pool_of, args.lab_merge_ratio)
+            n_merges += n_lin
             if n_merges:
                 print(f"[Rule lab] {name}: {n_merges} merges of close direction sectors, {n0} -> {len(final)} rules")
             pools.clear()
