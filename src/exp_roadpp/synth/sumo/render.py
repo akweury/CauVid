@@ -118,17 +118,25 @@ def _short(labels, ids, kind):
     return [labels[kind][i] for i in ids]
 
 
-def render(dataset, vid, frame, out_file, note=None, highlight=None):
+def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0):
     """One image of frame (1-based) of video vid; note: an extra line for the title of the top view;
-    highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`)."""
+    highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`);
+    groups: [(colour, [tube_uids], caption)] drawn in that colour in both views, with the group's union box
+    (dashed) in the camera view and the captions under it (`gestalt_fail_clips`); font_scale: every text larger."""
+    fs = float(font_scale)
     hl = highlight.split("-", 1)[1] if highlight and "-" in highlight else highlight
+    group_mode = groups is not None
+    groups = groups or []
+    color_of = {uid: col for col, uids, _ in groups for uid in uids}
+    color_of_sumo = {uid.split("-", 1)[1] if "-" in uid else uid: col for uid, col in color_of.items()}
     labels, data, worlds, firings = _video(dataset, vid)
     world = worlds[frame - 1]
     annos = data["frames"][str(frame)]["annos"]
     av = labels["av_action_labels"][data["frames"][str(frame)]["av_action_ids"][0]]
     seen = {a["tube_uid"].split("-", 1)[1] for a in annos.values()}
 
-    fig, (top, cam_ax) = plt.subplots(1, 2, figsize=(16, 6.4), gridspec_kw={"width_ratios": [1, 1.5]})
+    fig, (top, cam_ax) = plt.subplots(1, 2, figsize=(16 * max(fs, 1) ** 0.5, 6.4 * max(fs, 1) ** 0.5),
+                                      gridspec_kw={"width_ratios": [1, 1.5]})
     # -------------- top view --------------
     net_file, map_name = network_of(dataset, vid)
     draw_network(top, net_file)
@@ -150,12 +158,18 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None):
         on = vid_ in seen
         box(v["x"], v["y"], v["angle"], v["length"], v["width"], COLORS[v["cls"]] if on else "#bbbbbb",
             1.0 if on else 0.6, 5, mark=vid_ == hl)
+        if vid_ in color_of_sumo and vid_ != hl:                   # a group member: its group's colour around it
+            corners = observe.footprint(v["x"], v["y"], v["angle"], v["length"] + 1.5, v["width"] + 1.5)
+            top.add_patch(Polygon([corners[0], corners[1], corners[3], corners[2]], closed=True, fill=False,
+                                  ec=color_of_sumo[vid_], lw=2.2, zorder=6))
         if v["signals"] & 4:
             top.plot(v["x"], v["y"], marker="*", color="orange", ms=10, zorder=7)
     for pid, p in world["ped"].items():
         on = pid in seen
         top.add_patch(plt.Circle((p["x"], p["y"]), 0.6, fc=COLORS["Ped"] if on else "#bbbbbb",
                                  ec="red" if pid == hl else "black", lw=2.5 if pid == hl else 0.3, zorder=5))
+        if pid in color_of_sumo and pid != hl:
+            top.add_patch(plt.Circle((p["x"], p["y"]), 1.3, fill=False, ec=color_of_sumo[pid], lw=2.0, zorder=6))
     if world.get("tl"):
         tl = world["tl"]
         c = {"r": "red", "y": "gold", "g": "green"}.get(tl["state"][0].lower(), "grey")
@@ -167,7 +181,7 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None):
     top.set_aspect("equal")
     top.set_xticks([]); top.set_yticks([])
     top.set_title(f"{vid} frame {frame} (t={world['t']:.1f} s)  ego: {av}, {ego['speed']:.1f} m/s"
-                  + (f"\n{map_name}" if map_name else "") + (f"\n{note}" if note else ""), fontsize=10)
+                  + (f"\n{map_name}" if map_name else "") + (f"\n{note}" if note else ""), fontsize=10 * fs)
 
     # -------------- camera view (the GT boxes) --------------
     W, H = observe.W_IMG, observe.H_IMG
@@ -179,14 +193,26 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None):
         cls = labels["agent_labels"][a["agent_ids"][0]]
         col = COLORS.get(cls, "black")
         mark = highlight is not None and a.get("tube_uid") == highlight
+        gcol = color_of.get(a.get("tube_uid"))
         cam_ax.add_patch(Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H, fill=False,
-                                   ec="red" if mark else col, lw=4.0 if mark else 1.6))
+                                   ec="red" if mark else (gcol or col), lw=4.0 if mark else (3.0 if gcol else 1.6)))
         text = cls + " " + ",".join(_short(labels, a["action_ids"], "action_labels"))
         locs = _short(labels, a["loc_ids"], "loc_labels")
         if locs:
             text += " | " + ",".join(locs)
-        cam_ax.text(x1 * W, y1 * H - 6, text, fontsize=7, color="white",
+        cam_ax.text(x1 * W, y1 * H - 6, text, fontsize=7 * fs, color="white",
                     bbox={"fc": col, "ec": "none", "pad": 1, "alpha": 0.85})
+    by_uid = {a.get("tube_uid"): a["box"] for a in annos.values()}
+    for col, uids, _caption in groups:                              # the group's union box, dashed
+        bx = [by_uid[u] for u in uids if u in by_uid]
+        if bx:
+            gx1, gy1 = min(b[0] for b in bx) * W, min(b[1] for b in bx) * H
+            gx2, gy2 = max(b[2] for b in bx) * W, max(b[3] for b in bx) * H
+            cam_ax.add_patch(Rectangle((gx1 - 8, gy1 - 8), gx2 - gx1 + 16, gy2 - gy1 + 16, fill=False, ec=col,
+                                       lw=1.4, ls="--", zorder=2))
+    for i, (col, _uids, caption) in enumerate(groups[:4]):
+        cam_ax.text(0.0, -0.03 - 0.05 * fs * i, caption, transform=cam_ax.transAxes, fontsize=8 * fs, color=col,
+                    va="top")
     cam_ax.set_xlim(0, W); cam_ax.set_ylim(H, 0)
     cam_ax.set_aspect("equal")
     cam_ax.set_xticks([]); cam_ax.set_yticks([])
@@ -196,10 +222,13 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None):
                   key=lambda f: (not f["agent_is_ego"], abs(f["frame_fire"] - frame)))[:4]
     note = "; ".join(f"{f['rule']} {f['agent']} fires f{f['frame_fire']} (body {f['body_agent']} f{f['frame_body']})"
                      for f in near)
-    cam_ax.set_title(f"camera view: {len(annos)} GT boxes\n" + (textwrap.fill(note, 110) if note else ""), fontsize=9,
+    cam_ax.set_title(f"camera view: {len(annos)} GT boxes\n" + (textwrap.fill(note, int(110 / fs)) if note else ""),
+                     fontsize=9 * fs,
                      loc="left")
     # A fixed layout (not tight_layout): every frame of a video has the same geometry.
-    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.86, wspace=0.04)
+    # With groups given (even none in this frame), a fixed room for 4 captions, so a clip keeps one geometry.
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.14 if group_mode else 0.02, top=0.80 if fs > 1 else 0.86,
+                        wspace=0.04)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_file, dpi=110)
     plt.close(fig)
