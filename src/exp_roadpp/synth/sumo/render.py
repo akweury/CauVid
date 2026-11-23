@@ -121,8 +121,9 @@ def _short(labels, ids, kind):
 def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0):
     """One image of frame (1-based) of video vid; note: an extra line for the title of the top view;
     highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`);
-    groups: [(colour, [tube_uids], caption)] drawn in that colour in both views, with the group's union box
-    (dashed) in the camera view and the captions under it (`gestalt_fail_clips`); font_scale: every text larger."""
+    groups: [(colour, [tube_uids], caption)] drawn in that colour in both views, each with a big box around all its
+    members in both views and the captions under the camera view; every other agent grey (`gestalt_fail_clips`);
+    font_scale: every text larger."""
     fs = float(font_scale)
     hl = highlight.split("-", 1)[1] if highlight and "-" in highlight else highlight
     group_mode = groups is not None
@@ -156,20 +157,35 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
             box(v["x"], v["y"], v["angle"], v["length"], v["width"], "#000000", 1.0, 6)
             continue
         on = vid_ in seen
-        box(v["x"], v["y"], v["angle"], v["length"], v["width"], COLORS[v["cls"]] if on else "#bbbbbb",
-            1.0 if on else 0.6, 5, mark=vid_ == hl)
-        if vid_ in color_of_sumo and vid_ != hl:                   # a group member: its group's colour around it
+        # In group mode every agent outside the shown groups is grey: only the group (and the marked agent) stand out.
+        fill = ("#bbbbbb" if not on else ("#c8c8c8" if group_mode and vid_ not in color_of_sumo else COLORS[v["cls"]]))
+        box(v["x"], v["y"], v["angle"], v["length"], v["width"], fill, 1.0 if on else 0.6, 5, mark=vid_ == hl)
+        if vid_ in color_of_sumo:                                   # a group member: its group's colour over it
             corners = observe.footprint(v["x"], v["y"], v["angle"], v["length"] + 1.5, v["width"] + 1.5)
-            top.add_patch(Polygon([corners[0], corners[1], corners[3], corners[2]], closed=True, fill=False,
-                                  ec=color_of_sumo[vid_], lw=2.2, zorder=6))
+            top.add_patch(Polygon([corners[0], corners[1], corners[3], corners[2]], closed=True,
+                                  fc=color_of_sumo[vid_], alpha=0.45, ec=color_of_sumo[vid_], lw=2.5, zorder=6))
         if v["signals"] & 4:
             top.plot(v["x"], v["y"], marker="*", color="orange", ms=10, zorder=7)
     for pid, p in world["ped"].items():
         on = pid in seen
-        top.add_patch(plt.Circle((p["x"], p["y"]), 0.6, fc=COLORS["Ped"] if on else "#bbbbbb",
+        pfill = "#bbbbbb" if not on else ("#c8c8c8" if group_mode and pid not in color_of_sumo else COLORS["Ped"])
+        top.add_patch(plt.Circle((p["x"], p["y"]), 0.6, fc=pfill,
                                  ec="red" if pid == hl else "black", lw=2.5 if pid == hl else 0.3, zorder=5))
-        if pid in color_of_sumo and pid != hl:
-            top.add_patch(plt.Circle((p["x"], p["y"]), 1.3, fill=False, ec=color_of_sumo[pid], lw=2.0, zorder=6))
+        if pid in color_of_sumo:
+            top.add_patch(plt.Circle((p["x"], p["y"]), 1.4, fc=color_of_sumo[pid], alpha=0.45, ec=color_of_sumo[pid],
+                                     lw=2.0, zorder=6))
+    for col, uids, _caption in groups:                              # the group's big box in the top view
+        pts = []
+        for u in uids:
+            sid = u.split("-", 1)[1] if "-" in u else u
+            obj = world["veh"].get(sid) or world["ped"].get(sid)
+            if obj is not None:
+                pts.append((obj["x"], obj["y"], obj.get("length", 1.0)))
+        if pts:
+            pad = max(p[2] for p in pts) / 2 + 1.5
+            gx1, gx2 = min(p[0] for p in pts) - pad, max(p[0] for p in pts) + pad
+            gy1, gy2 = min(p[1] for p in pts) - pad, max(p[1] for p in pts) + pad
+            top.add_patch(Rectangle((gx1, gy1), gx2 - gx1, gy2 - gy1, fill=False, ec=col, lw=2.5, zorder=8))
     if world.get("tl"):
         tl = world["tl"]
         c = {"r": "red", "y": "gold", "g": "green"}.get(tl["state"][0].lower(), "grey")
@@ -194,8 +210,13 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
         col = COLORS.get(cls, "black")
         mark = highlight is not None and a.get("tube_uid") == highlight
         gcol = color_of.get(a.get("tube_uid"))
+        if group_mode and not gcol:
+            col = "#8a8a8a"                                          # outside the shown groups: grey
+        if gcol:                                                     # a group member: filled in its group's colour
+            cam_ax.add_patch(Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H, fc=gcol, alpha=0.35,
+                                       ec="none", zorder=1))
         cam_ax.add_patch(Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H, fill=False,
-                                   ec="red" if mark else (gcol or col), lw=4.0 if mark else (3.0 if gcol else 1.6)))
+                                   ec="red" if mark else (gcol or col), lw=4.0 if mark else (3.5 if gcol else 1.6)))
         text = cls + " " + ",".join(_short(labels, a["action_ids"], "action_labels"))
         locs = _short(labels, a["loc_ids"], "loc_labels")
         if locs:
@@ -203,13 +224,13 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
         cam_ax.text(x1 * W, y1 * H - 6, text, fontsize=7 * fs, color="white",
                     bbox={"fc": col, "ec": "none", "pad": 1, "alpha": 0.85})
     by_uid = {a.get("tube_uid"): a["box"] for a in annos.values()}
-    for col, uids, _caption in groups:                              # the group's union box, dashed
+    for col, uids, _caption in groups:                              # the group's big box around all its members
         bx = [by_uid[u] for u in uids if u in by_uid]
         if bx:
             gx1, gy1 = min(b[0] for b in bx) * W, min(b[1] for b in bx) * H
             gx2, gy2 = max(b[2] for b in bx) * W, max(b[3] for b in bx) * H
-            cam_ax.add_patch(Rectangle((gx1 - 8, gy1 - 8), gx2 - gx1 + 16, gy2 - gy1 + 16, fill=False, ec=col,
-                                       lw=1.4, ls="--", zorder=2))
+            cam_ax.add_patch(Rectangle((gx1 - 10, gy1 - 10), gx2 - gx1 + 20, gy2 - gy1 + 20, fill=False, ec=col,
+                                       lw=3.5, zorder=6))
     for i, (col, _uids, caption) in enumerate(groups[:4]):
         cam_ax.text(0.0, -0.03 - 0.05 * fs * i, caption, transform=cam_ax.transAxes, fontsize=8 * fs, color=col,
                     va="top")

@@ -43,7 +43,8 @@ from tqdm import tqdm
 from src.exp_roadpp import (config, gestalt, lane_clips, mine_sweep, residual_clips, rule_lab, step05, step05_mine,
                             step07_paper, utils_data, utils_pipe)
 
-COLORS = ["#1f77b4", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#e377c2", "#8c564b", "#bcbd22"]
+# Not a class colour of the SUMO renderer (Car is #1f77b4: groups drawn in it looked like single cars, 2026-11-23).
+COLORS = ["#ff00ff", "#00c853", "#ff6d00"]
 
 
 @torch.no_grad()
@@ -249,6 +250,9 @@ def main():
                     tf = min(f, g["in_group"].shape[0] - 1)
                     k = agent_group(g, tf, agent)                   # one group: the agent's own or the nearest
                     shown = group_captions(g, tf, classes, tube_of, only=k) if k is not None else []
+                    state = ("agent IN the group" if k is not None and bool(g["in_group"][tf, agent])
+                             else "agent NEXT TO the group" if k is not None else "no group this frame")
+                    note = f"{note}  |  {state}"
                     residual_clips.sumo_render.render(dataset, vid, f, Path(tmp) / f"{i:05d}.png", note=note,
                                                       highlight=tube_of.get(agent), groups=shown,
                                                       font_scale=args.font_scale)
