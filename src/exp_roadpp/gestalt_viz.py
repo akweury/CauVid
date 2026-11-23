@@ -1,7 +1,8 @@
 """Gestalt group pictures: which boxes `gestalt.groups` puts together, drawn in the camera view (2026-11-23).
 
 On frames of the val videos, every box is drawn in the colour of its group, grey if in none. Each drawing has:
-  - an arrow along the box's move over gestalt.K frames;
+  - an arrow along the box's move over gestalt.K frames, its length and the number below the box the speed
+    (box sizes per frame, `gestalt.groups`);
   - the dashed union box and the mean direction of each group;
   - the box's class and labels;
   - a caption per group: kind, members and direction.
@@ -84,7 +85,10 @@ def draw(ax, boxes_t, has_t, classes, labels_t, g, t, title):
         a = float(g["angle"][t, n])
         if a == a:
             cx, cy = (x1 + x2) / 2 * W, (y1 + y2) / 2 * H
-            L = 45
+            sp = float(g["speed"][t, n])
+            L = 30 + min(sp, 0.2) * 600                    # the arrow grows with the speed (box sizes per frame)
+            ax.text(cx + 4, (y2 * H) + 14, f"{sp:.3f}", fontsize=5, color=col if col != "#9e9e9e" else "#555555",
+                    zorder=4)
             ax.add_patch(FancyArrowPatch((cx, cy), (cx + L * math.cos(math.radians(a)), cy - L * math.sin(math.radians(a))),
                                          arrowstyle="-|>", mutation_scale=7, color=col, lw=1.2, zorder=5))
     lines = []

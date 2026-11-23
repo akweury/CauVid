@@ -17,7 +17,8 @@ Groups, per frame t (pixels of the image; the ego has no box and is never a memb
   move     the centre's move over K frames (both boxes uncut by the image border): a direction if >= MOVE_PX;
   near     two centres closer than NEAR x the mean of the two boxes' larger sides;
   link     two agents of the same kind (KINDS: vehicles incl. two-wheelers, pedestrians; traffic lights none),
-           near, both moving, directions differing by < SAME degrees;
+           near, both moving, directions differing by < SAME degrees, speeds (box sizes per frame over K_SPEED
+           frames) differing by a factor < SPEED_SIM (v5);
   group    a connected component of the links with >= 2 agents; its quadrant is that of the members' mean
            direction: right [315, 45), up [45, 135), left [135, 225), down [225, 315) degrees (0 right, 90 up).
 Two group tracks per agent i:
@@ -45,6 +46,10 @@ K = 2                                   # frames of the move (as `shape.K`)
 MOVE_PX = 3.0                           # a move below this over K frames gives no direction
 NEAR = 2.0                              # centre distance < NEAR x the mean of the two boxes' larger sides
 SAME = 45.0                             # degrees: linked if the directions differ by less
+# v5 (the user: a box clearly faster than the others is not in their group): linked only if their speeds, in box
+# sizes per frame over K_SPEED frames (the same for near and far boxes), differ by a factor < SPEED_SIM.
+K_SPEED = 5
+SPEED_SIM = 1.5
 DEBOUNCE = 3
 EDGE = 0.005
 FRAME_SIZE_PX = (1920, 1280)
@@ -52,7 +57,7 @@ QUADRANTS = ("right", "up", "left", "down")
 KINDS = ("veh", "ped")
 PED_CLASSES = ("Ped",)
 NO_KIND = ("TL",)                       # traffic lights: no motion of their own, never in a group
-VERSION = "v4"
+VERSION = "v5"                          # v4: group = a box with every shape atom; v5: + similar speed
 
 
 def actions(label_names):
@@ -74,7 +79,7 @@ def atom_names(label_names):
 
 
 def tag():
-    return f"_gst{K}n{NEAR:g}a{SAME:g}{VERSION}"
+    return f"_gst{K}n{NEAR:g}a{SAME:g}v{SPEED_SIM:g}{VERSION}"
 
 
 def vocabulary(label_names):
@@ -133,6 +138,14 @@ def groups(boxes, has_box, classes):
         ok = uncut[K:] & uncut[:-K] & (torch.hypot(dx, dy) >= MOVE_PX)
         angle[K:] = torch.where(ok, torch.rad2deg(torch.atan2(-dy, dx)) % 360, torch.full_like(dx, float("nan")))
     moving = ~torch.isnan(angle)
+    # Speed: the centre's move over K_SPEED frames (K frames where the track is shorter), in larger box sides.
+    speed = torch.full((T, N), float("nan"))
+    for k in (K, K_SPEED):
+        if T > k:
+            d = torch.hypot(cx[k:] - cx[:-k], cy[k:] - cy[:-k]) / (k * side[k:])
+            ok_k = uncut[k:] & uncut[:-k]
+            speed[k:] = torch.where(ok_k, d, speed[k:])
+    speed = torch.where(moving, speed, torch.full_like(speed, float("nan")))
     kind = torch.tensor([-1 if c is None or str(c) in NO_KIND else (1 if str(c) in PED_CLASSES else 0)
                          for c in classes], dtype=torch.long)
     eye = torch.eye(N, dtype=torch.bool)[None]
@@ -141,7 +154,9 @@ def groups(boxes, has_box, classes):
     near = pair & (dist < NEAR * (side[:, :, None] + side[:, None, :]) / 2)
     dang = ((angle[:, :, None] - angle[:, None, :] + 180) % 360 - 180).abs()           # NaN compares False
     same_kind = (kind[:, None] == kind[None, :]) & (kind[:, None] >= 0)
-    link = near & same_kind[None] & moving[:, :, None] & moving[:, None, :] & (dang < SAME)
+    ratio = (torch.log(speed[:, :, None].clamp(min=1e-6)) - torch.log(speed[:, None, :].clamp(min=1e-6))).abs()
+    link = near & same_kind[None] & moving[:, :, None] & moving[:, None, :] & (dang < SAME) \
+        & (ratio < torch.log(torch.tensor(SPEED_SIM)))                                  # NaN compares False
     member_ok = moving & (kind >= 0)[None]
     label = _components(link, member_ok)                                                # (T, N), N: none
     lab = label.clamp(max=N - 1)
@@ -155,7 +170,7 @@ def groups(boxes, has_box, classes):
     gq = torch.where(is_group, _quadrant(torch.rad2deg(torch.atan2(gy, gx)) % 360), torch.full_like(size, -1))
     gkind = torch.where(is_group, kind[None].expand(T, N), torch.full_like(size, -1))
     gdir = torch.where(is_group, torch.rad2deg(torch.atan2(gy, gx)) % 360, torch.full_like(gx, float("nan")))
-    return {"b": b, "angle": angle, "kind": kind, "eye": eye, "dist": dist, "near": near, "label": label, "lab": lab,
+    return {"b": b, "angle": angle, "speed": speed, "kind": kind, "eye": eye, "dist": dist, "near": near, "label": label, "lab": lab,
             "member": member, "size": size, "is_group": is_group, "in_group": in_group, "gq": gq, "gkind": gkind,
             "gdir": gdir}
 
