@@ -59,3 +59,12 @@
 ./run_roadpp_docker.sh --gpu 5 --atom_probe -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --probe_head Car:Jun --probe_target eventual --probe_rules "Car:IncomLane(own)@1;Car:IncomLane(own)@1 & TL:Red(other)@1;Car:IncomLane(own)@1 & TL:Green(other)@1;Car:IncomLane(own)@1 & !Car:Jun(own)@1 & !Car:Jun(own)@2 & !Car:Jun(own)@3"
 
 ./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_target eventual --lab_heads Car:Jun --lab_variants relaxed_nn_ng --lab_root_exclude shape,gestalt
+
+
+./run_roadpp_docker.sh --gpu 3 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egoturn_lab --lab_prepare_only True --lab_mlp False
+
+./run_roadpp_docker.sh --gpu 4 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egoturn_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn --lab_forbid av:turn_ 2>&1 | tee rule_lab_egoturn_A.log
+
+./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egoturn_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn 2>&1 | tee rule_lab_egoturn_B.log
+
+
