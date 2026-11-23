@@ -77,6 +77,17 @@ SOFT_PRIOR = 5                  # confidence shrink (onsets) of the soft noisy-O
 # |weight| < DROP_WEIGHT count as dropped.
 SPARSE = {"sparse_a": 0.001, "sparse_b": 0.005, "sparse_c": 0.02}   # fake-data check: 0.5+ drops every rule
 DROP_GATE, DROP_WEIGHT = 0.1, 0.05
+# Description length (MDL, 2026-11-23, the user: fewer and shorter rules, e.g. one group rule instead of several
+# single-agent ones). Mode "mdl_λ": the loss adds λ x (the head's base loss) / MDL_SCALE x (RULE_COST x the rules
+# kept + the literals kept). A rule is kept to the degree tanh(|w| / RULE_TAU), a literal to its gate times that,
+# so a literal of a dropped rule costs nothing. Unlike "sparse_*" (means over the rules and literals), the cost is
+# per rule and per literal: a group rule that covers the onsets of several single-agent rules is cheaper.
+RULE_COST, RULE_TAU, MDL_SCALE = 2.0, 0.1, 100.0
+
+
+def is_compact(mode):
+    """The fits that drop rules and literals (their size is counted after DROP_GATE / DROP_WEIGHT)."""
+    return mode in SPARSE or mode.startswith("mdl_")
 RELAXED = {"mine_max_rules": 32, "mine_roots": 4, "mine_root_min_cover": 0.05, "mine_depth": 6,
            "mine_min_events": 2, "min_videos": 1, "mine_val_lift": 0.0}
 
@@ -895,6 +906,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                 loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
             if mode in SPARSE:
                 loss = loss + SPARSE[mode] * base_loss * (g.sum() / n_real + wt.abs().mean())
+            elif mode.startswith("mdl_"):
+                kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a rule kept, 0..1
+                lits = (g * kept[:, None]).sum()                                    # literals of the kept rules
+                loss = loss + float(mode[4:]) * base_loss / MDL_SCALE * (RULE_COST * kept.sum() + lits)
             else:
                 loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
                 if logistic:
@@ -1028,6 +1043,7 @@ def report(hist, names, heads, rule_sets):
                       "rules": size[0] if size else len(rs),
                       "literals": size[1] if size else sum(len(r["literals"]) for r in rs) / max(len(rs), 1),
                       "max_literals": size[2] if size else max((len(r["literals"]) for r in rs), default=0)}
+        rows[name]["total_literals"] = round(rows[name]["rules"] * rows[name]["literals"])
     best = max(rows, key=lambda n: rows[n]["macro"]) if rows else None
     print(f"\n[Rule lab] eval = odd val videos, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
           f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP})"
@@ -1036,6 +1052,17 @@ def report(hist, names, heads, rule_sets):
     for name, r in sorted(rows.items(), key=lambda x: -x[1]["macro"]):
         mlp_cols = f"{r['close']:>5}/{len(learnable):<3}{r['wins']:>4}" if has_mlp else f"{'-':>9}{'-':>4}"
         print(f"  {name:<22}{r['rules']:>7}{r['literals']:>6.2f}{r['max_literals']:>5}{r['macro']:>8.3f}{mlp_cols}")
+    # Accuracy vs rule-set size: per variant, its compact fits (MDL / sparse) and soft_logit, by size.
+    by_variant = defaultdict(list)
+    for name, r in rows.items():
+        variant, scorer = name.split("/")
+        if is_compact(scorer) or scorer == "soft_logit":
+            by_variant[variant].append((r["total_literals"], r["rules"], r["macro"], scorer))
+    if by_variant:
+        print("\n  accuracy vs size (macro AP over the learnable heads; rules and literals kept):")
+        for variant, pts in sorted(by_variant.items()):
+            print(f"    {variant}: " + "  ".join(f"{sc} {m:.3f} @ {nr} rules / {nl} lits"
+                                                for nl, nr, m, sc in sorted(pts, reverse=True)))
     if best:
         by_action = defaultdict(list)
         for h in learnable:
@@ -1212,7 +1239,7 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
 def show_rules(texts, heads, mode, top=8):
     """Print the strongest rules (soft logistic weight of mode) of some heads, with each literal's gate; in a
     sparse mode the dropped literals and rules (DROP_GATE, DROP_WEIGHT) are left out."""
-    sparse = mode in SPARSE or mode == "crisp"
+    sparse = is_compact(mode) or mode == "crisp"
     for head in heads:
         rs = [r for r in texts if r["head"] == head and mode in r["soft"]]
         kept = [r for r in rs if not sparse or abs(r["soft"][mode]["weight"]) >= DROP_WEIGHT]
@@ -1234,6 +1261,8 @@ def main():
     parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
     parser.add_argument("--lab_gst_negated", type=str, default="False",
                         help="allow the negated gestalt literals (v1: they were filler, '!gst:near_1')")
+    parser.add_argument("--lab_mdl", type=str, default="",
+                        help="MDL strengths λ for the accuracy vs rule-set size curve, e.g. 0.03,0.1,0.3,1,3")
     parser.add_argument("--lab_fast", type=str, default="False",
                         help="quick test: train-sample counts (no pass over every train row), soft_logit only, no "
                              "sector / interval refinement or merging")
@@ -1393,6 +1422,7 @@ def main():
     exact = {k: i for i, k in enumerate(keys)}
     priors = [float(x) for x in args.lab_priors.split(",")]
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
+    soft_modes += [f"mdl_{x}" for x in args.lab_mdl.split(",") if x]          # the size curve (MDL strengths)
     rule_sets, texts = {}, {}
     for name in variants:
         components, flags = parse_variant(name)
@@ -1440,7 +1470,7 @@ def main():
         rule_sets[name] = RuleSet(final, counts["base"], priors, logit, L, A, device, soft)
         rule_sets[name].size = {}
         for m, (g, par) in soft.items():
-            if m in SPARSE and final:
+            if is_compact(m) and final:
                 n_eff, lits_eff, keep = effective(final, g, par[0])
                 lens = (g >= DROP_GATE).sum(dim=1)[keep]
                 rule_sets[name].size[m] = (n_eff, lits_eff, int(lens.max()) if len(lens) else 0)
@@ -1491,7 +1521,7 @@ def main():
             if m == "nor":
                 continue
             print(f"\n[Rule lab] strongest rules of {best_variant} / {m} (soft logistic weight; [gate] per literal, "
-                  f"1 = required, 0 = ignored{'; dropped literals and rules left out' if m in SPARSE else ''}):")
+                  f"1 = required, 0 = ignored{'; dropped literals and rules left out' if is_compact(m) else ''}):")
             show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h], m)
     for key in (k for k in rule_sets if k.endswith("~crisp")):
         print(f"\n[Rule lab] crisp rules of {key} (hard AND, logistic weight):")
