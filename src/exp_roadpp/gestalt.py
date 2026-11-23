@@ -114,18 +114,13 @@ def _components(adj, valid):
         label = new
 
 
-def gestalt_atoms(boxes, has_box, classes, X_labels, label_names, shape_spec=None):
-    """(T, N, len(atom_names(label_names))) bool gestalt atoms of one video. boxes (T, N, 4) normalized (NaN
-    without a box), has_box (T, N) bool (False for the ego), classes [N] the agents' class labels, X_labels
-    (T, N, A_labels) bool the label atoms, label_names their names, shape_spec the shape thresholds (`shape.fit`;
-    None: `default_shape_spec`)."""
-    spec = shape_spec if shape_spec is not None else default_shape_spec()
-    boxes, has_box, X_labels = boxes.cpu().float(), has_box.cpu(), X_labels.cpu().bool()
+def groups(boxes, has_box, classes):
+    """The groups of one video (module doc), as tensors: label (T, N) the component of each agent (its smallest
+    member index; N: in none), in_group (T, N), size / is_group / gq (quadrant) / gkind / gdir (degrees) per
+    component (T, g), angle (T, N) each agent's move direction (NaN: no move), kind (N,), and the pair tensors
+    near / dist (T, N, N). Shared by `gestalt_atoms` and `gestalt_viz`."""
+    boxes, has_box = boxes.cpu().float(), has_box.cpu()
     T, N, _ = boxes.shape
-    acts = actions(label_names)
-    n_total = len(atom_names(label_names))
-    if N == 0:
-        return torch.zeros((T, N, n_total), dtype=torch.bool)
     W, H = FRAME_SIZE_PX
     b = boxes.nan_to_num(0.0)
     x1, y1, x2, y2 = (boxes[..., i] for i in range(4))
@@ -159,6 +154,29 @@ def gestalt_atoms(boxes, has_box, classes, X_labels, label_names, shape_spec=Non
     gy = (member.float() * torch.sin(rad)[..., None]).sum(dim=1)
     gq = torch.where(is_group, _quadrant(torch.rad2deg(torch.atan2(gy, gx)) % 360), torch.full_like(size, -1))
     gkind = torch.where(is_group, kind[None].expand(T, N), torch.full_like(size, -1))
+    gdir = torch.where(is_group, torch.rad2deg(torch.atan2(gy, gx)) % 360, torch.full_like(gx, float("nan")))
+    return {"b": b, "angle": angle, "kind": kind, "eye": eye, "dist": dist, "near": near, "label": label, "lab": lab,
+            "member": member, "size": size, "is_group": is_group, "in_group": in_group, "gq": gq, "gkind": gkind,
+            "gdir": gdir}
+
+
+def gestalt_atoms(boxes, has_box, classes, X_labels, label_names, shape_spec=None):
+    """(T, N, len(atom_names(label_names))) bool gestalt atoms of one video. boxes (T, N, 4) normalized (NaN
+    without a box), has_box (T, N) bool (False for the ego), classes [N] the agents' class labels, X_labels
+    (T, N, A_labels) bool the label atoms, label_names their names, shape_spec the shape thresholds (`shape.fit`;
+    None: `default_shape_spec`)."""
+    spec = shape_spec if shape_spec is not None else default_shape_spec()
+    boxes, has_box, X_labels = boxes.cpu().float(), has_box.cpu(), X_labels.cpu().bool()
+    T, N, _ = boxes.shape
+    acts = actions(label_names)
+    n_total = len(atom_names(label_names))
+    if N == 0:
+        return torch.zeros((T, N, n_total), dtype=torch.bool)
+    g = groups(boxes, has_box, classes)
+    b, eye, dist, near = g["b"], g["eye"], g["dist"], g["near"]
+    label, lab, member, size, is_group, in_group = (g[k] for k in ("label", "lab", "member", "size", "is_group",
+                                                                  "in_group"))
+    gq, gkind = g["gq"], g["gkind"]
     # The nearest member of another group near i: its group is i's "near group".
     other = near & (label < N)[:, None, :] & is_group.gather(1, lab)[:, None, :] \
         & ((label[:, None, :] != label[:, :, None]) | ~in_group[..., None])

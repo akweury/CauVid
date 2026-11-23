@@ -299,12 +299,19 @@ def mine_head(model, names, head, train, val, cfg, device):
             p_left = left["hits"] / max(left["rows"], 1e-9)
             best = None
             for path in _grow(tr, residual, 0, allowed, cfg):
-                lits = []
+                lits, ok = [], True
                 for m, value in path:
                     c = m if value else _complement(model, m)
-                    if c is not None and c not in lits:
+                    # A "not" branch becomes the complementary literal. If that literal is not allowed (e.g. a
+                    # negation the rule lab forbids) or does not exist, the node cannot be written as a rule: skip
+                    # it. Before 2026-11-23 the forbidden complement went in anyway (rule lab: 382 rules with a
+                    # forbidden "!gst:", 487 with a forbidden "!X(other)").
+                    if c is None or not bool(allowed[c]):
+                        ok = False
+                        break
+                    if c not in lits:
                         lits.append(c)
-                if not lits:
+                if not ok or not lits:
                     continue
                 mask = _mask_of(tr, residual) & _holds(tr, lits)
                 st = _stats(tr, mask)
