@@ -324,6 +324,133 @@ def precise_rules(pool, allowed, cfg):
     return [(key, p, e) for key, (p, e, _s) in best]
 
 
+# -------------- Exhaustive short rules and per-seed extension ("exh", 2026-11-24) --------------
+# The user: a good rule must stay whatever atoms are added. The relaxed miner is a greedy tree (4 roots, depth 6):
+# an added atom can change one split and the path to a good rule is gone (v4-v6 A/B on the same data:
+# "Car:OutgoLane & av:AV-TurLft(other) -> Car:VehLane", p 0.40, 71 onsets, in 2 of 6 runs; a Ped:RhtPav rule with
+# p 0.93, 273 onsets, lost in v6). The "exh" miner keeps a rule by its own counts, never by a rank among others:
+#   1. every rule of 1 or 2 literals (all pairs at once: two matrix products on the head's train sample) with
+#      >= lab_min_events distinct onsets in >= lab_min_videos videos and precision >= lab_exh_lift x the head's
+#      sample rate; a pair only if its precision is >= lab_exh_gain x that of each of its literals (else the pair
+#      says nothing more). Adding literals adds candidates and never changes a pair's counts: these rules stay;
+#   2. every such rule, and every pair with lift >= lab_exh_seed_lift (extendable), is a seed grown on its own:
+#      one literal at a time, the child of best pessimistic precision (hits / (rows + one negative)) among those
+#      keeping >= lab_min_events onsets and raising the precision by lab_exh_gain; each step that qualifies (lift)
+#      is kept. Seeds do not compete for a beam;
+#   3. a per-head cap lab_exh_max (by pessimistic precision) only as a safeguard; reported when it binds. The
+#      extension (2) starts from the lab_exh_seeds best pairs (best effort); the short rules of 1 hold always.
+EXH_CHUNK = 4096
+
+
+def _pair_events(pool, a, b, hit_rows):
+    """(P,) distinct onsets of the hit rows where literals a[p] and b[p] both hold."""
+    ev = pool["event"][hit_rows]
+    uniq, inv = ev.unique(return_inverse=True)
+    Fh = pool["F"][hit_rows] > 0.5                                             # (H, L)
+    out = []
+    for i in range(0, len(a), EXH_CHUNK):
+        both = (Fh[:, a[i:i + EXH_CHUNK]] & Fh[:, b[i:i + EXH_CHUNK]]).float()  # (H, P)
+        per = torch.zeros((len(uniq), both.shape[1]), device=both.device).index_add_(0, inv, both)
+        out.append((per > 0).sum(dim=0))
+    return torch.cat(out) if out else torch.zeros(0, dtype=torch.long, device=Fh.device)
+
+
+def exhaustive_rules(pool, allowed, cfg):
+    """The "exh" rules of one head (see above): [(literals tuple, sample precision, onsets)] and the number of
+    rules over the cap."""
+    F, y, w = pool["F"], pool["y"], pool["w"]
+    n = len(y)
+    if n == 0 or not bool(y.any()):
+        return [], 0
+    dev = F.device
+    yf = y.float()
+    wy = w * yf
+    rate = float(wy.sum() / w.sum().clamp(min=1e-12))
+    lift, seed_lift, gain = cfg["lab_exh_lift"], cfg["lab_exh_seed_lift"], cfg["lab_exh_gain"]
+    min_ev, min_vid = cfg["lab_min_events"], cfg["lab_min_videos"]
+    lam = float(w[~y].median()) if bool((~y).any()) else 1.0
+    hit_rows = torch.nonzero(y).flatten()
+    ev1 = step05_mine._distinct(pool["event"][hit_rows], F[hit_rows])         # (L,) onsets per literal
+    vid1 = step05_mine._distinct(pool["video"][hit_rows], F[hit_rows])
+    n1, h1 = w @ F, wy @ F
+    p1 = h1 / n1.clamp(min=1e-12)
+    cand = torch.nonzero(allowed & (ev1 >= min_ev) & (vid1 >= min_vid) & (n1 > 0)).flatten()
+    kept = {}
+    for m in cand[(p1[cand] >= lift * rate)].tolist():
+        kept[(m,)] = (float(p1[m]), int(ev1[m]), float(h1[m] / (n1[m] + lam)))
+    # 1. All pairs of candidate literals.
+    Fc = F[:, cand]
+    n2 = (Fc * w[:, None]).T @ Fc                                              # (c, c) weighted rows
+    h2 = (Fc * wy[:, None]).T @ Fc
+    r2 = (Fc * yf[:, None]).T @ Fc                                             # hit rows (unweighted)
+    p2 = h2 / n2.clamp(min=1e-12)
+    pc = p1[cand]
+    upper = torch.triu(torch.ones_like(p2, dtype=torch.bool), diagonal=1)
+    useful = (p2 >= gain * torch.maximum(pc[:, None], pc[None, :])) & (r2 >= min_ev) & (n2 > 0) & upper
+    seedable = useful & (p2 >= seed_lift * rate)
+    ia, ib = torch.nonzero(seedable, as_tuple=True)
+    score = h2[ia, ib] / (n2[ia, ib] + lam)
+    order = torch.argsort(score, descending=True)                              # deterministic: by own counts
+    ia, ib, score = ia[order], ib[order], score[order]
+    ev2 = _pair_events(pool, cand[ia], cand[ib], hit_rows)
+    ok = ev2 >= min_ev
+    ia, ib, score, ev2 = ia[ok], ib[ok], score[ok], ev2[ok]
+    pp = p2[ia, ib]
+    a, b = cand[ia].tolist(), cand[ib].tolist()
+    qual = (pp >= lift * rate).tolist()
+    for k, (x, z, q) in enumerate(zip(a, b, qual)):
+        if q:
+            kept[(min(x, z), max(x, z))] = (float(pp[k]), int(ev2[k]), float(score[k]))
+    # Seeds: the pairs not yet at precision 1, best first (the extension is best effort; the pairs above stay).
+    open_ = (pp < 1.0 - 1e-9).tolist()
+    seeds = [(min(x, z), max(x, z)) for x, z, o in zip(a, b, open_) if o][:cfg["lab_exh_seeds"]]
+    seeds += [key for key in kept if len(key) == 1 and kept[key][0] < 1.0 - 1e-9]
+    # 2. Every seed grown on its own (no shared beam), batched.
+    for i in range(0, len(seeds), 256):
+        batch = seeds[i:i + 256]
+        masks = torch.stack([F[:, list(key)].gt(0.5).all(dim=1) for key in batch])          # (S, n)
+        precs = torch.tensor([float(((masks[s].float() * wy).sum()) / (masks[s].float() * w).sum().clamp(min=1e-12))
+                              for s in range(len(batch))], device=dev)
+        keys = list(batch)
+        for _depth in range(max(0, cfg["lab_max_len"] - min(len(k) for k in keys))):
+            M = masks.float()
+            nn_ = (M * w) @ F
+            hh = (M * wy) @ F
+            cc = (M * yf) @ F
+            pr = hh / nn_.clamp(min=1e-12)
+            sc = hh / (nn_ + lam)
+            okc = (allowed[None] & (cc >= min_ev) & (pr >= gain * precs[:, None]) & (nn_ > 0)
+                   & ((M @ F) < M.sum(dim=1, keepdim=True)))
+            for s, key in enumerate(keys):
+                okc[s, list(key)] = False
+            sc = torch.where(okc, sc, torch.full_like(sc, -1.0))
+            best_s, best_m = sc.max(dim=1)
+            alive = []
+            for s in range(len(keys)):
+                if float(best_s[s]) <= 0 or len(keys[s]) >= cfg["lab_max_len"]:
+                    continue
+                m = int(best_m[s])
+                child = masks[s] & (F[:, m] > 0.5)
+                hit = child & y
+                ev = int(pool["event"][hit].unique().numel())
+                if ev < min_ev or int(pool["video"][hit].unique().numel()) < min_vid:
+                    continue
+                key = tuple(sorted(keys[s] + (m,)))
+                p = float(pr[s, m])
+                if p >= lift * rate and key not in kept:
+                    kept[key] = (p, ev, float(sc[s, m]))
+                if p < 1.0 - 1e-9:
+                    alive.append((s, key, child, p))
+            if not alive:
+                break
+            masks = torch.stack([c for _, _, c, _ in alive])
+            precs = torch.tensor([p for _, _, _, p in alive], device=dev)
+            keys = [k for _, k, _, _ in alive]
+    ranked = sorted(kept.items(), key=lambda x: -x[1][2])
+    over = max(0, len(ranked) - cfg["lab_exh_max"])
+    return [(key, p, e) for key, (p, e, _s) in ranked[:cfg["lab_exh_max"]]], over
+
+
 # -------------- Exact counts on all train rows --------------
 @torch.no_grad()
 def recount(model, training_data, video_ids, rules, head_mask, possible, cfg, derived):
@@ -1229,6 +1356,19 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
         return rules
     base = ext.literal_base.to(device)
     scope = base // (ext.num_spans * A)
+    if component == "exh":
+        capped = 0
+        for h in tqdm(heads, desc=f"Exhaustive short rules{' + derived' if use_derived else ''}"):
+            if not bool((train["pairs"]["head"] == h).any()):
+                continue
+            allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
+            pool = step05_mine._pool_of(train, h, L, device)
+            found, over = exhaustive_rules(pool, allowed, cfg)
+            capped += over > 0
+            rules += [{"head": int(h), "literals": list(key)} for key, _p, _e in found]
+            del pool
+        print(f"[Rule lab] exh: {len(rules)} rules; the cap --lab_exh_max {cfg['lab_exh_max']} bound on {capped} heads")
+        return rules
     for h in tqdm(heads, desc=f"Precise search{' + derived' if use_derived else ''}"):
         if not bool((train["pairs"]["head"] == h).any()):
             continue
@@ -1306,6 +1446,12 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_exh_lift", type=float, default=2.0, help="exh: kept rule precision / head rate")
+    parser.add_argument("--lab_exh_seed_lift", type=float, default=1.5, help="exh: pairs extended (lift)")
+    parser.add_argument("--lab_exh_gain", type=float, default=1.1,
+                        help="exh: a literal added must raise the precision by this factor")
+    parser.add_argument("--lab_exh_max", type=int, default=400, help="exh: safeguard cap of rules per head")
+    parser.add_argument("--lab_exh_seeds", type=int, default=300, help="exh: pairs grown further per head")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -1313,7 +1459,8 @@ def main():
     args.run_dir = args.output_dir / "runs" / args.run_id
     cfg = step05.get_cfg(config.get_step_05_input(args))
     for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
-                "lab_max_rules"):
+                "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
+                "lab_exh_seeds"):
         cfg[key] = getattr(args, key)
     device = cfg["device"]
     out_dir = args.output_dir / "rule_lab"
