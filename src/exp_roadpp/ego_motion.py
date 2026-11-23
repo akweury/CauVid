@@ -55,6 +55,17 @@ pulled by the crossing traffic, often to the wrong side, and the 5-frame mean pl
     or DRIFT_TOL_REL of each other), its mean, if it has >= DRIFT_MIN boxes and >= DRIFT_SHARE of the boxes;
     NaN else. Crossing traffic and single movers fall out;
   - no moving average and no debounce for the turn atoms (NO_DEBOUNCE).
+Layout atoms (v6, 2026-11-23, the user: the strongest cue of a left turn is a left-turn lane: no vehicle of the
+same direction on the ego's left, the oncoming traffic right next to it on the left, more agents on the right
+and close together, maybe vehicles turning right on the right). From the boxes and the other agents' labels
+(SUMO: lanes relative to the ego, OutgoLane = same direction, IncomLane = oncoming; blinkers and turns), per frame,
+a side being the box centre left of 0.5 - SIDE_MARGIN or right of 0.5 + SIDE_MARGIN of the image width:
+  "lay_left_same" / "lay_right_same"   a vehicle of the same direction (OutgoLane) on that side;
+  "lay_left_oncoming"                  an oncoming vehicle (IncomLane) on the left;
+  "lay_left_heavy" / "lay_right_heavy" >= HEAVY_MIN ground agents in view and >= HEAVY_SHARE of them on that side;
+  "lay_left_turner" / "lay_right_turner"  a vehicle turning or blinking (TurLft / IncatLft, TurRht / IncatRht)
+                                       on that side.
+A left-turn lane reads "!lay_left_same & lay_left_oncoming & lay_right_heavy".
 A level holds at t only if it held in the motion.DEBOUNCE frames up to t (no flicker at a cut).
 The rules read the levels per memory slot, so a change ("fast 3 s ago, slow now") is a rule of
 two atoms in two slots. The ego's atoms are not pooled away in the other-agent scope (only the ego
@@ -68,11 +79,17 @@ SMOOTH = 5                                  # frames of the moving average of th
 STILL = {"scene_scale": 0.002, "scene_outflow": 0.004}  # the median of many boxes jitters less than one
 QUANTILES = (1 / 3, 2 / 3)
 MAX_SAMPLES = 1_000_000
-VERSION = "v5"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands;
-                                            # v4: the turn atoms (scene drift); v5: drift = common fate, no lag
+VERSION = "v6"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands;
+                                            # v4: the turn atoms (scene drift); v5: drift = common fate, no lag;
+                                            # v6: the layout atoms (lay_*)
 TL_CLASSES = ("TL",)                        # the ego's traffic light (ROAD++ "OthTL": the other directions)
 SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate",
            "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical", "scene_drift")
+LAYOUT = ("lay_left_same", "lay_right_same", "lay_left_oncoming", "lay_left_heavy", "lay_right_heavy",
+          "lay_left_turner", "lay_right_turner")                                     # v6: 0 / 1 signals
+SIGNALS = SIGNALS + LAYOUT
+SIDE_MARGIN = 0.05                          # v6: a box centre within 0.5 +- this is on neither side
+HEAVY_MIN, HEAVY_SHARE = 3, 0.7             # v6: agents in view and the share on one side
 LEVELS = {                                  # signal: atom names from low to high values
     "scene_scale": ("speed_slow", "speed_medium", "speed_fast"),
     "ahead_log_area": ("ahead_far", "ahead_mid", "ahead_near"),
@@ -95,7 +112,7 @@ TL_K = 20                                   # frames (2 s) of the traffic light'
 SIGNED_Q = 1 / 3                            # dead band: this quantile of |rate| (train frames with a light)
 SIGNED_Q_OF = {"scene_drift": 0.8}          # v4: a turn moves the scene in few frames, the band is wider
 ATOMS = (("speed_still",) + tuple(a for levels in LEVELS.values() for a in levels)
-         + tuple(a for levels in SIGNED.values() for a in levels))
+         + tuple(a for levels in SIGNED.values() for a in levels) + LAYOUT)
 
 
 def tag():
@@ -180,7 +197,44 @@ def signals(boxes, has_box, classes, ego, X_labels, unique_atoms):
     out["tl_log_area"] = torch.where(has_tl, best, float("nan"))
     out.update(tl_rates(boxes, ok, best, m, has_tl))
     out["scene_drift"] = scene_drift(boxes, ok, ego)                               # v5: no moving average
+    out.update(layout(boxes, ok, classes, ego, X_labels, unique_atoms))
     return out
+
+
+def layout(boxes, ok, classes, ego, X_labels, unique_atoms):
+    """{LAYOUT name: (T,) float 0 / 1} v6: where the other agents are around the ego (module doc)."""
+    T, N, _ = boxes.shape
+    x1, _y1, x2, _y2 = boxes.unbind(dim=2)
+    cx = (x1 + x2) / 2
+    seen = ok.clone()
+    if 0 <= ego < N:
+        seen[:, ego] = False
+    ground = torch.tensor([c not in agent_roles.NON_GROUND_CLASSES for c in classes], dtype=torch.bool)
+    vehicle = ground & torch.tensor([c not in ("Ped",) for c in classes], dtype=torch.bool)
+    left = seen & (cx < 0.5 - SIDE_MARGIN)
+    right = seen & (cx > 0.5 + SIDE_MARGIN)
+
+    def holds(labels, keys):
+        return agent_roles._holds_any(X_labels, unique_atoms, labels, keys).to(seen.device)
+
+    outgo = holds(("OutgoLane",), ("location_name_label",))
+    incom = holds(("IncomLane",), ("location_name_label",))
+    turn_l = holds(("TurLft", "IncatLft"), ("action_id_label",))
+    turn_r = holds(("TurRht", "IncatRht"), ("action_id_label",))
+    v = vehicle[None]
+    n_ground = (seen & ground[None]).sum(dim=1)
+    n_left, n_right = (left & ground[None]).sum(dim=1), (right & ground[None]).sum(dim=1)
+    many = n_ground >= HEAVY_MIN
+    out = {
+        "lay_left_same": (left & v & outgo).any(dim=1),
+        "lay_right_same": (right & v & outgo).any(dim=1),
+        "lay_left_oncoming": (left & v & incom).any(dim=1),
+        "lay_left_heavy": many & (n_left >= HEAVY_SHARE * n_ground),
+        "lay_right_heavy": many & (n_right >= HEAVY_SHARE * n_ground),
+        "lay_left_turner": (left & v & turn_l).any(dim=1),
+        "lay_right_turner": (right & v & turn_r).any(dim=1),
+    }
+    return {k: x.float() for k, x in out.items()}
 
 
 def common_move(move, valid):
@@ -285,6 +339,7 @@ def ego_atoms(sig, spec):
     for s in SIGNED:
         v, band = sig[s], spec["bands"][s]
         cond += [v < -band, v.abs() <= band, v > band]                             # NaN: all False
+    cond += [sig[a] > 0.5 for a in LAYOUT]                                         # v6: 0 / 1 signals
     cond = torch.stack(cond, dim=1)                                                 # (T, M)
     out = agent_motion._debounce(cond[:, None])[:, 0]
     i = 1 + 3 * len(LEVELS)
