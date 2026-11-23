@@ -430,7 +430,7 @@ def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max
     by_head = defaultdict(list)
     for r in rules:
         by_head[r["head"]].append(r)
-    for head, rs in by_head.items():
+    for head, rs in sorted(by_head.items()):
         pool = pool_of(head)
         F = pool["F"] > 0.5
         w, y = pool["w"], pool["y"]
@@ -553,7 +553,7 @@ def refine_intervals(rules, model, names, pool_of, min_events=2, min_lift=1.2):
     by_head = defaultdict(list)
     for r in rules:
         by_head[r["head"]].append(r)
-    for head, rs in by_head.items():
+    for head, rs in sorted(by_head.items()):
         pool = pool_of(head)
         F = pool["F"] > 0.5
         w, y = pool["w"], pool["y"]
@@ -636,7 +636,7 @@ def merge_intervals(rules, model, names, pool_of, ratio):
         other = tuple(sorted(m for m in r["literals"] if m not in mine))
         groups[(r["head"], other, q)].append([lo, hi, r])
     merges = 0
-    for (head, other, q), items in groups.items():
+    for (head, other, q), items in sorted(groups.items(), key=lambda kv: kv[0][0]):   # head by head (pool_of)
         nb = len(thresholds[q]) + 1
         if len(items) < 2:
             out += [it[2] for it in items]
@@ -668,8 +668,8 @@ def merge_intervals(rules, model, names, pool_of, ratio):
                     changed = True
                     break
         out += [it[2] for it in items]
-    for r in out:
-        if r.get("merged") and "precision" not in r:
+    for r in sorted((r for r in out if r.get("merged")), key=lambda r: r["head"]):
+        if "precision" not in r:
             pool = pool_of(r["head"])
             m = (pool["F"][:, r["literals"]] > 0.5).all(dim=1)
             fires = float(pool["w"][m].sum())
@@ -703,7 +703,7 @@ def merge_sectors(rules, model, names, pool_of, ratio, max_width=180):
         other = tuple(sorted(m for m in r["literals"] if m not in dir_of))
         groups[(r["head"], other, kind, scope, j)].append([sec[0], sec[1], r])
     merges, out = 0, list(rest)
-    for (head, other, kind, scope, j), items in groups.items():
+    for (head, other, kind, scope, j), items in sorted(groups.items(), key=lambda kv: kv[0][0]):
         if len(items) < 2:
             out += [it[2] for it in items]
             continue
@@ -744,8 +744,8 @@ def merge_sectors(rules, model, names, pool_of, ratio, max_width=180):
                     break
         out += [it[2] for it in items]
     # Precision and onsets of the merged rules on the train sample (the others keep their exact counts).
-    for r in out:
-        if r.get("merged"):
+    for r in sorted((r for r in out if r.get("merged")), key=lambda r: r["head"]):
+        if True:
             pool = pool_of(r["head"])
             m = (pool["F"][:, r["literals"]] > 0.5).all(dim=1)
             fires = float(pool["w"][m].sum())
@@ -794,7 +794,7 @@ def fit_logit(rules, train, model, heads, device, steps=500, l2=1e-5):
             loss.backward()
             opt.step()
         weight[idx] = wt.detach().cpu()
-        bias[h] = float(b0)
+        bias[h] = float(b0.detach())
     return weight, bias
 
 
@@ -877,7 +877,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         gate[idx] = gi
         if logistic:
             weight[idx] = wt.detach().cpu()
-            bias[h] = float(b0)
+            bias[h] = float(b0.detach())
         else:
             q[idx] = torch.sigmoid(phi.detach()).cpu()
     return gate, ((weight, bias) if logistic else q)
@@ -1341,7 +1341,10 @@ def main():
             pools = {}
 
             def pool_of(h):
+                # One head's unpacked sample at a time: all 111 heads with ~4.4k literals took > 30 GB (v4 OOM).
                 if h not in pools:
+                    pools.clear()
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
                     pools[h] = step05_mine._pool_of(train, h, L, device)
                 return pools[h]
             n0 = len(final)
