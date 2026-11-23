@@ -59,6 +59,7 @@ Writes <output_dir>/rule_lab/rule_lab_<tag>.json.
 """
 import math
 import os
+import re
 from collections import defaultdict
 
 import torch
@@ -1293,6 +1294,9 @@ def main():
                              "keeps >= this share of their precision (0: no merging)")
     parser.add_argument("--lab_shape_slot1", type=str, default="True",
                         help="the shape atoms only in the newest slot (their history is in the phases)")
+    parser.add_argument("--lab_forbid", type=str, default="",
+                        help="atom name prefixes (comma separated) no rule may use, e.g. av:turn_ (the A/B of new "
+                             "atoms on the same data)")
     parser.add_argument("--lab_root_exclude", type=str, default="shape,gestalt",
                         help="atom groups of the data layout (e.g. shape, position) that may not be mining roots")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
@@ -1386,9 +1390,18 @@ def main():
     if "gestalt" in layout:
         print(f"[Rule lab] gestalt atoms {layout['gestalt']}: {int(forbid_ng.sum())} literals (off in the _ng variants)")
 
+    prefixes = tuple(x for x in args.lab_forbid.split(",") if x)
+    forbid_user = torch.zeros_like(forbid_nn)
+    if prefixes:
+        hit = {a for a, nm in enumerate(names) if nm.startswith(prefixes)}
+        for m in range(model.num_literals):
+            info = model.literal_info(m)
+            forbid_user[m] = info["kind"] in ("X", "!X") and info["atom"] in hit
+        print(f"[Rule lab] --lab_forbid {prefixes}: {len(hit)} atoms, {int(forbid_user.sum())} literals left out")
+
     def forbid_of(flags):
         d, nn, ns, nd, np_, ng = flags
-        return ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
+        return forbid_user | ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
                   | forbid_old | forbid_dir_neg | (forbid_dir if nd else torch.zeros_like(forbid_dir))
                   | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs)))
                   | (forbid_ng if ng else forbid_ng_neg))
@@ -1542,7 +1555,8 @@ def main():
         show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
-    path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}.json"
+    fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
+    path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
     print(f"[Rule lab] saved {path}")

@@ -38,6 +38,13 @@ Signed atoms of the traffic light's rates (SIGNED: the direction is the fact; th
 SIGNED_Q quantile of |rate| over the train frames with a traffic light, `fit`, so it follows the size of
 these small changes instead of a fixed jitter band): "tl_shrink" / "tl_size_steady" / "tl_grow", "tl_left" / "tl_lateral_steady" /
 "tl_right", "tl_up" / "tl_vertical_steady" / "tl_down" (in the image).
+Turn atoms (v4, 2026-11-23; `turn_probe.py` on sumo_maps_v7, val AV-TurLft: 20% of the onsets end a brake during
+which the ego already turned for ~2 s, yaw ~25 deg/s, but no input said so): "scene_drift", the median over the
+agents' boxes (uncut by the image border, all classes but the ego) of the horizontal move of the box centre over
+DRIFT_K frames, per frame, in image widths. A yaw moves every point of the image the same way (the forward motion
+moves them outward, which cancels in the median of both sides), so a left turn moves the scene right. Signed atoms
+"turn_right" / "turn_straight" / "turn_left" (the scene moves left / little / right), the dead band the
+SIGNED_Q_OF["scene_drift"] quantile of |drift| over the train frames (a turn is the exception).
 A level holds at t only if it held in the motion.DEBOUNCE frames up to t (no flicker at a cut).
 The rules read the levels per memory slot, so a change ("fast 3 s ago, slow now") is a rule of
 two atoms in two slots. The ego's atoms are not pooled away in the other-agent scope (only the ego
@@ -51,10 +58,11 @@ SMOOTH = 5                                  # frames of the moving average of th
 STILL = {"scene_scale": 0.002, "scene_outflow": 0.004}  # the median of many boxes jitters less than one
 QUANTILES = (1 / 3, 2 / 3)
 MAX_SAMPLES = 1_000_000
-VERSION = "v3"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands
+VERSION = "v4"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands;
+                                            # v4: the turn atoms (scene drift)
 TL_CLASSES = ("TL",)                        # the ego's traffic light (ROAD++ "OthTL": the other directions)
 SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate",
-           "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical")
+           "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical", "scene_drift")
 LEVELS = {                                  # signal: atom names from low to high values
     "scene_scale": ("speed_slow", "speed_medium", "speed_fast"),
     "ahead_log_area": ("ahead_far", "ahead_mid", "ahead_near"),
@@ -66,9 +74,12 @@ SIGNED = {                                  # signal: atom names (below -band, w
     "tl_scale": ("tl_shrink", "tl_size_steady", "tl_grow"),
     "tl_lateral": ("tl_left", "tl_lateral_steady", "tl_right"),
     "tl_vertical": ("tl_up", "tl_vertical_steady", "tl_down"),
+    "scene_drift": ("turn_right", "turn_straight", "turn_left"),   # v4: the scene moves left / little / right
 }
+DRIFT_K = 2                                 # frames of the box moves of scene_drift (as the shape atoms)
 TL_K = 20                                   # frames (2 s) of the traffic light's rate differences
 SIGNED_Q = 1 / 3                            # dead band: this quantile of |rate| (train frames with a light)
+SIGNED_Q_OF = {"scene_drift": 0.8}          # v4: a turn moves the scene in few frames, the band is wider
 ATOMS = (("speed_still",) + tuple(a for levels in LEVELS.values() for a in levels)
          + tuple(a for levels in SIGNED.values() for a in levels))
 
@@ -154,6 +165,25 @@ def signals(boxes, has_box, classes, ego, X_labels, unique_atoms):
     has_tl = torch.isfinite(best)
     out["tl_log_area"] = torch.where(has_tl, best, float("nan"))
     out.update(tl_rates(boxes, ok, best, m, has_tl))
+    out["scene_drift"] = smooth(scene_drift(boxes, ok, ego))
+    return out
+
+
+def scene_drift(boxes, ok, ego, k=DRIFT_K):
+    """(T,) v4: the median over the agents (the ego left out) of the horizontal move of the box centre from
+    t - k to t, per frame, in image widths; both boxes uncut by the image border; NaN where none."""
+    T, N, _ = boxes.shape
+    E = agent_motion.EDGE
+    x1, y1, x2, y2 = boxes.unbind(dim=2)
+    uncut = ok & (x1 >= E) & (y1 >= E) & (x2 <= 1 - E) & (y2 <= 1 - E)
+    if 0 <= ego < N:
+        uncut = uncut.clone()
+        uncut[:, ego] = False
+    cx = (x1 + x2) / 2
+    out = torch.full((T,), float("nan"))
+    if T > k:
+        move = (cx[k:] - cx[:-k]) / k
+        out[k:] = scene_median(move, uncut[k:] & uncut[:-k])
     return out
 
 
@@ -204,7 +234,7 @@ def fit(samples):
         if len(v) > MAX_SAMPLES:
             v = v[torch.randperm(len(v), generator=generator)[:MAX_SAMPLES]]
         spec["counts"][s] = len(v)
-        spec["bands"][s] = float(torch.quantile(v, SIGNED_Q)) if len(v) else 0.0
+        spec["bands"][s] = float(torch.quantile(v, SIGNED_Q_OF.get(s, SIGNED_Q))) if len(v) else 0.0
     return spec
 
 
