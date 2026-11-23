@@ -63,6 +63,8 @@ def probe_rules(model, training_data, video_ids, head, rules, head_mask, possibl
             onset = t + rows["first"][:, head]
             ev = [(video_id, int(a), int(b)) for a, b in zip(n[yy].tolist(), onset[yy].tolist())]
             onsets.update(ev)
+            if not rules:
+                continue
             lits = rule_lab._with_true(model.literal_values(rows["inputs"][k]) > 0.5)
             holds = rule_lab._holds_all(lits, body)                                 # (B_k, R)
             fires += holds.sum(dim=0).float().cpu()
@@ -161,9 +163,25 @@ def mate_timing(cfg, split, head_name, label_names, m_off):
         T, N = X.shape[:2]
         Mf = tr["M"].float()
         co = torch.einsum("tip,tjp->tij", Mf, Mf) > 0                               # (T, i, j) in one track
+        hb = has_box.cpu()
+        bx = boxes.cpu().float().nan_to_num(0.0)
+        cut = (bx[..., 0] < gestalt.EDGE) | (bx[..., 1] < gestalt.EDGE) | (bx[..., 2] > 1 - gestalt.EDGE) \
+            | (bx[..., 3] > 1 - gestalt.EDGE)
         for t, n in torch.nonzero(on[:, :, a_head]).tolist():
             if t < 2 or str(classes[n]) != cls_head:
                 continue
+            # Track age: the frames with a box right before t (a contiguous run ending in t - 1).
+            gone = torch.nonzero(~hb[:t, n]).flatten()
+            age = t - (int(gone.max()) + 1 if len(gone) else 0)
+            k0 = t - 1 - gestalt.K
+            if not bool(hb[t - 1, n]):
+                why = "no_box_t-1"
+            elif k0 < 0 or not bool(hb[k0, n]):
+                why = "no_box_t-1-K"
+            elif bool(cut[t - 1, n]) or bool(cut[k0, n]):
+                why = "edge"
+            else:
+                why = "known"
             lo = max(0, t - MATE_LOOKBACK)
             mates = co[lo:t, n].any(dim=0)
             mates[n] = False
@@ -181,7 +199,61 @@ def mate_timing(cfg, split, head_name, label_names, m_off):
                 ctx = "near_group" if p_near >= 0 else "no_group"
             out.append({"video": vid, "agent": n, "onset": t, "has_mate": bool(mates.any()), "lag": lag,
                         "context": ctx, "mate_classes": sorted({str(classes[j]) for j in torch.nonzero(mates).flatten().tolist()}),
-                        "neighbour": neighbour_stats(g, has_box, t - 1, n)})
+                        "neighbour": neighbour_stats(g, has_box, t - 1, n), "motion_why": why, "age": age,
+                        "labels_before": bool(X[t - 1, n].any())})
+    return out
+
+
+AGE_BINS = (1, 3, 5, 10, 30, 100)
+
+
+def _shares(c, n):
+    return ", ".join(f"{k} {v / n:.1%}" for k, v in c.most_common())
+
+
+def report(events, title, head_name, short=False):
+    """Print and return the timing (2), group context (3) and neighbour (4) statistics of some onsets."""
+    n = max(len(events), 1)
+    act = head_name.partition(":")[2]
+    out = {"onsets": len(events)}
+    print(f"\n  === {title}: {len(events)} ===")
+    why = Counter(e["motion_why"] for e in events)
+    ages = [e["age"] for e in events]
+    age_txt = ", ".join(f"<{b} {sum(1 for a in ages if a < b) / n:.1%}" for b in AGE_BINS)
+    print(f"    box track age at the onset (frames): {age_txt}")
+    print(f"    labels in the frame before: {sum(e['labels_before'] for e in events) / n:.1%}")
+    print(f"    own motion state in the frame before: {_shares(why, n)}  "
+          f"(known: moving or still; else why unknown)")
+    out.update({"motion_why": dict(why), "ages": ages})
+    if short:
+        return out
+    with_mate = [e for e in events if e["has_mate"]]
+    lags = [e["lag"] for e in events if e["lag"] is not None]
+    print(f"    with a group mate (last {MATE_LOOKBACK} frames): {len(with_mate) / n:.1%}; "
+          f"a mate's {act} onset before it: {len(lags) / n:.1%}")
+    print("    mate's onset within: " + ", ".join(f"{b} {sum(1 for x in lags if x <= b) / n:.1%}" for b in LAG_BINS))
+    if lags:
+        q = sorted(lags)
+        print(f"    lag (frames): median {q[len(q) // 2]}, 25% {q[len(q) // 4]}, 75% {q[3 * len(q) // 4]}; "
+              f"mate_new_{act} covers <= {gestalt.NEW_WINDOW}")
+    ctx = Counter(e["context"] for e in events)
+    print(f"    group context in the frame before: {_shares(ctx, n)}")
+    mc = Counter(c for e in with_mate for c in e["mate_classes"])
+    print(f"    mates' classes: {dict(mc.most_common())}")
+    lone = [e["neighbour"] for e in events if not e["context"].startswith("in_group")]
+    nl = max(len(lone), 1)
+    fails = Counter(f for x in lone if x["nearest"] is not None for f in x["nearest_fails"])
+    only = Counter(x["nearest_fails"][0] if len(x["nearest_fails"]) == 1 else ("linked" if not x["nearest_fails"] else "several")
+                   for x in lone if x["nearest"] is not None)
+    print(f"    -- {len(lone)} outside a group (distance: centre distance / mean larger box side, link < {gestalt.NEAR:g}):")
+    print(f"       own motion: {_shares(Counter(x['self'] for x in lone), nl)}")
+    print(f"       nearest agent of its kind: {_dist_hist([x['nearest'] for x in lone], nl)}")
+    print(f"       criteria it fails (several possible): {_shares(fails, nl)}")
+    print(f"       fails exactly one: {_shares(only, nl)}")
+    print(f"       nearest agent with a linking motion: {_dist_hist([x['compatible'] for x in lone], nl)}")
+    out.update({"with_mate": len(with_mate), "lags": lags, "context": dict(ctx), "mate_classes": dict(mc),
+                "outside_group": len(lone), "fails": dict(fails), "fails_only": dict(only),
+                "nearest": [x["nearest"] for x in lone], "compatible": [x["compatible"] for x in lone]})
     return out
 
 
@@ -192,7 +264,7 @@ def main():
                         default="Car:IncomLane(own)@1;Car:IncomLane(own)@1 & gst:mate_new_Jun(own)@1;"
                                 "gst:mate_new_Jun(own)@1")
     parser.add_argument("--probe_split", type=str, default="val", choices=("train", "val"))
-    parser.add_argument("--probe_skip_rules", type=str, default="False", help="True: timing and neighbours only")
+    parser.add_argument("--probe_skip_rules", type=str, default="False", help="True: no rule counts (the at-risk rows are still built)")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -222,10 +294,8 @@ def main():
     skip = str(args.probe_skip_rules).lower() in ("true", "1", "yes")
     if skip:
         rules, rule_texts = [], []
-        fires, hits, covered, rows_h, hits_h, onsets = torch.zeros(0), torch.zeros(0), [], 0, 0, set()
-    else:
-        fires, hits, covered, rows_h, hits_h, onsets = probe_rules(model, training_data, video_ids, head, rules,
-                                                                   head_mask, possible, cfg)
+    fires, hits, covered, rows_h, hits_h, onsets = probe_rules(model, training_data, video_ids, head, rules,
+                                                               head_mask, possible, cfg)
     base = hits_h / max(rows_h, 1)
     print(f"\n[atom_probe] {args.probe_head} on the {args.probe_split} videos: {rows_h} at-risk rows, {hits_h} hit rows "
           f"(base rate {base:.4f}), {len(onsets)} onsets")
@@ -237,50 +307,25 @@ def main():
         print(f"  {rt}\n      rows {int(f):8d}  hits {int(h):6d}  precision {p:.4f}  lift {p / base if base else 0:6.1f}  "
               f"onsets {len(c)} / {len(onsets)} ({len(c) / max(len(onsets), 1):.1%})")
 
-    # 2. + 3. Timing and group context of the onsets.
+    # 2. - 4. Timing, group context and neighbours: all onsets of the labels, and the at-risk ones (the onsets of
+    # the head's at-risk rows of part 1, as the rules see them: no agents entering the scene).
     label_names = [step05._atom_name(sig) for sig in utils_data.load_json(cfg["unique_atoms_file"])]
     timing = mate_timing(cfg, args.probe_split, args.probe_head, label_names, int(cfg["min_off_frames"]))
-    n = max(len(timing), 1)
-    with_mate = [e for e in timing if e["has_mate"]]
-    lags = [e["lag"] for e in timing if e["lag"] is not None]
-    act = args.probe_head.partition(":")[2]
-    print(f"\n  timing over {len(timing)} onsets of {args.probe_head} (group mates of the {MATE_LOOKBACK} frames before):")
-    print(f"    with a group mate: {len(with_mate) / n:.1%}; a mate's {act} onset before it: {len(lags) / n:.1%}")
-    for b in LAG_BINS:
-        print(f"    mate's {act} onset within {b:3d} frames before: {sum(1 for x in lags if x <= b) / n:.1%}")
-    if lags:
-        q = sorted(lags)
-        print(f"    lag (frames): median {q[len(q) // 2]}, 25% {q[len(q) // 4]}, 75% {q[3 * len(q) // 4]}; "
-              f"mate_new_{act} covers <= {gestalt.NEW_WINDOW} frames after the mate's onset")
-    ctx = Counter(e["context"] for e in timing)
-    print("    group context in the frame before: " + ", ".join(f"{k} {v / n:.1%}" for k, v in ctx.most_common()))
-    mc = Counter(c for e in with_mate for c in e["mate_classes"])
-    print(f"    mates' classes: {dict(mc.most_common())}")
-
-    # 4. Why the onsets outside a group are not linked (frame t - 1).
-    lone = [e["neighbour"] for e in timing if not e["context"].startswith("in_group")]
-    nl = max(len(lone), 1)
-    selfc = Counter(x["self"] for x in lone)
-    fails = Counter(f for x in lone if x["nearest"] is not None for f in x["nearest_fails"])
-    only = Counter(x["nearest_fails"][0] if len(x["nearest_fails"]) == 1 else ("linked" if not x["nearest_fails"] else "several")
-                   for x in lone if x["nearest"] is not None)
-    print(f"\n  the {len(lone)} onsets outside a group, in the frame before "
-          f"(distance: centre distance / mean larger box side, link needs < {gestalt.NEAR:g}):")
-    print("    own motion: " + ", ".join(f"{k} {v / nl:.1%}" for k, v in selfc.most_common()))
-    print(f"    nearest agent of its kind, distance: {_dist_hist([x['nearest'] for x in lone], nl)}")
-    print("    criteria it fails (shares of the onsets, several possible): "
-          + ", ".join(f"{k} {v / nl:.1%}" for k, v in fails.most_common()))
-    print("    fails exactly one criterion: " + ", ".join(f"{k} {v / nl:.1%}" for k, v in only.most_common()))
-    print(f"    nearest agent with a linking motion, distance: {_dist_hist([x['compatible'] for x in lone], nl)}")
-    neigh = {"outside_group": len(lone), "self": dict(selfc), "fails": dict(fails), "fails_only": dict(only),
-             "nearest": [x["nearest"] for x in lone], "compatible": [x["compatible"] for x in lone]}
+    for e in timing:
+        e["at_risk"] = (e["video"], e["agent"], e["onset"]) in onsets
+    risk = [e for e in timing if e["at_risk"]]
+    print(f"\n  {len(timing)} label onsets of {args.probe_head}; {len(risk)} of them match the {len(onsets)} at-risk "
+          f"onsets of part 1")
+    reports = {"all": report(timing, "all label onsets", args.probe_head)}
+    if risk:
+        reports["at_risk"] = report(risk, "at-risk onsets", args.probe_head)
+        reports["not_at_risk"] = report([e for e in timing if not e["at_risk"]], "label onsets not at risk",
+                                        args.probe_head, short=True)
     out_dir = args.output_dir / "atom_probe"
     out_dir.mkdir(parents=True, exist_ok=True)
     utils_data.save_json({"head": args.probe_head, "split": args.probe_split, "rows": rows_h, "hit_rows": hits_h,
                           "base_rate": base, "onsets": len(onsets), "rules": res_rules,
-                          "timing": {"onsets": len(timing), "with_mate": len(with_mate), "lags": lags,
-                                     "context": dict(ctx), "mate_classes": dict(mc)},
-                          "neighbour": neigh,
+                          "reports": reports,
                           "events": timing}, out_dir / f"probe_{args.probe_head.replace(':', '_')}.json")
     print(f"[atom_probe] -> {out_dir}")
 
