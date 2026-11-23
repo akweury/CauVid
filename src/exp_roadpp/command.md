@@ -27,6 +27,7 @@
     --run_id 20261123-shape4_lab \
     --lab_variants relaxed+precise_nn_nd_np,relaxed+precise_nn_nd,relaxed+precise_nn_np,relaxed+precise_nn
 
+./run_roadpp_docker.sh --gpu 3 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt7_lab --lab_mlp False --lab_fast True --lab_mdl 0.03,0.1 --lab_variants relaxed_nn_ng,relaxed_nn
 
 
 ### 跨类别共享模式
