@@ -75,6 +75,69 @@ def probe_rules(model, training_data, video_ids, head, rules, head_mask, possibl
     return fires, hits, covered, rows_h, hits_h, onsets
 
 
+DIST_BINS = (1.5, 2.0, 2.5, 3.0, 4.0, 6.0)   # centre distance in mean larger box sides (gestalt.NEAR = 2)
+
+
+def _state(g, t, j):
+    if not torch.isnan(g["angle"][t, j]):
+        return "moving"
+    return "still" if bool(g["still"][t, j]) else "unknown"   # unknown: cut at the frame edge or no box K frames ago
+
+
+def neighbour_stats(g, has_box, t, n):
+    """Why agent n is not linked at frame t (the `gestalt.groups` criteria): its own motion state; the nearest other
+    agent of its kind (centre distance in mean larger box sides, and every link criterion it fails); the nearest one
+    whose motion would link it (both moving the same way at a similar speed, or both still of a similar size)."""
+    W, H = gestalt.FRAME_SIZE_PX
+    b = g["b"][t]
+    side = torch.maximum(((b[:, 2] - b[:, 0]) * W).clamp(min=1.0), ((b[:, 3] - b[:, 1]) * H).clamp(min=1.0))
+    hgt = (b[:, 3] - b[:, 1]).clamp(min=1e-6)
+    kind = g["kind"]
+    others = has_box[t].clone() & (kind == kind[n]) & (kind >= 0)
+    others[n] = False
+    me = _state(g, t, n)
+    out = {"self": me, "nearest": None, "nearest_fails": [], "compatible": None}
+    if kind[n] < 0 or not bool(others.any()):
+        return out
+    ratio = g["dist"][t, n] / ((side[n] + side) / 2)
+    best, best_c = None, None
+    for j in torch.nonzero(others).flatten().tolist():
+        st = _state(g, t, j)
+        fails = []
+        if me == "unknown" or st == "unknown":
+            fails.append("motion_unknown")
+        elif me != st:
+            fails.append("moving_vs_still")
+        elif me == "moving":
+            dang = abs((float(g["angle"][t, n]) - float(g["angle"][t, j]) + 180) % 360 - 180)
+            if dang >= gestalt.SAME:
+                fails.append("direction")
+            sp = abs(torch.log(g["speed"][t, n].clamp(min=1e-6) / g["speed"][t, j].clamp(min=1e-6)).item())
+            if not sp < torch.log(torch.tensor(gestalt.SPEED_SIM)).item():           # NaN speed fails too
+                fails.append("speed")
+        elif abs(torch.log(hgt[n] / hgt[j]).item()) >= torch.log(torch.tensor(gestalt.STILL_SIMILAR)).item():
+            fails.append("size")
+        r = float(ratio[j])
+        if not fails and (best_c is None or r < best_c):
+            best_c = r
+        if r >= gestalt.NEAR:
+            fails.append("far")
+        if best is None or r < best[0]:
+            best = (r, fails)
+    out["nearest"], out["nearest_fails"], out["compatible"] = best[0], best[1], best_c
+    return out
+
+
+def _dist_hist(xs, n):
+    parts, lo = [], 0.0
+    for hi in DIST_BINS:
+        parts.append(f"[{lo:g},{hi:g}) {sum(1 for x in xs if x is not None and lo <= x < hi) / n:.1%}")
+        lo = hi
+    parts.append(f">={lo:g} {sum(1 for x in xs if x is not None and x >= lo) / n:.1%}")
+    parts.append(f"none {sum(1 for x in xs if x is None) / n:.1%}")
+    return ", ".join(parts)
+
+
 def mate_timing(cfg, split, head_name, label_names, m_off):
     """Per onset of the head: the lag to the latest onset of the same action among its recent group mates, the
     group context in the frame before, and the mates' classes."""
@@ -117,7 +180,8 @@ def mate_timing(cfg, split, head_name, label_names, m_off):
             else:
                 ctx = "near_group" if p_near >= 0 else "no_group"
             out.append({"video": vid, "agent": n, "onset": t, "has_mate": bool(mates.any()), "lag": lag,
-                        "context": ctx, "mate_classes": sorted({str(classes[j]) for j in torch.nonzero(mates).flatten().tolist()})})
+                        "context": ctx, "mate_classes": sorted({str(classes[j]) for j in torch.nonzero(mates).flatten().tolist()}),
+                        "neighbour": neighbour_stats(g, has_box, t - 1, n)})
     return out
 
 
@@ -128,6 +192,7 @@ def main():
                         default="Car:IncomLane(own)@1;Car:IncomLane(own)@1 & gst:mate_new_Jun(own)@1;"
                                 "gst:mate_new_Jun(own)@1")
     parser.add_argument("--probe_split", type=str, default="val", choices=("train", "val"))
+    parser.add_argument("--probe_skip_rules", type=str, default="False", help="True: timing and neighbours only")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -154,8 +219,13 @@ def main():
     video_ids = list(training_data[f"{args.probe_split}_videos"])
 
     # 1. Rules on every at-risk row.
-    fires, hits, covered, rows_h, hits_h, onsets = probe_rules(model, training_data, video_ids, head, rules,
-                                                               head_mask, possible, cfg)
+    skip = str(args.probe_skip_rules).lower() in ("true", "1", "yes")
+    if skip:
+        rules, rule_texts = [], []
+        fires, hits, covered, rows_h, hits_h, onsets = torch.zeros(0), torch.zeros(0), [], 0, 0, set()
+    else:
+        fires, hits, covered, rows_h, hits_h, onsets = probe_rules(model, training_data, video_ids, head, rules,
+                                                                   head_mask, possible, cfg)
     base = hits_h / max(rows_h, 1)
     print(f"\n[atom_probe] {args.probe_head} on the {args.probe_split} videos: {rows_h} at-risk rows, {hits_h} hit rows "
           f"(base rate {base:.4f}), {len(onsets)} onsets")
@@ -186,12 +256,31 @@ def main():
     print("    group context in the frame before: " + ", ".join(f"{k} {v / n:.1%}" for k, v in ctx.most_common()))
     mc = Counter(c for e in with_mate for c in e["mate_classes"])
     print(f"    mates' classes: {dict(mc.most_common())}")
+
+    # 4. Why the onsets outside a group are not linked (frame t - 1).
+    lone = [e["neighbour"] for e in timing if not e["context"].startswith("in_group")]
+    nl = max(len(lone), 1)
+    selfc = Counter(x["self"] for x in lone)
+    fails = Counter(f for x in lone if x["nearest"] is not None for f in x["nearest_fails"])
+    only = Counter(x["nearest_fails"][0] if len(x["nearest_fails"]) == 1 else ("linked" if not x["nearest_fails"] else "several")
+                   for x in lone if x["nearest"] is not None)
+    print(f"\n  the {len(lone)} onsets outside a group, in the frame before "
+          f"(distance: centre distance / mean larger box side, link needs < {gestalt.NEAR:g}):")
+    print("    own motion: " + ", ".join(f"{k} {v / nl:.1%}" for k, v in selfc.most_common()))
+    print(f"    nearest agent of its kind, distance: {_dist_hist([x['nearest'] for x in lone], nl)}")
+    print("    criteria it fails (shares of the onsets, several possible): "
+          + ", ".join(f"{k} {v / nl:.1%}" for k, v in fails.most_common()))
+    print("    fails exactly one criterion: " + ", ".join(f"{k} {v / nl:.1%}" for k, v in only.most_common()))
+    print(f"    nearest agent with a linking motion, distance: {_dist_hist([x['compatible'] for x in lone], nl)}")
+    neigh = {"outside_group": len(lone), "self": dict(selfc), "fails": dict(fails), "fails_only": dict(only),
+             "nearest": [x["nearest"] for x in lone], "compatible": [x["compatible"] for x in lone]}
     out_dir = args.output_dir / "atom_probe"
     out_dir.mkdir(parents=True, exist_ok=True)
     utils_data.save_json({"head": args.probe_head, "split": args.probe_split, "rows": rows_h, "hit_rows": hits_h,
                           "base_rate": base, "onsets": len(onsets), "rules": res_rules,
                           "timing": {"onsets": len(timing), "with_mate": len(with_mate), "lags": lags,
                                      "context": dict(ctx), "mate_classes": dict(mc)},
+                          "neighbour": neigh,
                           "events": timing}, out_dir / f"probe_{args.probe_head.replace(':', '_')}.json")
     print(f"[atom_probe] -> {out_dir}")
 

@@ -37,3 +37,9 @@
 ### 运动轨迹RAW模式
 对于同一个行为的运动轨迹，RAW模式记录每一帧的原始位置信息，而不进行任何离散化或特征提取。
 将RAW格式的轨迹进行符号化处理，是否可以通过数学公式拟合？ 学出一个可以安全描述的运动范围？
+
+
+./run_roadpp_docker.sh --gpu 6 --atom_probe -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt7_lab --probe_head Car:Jun
+
+
+./run_roadpp_docker.sh --gpu 6 --atom_probe -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt7_lab --probe_head Car:Jun --probe_skip_rules True
