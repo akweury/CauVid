@@ -70,7 +70,7 @@ def collect_events(model, rs, mode, training_data, video_ids, heads, head_mask, 
             if not sel.any():
                 continue
             lits = rule_lab._with_true(model.literal_values(rows["inputs"][sel]) > 0.5)
-            p = rs.scores(lits)[mode][:, hd]
+            p = rs.scores(lits)["soft_logit" if mode == "logit" else mode][:, hd]   # `RuleSet.scores` keys
             keep, y = keep[sel], y[sel]
             b = hd[None].expand_as(p) * NB + step07_paper._logit_bins(p)
             neg.add_(torch.bincount(b[keep & ~y], minlength=A * NB).float())
