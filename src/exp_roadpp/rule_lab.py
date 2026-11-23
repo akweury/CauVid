@@ -381,6 +381,110 @@ def finalize(rules, counts, min_events):
     return keep
 
 
+# -------------- Merging close direction sectors --------------
+def direction_literals(model, names):
+    """{literal: (kind "dir" | "path", θ, scope, j)} of the 360-degree half circle literals (`shape.py`), and
+    {(kind, θ, scope, j): literal}."""
+    import re
+    of, back = {}, {}
+    for m in range(model.num_literals):
+        info = model.literal_info(m)
+        if info["kind"] != "X":
+            continue
+        mt = re.fullmatch(r"shp:(dir|path)_(\d{3})", names[info["atom"]])
+        if mt:
+            key = (mt.group(1), int(mt.group(2)), info["scope"], info["j"])
+            of[m], back[key] = key, m
+    return of, back
+
+
+def _sector(thetas):
+    """(start, width) in degrees of the intersection of half circles [θ, θ + 180), None if empty."""
+    grid = torch.arange(360, dtype=torch.float)
+    inside = torch.ones(360, dtype=torch.bool)
+    for t in thetas:
+        inside &= ((grid - t) % 360) < 180
+    if not inside.any() or inside.all():
+        return None
+    return int(torch.nonzero(inside & ~inside.roll(1)).flatten()[0]), int(inside.sum())
+
+
+def merge_sectors(rules, model, names, pool_of, ratio, max_width=180):
+    """Rules equal but for the sector of one direction kind (dir or path, same scope and slot), with sectors
+    next to each other on the circle, merged into one rule with the sector covering both and the gap between
+    (the user, 2026-11-23: (35, 37) and (40, 43) -> (35, 43); how far to merge is for the data to say). A merge
+    is kept if the merged rule's precision on the train sample (pool_of(head)) is >= ratio x the precision of the
+    two rules together; merged until no pair passes. Returns the rules and the number of merges."""
+    dir_of, lit_of = direction_literals(model, names)
+    if not dir_of:
+        return rules, 0
+    groups = defaultdict(list)                  # (head, other literals, kind, scope, j) -> [(start, width, rule)]
+    rest = []
+    for r in rules:
+        d = [m for m in r["literals"] if m in dir_of]
+        kinds = {dir_of[m][0::2] for m in d}
+        if len(kinds) != 1 or r.get("root"):
+            rest.append(r)                      # no direction, or both kinds: left as it is
+            continue
+        kind, scope, j = dir_of[d[0]][0], dir_of[d[0]][2], dir_of[d[0]][3]
+        sec = _sector([dir_of[m][1] for m in d])
+        if sec is None:
+            rest.append(r)
+            continue
+        other = tuple(sorted(m for m in r["literals"] if m not in dir_of))
+        groups[(r["head"], other, kind, scope, j)].append([sec[0], sec[1], r])
+    merges, out = 0, list(rest)
+    for (head, other, kind, scope, j), items in groups.items():
+        if len(items) < 2:
+            out += [it[2] for it in items]
+            continue
+        pool = pool_of(head)
+        F = pool["F"] > 0.5
+
+        def holds(start, width):
+            lits = list(other) + [lit_of[(kind, start % 360, scope, j)],
+                                  lit_of[(kind, (start + width - 180) % 360, scope, j)]]
+            return F[:, lits].all(dim=1)
+
+        def precision(mask):
+            fires = float(pool["w"][mask].sum())
+            return float(pool["w"][mask & pool["y"]].sum()) / fires if fires > 0 else 0.0
+        changed = True
+        while changed and len(items) > 1:
+            changed = False
+            items.sort(key=lambda it: it[0])
+            for i in range(len(items)):
+                a, b = items[i], items[(i + 1) % len(items)]
+                if a is b:
+                    continue
+                width = (b[0] - a[0]) % 360 + b[1]            # from a's start to b's end
+                if width > max_width or width <= max(a[1], b[1]):
+                    continue
+                if ((kind, a[0] % 360, scope, j) not in lit_of
+                        or (kind, (a[0] + width - 180) % 360, scope, j) not in lit_of):
+                    continue
+                both = holds(a[0], a[1]) | holds(b[0], b[1])
+                merged = holds(a[0], width)
+                if precision(merged) >= ratio * precision(both) and bool(merged.any()):
+                    lits = list(other) + [lit_of[(kind, a[0] % 360, scope, j)],
+                                          lit_of[(kind, (a[0] + width - 180) % 360, scope, j)]]
+                    items = [it for it in items if it is not a and it is not b] + \
+                        [[a[0], width, {"head": head, "literals": lits, "merged": True}]]
+                    merges += 1
+                    changed = True
+                    break
+        out += [it[2] for it in items]
+    # Precision and onsets of the merged rules on the train sample (the others keep their exact counts).
+    for r in out:
+        if r.get("merged"):
+            pool = pool_of(r["head"])
+            m = (pool["F"][:, r["literals"]] > 0.5).all(dim=1)
+            fires = float(pool["w"][m].sum())
+            r["precision"] = float(pool["w"][m & pool["y"]].sum()) / fires if fires > 0 else 0.0
+            r["events"] = int(pool["event"][m & pool["y"]].unique().numel())
+    return out, merges
+
+
 # -------------- Scorers --------------
 def confidence(rules, base, k):
     p = torch.tensor([r["precision"] for r in rules], dtype=torch.float)
@@ -651,6 +755,43 @@ def _none(x):
 
 
 # -------------- Main --------------
+def pretty_soft(texts, gates, min_gate=None):
+    """[(text, gate)] of a soft rule with the 360-degree half circles of one kind and slot merged into one soft
+    sector ("shp:dir[200, 240) ~[190, 245)(own)@1", `shape.soft_sector_text`); literals below min_gate left out."""
+    from src.exp_roadpp import shape as agent_shape
+    import re
+    groups, out = {}, []
+    for t, g in zip(texts, gates):
+        if min_gate is not None and g < min_gate:
+            continue
+        m = re.fullmatch(r"shp:(dir|path)_(\d{3})\((\w+)\)@(\d+)", t)
+        if m:
+            groups.setdefault((m.group(1), m.group(3), m.group(4)), []).append((int(m.group(2)), g))
+        else:
+            out.append((t, g))
+    for (kind, scope, j), tg in groups.items():
+        out.append((f"shp:{kind}{agent_shape.soft_sector_text([t for t, _ in tg], [g for _, g in tg])}({scope})@{j}",
+                    max(g for _, g in tg)))
+    return out
+
+
+def pretty_literals(texts):
+    """Rule literal texts with the 360-degree half circles of one kind and slot merged into one sector
+    ("shp:dir_200(own)@1", "shp:dir_060(own)@1" -> "shp:dir[200, 240)(own)@1", `shape.sector_text`)."""
+    from src.exp_roadpp import shape as agent_shape
+    import re
+    groups, out = {}, []
+    for t in texts:
+        m = re.fullmatch(r"shp:(dir|path)_(\d{3})\((\w+)\)@(\d+)", t)
+        if m:
+            groups.setdefault((m.group(1), m.group(3), m.group(4)), []).append(int(m.group(2)))
+        else:
+            out.append(t)
+    for (kind, scope, j), thetas in groups.items():
+        out.append(f"shp:{kind}{agent_shape.sector_text(thetas) or '[empty]'}({scope})@{j}")
+    return out
+
+
 def parse_variant(name):
     """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True, False)): the rule sets united; flags:
     with the derived literals (_d), without the negated literals of the other agents (_nn), without the
@@ -662,12 +803,13 @@ def parse_variant(name):
     return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"])
 
 
-def atom_literals(model, lo, hi):
-    """(L,) bool: the literals (any kind and scope) of the atoms lo..hi - 1, e.g. the shape atoms."""
+def atom_literals(model, lo, hi, older_only=False):
+    """(L,) bool: the literals (any kind and scope) of the atoms lo..hi - 1, e.g. the shape atoms; older_only:
+    only those of the slots before the newest (j > 1)."""
     out = torch.zeros(model.num_literals, dtype=torch.bool)
     for m in range(model.num_literals):
         info = model.literal_info(m)
-        out[m] = info["kind"] in ("X", "!X") and lo <= info["atom"] < hi
+        out[m] = info["kind"] in ("X", "!X") and lo <= info["atom"] < hi and (not older_only or info["j"] > 1)
     return out
 
 
@@ -753,7 +895,8 @@ def show_rules(texts, heads, mode, top=8):
         print(f"  {head}: {len(kept)} of {len(rs)} rules")
         for r in kept[:top]:
             s = r["soft"][mode]
-            lits = " & ".join(f"{t}[{g:.2f}]" for t, g in zip(r["literals"], s["gates"]) if not sparse or g >= DROP_GATE)
+            lits = " & ".join(f"{t}[{g:.2f}]" for t, g in pretty_soft(r["literals"], s["gates"],
+                                                                      DROP_GATE if sparse else None))
             print(f"    w {s['weight']:+6.2f}  p {r['precision']:.2f}  {r['events']:5d} onsets  {lits}")
 
 
@@ -769,6 +912,11 @@ def main():
     parser.add_argument("--lab_show", type=str,
                         default="Cyc:VehLane,Car:IncomLane,Cyc:MovRht,av:AV-TurLft,Car:MovAway,av:AV-Stop",
                         help="heads whose strongest rules are printed")
+    parser.add_argument("--lab_merge_ratio", type=float, default=0.9,
+                        help="merge two rules that differ only in a close direction sector if the covering sector "
+                             "keeps >= this share of their precision (0: no merging)")
+    parser.add_argument("--lab_shape_slot1", type=str, default="True",
+                        help="the shape atoms only in the newest slot (their history is in the phases)")
     parser.add_argument("--lab_root_exclude", type=str, default="shape",
                         help="atom groups of the data layout (e.g. shape, position) that may not be mining roots")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
@@ -816,10 +964,15 @@ def main():
                  else torch.zeros(model.num_literals, dtype=torch.bool))
     if "shape" in layout:
         print(f"[Rule lab] shape-phase atoms {layout['shape']}: {int(forbid_ns.sum())} literals (off in the _ns variants)")
+    # The shape atoms carry their own history (the phases p2..p4, the order-free rec_*): a rule reads them in the
+    # newest slot only (2026-11-23; "p1_x_left@3", the current phase 2-3 s ago, doubled the phases).
+    forbid_old = (atom_literals(model, *layout["shape"], older_only=True)
+                  if "shape" in layout and args.lab_shape_slot1 == "True" else torch.zeros_like(forbid_ns))
 
     def make_ext(flags):
         d, nn, ns = flags
-        forbid = (forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
+        forbid = ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
+                  | forbid_old)
         return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
     ext = {}
     L = make_ext((True, False, False)).num_literals
@@ -866,6 +1019,18 @@ def main():
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
         full = make_ext((True, False, False))
+        if args.lab_merge_ratio > 0:
+            pools = {}
+
+            def pool_of(h):
+                if h not in pools:
+                    pools[h] = step05_mine._pool_of(train, h, L, device)
+                return pools[h]
+            n0 = len(final)
+            final, n_merges = merge_sectors(final, model, names, pool_of, args.lab_merge_ratio)
+            if n_merges:
+                print(f"[Rule lab] {name}: {n_merges} merges of close direction sectors, {n0} -> {len(final)} rules")
+            pools.clear()
         logit = fit_logit(final, train, full, heads, device)
         soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, full,
                             heads, device, m) for m in soft_modes}
@@ -902,11 +1067,14 @@ def main():
             rule_sets[key].size = {"logit": (int(kept.sum()), float(lens.float().mean()) if len(lens) else 0.0,
                                              int(lens.max()) if len(lens) else 0)}
             texts[key] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
-                                  "literals": [step05_mine.literal_text(full, names, m) for m in r["literals"]],
+                                  "literals": pretty_literals([step05_mine.literal_text(full, names, m)
+                                                               for m in r["literals"]]),
                                   "derived": sum(m >= model.num_literals for m in r["literals"]),
                                   "weight": round(float(c_logit[0][i]), 3),
                                   "soft": {"crisp": {"weight": round(float(c_logit[0][i]), 3),
-                                                     "gates": [1.0] * len(r["literals"])}}}
+                                                     "gates": [1.0] * len(pretty_literals(
+                                                         [step05_mine.literal_text(full, names, m)
+                                                          for m in r["literals"]]))}}}
                                  for i, r in enumerate(crisp)), key=lambda r: r["head"])
             print(f"[Rule lab] {key}: {int(kept.sum())} rules (|w| >= {DROP_WEIGHT}) from {args.lab_crisp}, "
                   f"{float(lens.float().mean()) if len(lens) else 0:.2f} literals per rule")

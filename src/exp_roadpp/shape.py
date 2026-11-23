@@ -9,7 +9,7 @@ The second needs the order of several changes, of varying durations (speed, leng
 and the motion atoms (`motion.py`: area, lateral, vertical) do not separate width from height and keep no
 order. Rule lab 2026-11-22: the rules trail the MLP most on VehLane / IncomLane / OutgoLane / MovRht.
 
-Primitives per agent and frame t (own box, over K frames, pixels of the image):
+Primitives per agent and frame t (own box, over K = 2 frames since v2, pixels of the image):
   x   dx = (centre x(t) - centre x(t - K)) / (K x width)    -> x_left / x_right
   y   dy = (centre y(t) - centre y(t - K)) / (K x height)   -> y_up / y_down (down: towards the camera)
   w   dw = log(width(t) / width(t - K)) / K                  -> w_grow / w_shrink
@@ -29,16 +29,30 @@ Atoms (inputs only, own agent scope, `step05.rule_input_mask`):
       track appeared (its aspect tertile of the class; the image third of its centre);
   "shp:{tall,square,wide}": the box now;
   "shp:young": the track appeared less than YOUNG frames ago (the agent was not seen before).
+  "shp:rec_{prim}", "shp:rec_{a}+{b}" (v2): one of the last PHASES phases held the primitive, or both
+      primitives of a pair at once (PAIRS), wherever it came in the order: a rule keeps only the step that
+      tells the onset apart (the user, 2026-11-23), e.g. "shp:rec_w_shrink+h_grow" (turning towards the ego).
+  "shp:dir_θ" / "shp:path_θ" (v3, θ = 0, 5, .., 355): the move now (over K frames, debounced) / the path since
+      the track appeared points into the half circle [θ, θ + 180). Two such literals give any sector up to 180
+      degrees at a 5 degree resolution, e.g. "dir_200 & dir_060" = the move points into [200, 240) (left, a little
+      down). `sector_text` prints them as one sector.
+The rule lab lets the shape atoms be read in slot 1 only: their history is in the phases (`rule_lab`).
 The truck turning right towards the ego then reads, e.g.:
   shp:app_tall & shp:app_left & shp:p3_x_right & shp:p3_w_grow & shp:p2_h_grow & shp:p1_w_shrink & shp:p1_h_grow
 """
 import torch
 
-K = 5                                   # frames of each difference (0.5 s at 10 fps)
+K = 2                                   # frames of each difference (0.2 s at 10 fps; v1: 5, the user: 2)
 DEBOUNCE = 3                            # frames a primitive's condition must hold in a row
 MIN_PHASE = 3                           # frames of a run to count as a phase
 PHASES = 4                              # phases kept: the current one and the 3 before
 YOUNG = 20                              # frames: a track younger than this is "young"
+# Directions over the full circle (v3, the user: 360 degrees, not 8 directions). Atom "dir_θ": the box's move
+# points into the half circle [θ, θ + 180) (0 right, 90 up, 180 left, 270 down, image pixels). Two of them make
+# any sector up to 180 degrees, also across 0: dir_a & dir_(b - 180) = [a, b). θ in steps of ANGLE_STEP.
+ANGLE_STEP = 5                          # degrees between the half circles (72 per direction signal)
+MOVE_PX = 3.0                           # pixels over K frames: less is no move (no direction)
+PATH_MIN = 0.3                          # box heights moved since the track appeared, for a path direction
 EDGE = 0.005                            # normalized: a box this close to the border is cut
 FRAME_SIZE_PX = (1920, 1280)
 SIGNALS = ("dx", "dy", "dw", "dh", "aspect")
@@ -47,14 +61,70 @@ LOW, HIGH = 0.15, 0.85                  # train quantiles of dx, dy, dw, dh
 FLOORS = {"dx": 0.02, "dy": 0.01, "dw": 0.008, "dh": 0.008}
 MIN_CLASS_SAMPLES = 5000
 MAX_SAMPLES = 1_000_000
-VERSION = "v1"
+VERSION = "v3"                          # v2: K 2, the order-free "recent" atoms; v3: 360-degree directions
+
+
+# The pairs of primitives that can hold in one phase (not the opposites of one signal), e.g. w_shrink + h_grow:
+# the box gets narrower and taller at once (a vehicle turning towards the camera).
+PAIRS = tuple((a, b) for i, a in enumerate(PRIMS) for b in PRIMS[i + 1:] if a.split("_")[0] != b.split("_")[0])
 
 
 def atom_names():
     names = [f"p{k}_{p}" for k in range(1, PHASES + 1) for p in PRIMS + ("still",)]
     names += [f"app_{a}" for a in ("tall", "square", "wide", "left", "centre", "right", "top", "middle", "bottom")]
     names += ["tall", "square", "wide", "young"]
+    # Order-free (v2, the user: a rule keeps the one step that tells true from false, wherever it came in the
+    # sequence): the primitive, or the pair in one phase, held in one of the last PHASES phases.
+    names += [f"rec_{p}" for p in PRIMS]
+    names += [f"rec_{a}+{b}" for a, b in PAIRS]
+    # 360 degrees (v3): the move now (over K frames, debounced) and the path since the track appeared.
+    names += [f"dir_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
+    names += [f"path_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
     return names
+
+
+def half_circles(angle):
+    """(..., 360 / ANGLE_STEP) bool: the angle (degrees, NaN: none) lies in [θ, θ + 180) for every θ."""
+    theta = torch.arange(0, 360, ANGLE_STEP, dtype=torch.float)
+    d = (angle[..., None] - theta) % 360
+    return ~torch.isnan(angle)[..., None] & (d < 180)
+
+
+def soft_sector_text(thetas, gates, core=0.95, edge=0.5):
+    """A soft AND of half circles [θ, θ + 180) with gates g (`rule_lab.fit_soft`): per degree the membership
+    prod_i (1 - g_i [not in half circle i]). Printed as the core (membership >= core) and the extent (>= edge),
+    e.g. "[200, 240) ~[190, 245)"; the hard case (all gates 1) is `sector_text`."""
+    grid = torch.arange(360, dtype=torch.float)
+    member = torch.ones(360)
+    for t, g in zip(thetas, gates):
+        member *= 1 - float(g) * (((grid - t) % 360) >= 180).float()
+
+    def arc(mask):
+        if not mask.any():
+            return None
+        if mask.all():
+            return "[0, 360)"
+        start = int(torch.nonzero(mask & ~mask.roll(1)).flatten()[0])
+        return f"[{start}, {(start + int(mask.sum())) % 360})"
+    c, e = arc(member >= core), arc(member >= edge)
+    if c == e:
+        return c or "[empty]"
+    return f"{c or '[none]'} ~{e or '[none]'}"
+
+
+def sector_text(thetas):
+    """The sector "[a, b)" (degrees) where all the half circles [θ, θ + 180) of thetas hold, or None if empty;
+    for printing rules (`rule_lab`)."""
+    grid = torch.arange(360, dtype=torch.float)
+    inside = torch.ones(360, dtype=torch.bool)
+    for t in thetas:
+        inside &= ((grid - t) % 360) < 180
+    if not inside.any():
+        return None
+    if inside.all():
+        return "[0, 360)"
+    start = int(torch.nonzero(inside & ~inside.roll(1)).flatten()[0])
+    return f"[{start}, {(start + int(inside.sum())) % 360})"
 
 
 ATOMS = tuple(atom_names())
@@ -221,6 +291,7 @@ def shape_atoms(boxes, has_box, classes, spec):
     W, H = FRAME_SIZE_PX
     b = boxes.nan_to_num(0.0)
     cx, cy = (b[..., 0] + b[..., 2]) / 2, (b[..., 1] + b[..., 3]) / 2
+    start_of = torch.full((T, N), -1, dtype=torch.long)
     for n in range(N):
         start = -1
         for t in range(T):
@@ -236,4 +307,32 @@ def shape_atoms(boxes, has_box, classes, spec):
             if aspect[t, n] >= 0:
                 out[t, n, base + 9 + int(aspect[t, n])] = True
             out[t, n, base + 12] = t - start < YOUNG
+            start_of[t, n] = start
+    # Order-free: some phase of the last PHASES held the primitive / both primitives of the pair.
+    ph = table[hist.clamp(min=0)][..., :len(PRIMS)] & (hist >= 0)[..., None]            # (T, N, PHASES, 8)
+    rec = base + 13
+    out[..., rec:rec + len(PRIMS)] = ph.any(dim=2)
+    idx = {p: i for i, p in enumerate(PRIMS)}
+    for j, (pa, pb) in enumerate(PAIRS):
+        out[..., rec + len(PRIMS) + j] = (ph[..., idx[pa]] & ph[..., idx[pb]]).any(dim=2)
+    # 360 degrees: the move over the last K frames (>= MOVE_PX, both boxes uncut; debounced) and the path from
+    # the box where the track appeared (>= PATH_MIN box heights).
+    na = 360 // ANGLE_STEP
+    d0 = rec + len(PRIMS) + len(PAIRS)
+    px, py = cx * W, cy * H
+    hgt = ((b[..., 3] - b[..., 1]) * H).clamp(min=1.0)
+    x1, y1, x2, y2 = (boxes[..., i] for i in range(4))
+    uncut = has_box & ~((x1 < EDGE) | (y1 < EDGE) | (x2 > 1 - EDGE) | (y2 > 1 - EDGE))    # NaN compares False
+    ang_now = torch.full((T, N), float("nan"))
+    if T > K:
+        dx, dy = px[K:] - px[:-K], py[K:] - py[:-K]
+        ok = uncut[K:] & uncut[:-K] & (torch.hypot(dx, dy) >= MOVE_PX)
+        ang_now[K:] = torch.where(ok, torch.rad2deg(torch.atan2(-dy, dx)) % 360, torch.full_like(dx, float("nan")))
+    out[..., d0:d0 + na] = _debounce(half_circles(ang_now))
+    s0 = start_of.clamp(min=0)
+    n_idx = torch.arange(N)[None].expand(T, N)
+    dxa, dya = px - px[s0, n_idx], py - py[s0, n_idx]
+    ok = (start_of >= 0) & (torch.hypot(dxa, dya) >= PATH_MIN * hgt)
+    ang_path = torch.where(ok, torch.rad2deg(torch.atan2(-dya, dxa)) % 360, torch.full_like(dxa, float("nan")))
+    out[..., d0 + na:d0 + 2 * na] = half_circles(ang_path)
     return out & has_box[..., None]

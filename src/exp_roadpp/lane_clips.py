@@ -46,7 +46,7 @@ def rule_text(model, names, rule, gates=None, truth=None, min_gate=rule_lab.DROP
             continue
         t = step05_mine.literal_text(model, names, m)
         parts.append(t if truth is None else f"{'+' if truth[m] else '-'}{t}")
-    return " & ".join(parts)
+    return " & ".join(parts if truth is not None else rule_lab.pretty_literals(parts))
 
 
 def explain(model, names, rules, gate, weight, head_rules, act, lits_row, top=2):
