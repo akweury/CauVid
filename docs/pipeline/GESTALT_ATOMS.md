@@ -116,10 +116,10 @@ gain, 3x the rules).
 
 ```bash
 ./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True \
-    --run_id 20261123-gestalt8_lab --lab_prepare_only True
+    --run_id 20261123-gestalt8_lab --lab_prepare_only True --lab_mlp False
 for spec in "2 relaxed_nn_ng shape,gestalt" "3 relaxed_nn shape,gestalt" "4 relaxed_nn shape"; do
   set -- $spec
-  tmux new-session -d -s gst8_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_variants $2 --lab_root_exclude $3 2>&1 | tee rule_lab_gst8_gpu$1.log; read"
+  tmux new-session -d -s gst8_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_mlp False --lab_variants $2 --lab_root_exclude $3 2>&1 | tee rule_lab_gst8_gpu$1.log; read"
 done
 ```
 

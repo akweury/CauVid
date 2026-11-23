@@ -43,3 +43,7 @@
 
 
 ./run_roadpp_docker.sh --gpu 6 --atom_probe -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt7_lab --probe_head Car:Jun --probe_skip_rules True
+
+./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_prepare_only True
+
+./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt8_lab --lab_prepare_only True --lab_mlp False
