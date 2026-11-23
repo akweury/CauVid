@@ -18,7 +18,8 @@ Group context: in the frame before the onset (`gestalt.groups` of the val boxes)
   no_group     neither.
 Situations rendered (--num each): missed_in_group, missed_near_group, and detected_in_group as a control.
 Every clip spans --before_s before the onset to --after_s after it:
-  - one group per frame: the agent's own group, else the nearest group near it (none if neither), in its colour
+  - one tracked group per frame (`gestalt.track_groups`: no jumps to a passing group, short gaps filled): the
+    agent's own group, else its near group (none if neither), in its colour
     in both views, with its union box (dashed) in the camera view and a caption (kind, members, direction, speed);
   - text --font_scale times the default size;
   - the event's agent outlined in red;
@@ -88,32 +89,26 @@ def collect_events(model, rs, mode, training_data, video_ids, heads, head_mask, 
     return neg.view(A, NB).cpu(), events
 
 
-def agent_group(g, t, agent):
-    """The one group to show for the agent in frame t: its own group if it is in one, else the group of the nearest
-    member of another group near it, else None."""
-    if bool(g["in_group"][t, agent]):
-        return int(g["label"][t, agent])
-    other = g["near"][t, agent] & g["in_group"][t]
-    if bool(other.any()):
-        d = torch.where(other, g["dist"][t, agent], torch.full_like(g["dist"][t, agent], float("inf")))
-        return int(g["label"][t, int(d.argmin())])
-    return None
+def agent_group(tr, t, agent):
+    """The one group track to show for the agent in frame t (`gestalt.track_groups`): its own group if it is in one,
+    else its near group (sticky), else None."""
+    p = int(tr["own"][t, agent])
+    if p < 0:
+        p = int(tr["near"][t, agent])
+    return p if p >= 0 else None
 
 
-def group_captions(g, t, classes, tube_of, only=None):
-    """[(colour, [tube_uids], caption)] of the groups in frame t (`gestalt.groups`); only: just that group."""
-    out = []
-    ids = [k for k in range(g["size"].shape[1]) if g["is_group"][t, k] and (only is None or k == only)]
-    for i, k in enumerate(ids):
-        members = [n for n in range(g["label"].shape[1]) if int(g["label"][t, n]) == k and bool(g["in_group"][t, n])]
-        uids = [tube_of[n] for n in members if n in tube_of]
-        speed = sum(float(g["speed"][t, n]) for n in members) / max(len(members), 1)
-        kind = gestalt.KINDS[int(g["gkind"][t, k])]
-        cls = ",".join(f"{c}x{v}" if v > 1 else c for c, v in sorted(Counter(str(classes[n]) for n in members).items()))
-        out.append((COLORS[i % len(COLORS)], uids,
-                    f"G{i + 1} {kind}: {len(members)} ({cls}), direction {float(g['gdir'][t, k]):.0f} deg, "
-                    f"speed {speed:.3f} box/frame"))
-    return out
+def group_captions(g, tr, t, p, classes, tube_of):
+    """[(colour, [tube_uids], caption)] of group track p in frame t."""
+    members = torch.nonzero(tr["M"][t, :, p]).flatten().tolist()
+    uids = [tube_of[n] for n in members if n in tube_of]
+    sp = [float(g["speed"][t, n]) for n in members if float(g["speed"][t, n]) == float(g["speed"][t, n])]
+    kind = gestalt.KINDS[int(tr["kind"][p])]
+    cls = ",".join(f"{c}x{v}" if v > 1 else c for c, v in sorted(Counter(str(classes[n]) for n in members).items()))
+    d = float(tr["dir"][t, p])
+    return [(COLORS[0], uids, f"group #{p} {kind}: {len(members)} ({cls}), direction "
+                              f"{'-' if d != d else f'{d:.0f} deg'}, speed "
+                              f"{sum(sp) / len(sp) if sp else float('nan'):.3f} box/frame")]
 
 
 def main():
@@ -185,19 +180,20 @@ def main():
             X = step05.build_video_tensor(atoms[vid], A_lab)
             boxes, classes, has_box = step05._agent_boxes(boxes_all, vid, atoms[vid], X)
             tube_of = {n: uid for uid, n in step05.video_agent_ids(atoms[vid]).items()}
-            video_cache[vid] = (gestalt.groups(boxes, has_box, classes), classes, tube_of)
+            g = gestalt.groups(boxes, has_box, classes)
+            video_cache[vid] = (g, gestalt.track_groups(g, has_box), classes, tube_of)
         return video_cache[vid]
     situations = defaultdict(list)
     counts = defaultdict(Counter)
     out_events = []
     for key, e in tqdm(events.items(), desc="Group context"):
         vid, agent, onset, h = key
-        g, _classes, _tube = video(vid)
+        g, tr, _classes, _tube = video(vid)
         t = max(onset - 1, 0)
         if t >= g["in_group"].shape[0] or agent >= g["in_group"].shape[1]:
             continue
-        ctx = ("in_group" if bool(g["in_group"][t, agent]) else
-               "near_group" if bool((g["near"][t, agent] & g["in_group"][t]).any()) else "no_group")
+        ctx = ("in_group" if int(tr["own"][t, agent]) >= 0 else
+               "near_group" if int(tr["near"][t, agent]) >= 0 else "no_group")
         missed = step07_paper._logit_bins(torch.tensor([e["score"]]))[0] < th[h]
         state = "missed" if bool(missed) else "detected"
         counts[names[h]][f"{state}_{ctx}"] += 1
@@ -232,7 +228,7 @@ def main():
             if args.no_render:
                 break
             vid, agent, onset, h = key
-            g, classes, tube_of = video(vid)
+            g, tr, classes, tube_of = video(vid)
             e = events[key]
             ex = e["explain"]
             line = (f"rules hold: {ex['holding'][0]['rule']} (w {ex['holding'][0]['weight']})" if ex.get("holding")
@@ -248,9 +244,9 @@ def main():
                     dt = (f - onset) / 10
                     note = f"{label}\nonset at f{onset}: " + ("NOW" if f == onset else f"{dt:+.1f} s")
                     tf = min(f, g["in_group"].shape[0] - 1)
-                    k = agent_group(g, tf, agent)                   # one group: the agent's own or the nearest
-                    shown = group_captions(g, tf, classes, tube_of, only=k) if k is not None else []
-                    state = ("agent IN the group" if k is not None and bool(g["in_group"][tf, agent])
+                    k = agent_group(tr, tf, agent)                  # one tracked group: own, else near
+                    shown = group_captions(g, tr, tf, k, classes, tube_of) if k is not None else []
+                    state = ("agent IN the group" if k is not None and int(tr["own"][tf, agent]) == k
                              else "agent NEXT TO the group" if k is not None else "no group this frame")
                     note = f"{note}  |  {state}"
                     residual_clips.sumo_render.render(dataset, vid, f, Path(tmp) / f"{i:05d}.png", note=note,

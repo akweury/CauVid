@@ -67,6 +67,26 @@ Members join and leave, so the group box also grows or shrinks with the membersh
 gathers). On SUMO v7 there are 24 + 2 x 225 + 4 x 22 = 562 gestalt atoms. In the rule lab they are read in the
 newest slot only, as the shape atoms.
 
+**v6: tracked groups** (`track_groups`, the user: the shown group jumped from two turning cars to two pedestrians on
+the crossing and back).
+- A group keeps its id while it shares members with a group of the last 5 frames (best overlap first).
+- A gap of up to 5 frames is filled with the members on both sides.
+- The agent's near group sticks to the one it had while that one is near, or out of reach for up to 5 frames. A
+  new one is the nearest group of the agent's own kind first.
+
+**v7: still groups and `mate_new`** (the user: a queue on the oncoming lane, one car enters the junction, the others
+will follow). In the rule lab of v5, no Jun rule used `grp_any_Jun`, for three reasons:
+- the waiting queue stood still, so it was no group;
+- the leader left the group as soon as it moved off;
+- there was no "just now".
+
+The changes:
+- Still agents group too: near, same kind, both still, height ratio < 1.5. A still agent and a moving one never
+  link.
+- `gst:mate_new_{action}`: an agent that was in the agent's (tracked) group within the last 3 s, even if it has
+  left by now, started the action within the last 2 s (it was off in the 5 frames before). Example:
+  `Car:IncomLane(own) & gst:mate_new_Jun -> Car:Jun`.
+
 The negated gestalt literals are off in the rule lab (`--lab_gst_negated False`).
 
 ## Shape atoms v5
@@ -79,10 +99,10 @@ gain, 3x the rules).
 ```bash
 # 1. Once: the training data (shape v5 + gestalt), the OnsetMLP and the row sample.
 ./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True \
-    --run_id 20261123-gestalt4_lab --lab_prepare_only True
+    --run_id 20261123-gestalt7_lab --lab_prepare_only True
 # 2. The four variants in parallel (tmux: docker -it needs a terminal).
 for spec in "2 relaxed+precise_nn_ns_ng" "3 relaxed+precise_nn_ng" "4 relaxed+precise_nn_ns" "5 relaxed+precise_nn"; do
   set -- $spec
-  tmux new-session -d -s gst_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt4_lab --lab_variants $2 2>&1 | tee rule_lab_gst_gpu$1.log; read"
+  tmux new-session -d -s gst_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt7_lab --lab_variants $2 2>&1 | tee rule_lab_gst_gpu$1.log; read"
 done
 ```
