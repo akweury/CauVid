@@ -388,6 +388,8 @@ def get_step_05_input(args):
         "predict": str(getattr(args, "predict", "False")) == "True",
         # Shape-phase atoms (`shape.py`): the own box's moves and width / height changes, and their order.
         "shape": str(getattr(args, "shape_phases", "False")) == "True",
+        # Gestalt atoms (`gestalt.py`): proximity, similar size and common fate of the boxes around the agent.
+        "gestalt": str(getattr(args, "gestalt", "False")) == "True",
         # Duration atoms (`duration.py`): how long a label has held (log-scale age bins and their unions).
         "durations": str(getattr(args, "durations", "False")) == "True",
         "duration_labels": str(getattr(args, "duration_labels", "") or ""),

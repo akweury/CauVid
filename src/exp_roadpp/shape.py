@@ -64,6 +64,9 @@ PATH_MIN = 0.3                          # box heights moved since the track appe
 #   size            the box height / image height;
 #   move            the centre's move over the last K frames, in box heights per frame (both boxes uncut);
 #   travel          the centre's move since the track appeared, in box heights.
+# v5: off (rule lab v4, 2026-11-23: no gain, +0.001 soft and 26 heads better vs 42 worse; 3x the rules and
+# sparse_c 0.275 -> 0.234). The code stays for an ablation (POSITION = True).
+POSITION = False
 GRID = [round(0.05 * i, 2) for i in range(1, 20)]
 THRESHOLDS = {"cx": GRID, "by": GRID, "app_cx": GRID, "app_by": GRID,
               "size": [0.01, 0.015, 0.02, 0.03, 0.045, 0.06, 0.08, 0.1, 0.15, 0.2, 0.3, 0.45],
@@ -77,7 +80,8 @@ LOW, HIGH = 0.15, 0.85                  # train quantiles of dx, dy, dw, dh
 FLOORS = {"dx": 0.02, "dy": 0.01, "dw": 0.008, "dh": 0.008}
 MIN_CLASS_SAMPLES = 5000
 MAX_SAMPLES = 1_000_000
-VERSION = "v4"                          # v2: K 2, "recent" atoms; v3: 360-degree directions; v4: fine position
+VERSION = "v5"                          # v2: K 2, "recent"; v3: 360-degree directions; v4: fine position; v5: v4
+                                        # without the fine position (POSITION False)
 
 
 # The pairs of primitives that can hold in one phase (not the opposites of one signal), e.g. w_shrink + h_grow:
@@ -97,7 +101,8 @@ def atom_names():
     names += [f"dir_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
     names += [f"path_{t:03d}" for t in range(0, 360, ANGLE_STEP)]
     # Fine position, size and distance (v4): every threshold as a ">=" and a "<" atom.
-    names += [f"{q}_{op}_{t:g}" for q, ts in THRESHOLDS.items() for t in ts for op in ("ge", "lt")]
+    if POSITION:
+        names += [f"{q}_{op}_{t:g}" for q, ts in THRESHOLDS.items() for t in ts for op in ("ge", "lt")]
     return names
 
 
@@ -376,7 +381,7 @@ def shape_atoms(boxes, has_box, classes, spec):
               "size": torch.where(has_box, hgt / H, nan), "move": move,
               "travel": torch.where(start_of >= 0, torch.hypot(dxa, dya) / hgt, nan)}
     col = d0 + 2 * na
-    for q, ts in THRESHOLDS.items():
+    for q, ts in (THRESHOLDS.items() if POSITION else ()):
         v = values[q]
         for t in ts:
             out[..., col] = v >= t                                              # NaN compares False

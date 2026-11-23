@@ -978,7 +978,8 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
 def report(hist, names, heads, rule_sets):
     """Per head AP of every scorer; macro / close / wins over the learnable heads; per action."""
     ap = {name: step07_paper._ap(pos, neg) for name, (pos, neg) in hist.items()}
-    npos = hist["mlp"][0].sum(dim=1)
+    has_mlp = "mlp" in hist
+    npos = next(iter(hist.values()))[0].sum(dim=1)            # the same rows and labels for every scorer
     compared = [h for h in heads if npos[h] >= MIN_EVAL_POS]
     scorers = [n for n in ap if n != "mlp"]
 
@@ -989,31 +990,34 @@ def report(hist, names, heads, rule_sets):
     rows = {}
     for name in scorers:
         a = [val(name, h) for h in learnable]
-        m = [val("mlp", h) for h in learnable]
+        m = [val("mlp", h) for h in learnable] if has_mlp else [0.0] * len(a)
         variant, scorer = name.split("/")
         rs = rule_sets[variant].rules
         size = getattr(rule_sets[variant], "size", {}).get(scorer)          # after the drops (sparse modes)
-        rows[name] = {"macro": sum(a) / max(len(a), 1), "mlp_macro": sum(m) / max(len(m), 1),
-                      "close": sum(x >= CLOSE * y for x, y in zip(a, m)), "wins": sum(x > y for x, y in zip(a, m)),
+        rows[name] = {"macro": sum(a) / max(len(a), 1), "mlp_macro": sum(m) / max(len(m), 1) if has_mlp else None,
+                      "close": sum(x >= CLOSE * y for x, y in zip(a, m)) if has_mlp else None,
+                      "wins": sum(x > y for x, y in zip(a, m)) if has_mlp else None,
                       "rules": size[0] if size else len(rs),
                       "literals": size[1] if size else sum(len(r["literals"]) for r in rs) / max(len(rs), 1),
                       "max_literals": size[2] if size else max((len(r["literals"]) for r in rs), default=0)}
     best = max(rows, key=lambda n: rows[n]["macro"]) if rows else None
     print(f"\n[Rule lab] eval = odd val videos, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
-          f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP}); MLP macro "
-          f"{rows[best]['mlp_macro'] if best else float('nan'):.3f}")
+          f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP})"
+          + (f"; MLP macro {rows[best]['mlp_macro']:.3f}" if best and has_mlp else "; no MLP (--lab_mlp False)"))
     print(f"  {'variant/scorer':<22}{'rules':>7}{'lits':>6}{'max':>5}{'macro':>8}{'close':>7}{'wins':>6}")
     for name, r in sorted(rows.items(), key=lambda x: -x[1]["macro"]):
-        print(f"  {name:<22}{r['rules']:>7}{r['literals']:>6.2f}{r['max_literals']:>5}{r['macro']:>8.3f}"
-              f"{r['close']:>5}/{len(learnable):<3}{r['wins']:>4}")
+        mlp_cols = f"{r['close']:>5}/{len(learnable):<3}{r['wins']:>4}" if has_mlp else f"{'-':>9}{'-':>4}"
+        print(f"  {name:<22}{r['rules']:>7}{r['literals']:>6.2f}{r['max_literals']:>5}{r['macro']:>8.3f}{mlp_cols}")
     if best:
         by_action = defaultdict(list)
         for h in learnable:
             by_action[names[h].split(":")[-1]].append(h)
-        print(f"\n  per action, {best} vs MLP (macro AP, heads):")
-        for action, hs in sorted(by_action.items(), key=lambda x: sum(val(best, h) - val("mlp", h) for h in x[1])):
-            print(f"    {action:<12}{sum(val(best, h) for h in hs) / len(hs):>7.3f}{sum(val('mlp', h) for h in hs) / len(hs):>7.3f}"
-                  f"{len(hs):>4}")
+        ref = "mlp" if has_mlp else None
+        print(f"\n  per action, {best}" + (" vs MLP" if ref else "") + " (macro AP, heads):")
+        for action, hs in sorted(by_action.items(),
+                                 key=lambda x: sum(val(best, h) - (val(ref, h) if ref else 0) for h in x[1])):
+            ref_txt = f"{sum(val(ref, h) for h in hs) / len(hs):>7.3f}" if ref else ""
+            print(f"    {action:<12}{sum(val(best, h) for h in hs) / len(hs):>7.3f}{ref_txt}{len(hs):>4}")
     per_head = {names[h]: {"learnable": h in learnable, "pos_rows": int(npos[h]),
                            **{n: _none(float(ap[n][h])) for n in ap}} for h in compared}
     return {"summary": rows, "best": best, "learnable": [names[h] for h in learnable], "per_head": per_head}
@@ -1091,11 +1095,11 @@ def parse_variant(name):
     """"relaxed+precise_d_nn" -> (["relaxed", "precise"], (True, True, False)): the rule sets united; flags:
     with the derived literals (_d), without the negated literals of the other agents (_nn), without the
     shape-phase atoms (_ns, `shape.py`)."""
-    flags = {"_d": False, "_nn": False, "_ns": False, "_nd": False, "_np": False}
+    flags = {"_d": False, "_nn": False, "_ns": False, "_nd": False, "_np": False, "_ng": False}
     while any(name.endswith(f) for f in flags):
         f = next(f for f in flags if name.endswith(f))
         flags[f], name = True, name[:-len(f)]
-    return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"], flags["_nd"], flags["_np"])
+    return name.split("+"), (flags["_d"], flags["_nn"], flags["_ns"], flags["_nd"], flags["_np"], flags["_ng"])
 
 
 def atom_literals(model, lo, hi, older_only=False):
@@ -1200,6 +1204,11 @@ def main():
     parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed_nn,relaxed+precise_nn",
                         help="rule sets: miners m4 / relaxed / precise joined by +, suffix _d: with the derived literals")
     parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
+    parser.add_argument("--lab_mlp", type=str, default="True",
+                        help="train / score the OnsetMLP as the reference (False: rule variants only, no MLP)")
+    parser.add_argument("--lab_prepare_only", type=str, default="False",
+                        help="build the training data, the OnsetMLP and the row sample, then stop (run once before "
+                             "several variants in parallel)")
     parser.add_argument("--lab_crisp", type=str, default="sparse_c",
                         help="the sparse soft mode whose rounded gates give the crisp rules (variant ~crisp)")
     parser.add_argument("--lab_soft", type=str, default="logit,sparse_c",
@@ -1216,7 +1225,7 @@ def main():
                              "keeps >= this share of their precision (0: no merging)")
     parser.add_argument("--lab_shape_slot1", type=str, default="True",
                         help="the shape atoms only in the newest slot (their history is in the phases)")
-    parser.add_argument("--lab_root_exclude", type=str, default="shape",
+    parser.add_argument("--lab_root_exclude", type=str, default="shape,gestalt",
                         help="atom groups of the data layout (e.g. shape, position) that may not be mining roots")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
     parser.add_argument("--lab_min_events", type=int, default=2, help="precise search: distinct onsets of a rule")
@@ -1240,7 +1249,7 @@ def main():
 
     training_data = step05.load_training_data(cfg)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
-    mlp = ensure_mlp(training_data, cfg)
+    mlp = ensure_mlp(training_data, cfg) if args.lab_mlp == "True" else None
     window = int(cfg.get("clause_slots", 1)) * model.slot_size
     k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
     vocab = step05.load_vocabulary(cfg)
@@ -1286,15 +1295,25 @@ def main():
         if model.negation:
             forbid_lin[model.num_inputs + m] = True       # "not >= τ" is "< τ" or no value: the "<" atoms cover it
 
+    # The gestalt atoms (`gestalt.py`): "_ng" variants go without them.
+    forbid_ng = (atom_literals(model, *layout["gestalt"]) if "gestalt" in layout
+                 else torch.zeros(model.num_literals, dtype=torch.bool))
+    if "gestalt" in layout:
+        print(f"[Rule lab] gestalt atoms {layout['gestalt']}: {int(forbid_ng.sum())} literals (off in the _ng variants)")
+
     def make_ext(flags):
-        d, nn, ns, nd, np_ = flags
+        d, nn, ns, nd, np_, ng = flags
         forbid = ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
                   | forbid_old | forbid_dir_neg | (forbid_dir if nd else torch.zeros_like(forbid_dir))
-                  | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs))))
+                  | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs)))
+                  | (forbid_ng if ng else torch.zeros_like(forbid_ng)))
         return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
     ext = {}
-    L = make_ext((True, False, False, False, False)).num_literals
+    L = make_ext((True, False, False, False, False, False)).num_literals
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
+    if args.lab_prepare_only == "True":
+        print("[Rule lab] --lab_prepare_only: the training data, the OnsetMLP and the row sample are cached; stop")
+        return
     val_ids = list(training_data["val_videos"])
     train = extend_rows(train, derived, model.num_literals, device)
     check = extend_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), derived, model.num_literals, device)
@@ -1336,7 +1355,7 @@ def main():
         idx = [exact[(r["head"], tuple(sorted(r["literals"])))] for r in rs]
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
-        full = make_ext((True, False, False, False, False))
+        full = make_ext((True, False, False, False, False, False))
         if args.lab_merge_ratio > 0:
             pools = {}
 
