@@ -80,7 +80,7 @@ def load_vocabulary(cfg):
     if cfg.get("shape"):
         out += agent_shape.vocabulary()
     if cfg.get("gestalt"):
-        out += agent_gestalt.vocabulary()
+        out += agent_gestalt.vocabulary([_atom_name(sig) for sig in unique_atoms])
     return out
 
 
@@ -610,7 +610,9 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
     num_shape = len(agent_shape.ATOMS) if shape_spec is not None else 0
     shape_on = torch.zeros(num_shape)
     gestalt_start = shape_start + num_shape
-    num_gestalt = len(agent_gestalt.ATOMS) if gestalt_spec is not None else 0
+    label_names = [_atom_name(sig) for sig in unique_atoms] if unique_atoms is not None else []
+    gestalt_names = agent_gestalt.atom_names(label_names) if gestalt_spec is not None else []
+    num_gestalt = len(gestalt_names)
     gestalt_on = torch.zeros(num_gestalt)
     turn_atoms = agent_predict.ego_turn_atoms(unique_atoms) if predict_spec is not None else []
     if ego_flow_spec is not None:
@@ -692,7 +694,7 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
             shape_on += S_atoms.sum(dim=(0, 1)).float()
             X = torch.cat([X, S_atoms.to(X.device)], dim=2)
         if gestalt_spec is not None:
-            G_atoms = agent_gestalt.gestalt_atoms(video_boxes, has_box, classes)
+            G_atoms = agent_gestalt.gestalt_atoms(video_boxes, has_box, classes, X_labels, label_names, shape_spec)
             gestalt_on += G_atoms.sum(dim=(0, 1)).float()
             X = torch.cat([X, G_atoms.to(X.device)], dim=2)
         videos[video_id] = _video_cells(X)
@@ -731,7 +733,8 @@ def prepare_videos(atom_file, num_atoms, device, min_off_frames=1, box_file=None
               f"{predict_on / max(num_rows, 1):.3f}")
     if gestalt_spec is not None:
         print(f"[Gestalt]\t {name}: share of visible agents (rows) holding each gestalt atom: "
-              + ", ".join(f"{a} {gestalt_on[i] / max(num_rows, 1):.3f}" for i, a in enumerate(agent_gestalt.ATOMS)))
+              + ", ".join(f"{a} {gestalt_on[i] / max(num_rows, 1):.3f}" for i, a in enumerate(gestalt_names)
+                          if not a.startswith(("grp_dir_", "grp_path_", "ngrp_dir_", "ngrp_path_"))))
     if shape_spec is not None:
         print(f"[Shape]\t {name}: share of visible agents (rows) holding each shape atom: "
               + ", ".join(f"{a} {shape_on[i] / max(num_rows, 1):.3f}" for i, a in enumerate(agent_shape.ATOMS)))

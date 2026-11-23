@@ -358,6 +358,30 @@ def recount(model, training_data, video_ids, rules, head_mask, possible, cfg, de
             "base": (pos_h / rows_h.clamp(min=1)).cpu()}
 
 
+def sample_counts(rules, train, L, device, A):
+    """`recount` from the train sample (`--lab_fast`): per rule the weighted rows and hits where it holds and its
+    onsets in the sample; per head the weighted base rate."""
+    fires, hits = torch.zeros(len(rules)), torch.zeros(len(rules))
+    events = torch.zeros(len(rules), dtype=torch.long)
+    base = torch.zeros(A)
+    by = defaultdict(list)
+    for i, r in enumerate(rules):
+        by[r["head"]].append(i)
+    for h, idx in sorted(by.items()):
+        if not bool((train["pairs"]["head"] == h).any()):
+            continue
+        pool = step05_mine._pool_of(train, h, L, device)
+        F = pool["F"] > 0.5
+        base[h] = float((pool["w"] * pool["y"]).sum() / pool["w"].sum().clamp(min=1e-9))
+        for i in idx:
+            m = F[:, rules[i]["literals"]].all(dim=1)
+            fires[i] = float(pool["w"][m].sum())
+            hits[i] = float(pool["w"][m & pool["y"]].sum())
+            events[i] = int(pool["event"][m & pool["y"]].unique().numel())
+        del pool, F
+    return {"fires": fires, "hits": hits, "events": events, "base": base}
+
+
 def finalize(rules, counts, min_events):
     """The rules with exact precision and onsets: >= min_events onsets; a rule is dropped if one of its
     sub-rules (fewer literals, same head) is at least as precise (the extension adds nothing)."""
@@ -382,6 +406,10 @@ def finalize(rules, counts, min_events):
 
 
 # -------------- Merging close direction sectors --------------
+# The 360-degree half circle atoms: the own box's move / path (`shape.py`) and those of the agent's own / the
+# nearest group's box (`gestalt.py` grp_ / ngrp_); group 1 the kind ("shp:dir", "gst:grp_path", ..), group 2 θ.
+DIRECTION_RE = r"((?:shp|gst):(?:(?:grp_|ngrp_)?(?:dir|path)))_(\d{3})"
+
 def direction_literals(model, names):
     """{literal: (kind "dir" | "path", θ, scope, j)} of the 360-degree half circle literals (`shape.py`), and
     {(kind, θ, scope, j): literal}."""
@@ -391,7 +419,7 @@ def direction_literals(model, names):
         info = model.literal_info(m)
         if info["kind"] != "X":
             continue
-        mt = re.fullmatch(r"shp:(dir|path)_(\d{3})", names[info["atom"]])
+        mt = re.fullmatch(DIRECTION_RE, names[info["atom"]])
         if mt:
             key = (mt.group(1), int(mt.group(2)), info["scope"], info["j"])
             of[m], back[key] = key, m
@@ -434,7 +462,7 @@ def refine_sectors(rules, model, names, pool_of, min_events=2, min_lift=1.2, max
         pool = pool_of(head)
         F = pool["F"] > 0.5
         w, y = pool["w"], pool["y"]
-        for kind in ("dir", "path"):
+        for kind in sorted({key[0] for key in lit_of}):
             cols = [lit_of.get((kind, t * step, 0, 1)) for t in range(nb)]
             if any(c is None for c in cols):
                 continue
@@ -1063,13 +1091,13 @@ def pretty_soft(texts, gates, min_gate=None):
     for t, g in zip(texts, gates):
         if min_gate is not None and g < min_gate:
             continue
-        m = re.fullmatch(r"shp:(dir|path)_(\d{3})\((\w+)\)@(\d+)", t)
+        m = re.fullmatch(DIRECTION_RE + r"\((\w+)\)@(\d+)", t)
         if m:
             groups.setdefault((m.group(1), m.group(3), m.group(4)), []).append((int(m.group(2)), g))
         else:
             out.append((t, g))
     for (kind, scope, j), tg in groups.items():
-        out.append((f"shp:{kind}{agent_shape.soft_sector_text([t for t, _ in tg], [g for _, g in tg])}({scope})@{j}",
+        out.append((f"{kind}{agent_shape.soft_sector_text([t for t, _ in tg], [g for _, g in tg])}({scope})@{j}",
                     max(g for _, g in tg)))
     return _merge_linear(out)
 
@@ -1081,13 +1109,13 @@ def pretty_literals(texts):
     import re
     groups, out = {}, []
     for t in texts:
-        m = re.fullmatch(r"shp:(dir|path)_(\d{3})\((\w+)\)@(\d+)", t)
+        m = re.fullmatch(DIRECTION_RE + r"\((\w+)\)@(\d+)", t)
         if m:
             groups.setdefault((m.group(1), m.group(3), m.group(4)), []).append(int(m.group(2)))
         else:
             out.append(t)
     for (kind, scope, j), thetas in groups.items():
-        out.append(f"shp:{kind}{agent_shape.sector_text(thetas) or '[empty]'}({scope})@{j}")
+        out.append(f"{kind}{agent_shape.sector_text(thetas) or '[empty]'}({scope})@{j}")
     return [t for t, _ in _merge_linear([(t, 1.0) for t in out])]
 
 
@@ -1204,6 +1232,13 @@ def main():
     parser.add_argument("--lab_variants", type=str, default="relaxed,relaxed_nn,relaxed+precise_nn",
                         help="rule sets: miners m4 / relaxed / precise joined by +, suffix _d: with the derived literals")
     parser.add_argument("--lab_priors", type=str, default="0", help="confidence shrink k (onsets)")
+    parser.add_argument("--lab_gst_negated", type=str, default="False",
+                        help="allow the negated gestalt literals (v1: they were filler, '!gst:near_1')")
+    parser.add_argument("--lab_fast", type=str, default="False",
+                        help="quick test: train-sample counts (no pass over every train row), soft_logit only, no "
+                             "sector / interval refinement or merging")
+    parser.add_argument("--lab_heads", type=str, default="",
+                        help="quick test: only these heads (names like Car:IncomLane or actions like IncomLane)")
     parser.add_argument("--lab_mlp", type=str, default="True",
                         help="train / score the OnsetMLP as the reference (False: rule variants only, no MLP)")
     parser.add_argument("--lab_prepare_only", type=str, default="False",
@@ -1256,6 +1291,12 @@ def main():
     names = [step05._atom_name(sig) for sig in vocab]
     head_mask = training_data["target_heads"].to(device)
     heads = torch.nonzero(head_mask).flatten().tolist()
+    if args.lab_heads:
+        # Only these heads (names "Car:IncomLane" or actions "IncomLane"): a quick test. The others keep their
+        # base rate in the evaluation and are not mined.
+        wanted = {x for x in args.lab_heads.split(",") if x}
+        heads = [h for h in heads if names[h] in wanted or names[h].split(":")[-1] in wanted]
+        print(f"[Rule lab] --lab_heads: {len(heads)} heads: {', '.join(names[h] for h in heads)}")
     possible = step05.class_possible(training_data, vocab, device)
     A = model.num_atoms
 
@@ -1274,8 +1315,11 @@ def main():
         print(f"[Rule lab] shape-phase atoms {layout['shape']}: {int(forbid_ns.sum())} literals (off in the _ns variants)")
     # The shape atoms carry their own history (the phases p2..p4, the order-free rec_*): a rule reads them in the
     # newest slot only (2026-11-23; "p1_x_left@3", the current phase 2-3 s ago, doubled the phases).
-    forbid_old = (atom_literals(model, *layout["shape"], older_only=True)
-                  if "shape" in layout and args.lab_shape_slot1 == "True" else torch.zeros_like(forbid_ns))
+    forbid_old = torch.zeros_like(forbid_ns)
+    if args.lab_shape_slot1 == "True":
+        for key in ("shape", "gestalt"):            # gestalt v4: the group tracks' shape atoms carry their history too
+            if key in layout:
+                forbid_old |= atom_literals(model, *layout[key], older_only=True)
 
     # The 360-degree direction literals: "_nd" variants go without them; their negations ("not in this half
     # circle", which also holds without a move) are off unless --lab_dir_negated True.
@@ -1298,6 +1342,9 @@ def main():
     # The gestalt atoms (`gestalt.py`): "_ng" variants go without them.
     forbid_ng = (atom_literals(model, *layout["gestalt"]) if "gestalt" in layout
                  else torch.zeros(model.num_literals, dtype=torch.bool))
+    # Their negations ("!gst:near_1") were filler in gestalt v1 (rule lab 2026-11-23): off unless --lab_gst_negated.
+    forbid_ng_neg = forbid_ng & (torch.arange(model.num_literals) >= model.num_inputs) \
+        if args.lab_gst_negated != "True" else torch.zeros_like(forbid_ng)
     if "gestalt" in layout:
         print(f"[Rule lab] gestalt atoms {layout['gestalt']}: {int(forbid_ng.sum())} literals (off in the _ng variants)")
 
@@ -1306,7 +1353,7 @@ def main():
         forbid = ((forbid_nn if nn else torch.zeros_like(forbid_nn)) | (forbid_ns if ns else torch.zeros_like(forbid_ns))
                   | forbid_old | forbid_dir_neg | (forbid_dir if nd else torch.zeros_like(forbid_dir))
                   | (forbid_lin if np_ else (forbid_lin & (torch.arange(len(forbid_lin)) >= model.num_inputs)))
-                  | (forbid_ng if ng else torch.zeros_like(forbid_ng)))
+                  | (forbid_ng if ng else forbid_ng_neg))
         return ExtModel(model, derived, d, forbid if bool(forbid.any()) else None)
     ext = {}
     L = make_ext((True, False, False, False, False, False)).num_literals
@@ -1337,11 +1384,15 @@ def main():
         for r in rules:
             unique.setdefault((r["head"], tuple(sorted(r["literals"]))), r)
     keys = list(unique)
-    counts = recount(model, training_data, training_data["train_videos"], [unique[k] for k in keys], head_mask,
-                     possible, cfg, derived)
+    if args.lab_fast == "True":
+        # Quick test: the counts of the train sample (weighted rows, its onsets) instead of every train row.
+        counts = sample_counts([unique[k] for k in keys], train, L, device, model.num_atoms)
+    else:
+        counts = recount(model, training_data, training_data["train_videos"], [unique[k] for k in keys], head_mask,
+                         possible, cfg, derived)
     exact = {k: i for i, k in enumerate(keys)}
     priors = [float(x) for x in args.lab_priors.split(",")]
-    soft_modes = [m for m in args.lab_soft.split(",") if m]
+    soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     rule_sets, texts = {}, {}
     for name in variants:
         components, flags = parse_variant(name)
@@ -1356,7 +1407,7 @@ def main():
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
         full = make_ext((True, False, False, False, False, False))
-        if args.lab_merge_ratio > 0:
+        if args.lab_merge_ratio > 0 and args.lab_fast != "True":
             pools = {}
 
             def pool_of(h):

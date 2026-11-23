@@ -10,33 +10,64 @@ the other agents' motion: pooled over the scene it says little (`step05.rule_inp
 describe the agent by the boxes near it or similar to it. They follow three grouping principles: proximity,
 similarity and common fate.
 
-## Atoms
+## v1 result (rule lab, 2026-11-23, 83 heads, no MLP)
 
-There are 27 atoms. They are inputs only, read in the agent's own scope, and must hold for 3 frames in a row.
-They are computed per frame from the GT boxes; the ego has no box.
+The main model (relaxed+precise_nn, shape v5) with the v1 atoms vs without them:
 
-**Definitions:**
-- **Move:** the centre over K = 2 frames. It is a direction if it moved at least 3 px, "still" if less.
-- **Near:** the two centres are closer than 2 x the mean of the boxes' larger sides.
-- **Similar:** the height ratio is below 1.5.
-- **Same / opposite / cross:** both move, and their directions differ by < 45 / > 135 degrees / in between.
+| Scorer | Difference | Heads better / worse | 95% CI |
+|---|---|---|---|
+| soft_logit | +0.006 | 25 / 25 | [-0.005, +0.018] |
+| sparse_c | -0.002 | 24 / 33 | |
+| crisp | -0.001 | | |
 
-**Atoms:**
+No clear gain. The v1 atoms were agent-relative counts (near_1..3, co_move_1/2, scene counts 2 / 4). Their rules
+used mostly the negations as filler (`!gst:near_1` 78x, `!gst:scene_left_4` 54x).
+
+## Atoms (v2, the user: two or three cars moving right together are the same fact)
+
+A **group** is a set of at least 2 agents of one kind that are close and move the same way. Its size does not
+matter.
+- **Kinds:** vehicles (two-wheelers included) and pedestrians. Traffic lights belong to no group.
+- **Close and same way:** centres closer than 2 x the mean of the boxes' larger sides; both moving (at least
+  3 px over 2 frames); directions differing by < 45 degrees.
+- **The group:** a connected component of these links.
+- **Its direction:** the members' mean direction, as a quadrant (right / up / left / down).
+
+24 atoms, own scope, debounced over 3 frames, for kind in {veh, ped} and quadrant q:
 
 | Atom | Holds when |
 |---|---|
-| `gst:near_{1,2,3}` | at least 1 / 2 / 3 near agents |
-| `gst:near_same_cls`, `gst:near_similar` | a near agent of the same class / of a similar size |
-| `gst:co_move_{1,2}`, `gst:co_move_similar` | near agents moving the same way as the agent (common fate) |
-| `gst:counter_move`, `gst:cross_move` | a near agent moving the opposite way / across |
-| `gst:others_move_i_still_{1,2}` | the agent is still while near agents move: the group starts, the agent not yet |
-| `gst:i_move_others_still` | the agent moves, the near agents stand |
-| `gst:near_flow_{right,up,left,down}` | the near movers agree on a direction (mean unit vector >= 0.5) in that quadrant |
-| `gst:scene_{right,up,left,down}_{2,4}` | at least 2 / 4 other agents anywhere move in that quadrant |
-| `gst:scene_co_move_{2,4}` | at least 2 / 4 other agents anywhere move the same way as the agent |
+| `gst:in_group_{kind}_{q}` | the agent is a member of such a group |
+| `gst:near_group_{kind}_{q}` | a member of such a group is near the agent, which is not in it (e.g. the car that stays while the queue starts) |
+| `gst:group_{kind}_{q}` | the scene has such a group |
 
-In the rule lab the gestalt atoms may not be mining roots (`--lab_root_exclude shape,gestalt`): `near_1` holds
-almost always, as `shp:app_middle` did. The `_ng` variants go without them.
+**360-degree group directions (v3).** As the shape atoms' `dir_θ`, θ = 0, 5, .., 355:
+- `gst:in_group_dir_θ`: the agent's own group moves into the half circle [θ, θ + 180);
+- `gst:near_group_dir_θ`: the group of the nearest member of another group does.
+
+Two of them give any sector. The rule lab prints them merged (`gst:in_group_dir[345, 350)`), narrows them to
+where the onsets concentrate and merges close sectors. That makes 24 + 144 = 168 gestalt atoms.
+
+**v4 (the user: every concept of a single box has its counterpart for a group).** A group is described as a box
+of its own: the union of its members' boxes, frame by frame. Two group tracks per agent:
+- `grp_`: the agent's own group;
+- `ngrp_`: the group of the nearest member of another group.
+
+Each track gets every shape atom (`shape.py`) and the members' labels. The v3 `in_group_dir` / `near_group_dir`
+atoms are `grp_dir` / `ngrp_dir` now.
+
+| Single box | Group counterpart |
+|---|---|
+| primitives, phases p1-p4, order-free `rec_*` | `gst:grp_p1_x_right`, `gst:grp_rec_w_grow+h_grow`, `gst:ngrp_...` |
+| 360-degree `dir_θ` / `path_θ` | `gst:grp_dir_θ`, `gst:grp_path_θ` (the path since the group formed) |
+| `app_*`, aspect, `young` | where the group formed, the group box's aspect, the group formed recently |
+| labels (`Car:Brake`) | `gst:grp_any_Brake` (another member brakes), `gst:grp_all_Stop` (every member stands) |
+
+Members join and leave, so the group box also grows or shrinks with the membership (the group spreads or
+gathers). On SUMO v7 there are 24 + 2 x 225 + 4 x 22 = 562 gestalt atoms. In the rule lab they are read in the
+newest slot only, as the shape atoms.
+
+The negated gestalt literals are off in the rule lab (`--lab_gst_negated False`).
 
 ## Shape atoms v5
 
@@ -48,10 +79,10 @@ gain, 3x the rules).
 ```bash
 # 1. Once: the training data (shape v5 + gestalt), the OnsetMLP and the row sample.
 ./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True \
-    --run_id 20261123-gestalt_lab --lab_prepare_only True
+    --run_id 20261123-gestalt4_lab --lab_prepare_only True
 # 2. The four variants in parallel (tmux: docker -it needs a terminal).
 for spec in "2 relaxed+precise_nn_ns_ng" "3 relaxed+precise_nn_ng" "4 relaxed+precise_nn_ns" "5 relaxed+precise_nn"; do
   set -- $spec
-  tmux new-session -d -s gst_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt_lab --lab_variants $2 2>&1 | tee rule_lab_gst_gpu$1.log; read"
+  tmux new-session -d -s gst_gpu$1 "./run_roadpp_docker.sh --gpu $1 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --gestalt True --run_id 20261123-gestalt4_lab --lab_variants $2 2>&1 | tee rule_lab_gst_gpu$1.log; read"
 done
 ```

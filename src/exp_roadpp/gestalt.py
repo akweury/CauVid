@@ -1,75 +1,94 @@
-"""Gestalt atoms: an agent's relation to the boxes around it, by proximity, similarity and common fate, as inputs
-of the rules (2026-11-23, the user's request).
+"""Gestalt atoms: groups of boxes that are close and move the same way (common fate), described with the same
+concepts as a single box, as inputs of the rules (2026-11-23, the user's request).
 
 Why: several boxes moving the same way at once (a queue starting at a green light, a group of pedestrians
-crossing, the traffic flowing right while one car stays) says what an agent will do, beyond its own box. The
-other-agent scope of the rules pools a label over every agent of the scene. The other agents' motion is not
-read there at all (`step05.rule_input_mask`), because pooled over the whole scene it says little. These atoms
-keep only the agents near the agent or similar to it.
+crossing, the traffic flowing right while one car stays) says what an agent will do, beyond its own box.
 
-Per frame t and agent i with a box (pixels of the image; the ego has no box and is never a partner):
-  move     the centre's move over K frames (both boxes uncut by the image border): a direction if >= MOVE_PX,
-           "still" if below;
-  near     another agent j whose centre is closer than NEAR x the mean of the two boxes' larger sides;
-  similar  |log(height_i / height_j)| < log(SIMILAR);
-  same / opposite / cross  both move and their directions differ by < SAME / > 180 - SAME / in between.
-Atoms (inputs only, own agent scope, debounced over DEBOUNCE frames):
-  "gst:near_{1,2,3}"              >= 1 / 2 / 3 near agents;
-  "gst:near_same_cls"             a near agent of the same class;
-  "gst:near_similar"              a near agent of a similar size;
-  "gst:co_move_{1,2}"             >= 1 / 2 near agents moving the same way as i (common fate);
-  "gst:co_move_similar"           a near agent of a similar size moving the same way;
-  "gst:counter_move"              a near agent moving the opposite way;
-  "gst:cross_move"                a near agent moving across i's direction;
-  "gst:others_move_i_still_{1,2}" i is still, >= 1 / 2 near agents move (the group starts, i not yet);
-  "gst:i_move_others_still"       i moves, near agents are there and none of them moves;
-  "gst:near_flow_{right,up,left,down}"  the near movers (excluding i) agree on a direction (mean unit vector
-                                  >= FLOW_AGREE long) that lies in that quadrant;
-  "gst:scene_{right,up,left,down}_{2,4}"  >= 2 / 4 other agents anywhere move in that quadrant;
-  "gst:scene_co_move_{2,4}"       >= 2 / 4 other agents anywhere move the same way as i.
-Quadrants: right [315, 45), up [45, 135), left [135, 225), down [225, 315) degrees (0 right, 90 up).
+History:
+  - v1: agent-relative counts (near_1..3, co_move_1/2, scene counts 2 / 4). No clear gain (rule lab 2026-11-23,
+    83 heads: soft +0.006, CI [-0.005, +0.018]); the rules used mostly the negations ("!gst:near_1") as filler.
+  - v2: a group is >= 2 agents, close and moving the same way, whatever its size (the user: two or three cars
+    moving right together are the same fact).
+  - v3: + the group's 360-degree direction.
+  - v4 (the user: every concept of a single box has its counterpart for a group): a group is described as a
+    box of its own, with every shape atom (`shape.py`), and by its members' labels.
+
+Groups, per frame t (pixels of the image; the ego has no box and is never a member):
+  move     the centre's move over K frames (both boxes uncut by the image border): a direction if >= MOVE_PX;
+  near     two centres closer than NEAR x the mean of the two boxes' larger sides;
+  link     two agents of the same kind (KINDS: vehicles incl. two-wheelers, pedestrians; traffic lights none),
+           near, both moving, directions differing by < SAME degrees;
+  group    a connected component of the links with >= 2 agents; its quadrant is that of the members' mean
+           direction: right [315, 45), up [45, 135), left [135, 225), down [225, 315) degrees (0 right, 90 up).
+Two group tracks per agent i:
+  grp      i's own group, while i is in one;
+  ngrp     the group of the nearest member of another group near i.
+The track's box is the union of the members' boxes, frame by frame. Members join and leave, so the box can grow or
+shrink with the membership too (the group spreads, gathers).
+
+Atoms (inputs only, own agent scope):
+  "gst:{in_group,near_group,group}_{kind}_{q}"  i is in / is near / the scene has a group of that kind moving to
+      q (debounced over DEBOUNCE frames);
+  "gst:grp_{a}" / "gst:ngrp_{a}"  every shape atom a of `shape.py` (phases, order-free "rec", the box when the
+      group formed, its aspect, "young", 360-degree "dir" / "path") of the group track's box: e.g.
+      "gst:grp_rec_w_grow+h_grow" (the group comes closer), "gst:ngrp_dir_200" (the nearby group's move lies in
+      [200, 380));
+  "gst:{grp,ngrp}_any_{action}"  some other member holds the action label (Brake, Stop, TurRht, IncomLane, ..);
+  "gst:{grp,ngrp}_all_{action}"  every member holds it (debounced).
+The actions are the label names after "Class:" of the agent classes, the ego's (av:) left out.
 """
-import math
-
 import torch
 
+from src.exp_roadpp import shape as agent_shape
+
 K = 2                                   # frames of the move (as `shape.K`)
-MOVE_PX = 3.0                           # a move below this over K frames is "still"
+MOVE_PX = 3.0                           # a move below this over K frames gives no direction
 NEAR = 2.0                              # centre distance < NEAR x the mean of the two boxes' larger sides
-SIMILAR = 1.5                           # height ratio below this: similar size
-SAME = 45.0                             # degrees: same direction below, opposite above 180 - SAME
-FLOW_AGREE = 0.5                        # the near movers' mean unit vector must be at least this long
+SAME = 45.0                             # degrees: linked if the directions differ by less
 DEBOUNCE = 3
 EDGE = 0.005
 FRAME_SIZE_PX = (1920, 1280)
 QUADRANTS = ("right", "up", "left", "down")
-VERSION = "v1"
+KINDS = ("veh", "ped")
+PED_CLASSES = ("Ped",)
+NO_KIND = ("TL",)                       # traffic lights: no motion of their own, never in a group
+VERSION = "v4"
 
 
-def atom_names():
-    names = ["near_1", "near_2", "near_3", "near_same_cls", "near_similar", "co_move_1", "co_move_2",
-             "co_move_similar", "counter_move", "cross_move", "others_move_i_still_1", "others_move_i_still_2",
-             "i_move_others_still"]
-    names += [f"near_flow_{q}" for q in QUADRANTS]
-    names += [f"scene_{q}_{k}" for q in QUADRANTS for k in (2, 4)]
-    names += ["scene_co_move_2", "scene_co_move_4"]
+def actions(label_names):
+    """The action names of the label atoms ("Car:Brake" -> "Brake"), the ego's and the traffic lights' left out,
+    in first-seen order."""
+    out = []
+    for nm in label_names:
+        cls, _, act = nm.partition(":")
+        if act and cls not in ("av", "TL") and act not in out:
+            out.append(act)
+    return out
+
+
+def atom_names(label_names):
+    names = [f"{rel}_{k}_{q}" for rel in ("in_group", "near_group", "group") for k in KINDS for q in QUADRANTS]
+    names += [f"{g}_{a}" for g in ("grp", "ngrp") for a in agent_shape.ATOMS]
+    names += [f"{g}_{m}_{a}" for g in ("grp", "ngrp") for m in ("any", "all") for a in actions(label_names)]
     return names
 
 
-ATOMS = tuple(atom_names())
-
-
 def tag():
-    return f"_gst{K}n{NEAR:g}s{SIMILAR:g}{VERSION}"
+    return f"_gst{K}n{NEAR:g}a{SAME:g}{VERSION}"
 
 
-def vocabulary():
-    """Signatures of the gestalt atoms; `step05._atom_name` reads them as "gst:co_move_1"."""
-    return [["pred", "gestalt", "gestalt_label", a, "agent_class_label", "gst"] for a in ATOMS]
+def vocabulary(label_names):
+    """Signatures of the gestalt atoms; `step05._atom_name` reads them as "gst:grp_p1_x_right". label_names: the
+    names of the label atoms (`step05._atom_name`)."""
+    return [["pred", "gestalt", "gestalt_label", a, "agent_class_label", "gst"] for a in atom_names(label_names)]
+
+
+def default_shape_spec():
+    """Shape thresholds without a fit (the FLOORS), for the group tracks when the shape atoms are off."""
+    return agent_shape.fit({})
 
 
 def _quadrant(angle):
-    """(...,) long 0..3 (QUADRANTS) of degrees, -1 for NaN."""
     q = (((angle + 45) % 360) // 90).long()
     return torch.where(torch.isnan(angle), torch.full_like(q, -1), q)
 
@@ -83,68 +102,110 @@ def _debounce(cond):
     return out
 
 
-def gestalt_atoms(boxes, has_box, classes):
-    """(T, N, len(ATOMS)) bool gestalt atoms of one video. boxes (T, N, 4) normalized (NaN without a box),
-    has_box (T, N) bool (False for the ego), classes [N] the agents' class labels."""
-    boxes, has_box = boxes.cpu().float(), has_box.cpu()
+def _components(adj, valid):
+    """(T, N) long component label (the smallest member index; N for agents not in valid) of (T, N, N) links."""
+    T, N, _ = adj.shape
+    adj = adj | (torch.eye(N, dtype=torch.bool)[None] & valid[:, :, None])
+    label = torch.where(valid, torch.arange(N)[None].expand(T, N), N)
+    while True:
+        new = torch.where(valid, torch.where(adj, label[:, None, :], N).amin(dim=2), N)
+        if torch.equal(new, label):
+            return label
+        label = new
+
+
+def gestalt_atoms(boxes, has_box, classes, X_labels, label_names, shape_spec=None):
+    """(T, N, len(atom_names(label_names))) bool gestalt atoms of one video. boxes (T, N, 4) normalized (NaN
+    without a box), has_box (T, N) bool (False for the ego), classes [N] the agents' class labels, X_labels
+    (T, N, A_labels) bool the label atoms, label_names their names, shape_spec the shape thresholds (`shape.fit`;
+    None: `default_shape_spec`)."""
+    spec = shape_spec if shape_spec is not None else default_shape_spec()
+    boxes, has_box, X_labels = boxes.cpu().float(), has_box.cpu(), X_labels.cpu().bool()
     T, N, _ = boxes.shape
+    acts = actions(label_names)
+    n_total = len(atom_names(label_names))
+    if N == 0:
+        return torch.zeros((T, N, n_total), dtype=torch.bool)
     W, H = FRAME_SIZE_PX
     b = boxes.nan_to_num(0.0)
     x1, y1, x2, y2 = (boxes[..., i] for i in range(4))
     cx, cy = (b[..., 0] + b[..., 2]) / 2 * W, (b[..., 1] + b[..., 3]) / 2 * H
-    w, h = ((b[..., 2] - b[..., 0]) * W).clamp(min=1.0), ((b[..., 3] - b[..., 1]) * H).clamp(min=1.0)
-    side = torch.maximum(w, h)
+    side = torch.maximum(((b[..., 2] - b[..., 0]) * W).clamp(min=1.0), ((b[..., 3] - b[..., 1]) * H).clamp(min=1.0))
     uncut = has_box & ~((x1 < EDGE) | (y1 < EDGE) | (x2 > 1 - EDGE) | (y2 > 1 - EDGE))
-    # Own move: a direction (moving) or still, unknown without two uncut boxes K frames apart.
     angle = torch.full((T, N), float("nan"))
-    still = torch.zeros((T, N), dtype=torch.bool)
     if T > K:
         dx, dy = cx[K:] - cx[:-K], cy[K:] - cy[:-K]
-        ok = uncut[K:] & uncut[:-K]
-        dist = torch.hypot(dx, dy)
-        angle[K:] = torch.where(ok & (dist >= MOVE_PX), torch.rad2deg(torch.atan2(-dy, dx)) % 360,
-                                torch.full_like(dx, float("nan")))
-        still[K:] = ok & (dist < MOVE_PX)
+        ok = uncut[K:] & uncut[:-K] & (torch.hypot(dx, dy) >= MOVE_PX)
+        angle[K:] = torch.where(ok, torch.rad2deg(torch.atan2(-dy, dx)) % 360, torch.full_like(dx, float("nan")))
     moving = ~torch.isnan(angle)
-    # Pairs (T, N, N): i the agent, j the partner.
+    kind = torch.tensor([-1 if c is None or str(c) in NO_KIND else (1 if str(c) in PED_CLASSES else 0)
+                         for c in classes], dtype=torch.long)
     eye = torch.eye(N, dtype=torch.bool)[None]
     pair = has_box[:, :, None] & has_box[:, None, :] & ~eye
     dist = torch.hypot(cx[:, :, None] - cx[:, None, :], cy[:, :, None] - cy[:, None, :])
     near = pair & (dist < NEAR * (side[:, :, None] + side[:, None, :]) / 2)
-    similar = (torch.log(h[:, :, None] / h[:, None, :])).abs() < math.log(SIMILAR)
-    cls = {c: k for k, c in enumerate(sorted({str(c) for c in classes}))}
-    cid = torch.tensor([cls[str(c)] for c in classes], dtype=torch.long) if N else torch.zeros(0, dtype=torch.long)
-    same_cls = (cid[:, None] == cid[None, :])[None]
-    both = moving[:, :, None] & moving[:, None, :]
-    dang = ((angle[:, :, None] - angle[:, None, :] + 180) % 360 - 180).abs()               # NaN compares False
-    same = both & (dang < SAME)
-    opposite = both & (dang > 180 - SAME)
-    cross = both & ~same & ~opposite
-    n_near = near.sum(dim=2)
-    co = (near & same).sum(dim=2)
-    near_moving = (near & moving[:, None, :]).sum(dim=2)
-    near_still = (near & still[:, None, :]).sum(dim=2)
-    # Mean direction of the near movers (unit vectors, i excluded).
+    dang = ((angle[:, :, None] - angle[:, None, :] + 180) % 360 - 180).abs()           # NaN compares False
+    same_kind = (kind[:, None] == kind[None, :]) & (kind[:, None] >= 0)
+    link = near & same_kind[None] & moving[:, :, None] & moving[:, None, :] & (dang < SAME)
+    member_ok = moving & (kind >= 0)[None]
+    label = _components(link, member_ok)                                                # (T, N), N: none
+    lab = label.clamp(max=N - 1)
+    member = torch.nn.functional.one_hot(label, N + 1)[..., :N].bool() & member_ok[..., None]   # (T, i, g)
+    size = member.sum(dim=1)                                                            # (T, g)
+    is_group = size >= 2
+    in_group = (label < N) & is_group.gather(1, lab)
     rad = torch.deg2rad(angle.nan_to_num(0.0))
-    ux, uy = torch.where(moving, torch.cos(rad), 0.0), torch.where(moving, torch.sin(rad), 0.0)
-    nm = (near & moving[:, None, :]).float()
-    sx, sy = (nm * ux[:, None, :]).sum(2), (nm * uy[:, None, :]).sum(2)
-    flow = torch.rad2deg(torch.atan2(sy, sx)) % 360
-    agree = torch.hypot(sx, sy) >= FLOW_AGREE * near_moving                 # the near movers agree on a direction
-    flow = torch.where((near_moving > 0) & agree, flow, torch.full_like(flow, float("nan")))
-    flow_q = _quadrant(flow)
-    # Scene: every other agent with a box, by the quadrant of its move.
-    q_all = _quadrant(angle)                                                                 # (T, N)
-    scene_q = torch.stack([((q_all == k) & has_box).sum(dim=1) for k in range(4)], dim=1)  # (T, 4)
-    own_q = torch.nn.functional.one_hot(q_all.clamp(min=0), 4).bool() & (q_all >= 0)[..., None]
-    scene_others = scene_q[:, None, :] - own_q.long()                                        # (T, N, 4)
-    scene_co = (pair & same).sum(dim=2)
-    cond = [n_near >= 1, n_near >= 2, n_near >= 3, (near & same_cls).any(dim=2), (near & similar).any(dim=2),
-            co >= 1, co >= 2, (near & similar & same).any(dim=2), (near & opposite).any(dim=2),
-            (near & cross).any(dim=2), still & (near_moving >= 1), still & (near_moving >= 2),
-            moving & (n_near >= 1) & (near_moving == 0) & (near_still >= 1)]
-    cond += [flow_q == k for k in range(4)]
-    cond += [scene_others[..., k] >= n for k in range(4) for n in (2, 4)]
-    cond += [scene_co >= 2, scene_co >= 4]
-    out = torch.stack(cond, dim=2)
-    return _debounce(out) & has_box[..., None]
+    gx = (member.float() * torch.cos(rad)[..., None]).sum(dim=1)
+    gy = (member.float() * torch.sin(rad)[..., None]).sum(dim=1)
+    gq = torch.where(is_group, _quadrant(torch.rad2deg(torch.atan2(gy, gx)) % 360), torch.full_like(size, -1))
+    gkind = torch.where(is_group, kind[None].expand(T, N), torch.full_like(size, -1))
+    # The nearest member of another group near i: its group is i's "near group".
+    other = near & (label < N)[:, None, :] & is_group.gather(1, lab)[:, None, :] \
+        & ((label[:, None, :] != label[:, :, None]) | ~in_group[..., None])
+    nearest = torch.where(other, dist, torch.full_like(dist, float("inf"))).argmin(dim=2)
+    has_near = other.any(dim=2)
+    near_g = label.gather(1, nearest).clamp(max=N - 1)                                  # (T, N) the near group
+    my_g = lab
+    out = []
+    # Quadrants (debounced).
+    quad = []
+    for rel in ("in_group", "near_group", "group"):
+        for k in range(len(KINDS)):
+            for q in range(4):
+                sel = (gq == q) & (gkind == k)                                          # (T, g)
+                if rel == "in_group":
+                    quad.append(in_group & sel.gather(1, my_g))
+                elif rel == "near_group":
+                    quad.append(has_near & sel.gather(1, near_g))
+                else:
+                    quad.append(sel.any(dim=1)[:, None].expand(T, N))
+    out.append(_debounce(torch.stack(quad, dim=2)))
+    # The group tracks' boxes: the union of the members' boxes (normalized), and every shape atom of them.
+    big = torch.full_like(b[..., 0], float("inf"))[..., None]
+    mins = [torch.where(member, b[..., c][..., None], big).amin(dim=1) for c in (0, 1)]
+    maxs = [torch.where(member, b[..., c][..., None], -big).amax(dim=1) for c in (2, 3)]
+    gbox = torch.stack(mins + maxs, dim=2)                                              # (T, g, 4)
+
+    def track(g_index, valid):
+        bx = gbox.gather(1, g_index[..., None].expand(T, N, 4))
+        return torch.where(valid[..., None], bx, torch.full_like(bx, float("nan")))
+    out.append(agent_shape.shape_atoms(track(my_g, in_group), in_group, classes, spec))
+    out.append(agent_shape.shape_atoms(track(near_g, has_near), has_near, classes, spec))
+    # Labels of the members: some other member / every member holds the action.
+    A_lab = X_labels.shape[2]
+    act_of = torch.zeros((A_lab, max(len(acts), 1)), dtype=torch.float)
+    for a, nm in enumerate(label_names[:A_lab]):
+        cls, _, act = nm.partition(":")
+        if act in acts and cls not in ("av", "TL"):
+            act_of[a, acts.index(act)] = 1.0
+    holds = ((X_labels.float() @ act_of) > 0)[..., :len(acts)]                          # (T, N, n_act)
+    labs = []
+    for g_index, valid, own in ((my_g, in_group, True), (near_g, has_near, False)):
+        mem = (label[:, None, :] == g_index[:, :, None]) & (label < N)[:, None, :] & valid[..., None]   # (T, i, j)
+        others = mem & ~eye if own else mem
+        cnt = mem.sum(dim=2, keepdim=True)
+        any_ = torch.einsum("tij,tja->tia", others.float(), holds.float()) > 0
+        all_ = (torch.einsum("tij,tja->tia", mem.float(), holds.float()) >= cnt) & (cnt > 0)
+        labs += [any_ & valid[..., None], all_ & valid[..., None]]
+    out.append(_debounce(torch.cat(labs, dim=2)))
+    return torch.cat(out, dim=2) & has_box[..., None]
