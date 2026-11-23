@@ -45,6 +45,16 @@ DRIFT_K frames, per frame, in image widths. A yaw moves every point of the image
 moves them outward, which cancels in the median of both sides), so a left turn moves the scene right. Signed atoms
 "turn_right" / "turn_straight" / "turn_left" (the scene moves left / little / right), the dead band the
 SIGNED_Q_OF["scene_drift"] quantile of |drift| over the train frames (a turn is the exception).
+v5 (2026-11-23, the user on the failure clips: before a left turn from a stop the ego moves left a few frames
+before the label, and many objects move right together at a similar speed; `turn_fail_clips`: the v4 median was
+pulled by the crossing traffic, often to the wrong side, and the 5-frame mean plus the debounce made turn_left hold
+~4 frames late, at or after the onset):
+  - per box the horizontal move over DRIFT_K frames minus the forward motion's outflow ((cx - 0.5) x the change
+    of log box width: a static box moves away from the image centre as it grows), per frame;
+  - the drift is the common fate of the boxes: the largest set of boxes whose moves agree (within DRIFT_TOL_ABS
+    or DRIFT_TOL_REL of each other), its mean, if it has >= DRIFT_MIN boxes and >= DRIFT_SHARE of the boxes;
+    NaN else. Crossing traffic and single movers fall out;
+  - no moving average and no debounce for the turn atoms (NO_DEBOUNCE).
 A level holds at t only if it held in the motion.DEBOUNCE frames up to t (no flicker at a cut).
 The rules read the levels per memory slot, so a change ("fast 3 s ago, slow now") is a rule of
 two atoms in two slots. The ego's atoms are not pooled away in the other-agent scope (only the ego
@@ -58,8 +68,8 @@ SMOOTH = 5                                  # frames of the moving average of th
 STILL = {"scene_scale": 0.002, "scene_outflow": 0.004}  # the median of many boxes jitters less than one
 QUANTILES = (1 / 3, 2 / 3)
 MAX_SAMPLES = 1_000_000
-VERSION = "v4"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands;
-                                            # v4: the turn atoms (scene drift)
+VERSION = "v5"                              # v2: the traffic light atoms; v3: their 2 s rates, fitted bands;
+                                            # v4: the turn atoms (scene drift); v5: drift = common fate, no lag
 TL_CLASSES = ("TL",)                        # the ego's traffic light (ROAD++ "OthTL": the other directions)
 SIGNALS = ("scene_scale", "scene_outflow", "ahead_log_area", "ahead_scale", "near_rate",
            "tl_log_area", "tl_scale", "tl_lateral", "tl_vertical", "scene_drift")
@@ -77,6 +87,10 @@ SIGNED = {                                  # signal: atom names (below -band, w
     "scene_drift": ("turn_right", "turn_straight", "turn_left"),   # v4: the scene moves left / little / right
 }
 DRIFT_K = 2                                 # frames of the box moves of scene_drift (as the shape atoms)
+DRIFT_TOL_ABS = 0.002                       # v5: two moves agree within this (image widths / frame) ..
+DRIFT_TOL_REL = 0.25                        # .. or this share of the larger one
+DRIFT_MIN, DRIFT_SHARE = 2, 1 / 3           # v5: the common set needs this many boxes and this share of them
+NO_DEBOUNCE = ("scene_drift",)              # v5: the turn atoms hold from the first frame (no lag)
 TL_K = 20                                   # frames (2 s) of the traffic light's rate differences
 SIGNED_Q = 1 / 3                            # dead band: this quantile of |rate| (train frames with a light)
 SIGNED_Q_OF = {"scene_drift": 0.8}          # v4: a turn moves the scene in few frames, the band is wider
@@ -165,13 +179,32 @@ def signals(boxes, has_box, classes, ego, X_labels, unique_atoms):
     has_tl = torch.isfinite(best)
     out["tl_log_area"] = torch.where(has_tl, best, float("nan"))
     out.update(tl_rates(boxes, ok, best, m, has_tl))
-    out["scene_drift"] = smooth(scene_drift(boxes, ok, ego))
+    out["scene_drift"] = scene_drift(boxes, ok, ego)                               # v5: no moving average
     return out
 
 
+def common_move(move, valid):
+    """(F,) v5: per frame the mean move of the largest set of agents whose moves agree (|m_i - m_j| <=
+    max(DRIFT_TOL_ABS, DRIFT_TOL_REL x max(|m_i|, |m_j|))), if it has >= DRIFT_MIN agents and >= DRIFT_SHARE of
+    the valid ones; NaN else. move, valid (F, N)."""
+    m = torch.where(valid, move, torch.zeros_like(move))
+    diff = (m[:, :, None] - m[:, None, :]).abs()
+    tol = torch.maximum(torch.full_like(diff, DRIFT_TOL_ABS),
+                        DRIFT_TOL_REL * torch.maximum(m.abs()[:, :, None], m.abs()[:, None, :]))
+    agree = (diff <= tol) & valid[:, :, None] & valid[:, None, :]                  # (F, i, j)
+    count = agree.sum(dim=2)                                                       # (F, i): agents agreeing with i
+    best, i = count.max(dim=1)
+    members = agree[torch.arange(len(m)), i]                                       # (F, j)
+    mean = (m * members).sum(dim=1) / members.sum(dim=1).clamp(min=1)
+    n = valid.sum(dim=1)
+    ok = (best >= DRIFT_MIN) & (best.float() >= DRIFT_SHARE * n.float())
+    return torch.where(ok, mean, torch.full_like(mean, float("nan")))
+
+
 def scene_drift(boxes, ok, ego, k=DRIFT_K):
-    """(T,) v4: the median over the agents (the ego left out) of the horizontal move of the box centre from
-    t - k to t, per frame, in image widths; both boxes uncut by the image border; NaN where none."""
+    """(T,) v5: the common horizontal move of the agents' boxes (the ego left out, both boxes uncut by the image
+    border) from t - k to t, per frame, in image widths, the forward motion's outflow taken out (`common_move`);
+    NaN where no common move."""
     T, N, _ = boxes.shape
     E = agent_motion.EDGE
     x1, y1, x2, y2 = boxes.unbind(dim=2)
@@ -180,10 +213,13 @@ def scene_drift(boxes, ok, ego, k=DRIFT_K):
         uncut = uncut.clone()
         uncut[:, ego] = False
     cx = (x1 + x2) / 2
+    log_w = torch.log((x2 - x1).clamp(min=1e-4))
     out = torch.full((T,), float("nan"))
     if T > k:
-        move = (cx[k:] - cx[:-k]) / k
-        out[k:] = scene_median(move, uncut[k:] & uncut[:-k])
+        valid = uncut[k:] & uncut[:-k]
+        outflow = (cx[:-k] - 0.5) * (log_w[k:] - log_w[:-k])                     # a static box under forward motion
+        move = (cx[k:] - cx[:-k] - outflow) / k
+        out[k:] = common_move(move.nan_to_num(0.0), valid)
     return out
 
 
@@ -249,5 +285,11 @@ def ego_atoms(sig, spec):
     for s in SIGNED:
         v, band = sig[s], spec["bands"][s]
         cond += [v < -band, v.abs() <= band, v > band]                             # NaN: all False
-    cond = torch.stack(cond, dim=1)[:, None]                                        # (T, 1, M)
-    return agent_motion._debounce(cond)[:, 0]
+    cond = torch.stack(cond, dim=1)                                                 # (T, M)
+    out = agent_motion._debounce(cond[:, None])[:, 0]
+    i = 1 + 3 * len(LEVELS)
+    for s in SIGNED:                                                                # v5: no lag for these
+        if s in NO_DEBOUNCE:
+            out[:, i:i + 3] = cond[:, i:i + 3]
+        i += 3
+    return out
