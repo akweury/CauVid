@@ -689,61 +689,142 @@ def adapt_rule(pool, rows, lits, lmap, allowed, cfg):
     return best
 
 
-def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device):
-    """The "tr" rules of the target heads (see above)."""
+def _map_index(lmap, L, src, dst):
+    """(L,) long: per literal of the target class dst the source column (-1: always false, -2: always true for a
+    dst agent), so a source pool's rows read as rows of the target class ("pooled" transfer)."""
+    idx = torch.arange(L)
+    for t in range(L):
+        if t >= len(lmap.tab):
+            idx[t] = -1                                                     # derived literals: not mapped
+            continue
+        info = lmap.tab[t]
+        if info["kind"] in ("X", "!X") and info["scope"] == 0:
+            cls, _, act = lmap.names[info["atom"]].partition(":")
+            if cls == src:
+                idx[t] = -1 if info["kind"] == "X" else -2                  # src's own atoms never hold for dst
+            elif cls == dst:
+                s = lmap.swap_class(t, dst, src)
+                idx[t] = -1 if s is None else s
+    return idx
+
+
+def _mapped_pool(pool, idx, offset):
+    """A source pool in the target's literal space (`_map_index`), its onsets and videos offset."""
+    dev = pool["F"].device
+    i = idx.to(dev)
+    F = pool["F"][:, i.clamp(min=0)]
+    F[:, i == -1] = 0.0
+    F[:, i == -2] = 1.0                                                     # a negated src-own literal: always true
+    return {"F": F, "y": pool["y"], "w": pool["w"], "event": pool["event"] + offset, "video": pool["video"] + offset}
+
+
+def _cat_pools(pools):
+    return {k: torch.cat([p[k] for p in pools]) for k in ("F", "y", "w", "event", "video")}
+
+
+def _foil_rank(found, pool):
+    """found [(literals, precision, onsets)] best by FOIL gain (onsets x log(precision / rate)): wide rules first,
+    which transfer better than narrow ones (2026-11-24)."""
+    rate = float((pool["w"] * pool["y"]).sum() / pool["w"].sum().clamp(min=1e-12))
+    return sorted(found, key=lambda x: -(x[2] * math.log(max(x[1], 1e-9) / max(rate, 1e-9))))
+
+
+def _confirm(tgt, odd, tck, lits, rate, need):
+    """Held-out onsets of a rule on the target (odd train videos + check videos) and whether it is kept: >= need
+    onsets (2026-11-24, the user: with few samples a hit counts; two hits are enough) and a held-out precision >=
+    the target's rate."""
+    p_o, _s, e_o = _rule_stats(tgt, odd, lits)
+    hold_o = odd & (tgt["F"][:, list(lits)] > 0.5).all(dim=1)
+    f, h = float(tgt["w"][hold_o].sum()), float(tgt["w"][hold_o & tgt["y"]].sum())
+    e = e_o
+    if tck is not None and len(tck["y"]):
+        hold_c = (tck["F"][:, list(lits)] > 0.5).all(dim=1)
+        e += int(tck["event"][hold_c & tck["y"]].unique().numel())
+        rate_c = float((tck["w"] * tck["y"]).sum() / tck["w"].sum().clamp(min=1e-12))
+        # check weights differ from train weights: scale the check rows to the train rate
+        sc = rate / max(rate_c, 1e-12)
+        f += float(tck["w"][hold_c].sum())
+        h += float(tck["w"][hold_c & tck["y"]].sum()) * sc
+    return e, e >= need and f > 0 and h / f >= rate
+
+
+def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pooled=False):
+    """The "tr" (per source) or "trp" (pooled) rules of the target heads (see above)."""
     base_model = getattr(ext, "_model", ext)
     lmap = LiteralMap(base_model, names)
     L, A = ext.num_literals, ext.num_atoms
     base = ext.literal_base.to(device)
     scope = base // (ext.num_spans * A)
+    tag = "trp" if pooled else "tr"
     targets, onsets = transfer_sources(names, heads, all_heads, train, cfg)
-    print(f"[Rule lab] tr: {len(targets)} target heads: "
+    print(f"[Rule lab] {tag}: {len(targets)} target heads: "
           + ", ".join(f"{names[h]} ({onsets.get(h, 0)}) <- {'/'.join(names[g] for g in src)}" for h, src in targets.items()))
     rules = []
-    for h, sources in tqdm(targets.items(), desc="Transfer"):
+    for h, sources in tqdm(targets.items(), desc="Transfer" + (" (pooled)" if pooled else "")):
         allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
         tgt = step05_mine._pool_of(train, h, L, device)
         if not bool(tgt["y"].any()):
             continue
         rate = float((tgt["w"] * tgt["y"]).sum() / tgt["w"].sum().clamp(min=1e-12))
         even = tgt["video"] % 2 == 0
+        tck = step05_mine._pool_of(check, h, L, device) if bool((check["pairs"]["head"] == h).any()) else None
         dst = names[h].partition(":")[0]
-        seen = set()
-        tally = Counter()
-        for g in sources:
-            src_pool = step05_mine._pool_of(train, g, L, device)
-            ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
-                bool((check["pairs"]["head"] == g).any()) else None
-            src_allowed = ext.input_mask.to(device) & ~((base % A == g) & (scope == 0))
-            found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
-            del src_pool, ck
-            src_cls = names[g].partition(":")[0]
-            tally["source rules"] += len(found)
-            for lits, _p, _e in found[:cfg["lab_tr_rules"]]:
+        seen, tally = set(), Counter()
+        batches = []                                       # [(source name, [(literals, src class)])]
+        if pooled:
+            parts = [{k: v[even] for k, v in tgt.items()}]
+            for k, g in enumerate(sources):
+                src_pool = step05_mine._pool_of(train, g, L, device)
+                parts.append(_mapped_pool(src_pool, _map_index(lmap, L, names[g].partition(":")[0], dst),
+                                          (k + 1) * 10 ** 9))
+                del src_pool
+            pool = _cat_pools(parts)
+            del parts
+            found, _ = exhaustive_rules(pool, allowed, cfg, None)
+            tally["pooled rows"] = len(pool["y"])
+            ranked = _foil_rank(found, pool)[:cfg["lab_tr_rules"]]
+            del pool
+            batches.append(("+".join(names[g] for g in sources), [(lits, None) for lits, _p, _e in ranked]))
+            tally["pooled rules"] += len(found)
+        else:
+            for g in sources:
+                src_pool = step05_mine._pool_of(train, g, L, device)
+                ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
+                    bool((check["pairs"]["head"] == g).any()) else None
+                src_allowed = ext.input_mask.to(device) & ~((base % A == g) & (scope == 0))
+                found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
+                ranked = _foil_rank(found, src_pool)[:cfg["lab_tr_rules"]]
+                del src_pool, ck
+                tally["source rules"] += len(found)
+                batches.append((names[g], [(lits, names[g].partition(":")[0]) for lits, _p, _e in ranked]))
+        for src_name, items in batches:
+            for lits, src_cls in items:
                 tally["tried"] += 1
-                mapped = [lmap.swap_class(m, src_cls, dst) for m in lits]
+                mapped = list(lits) if src_cls is None else [lmap.swap_class(m, src_cls, dst) for m in lits]
                 if any(m is None or not bool(allowed[m]) for m in mapped):
                     tally["not mappable"] += 1
                     continue
                 _p_m, _s, e_m = _rule_stats(tgt, even, mapped)
-                tally["mapped with >= 1 onset"] += e_m >= 1
+                tally["with >= 1 target onset"] += e_m >= 1
                 adapted = adapt_rule(tgt, even, mapped, lmap, allowed, cfg)
                 tally["changed by adaptation"] += tuple(sorted(set(mapped))) != adapted
                 if adapted in seen:
                     continue
                 seen.add(adapted)
-                p_c, _s, e_c = _rule_stats(tgt, ~even, adapted)                 # confirm on the odd videos
-                if e_c < 1 or p_c < rate:
+                e_c, ok = _confirm(tgt, ~even, tck, adapted, rate, cfg["lab_tr_confirm"])
+                if not ok:
                     tally["not confirmed"] += 1
                     continue
                 tally["kept"] += 1
-                rules.append({"head": int(h), "literals": list(adapted), "transfer": names[g],
-                              "min_events": cfg["lab_tr_min_events"]})
+                rules.append({"head": int(h), "literals": list(adapted), "transfer": f"{tag}:{src_name}",
+                              "min_events": cfg["lab_tr_min_events"], "heldout_events": e_c})
         print(f"    {names[h]}: rate {rate:.3f}, train onsets even/odd videos "
-              f"{int(tgt['event'][tgt['y'] & even].unique().numel())}/{int(tgt['event'][tgt['y'] & ~even].unique().numel())}; "
+              f"{int(tgt['event'][tgt['y'] & even].unique().numel())}/{int(tgt['event'][tgt['y'] & ~even].unique().numel())}"
+              f", check onsets {int(tck['event'][tck['y']].unique().numel()) if tck is not None else 0}; "
               + ", ".join(f"{k} {v}" for k, v in tally.items()))
-        del tgt
-    print(f"[Rule lab] tr: {len(rules)} transferred and adapted rules (confirmed on the odd train videos)")
+        del tgt, tck
+    print(f"[Rule lab] {tag}: {len(rules)} rules (confirmed: >= {cfg['lab_tr_confirm']} held-out onsets on the odd "
+          f"train and check videos)")
     return rules
 
 
@@ -843,6 +924,9 @@ def check_filter(rules, ck, index):
     "check_lift"."""
     out = []
     for r in rules:
+        if "heldout_events" in r:                         # transferred: confirmed on odd train + check videos
+            out.append(r)
+            continue
         i = index[(r["head"], tuple(sorted(r["literals"])))]
         f, h, e, n = float(ck["fires"][i]), float(ck["hits"][i]), int(ck["events"][i]), int(ck["rows"][i])
         rate = float(ck["base"][r["head"]])
@@ -1752,8 +1836,9 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
         return rules
     base = ext.literal_base.to(device)
     scope = base // (ext.num_spans * A)
-    if component == "tr":
-        return transfer_rules(ext, names, heads, cfg.get("lab_all_heads", heads), train, check, cfg, device)
+    if component in ("tr", "trp"):
+        return transfer_rules(ext, names, heads, cfg.get("lab_all_heads", heads), train, check, cfg, device,
+                              pooled=component == "trp")
     if component == "exh":
         capped = 0
         for h in tqdm(heads, desc=f"Exhaustive short rules{' + derived' if use_derived else ''}"):
@@ -1856,7 +1941,9 @@ def main():
     parser.add_argument("--lab_tr_max_onsets", type=int, default=60, help="tr: target heads below these train onsets")
     parser.add_argument("--lab_tr_min_source", type=int, default=100, help="tr: source heads with these train onsets")
     parser.add_argument("--lab_tr_rules", type=int, default=200, help="tr: source rules tried per source head")
-    parser.add_argument("--lab_tr_min_events", type=int, default=2, help="tr: train onsets a rule needs on the target")
+    parser.add_argument("--lab_tr_min_events", type=int, default=1, help="tr: train onsets a rule needs on the target")
+    parser.add_argument("--lab_tr_confirm", type=int, default=2,
+                        help="tr: held-out onsets (odd train + check videos of the target) a rule needs")
     parser.add_argument("--lab_exh_lift", type=float, default=2.0, help="exh: kept rule precision / head rate")
     parser.add_argument("--lab_exh_seed_lift", type=float, default=1.5, help="exh: pairs extended (lift)")
     parser.add_argument("--lab_exh_gain", type=float, default=1.1,
@@ -1871,7 +1958,7 @@ def main():
     cfg = step05.get_cfg(config.get_step_05_input(args))
     for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
                 "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
-                "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events"):
+                "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events", "lab_tr_confirm"):
         cfg[key] = getattr(args, key)
     cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
     device = cfg["device"]
@@ -1984,7 +2071,7 @@ def main():
     val_ids = list(training_data["val_videos"])
     step(4, "derived literals of the sampled rows")
     only = set(heads) if args.lab_heads else None
-    if only is not None and any("tr" in parse_variant(v)[0] for v in args.lab_variants.split(",")):
+    if only is not None and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in args.lab_variants.split(",")):
         srcs, _ = transfer_sources(names, heads, cfg["lab_all_heads"], train, cfg)
         only |= {g for v in srcs.values() for g in v}                 # keep the source heads' sample rows
     train = extend_rows(compact_rows(train, only), derived, model.num_literals, device, desc="Derived literals (train)")
