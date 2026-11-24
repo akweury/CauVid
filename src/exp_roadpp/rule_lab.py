@@ -2049,6 +2049,7 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_tag", type=str, default="", help="suffix of the result file (parallel runs on head batches)")
     parser.add_argument("--lab_select", type=str, default="True",
                         help="choose the variant per head on the check videos; reported as the variant 'selected'")
     parser.add_argument("--lab_select_scorer", type=str, default="soft_logit", help="the scorer of the selection")
@@ -2389,6 +2390,7 @@ def main():
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
+    fb += f"_{args.lab_tag}" if args.lab_tag else ""
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
