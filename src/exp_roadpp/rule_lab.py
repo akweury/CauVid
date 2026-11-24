@@ -58,6 +58,7 @@ Run (server, with the run's MLP and training data):
 Writes <output_dir>/rule_lab/rule_lab_<tag>.json.
 """
 import math
+import time
 import os
 import re
 from collections import defaultdict
@@ -249,10 +250,31 @@ class ExtModel:
         return self._d.text[m - self._model.num_literals] if m >= self._model.num_literals else None
 
 
-def extend_rows(data, derived, L, device, chunk=50000):
+def literal_table(model):
+    """[literal_info(m) for every literal of the rule net], computed once per model (2026-11-24: eight scans of
+    every literal through `literal_info` made the lab's set-up minutes long)."""
+    tab = getattr(model, "_lab_literal_table", None)
+    if tab is None:
+        tab = [model.literal_info(m) for m in range(model.num_literals)]
+        model._lab_literal_table = tab
+    return tab
+
+
+def compact_rows(data, heads=None):
+    """A `collect` sample cut to the pairs of some heads (None: all) and to the packed rows they use (2026-11-24:
+    `subset` keeps every packed row, so the derived literals were computed for rows no pair reads)."""
+    pairs = data["pairs"]
+    sel = torch.ones(len(pairs["head"]), dtype=torch.bool) if heads is None else \
+        torch.isin(pairs["head"].long(), torch.tensor(sorted(heads), dtype=torch.long))
+    pairs = {k: v[sel] for k, v in pairs.items()}
+    used, inv = pairs["row"].long().unique(return_inverse=True)
+    return {**data, "packed": data["packed"][used], "pairs": {**pairs, "row": inv.to(pairs["row"].dtype)}}
+
+
+def extend_rows(data, derived, L, device, chunk=50000, desc="Derived literals"):
     """A `collect` sample with the derived literal bits appended to every row."""
     packed = []
-    for i in range(0, len(data["packed"]), chunk):
+    for i in tqdm(range(0, len(data["packed"]), chunk), desc=desc):
         bits = step05_mine._unpack(data["packed"][i:i + chunk], L, device) > 0.5
         packed.append(step05_mine._pack(derived.extend(bits)).cpu())
     return {**data, "packed": torch.cat(packed) if packed else data["packed"]}
@@ -355,9 +377,16 @@ def _pair_events(pool, a, b, hit_rows):
     return torch.cat(out) if out else torch.zeros(0, dtype=torch.long, device=Fh.device)
 
 
-def exhaustive_rules(pool, allowed, cfg):
+def _check_ok(ev_train, rows_c, hits_c, lift_c):
+    """`check_filter`'s test on tensors: >= 1 check hit row and a check lift >= 1."""
+    return (rows_c >= 1) & (hits_c >= 1) & (lift_c >= 1.0)
+
+
+def exhaustive_rules(pool, allowed, cfg, check=None):
     """The "exh" rules of one head (see above): [(literals tuple, sample precision, onsets)] and the number of
-    rules over the cap."""
+    rules over the cap. check: the head's pool of the check videos (`--lab_check`): the short rules must pass
+    `check_filter`'s test there already (2026-11-24: without it 8 heads gave 263k short rules, mostly chance
+    pairs of 2-4 onsets)."""
     F, y, w = pool["F"], pool["y"], pool["w"]
     n = len(y)
     if n == 0 or not bool(y.any()):
@@ -376,7 +405,16 @@ def exhaustive_rules(pool, allowed, cfg):
     p1 = h1 / n1.clamp(min=1e-12)
     cand = torch.nonzero(allowed & (ev1 >= min_ev) & (vid1 >= min_vid) & (n1 > 0)).flatten()
     kept = {}
-    for m in cand[(p1[cand] >= lift * rate)].tolist():
+    if check is not None and len(check["y"]):
+        Fk, yk, wk = check["F"], check["y"].float(), check["w"]
+        rate_c = float((wk * yk).sum() / wk.sum().clamp(min=1e-12))
+        n1c, h1c, r1c, c1c = wk @ Fk, (wk * yk) @ Fk, Fk.sum(dim=0), yk @ Fk
+        lift1c = (h1c / n1c.clamp(min=1e-12)) / max(rate_c, 1e-12)
+        ok1 = _check_ok(ev1, r1c, c1c, lift1c)
+    else:
+        Fk = None
+        ok1 = torch.ones_like(ev1, dtype=torch.bool)
+    for m in cand[(p1[cand] >= lift * rate) & ok1[cand]].tolist():
         kept[(m,)] = (float(p1[m]), int(ev1[m]), float(h1[m] / (n1[m] + lam)))
     # 1. All pairs of candidate literals.
     Fc = F[:, cand]
@@ -394,6 +432,13 @@ def exhaustive_rules(pool, allowed, cfg):
     ia, ib, score = ia[order], ib[order], score[order]
     ev2 = _pair_events(pool, cand[ia], cand[ib], hit_rows)
     ok = ev2 >= min_ev
+    if Fk is not None:                                                         # the pairs on the check videos
+        Kc = Fk[:, cand]
+        n2c = ((Kc * wk[:, None]).T @ Kc)[ia, ib]
+        h2c = ((Kc * (wk * yk)[:, None]).T @ Kc)[ia, ib]
+        r2c = (Kc.T @ Kc)[ia, ib]
+        c2c = ((Kc * yk[:, None]).T @ Kc)[ia, ib]
+        ok &= _check_ok(ev2, r2c, c2c, (h2c / n2c.clamp(min=1e-12)) / max(rate_c, 1e-12))
     ia, ib, score, ev2 = ia[ok], ib[ok], score[ok], ev2[ok]
     pp = p2[ia, ib]
     a, b = cand[ia].tolist(), cand[ib].tolist()
@@ -540,27 +585,23 @@ def sample_counts(rules, train, L, device, A, chunk=512):
 # The user: a rule that does not hold on the validation split should go before the fit; rules that differ only in
 # a parameter should merge. relaxed+exh had 42k rules, 32k of them with < 5 train onsets (22k at precision 1):
 # chance co-occurrences that the soft fit weighed high (small heads lost up to 0.47 AP).
-CHECK_SMALL = 5            # train onsets below which a rule must be confirmed on the check videos
-CHECK_MIN_ROWS = 20        # check rows a larger rule needs before its check precision can reject it
+# 2026-11-24, the user: a rule must stand on the train split by itself (--lab_min_events, default 5 onsets) and
+# show up on the validation split too (and on test, which is never used to select): it holds on the check videos
+# with >= 1 hit row and a lift >= 1. A rule that never fires there, or fires without beating the base rate, goes.
 
 
 def check_filter(rules, ck, index):
-    """The rules that hold on the check videos (the even val videos; the odd ones stay for the evaluation):
-      - a rule of < CHECK_SMALL train onsets needs >= 1 check onset and a check precision >= the head's check
-        rate (lift >= 1): seen again, not contradicted;
-      - a larger rule is dropped only if it holds on >= CHECK_MIN_ROWS check rows with a lift < 1.
-    ck: `sample_counts` of the check sample; index: (head, sorted literals) -> its row in ck. Each rule kept
-    gets "check_events" and "check_lift"."""
+    """The rules that hold on the check videos (the even val videos; the odd ones stay for the evaluation): >= 1
+    check onset and a check precision >= the head's check rate (lift >= 1). ck: `sample_counts` of the check
+    sample; index: (head, sorted literals) -> its row in ck. Each rule kept gets "check_events" and
+    "check_lift"."""
     out = []
     for r in rules:
         i = index[(r["head"], tuple(sorted(r["literals"])))]
         f, h, e, n = float(ck["fires"][i]), float(ck["hits"][i]), int(ck["events"][i]), int(ck["rows"][i])
         rate = float(ck["base"][r["head"]])
         lift = (h / f) / rate if f > 0 and rate > 0 else None
-        if r["events"] < CHECK_SMALL:
-            if e < 1 or lift is None or lift < 1.0:
-                continue
-        elif n >= CHECK_MIN_ROWS and lift is not None and lift < 1.0:
+        if e < 1 or lift is None or lift < 1.0 or n < 1:
             continue
         out.append({**r, "check_events": e, "check_lift": round(lift, 3) if lift is not None else None})
     return out
@@ -572,8 +613,8 @@ def merge_classes(rules, model, names, pool_of, ratio):
     >= ratio x the precision and at least the onsets (train sample of the head). All such literals at once, else the
     one replacement with the most onsets. Duplicates merge. Returns the rules and the number generalized."""
     gmap = {}
-    for m in range(model.num_literals):
-        info = model.literal_info(m)
+    tab = literal_table(model)
+    for m, info in enumerate(tab):
         if info["kind"] == "G":
             gmap[(info["scope"], info["j"], info["group"])] = m
     if not gmap:
@@ -582,7 +623,7 @@ def merge_classes(rules, model, names, pool_of, ratio):
     def general(m):
         if m >= model.num_literals:
             return None
-        info = model.literal_info(m)
+        info = tab[m]
         if info["kind"] != "X" or info["scope"] == 0:
             return None
         cls, _, act = names[info["atom"]].partition(":")
@@ -661,8 +702,7 @@ def direction_literals(model, names):
     {(kind, θ, scope, j): literal}."""
     import re
     of, back = {}, {}
-    for m in range(model.num_literals):
-        info = model.literal_info(m)
+    for m, info in enumerate(literal_table(model)):
         if info["kind"] != "X":
             continue
         mt = re.fullmatch(DIRECTION_RE, names[info["atom"]])
@@ -782,8 +822,7 @@ def linear_literals(model, names):
     import re
     from src.exp_roadpp import shape as agent_shape
     of, back = {}, {}
-    for m in range(model.num_literals):
-        info = model.literal_info(m)
+    for m, info in enumerate(literal_table(model)):
         if info["kind"] != "X":
             continue
         mt = re.fullmatch(r"shp:(cx|by|app_cx|app_by|size|move|travel)_(ge|lt)_([0-9.]+)", names[info["atom"]])
@@ -1396,11 +1435,8 @@ def parse_variant(name):
 def atom_literals(model, lo, hi, older_only=False):
     """(L,) bool: the literals (any kind and scope) of the atoms lo..hi - 1, e.g. the shape atoms; older_only:
     only those of the slots before the newest (j > 1)."""
-    out = torch.zeros(model.num_literals, dtype=torch.bool)
-    for m in range(model.num_literals):
-        info = model.literal_info(m)
-        out[m] = info["kind"] in ("X", "!X") and lo <= info["atom"] < hi and (not older_only or info["j"] > 1)
-    return out
+    return torch.tensor([info["kind"] in ("X", "!X") and lo <= info["atom"] < hi and (not older_only or info["j"] > 1)
+                         for info in literal_table(model)], dtype=torch.bool)
 
 
 def ensure_mlp(training_data, cfg):
@@ -1418,11 +1454,8 @@ def negated_others(model):
     """(L,) bool: the negated literals of the other agents ("!X(other)", "!veh:X(other)"). On v7 they held on
     almost every row ("no bus is moving left"), so the relaxed miner's deep trees added them as noise
     (lab 3, 2026-11-22: e.g. Car:TurRht w -3.33 "!Bus:MovLft(other)@2 & ...")."""
-    out = torch.zeros(model.num_literals, dtype=torch.bool)
-    for m in range(model.num_literals):
-        info = model.literal_info(m)
-        out[m] = info["kind"] in ("!X", "!G") and info["scope"] == 1
-    return out
+    return torch.tensor([info["kind"] in ("!X", "!G") and info["scope"] == 1 for info in literal_table(model)],
+                        dtype=torch.bool)
 
 
 def crisp_rules(rules, gate, weight, pool_of, heads):
@@ -1470,11 +1503,13 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
                 continue
             allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
             pool = step05_mine._pool_of(train, h, L, device)
-            found, over = exhaustive_rules(pool, allowed, cfg)
+            ck = step05_mine._pool_of(check, h, L, device) if cfg.get("lab_check") and \
+                bool((check["pairs"]["head"] == h).any()) else None
+            found, over = exhaustive_rules(pool, allowed, cfg, ck)
             capped += over > 0
             rules += [{"head": int(h), "literals": list(key)} for key, _p, _e in found]
-            del pool
-        print(f"[Rule lab] exh: {len(rules)} rules; the cap --lab_exh_max {cfg['lab_exh_max']} bound on {capped} heads")
+            del pool, ck
+        print(f"[Rule lab] exh: {len(rules)} rules{' (checked on the check videos)' if cfg.get('lab_check') else ''}; the cap --lab_exh_max {cfg['lab_exh_max']} bound on {capped} heads")
         return rules
     for h in tqdm(heads, desc=f"Precise search{' + derived' if use_derived else ''}"):
         if not bool((train["pairs"]["head"] == h).any()):
@@ -1547,7 +1582,9 @@ def main():
     parser.add_argument("--lab_root_exclude", type=str, default="shape,gestalt",
                         help="atom groups of the data layout (e.g. shape, position) that may not be mining roots")
     parser.add_argument("--lab_precise_min", type=float, default=0.5, help="precise search: kept rule precision")
-    parser.add_argument("--lab_min_events", type=int, default=2, help="precise search: distinct onsets of a rule")
+    parser.add_argument("--lab_min_events", type=int, default=5,
+                        help="distinct train onsets a rule needs (2026-11-24, the user: a rule must stand on train by "
+                             "itself; was 2)")
     parser.add_argument("--lab_min_videos", type=int, default=1)
     parser.add_argument("--lab_max_len", type=int, default=8, help="precise search: literals per rule")
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
@@ -1574,10 +1611,16 @@ def main():
                 "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
                 "lab_exh_seeds"):
         cfg[key] = getattr(args, key)
+    cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
     device = cfg["device"]
     out_dir = args.output_dir / "rule_lab"
     os.makedirs(out_dir, exist_ok=True)
 
+    t0 = time.time()
+
+    def step(k, msg):
+        print(f"\n[Rule lab] step {k}/9 ({time.time() - t0:.0f} s): {msg}", flush=True)
+    step(1, "training data and rule net")
     training_data = step05.load_training_data(cfg)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
     if args.lab_target == "eventual":
@@ -1604,6 +1647,7 @@ def main():
     # Literals: the rule net's and the derived ones (same indices in every variant; the variants without "_d"
     # may not use the derived ones).
     derived = Derived(model, names)
+    step(2, "literal masks (forbidden literals per variant)")
     forbid_nn = negated_others(model)
     layout = training_data.get("grid_layout", {})
     cfg["mine_root_exclude"] = [layout[k] for k in args.lab_root_exclude.split(",") if k in layout]
@@ -1653,9 +1697,8 @@ def main():
     forbid_user = torch.zeros_like(forbid_nn)
     if prefixes:
         hit = {a for a, nm in enumerate(names) if nm.startswith(prefixes)}
-        for m in range(model.num_literals):
-            info = model.literal_info(m)
-            forbid_user[m] = info["kind"] in ("X", "!X") and info["atom"] in hit
+        forbid_user = torch.tensor([info["kind"] in ("X", "!X") and info["atom"] in hit
+                                    for info in literal_table(model)], dtype=torch.bool)
         print(f"[Rule lab] --lab_forbid {prefixes}: {len(hit)} atoms, {int(forbid_user.sum())} literals left out")
 
     def forbid_of(flags):
@@ -1670,17 +1713,22 @@ def main():
         return ExtModel(model, derived, flags[0], forbid if bool(forbid.any()) else None)
     ext = {}
     L = make_ext((True, False, False, False, False, False)).num_literals
+    step(3, "row sample (train, val)")
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     if args.lab_prepare_only == "True":
         print("[Rule lab] --lab_prepare_only: the training data, the OnsetMLP and the row sample are cached; stop")
         return
     val_ids = list(training_data["val_videos"])
-    train = extend_rows(train, derived, model.num_literals, device)
-    check = extend_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), derived, model.num_literals, device)
+    step(4, "derived literals of the sampled rows")
+    only = set(heads) if args.lab_heads else None
+    train = extend_rows(compact_rows(train, only), derived, model.num_literals, device, desc="Derived literals (train)")
+    check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), only), derived,
+                        model.num_literals, device, desc="Derived literals (check)")
     del val
     eval_ids = val_ids[1::2]
 
     # 1. Rule sets on the train sample, each miner once per literal set.
+    step(5, f"mining ({args.lab_variants})")
     variants = args.lab_variants.split(",")
     mined = {}
     for name in variants:
@@ -1692,6 +1740,8 @@ def main():
                 mined[(c, flags)] = mine_component(c, flags[0], ext[flags], names, heads, train, check, cfg, device)
 
     # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
+    step(6, "rule counts" + (" (train sample)" if args.lab_fast == "True" else " (all train rows)")
+         + (" and check videos" if args.lab_check == "True" else ""))
     unique = {}
     for rules in mined.values():
         for r in rules:
@@ -1711,6 +1761,8 @@ def main():
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     soft_modes += [f"mdl_{x}" for x in args.lab_mdl.split(",") if x]          # the size curve (MDL strengths)
     rule_sets, texts = {}, {}
+    step(7, "per variant: finalize" + (", check filter" if args.lab_check == "True" else "")
+         + (", merges" if args.lab_merge == "True" else "") + ", fits")
     for name in variants:
         components, flags = parse_variant(name)
         seen, rs = set(), []
@@ -1727,8 +1779,7 @@ def main():
         if args.lab_check == "True":
             n0 = len(final)
             final = check_filter(final, check_counts, exact)
-            print(f"[Rule lab] {name}: check videos: {n0} -> {len(final)} rules "
-                  f"(< {CHECK_SMALL} train onsets: confirmed once, lift >= 1; larger: not contradicted)")
+            print(f"[Rule lab] {name}: check videos: {n0} -> {len(final)} rules (>= 1 check onset, lift >= 1)")
         if args.lab_merge_ratio > 0 and (args.lab_fast != "True" or args.lab_merge == "True"):
             pools = {}
 
@@ -1810,6 +1861,7 @@ def main():
               f"{n_d} with a derived literal)")
 
     # 3. Every at-risk row of the odd val videos.
+    step(8, "evaluation on the odd val videos")
     hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
     out = report(hist, names, heads, rule_sets)
     if out["best"]:
@@ -1823,6 +1875,7 @@ def main():
     for key in (k for k in rule_sets if k.endswith("~crisp")):
         print(f"\n[Rule lab] crisp rules of {key} (hard AND, logistic weight):")
         show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
+    step(9, "report and save")
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
