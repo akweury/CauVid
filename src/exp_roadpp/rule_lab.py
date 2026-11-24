@@ -446,9 +446,14 @@ def exhaustive_rules(pool, allowed, cfg):
             masks = torch.stack([c for _, _, c, _ in alive])
             precs = torch.tensor([p for _, _, _, p in alive], device=dev)
             keys = [k for _, k, _, _ in alive]
-    ranked = sorted(kept.items(), key=lambda x: -x[1][2])
-    over = max(0, len(ranked) - cfg["lab_exh_max"])
-    return [(key, p, e) for key, (p, e, _s) in ranked[:cfg["lab_exh_max"]]], over
+    # The cap binds the extended rules only: the rules of 1 - 2 literals all stay (the guarantee; the A/B of
+    # 2026-11-24 lost 23 short rules to a cap over all rules).
+    short = [(k, v) for k, v in kept.items() if len(k) <= 2]
+    longer = sorted(((k, v) for k, v in kept.items() if len(k) > 2), key=lambda x: -x[1][2])
+    room = max(0, cfg["lab_exh_max"] - len(short))
+    over = max(0, len(longer) - room)
+    ranked = sorted(short + longer[:room], key=lambda x: -x[1][2])
+    return [(key, p, e) for key, (p, e, _s) in ranked], over
 
 
 # -------------- Exact counts on all train rows --------------
@@ -501,7 +506,7 @@ def sample_counts(rules, train, L, device, A):
     """`recount` from the train sample (`--lab_fast`): per rule the weighted rows and hits where it holds and its
     onsets in the sample; per head the weighted base rate."""
     fires, hits = torch.zeros(len(rules)), torch.zeros(len(rules))
-    events = torch.zeros(len(rules), dtype=torch.long)
+    events, rows = torch.zeros(len(rules), dtype=torch.long), torch.zeros(len(rules), dtype=torch.long)
     base = torch.zeros(A)
     by = defaultdict(list)
     for i, r in enumerate(rules):
@@ -517,8 +522,101 @@ def sample_counts(rules, train, L, device, A):
             fires[i] = float(pool["w"][m].sum())
             hits[i] = float(pool["w"][m & pool["y"]].sum())
             events[i] = int(pool["event"][m & pool["y"]].unique().numel())
+            rows[i] = int(m.sum())
         del pool, F
-    return {"fires": fires, "hits": hits, "events": events, "base": base}
+    return {"fires": fires, "hits": hits, "events": events, "rows": rows, "base": base}
+
+
+# -------------- Check on held-out videos and merging (2026-11-24) --------------
+# The user: a rule that does not hold on the validation split should go before the fit; rules that differ only in
+# a parameter should merge. relaxed+exh had 42k rules, 32k of them with < 5 train onsets (22k at precision 1):
+# chance co-occurrences that the soft fit weighed high (small heads lost up to 0.47 AP).
+CHECK_SMALL = 5            # train onsets below which a rule must be confirmed on the check videos
+CHECK_MIN_ROWS = 20        # check rows a larger rule needs before its check precision can reject it
+
+
+def check_filter(rules, ck, index):
+    """The rules that hold on the check videos (the even val videos; the odd ones stay for the evaluation):
+      - a rule of < CHECK_SMALL train onsets needs >= 1 check onset and a check precision >= the head's check
+        rate (lift >= 1): seen again, not contradicted;
+      - a larger rule is dropped only if it holds on >= CHECK_MIN_ROWS check rows with a lift < 1.
+    ck: `sample_counts` of the check sample; index: (head, sorted literals) -> its row in ck. Each rule kept
+    gets "check_events" and "check_lift"."""
+    out = []
+    for r in rules:
+        i = index[(r["head"], tuple(sorted(r["literals"])))]
+        f, h, e, n = float(ck["fires"][i]), float(ck["hits"][i]), int(ck["events"][i]), int(ck["rows"][i])
+        rate = float(ck["base"][r["head"]])
+        lift = (h / f) / rate if f > 0 and rate > 0 else None
+        if r["events"] < CHECK_SMALL:
+            if e < 1 or lift is None or lift < 1.0:
+                continue
+        elif n >= CHECK_MIN_ROWS and lift is not None and lift < 1.0:
+            continue
+        out.append({**r, "check_events": e, "check_lift": round(lift, 3) if lift is not None else None})
+    return out
+
+
+def merge_classes(rules, model, names, pool_of, ratio):
+    """Rules on another agent's class-specific label ("Car:TurLft(other)@1") made class-free with the group
+    literal of the same scope and slot ("veh:TurLft(other)@1", `TemporalRuleNet` groups) if the general rule keeps
+    >= ratio x the precision and at least the onsets (train sample of the head). All such literals at once, else the
+    one replacement with the most onsets. Duplicates merge. Returns the rules and the number generalized."""
+    gmap = {}
+    for m in range(model.num_literals):
+        info = model.literal_info(m)
+        if info["kind"] == "G":
+            gmap[(info["scope"], info["j"], info["group"])] = m
+    if not gmap:
+        return rules, 0
+
+    def general(m):
+        if m >= model.num_literals:
+            return None
+        info = model.literal_info(m)
+        if info["kind"] != "X" or info["scope"] == 0:
+            return None
+        cls, _, act = names[info["atom"]].partition(":")
+        if not act or cls in ("av", "TL", "OthTL", "Ped", "shp", "gst", "pos"):
+            return None
+        return gmap.get((info["scope"], info["j"], act))
+
+    def stats(pool, lits):
+        hold = (pool["F"][:, lits] > 0.5).all(dim=1)
+        f = float(pool["w"][hold].sum())
+        hit = hold & pool["y"]
+        return (float(pool["w"][hit].sum()) / f if f > 0 else 0.0), int(pool["event"][hit].unique().numel()), f
+    out, seen, n_gen = [], set(), 0
+    by_head = defaultdict(list)
+    for r in rules:
+        by_head[r["head"]].append(r)
+    for h, rs in sorted(by_head.items()):
+        pool = None
+        for r in rs:
+            subs = [(k, general(m)) for k, m in enumerate(r["literals"])]
+            subs = [(k, g) for k, g in subs if g is not None]
+            best = None
+            if subs:
+                pool = pool if pool is not None else pool_of(h)
+                p0, e0, _ = stats(pool, r["literals"])
+                trials = [subs] + ([[x] for x in subs] if len(subs) > 1 else [])
+                for t in trials:
+                    lits = list(r["literals"])
+                    for k, g in t:
+                        lits[k] = g
+                    lits = sorted(set(lits))
+                    p, e, f = stats(pool, lits)
+                    if p >= ratio * p0 and e >= e0 and (best is None or e > best[1]):
+                        best = (lits, e, p, f)
+            r2 = r if best is None else {**r, "literals": best[0], "events": best[1], "precision": best[2],
+                                         "fires": best[3], "merged_from": "class"}
+            key = (r2["head"], tuple(sorted(r2["literals"])))
+            if key in seen:
+                continue
+            seen.add(key)
+            n_gen += best is not None
+            out.append(r2)
+    return out, n_gen
 
 
 def finalize(rules, counts, min_events):
@@ -1446,6 +1544,11 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_check", type=str, default="False",
+                        help="drop the rules that do not hold on the check videos (even val videos), `check_filter`")
+    parser.add_argument("--lab_merge", type=str, default="False",
+                        help="merge the rules that differ in a parameter: class -> veh: group, close sectors and "
+                             "intervals (also with --lab_fast)")
     parser.add_argument("--lab_exh_lift", type=float, default=2.0, help="exh: kept rule precision / head rate")
     parser.add_argument("--lab_exh_seed_lift", type=float, default=1.5, help="exh: pairs extended (lift)")
     parser.add_argument("--lab_exh_gain", type=float, default=1.1,
@@ -1592,6 +1695,9 @@ def main():
         counts = recount(model, training_data, training_data["train_videos"], [unique[k] for k in keys], head_mask,
                          possible, cfg, derived)
     exact = {k: i for i, k in enumerate(keys)}
+    if args.lab_check == "True":
+        # The rules on the check videos (the even val videos, `check`): seen again, not contradicted.
+        check_counts = sample_counts([unique[k] for k in keys], check, L, device, model.num_atoms)
     priors = [float(x) for x in args.lab_priors.split(",")]
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     soft_modes += [f"mdl_{x}" for x in args.lab_mdl.split(",") if x]          # the size curve (MDL strengths)
@@ -1609,7 +1715,12 @@ def main():
         sub = {k: v[idx] for k, v in counts.items() if k != "base"}
         final = finalize(rs, sub, 1 if components == ["m4"] else args.lab_min_events)
         full = make_ext((True, False, False, False, False, False))
-        if args.lab_merge_ratio > 0 and args.lab_fast != "True":
+        if args.lab_check == "True":
+            n0 = len(final)
+            final = check_filter(final, check_counts, exact)
+            print(f"[Rule lab] {name}: check videos: {n0} -> {len(final)} rules "
+                  f"(< {CHECK_SMALL} train onsets: confirmed once, lift >= 1; larger: not contradicted)")
+        if args.lab_merge_ratio > 0 and (args.lab_fast != "True" or args.lab_merge == "True"):
             pools = {}
 
             def pool_of(h):
@@ -1620,11 +1731,14 @@ def main():
                     pools[h] = step05_mine._pool_of(train, h, L, device)
                 return pools[h]
             n0 = len(final)
-            if args.lab_refine == "True" and not flags[3]:
+            if args.lab_merge == "True":
+                final, n_cls = merge_classes(final, model, names, pool_of, args.lab_merge_ratio)
+                print(f"[Rule lab] {name}: {n_cls} rules made class-free (veh:), {n0} -> {len(final)} rules")
+            if args.lab_refine == "True" and not flags[3] and args.lab_fast != "True":
                 final, n_ref = refine_sectors(final, model, names, pool_of, args.lab_min_events,
                                               forbid=forbid_of(flags).cpu())
                 print(f"[Rule lab] {name}: {n_ref} rules with a direction narrowed to where their onsets concentrate")
-            if args.lab_refine == "True" and not flags[4]:
+            if args.lab_refine == "True" and not flags[4] and args.lab_fast != "True":
                 final, n_ref = refine_intervals(final, model, names, pool_of, args.lab_min_events,
                                                 forbid=forbid_of(flags).cpu())
                 print(f"[Rule lab] {name}: {n_ref} rules with a position / size / distance interval narrowed")
@@ -1703,6 +1817,7 @@ def main():
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
+    fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
