@@ -85,4 +85,4 @@
 
 ./run_roadpp_docker.sh --gpu 5 --head_clips -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --clip_heads Bus:MovRht --clip_variant relaxed+tr
 
-./run_roadpp_docker.sh --gpu 3 --head_clips -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --clip_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --clip_variant relaxed+tr --clip_videos val --num 1000
+./run_roadpp_docker.sh --gpu 4 --head_clips -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --clip_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --clip_variant relaxed+tr --clip_videos val --num 1000

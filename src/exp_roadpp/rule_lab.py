@@ -785,6 +785,7 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pool
             ranked = _foil_rank(found, pool)[:cfg["lab_tr_rules"]]
             del pool
             batches.append(("+".join(names[g] for g in sources), [(lits, None) for lits, _p, _e in ranked]))
+            src_back = names[sources[0]].partition(":")[0]          # the main source class, for "source_literals"
             tally["pooled rules"] += len(found)
         else:
             for g in sources:
@@ -816,8 +817,14 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pool
                     tally["not confirmed"] += 1
                     continue
                 tally["kept"] += 1
+                if src_cls is None:                                  # pooled: the rule read back in the main source
+                    src_lits = [lmap.swap_class(m, dst, src_back) for m in lits]
+                    src_head, src_lits = names[sources[0]], [m for m in src_lits if m is not None]
+                else:
+                    src_head, src_lits = src_name, list(lits)
                 rules.append({"head": int(h), "literals": list(adapted), "transfer": f"{tag}:{src_name}",
-                              "min_events": cfg["lab_tr_min_events"], "heldout_events": e_c})
+                              "min_events": cfg["lab_tr_min_events"], "heldout_events": e_c,
+                              "source_head": src_head, "source_literals": src_lits})
         print(f"    {names[h]}: rate {rate:.3f}, train onsets even/odd videos "
               f"{int(tgt['event'][tgt['y'] & even].unique().numel())}/{int(tgt['event'][tgt['y'] & ~even].unique().numel())}"
               f", check onsets {int(tck['event'][tck['y']].unique().numel()) if tck is not None else 0}; "
