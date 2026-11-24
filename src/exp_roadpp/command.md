@@ -89,3 +89,8 @@
 
 
 ./run_roadpp_docker.sh --gpu 5 --compare_clips -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --clip_heads Cyc:VehLane,Cyc:MovAway,Bus:MovRht,Mobike:TurRht,Bus:VehLane
+
+./run_roadpp_docker.sh --gpu 4 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --lab_variants relaxed_nn,relaxed+tr_nn,relaxed+trp_nn --lab_check True --lab_merge True 2>&1 | tee rule_lab_quick_mirror.log
+
+
+./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --lab_variants relaxed_nn,relaxed+tr_nn,relaxed+trp_nn --lab_check True --lab_merge True --lab_tr_mirror False 2>&1 | tee rule_lab_quick_nomirror.log

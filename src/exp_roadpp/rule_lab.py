@@ -538,6 +538,13 @@ TR_STEPS = 4               # improvements of the local search per rule
 TR_ANGLES = (-10, -5, 5, 10)
 
 
+def mirror_text(nm):
+    """Lft <-> Rht, left <-> right in a name (the head "Car:TurLft" -> "Car:TurRht"; `LiteralMap.mirror_name`)."""
+    import re
+    swap = {"Lft": "Rht", "Rht": "Lft", "left": "right", "right": "left", "Left": "Right", "Right": "Left"}
+    return re.sub(r"Lft|Rht|left|right|Left|Right", lambda x: swap[x.group(0)], nm)
+
+
 def _class_actions(names, heads):
     """{head: (class, action)} of the agent label heads ("Car:VehLane" -> ("Car", "VehLane"))."""
     out = {}
@@ -556,7 +563,7 @@ def transfer_sources(names, heads, all_heads, train, cfg):
     for h in ca:
         sel = (train["pairs"]["head"] == h) & train["pairs"]["y"].bool()
         onsets[h] = int(train["pairs"]["event"][sel].unique().numel())
-    out = {}
+    out, mirror = {}, {}
     for h in heads:
         if h not in ca or onsets.get(h, 0) >= cfg["lab_tr_max_onsets"]:
             continue
@@ -565,8 +572,17 @@ def transfer_sources(names, heads, all_heads, train, cfg):
             continue
         src = [g for g, (c, a) in ca.items() if a == act and c not in (cls, "Ped") and onsets[g] >= cfg["lab_tr_min_source"]]
         src = sorted(src, key=lambda g: -onsets[g])[:2]
-        if src:
+        m_act = mirror_text(act)
+        if m_act != act and cfg.get("lab_tr_mirror"):
+            # A directional action (TurRht): its mirror is the mirrored action's rules (TurLft) of any vehicle class,
+            # the target's own class too, mirrored (2026-11-24: mirroring a TurRht rule for TurRht was wrong).
+            ms = [g for g, (c, a) in ca.items() if a == m_act and c != "Ped" and onsets[g] >= cfg["lab_tr_min_source"]]
+            ms = sorted(ms, key=lambda g: -onsets[g])[:2]
+            if ms:
+                mirror[h] = ms
+        if src or h in mirror:
             out[h] = src
+    transfer_sources.mirror = mirror
     return out, onsets
 
 
@@ -617,8 +633,7 @@ class LiteralMap:
         mt = re_.fullmatch(r"(.*(?:dir|path))_(\d{3})", nm)
         if mt:
             return f"{mt.group(1)}_{(-int(mt.group(2))) % 360:03d}"
-        swap = {"Lft": "Rht", "Rht": "Lft", "left": "right", "right": "left", "Left": "Right", "Right": "Left"}
-        return re_.sub(r"Lft|Rht|left|right|Left|Right", lambda x: swap[x.group(0)], nm)
+        return mirror_text(nm)
 
     def mirror(self, m):
         """The mirrored literal of m (`mirror_name`), m itself if nothing to mirror, None if the mirror is missing."""
@@ -811,7 +826,9 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pool
         dst = names[h].partition(":")[0]
         seen, tally = set(), Counter()
         batches = []                                       # [(source name, [(literals, src class)])]
-        if pooled:
+        directional = mirror_text(names[h]) != names[h]
+        m_sources = transfer_sources.mirror.get(h, []) if directional else []
+        if pooled and sources:
             parts = [{k: v[even] for k, v in tgt.items()}]
             for k, g in enumerate(sources):
                 src_pool = step05_mine._pool_of(train, g, L, device)
@@ -824,30 +841,34 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pool
             tally["pooled rows"] = len(pool["y"])
             ranked = _foil_rank(found, pool)[:cfg["lab_tr_rules"]]
             del pool
-            batches.append(("+".join(names[g] for g in sources), [(lits, None) for lits, _p, _e in ranked]))
+            batches.append(("+".join(names[g] for g in sources), [(lits, None) for lits, _p, _e in ranked], False))
             src_back = names[sources[0]].partition(":")[0]          # the main source class, for "source_literals"
             tally["pooled rules"] += len(found)
-        else:
-            for g in sources:
-                src_pool = step05_mine._pool_of(train, g, L, device)
-                ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
-                    bool((check["pairs"]["head"] == g).any()) else None
-                src_allowed = ext.input_mask.to(device) & ~((base % A == g) & (scope == 0))
-                found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
-                ranked = _foil_rank(found, src_pool)[:cfg["lab_tr_rules"]]
-                del src_pool, ck
-                tally["source rules"] += len(found)
-                batches.append((names[g], [(lits, names[g].partition(":")[0]) for lits, _p, _e in ranked]))
-        for src_name, items in batches:
+        for g in ([] if pooled else sources) + m_sources:
+            src_pool = step05_mine._pool_of(train, g, L, device)
+            ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
+                bool((check["pairs"]["head"] == g).any()) else None
+            src_allowed = ext.input_mask.to(device) & ~((base % A == g) & (scope == 0))
+            found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
+            ranked = _foil_rank(found, src_pool)[:cfg["lab_tr_rules"]]
+            del src_pool, ck
+            tally["source rules"] += len(found)
+            batches.append((names[g], [(lits, names[g].partition(":")[0]) for lits, _p, _e in ranked],
+                            g in m_sources))
+        for src_name, items, from_mirror in batches:
             for lits, src_cls in items:
                 tally["tried"] += 1
                 mapped = list(lits) if src_cls is None else [lmap.swap_class(m, src_cls, dst) for m in lits]
                 if any(m is None or not bool(allowed[m]) for m in mapped):
                     tally["not mappable"] += 1
                     continue
-                cands = [(mapped, False)]
-                if cfg.get("lab_tr_mirror"):
+                # A directional head takes mirrored rules only from the mirrored action (from_mirror), and those only
+                # mirrored; a direction-free head (VehLane, Jun) also tries each rule mirrored.
+                cands = [] if from_mirror else [(mapped, False)]
+                if cfg.get("lab_tr_mirror") and (from_mirror or not directional):
                     mir = lmap.mirror_rule(mapped)
+                    if from_mirror and mir is None and all(lmap.mirror(m) == m for m in mapped):
+                        mir = mapped                     # a symmetric body predicts the mirrored action as well
                     if mir is not None and all(bool(allowed[m]) for m in mir):
                         cands.append((mir, True))
                         tally["mirrored tried"] += 1
@@ -2132,6 +2153,7 @@ def main():
     if only is not None and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in args.lab_variants.split(",")):
         srcs, _ = transfer_sources(names, heads, cfg["lab_all_heads"], train, cfg)
         only |= {g for v in srcs.values() for g in v}                 # keep the source heads' sample rows
+        only |= {g for v in transfer_sources.mirror.values() for g in v}
     train = extend_rows(compact_rows(train, only), derived, model.num_literals, device, desc="Derived literals (train)")
     check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), only), derived,
                         model.num_literals, device, desc="Derived literals (check)")
