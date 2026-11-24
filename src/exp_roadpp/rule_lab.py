@@ -1718,6 +1718,13 @@ class _Selected:
 
 def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default, small=None, small_variant=None,
                     min_pos=20):
+    """scorer: one scorer or a comma list (e.g. "soft_logit,mdl_0.1,mdl_0.3": the fit strength chosen per head too;
+    the first is the one of the small heads and of the default)."""
+    scorers = [x for x in scorer.split(",") if x]
+    return _select(hist_eval, hist_check, rule_sets, heads, scorers, default, small or set(), small_variant, min_pos)
+
+
+def _select(hist_eval, hist_check, rule_sets, heads, scorers, default, small, small_variant, min_pos):
     """Per head the variant of best AP on the check videos (the even val videos; the evaluation stays on the odd
     ones), scorer fixed (2026-11-24, the user: choose the variant per head; relaxed alone beat relaxed+exh on
     Bus:TurLft / LarVeh:TurLft, tr helped Cyc:VehLane). Rules of the choice (2026-11-24 quick test, 12 heads: the
@@ -1727,12 +1734,12 @@ def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default, sm
       - a head with >= min_pos positive check rows the variant of best check AP;
       - else `default`.
     Returns the histograms of the choice on the evaluation videos, {head: variant} and the rule set."""
-    names = [n for n in hist_check if n != "mlp" and n.split("/")[1] == scorer]
+    scorer = scorers[0]
+    names = [n for n in hist_check if n != "mlp" and n.split("/")[1] in scorers]
     ap = {n: step07_paper._ap(*hist_check[n]) for n in names}
     npos = next(iter(hist_check.values()))[0].sum(dim=1)
     pos, neg = (torch.zeros_like(x) for x in hist_eval[f"{default}/{scorer}"])
     choice, rules = {}, []
-    small = small or set()
     for h in range(pos.shape[0]):
         best = f"{default}/{scorer}"
         if h in heads and h in small and small_variant:
@@ -1744,7 +1751,7 @@ def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default, sm
         pos[h], neg[h] = hist_eval[best][0][h], hist_eval[best][1][h]
         if h in heads:
             v = best.split("/")[0]
-            choice[h] = v
+            choice[h] = best if len(scorers) > 1 else v
             rules += [r for r in rule_sets[v].rules if r["head"] == h]
     return (pos, neg), choice, _Selected(rules)
 
@@ -2053,6 +2060,8 @@ def main():
     parser.add_argument("--lab_select", type=str, default="True",
                         help="choose the variant per head on the check videos; reported as the variant 'selected'")
     parser.add_argument("--lab_select_scorer", type=str, default="soft_logit", help="the scorer of the selection")
+    parser.add_argument("--lab_select_split", type=str, default="True",
+                        help="the selection on val videos apart from the check videos of the rule filter (0,4,.. / 2,6,..)")
     parser.add_argument("--lab_select_min_pos", type=int, default=20,
                         help="positive check rows a head needs to be chosen by its check AP (else the exh variant)")
     parser.add_argument("--lab_check", type=str, default="False",
@@ -2201,7 +2210,11 @@ def main():
         only |= {g for v in srcs.values() for g in v}                 # keep the source heads' sample rows
         only |= {g for v in transfer_sources.mirror.values() for g in v}
     train = extend_rows(compact_rows(train, only), derived, model.num_literals, device, desc="Derived literals (train)")
-    check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), only), derived,
+    # The check videos: the even val videos; with the per-head selection only every other of them (0, 4, 8, ..): the
+    # selection reads the rest (2, 6, 10, ..), never the videos the rules were filtered or confirmed on (2026-11-24:
+    # the exh rules had to hold on the check videos, so they looked better there and the selection preferred them).
+    check_step = 4 if args.lab_select == "True" and args.lab_select_split == "True" else 2
+    check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), check_step))), only), derived,
                         model.num_literals, device, desc="Derived literals (check)")
     del val
     eval_ids = val_ids[1::2]
@@ -2348,7 +2361,7 @@ def main():
     choice = {}
     if args.lab_select == "True" and len(rule_sets) > 1:
         # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
-        check_ids = val_ids[0::2]
+        check_ids = val_ids[2::4] if check_step == 4 else val_ids[0::2]   # the selection videos
         hist_c = evaluate(model, None, training_data, check_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
         comps = {v: set(parse_variant(v)[0]) for v in variants}
         default = next((v for v in variants if "exh" in comps[v]), variants[0])
@@ -2364,10 +2377,11 @@ def main():
                                                 small, small_variant, args.lab_select_min_pos)
         print(f"[Rule lab] selection: transfer targets ({len(small)}) -> {small_variant}; others by the check AP with "
               f">= {args.lab_select_min_pos} positive check rows, else {default}")
-        hist[f"selected/{args.lab_select_scorer}"] = h_sel
+        hist[f"selected/{args.lab_select_scorer.split(',')[0]}"] = h_sel
         rule_sets["selected"] = rs_sel
         print(f"[Rule lab] per-head selection ({args.lab_select_scorer}, on the check videos): "
-              + ", ".join(f"{v} {n}" for v, n in Counter(choice.values()).most_common()))
+              + ", ".join(f"{v} {n}" for v, n in Counter(choice.values()).most_common())
+              + f" (chosen on {len(check_ids)} val videos the rules were not checked on)")
     out = report(hist, names, heads, rule_sets)
     if choice:
         out["selected"] = {names[h]: v for h, v in choice.items()}
