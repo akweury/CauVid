@@ -68,3 +68,10 @@
 ./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egoturn_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn 2>&1 | tee rule_lab_egoturn_B.log
 
 
+./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn,exh_nn,relaxed+exh_nn --lab_check True --lab_merge True --lab_forbid av:lay_ 2>&1 | tee rule_lab_cv_mg_A.log
+
+
+./run_roadpp_docker.sh --gpu 4 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn,exh_nn,relaxed+exh_nn --lab_check True 2>&1 | tee rule_lab_cv.log
+
+./run_roadpp_docker.sh --gpu 7 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn,exh_nn,relaxed+exh_nn --lab_check True --lab_merge True 2>&1 | tee rule_lab_cv_mg.log
+

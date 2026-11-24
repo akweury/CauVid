@@ -502,9 +502,10 @@ def recount(model, training_data, video_ids, rules, head_mask, possible, cfg, de
             "base": (pos_h / rows_h.clamp(min=1)).cpu()}
 
 
-def sample_counts(rules, train, L, device, A):
-    """`recount` from the train sample (`--lab_fast`): per rule the weighted rows and hits where it holds and its
-    onsets in the sample; per head the weighted base rate."""
+def sample_counts(rules, train, L, device, A, chunk=512):
+    """`recount` from the train sample (`--lab_fast`): per rule the weighted rows and hits where it holds, its
+    onsets in the sample and its (unweighted) rows; per head the weighted base rate. Vectorized per head over
+    chunks of rules (2026-11-24: a loop over 42k rules was the slowest step of the exh runs)."""
     fires, hits = torch.zeros(len(rules)), torch.zeros(len(rules))
     events, rows = torch.zeros(len(rules), dtype=torch.long), torch.zeros(len(rules), dtype=torch.long)
     base = torch.zeros(A)
@@ -515,14 +516,22 @@ def sample_counts(rules, train, L, device, A):
         if not bool((train["pairs"]["head"] == h).any()):
             continue
         pool = step05_mine._pool_of(train, h, L, device)
-        F = pool["F"] > 0.5
-        base[h] = float((pool["w"] * pool["y"]).sum() / pool["w"].sum().clamp(min=1e-9))
-        for i in idx:
-            m = F[:, rules[i]["literals"]].all(dim=1)
-            fires[i] = float(pool["w"][m].sum())
-            hits[i] = float(pool["w"][m & pool["y"]].sum())
-            events[i] = int(pool["event"][m & pool["y"]].unique().numel())
-            rows[i] = int(m.sum())
+        F = torch.cat([pool["F"] > 0.5, torch.ones((len(pool["y"]), 1), dtype=torch.bool, device=device)], dim=1)
+        w, y = pool["w"], pool["y"]
+        base[h] = float((w * y).sum() / w.sum().clamp(min=1e-9))
+        hit_rows = torch.nonzero(y).flatten()
+        uniq, inv = pool["event"][hit_rows].unique(return_inverse=True)
+        for c in range(0, len(idx), chunk):
+            ids = idx[c:c + chunk]
+            body = _pad([rules[i]["literals"] for i in ids], L).to(device)        # (R, K), pad = column L (true)
+            hold = _holds_all(F, body)                                            # (n, R)
+            hf = hold.float()
+            t = torch.tensor(ids)
+            fires[t] = (w @ hf).cpu()
+            hits[t] = ((w * y) @ hf).cpu()
+            rows[t] = hold.sum(dim=0).cpu()
+            per = torch.zeros((len(uniq), len(ids)), device=device).index_add_(0, inv, hf[hit_rows])
+            events[t] = (per > 0).sum(dim=0).cpu()
         del pool, F
     return {"fires": fires, "hits": hits, "events": events, "rows": rows, "base": base}
 
