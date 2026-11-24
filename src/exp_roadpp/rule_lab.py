@@ -581,10 +581,12 @@ class LiteralMap:
         self.tab = literal_table(model)
         self.names = names
         self.atom_of = {nm: a for a, nm in enumerate(names)}
-        self.index = {}
+        self.index, self.gindex = {}, {}
         for m, info in enumerate(self.tab):
             if info["kind"] in ("X", "!X"):
                 self.index[(info["kind"], info["atom"], info["scope"], info["j"])] = m
+            else:
+                self.gindex[(info["kind"], info["group"], info["scope"], info["j"])] = m
 
     def _lit(self, kind, atom, scope, j):
         return self.index.get((kind, atom, scope, j))
@@ -602,6 +604,44 @@ class LiteralMap:
             return m
         a = self.atom_of.get(f"{dst}:{act}")
         return None if a is None else self._lit(info["kind"], a, 0, info["j"])
+
+    def mirror_name(self, nm):
+        """The left / right mirror of an atom or group name (2026-11-24, the user: a cut-in from the left is the
+        mirror of one from the right): Lft <-> Rht, left <-> right; the position grid column c -> 2 - c (the
+        corners keep their names: an approximation for a box); a half circle dir_θ / path_θ ([θ, θ + 180) of
+        the image heading, 0 = right, counter-clockwise) -> its mirror [-θ, -θ + 180)."""
+        re_ = self.re
+        mt = re_.fullmatch(r"(pos:(?:TL|BR)_r\d)c(\d)", nm)
+        if mt:
+            return f"{mt.group(1)}c{2 - int(mt.group(2))}"
+        mt = re_.fullmatch(r"(.*(?:dir|path))_(\d{3})", nm)
+        if mt:
+            return f"{mt.group(1)}_{(-int(mt.group(2))) % 360:03d}"
+        swap = {"Lft": "Rht", "Rht": "Lft", "left": "right", "right": "left", "Left": "Right", "Right": "Left"}
+        return re_.sub(r"Lft|Rht|left|right|Left|Right", lambda x: swap[x.group(0)], nm)
+
+    def mirror(self, m):
+        """The mirrored literal of m (`mirror_name`), m itself if nothing to mirror, None if the mirror is missing."""
+        if m >= len(self.tab):
+            return None
+        info = self.tab[m]
+        if info["kind"] in ("X", "!X"):
+            nm = self.names[info["atom"]]
+            mn = self.mirror_name(nm)
+            if mn == nm:
+                return m
+            a = self.atom_of.get(mn)
+            return None if a is None else self._lit(info["kind"], a, info["scope"], info["j"])
+        g = info["group"]
+        mg = self.mirror_name(g) if isinstance(g, str) else g
+        return m if mg == g else self.gindex.get((info["kind"], mg, info["scope"], info["j"]))
+
+    def mirror_rule(self, lits):
+        """The mirrored rule, None if a literal has no mirror or the rule has nothing to mirror."""
+        out = [self.mirror(m) for m in lits]
+        if any(x is None for x in out) or sorted(out) == sorted(lits):
+            return None
+        return out
 
     def siblings(self, m):
         if m >= len(self.tab):
@@ -805,26 +845,34 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device, pool
                 if any(m is None or not bool(allowed[m]) for m in mapped):
                     tally["not mappable"] += 1
                     continue
-                _p_m, _s, e_m = _rule_stats(tgt, even, mapped)
-                tally["with >= 1 target onset"] += e_m >= 1
-                adapted = adapt_rule(tgt, even, mapped, lmap, allowed, cfg)
-                tally["changed by adaptation"] += tuple(sorted(set(mapped))) != adapted
-                if adapted in seen:
-                    continue
-                seen.add(adapted)
-                e_c, ok = _confirm(tgt, ~even, tck, adapted, rate, cfg["lab_tr_confirm"])
-                if not ok:
-                    tally["not confirmed"] += 1
-                    continue
-                tally["kept"] += 1
-                if src_cls is None:                                  # pooled: the rule read back in the main source
-                    src_lits = [lmap.swap_class(m, dst, src_back) for m in lits]
-                    src_head, src_lits = names[sources[0]], [m for m in src_lits if m is not None]
-                else:
-                    src_head, src_lits = src_name, list(lits)
-                rules.append({"head": int(h), "literals": list(adapted), "transfer": f"{tag}:{src_name}",
-                              "min_events": cfg["lab_tr_min_events"], "heldout_events": e_c,
-                              "source_head": src_head, "source_literals": src_lits})
+                cands = [(mapped, False)]
+                if cfg.get("lab_tr_mirror"):
+                    mir = lmap.mirror_rule(mapped)
+                    if mir is not None and all(bool(allowed[m]) for m in mir):
+                        cands.append((mir, True))
+                        tally["mirrored tried"] += 1
+                for body, mirrored in cands:
+                    _p_m, _s, e_m = _rule_stats(tgt, even, body)
+                    tally["with >= 1 target onset"] += e_m >= 1
+                    adapted = adapt_rule(tgt, even, body, lmap, allowed, cfg)
+                    tally["changed by adaptation"] += tuple(sorted(set(body))) != adapted
+                    if adapted in seen:
+                        continue
+                    seen.add(adapted)
+                    e_c, ok = _confirm(tgt, ~even, tck, adapted, rate, cfg["lab_tr_confirm"])
+                    if not ok:
+                        tally["not confirmed"] += 1
+                        continue
+                    tally["kept mirrored" if mirrored else "kept"] += 1
+                    if src_cls is None:                              # pooled: the rule read back in the main source
+                        src_lits = [lmap.swap_class(m, dst, src_back) for m in lits]
+                        src_head, src_lits = names[sources[0]], [m for m in src_lits if m is not None]
+                    else:
+                        src_head, src_lits = src_name, list(lits)
+                    rules.append({"head": int(h), "literals": list(adapted),
+                                  "transfer": f"{tag}{'-mirror' if mirrored else ''}:{src_name}",
+                                  "min_events": cfg["lab_tr_min_events"], "heldout_events": e_c,
+                                  "source_head": src_head, "source_literals": src_lits, "mirrored": mirrored})
         print(f"    {names[h]}: rate {rate:.3f}, train onsets even/odd videos "
               f"{int(tgt['event'][tgt['y'] & even].unique().numel())}/{int(tgt['event'][tgt['y'] & ~even].unique().numel())}"
               f", check onsets {int(tck['event'][tck['y']].unique().numel()) if tck is not None else 0}; "
@@ -1949,6 +1997,8 @@ def main():
     parser.add_argument("--lab_tr_min_source", type=int, default=100, help="tr: source heads with these train onsets")
     parser.add_argument("--lab_tr_rules", type=int, default=200, help="tr: source rules tried per source head")
     parser.add_argument("--lab_tr_min_events", type=int, default=1, help="tr: train onsets a rule needs on the target")
+    parser.add_argument("--lab_tr_mirror", type=str, default="True",
+                        help="tr: also try every transferred rule mirrored left / right (`LiteralMap.mirror`)")
     parser.add_argument("--lab_tr_confirm", type=int, default=2,
                         help="tr: held-out onsets (odd train + check videos of the target) a rule needs")
     parser.add_argument("--lab_exh_lift", type=float, default=2.0, help="exh: kept rule precision / head rate")
@@ -1968,6 +2018,7 @@ def main():
                 "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events", "lab_tr_confirm"):
         cfg[key] = getattr(args, key)
     cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
+    cfg["lab_tr_mirror"] = args.lab_tr_mirror == "True"
     device = cfg["device"]
     out_dir = args.output_dir / "rule_lab"
     os.makedirs(out_dir, exist_ok=True)
@@ -2243,6 +2294,7 @@ def main():
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
+    fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)

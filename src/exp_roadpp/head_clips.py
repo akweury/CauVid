@@ -34,7 +34,8 @@ from src.exp_roadpp import (config, gestalt_fail_clips, lane_clips, mine_sweep, 
 LAB_DEFAULTS = {"lab_precise_min": 0.5, "lab_min_events": 5, "lab_min_videos": 1, "lab_max_len": 8, "lab_beam": 100,
                 "lab_branch": 10, "lab_max_rules": 100, "lab_exh_lift": 2.0, "lab_exh_seed_lift": 1.5,
                 "lab_exh_gain": 1.1, "lab_exh_max": 400, "lab_exh_seeds": 300, "lab_tr_max_onsets": 60,
-                "lab_tr_min_source": 100, "lab_tr_rules": 200, "lab_tr_min_events": 1, "lab_tr_confirm": 2}
+                "lab_tr_min_source": 100, "lab_tr_rules": 200, "lab_tr_min_events": 1, "lab_tr_confirm": 2,
+                "lab_tr_mirror": True}
 
 
 def agent_age(X, n, t):
