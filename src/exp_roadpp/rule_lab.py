@@ -521,6 +521,220 @@ def exhaustive_rules(pool, allowed, cfg, check=None):
     return [(key, p, e) for key, (p, e, _s) in ranked], over
 
 
+# -------------- Transfer from data-rich classes and adaptation ("tr", 2026-11-24) --------------
+# The user: heads with few samples (Bus:VehLane, 24 train onsets) should borrow the rules of the same action of
+# other classes (Car:VehLane, 596 onset rows) and adapt them to their own samples (a bus box is larger, ...).
+#   1. targets: heads with < lab_tr_max_onsets train onsets; sources: the same action of the other vehicle classes
+#      with >= lab_tr_min_source onsets (the two largest);
+#   2. the source's "exh" rules (by its own train sample and check videos), the lab_tr_rules best;
+#   3. mapped: the source class's own label literals ("Car:OutgoLane(own)") become the target's ("Bus:OutgoLane");
+#      shape atoms are per-class quantiles already ("shp:tall" of a bus is tall for a bus), the rest stays;
+#   4. adapted on the target's train videos of even index: a local search that keeps the change of best
+#      pessimistic precision (>= lab_tr_min_events onsets): a literal in the slot before / after, the neighbouring
+#      position cell or direction sector (+-5, +-10 deg), a literal dropped, one significant literal added;
+#   5. confirmed on the target's odd train videos (>= 1 onset, lift >= 1); --lab_check then asks the check videos.
+# The source's train onsets carry the rule (>= lab_min_events there); the target needs lab_tr_min_events.
+TR_STEPS = 4               # improvements of the local search per rule
+TR_ANGLES = (-10, -5, 5, 10)
+
+
+def _class_actions(names, heads):
+    """{head: (class, action)} of the agent label heads ("Car:VehLane" -> ("Car", "VehLane"))."""
+    out = {}
+    for h in heads:
+        cls, _, act = names[h].partition(":")
+        if act and cls not in ("av", "TL", "OthTL", "shp", "gst", "pos"):
+            out[h] = (cls, act)
+    return out
+
+
+def transfer_sources(names, heads, all_heads, train, cfg):
+    """{target head: [source heads]}: targets with few train onsets, sources the same action of other vehicle
+    classes with many (`--lab_tr_*`)."""
+    ca = _class_actions(names, all_heads)
+    onsets = {}
+    for h in ca:
+        sel = (train["pairs"]["head"] == h) & train["pairs"]["y"].bool()
+        onsets[h] = int(train["pairs"]["event"][sel].unique().numel())
+    out = {}
+    for h in heads:
+        if h not in ca or onsets.get(h, 0) >= cfg["lab_tr_max_onsets"]:
+            continue
+        cls, act = ca[h]
+        if cls == "Ped":
+            continue
+        src = [g for g, (c, a) in ca.items() if a == act and c not in (cls, "Ped") and onsets[g] >= cfg["lab_tr_min_source"]]
+        src = sorted(src, key=lambda g: -onsets[g])[:2]
+        if src:
+            out[h] = src
+    return out, onsets
+
+
+class LiteralMap:
+    """Literal arithmetic on the rule net's own literals (`literal_table`): the class swap of own label literals,
+    and the siblings of a literal (other slot, neighbouring position cell, close direction sector)."""
+
+    def __init__(self, model, names):
+        import re
+        self.re = re
+        self.model = model
+        self.tab = literal_table(model)
+        self.names = names
+        self.atom_of = {nm: a for a, nm in enumerate(names)}
+        self.index = {}
+        for m, info in enumerate(self.tab):
+            if info["kind"] in ("X", "!X"):
+                self.index[(info["kind"], info["atom"], info["scope"], info["j"])] = m
+
+    def _lit(self, kind, atom, scope, j):
+        return self.index.get((kind, atom, scope, j))
+
+    def swap_class(self, m, src, dst):
+        """The literal with the own label atom "src:act" made "dst:act"; m itself if not such; None if missing."""
+        if m >= len(self.tab):
+            return None                                                     # derived literals: not mapped
+        info = self.tab[m]
+        if info["kind"] not in ("X", "!X") or info["scope"] != 0:
+            return m
+        nm = self.names[info["atom"]]
+        cls, _, act = nm.partition(":")
+        if cls != src:
+            return m
+        a = self.atom_of.get(f"{dst}:{act}")
+        return None if a is None else self._lit(info["kind"], a, 0, info["j"])
+
+    def siblings(self, m):
+        if m >= len(self.tab):
+            return []
+        info = self.tab[m]
+        if info["kind"] not in ("X", "!X"):
+            return []
+        k, a, sc, j = info["kind"], info["atom"], info["scope"], info["j"]
+        out = [self._lit(k, a, sc, jj) for jj in (j - 1, j + 1)]
+        nm = self.names[a]
+        mt = self.re.fullmatch(r"(pos:(?:TL|BR))_r(\d)c(\d)", nm)
+        if mt:
+            r, c = int(mt.group(2)), int(mt.group(3))
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                b = self.atom_of.get(f"{mt.group(1)}_r{r + dr}c{c + dc}")
+                if b is not None:
+                    out.append(self._lit(k, b, sc, j))
+        mt = self.re.fullmatch(r"(.*(?:dir|path))_(\d{3})", nm)
+        if mt:
+            for d in TR_ANGLES:
+                b = self.atom_of.get(f"{mt.group(1)}_{(int(mt.group(2)) + d) % 360:03d}")
+                if b is not None:
+                    out.append(self._lit(k, b, sc, j))
+        return [x for x in out if x is not None]
+
+
+def _rule_stats(pool, rows, lits, rate=None):
+    """(weighted precision, score, onsets) of a rule on the pool rows `rows` (bool). score: the FOIL gain
+    hits x log(precision / rate) (coverage and precision traded off: a rule twice as wide at a slightly lower
+    precision wins; 2026-11-24 the pessimistic precision kept a needless literal), or the pessimistic precision
+    without a rate."""
+    hold = rows & (pool["F"][:, list(lits)] > 0.5).all(dim=1)
+    w, y = pool["w"], pool["y"]
+    f = float(w[hold].sum())
+    h = float(w[hold & y].sum())
+    p = h / f if f > 0 else 0.0
+    if rate is not None:
+        score = h * math.log(max(p, 1e-9) / max(rate, 1e-9)) if h > 0 else -1e9
+    else:
+        lam = float(w[rows & ~y].median()) if bool((rows & ~y).any()) else 1.0
+        score = h / (f + lam)
+    return p, score, int(pool["event"][hold & y].unique().numel())
+
+
+def adapt_rule(pool, rows, lits, lmap, allowed, cfg):
+    """The local search of the transfer (see above) on the pool rows `rows`, by FOIL gain over the rows' rate:
+    returns the adapted literals."""
+    best = tuple(sorted(set(lits)))
+    w_r, y_r = pool["w"][rows], pool["y"][rows]
+    rate = float((w_r * y_r).sum() / w_r.sum().clamp(min=1e-12))
+    p0, s0, _e0 = _rule_stats(pool, rows, best, rate)
+    min_ev = cfg["lab_tr_min_events"]
+    F, w, y = pool["F"], pool["w"], pool["y"]
+    for _ in range(TR_STEPS):
+        cands = []
+        for k, m in enumerate(best):
+            rest = best[:k] + best[k + 1:]
+            if rest:
+                cands.append(rest)                                         # drop a literal
+            for s in lmap.siblings(m):
+                if bool(allowed[s]):
+                    cands.append(tuple(sorted(set(rest + (s,)))))          # a sibling instead
+        # one literal added: the significant best (as the exh extension)
+        hold = rows & (F[:, list(best)] > 0.5).all(dim=1)
+        M = hold.float()
+        nn_ = (M * w) @ F
+        hh = (M * w * y.float()) @ F
+        cc = (M * y.float()) @ F
+        pr = hh / nn_.clamp(min=1e-12)
+        lb = wilson_lb(pr, nn_ * nn_ / ((M * w * w) @ F).clamp(min=1e-12))
+        ok = allowed & (cc >= min_ev) & (lb > p0)
+        ok[list(best)] = False
+        if bool(ok.any()):
+            foil = hh * torch.log(pr.clamp(min=1e-9) / max(rate, 1e-9))
+            m = int(torch.where(ok, foil, torch.full_like(hh, -1e9)).argmax())
+            cands.append(tuple(sorted(best + (m,))))
+        top = None
+        for c in set(cands):
+            p, sc, e = _rule_stats(pool, rows, c, rate)
+            if e >= min_ev and p > rate and sc > s0 + 1e-6 and (top is None or sc > top[1]):
+                top = (c, sc, p, e)
+        if top is None:
+            break
+        best, s0, p0 = top[0], top[1], top[2]
+    return best
+
+
+def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device):
+    """The "tr" rules of the target heads (see above)."""
+    base_model = getattr(ext, "_model", ext)
+    lmap = LiteralMap(base_model, names)
+    L, A = ext.num_literals, ext.num_atoms
+    base = ext.literal_base.to(device)
+    scope = base // (ext.num_spans * A)
+    targets, onsets = transfer_sources(names, heads, all_heads, train, cfg)
+    print(f"[Rule lab] tr: {len(targets)} target heads: "
+          + ", ".join(f"{names[h]} ({onsets.get(h, 0)}) <- {'/'.join(names[g] for g in src)}" for h, src in targets.items()))
+    rules = []
+    for h, sources in tqdm(targets.items(), desc="Transfer"):
+        allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
+        tgt = step05_mine._pool_of(train, h, L, device)
+        if not bool(tgt["y"].any()):
+            continue
+        rate = float((tgt["w"] * tgt["y"]).sum() / tgt["w"].sum().clamp(min=1e-12))
+        even = tgt["video"] % 2 == 0
+        dst = names[h].partition(":")[0]
+        seen = set()
+        for g in sources:
+            src_pool = step05_mine._pool_of(train, g, L, device)
+            ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
+                bool((check["pairs"]["head"] == g).any()) else None
+            src_allowed = ext.input_mask.to(device) & ~((base % A == g) & (scope == 0))
+            found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
+            del src_pool, ck
+            src_cls = names[g].partition(":")[0]
+            for lits, _p, _e in found[:cfg["lab_tr_rules"]]:
+                mapped = [lmap.swap_class(m, src_cls, dst) for m in lits]
+                if any(m is None or not bool(allowed[m]) for m in mapped):
+                    continue
+                adapted = adapt_rule(tgt, even, mapped, lmap, allowed, cfg)
+                if adapted in seen:
+                    continue
+                seen.add(adapted)
+                p_c, _s, e_c = _rule_stats(tgt, ~even, adapted)                 # confirm on the odd videos
+                if e_c < 1 or p_c < rate:
+                    continue
+                rules.append({"head": int(h), "literals": list(adapted), "transfer": names[g],
+                              "min_events": cfg["lab_tr_min_events"]})
+        del tgt
+    print(f"[Rule lab] tr: {len(rules)} transferred and adapted rules (confirmed on the odd train videos)")
+    return rules
+
+
 # -------------- Exact counts on all train rows --------------
 @torch.no_grad()
 def recount(model, training_data, video_ids, rules, head_mask, possible, cfg, derived):
@@ -695,7 +909,7 @@ def finalize(rules, counts, min_events):
     out = []
     for i, r in enumerate(rules):
         f, h, e = float(counts["fires"][i]), float(counts["hits"][i]), int(counts["events"][i])
-        if f <= 0 or e < min_events:
+        if f <= 0 or e < r.get("min_events", min_events):          # "tr" rules: their own minimum (target)
             continue
         out.append({**r, "precision": h / f, "events": e, "fires": f})
     by_head = defaultdict(dict)
@@ -1526,6 +1740,8 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
         return rules
     base = ext.literal_base.to(device)
     scope = base // (ext.num_spans * A)
+    if component == "tr":
+        return transfer_rules(ext, names, heads, cfg.get("lab_all_heads", heads), train, check, cfg, device)
     if component == "exh":
         capped = 0
         for h in tqdm(heads, desc=f"Exhaustive short rules{' + derived' if use_derived else ''}"):
@@ -1625,6 +1841,10 @@ def main():
     parser.add_argument("--lab_merge", type=str, default="False",
                         help="merge the rules that differ in a parameter: class -> veh: group, close sectors and "
                              "intervals (also with --lab_fast)")
+    parser.add_argument("--lab_tr_max_onsets", type=int, default=60, help="tr: target heads below these train onsets")
+    parser.add_argument("--lab_tr_min_source", type=int, default=100, help="tr: source heads with these train onsets")
+    parser.add_argument("--lab_tr_rules", type=int, default=200, help="tr: source rules tried per source head")
+    parser.add_argument("--lab_tr_min_events", type=int, default=2, help="tr: train onsets a rule needs on the target")
     parser.add_argument("--lab_exh_lift", type=float, default=2.0, help="exh: kept rule precision / head rate")
     parser.add_argument("--lab_exh_seed_lift", type=float, default=1.5, help="exh: pairs extended (lift)")
     parser.add_argument("--lab_exh_gain", type=float, default=1.1,
@@ -1639,7 +1859,7 @@ def main():
     cfg = step05.get_cfg(config.get_step_05_input(args))
     for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
                 "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
-                "lab_exh_seeds"):
+                "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events"):
         cfg[key] = getattr(args, key)
     cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
     device = cfg["device"]
@@ -1665,6 +1885,7 @@ def main():
     names = [step05._atom_name(sig) for sig in vocab]
     head_mask = training_data["target_heads"].to(device)
     heads = torch.nonzero(head_mask).flatten().tolist()
+    cfg["lab_all_heads"] = list(heads)                     # "tr": its sources may lie outside --lab_heads
     if args.lab_heads:
         # Only these heads (names "Car:IncomLane" or actions "IncomLane"): a quick test. The others keep their
         # base rate in the evaluation and are not mined.
@@ -1751,6 +1972,9 @@ def main():
     val_ids = list(training_data["val_videos"])
     step(4, "derived literals of the sampled rows")
     only = set(heads) if args.lab_heads else None
+    if only is not None and any("tr" in parse_variant(v)[0] for v in args.lab_variants.split(",")):
+        srcs, _ = transfer_sources(names, heads, cfg["lab_all_heads"], train, cfg)
+        only |= {g for v in srcs.values() for g in v}                 # keep the source heads' sample rows
     train = extend_rows(compact_rows(train, only), derived, model.num_literals, device, desc="Derived literals (train)")
     check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), 2))), only), derived,
                         model.num_literals, device, desc="Derived literals (check)")
