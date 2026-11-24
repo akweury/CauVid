@@ -33,11 +33,13 @@ from src.exp_roadpp import (config, head_clips, mine_sweep, residual_clips, rule
 
 
 @torch.no_grad()
-def rule_onsets(model, training_data, video_ids, head, lits, head_mask, possible, cfg, limit):
-    """[(video, agent, onset)] of the head's onsets at which the rule (literal list) holds on a hit row."""
+def rule_onsets(model, training_data, video_ids, head, lits, head_mask, possible, cfg, limit, min_age=0):
+    """[(video, agent, onset)] of the head's onsets at which the rule (literal list) holds on a hit row; onsets
+    whose agent was seen for fewer than min_age frames before are left out (`head_clips.agent_age`)."""
     device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
     out, seen = [], set()
     for vid in video_ids:
+        X = step05._video_from_cells(training_data["videos"][vid], training_data["num_atoms"], "cpu") if min_age else None
         can = possible(vid)
         for frames in training_data["frames"][vid].split(int(cfg.get("mine_chunk", 256))):
             rows = step05._video_rows(model, training_data, vid, frames, device)
@@ -53,6 +55,8 @@ def rule_onsets(model, training_data, video_ids, head, lits, head_mask, possible
             onset = t + rows["first"][hit][:, head]
             for i in torch.nonzero(ok).flatten().tolist():
                 key = (vid, int(n[i]), int(onset[i]))
+                if X is not None and head_clips.agent_age(X, key[1], key[2]) < min_age:
+                    continue
                 if key not in seen:
                     seen.add(key)
                     out.append(key)
@@ -79,6 +83,8 @@ def main():
     parser.add_argument("--before_s", type=float, default=4.0)
     parser.add_argument("--after_s", type=float, default=1.0)
     parser.add_argument("--font_scale", type=float, default=1.5)
+    parser.add_argument("--min_age", type=int, default=5,
+                        help="skip onsets whose agent was seen for fewer frames right before (the user, 2026-11-24)")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -145,11 +151,12 @@ def main():
             if done >= args.pairs:
                 break
             src_head = names.index(r["source_head"])
-            tgt_on = rule_onsets(model, training_data, videos, h, r["literals"], head_mask, possible, cfg, args.per_rule)
+            tgt_on = rule_onsets(model, training_data, videos, h, r["literals"], head_mask, possible, cfg, args.per_rule,
+                                 args.min_age)
             if not tgt_on:
                 continue
             src_on = rule_onsets(model, training_data, videos, src_head, r["source_literals"], head_mask, possible, cfg,
-                                 len(tgt_on))
+                                 len(tgt_on), args.min_age)
             for (tv, ta, to), (sv, sa, so) in zip(tgt_on, src_on):
                 if done >= args.pairs:
                     break

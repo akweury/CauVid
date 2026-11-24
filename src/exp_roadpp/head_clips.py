@@ -37,6 +37,14 @@ LAB_DEFAULTS = {"lab_precise_min": 0.5, "lab_min_events": 5, "lab_min_videos": 1
                 "lab_tr_min_source": 100, "lab_tr_rules": 200, "lab_tr_min_events": 1, "lab_tr_confirm": 2}
 
 
+def agent_age(X, n, t):
+    """Frames agent n was seen (any label atom) without a break right before frame t (2026-11-24, the user: an
+    event right after the agent appears, e.g. a new state in its second frame, is not worth predicting or showing)."""
+    seen = X[:t, n].any(dim=1)
+    gone = torch.nonzero(~seen).flatten()
+    return int(t - (int(gone.max()) + 1 if len(gone) else 0))
+
+
 class NoNegOthers:
     """The rule net with the negated literals of the other agents off (the rule lab's "_nn")."""
 
@@ -63,6 +71,8 @@ def main():
     parser.add_argument("--after_s", type=float, default=1.0)
     parser.add_argument("--font_scale", type=float, default=1.7)
     parser.add_argument("--no_render", action="store_true")
+    parser.add_argument("--min_age", type=int, default=5,
+                        help="skip onsets whose agent was seen for fewer frames right before (the user, 2026-11-24)")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -150,8 +160,15 @@ def main():
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     label_names = [step05._atom_name(sig) for sig in unique_atoms]
     groups, out_events = defaultdict(list), []
+    young = 0
+    X_of = {}
     for key, e in events.items():
         vid, agent, onset, h = key
+        if vid not in X_of:
+            X_of[vid] = step05.build_video_tensor(atoms[vid], len(unique_atoms))
+        if agent_age(X_of[vid], agent, onset) < args.min_age:
+            young += 1
+            continue
         detected = bool(step07_paper._logit_bins(torch.tensor([e["score"]]))[0] >= th[h])
         ex = lane_clips.explain(model, names, final, gate, weight, by_head[h], e["act"], e["lits"]) if "act" in e else {}
         hold = [i for i in by_head[h] if float(e["act"][i]) >= 0.5 and float(weight[i]) > rule_lab.DROP_WEIGHT] \
@@ -162,6 +179,8 @@ def main():
                            "detected": detected,
                            "score": round(e["score"], 4), "threshold": lane_clips.bin_score(int(th[h])),
                            "transfer_rules_holding": e["transfer"], **ex})
+    print(f"[head_clips] {young} onsets skipped: their agent was seen < {args.min_age} frames before")
+    X_of.clear()
     for h in heads:
         n_d, n_m = len(groups[(h, "detected")]), len(groups[(h, "missed")])
         n_tr = sum(1 for k in groups[(h, "detected")] if events[k]["transfer"])
