@@ -1716,19 +1716,28 @@ class _Selected:
         self.rules = rules
 
 
-def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default):
+def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default, small=None, small_variant=None,
+                    min_pos=20):
     """Per head the variant of best AP on the check videos (the even val videos; the evaluation stays on the odd
     ones), scorer fixed (2026-11-24, the user: choose the variant per head; relaxed alone beat relaxed+exh on
-    Bus:TurLft / LarVeh:TurLft, tr helped Cyc:VehLane). A head without check positives keeps `default`. Returns
-    the histograms of the choice on the evaluation videos, {head: variant} and the rule set."""
+    Bus:TurLft / LarVeh:TurLft, tr helped Cyc:VehLane). Rules of the choice (2026-11-24 quick test, 12 heads: the
+    check videos chose right on the well sampled heads, at random on the small ones, Cyc:VehLane had no check
+    positive and fell to a variant without rules, 0.610 -> 0.025):
+      - a head in `small` (a transfer target, few train onsets) takes `small_variant` (the transfer);
+      - a head with >= min_pos positive check rows the variant of best check AP;
+      - else `default`.
+    Returns the histograms of the choice on the evaluation videos, {head: variant} and the rule set."""
     names = [n for n in hist_check if n != "mlp" and n.split("/")[1] == scorer]
     ap = {n: step07_paper._ap(*hist_check[n]) for n in names}
     npos = next(iter(hist_check.values()))[0].sum(dim=1)
     pos, neg = (torch.zeros_like(x) for x in hist_eval[f"{default}/{scorer}"])
     choice, rules = {}, []
+    small = small or set()
     for h in range(pos.shape[0]):
         best = f"{default}/{scorer}"
-        if h in heads and float(npos[h]) > 0:
+        if h in heads and h in small and small_variant:
+            best = f"{small_variant}/{scorer}"
+        elif h in heads and float(npos[h]) >= min_pos:
             vals = {n: float(ap[n][h]) for n in names}
             vals = {n: (v if v == v else -1.0) for n, v in vals.items()}
             best = max(names, key=lambda n: (vals[n], -names.index(n)))     # ties: the variant listed first
@@ -2043,6 +2052,8 @@ def main():
     parser.add_argument("--lab_select", type=str, default="True",
                         help="choose the variant per head on the check videos; reported as the variant 'selected'")
     parser.add_argument("--lab_select_scorer", type=str, default="soft_logit", help="the scorer of the selection")
+    parser.add_argument("--lab_select_min_pos", type=int, default=20,
+                        help="positive check rows a head needs to be chosen by its check AP (else the exh variant)")
     parser.add_argument("--lab_check", type=str, default="False",
                         help="drop the rules that do not hold on the check videos (even val videos), `check_filter`")
     parser.add_argument("--lab_merge", type=str, default="False",
@@ -2338,8 +2349,20 @@ def main():
         # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
         check_ids = val_ids[0::2]
         hist_c = evaluate(model, None, training_data, check_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
-        default = variants[0]
-        h_sel, choice, rs_sel = select_per_head(hist, hist_c, rule_sets, heads, args.lab_select_scorer, default)
+        comps = {v: set(parse_variant(v)[0]) for v in variants}
+        default = next((v for v in variants if "exh" in comps[v]), variants[0])
+        small_variant = next((v for v in variants if {"tr", "trp"} & comps[v]), None)
+        small = set()
+        if small_variant:
+            pairs = train["pairs"]
+            for h in heads:
+                sel = (pairs["head"] == h) & pairs["y"].bool()
+                if int(pairs["event"][sel].unique().numel()) < cfg["lab_tr_max_onsets"]:
+                    small.add(h)
+        h_sel, choice, rs_sel = select_per_head(hist, hist_c, rule_sets, heads, args.lab_select_scorer, default,
+                                                small, small_variant, args.lab_select_min_pos)
+        print(f"[Rule lab] selection: transfer targets ({len(small)}) -> {small_variant}; others by the check AP with "
+              f">= {args.lab_select_min_pos} positive check rows, else {default}")
         hist[f"selected/{args.lab_select_scorer}"] = h_sel
         rule_sets["selected"] = rs_sel
         print(f"[Rule lab] per-head selection ({args.lab_select_scorer}, on the check videos): "
