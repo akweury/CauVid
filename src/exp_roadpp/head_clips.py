@@ -55,7 +55,9 @@ def main():
     parser.add_argument("--clip_mode", type=str, default="logit", help="soft fit (logit = the lab's soft_logit)")
     parser.add_argument("--clip_fpr", type=float, default=0.02)
     parser.add_argument("--lab_check", type=str, default="True")
-    parser.add_argument("--num", type=int, default=6, help="missed and detected clips per head")
+    parser.add_argument("--num", type=int, default=6, help="missed and detected clips per head (large: all)")
+    parser.add_argument("--clip_videos", type=str, default="eval", choices=("eval", "val", "all"),
+                        help="onsets of the odd val videos (the lab's evaluation), all val videos, or val + train")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--before_s", type=float, default=4.0)
     parser.add_argument("--after_s", type=float, default=1.0)
@@ -129,9 +131,22 @@ def main():
     eval_ids = val_ids[1::2]
     neg, events = gestalt_fail_clips.collect_events(model, rs, args.clip_mode, training_data, eval_ids, heads,
                                                     head_mask, possible, cfg)
-    th = lane_clips.thresholds(neg, args.clip_fpr)
+    th = lane_clips.thresholds(neg, args.clip_fpr)              # the threshold of the evaluation videos, always
+    split_of = {v: "eval" for v in eval_ids}
+    more = []
+    if args.clip_videos in ("val", "all"):
+        more += [(v, "check") for v in val_ids[0::2]]
+    if args.clip_videos == "all":
+        more += [(v, "train") for v in training_data["train_videos"]]
+    if more:
+        _neg2, ev2 = gestalt_fail_clips.collect_events(model, rs, args.clip_mode, training_data, [v for v, _ in more],
+                                                       heads, head_mask, possible, cfg)
+        events.update(ev2)
+        split_of.update(dict(more))
     rule_tr = {i: final[i].get("transfer") for i in range(len(final))}
     atoms = utils_data.load_json(cfg["val_atom_file"])
+    if args.clip_videos == "all":
+        atoms.update(utils_data.load_json(cfg["train_atom_file"]))
     unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
     label_names = [step05._atom_name(sig) for sig in unique_atoms]
     groups, out_events = defaultdict(list), []
@@ -143,13 +158,14 @@ def main():
             if "act" in e else []
         e.update(detected=detected, explain=ex, transfer=sorted({rule_tr[i] for i in hold if rule_tr[i]}))
         groups[(h, "detected" if detected else "missed")].append(key)
-        out_events.append({"video": vid, "onset_frame": onset, "head": names[h], "detected": detected,
+        out_events.append({"video": vid, "split": split_of.get(vid), "onset_frame": onset, "head": names[h],
+                           "detected": detected,
                            "score": round(e["score"], 4), "threshold": lane_clips.bin_score(int(th[h])),
                            "transfer_rules_holding": e["transfer"], **ex})
     for h in heads:
         n_d, n_m = len(groups[(h, "detected")]), len(groups[(h, "missed")])
         n_tr = sum(1 for k in groups[(h, "detected")] if events[k]["transfer"])
-        print(f"\n[head_clips] {names[h]}: {n_d + n_m} onsets on the odd val videos, detected {n_d} "
+        print(f"\n[head_clips] {names[h]}: {n_d + n_m} onsets ({args.clip_videos} videos), detected {n_d} "
               f"({n_tr} with a transferred rule holding), missed {n_m}; threshold "
               f"{lane_clips.bin_score(int(th[h])):.3f} (fpr {args.clip_fpr})")
 
@@ -176,11 +192,11 @@ def main():
                 line = (f"rules hold: {ex['holding'][0]['rule']} (w {ex['holding'][0]['weight']})"
                         + (f" [{', '.join(e['transfer'])}]" if e["transfer"] else "") if ex.get("holding")
                         else f"near miss: {ex['near_miss'][0]['rule']}" if ex.get("near_miss") else "no rule of the head")
-                label = (f"[{state}] {names[h]}; score {e['score']:.3f} (thr {lane_clips.bin_score(int(th[h])):.3f})\n"
+                label = (f"[{state}, {split_of.get(vid)}] {names[h]}; score {e['score']:.3f} (thr {lane_clips.bin_score(int(th[h])):.3f})\n"
                          f"{line[:170]}")
                 num_frames = len(residual_clips.sumo_render._video(dataset, vid)[1]["frames"])
                 lo, hi = max(1, onset - int(args.before_s * 10)), min(num_frames, onset + int(args.after_s * 10))
-                out_file = out_dir / names[h].replace(":", "_") / f"{state}_{vid}_f{onset}.mp4"
+                out_file = out_dir / names[h].replace(":", "_") / f"{state}_{split_of.get(vid)}_{vid}_f{onset}.mp4"
                 print(f"  rendering {out_file.relative_to(out_dir)} (frames {lo}-{hi})")
                 with tempfile.TemporaryDirectory() as tmp:
                     for i, f in enumerate(range(lo, hi + 1)):
