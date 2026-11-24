@@ -382,6 +382,17 @@ def _check_ok(ev_train, rows_c, hits_c, lift_c):
     return (rows_c >= 1) & (hits_c >= 1) & (lift_c >= 1.0)
 
 
+WILSON_Z = 1.96            # 95% (two-sided) Wilson bound of the significance tests below
+
+
+def wilson_lb(p, n_eff, z=WILSON_Z):
+    """Lower Wilson bound of a precision p seen on n_eff (effective) rows; tensors."""
+    n = n_eff.clamp(min=1e-9)
+    den = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    return (centre - z * torch.sqrt((p * (1 - p) / n + z * z / (4 * n * n)).clamp(min=0))) / den
+
+
 def exhaustive_rules(pool, allowed, cfg, check=None):
     """The "exh" rules of one head (see above): [(literals tuple, sample precision, onsets)] and the number of
     rules over the cap. check: the head's pool of the check videos (`--lab_check`): the short rules must pass
@@ -401,8 +412,12 @@ def exhaustive_rules(pool, allowed, cfg, check=None):
     hit_rows = torch.nonzero(y).flatten()
     ev1 = step05_mine._distinct(pool["event"][hit_rows], F[hit_rows])         # (L,) onsets per literal
     vid1 = step05_mine._distinct(pool["video"][hit_rows], F[hit_rows])
-    n1, h1 = w @ F, wy @ F
+    n1, h1, s1 = w @ F, wy @ F, (w * w) @ F
     p1 = h1 / n1.clamp(min=1e-12)
+    # Significance (2026-11-24, 118k rules of >= 5 onsets for 8 heads ran the fit out of memory): the weighted
+    # sample's effective rows n_eff = (sum w)^2 / sum w^2; a literal must beat the head's rate, a pair both its
+    # literals, an extension its parent, at the lower 95% Wilson bound. Each test reads the rule's own counts only.
+    lb1 = wilson_lb(p1, n1 * n1 / s1.clamp(min=1e-12))
     cand = torch.nonzero(allowed & (ev1 >= min_ev) & (vid1 >= min_vid) & (n1 > 0)).flatten()
     kept = {}
     if check is not None and len(check["y"]):
@@ -414,7 +429,7 @@ def exhaustive_rules(pool, allowed, cfg, check=None):
     else:
         Fk = None
         ok1 = torch.ones_like(ev1, dtype=torch.bool)
-    for m in cand[(p1[cand] >= lift * rate) & ok1[cand]].tolist():
+    for m in cand[(p1[cand] >= lift * rate) & ok1[cand] & (lb1[cand] > rate)].tolist():
         kept[(m,)] = (float(p1[m]), int(ev1[m]), float(h1[m] / (n1[m] + lam)))
     # 1. All pairs of candidate literals.
     Fc = F[:, cand]
@@ -422,9 +437,13 @@ def exhaustive_rules(pool, allowed, cfg, check=None):
     h2 = (Fc * wy[:, None]).T @ Fc
     r2 = (Fc * yf[:, None]).T @ Fc                                             # hit rows (unweighted)
     p2 = h2 / n2.clamp(min=1e-12)
+    s2 = (Fc * (w * w)[:, None]).T @ Fc
+    lb2 = wilson_lb(p2, n2 * n2 / s2.clamp(min=1e-12))
     pc = p1[cand]
     upper = torch.triu(torch.ones_like(p2, dtype=torch.bool), diagonal=1)
-    useful = (p2 >= gain * torch.maximum(pc[:, None], pc[None, :])) & (r2 >= min_ev) & (n2 > 0) & upper
+    best_part = torch.maximum(pc[:, None], pc[None, :])
+    useful = (p2 >= gain * best_part) & (lb2 > best_part) & (r2 >= min_ev) & (n2 > 0) & upper
+    del s2, lb2
     seedable = useful & (p2 >= seed_lift * rate)
     ia, ib = torch.nonzero(seedable, as_tuple=True)
     score = h2[ia, ib] / (n2[ia, ib] + lam)
@@ -464,7 +483,8 @@ def exhaustive_rules(pool, allowed, cfg, check=None):
             cc = (M * yf) @ F
             pr = hh / nn_.clamp(min=1e-12)
             sc = hh / (nn_ + lam)
-            okc = (allowed[None] & (cc >= min_ev) & (pr >= gain * precs[:, None]) & (nn_ > 0)
+            lbc = wilson_lb(pr, nn_ * nn_ / ((M * (w * w)) @ F).clamp(min=1e-12))
+            okc = (allowed[None] & (cc >= min_ev) & (pr >= gain * precs[:, None]) & (lbc > precs[:, None]) & (nn_ > 0)
                    & ((M @ F) < M.sum(dim=1, keepdim=True)))
             for s, key in enumerate(keys):
                 okc[s, list(key)] = False
@@ -1122,6 +1142,9 @@ def _soft_act(lits_f, body, gate):
     return torch.cat(out, dim=1) if out else torch.zeros((len(lits_f), 0), device=lits_f.device)
 
 
+FIT_CELLS = 4e8             # rows x rules x literals of one head's soft fit (activations + gradients ~ 10 GB)
+
+
 def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2=1e-5, gate_reg=1e-4):
     """Soft AND and soft OR per head, fit on the weighted train sample (2026-11-22, the user: the AND within a
     rule and the OR between rules should be soft, not hard).
@@ -1148,6 +1171,13 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         pool = step05_mine._pool_of(train, h, L, device)
         if not bool(pool["y"].any()):
             continue
+        cap = max(1, int(FIT_CELLS // max(len(pool["y"]) * K, 1)))
+        if len(idx) > cap:
+            # Safeguard (activations (rows, rules, literals) must fit the GPU): the cap best rules by their own
+            # pessimistic precision are fit, the others get weight 0 (reported).
+            order = sorted(idx, key=lambda i: -float(conf[i]))
+            print(f"[Rule lab] fit_soft: head {h}: {len(idx)} rules, only the {cap} most confident fit (memory)")
+            idx = order[:cap]
         body = _pad([rules[i]["literals"] for i in idx], L).to(device)
         if body.shape[1] < K:
             body = torch.cat([body, torch.full((len(idx), K - body.shape[1]), L, device=device)], dim=1)
