@@ -75,3 +75,6 @@
 
 ./run_roadpp_docker.sh --gpu 7 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_variants relaxed_nn,exh_nn,relaxed+exh_nn --lab_check True --lab_merge True 2>&1 | tee rule_lab_cv_mg.log
 
+
+
+./run_roadpp_docker.sh --gpu 4 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --lab_variants relaxed_nn,relaxed+exh_nn,relaxed+exh+tr_nn --lab_check True --lab_merge True 2>&1 | tee rule_lab_quick_tr.log

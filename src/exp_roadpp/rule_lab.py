@@ -61,7 +61,7 @@ import math
 import time
 import os
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import torch
 from tqdm import tqdm
@@ -709,6 +709,7 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device):
         even = tgt["video"] % 2 == 0
         dst = names[h].partition(":")[0]
         seen = set()
+        tally = Counter()
         for g in sources:
             src_pool = step05_mine._pool_of(train, g, L, device)
             ck = step05_mine._pool_of(check, g, L, device) if cfg.get("lab_check") and \
@@ -717,19 +718,30 @@ def transfer_rules(ext, names, heads, all_heads, train, check, cfg, device):
             found, _ = exhaustive_rules(src_pool, src_allowed, cfg, ck)
             del src_pool, ck
             src_cls = names[g].partition(":")[0]
+            tally["source rules"] += len(found)
             for lits, _p, _e in found[:cfg["lab_tr_rules"]]:
+                tally["tried"] += 1
                 mapped = [lmap.swap_class(m, src_cls, dst) for m in lits]
                 if any(m is None or not bool(allowed[m]) for m in mapped):
+                    tally["not mappable"] += 1
                     continue
+                _p_m, _s, e_m = _rule_stats(tgt, even, mapped)
+                tally["mapped with >= 1 onset"] += e_m >= 1
                 adapted = adapt_rule(tgt, even, mapped, lmap, allowed, cfg)
+                tally["changed by adaptation"] += tuple(sorted(set(mapped))) != adapted
                 if adapted in seen:
                     continue
                 seen.add(adapted)
                 p_c, _s, e_c = _rule_stats(tgt, ~even, adapted)                 # confirm on the odd videos
                 if e_c < 1 or p_c < rate:
+                    tally["not confirmed"] += 1
                     continue
+                tally["kept"] += 1
                 rules.append({"head": int(h), "literals": list(adapted), "transfer": names[g],
                               "min_events": cfg["lab_tr_min_events"]})
+        print(f"    {names[h]}: rate {rate:.3f}, train onsets even/odd videos "
+              f"{int(tgt['event'][tgt['y'] & even].unique().numel())}/{int(tgt['event'][tgt['y'] & ~even].unique().numel())}; "
+              + ", ".join(f"{k} {v}" for k, v in tally.items()))
         del tgt
     print(f"[Rule lab] tr: {len(rules)} transferred and adapted rules (confirmed on the odd train videos)")
     return rules
@@ -2080,6 +2092,9 @@ def main():
         texts[name] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
                                "literals": [step05_mine.literal_text(full, names, m) for m in r["literals"]],
                                "derived": sum(m >= model.num_literals for m in r["literals"]),
+                               **({"transfer": r["transfer"]} if r.get("transfer") else {}),
+                               **({"check_events": r["check_events"], "check_lift": r["check_lift"]}
+                                  if "check_events" in r else {}),
                                "weight": round(float(logit[0][i]), 3),
                                "soft": {m: {"weight": round(float(par[0][i]), 3),
                                             "gates": [round(float(x), 3) for x in g[i][:len(r["literals"])]]}
