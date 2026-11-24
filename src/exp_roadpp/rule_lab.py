@@ -1709,6 +1709,37 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
     return {name: (pos.view(A, NB).cpu(), neg.view(A, NB).cpu()) for name, (pos, neg) in hist.items()}
 
 
+class _Selected:
+    """The per-head choice as a rule set for `report` (its rules: the chosen variant's per head)."""
+
+    def __init__(self, rules):
+        self.rules = rules
+
+
+def select_per_head(hist_eval, hist_check, rule_sets, heads, scorer, default):
+    """Per head the variant of best AP on the check videos (the even val videos; the evaluation stays on the odd
+    ones), scorer fixed (2026-11-24, the user: choose the variant per head; relaxed alone beat relaxed+exh on
+    Bus:TurLft / LarVeh:TurLft, tr helped Cyc:VehLane). A head without check positives keeps `default`. Returns
+    the histograms of the choice on the evaluation videos, {head: variant} and the rule set."""
+    names = [n for n in hist_check if n != "mlp" and n.split("/")[1] == scorer]
+    ap = {n: step07_paper._ap(*hist_check[n]) for n in names}
+    npos = next(iter(hist_check.values()))[0].sum(dim=1)
+    pos, neg = (torch.zeros_like(x) for x in hist_eval[f"{default}/{scorer}"])
+    choice, rules = {}, []
+    for h in range(pos.shape[0]):
+        best = f"{default}/{scorer}"
+        if h in heads and float(npos[h]) > 0:
+            vals = {n: float(ap[n][h]) for n in names}
+            vals = {n: (v if v == v else -1.0) for n, v in vals.items()}
+            best = max(names, key=lambda n: (vals[n], -names.index(n)))     # ties: the variant listed first
+        pos[h], neg[h] = hist_eval[best][0][h], hist_eval[best][1][h]
+        if h in heads:
+            v = best.split("/")[0]
+            choice[h] = v
+            rules += [r for r in rule_sets[v].rules if r["head"] == h]
+    return (pos, neg), choice, _Selected(rules)
+
+
 def report(hist, names, heads, rule_sets):
     """Per head AP of every scorer; macro / close / wins over the learnable heads; per action."""
     ap = {name: step07_paper._ap(pos, neg) for name, (pos, neg) in hist.items()}
@@ -2009,6 +2040,9 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_select", type=str, default="True",
+                        help="choose the variant per head on the check videos; reported as the variant 'selected'")
+    parser.add_argument("--lab_select_scorer", type=str, default="soft_logit", help="the scorer of the selection")
     parser.add_argument("--lab_check", type=str, default="False",
                         help="drop the rules that do not hold on the check videos (even val videos), `check_filter`")
     parser.add_argument("--lab_merge", type=str, default="False",
@@ -2299,9 +2333,25 @@ def main():
     # 3. Every at-risk row of the odd val videos.
     step(8, "evaluation on the odd val videos")
     hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
+    choice = {}
+    if args.lab_select == "True" and len(rule_sets) > 1:
+        # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
+        check_ids = val_ids[0::2]
+        hist_c = evaluate(model, None, training_data, check_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
+        default = variants[0]
+        h_sel, choice, rs_sel = select_per_head(hist, hist_c, rule_sets, heads, args.lab_select_scorer, default)
+        hist[f"selected/{args.lab_select_scorer}"] = h_sel
+        rule_sets["selected"] = rs_sel
+        print(f"[Rule lab] per-head selection ({args.lab_select_scorer}, on the check videos): "
+              + ", ".join(f"{v} {n}" for v, n in Counter(choice.values()).most_common()))
     out = report(hist, names, heads, rule_sets)
+    if choice:
+        out["selected"] = {names[h]: v for h, v in choice.items()}
     if out["best"]:
         best_variant = out["best"].split("/")[0]
+        if best_variant not in texts:                       # "selected": show the best real variant's rules
+            real = {k: v for k, v in out["summary"].items() if k.split("/")[0] in texts}
+            best_variant = max(real, key=lambda k: real[k]["macro"]).split("/")[0] if real else variants[0]
         for m in soft_modes:
             if m == "nor":
                 continue

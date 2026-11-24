@@ -14,6 +14,18 @@ VEHICLE_CLASSES = {
     "Cyc":    ("bicycle",    0.02,  1.6, 0.6, 1.7,  5.5, 1.2, 3.0),
     "Mobike": ("motorcycle", 0.02,  2.0, 0.8, 1.5, 16.0, 3.0, 6.0),
 }
+
+
+def set_class_shares(shares):
+    """Override the vehicle class shares ({"Bus": 0.10, ..}; the others keep theirs, `rng.choices` normalizes):
+    rare classes made more frequent so that their heads get enough onsets (2026-11-24: Bus / Cyc / Mobike heads
+    had 1-3 onsets in the evaluation half of sumo_maps_v7). Call before the worker pool forks."""
+    for cls, share in shares.items():
+        if cls not in VEHICLE_CLASSES:
+            raise ValueError(f"unknown vehicle class {cls!r}; known: {list(VEHICLE_CLASSES)}")
+        VEHICLE_CLASSES[cls] = (VEHICLE_CLASSES[cls][0], float(share)) + VEHICLE_CLASSES[cls][2:]
+
+
 PED_SIZE = (0.5, 0.5, 1.75)             # length, width, height
 TL_SIZE = (0.4, 0.4, 1.0)               # signal head; its bottom at TL_BOTTOM
 TL_BOTTOM = 4.0

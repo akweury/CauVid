@@ -386,6 +386,9 @@ def main():
                         help="instances per event to reach, e.g. R1=400,N4=200,av:AV-TurLft=300 (rule tests of "
                              "check_rules or heads); empty: exactly --num simulations; default "
                              f"{DEFAULT_TARGETS} (grid: {DEFAULT_GRID_TARGETS})")
+    parser.add_argument("--class_shares", default=None,
+                        help="vehicle class shares, e.g. Bus=0.10,Cyc=0.08,Mobike=0.08 (default: traffic.VEHICLE_CLASSES; "
+                             "rare classes more frequent for their heads' onsets)")
     parser.add_argument("--batch", type=int, default=BATCH, help="simulations per sampling round")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
@@ -424,6 +427,10 @@ def main():
         {"version": version, "rules": rules.GT_RULES + (rules.GT_RULES_GRID if grid else []),
          "natural_rules": rules.NATURAL_RULES}, indent=2))
     targets = parse_targets(args.targets)
+    if args.class_shares:
+        shares = {k: float(v) for k, v in (x.split("=") for x in args.class_shares.split(",") if x)}
+        traffic.set_class_shares(shares)                 # before the pool forks: the workers inherit it
+        print(f"[SUMO] vehicle class shares: {({c: v[1] for c, v in traffic.VEHICLE_CLASSES.items()})}")
     if args.maps:
         maps = scenario.build_maps(out / "sumo", args.maps, args.seed, args.layout)
         kinds = Counter(maps[m]["name"].split("_")[0] if grid else
