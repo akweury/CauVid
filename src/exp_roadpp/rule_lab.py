@@ -93,9 +93,50 @@ MDL_SIZE_REF = 200.0
 
 
 def mdl_lambda(mode, onsets):
-    """λ of a "mdl_λ" / "mdls_λ" mode for a head with this many train (sample) onsets."""
+    """λ of a "mdl_λ" / "mdls_λ" / "mdlt_λ" / "mdlts_λ" mode for a head with this many train (sample) onsets."""
     lam = float(mode.split("_", 1)[1])
-    return lam * min(1.0, MDL_SIZE_REF / max(onsets, 1)) if mode.startswith("mdls_") else lam
+    return lam * min(1.0, MDL_SIZE_REF / max(onsets, 1)) if mode.startswith(("mdls_", "mdlts_")) else lam
+
+
+def is_temporal(mode):
+    """The MDL modes over temporal rules ("mdlt_λ", "mdlts_λ", `temporal_groups`)."""
+    return mode.startswith(("mdlt_", "mdlts_"))
+
+
+# Temporal rules (2026-11-25, the user: the rules of one event at different times, e.g. Car:MovTow@1 +0.81,
+# @2 -0.65, @3 -0.76 = "just started to come toward the ego", are one rule with a weight per time, and the weights
+# may differ between situations). A temporal rule: a context C (the other literals) and an event X; its members are
+# the rules C & X@k (one per slot k), each with its own weight = the time profile of X under C. Another context
+# gives another rule, so another profile. The members share C's gates; the MDL fit ("mdlt_λ") pays RULE_COST and
+# C's literals once per temporal rule, plus one literal per slot weight kept.
+SLOT_RE = re.compile(r"^(!?)(.+)@(\d+)$")
+
+
+def temporal_groups(rules, text_of):
+    """Per rule (group id, index of its slot literal in r["literals"] or -1). Rules equal but for the slot of one
+    literal (same sign, scope and atom) form a group; a rule joins at most one group (largest first); the others
+    are groups of one (plain rules, no slot literal)."""
+    cand = defaultdict(list)
+    for i, r in enumerate(rules):
+        lits = list(r["literals"])
+        for j, m in enumerate(lits):
+            hit = SLOT_RE.match(text_of(m))
+            if hit:
+                rest = tuple(sorted(lits[:j] + lits[j + 1:]))
+                cand[(r["head"], rest, hit[1] + hit[2])].append((i, j, int(hit[3])))
+    group, slot_pos = [-1] * len(rules), [-1] * len(rules)
+    n = 0
+    for key, members in sorted(cand.items(), key=lambda kv: -len(kv[1])):
+        free = [(i, j, k) for i, j, k in members if group[i] < 0]
+        if len({k for _i, _j, k in free}) < 2:
+            continue
+        for i, j, _k in free:
+            group[i], slot_pos[i] = n, j
+        n += 1
+    for i in range(len(rules)):
+        if group[i] < 0:
+            group[i], n = n, n + 1
+    return group, slot_pos
 
 
 def is_compact(mode):
@@ -1542,7 +1583,7 @@ def _soft_act(lits_f, body, gate):
 FIT_CELLS = 4e8             # rows x rules x literals of one head's soft fit (activations + gradients ~ 10 GB)
 
 
-def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2=1e-5, gate_reg=1e-4):
+def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2=1e-5, gate_reg=1e-4, temporal=None):
     """Soft AND and soft OR per head, fit on the weighted train sample (2026-11-22, the user: the AND within a
     rule and the OR between rules should be soft, not hard).
     Soft AND: a rule's activation a_r = prod_i (1 - g_ri (1 - x_i)); every gate g_ri starts at ~0.95 (the
@@ -1550,8 +1591,9 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
     gate_reg x sum(1 - g) keeps the gates near the hard rule unless the data pays for it.
     Soft OR, mode "logit": p = sigmoid(b + sum_r w_r a_r); mode "nor": p = 1 - (1 - base) prod_r (1 - q_r a_r),
     q_r from the rule's confidence. Modes of SPARSE: "logit" with the gates and weights pushed toward 0
-    instead (readable rules: the literals and rules that do not pay drop). Returns gate (R, K) and
-    (w (R,), b (A,)) or q (R,)."""
+    instead (readable rules: the literals and rules that do not pay drop). Modes "mdlt_*" need temporal
+    (`temporal_groups`): the members of a temporal rule share the gates of their context literals, and the
+    description length counts each temporal rule once. Returns gate (R, K) and (w (R,), b (A,)) or q (R,)."""
     logistic = mode != "nor"
     L = model.num_literals
     K = max((len(r["literals"]) for r in rules), default=1)
@@ -1568,7 +1610,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         pool = step05_mine._pool_of(train, h, L, device)
         if not bool(pool["y"].any()):
             continue
-        if mode.startswith(("mdl_", "mdls_")):
+        if mode.startswith("mdl"):
             lam = mdl_lambda(mode, int(pool["event"][pool["y"]].unique().numel()))
         cap = max(1, int(FIT_CELLS // max(len(pool["y"]) * K, 1)))
         if len(idx) > cap:
@@ -1583,8 +1625,31 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         X = torch.cat([pool["F"], torch.ones((len(pool["y"]), 1), device=device)], dim=1)[:, body]   # (n, R, K)
         pad = body == L
         y, w = pool["y"].float(), pool["w"] / pool["w"].sum()
-        theta = torch.full(body.shape, 3.0, device=device, requires_grad=True)
-        params = [theta]
+        tied = is_temporal(mode) and temporal is not None
+        if tied:
+            # One gate parameter per (temporal rule, context literal) and per (rule, slot literal); owner: the
+            # temporal rule (context literal, paid while any member is kept) or the member (its slot literal).
+            grp_of, spos = temporal[0], temporal[1]
+            local = {g: n for n, g in enumerate(dict.fromkeys(grp_of[i] for i in idx))}
+            gid = torch.tensor([local[grp_of[i]] for i in idx], device=device)
+            keys, pid = {}, torch.zeros(body.shape, dtype=torch.long)
+            own_rule, owner = [], []
+            for a, i in enumerate(idx):
+                for k, m in enumerate(rules[i]["literals"]):
+                    key = ("r", a, k) if k == spos[i] else ("g", local[grp_of[i]], m)
+                    if key not in keys:
+                        keys[key] = len(keys)
+                        own_rule.append(key[0] == "r")
+                        owner.append(a if key[0] == "r" else local[grp_of[i]])
+                    pid[a, k] = keys[key]
+            pid = pid.to(device)
+            own_rule = torch.tensor(own_rule, dtype=torch.bool, device=device)
+            owner = torch.tensor(owner, dtype=torch.long, device=device)
+            theta_p = torch.full((len(keys),), 3.0, device=device, requires_grad=True)
+            params = [theta_p]
+        else:
+            theta = torch.full(body.shape, 3.0, device=device, requires_grad=True)
+            params = [theta]
         p0 = min(max(float((w * y).sum()), 1e-6), 1 - 1e-6)
         base_loss = -(p0 * math.log(p0) + (1 - p0) * math.log(1 - p0))       # BCE of the constant base rate
         n_real = max(int((~pad).sum()), 1)
@@ -1600,6 +1665,8 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         opt = torch.optim.Adam(params, lr=0.1)
         for _ in range(steps):
             opt.zero_grad()
+            if tied:
+                theta = theta_p[pid]
             g = torch.sigmoid(theta).masked_fill(pad, 0.0)
             a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R)
             if logistic:
@@ -1610,7 +1677,14 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                 loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
             if mode in SPARSE:
                 loss = loss + SPARSE[mode] * base_loss * (g.sum() / n_real + wt.abs().mean())
-            elif mode.startswith(("mdl_", "mdls_")):
+            elif tied:
+                kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a member kept
+                norm = torch.zeros(len(local), device=device).index_add(0, gid, wt ** 2).add(1e-12).sqrt()
+                kept_g = torch.tanh(norm / RULE_TAU)                               # a temporal rule kept
+                pay = torch.where(own_rule, kept[owner.clamp(max=len(idx) - 1)], kept_g[owner.clamp(max=len(local) - 1)])
+                loss = loss + lam * base_loss / MDL_SCALE * (RULE_COST * kept_g.sum()
+                                                             + (torch.sigmoid(theta_p) * pay).sum())
+            elif mode.startswith("mdl"):
                 kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a rule kept, 0..1
                 lits = (g * kept[:, None]).sum()                                    # literals of the kept rules
                 loss = loss + lam * base_loss / MDL_SCALE * (RULE_COST * kept.sum() + lits)
@@ -1620,6 +1694,8 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                     loss = loss + l2 * (wt ** 2).sum()
             loss.backward()
             opt.step()
+        if tied:
+            theta = theta_p[pid]
         gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).cpu()
         gate[idx] = gi
         if logistic:
@@ -2033,6 +2109,61 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
     return rules
 
 
+def effective_temporal(rules, gate, keep, temporal):
+    """Size of a temporal fit: (temporal rules kept, literals per kept temporal rule, (kept,) literal counts); a
+    temporal rule is kept if a member is, its literals: the kept context literals + 1 for its event."""
+    group, spos = temporal
+    lits = {}
+    for i, r in enumerate(rules):
+        if not bool(keep[i]):
+            continue
+        n = sum(1 for k in range(len(r["literals"])) if k != spos[i] and float(gate[i, k]) >= DROP_GATE)
+        lits[group[i]] = max(lits.get(group[i], 0), n + (1 if spos[i] >= 0 else 0))
+    lens = torch.tensor(list(lits.values()), dtype=torch.long)
+    return len(lits), float(lens.float().mean()) if len(lens) else 0.0, lens
+
+
+def temporal_profiles(texts, mode):
+    """The temporal rules of one variant's texts in a temporal mode: [{head, context, event, profile {slot:
+    weight}, onsets (max over members), weight (L2 of the profile)}], strongest first; kept members only."""
+    by = defaultdict(list)
+    for r in texts:
+        if "temporal" in r and mode in r["soft"]:
+            by[r["temporal"][0]].append(r)
+    out = []
+    for rs in by.values():
+        kept = [r for r in rs if abs(r["soft"][mode]["weight"]) >= DROP_WEIGHT]
+        if not kept:
+            continue
+        j = rs[0]["temporal"][1]
+        if j < 0:
+            context, event, profile = rs[0]["literals"], None, {}
+        else:
+            hit = SLOT_RE.match(rs[0]["literals"][j])
+            event = hit[1] + hit[2]
+            context = [x for k, x in enumerate(rs[0]["literals"]) if k != j]
+            profile = {int(SLOT_RE.match(r["literals"][r["temporal"][1]])[3]): r["soft"][mode]["weight"] for r in rs}
+        w = (sum(r["soft"][mode]["weight"] ** 2 for r in kept)) ** 0.5
+        out.append({"head": rs[0]["head"], "context": context, "event": event,
+                    "profile": dict(sorted(profile.items())), "onsets": max(r["events"] for r in rs),
+                    "weight": round(w, 3)})
+    return sorted(out, key=lambda x: -x["weight"])
+
+
+def show_temporal(texts, heads, mode, top=8):
+    """Print the strongest temporal rules of some heads: context & event[@1 w1 | @2 w2 | ..]."""
+    prof = temporal_profiles(texts, mode)
+    for head in heads:
+        rs = [p for p in prof if p["head"] == head]
+        if not rs:
+            continue
+        print(f"  {head}: {len(rs)} temporal rules kept ({sum(1 for p in rs if p['event'])} with a time profile)")
+        for p in rs[:top]:
+            ev = (f"{p['event']}[" + " | ".join(f"@{k} {w:+.2f}" for k, w in p["profile"].items()) + "]"
+                  if p["event"] else "")
+            print(f"    |w| {p['weight']:5.2f}  {p['onsets']:5d} onsets  " + " & ".join(p["context"] + ([ev] if ev else [])))
+
+
 def show_rules(texts, heads, mode, top=8):
     """Print the strongest rules (soft logistic weight of mode) of some heads, with each literal's gate; in a
     sparse mode the dropped literals and rules (DROP_GATE, DROP_WEIGHT) are left out."""
@@ -2308,7 +2439,10 @@ def main():
     priors = [float(x) for x in args.lab_priors.split(",")]
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     # the size curve (MDL strengths); "s0.1": λ 0.1 scaled by the head's size (mode mdls_0.1)
-    soft_modes += [f"mdls_{x[1:]}" if x.startswith("s") else f"mdl_{x}" for x in args.lab_mdl.split(",") if x]
+    # "t0.1" / "ts0.1": over temporal rules (mdlt_0.1 / mdlts_0.1, `temporal_groups`)
+    prefix = {"ts": "mdlts_", "t": "mdlt_", "s": "mdls_"}
+    soft_modes += [next((v + x[len(k):] for k, v in prefix.items() if x.startswith(k)), f"mdl_{x}")
+                   for x in args.lab_mdl.split(",") if x]
     global MDL_SIZE_REF
     MDL_SIZE_REF = args.lab_mdl_ref
     rule_sets, texts = {}, {}
@@ -2360,8 +2494,15 @@ def main():
                 print(f"[Rule lab] {name}: {n_merges} merges of close direction sectors, {n0} -> {len(final)} rules")
             pools.clear()
         logit = fit_logit(final, train, full, heads, device)
+        tgroups = temporal_groups(final, lambda m: step05_mine.literal_text(full, names, m)) \
+            if any(is_temporal(m) for m in soft_modes) else None
+        if tgroups is not None:
+            sizes = Counter(tgroups[0])
+            multi = [g for g, c in sizes.items() if c > 1]
+            print(f"[Rule lab] {name}: temporal rules: {len(multi)} of {len(sizes)} rules have >= 2 time slots "
+                  f"({sum(sizes[g] for g in multi)} of {len(final)} mined rules)")
         soft = {m: fit_soft(final, confidence(final, counts["base"], SOFT_PRIOR), counts["base"], train, full,
-                            heads, device, m) for m in soft_modes}
+                            heads, device, m, temporal=tgroups if is_temporal(m) else None) for m in soft_modes}
         for m, (g, _p) in soft.items():
             real = g[_pad([r["literals"] for r in final], L) != L] if final else g.flatten()
             print(f"[Rule lab] {name} soft {m}: {float((real < 0.5).float().mean()) if len(real) else 0:.1%} of the "
@@ -2372,6 +2513,8 @@ def main():
             if is_compact(m) and final:
                 n_eff, lits_eff, keep = effective(final, g, par[0])
                 lens = (g >= DROP_GATE).sum(dim=1)[keep]
+                if is_temporal(m):
+                    n_eff, lits_eff, lens = effective_temporal(final, g, keep, tgroups)
                 rule_sets[name].size[m] = (n_eff, lits_eff, int(lens.max()) if len(lens) else 0)
                 print(f"[Rule lab] {name} {m}: {n_eff} of {len(final)} rules kept, {lits_eff:.2f} literals per rule")
         texts[name] = sorted(({"head": names[r["head"]], "precision": r["precision"], "events": r["events"],
@@ -2383,7 +2526,8 @@ def main():
                                "weight": round(float(logit[0][i]), 3),
                                "soft": {m: {"weight": round(float(par[0][i]), 3),
                                             "gates": [round(float(x), 3) for x in g[i][:len(r["literals"])]]}
-                                        for m, (g, par) in soft.items() if m != "nor"}}
+                                        for m, (g, par) in soft.items() if m != "nor"},
+                               **({"temporal": [tgroups[0][i], tgroups[1][i]]} if tgroups is not None else {})}
                               for i, r in enumerate(final)), key=lambda r: r["head"])
         # Crisp rules: the sparse fit's gates rounded (>= 0.5: the literal is required, else dropped), then only
         # the rule weights refit (a hard AND per rule, a logistic OR per head): readable rules, no partial gates.
@@ -2455,6 +2599,12 @@ def main():
             print(f"\n[Rule lab] strongest rules of {best_variant} / {m} (soft logistic weight; [gate] per literal, "
                   f"1 = required, 0 = ignored{'; dropped literals and rules left out' if is_compact(m) else ''}):")
             show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h], m)
+    for name_t in texts:
+        for m in (m for m in soft_modes if is_temporal(m)):
+            if any("temporal" in r for r in texts[name_t]):
+                print(f"\n[Rule lab] temporal rules of {name_t} / {m} (context & event[weight per time slot]):")
+                show_temporal(texts[name_t], [names[h] for h in heads] if args.lab_heads
+                              else [h for h in args.lab_show.split(",") if h], m)
     for key in (k for k in rule_sets if k.endswith("~crisp")):
         print(f"\n[Rule lab] crisp rules of {key} (hard AND, logistic weight):")
         show_rules(texts[key], [h for h in args.lab_show.split(",") if h], "crisp")
@@ -2468,7 +2618,9 @@ def main():
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
-                          "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts}, path)
+                          "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts,
+                          "temporal": {f"{v}/{m}": temporal_profiles(texts[v], m) for v in texts for m in soft_modes
+                                       if is_temporal(m) and any("temporal" in r for r in texts[v])}}, path)
     print(f"[Rule lab] saved {path}")
 
 
