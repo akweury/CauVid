@@ -2097,7 +2097,7 @@ def _entropy_sum(n, h):
     return -n * (p * p.log() + (1 - p) * (1 - p).log())
 
 
-def main_cues(pool, allowed, positive, cfg, check=None, top=150):
+def main_cues(pool, allowed, positive, cfg, check=None, top=150, text=None):
     """[(literals tuple, onset recall, precision, lift)] of one head (see above). Each next main cue: the 1-2
     literal rule of most information gain about the onset among the rows no earlier main cue covers (a decision
     list's first steps), that covers >= --lab_hier_min_cover of those rows' onset rows, with lift >= --lab_hier_lift
@@ -2143,6 +2143,17 @@ def main_cues(pool, allowed, positive, cfg, check=None, top=150):
         score = torch.where(good, gain, torch.full_like(gain, -1.0))
         best = int(torch.argmax(score))
         if float(score.flatten()[best]) <= 0:
+            if text is not None:
+                # Why no (further) main cue: the best candidates by gain, with what they miss
+                cov = r2 / max(float(yff.sum()), 1.0)
+                order = torch.argsort(torch.where(ok, gain, torch.full_like(gain, -1e9)).flatten(), descending=True)[:5]
+                print(f"      no main cue {len(out)}: best candidates (need lift >= {cfg['lab_hier_lift']}, cover >= "
+                      f"{cfg['lab_hier_min_cover']} of the {int(yff.sum())} onset rows left):")
+                for o in order.tolist():
+                    a, b = divmod(o, len(cand))
+                    lits = [int(cand[a])] if a == b else [int(cand[a]), int(cand[b])]
+                    print(f"        {' & '.join(text(m) for m in lits)}: lift {float(lift[a, b]):.1f}, "
+                          f"cover {float(cov[a, b]):.2f}")
             break
         a, b = divmod(best, len(cand))
         lits = (int(cand[a]),) if a == b else (int(cand[a]), int(cand[b]))
@@ -2169,8 +2180,8 @@ def hier_rules(ext, h, train, check, allowed, positive, cfg, device, names):
     pool = step05_mine._pool_of(train, h, L, device)
     ck = step05_mine._pool_of(check, h, L, device) if cfg.get("lab_check") and check is not None and \
         bool((check["pairs"]["head"] == h).any()) else None
-    mains = main_cues(pool, allowed, positive, cfg, ck)
     text = lambda m: step05_mine.literal_text(ext, names, m)
+    mains = main_cues(pool, allowed, positive, cfg, ck, text=text)
     out, seen = [], set()
 
     def add(r):
