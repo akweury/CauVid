@@ -71,6 +71,7 @@ from src.exp_roadpp import config, eventual, mine_sweep, step05, step05_mine, st
 LEARNABLE_MIN_AP = 0.05
 CLOSE = 0.9                     # "close to the MLP": AP >= CLOSE x the MLP's
 MIN_EVAL_POS = 20               # heads with fewer positive eval rows are not compared
+EVAL_MIN_ONSETS = 100           # the user (2026-11-25): a head's comparison needs >= 100 eval onsets
 RULE_CHUNK = 4096               # rules per gather in `_holds_all`
 SOFT_PRIOR = 5                  # confidence shrink (onsets) of the soft noisy-OR's starting q
 # Sparse soft rules (2026-11-22, readability): the gates and the rule weights are pushed toward 0, so a rule
@@ -1775,21 +1776,42 @@ class RuleSet:
 
 
 # -------------- Evaluation --------------
+BOOT_BINS = 10                  # score bins merged for the per-video histograms of the bootstrap (2001 -> 201)
+BOOT_SCORERS = ("mlp", "soft_logit", "mdl")      # the scorers with per-video histograms (prefixes)
+BOOT_SAMPLES = 1000
+
+
+def _coarse(x):
+    """(..., NB) -> (..., ceil(NB / BOOT_BINS)) summed bins."""
+    pad = (-x.shape[-1]) % BOOT_BINS
+    x = torch.nn.functional.pad(x, (0, pad))
+    return x.view(*x.shape[:-1], -1, BOOT_BINS).sum(-1)
+
+
 @torch.no_grad()
-def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived):
-    """Score histograms {(variant, scorer) | "mlp": (pos, neg) (A, NB)} on all at-risk rows of video_ids."""
+def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived, stats=None):
+    """Score histograms {(variant, scorer) | "mlp": (pos, neg) (A, NB)} on all at-risk rows of video_ids.
+    stats (dict, 2026-11-25): filled with "onsets" (A,) the distinct eval onsets per head and, for stats["heads"],
+    "videos": per video {name: (pos, neg) (H, NB / BOOT_BINS)} of the BOOT_SCORERS (the video bootstrap)."""
     device, S, w = cfg["device"], model.slot_size, int(cfg.get("clause_slots", 1))
     A, NB = model.num_atoms, step07_paper.NB
     hist = {}
+    cur = {}
+    if stats is not None:
+        stats["onsets"] = torch.zeros(A, dtype=torch.long)
+        stats["videos"] = []
+        sel = torch.tensor(stats["heads"], dtype=torch.long, device=device)
 
     def add(name, p, keep, y):
-        if name not in hist:
-            hist[name] = (torch.zeros(A * NB, device=device), torch.zeros(A * NB, device=device))
+        if name not in cur:
+            cur[name] = (torch.zeros(A * NB, device=device), torch.zeros(A * NB, device=device))
         cell = torch.arange(A, device=device)[None] * NB + step07_paper._logit_bins(p)
-        hist[name][0].add_(torch.bincount(cell[keep & y], minlength=A * NB).float())
-        hist[name][1].add_(torch.bincount(cell[keep & ~y], minlength=A * NB).float())
+        cur[name][0].add_(torch.bincount(cell[keep & y], minlength=A * NB).float())
+        cur[name][1].add_(torch.bincount(cell[keep & ~y], minlength=A * NB).float())
 
     for video_id in tqdm(video_ids, desc="Evaluating"):
+        cur.clear()
+        keys = []
         can = possible(video_id)
         for frames in training_data["frames"][video_id].split(int(cfg.get("mine_chunk", 256))):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
@@ -1798,13 +1820,64 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
             keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
             if not keep.any():
                 continue
+            if stats is not None:
+                r_i, h_i = torch.nonzero(y, as_tuple=True)
+                t_i, n_i = rows["rows"][r_i].T
+                onset = t_i.long() + rows["first"][r_i, h_i].long()
+                keys.append((h_i.long() * 100000 + n_i.long()) * 1000000 + onset)
             lits = literal_rows(model, rows["inputs"], derived)
             if mlp is not None:
                 add("mlp", mlp.window_probs(mlp(rows["inputs"])[0])[:, k_mlp], keep, y)
             for variant, rs in rule_sets.items():
                 for scorer, p in rs.scores(lits).items():
                     add(f"{variant}/{scorer}", p, keep, y)
+        for name, (pos, neg) in cur.items():
+            if name not in hist:
+                hist[name] = (pos.clone(), neg.clone())
+            else:
+                hist[name][0].add_(pos)
+                hist[name][1].add_(neg)
+        if stats is not None:
+            if keys:
+                u = torch.unique(torch.cat(keys))
+                stats["onsets"] += torch.bincount((u // 100000 // 1000000).cpu(), minlength=A)[:A]
+            stats["videos"].append({name: (_coarse(pos.view(A, NB)[sel]).cpu(), _coarse(neg.view(A, NB)[sel]).cpu())
+                                    for name, (pos, neg) in cur.items()
+                                    if name.split("/")[-1].startswith(BOOT_SCORERS)})
     return {name: (pos.view(A, NB).cpu(), neg.view(A, NB).cpu()) for name, (pos, neg) in hist.items()}
+
+
+@torch.no_grad()
+def bootstrap_ci(videos, names_h, device, ref=None, samples=BOOT_SAMPLES, seed=0):
+    """Per head the 95% video-bootstrap interval of each scorer's AP and, with ref (e.g. "mlp"), of AP - AP(ref):
+    {head name: {scorer: [lo, hi], scorer + " - " + ref: [lo, hi]}} (`evaluate` stats["videos"])."""
+    if not videos:
+        return {}
+    keys = [k for k in videos[0] if all(k in v for v in videos)]
+    P = {k: torch.stack([v[k][0] for v in videos]).to(device) for k in keys}       # (V, H, B)
+    N = {k: torch.stack([v[k][1] for v in videos]).to(device) for k in keys}
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    V = len(videos)
+    aps = {k: [] for k in keys}
+    for _ in range(samples):
+        wv = torch.bincount(torch.randint(V, (V,), generator=g), minlength=V).float().to(device)
+        for k in keys:
+            aps[k].append(step07_paper._ap(torch.einsum("v,vhb->hb", wv, P[k]), torch.einsum("v,vhb->hb", wv, N[k])))
+    aps = {k: torch.stack(v).cpu() for k, v in aps.items()}                       # (samples, H)
+    out = {}
+    for j, h in enumerate(names_h):
+        row = {}
+        for k, a in aps.items():
+            x = a[:, j][~torch.isnan(a[:, j])]
+            if len(x):
+                row[k] = [round(float(x.quantile(0.025)), 3), round(float(x.quantile(0.975)), 3)]
+            if ref and ref in aps and k != ref:
+                d = (a[:, j] - aps[ref][:, j])
+                d = d[~torch.isnan(d)]
+                if len(d):
+                    row[f"{k} - {ref}"] = [round(float(d.quantile(0.025)), 3), round(float(d.quantile(0.975)), 3)]
+        out[h] = row
+    return out
 
 
 class _Selected:
@@ -1854,8 +1927,9 @@ def _select(hist_eval, hist_check, rule_sets, heads, scorers, default, small, sm
     return (pos, neg), choice, _Selected(rules)
 
 
-def report(hist, names, heads, rule_sets):
-    """Per head AP of every scorer; macro / close / wins over the learnable heads; per action."""
+def report(hist, names, heads, rule_sets, onsets=None, ci=None, eval_desc="odd val videos"):
+    """Per head AP of every scorer; macro / close / wins over the learnable heads; per action. onsets (A,): the
+    distinct eval onsets per head; ci: `bootstrap_ci` per head name."""
     ap = {name: step07_paper._ap(pos, neg) for name, (pos, neg) in hist.items()}
     has_mlp = "mlp" in hist
     npos = next(iter(hist.values()))[0].sum(dim=1)            # the same rows and labels for every scorer
@@ -1881,7 +1955,7 @@ def report(hist, names, heads, rule_sets):
                       "max_literals": size[2] if size else max((len(r["literals"]) for r in rs), default=0)}
         rows[name]["total_literals"] = round(rows[name]["rules"] * rows[name]["literals"])
     best = max(rows, key=lambda n: rows[n]["macro"]) if rows else None
-    print(f"\n[Rule lab] eval = odd val videos, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
+    print(f"\n[Rule lab] eval = {eval_desc}, every at-risk row; {len(compared)} heads with >= {MIN_EVAL_POS} "
           f"positive rows, {len(learnable)} learnable (some scorer >= AP {LEARNABLE_MIN_AP})"
           + (f"; MLP macro {rows[best]['mlp_macro']:.3f}" if best and has_mlp else "; no MLP (--lab_mlp False)"))
     print(f"  {'variant/scorer':<22}{'rules':>7}{'lits':>6}{'max':>5}{'macro':>8}{'close':>7}{'wins':>6}")
@@ -1910,7 +1984,20 @@ def report(hist, names, heads, rule_sets):
             ref_txt = f"{sum(val(ref, h) for h in hs) / len(hs):>7.3f}" if ref else ""
             print(f"    {action:<12}{sum(val(best, h) for h in hs) / len(hs):>7.3f}{ref_txt}{len(hs):>4}")
     per_head = {names[h]: {"learnable": h in learnable, "pos_rows": int(npos[h]),
-                           **{n: _none(float(ap[n][h])) for n in ap}} for h in compared}
+                           **({"onsets": int(onsets[h])} if onsets is not None else {}),
+                           **{n: _none(float(ap[n][h])) for n in ap},
+                           **({"ci": ci[names[h]]} if ci and names[h] in ci else {})} for h in compared}
+    if onsets is not None:
+        few = sorted((int(onsets[h]), names[h]) for h in heads if int(onsets[h]) < EVAL_MIN_ONSETS)
+        print(f"\n  eval onsets per head: {len(heads) - len(few)} of {len(heads)} heads with >= {EVAL_MIN_ONSETS}; "
+              f"fewer (more data needed, e.g. v8): " + ", ".join(f"{n} {k}" for k, n in few))
+    if ci:
+        print("\n  per head AP with 95% video-bootstrap intervals:")
+        for h in compared:
+            row = ci.get(names[h], {})
+            ons = f"{int(onsets[h])} onsets" if onsets is not None else ""
+            print(f"    {names[h]} ({ons}): " + "; ".join(f"{k} {_none(float(ap[k][h])) or 0:.3f} {v}" if k in ap
+                                                       else f"{k} {v}" for k, v in row.items()))
     return {"summary": rows, "best": best, "learnable": [names[h] for h in learnable], "per_head": per_head}
 
 
@@ -2467,7 +2554,7 @@ def main():
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
     parser.add_argument("--lab_mdl_ref", type=float, default=200.0,
                         help="mdls_λ (--lab_mdl s0.1): λ x min(1, ref / train onsets of the head)")
-    parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test"),
+    parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test", "valtest"),
                         help="evaluate on the odd val videos (default) or on every test video (SUMO _unseen: the test "
                              "maps, untouched by the rule check and the selection); mining and selection are the same")
     parser.add_argument("--lab_tag", type=str, default="", help="suffix of the result file (parallel runs on head batches)")
@@ -2497,6 +2584,10 @@ def main():
                         help="exh: a literal added must raise the precision by this factor")
     parser.add_argument("--lab_exh_max", type=int, default=400, help="exh: safeguard cap of rules per head")
     parser.add_argument("--lab_exh_seeds", type=int, default=300, help="exh: pairs grown further per head")
+    parser.add_argument("--lab_ci", type=str, default="True",
+                        help="per head 95%% video-bootstrap intervals of the AP (and of AP - MLP)")
+    parser.add_argument("--lab_ci_ref", type=str, default="",
+                        help="the reference of the AP differences (default mlp), e.g. relaxed+exh_nn/mdls_0.1")
     parser.add_argument("--lab_mine_only", type=str, default="False",
                         help="stop after the mining step (step 5): a quick look, e.g. at the hier main cues")
     parser.add_argument("--lab_hier_mains", type=int, default=3, help="hier: main cues per head at most")
@@ -2626,7 +2717,7 @@ def main():
     step(3, "row sample (train, val)")
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     if args.lab_prepare_only == "True":
-        if args.lab_eval_split == "test":
+        if args.lab_eval_split in ("test", "valtest"):
             add_test_videos(training_data, cfg)         # built once here, not by each parallel head batch
         print("[Rule lab] --lab_prepare_only: the training data, the OnsetMLP and the row sample are cached; stop")
         return
@@ -2648,6 +2739,8 @@ def main():
     eval_ids = val_ids[1::2]
     if args.lab_eval_split == "test":
         eval_ids = add_test_videos(training_data, cfg)
+    elif args.lab_eval_split == "valtest":                 # more eval onsets (2026-11-25): odd val + all test videos
+        eval_ids = val_ids[1::2] + add_test_videos(training_data, cfg)
 
     # 1. Rule sets on the train sample, each miner once per literal set.
     step(5, f"mining ({args.lab_variants})")
@@ -2809,7 +2902,16 @@ def main():
 
     # 3. Every at-risk row of the odd val videos.
     step(8, "evaluation on the " + ("test videos" if args.lab_eval_split == "test" else "odd val videos"))
-    hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
+    stats = {"heads": list(heads)}
+    hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived, stats)
+    # eval onsets of every learned head (not only --lab_heads): which heads need more data (v8)
+    ons_all = {names[h]: int(stats["onsets"][h]) for h in cfg["lab_all_heads"]}
+    few_all = sorted((k, n) for n, k in ons_all.items() if k < EVAL_MIN_ONSETS)
+    print(f"[Rule lab] eval onsets: {len(ons_all) - len(few_all)} of {len(ons_all)} learned heads have >= "
+          f"{EVAL_MIN_ONSETS}; fewer: " + ", ".join(f"{n} {k}" for k, n in few_all))
+    ci_ref = args.lab_ci_ref or ("mlp" if mlp is not None else None)
+    ci = bootstrap_ci(stats["videos"], [names[h] for h in heads], device, ref=ci_ref) \
+        if args.lab_ci == "True" else None
     choice = {}
     if args.lab_select == "True" and len(rule_sets) > 1:
         # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
@@ -2834,7 +2936,9 @@ def main():
         print(f"[Rule lab] per-head selection ({args.lab_select_scorer}, on the check videos): "
               + ", ".join(f"{v} {n}" for v, n in Counter(choice.values()).most_common())
               + f" (chosen on {len(check_ids)} val videos the rules were not checked on)")
-    out = report(hist, names, heads, rule_sets)
+    out = report(hist, names, heads, rule_sets, stats["onsets"], ci,
+                 {"val": "odd val videos", "test": "test videos", "valtest": "odd val + test videos"}[args.lab_eval_split]
+                 + f" ({len(eval_ids)})")
     if choice:
         out["selected"] = {names[h]: v for h, v in choice.items()}
     if out["best"]:
@@ -2869,7 +2973,7 @@ def main():
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
-    fb += "_test" if args.lab_eval_split == "test" else ""
+    fb += {"test": "_test", "valtest": "_vt"}.get(args.lab_eval_split, "")
     fb += f"_{args.lab_tag}" if args.lab_tag else ""
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
@@ -2877,7 +2981,7 @@ def main():
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts,
                           "temporal": {f"{v}/{m}": temporal_profiles(texts[v], m) for v in texts for m in soft_modes
                                        if is_temporal(m) and any("temporal" in r for r in texts[v])},
-                          "hierarchy": hier_out}, path)
+                          "hierarchy": hier_out, "eval_onsets": ons_all, "eval_videos": len(eval_ids)}, path)
     print(f"[Rule lab] saved {path}")
 
 
