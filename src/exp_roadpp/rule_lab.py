@@ -2078,62 +2078,88 @@ def crisp_rules(rules, gate, weight, pool_of, heads):
 # -------------- Main cues and small cues ("hier", 2026-11-25) --------------
 # The user: a head should rest on a main cue that is common and important but not precise (it is there before most
 # onsets), and on small cues for the different situations, rare but precise. Per head:
-#   1. main cues: up to --lab_hier_mains rules of 1-2 literals (>= 1 positive literal), chosen greedily by the new
-#      onset rows they cover x log(lift), lift >= --lab_hier_lift (and >= 1 on the check videos), until they cover
-#      --lab_hier_cover of the onset rows or a cue adds < 10% of them;
+#   1. main cues: up to --lab_hier_mains rules of 1-2 literals (>= 1 positive literal), each the one of most
+#      information gain on the rows earlier main cues leave (`main_cues`), lift >= --lab_hier_lift (and >= 1 on the
+#      check videos), until they cover --lab_hier_cover of the onset rows;
 #   2. small cues: the "exh" rules mined within the rows of each main cue (they must beat the main cue's precision
 #      there); a small-cue rule is main & small, the main literals pinned (gate 1, not paid in the MDL fit), so a
 #      small cue only acts inside its main cue;
 #   3. exceptions: the "exh" rules of the rows no main cue covers.
+# Small cues and exceptions: the --lab_hier_small most precise each (2026-11-25: 3-5k small cues per main cue made
+# the fit slow and the heads flat again).
 def _subpool(pool, mask):
     return {k: (v[mask] if torch.is_tensor(v) and len(v) == len(mask) else v) for k, v in pool.items()}
 
 
+def _entropy_sum(n, h):
+    """Weighted binary entropy x weight of a row set with weight n and hit weight h (elementwise)."""
+    p = (h / n.clamp(min=1e-12)).clamp(1e-9, 1 - 1e-9)
+    return -n * (p * p.log() + (1 - p) * (1 - p).log())
+
+
 def main_cues(pool, allowed, positive, cfg, check=None, top=150):
-    """[(literals tuple, onset recall, precision, lift)] of one head (see above)."""
+    """[(literals tuple, onset recall, precision, lift)] of one head (see above). Each next main cue: the 1-2
+    literal rule of most information gain about the onset among the rows no earlier main cue covers (a decision
+    list's first steps), that covers >= --lab_hier_min_cover of those rows' onset rows, with lift >= --lab_hier_lift
+    (2026-11-25: new rows x log(lift) chose "shp:app_middle & !p1_h_shrink" for Car:IncomLane, recall 0.93 at
+    lift 1.7, a cue of almost every row)."""
     F, y, w = pool["F"], pool["y"], pool["w"]
     if not bool(y.any()):
         return []
-    rate = float((w * y.float()).sum() / w.sum().clamp(min=1e-12))
-    hit = torch.nonzero(y).flatten()
-    n1, h1 = w @ F, (w * y.float()) @ F
+    yf = y.float()
+    rate = float((w * yf).sum() / w.sum().clamp(min=1e-12))
+    n1, h1 = w @ F, (w * yf) @ F
     lift1 = (h1 / n1.clamp(min=1e-12)) / max(rate, 1e-12)
-    Fh = F[hit]
-    rec1 = Fh.mean(dim=0)
+    rec1 = F[y].mean(dim=0)
     cand = torch.nonzero(allowed & (lift1 > 1.0) & (n1 > 0)).flatten()
     cand = cand[torch.argsort(rec1[cand], descending=True)[:top]]
     if len(cand) == 0:
         return []
-    Fc, Fch = F[:, cand], Fh[:, cand]
-    n2, h2 = (Fc * w[:, None]).T @ Fc, (Fc * (w * y.float())[:, None]).T @ Fc
-    lift2 = (h2 / n2.clamp(min=1e-12)) / max(rate, 1e-12)                       # diagonal: the single literals
+    Fc = F[:, cand]
     pos = positive[cand]
-    ok = (lift2 >= cfg["lab_hier_lift"]) & (pos[:, None] | pos[None, :]) & torch.triu(torch.ones_like(lift2, dtype=torch.bool))
+    ok = (pos[:, None] | pos[None, :]) & torch.triu(torch.ones((len(cand), len(cand)), dtype=torch.bool, device=F.device))
     if check is not None and len(check["y"]):
         Kc, wk, yk = check["F"][:, cand], check["w"], check["y"].float()
         rate_c = float((wk * yk).sum() / wk.sum().clamp(min=1e-12))
         n2c, h2c = (Kc * wk[:, None]).T @ Kc, (Kc * (wk * yk)[:, None]).T @ Kc
         ok &= (h2c > 0) & ((h2c / n2c.clamp(min=1e-12)) >= rate_c)
-    covered = torch.zeros(len(hit), dtype=torch.bool, device=F.device)
+    free = torch.ones(len(y), dtype=torch.bool, device=F.device)                 # rows no main cue covers yet
+    ev_all = pool["event"][y]
+    n_ev = max(int(ev_all.unique().numel()), 1)
     out = []
     for _ in range(int(cfg["lab_hier_mains"])):
-        unc = Fch[~covered]
-        new = unc.T @ unc                                                        # (c, c) new onset rows covered
-        score = torch.where(ok, new * torch.log(lift2.clamp(min=1.0 + 1e-6)), torch.zeros_like(new))
-        best = int(torch.argmax(score))
-        a, b = divmod(best, len(cand))
-        if float(score.flatten()[best]) <= 0 or float(new[a, b]) < 0.1 * len(hit):
+        Ff, wf, yff = Fc[free], w[free], yf[free]
+        if not bool(yff.any()):
             break
+        n2, h2 = (Ff * wf[:, None]).T @ Ff, (Ff * (wf * yff)[:, None]).T @ Ff
+        r2 = (Ff * yff[:, None]).T @ Ff                                          # onset rows covered (unweighted)
+        N, H = float(wf.sum()), float((wf * yff).sum())
+        gain = _entropy_sum(torch.tensor(N), torch.tensor(H)).to(F.device) - _entropy_sum(n2, h2) \
+            - _entropy_sum((N - n2).clamp(min=0), (H - h2).clamp(min=0))
+        lift = (h2 / n2.clamp(min=1e-12)) / max(rate, 1e-12)
+        good = ok & (lift >= cfg["lab_hier_lift"]) & (r2 >= cfg["lab_hier_min_cover"] * float(yff.sum()))
+        single = torch.eye(len(cand), dtype=torch.bool, device=F.device)
+        gain = gain * torch.where(single, 1.0, 0.99)                             # a pair must add > 1% over one literal
+        score = torch.where(good, gain, torch.full_like(gain, -1.0))
+        best = int(torch.argmax(score))
+        if float(score.flatten()[best]) <= 0:
+            break
+        a, b = divmod(best, len(cand))
         lits = (int(cand[a]),) if a == b else (int(cand[a]), int(cand[b]))
-        hold = Fh[:, list(lits)].all(dim=1).bool()
-        covered |= hold
-        ev = pool["event"][hit]
-        recall = float(ev[hold].unique().numel()) / max(int(ev.unique().numel()), 1)
-        out.append((lits, recall, float(h2[a, b] / n2[a, b].clamp(min=1e-12)), float(lift2[a, b])))
+        hold = F[:, list(lits)].all(dim=1).bool()
+        recall = float(pool["event"][y & hold].unique().numel()) / n_ev
+        prec = float((w * yf)[hold].sum() / w[hold].sum().clamp(min=1e-12))
+        out.append((lits, recall, prec, prec / max(rate, 1e-12)))
         ok[a, b] = False
-        if float(covered.float().mean()) >= cfg["lab_hier_cover"]:
+        free &= ~hold
+        if 1 - float(yf[free].sum() / yf.sum()) >= cfg["lab_hier_cover"]:
             break
     return out
+
+
+def _cap(found, k):
+    """The k most precise rules of an exhaustive_rules list (ties: more onsets first)."""
+    return sorted(found, key=lambda x: (-x[1], -x[2]))[:k] if k > 0 else found
 
 
 def hier_rules(ext, h, train, check, allowed, positive, cfg, device, names):
@@ -2166,16 +2192,18 @@ def hier_rules(ext, h, train, check, allowed, positive, cfg, device, names):
         sub_allowed[list(lits)] = False
         found, _ = exhaustive_rules(_subpool(pool, hold), sub_allowed, cfg,
                                     _subpool(ck, hold_c) if ck is not None else None)
+        n_found, found = len(found), _cap(found, cfg["lab_hier_small"])
         for key, _p, _e in found:
             add({"head": int(h), "literals": list(lits) + [m for m in key if m not in lits], "role": "sub",
                  "main_id": k, "main": list(lits)})
         print(f"    {names[h]} main {k}: {' & '.join(text(m) for m in lits)}  onset recall {recall:.2f}, precision "
-              f"{prec:.3f} (lift {lift:.1f}); {len(found)} small cues")
+              f"{prec:.3f} (lift {lift:.1f}); {len(found)} small cues (of {n_found})")
     found, _ = exhaustive_rules(_subpool(pool, ~anymain), allowed, cfg,
                                 _subpool(ck, ~anymain_c) if ck is not None else None)
+    n_found, found = len(found), _cap(found, cfg["lab_hier_small"])
     for key, _p, _e in found:
         add({"head": int(h), "literals": list(key), "role": "exc"})
-    print(f"    {names[h]}: {len(mains)} main cues, {len(found)} exception rules (rows no main cue covers)")
+    print(f"    {names[h]}: {len(mains)} main cues, {len(found)} exception rules (of {n_found}; rows no main cue covers)")
     return out
 
 
@@ -2435,8 +2463,14 @@ def main():
                         help="exh: a literal added must raise the precision by this factor")
     parser.add_argument("--lab_exh_max", type=int, default=400, help="exh: safeguard cap of rules per head")
     parser.add_argument("--lab_exh_seeds", type=int, default=300, help="exh: pairs grown further per head")
+    parser.add_argument("--lab_mine_only", type=str, default="False",
+                        help="stop after the mining step (step 5): a quick look, e.g. at the hier main cues")
     parser.add_argument("--lab_hier_mains", type=int, default=3, help="hier: main cues per head at most")
-    parser.add_argument("--lab_hier_lift", type=float, default=1.5, help="hier: a main cue's lift at least")
+    parser.add_argument("--lab_hier_lift", type=float, default=2.0, help="hier: a main cue's lift at least")
+    parser.add_argument("--lab_hier_min_cover", type=float, default=0.2,
+                        help="hier: a main cue covers at least this share of the onset rows still uncovered")
+    parser.add_argument("--lab_hier_small", type=int, default=300,
+                        help="hier: small cues per main cue (and exceptions per head) at most, the most precise")
     parser.add_argument("--lab_hier_cover", type=float, default=0.7,
                         help="hier: main cues are added until they cover this share of the onset rows")
     args = utils_pipe.parse_args(parser)
@@ -2448,7 +2482,8 @@ def main():
     for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
                 "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
                 "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events", "lab_tr_confirm",
-                "lab_hier_mains", "lab_hier_lift", "lab_hier_cover"):
+                "lab_hier_mains", "lab_hier_lift", "lab_hier_cover",
+                "lab_hier_min_cover", "lab_hier_small"):
         cfg[key] = getattr(args, key)
     cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
     cfg["lab_tr_mirror"] = args.lab_tr_mirror == "True"
@@ -2591,6 +2626,11 @@ def main():
                 if flags not in ext:
                     ext[flags] = make_ext(flags)
                 mined[(c, flags)] = mine_component(c, flags[0], ext[flags], names, heads, train, check, cfg, device)
+    if args.lab_mine_only == "True":
+        # A look at the mining before the slow part (counts, fits, evaluation), e.g. the main cues of "hier".
+        print("[Rule lab] --lab_mine_only: stop after mining ("
+              + ", ".join(f"{c}: {len(rs)} rules" for (c, _f), rs in mined.items()) + ")")
+        return
 
     # 2. Exact counts on all train rows (each distinct rule once), then the final rule sets.
     step(6, "rule counts" + (" (train sample)" if args.lab_fast == "True" else " (all train rows)")
