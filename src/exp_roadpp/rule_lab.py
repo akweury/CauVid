@@ -2112,9 +2112,17 @@ def main_cues(pool, allowed, positive, cfg, check=None, top=150, text=None):
     lift1 = (h1 / n1.clamp(min=1e-12)) / max(rate, 1e-12)
     rec1 = F[y].mean(dim=0)
     cand = torch.nonzero(allowed & (lift1 > 1.0) & (n1 > 0)).flatten()
-    cand = cand[torch.argsort(rec1[cand], descending=True)[:top]]
     if len(cand) == 0:
         return []
+    # Candidates: the most common literals and those of most gain (with the lift) on their own; by recall alone the
+    # near-universal literals filled the list (2026-11-25).
+    N, H = float(w.sum()), float((w * yf).sum())
+    g1 = _entropy_sum(torch.tensor(N), torch.tensor(H)).to(F.device) - _entropy_sum(n1, h1) \
+        - _entropy_sum((N - n1).clamp(min=0), (H - h1).clamp(min=0))
+    by_rec = cand[torch.argsort(rec1[cand], descending=True)[:top // 2]]
+    lifted = cand[lift1[cand] >= cfg["lab_hier_lift"]]
+    by_gain = lifted[torch.argsort(g1[lifted], descending=True)[:top // 2]]
+    cand = torch.unique(torch.cat([by_rec, by_gain]))
     Fc = F[:, cand]
     pos = positive[cand]
     ok = (pos[:, None] | pos[None, :]) & torch.triu(torch.ones((len(cand), len(cand)), dtype=torch.bool, device=F.device))
@@ -2144,16 +2152,24 @@ def main_cues(pool, allowed, positive, cfg, check=None, top=150, text=None):
         best = int(torch.argmax(score))
         if float(score.flatten()[best]) <= 0:
             if text is not None:
-                # Why no (further) main cue: the best candidates by gain, with what they miss
+                # Why no (further) main cue: the best candidates by gain, then those with the lift by gain and by
+                # cover (2026-11-25: the gain alone listed only near-universal cues such as shp:app_middle)
                 cov = r2 / max(float(yff.sum()), 1.0)
-                order = torch.argsort(torch.where(ok, gain, torch.full_like(gain, -1e9)).flatten(), descending=True)[:5]
-                print(f"      no main cue {len(out)}: best candidates (need lift >= {cfg['lab_hier_lift']}, cover >= "
+                lifted = ok & (lift >= cfg["lab_hier_lift"])
+                print(f"      no main cue {len(out)} (need lift >= {cfg['lab_hier_lift']}, cover >= "
                       f"{cfg['lab_hier_min_cover']} of the {int(yff.sum())} onset rows left):")
-                for o in order.tolist():
-                    a, b = divmod(o, len(cand))
-                    lits = [int(cand[a])] if a == b else [int(cand[a]), int(cand[b])]
-                    print(f"        {' & '.join(text(m) for m in lits)}: lift {float(lift[a, b]):.1f}, "
-                          f"cover {float(cov[a, b]):.2f}")
+                for title, mask, key in (("by gain", ok, gain), ("lift ok, by gain", lifted, gain),
+                                         ("lift ok, by cover", lifted, cov)):
+                    order = torch.argsort(torch.where(mask, key, torch.full_like(key, -1e9)).flatten(),
+                                          descending=True)[:5]
+                    print(f"        {title}:")
+                    for o in order.tolist():
+                        a, b = divmod(o, len(cand))
+                        if not bool(mask[a, b]):
+                            break
+                        lits = [int(cand[a])] if a == b else [int(cand[a]), int(cand[b])]
+                        print(f"          {' & '.join(text(m) for m in lits)}: lift {float(lift[a, b]):.1f}, "
+                              f"cover {float(cov[a, b]):.2f}")
             break
         a, b = divmod(best, len(cand))
         lits = (int(cand[a]),) if a == b else (int(cand[a]), int(cand[b]))
