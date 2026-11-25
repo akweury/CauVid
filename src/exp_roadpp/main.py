@@ -37,6 +37,9 @@ def main():
     step_dataset_input = config.get_step_dataset_input(args)
     step_dataset.main(step_dataset_input)
     rtpt_utils.step(rtpt, "dataset")
+    if getattr(args, "dataset_only", "False") == "True":
+        print("[main] --dataset_only: the dataset step is done; stop (e.g. before the rule lab's --lab_prepare_only)")
+        return
     
     # step 3: use a language model to generate anchor clauses
     step03_input = config.get_step_03_input(args)

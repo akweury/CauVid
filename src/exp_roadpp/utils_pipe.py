@@ -56,6 +56,9 @@ def get_parser():
     parser.add_argument("--gestalt", type=str, default="False",
                         help="Step 05: gestalt atoms (gestalt.py): proximity, similar size and common fate (moving the "
                              "same way) of the boxes around the agent; default False (rule lab test, 2026-11-23)")
+    parser.add_argument("--dataset_only", type=str, default="False",
+                        help="main: stop after step_dataset (the atoms and boxes of every split), e.g. for a new SUMO "
+                             "dataset that only the rule lab reads")
     parser.add_argument("--shape_phases", type=str, default="False",
                         help="Step 05: shape-phase atoms (shape.py): the own box's moves and width / height changes "
                              "and the order of the last 4 such phases; default False (rule lab test, 2026-11-22)")

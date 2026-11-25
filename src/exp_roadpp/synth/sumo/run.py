@@ -470,7 +470,8 @@ def main():
         """The explicit targets and --head_target for every head with an onset so far (counted per round)."""
         if not args.head_target:
             return explicit
-        heads = {e for r in ok for e in (r.get("onsets") or {})}
+        # the traffic light states (TL:Red, ..) are inputs of the models, not learned heads
+        heads = {e for r in ok for e in (r.get("onsets") or {}) if not e.startswith("TL:")}
         return {**{h: args.head_target for h in sorted(heads)}, **explicit}
 
     with Pool(args.workers) as pool:

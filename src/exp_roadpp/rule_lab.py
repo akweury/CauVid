@@ -2557,6 +2557,8 @@ def main():
     parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test", "valtest"),
                         help="evaluate on the odd val videos (default) or on every test video (SUMO _unseen: the test "
                              "maps, untouched by the rule check and the selection); mining and selection are the same")
+    parser.add_argument("--lab_head_part", type=str, default="",
+                        help="i/k: only every k-th learned head from i (0-based), for parallel runs; use with --lab_tag")
     parser.add_argument("--lab_tag", type=str, default="", help="suffix of the result file (parallel runs on head batches)")
     parser.add_argument("--lab_select", type=str, default="True",
                         help="choose the variant per head on the check videos; reported as the variant 'selected'")
@@ -2642,6 +2644,11 @@ def main():
         wanted = {x for x in args.lab_heads.split(",") if x}
         heads = [h for h in heads if names[h] in wanted or names[h].split(":")[-1] in wanted]
         print(f"[Rule lab] --lab_heads: {len(heads)} heads: {', '.join(names[h] for h in heads)}")
+    if args.lab_head_part:
+        # One part of the heads (parallel runs on several GPUs, 2026-11-25): "i/k" keeps every k-th head from i
+        i_p, k_p = (int(x) for x in args.lab_head_part.split("/"))
+        heads = heads[i_p::k_p]
+        print(f"[Rule lab] --lab_head_part {args.lab_head_part}: {len(heads)} heads")
     possible = step05.class_possible(training_data, vocab, device)
     A = model.num_atoms
 
@@ -2909,9 +2916,6 @@ def main():
     few_all = sorted((k, n) for n, k in ons_all.items() if k < EVAL_MIN_ONSETS)
     print(f"[Rule lab] eval onsets: {len(ons_all) - len(few_all)} of {len(ons_all)} learned heads have >= "
           f"{EVAL_MIN_ONSETS}; fewer: " + ", ".join(f"{n} {k}" for k, n in few_all))
-    ci_ref = args.lab_ci_ref or ("mlp" if mlp is not None else None)
-    ci = bootstrap_ci(stats["videos"], [names[h] for h in heads], device, ref=ci_ref) \
-        if args.lab_ci == "True" else None
     choice = {}
     if args.lab_select == "True" and len(rule_sets) > 1:
         # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
@@ -2936,6 +2940,17 @@ def main():
         print(f"[Rule lab] per-head selection ({args.lab_select_scorer}, on the check videos): "
               + ", ".join(f"{v} {n}" for v, n in Counter(choice.values()).most_common())
               + f" (chosen on {len(check_ids)} val videos the rules were not checked on)")
+    if choice:
+        # the per-head choice per video too (its bootstrap interval): each head's row from its chosen variant
+        sc = args.lab_select_scorer.split(",")[0]
+        for v in stats["videos"]:
+            parts = [v.get(choice.get(h, "") if "/" in choice.get(h, "") else f"{choice.get(h, '')}/{sc}")
+                     for h in heads]
+            if all(p is not None for p in parts):
+                v[f"selected/{sc}"] = tuple(torch.stack([p[k][j] for j, p in enumerate(parts)]) for k in (0, 1))
+    ci_ref = args.lab_ci_ref or ("mlp" if mlp is not None else None)
+    ci = bootstrap_ci(stats["videos"], [names[h] for h in heads], device, ref=ci_ref) \
+        if args.lab_ci == "True" else None
     out = report(hist, names, heads, rule_sets, stats["onsets"], ci,
                  {"val": "odd val videos", "test": "test videos", "valtest": "odd val + test videos"}[args.lab_eval_split]
                  + f" ({len(eval_ids)})")
