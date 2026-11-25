@@ -85,11 +85,22 @@ DROP_GATE, DROP_WEIGHT = 0.1, 0.05
 # so a literal of a dropped rule costs nothing. Unlike "sparse_*" (means over the rules and literals), the cost is
 # per rule and per literal: a group rule that covers the onsets of several single-agent rules is cheaper.
 RULE_COST, RULE_TAU, MDL_SCALE = 2.0, 0.1, 100.0
+# Mode "mdls_λ" (2026-11-25): λ scaled by the head's size, λ x min(1, MDL_SIZE_REF / train onsets of the head). The fit
+# loss is a mean over rows, so the plain penalty weighs the same for a head with 50 or 3000 onsets; in a real
+# description length the data term grows with the onsets and the model term does not. λ 0.1 cost the big heads
+# (Car:Brake 0.322 -> 0.236, Car:IncomLane 0.539 -> 0.383 AP on v7); small heads keep λ. Set by --lab_mdl_ref.
+MDL_SIZE_REF = 200.0
+
+
+def mdl_lambda(mode, onsets):
+    """λ of a "mdl_λ" / "mdls_λ" mode for a head with this many train (sample) onsets."""
+    lam = float(mode.split("_", 1)[1])
+    return lam * min(1.0, MDL_SIZE_REF / max(onsets, 1)) if mode.startswith("mdls_") else lam
 
 
 def is_compact(mode):
     """The fits that drop rules and literals (their size is counted after DROP_GATE / DROP_WEIGHT)."""
-    return mode in SPARSE or mode.startswith("mdl_")
+    return mode in SPARSE or mode.startswith(("mdl_", "mdls_"))
 RELAXED = {"mine_max_rules": 32, "mine_roots": 4, "mine_root_min_cover": 0.05, "mine_depth": 6,
            "mine_min_events": 2, "min_videos": 1, "mine_val_lift": 0.0}
 
@@ -1557,6 +1568,8 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         pool = step05_mine._pool_of(train, h, L, device)
         if not bool(pool["y"].any()):
             continue
+        if mode.startswith(("mdl_", "mdls_")):
+            lam = mdl_lambda(mode, int(pool["event"][pool["y"]].unique().numel()))
         cap = max(1, int(FIT_CELLS // max(len(pool["y"]) * K, 1)))
         if len(idx) > cap:
             # Safeguard (activations (rows, rules, literals) must fit the GPU): the cap best rules by their own
@@ -1597,10 +1610,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                 loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
             if mode in SPARSE:
                 loss = loss + SPARSE[mode] * base_loss * (g.sum() / n_real + wt.abs().mean())
-            elif mode.startswith("mdl_"):
+            elif mode.startswith(("mdl_", "mdls_")):
                 kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a rule kept, 0..1
                 lits = (g * kept[:, None]).sum()                                    # literals of the kept rules
-                loss = loss + float(mode[4:]) * base_loss / MDL_SCALE * (RULE_COST * kept.sum() + lits)
+                loss = loss + lam * base_loss / MDL_SCALE * (RULE_COST * kept.sum() + lits)
             else:
                 loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
                 if logistic:
@@ -2090,6 +2103,8 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_mdl_ref", type=float, default=200.0,
+                        help="mdls_λ (--lab_mdl s0.1): λ x min(1, ref / train onsets of the head)")
     parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test"),
                         help="evaluate on the odd val videos (default) or on every test video (SUMO _unseen: the test "
                              "maps, untouched by the rule check and the selection); mining and selection are the same")
@@ -2292,7 +2307,10 @@ def main():
         check_counts = sample_counts([unique[k] for k in keys], check, L, device, model.num_atoms)
     priors = [float(x) for x in args.lab_priors.split(",")]
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
-    soft_modes += [f"mdl_{x}" for x in args.lab_mdl.split(",") if x]          # the size curve (MDL strengths)
+    # the size curve (MDL strengths); "s0.1": λ 0.1 scaled by the head's size (mode mdls_0.1)
+    soft_modes += [f"mdls_{x[1:]}" if x.startswith("s") else f"mdl_{x}" for x in args.lab_mdl.split(",") if x]
+    global MDL_SIZE_REF
+    MDL_SIZE_REF = args.lab_mdl_ref
     rule_sets, texts = {}, {}
     step(7, "per variant: finalize" + (", check filter" if args.lab_check == "True" else "")
          + (", merges" if args.lab_merge == "True" else "") + ", fits")
