@@ -2085,6 +2085,8 @@ def crisp_rules(rules, gate, weight, pool_of, heads):
 #      there); a small-cue rule is main & small, the main literals pinned (gate 1, not paid in the MDL fit), so a
 #      small cue only acts inside its main cue;
 #   3. exceptions: the "exh" rules of the rows no main cue covers.
+# A head may have no main cue (the user: it is not required): then all its rules are of step 3, plain short rules
+# (2026-11-25: LarVeh:Jun, no cue with lift >= 2 covers more than 13% of its onset rows).
 # Small cues and exceptions: the --lab_hier_small most precise each (2026-11-25: 3-5k small cues per main cue made
 # the fit slow and the heads flat again).
 def _subpool(pool, mask):
@@ -2227,7 +2229,8 @@ def hier_rules(ext, h, train, check, allowed, positive, cfg, device, names):
               f"{prec:.3f} (lift {lift:.1f}); {len(found)} small cues (of {n_found})")
     found, _ = exhaustive_rules(_subpool(pool, ~anymain), allowed, cfg,
                                 _subpool(ck, ~anymain_c) if ck is not None else None)
-    n_found, found = len(found), _cap(found, cfg["lab_hier_small"])
+    # without a main cue the exceptions are the head's whole rule set: not capped (as the plain "exh" rules)
+    n_found, found = len(found), (_cap(found, cfg["lab_hier_small"]) if mains else found)
     for key, _p, _e in found:
         add({"head": int(h), "literals": list(key), "role": "exc"})
     print(f"    {names[h]}: {len(mains)} main cues, {len(found)} exception rules (of {n_found}; rows no main cue covers)")
@@ -2383,7 +2386,8 @@ def show_hierarchy(hier, heads, top=5):
                   f"w {m['weight']:+.2f}; {m['n_small']} small cues kept")
             for s in m["small"][:top]:
                 print(f"       + {' & '.join(s['literals'])}  (w {s['weight']:+.2f}, p {s['precision']:.2f}, {s['onsets']} onsets)")
-        print(f"    exceptions (no main cue): {hier['n_exceptions'].get(head, 0)} kept")
+        print(f"    {'exceptions (rows no main cue covers)' if ms else 'no main cue (none is common enough): rules'}: "
+              f"{hier['n_exceptions'].get(head, 0)} kept")
         for s in hier["exceptions"].get(head, [])[:top]:
             print(f"       * {' & '.join(s['literals'])}  (w {s['weight']:+.2f}, p {s['precision']:.2f}, {s['onsets']} onsets)")
 
