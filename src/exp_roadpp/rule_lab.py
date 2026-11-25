@@ -141,7 +141,7 @@ def temporal_groups(rules, text_of):
 
 def is_compact(mode):
     """The fits that drop rules and literals (their size is counted after DROP_GATE / DROP_WEIGHT)."""
-    return mode in SPARSE or mode.startswith(("mdl_", "mdls_"))
+    return mode in SPARSE or mode.startswith("mdl")
 RELAXED = {"mine_max_rules": 32, "mine_roots": 4, "mine_root_min_cover": 0.05, "mine_depth": 6,
            "mine_min_events": 2, "min_videos": 1, "mine_val_lift": 0.0}
 
@@ -1650,6 +1650,12 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
         else:
             theta = torch.full(body.shape, 3.0, device=device, requires_grad=True)
             params = [theta]
+        # "hier" small cues: their main cue's literals are pinned (gate 1, not paid; with the temporal fit too)
+        pinned = torch.zeros(body.shape, dtype=torch.bool)
+        for a, i in enumerate(idx):
+            for k, m in enumerate(rules[i]["literals"]):
+                pinned[a, k] = m in rules[i].get("main", ())
+        pinned = pinned.to(device)
         p0 = min(max(float((w * y).sum()), 1e-6), 1 - 1e-6)
         base_loss = -(p0 * math.log(p0) + (1 - p0) * math.log(1 - p0))       # BCE of the constant base rate
         n_real = max(int((~pad).sum()), 1)
@@ -1667,7 +1673,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
             opt.zero_grad()
             if tied:
                 theta = theta_p[pid]
-            g = torch.sigmoid(theta).masked_fill(pad, 0.0)
+            g = torch.sigmoid(theta).masked_fill(pad, 0.0).masked_fill(pinned, 1.0)
             a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R)
             if logistic:
                 loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(a @ wt + b0, y, reduction="none")).sum()
@@ -1686,7 +1692,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                                                              + (torch.sigmoid(theta_p) * pay).sum())
             elif mode.startswith("mdl"):
                 kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a rule kept, 0..1
-                lits = (g * kept[:, None]).sum()                                    # literals of the kept rules
+                lits = (g.masked_fill(pinned, 0.0) * kept[:, None]).sum()                                    # literals of the kept rules
                 loss = loss + lam * base_loss / MDL_SCALE * (RULE_COST * kept.sum() + lits)
             else:
                 loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum()
@@ -1696,7 +1702,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
             opt.step()
         if tied:
             theta = theta_p[pid]
-        gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).cpu()
+        gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).masked_fill(pinned, 1.0).cpu()
         gate[idx] = gi
         if logistic:
             weight[idx] = wt.detach().cpu()
@@ -2069,6 +2075,110 @@ def crisp_rules(rules, gate, weight, pool_of, heads):
     return out
 
 
+# -------------- Main cues and small cues ("hier", 2026-11-25) --------------
+# The user: a head should rest on a main cue that is common and important but not precise (it is there before most
+# onsets), and on small cues for the different situations, rare but precise. Per head:
+#   1. main cues: up to --lab_hier_mains rules of 1-2 literals (>= 1 positive literal), chosen greedily by the new
+#      onset rows they cover x log(lift), lift >= --lab_hier_lift (and >= 1 on the check videos), until they cover
+#      --lab_hier_cover of the onset rows or a cue adds < 10% of them;
+#   2. small cues: the "exh" rules mined within the rows of each main cue (they must beat the main cue's precision
+#      there); a small-cue rule is main & small, the main literals pinned (gate 1, not paid in the MDL fit), so a
+#      small cue only acts inside its main cue;
+#   3. exceptions: the "exh" rules of the rows no main cue covers.
+def _subpool(pool, mask):
+    return {k: (v[mask] if torch.is_tensor(v) and len(v) == len(mask) else v) for k, v in pool.items()}
+
+
+def main_cues(pool, allowed, positive, cfg, check=None, top=150):
+    """[(literals tuple, onset recall, precision, lift)] of one head (see above)."""
+    F, y, w = pool["F"], pool["y"], pool["w"]
+    if not bool(y.any()):
+        return []
+    rate = float((w * y.float()).sum() / w.sum().clamp(min=1e-12))
+    hit = torch.nonzero(y).flatten()
+    n1, h1 = w @ F, (w * y.float()) @ F
+    lift1 = (h1 / n1.clamp(min=1e-12)) / max(rate, 1e-12)
+    Fh = F[hit]
+    rec1 = Fh.mean(dim=0)
+    cand = torch.nonzero(allowed & (lift1 > 1.0) & (n1 > 0)).flatten()
+    cand = cand[torch.argsort(rec1[cand], descending=True)[:top]]
+    if len(cand) == 0:
+        return []
+    Fc, Fch = F[:, cand], Fh[:, cand]
+    n2, h2 = (Fc * w[:, None]).T @ Fc, (Fc * (w * y.float())[:, None]).T @ Fc
+    lift2 = (h2 / n2.clamp(min=1e-12)) / max(rate, 1e-12)                       # diagonal: the single literals
+    pos = positive[cand]
+    ok = (lift2 >= cfg["lab_hier_lift"]) & (pos[:, None] | pos[None, :]) & torch.triu(torch.ones_like(lift2, dtype=torch.bool))
+    if check is not None and len(check["y"]):
+        Kc, wk, yk = check["F"][:, cand], check["w"], check["y"].float()
+        rate_c = float((wk * yk).sum() / wk.sum().clamp(min=1e-12))
+        n2c, h2c = (Kc * wk[:, None]).T @ Kc, (Kc * (wk * yk)[:, None]).T @ Kc
+        ok &= (h2c > 0) & ((h2c / n2c.clamp(min=1e-12)) >= rate_c)
+    covered = torch.zeros(len(hit), dtype=torch.bool, device=F.device)
+    out = []
+    for _ in range(int(cfg["lab_hier_mains"])):
+        unc = Fch[~covered]
+        new = unc.T @ unc                                                        # (c, c) new onset rows covered
+        score = torch.where(ok, new * torch.log(lift2.clamp(min=1.0 + 1e-6)), torch.zeros_like(new))
+        best = int(torch.argmax(score))
+        a, b = divmod(best, len(cand))
+        if float(score.flatten()[best]) <= 0 or float(new[a, b]) < 0.1 * len(hit):
+            break
+        lits = (int(cand[a]),) if a == b else (int(cand[a]), int(cand[b]))
+        hold = Fh[:, list(lits)].all(dim=1).bool()
+        covered |= hold
+        ev = pool["event"][hit]
+        recall = float(ev[hold].unique().numel()) / max(int(ev.unique().numel()), 1)
+        out.append((lits, recall, float(h2[a, b] / n2[a, b].clamp(min=1e-12)), float(lift2[a, b])))
+        ok[a, b] = False
+        if float(covered.float().mean()) >= cfg["lab_hier_cover"]:
+            break
+    return out
+
+
+def hier_rules(ext, h, train, check, allowed, positive, cfg, device, names):
+    """The "hier" rules of one head: main cues (role "main", root), main & small cues ("sub", "main" = the main
+    literals), exceptions ("exc")."""
+    L = ext.num_literals
+    pool = step05_mine._pool_of(train, h, L, device)
+    ck = step05_mine._pool_of(check, h, L, device) if cfg.get("lab_check") and check is not None and \
+        bool((check["pairs"]["head"] == h).any()) else None
+    mains = main_cues(pool, allowed, positive, cfg, ck)
+    text = lambda m: step05_mine.literal_text(ext, names, m)
+    out, seen = [], set()
+
+    def add(r):
+        key = frozenset(r["literals"])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    anymain = torch.zeros(len(pool["y"]), dtype=torch.bool, device=device)
+    anymain_c = torch.zeros(len(ck["y"]), dtype=torch.bool, device=device) if ck is not None else None
+    for k, (lits, recall, prec, lift) in enumerate(mains):
+        add({"head": int(h), "literals": list(lits), "root": True, "role": "main", "main_id": k,
+             "main_recall": round(recall, 3)})
+        hold = pool["F"][:, list(lits)].all(dim=1).bool()
+        anymain |= hold
+        hold_c = ck["F"][:, list(lits)].all(dim=1).bool() if ck is not None else None
+        if hold_c is not None:
+            anymain_c |= hold_c
+        sub_allowed = allowed.clone()
+        sub_allowed[list(lits)] = False
+        found, _ = exhaustive_rules(_subpool(pool, hold), sub_allowed, cfg,
+                                    _subpool(ck, hold_c) if ck is not None else None)
+        for key, _p, _e in found:
+            add({"head": int(h), "literals": list(lits) + [m for m in key if m not in lits], "role": "sub",
+                 "main_id": k, "main": list(lits)})
+        print(f"    {names[h]} main {k}: {' & '.join(text(m) for m in lits)}  onset recall {recall:.2f}, precision "
+              f"{prec:.3f} (lift {lift:.1f}); {len(found)} small cues")
+    found, _ = exhaustive_rules(_subpool(pool, ~anymain), allowed, cfg,
+                                _subpool(ck, ~anymain_c) if ck is not None else None)
+    for key, _p, _e in found:
+        add({"head": int(h), "literals": list(key), "role": "exc"})
+    print(f"    {names[h]}: {len(mains)} main cues, {len(found)} exception rules (rows no main cue covers)")
+    return out
+
+
 def mine_component(component, use_derived, ext, names, heads, train, check, cfg, device):
     """The rules {"head", "literals"[, "root"]} of one miner ("m4", "relaxed", "precise") on the train sample."""
     L, A = ext.num_literals, ext.num_atoms
@@ -2085,6 +2195,19 @@ def mine_component(component, use_derived, ext, names, heads, train, check, cfg,
     if component in ("tr", "trp"):
         return transfer_rules(ext, names, heads, cfg.get("lab_all_heads", heads), train, check, cfg, device,
                               pooled=component == "trp")
+    if component == "hier":
+        base_tab = literal_table(ext._model if hasattr(ext, "_model") else ext)
+        positive = torch.tensor([not info["kind"].startswith("!") for info in base_tab]
+                                + [True] * (L - len(base_tab)), dtype=torch.bool, device=device)
+        rules = []
+        for h in tqdm(heads, desc="Main and small cues"):
+            if not bool((train["pairs"]["head"] == h).any()):
+                continue
+            allowed = ext.input_mask.to(device) & ~((base % A == h) & (scope == 0))
+            rules += hier_rules(ext, h, train, check, allowed, positive, cfg, device, names)
+        print(f"[Rule lab] hier: {len(rules)} rules ({sum(r['role'] == 'main' for r in rules)} main cues, "
+              f"{sum(r['role'] == 'sub' for r in rules)} small cues, {sum(r['role'] == 'exc' for r in rules)} exceptions)")
+        return rules
     if component == "exh":
         capped = 0
         for h in tqdm(heads, desc=f"Exhaustive short rules{' + derived' if use_derived else ''}"):
@@ -2162,6 +2285,52 @@ def show_temporal(texts, heads, mode, top=8):
             ev = (f"{p['event']}[" + " | ".join(f"@{k} {w:+.2f}" for k, w in p["profile"].items()) + "]"
                   if p["event"] else "")
             print(f"    |w| {p['weight']:5.2f}  {p['onsets']:5d} onsets  " + " & ".join(p["context"] + ([ev] if ev else [])))
+
+
+def hierarchy(texts, mode, top=8):
+    """{head: [{main, recall, precision, onsets, weight, small: [..], }], "exceptions": {head: [..]}} of the "hier"
+    rules in one fit mode: each main cue with its strongest small cues (kept, by |weight|)."""
+    out, exc = {}, {}
+    w = lambda r: r["soft"][mode]["weight"] if mode in r["soft"] else r["weight"]
+    for r in texts:
+        if r.get("role") == "main":
+            out.setdefault(r["head"], []).append({"main_id": r["main_id"], "main": r["literals"],
+                                                  "recall": r.get("main_recall"), "precision": round(r["precision"], 3),
+                                                  "onsets": r["events"], "weight": round(w(r), 3), "small": []})
+    for r in texts:
+        role = r.get("role")
+        if role in ("sub", "exc") and abs(w(r)) >= DROP_WEIGHT:
+            item = {"literals": r["literals"], "precision": round(r["precision"], 3), "onsets": r["events"],
+                    "weight": round(w(r), 3)}
+            if role == "sub":
+                for m in out.get(r["head"], []):
+                    if m["main_id"] == r["main_id"]:
+                        item["literals"] = [x for x in r["literals"] if x not in m["main"]]
+                        m["small"].append(item)
+            else:
+                exc.setdefault(r["head"], []).append(item)
+    for ms in out.values():
+        for m in ms:
+            m["n_small"] = len(m["small"])
+            m["small"] = sorted(m["small"], key=lambda x: -abs(x["weight"]))[:top]
+    return {"mains": out, "exceptions": {h: sorted(v, key=lambda x: -abs(x["weight"]))[:top] for h, v in exc.items()},
+            "n_exceptions": {h: len(v) for h, v in exc.items()}}
+
+
+def show_hierarchy(hier, heads, top=5):
+    for head in heads:
+        ms = hier["mains"].get(head, [])
+        if not ms and head not in hier["exceptions"]:
+            continue
+        print(f"  {head}:")
+        for m in ms:
+            print(f"    MAIN {' & '.join(m['main'])}: onset recall {m['recall']}, precision {m['precision']}, "
+                  f"w {m['weight']:+.2f}; {m['n_small']} small cues kept")
+            for s in m["small"][:top]:
+                print(f"       + {' & '.join(s['literals'])}  (w {s['weight']:+.2f}, p {s['precision']:.2f}, {s['onsets']} onsets)")
+        print(f"    exceptions (no main cue): {hier['n_exceptions'].get(head, 0)} kept")
+        for s in hier["exceptions"].get(head, [])[:top]:
+            print(f"       * {' & '.join(s['literals'])}  (w {s['weight']:+.2f}, p {s['precision']:.2f}, {s['onsets']} onsets)")
 
 
 def show_rules(texts, heads, mode, top=8):
@@ -2266,6 +2435,10 @@ def main():
                         help="exh: a literal added must raise the precision by this factor")
     parser.add_argument("--lab_exh_max", type=int, default=400, help="exh: safeguard cap of rules per head")
     parser.add_argument("--lab_exh_seeds", type=int, default=300, help="exh: pairs grown further per head")
+    parser.add_argument("--lab_hier_mains", type=int, default=3, help="hier: main cues per head at most")
+    parser.add_argument("--lab_hier_lift", type=float, default=1.5, help="hier: a main cue's lift at least")
+    parser.add_argument("--lab_hier_cover", type=float, default=0.7,
+                        help="hier: main cues are added until they cover this share of the onset rows")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     if not getattr(args, "run_id", None):
@@ -2274,7 +2447,8 @@ def main():
     cfg = step05.get_cfg(config.get_step_05_input(args))
     for key in ("lab_precise_min", "lab_min_events", "lab_min_videos", "lab_max_len", "lab_beam", "lab_branch",
                 "lab_max_rules", "lab_exh_lift", "lab_exh_seed_lift", "lab_exh_gain", "lab_exh_max",
-                "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events", "lab_tr_confirm"):
+                "lab_exh_seeds", "lab_tr_max_onsets", "lab_tr_min_source", "lab_tr_rules", "lab_tr_min_events", "lab_tr_confirm",
+                "lab_hier_mains", "lab_hier_lift", "lab_hier_cover"):
         cfg[key] = getattr(args, key)
     cfg["lab_check"] = args.lab_check == "True"          # exh: the short rules pass the check test while mining
     cfg["lab_tr_mirror"] = args.lab_tr_mirror == "True"
@@ -2527,7 +2701,8 @@ def main():
                                "soft": {m: {"weight": round(float(par[0][i]), 3),
                                             "gates": [round(float(x), 3) for x in g[i][:len(r["literals"])]]}
                                         for m, (g, par) in soft.items() if m != "nor"},
-                               **({"temporal": [tgroups[0][i], tgroups[1][i]]} if tgroups is not None else {})}
+                               **({"temporal": [tgroups[0][i], tgroups[1][i]]} if tgroups is not None else {}),
+                               **({k: r[k] for k in ("role", "main_id", "main_recall") if k in r})}
                               for i, r in enumerate(final)), key=lambda r: r["head"])
         # Crisp rules: the sparse fit's gates rounded (>= 0.5: the literal is required, else dropped), then only
         # the rule weights refit (a hard AND per rule, a logistic OR per head): readable rules, no partial gates.
@@ -2599,7 +2774,14 @@ def main():
             print(f"\n[Rule lab] strongest rules of {best_variant} / {m} (soft logistic weight; [gate] per literal, "
                   f"1 = required, 0 = ignored{'; dropped literals and rules left out' if is_compact(m) else ''}):")
             show_rules(texts[best_variant], [h for h in args.lab_show.split(",") if h], m)
+    hier_out = {}
     for name_t in texts:
+        if any(r.get("role") == "main" for r in texts[name_t]):
+            for m in [m for m in soft_modes if m != "nor"]:
+                hier_out[f"{name_t}/{m}"] = hierarchy(texts[name_t], m)
+                print(f"\n[Rule lab] main and small cues of {name_t} / {m} (small cues act inside their main cue):")
+                show_hierarchy(hier_out[f"{name_t}/{m}"], [names[h] for h in heads] if args.lab_heads
+                               else [h for h in args.lab_show.split(",") if h])
         for m in (m for m in soft_modes if is_temporal(m)):
             if any("temporal" in r for r in texts[name_t]):
                 print(f"\n[Rule lab] temporal rules of {name_t} / {m} (context & event[weight per time slot]):")
@@ -2620,7 +2802,8 @@ def main():
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
                           "mlp_window": model.windows[k_mlp], "derived": derived.text, **out, "rules": texts,
                           "temporal": {f"{v}/{m}": temporal_profiles(texts[v], m) for v in texts for m in soft_modes
-                                       if is_temporal(m) and any("temporal" in r for r in texts[v])}}, path)
+                                       if is_temporal(m) and any("temporal" in r for r in texts[v])},
+                          "hierarchy": hier_out}, path)
     print(f"[Rule lab] saved {path}")
 
 
