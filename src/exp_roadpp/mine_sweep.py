@@ -114,6 +114,7 @@ def load_rows(cfg, training_data, model, head_mask, possible, out_dir):
                                 "Rows (train)")
     val = step05_mine.collect(model, training_data, training_data["val_videos"], head_mask, possible, cfg,
                               "Rows (val)")
+    os.makedirs(out_dir, exist_ok=True)                 # a new exp has no mine_sweep folder yet
     torch.save((train, val), rows_file)
     return train, val
 
