@@ -622,7 +622,10 @@ def transfer_sources(names, heads, all_heads, train, cfg):
         cls, act = ca[h]
         if cls == "Ped":
             continue
-        src = [g for g, (c, a) in ca.items() if a == act and c not in (cls, "Ped") and onsets[g] >= cfg["lab_tr_min_source"]]
+        # sources: other classes with more onsets than the target (2026-11-25: with --lab_tr_max_onsets raised,
+        # mid-size heads such as MedVeh:OutgoLane are targets too, and must not borrow from smaller classes)
+        src = [g for g, (c, a) in ca.items() if a == act and c not in (cls, "Ped") and onsets[g] >= cfg["lab_tr_min_source"]
+               and onsets[g] > onsets[h]]
         src = sorted(src, key=lambda g: -onsets[g])[:2]
         m_act = mirror_text(act)
         if m_act != act and cfg.get("lab_tr_mirror"):
