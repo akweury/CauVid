@@ -1691,7 +1691,7 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
         hist[name][0].add_(torch.bincount(cell[keep & y], minlength=A * NB).float())
         hist[name][1].add_(torch.bincount(cell[keep & ~y], minlength=A * NB).float())
 
-    for video_id in tqdm(video_ids, desc="Evaluating (val)"):
+    for video_id in tqdm(video_ids, desc="Evaluating"):
         can = possible(video_id)
         for frames in training_data["frames"][video_id].split(int(cfg.get("mine_chunk", 256))):
             rows = step05._video_rows(model, training_data, video_id, frames, device)
@@ -1902,6 +1902,40 @@ def atom_literals(model, lo, hi, older_only=False):
                          for info in literal_table(model)], dtype=torch.bool)
 
 
+def add_test_videos(training_data, cfg):
+    """The dataset's test split (SUMO multi-map exps: the test maps, seen neither in training nor by the rule check
+    or the selection), prepared like the train / val videos (as step06 does) and merged into training_data. Cached
+    next to the training data. Returns the sorted test video ids (2026-11-25: unseen-map evaluation on test)."""
+    atom_file = str(cfg["val_atom_file"]).replace("val_atoms_compressed", "test_atoms_compressed")
+    box_file = cfg.get("val_box_file")
+    box_file = str(box_file).replace("val_boxes", "test_boxes") if box_file else None
+    if not os.path.exists(atom_file):
+        raise FileNotFoundError(f"--lab_eval_split test: no test atoms at {atom_file}")
+    cache = os.path.join(os.path.dirname(str(cfg["training_data_file"])), "rule_lab_test_data.pt")
+    data = torch.load(cache, map_location="cpu") if step05.is_fresh(cache, cfg["training_data_file"], atom_file) else {}
+    if (data.get("min_off_frames") != cfg["min_off_frames"] or data.get("roles", []) != list(cfg["roles"])
+            or data.get("geometry", []) != list(cfg["geometry"]) or data.get("grid_tag", "") != step05.grid_tag(cfg)):
+        unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])
+        data = step05.prepare_videos(atom_file, len(unique_atoms), cfg["device"], cfg["min_off_frames"], box_file,
+                                     cfg["roles"], cfg["geometry"], unique_atoms, step05.load_grid(cfg),
+                                     step05.load_motion(cfg), step05.load_ego_motion(cfg), step05.load_ego_flow(cfg),
+                                     step05.load_durations(cfg), step05.load_predict(cfg), step05.load_shape(cfg),
+                                     step05.load_gestalt(cfg))
+        data.update(min_off_frames=cfg["min_off_frames"], roles=list(cfg["roles"]), geometry=list(cfg["geometry"]),
+                    grid_tag=step05.grid_tag(cfg))
+        step05.save_data(data, cache)
+    test_ids = sorted(data["videos"])
+    shared = set(test_ids) & (set(training_data["train_videos"]) | set(training_data["val_videos"]))
+    if shared:
+        raise ValueError(f"{len(shared)} test videos are also train / val videos, e.g. {sorted(shared)[:3]}")
+    if data.get("num_atoms", training_data["num_atoms"]) != training_data["num_atoms"]:
+        raise ValueError(f"test data has {data.get('num_atoms')} atoms, the training data {training_data['num_atoms']}")
+    for key in ("videos", "frames", "positive_frames"):
+        training_data[key].update(data[key])
+    print(f"[Rule lab] evaluation on the test split: {len(test_ids)} videos ({cache})")
+    return test_ids
+
+
 def ensure_mlp(training_data, cfg):
     """The run's OnsetMLP, trained (and saved) if missing: the lab needs no rule net, so a new run with new
     atoms (e.g. --shape_phases True) only builds the data and the MLP here."""
@@ -2056,6 +2090,9 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test"),
+                        help="evaluate on the odd val videos (default) or on every test video (SUMO _unseen: the test "
+                             "maps, untouched by the rule check and the selection); mining and selection are the same")
     parser.add_argument("--lab_tag", type=str, default="", help="suffix of the result file (parallel runs on head batches)")
     parser.add_argument("--lab_select", type=str, default="True",
                         help="choose the variant per head on the check videos; reported as the variant 'selected'")
@@ -2200,6 +2237,8 @@ def main():
     step(3, "row sample (train, val)")
     train, val = mine_sweep.load_rows(cfg, training_data, model, head_mask, possible, args.output_dir / "mine_sweep")
     if args.lab_prepare_only == "True":
+        if args.lab_eval_split == "test":
+            add_test_videos(training_data, cfg)         # built once here, not by each parallel head batch
         print("[Rule lab] --lab_prepare_only: the training data, the OnsetMLP and the row sample are cached; stop")
         return
     val_ids = list(training_data["val_videos"])
@@ -2218,6 +2257,8 @@ def main():
                         model.num_literals, device, desc="Derived literals (check)")
     del val
     eval_ids = val_ids[1::2]
+    if args.lab_eval_split == "test":
+        eval_ids = add_test_videos(training_data, cfg)
 
     # 1. Rule sets on the train sample, each miner once per literal set.
     step(5, f"mining ({args.lab_variants})")
@@ -2356,7 +2397,7 @@ def main():
               f"{n_d} with a derived literal)")
 
     # 3. Every at-risk row of the odd val videos.
-    step(8, "evaluation on the odd val videos")
+    step(8, "evaluation on the " + ("test videos" if args.lab_eval_split == "test" else "odd val videos"))
     hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
     choice = {}
     if args.lab_select == "True" and len(rule_sets) > 1:
@@ -2404,6 +2445,7 @@ def main():
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
+    fb += "_test" if args.lab_eval_split == "test" else ""
     fb += f"_{args.lab_tag}" if args.lab_tag else ""
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
