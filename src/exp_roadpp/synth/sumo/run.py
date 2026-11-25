@@ -389,6 +389,15 @@ def main():
     parser.add_argument("--class_shares", default=None,
                         help="vehicle class shares, e.g. Bus=0.10,Cyc=0.08,Mobike=0.08 (default: traffic.VEHICLE_CLASSES; "
                              "rare classes more frequent for their heads' onsets)")
+    parser.add_argument("--person_rate", type=float, default=None,
+                        help=f"pedestrians per s (junction layout; default {traffic.DEFAULTS['person_rate']}): more "
+                             "for the Ped heads' onsets")
+    parser.add_argument("--vehicle_rate", type=float, default=None,
+                        help=f"vehicles per s (junction layout; default {traffic.DEFAULTS['vehicle_rate']})")
+    parser.add_argument("--head_target", type=int, default=0,
+                        help="also a target of this many onsets for every head seen so far (2026-11-25: every head "
+                             "needs >= 100 evaluation onsets; the eval videos are ~22%% of all); stops at --num at "
+                             "the latest, as heads that hardly ever happen never reach it")
     parser.add_argument("--batch", type=int, default=BATCH, help="simulations per sampling round")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=8)
@@ -427,6 +436,10 @@ def main():
         {"version": version, "rules": rules.GT_RULES + (rules.GT_RULES_GRID if grid else []),
          "natural_rules": rules.NATURAL_RULES}, indent=2))
     targets = parse_targets(args.targets)
+    for key in ("person_rate", "vehicle_rate"):
+        if getattr(args, key) is not None:
+            traffic.DEFAULTS[key] = getattr(args, key)          # before the pool forks: the workers inherit it
+            print(f"[SUMO] {key} {traffic.DEFAULTS[key]}")
     if args.class_shares:
         shares = {k: float(v) for k, v in (x.split("=") for x in args.class_shares.split(",") if x)}
         traffic.set_class_shares(shares)                 # before the pool forks: the workers inherit it
@@ -451,9 +464,19 @@ def main():
     gen_file = out / "meta" / "generation.json"
     earlier = _earlier_results(out)
     start, results, i, rounds = time.time(), [], 0, 0
+    explicit = dict(targets)
+
+    def head_targets(ok):
+        """The explicit targets and --head_target for every head with an onset so far (counted per round)."""
+        if not args.head_target:
+            return explicit
+        heads = {e for r in ok for e in (r.get("onsets") or {})}
+        return {**{h: args.head_target for h in sorted(heads)}, **explicit}
+
     with Pool(args.workers) as pool:
         while True:
             ok = [r for r in results if r["status"] == "ok"]
+            targets = head_targets(ok)
             counts = event_counts(ok, targets)
             missing = {e: t - counts[e] for e, t in targets.items() if counts[e] < t}
             if targets and not missing:
@@ -469,10 +492,14 @@ def main():
             results += [earlier.get(r["vid"], r) if r["status"] == "exists" else r for r in batch]
             i, rounds = i + n, rounds + 1
             ok = [r for r in results if r["status"] == "ok"]
+            targets = head_targets(ok)
             counts = event_counts(ok, targets)
+            short = sorted((counts[e], e) for e, t in targets.items() if counts[e] < t)
             print(f"[SUMO] round {rounds}: {i} simulations, {len(ok)} videos ({time.time() - start:.0f} s); "
                   f"modes {dict(zip(modes, (round(w, 2) for w in weights)))}; "
-                  + ", ".join(f"{e} {counts[e]}/{t}" for e, t in targets.items()))
+                  + (f"{len(targets) - len(short)} of {len(targets)} targets reached; short: "
+                     + ", ".join(f"{e} {c}/{targets[e]}" for c, e in short[:12]) + (" ..." if len(short) > 12 else "")
+                     if args.head_target else ", ".join(f"{e} {counts[e]}/{t}" for e, t in targets.items())))
             _write_generation(gen_file, args, targets, results, f"running, round {rounds}", version)
     results.sort(key=lambda r: r["vid"])
     report = _write_generation(gen_file, args, targets, results, stop, version)
