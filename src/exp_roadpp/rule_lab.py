@@ -67,6 +67,7 @@ import torch
 from tqdm import tqdm
 
 from src.exp_roadpp import config, eventual, mine_sweep, step05, step05_mine, step07_paper, utils_data, utils_pipe
+from src.exp_roadpp.baselines import atom_former
 
 LEARNABLE_MIN_AP = 0.05
 CLOSE = 0.9                     # "close to the MLP": AP >= CLOSE x the MLP's
@@ -1856,7 +1857,15 @@ def evaluate(model, mlp, training_data, video_ids, rule_sets, head_mask, possibl
                 keys.append((h_i.long() * 100000 + n_i.long()) * 1000000 + onset)
             lits = literal_rows(model, rows["inputs"], derived)
             if mlp is not None:
-                add("mlp", mlp.window_probs(mlp(rows["inputs"])[0])[:, k_mlp], keep, y)
+                if getattr(mlp, "scene_model", False):
+                    # The AtomFormer (`--lab_former`): its own rows of the same frames carry the scene.
+                    rows_f = step05._video_rows(mlp, training_data, video_id, frames, device)
+                    if not torch.equal(rows_f["rows"], rows["rows"]):
+                        raise RuntimeError("AtomFormer rows differ from the rule net's")
+                    h_mlp = mlp.forward_rows(rows_f)
+                else:
+                    h_mlp = mlp(rows["inputs"])[0]
+                add("mlp", mlp.window_probs(h_mlp)[:, k_mlp], keep, y)
             for variant, rs in rule_sets.items():
                 for scorer, p in rs.scores(lits).items():
                     add(f"{variant}/{scorer}", p, keep, y)
@@ -2622,6 +2631,14 @@ def main():
                         help="the reference of the AP differences (default mlp), e.g. relaxed+exh_nn/mdls_0.1")
     parser.add_argument("--lab_mlp_only", type=str, default="False",
                         help="only evaluate the OnsetMLP (e.g. a stronger one, --mlp_hidden_size) on the eval videos")
+    parser.add_argument("--lab_former", type=str, default="", choices=("", "time", "factor", "joint"),
+                        help="the reference model is an AtomFormer (`baselines/atom_former.py`) with this attention "
+                             "instead of the OnsetMLP (trained if missing); with --lab_mlp_only True: only it")
+    parser.add_argument("--former_dim", type=int, default=128, help="AtomFormer width")
+    parser.add_argument("--former_layers", type=int, default=2, help="AtomFormer blocks")
+    parser.add_argument("--former_heads", type=int, default=4, help="AtomFormer attention heads")
+    parser.add_argument("--former_dropout", type=float, default=0.1, help="AtomFormer dropout")
+    parser.add_argument("--former_lr", type=float, default=5e-4, help="AtomFormer AdamW learning rate")
     parser.add_argument("--lab_mine_only", type=str, default="False",
                         help="stop after the mining step (step 5): a quick look, e.g. at the hier main cues")
     parser.add_argument("--lab_hier_mains", type=int, default=3, help="hier: main cues per head at most")
@@ -2667,7 +2684,15 @@ def main():
         cfg["target_tag"] = "_ev"
         args.lab_mlp = "False"                  # the OnsetMLP is trained on the window target
         print("[Rule lab] target: eventual (an onset at any later frame before the agent leaves the scene); no MLP")
-    mlp = ensure_mlp(training_data, cfg) if args.lab_mlp == "True" else None
+    if args.lab_former:
+        # 2026-11-26: a Transformer reference on the same inputs; its file name stands in for the MLP's below.
+        for key in ("dim", "layers", "heads", "dropout", "lr"):
+            cfg[f"former_{key}"] = getattr(args, f"former_{key}")
+        cfg["former_attention"] = args.lab_former
+        mlp = atom_former.ensure_former(training_data, cfg) if args.lab_mlp == "True" else None
+        cfg["mlp_model_file"] = atom_former.former_files(cfg)[0]
+    else:
+        mlp = ensure_mlp(training_data, cfg) if args.lab_mlp == "True" else None
     window = int(cfg.get("clause_slots", 1)) * model.slot_size
     k_mlp = min(range(len(model.windows)), key=lambda i: abs(model.windows[i] - window))
     vocab = step05.load_vocabulary(cfg)

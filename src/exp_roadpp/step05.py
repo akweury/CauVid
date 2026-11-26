@@ -1088,7 +1088,8 @@ def video_rows(model, X, frames, min_off_frames=1, history=None, roles=None):
         rows = model.training_rows(X, frames, min_off_frames, history)
     t, n = rows["rows"].T
     seen = (t > 0) & X[(t - 1).clamp(min=0), n].any(dim=1)
-    return {key: value[seen] for key, value in rows.items()}
+    # Keys with "_" are per video, not per row (the scene of `AtomFormer.training_rows`).
+    return {key: (value if key.startswith("_") else value[seen]) for key, value in rows.items()}
 
 
 def sample_history(frames, cfg, generator):
@@ -1110,8 +1111,22 @@ def sample_history(frames, cfg, generator):
 
 
 def concat_rows(parts):
-    """One rows dict of several `video_rows` dicts."""
-    return {key: torch.cat([part[key] for part in parts]) for key in parts[0]}
+    """One rows dict of several `video_rows` dicts (without the per-video "_" keys)."""
+    return {key: torch.cat([part[key] for part in parts]) for key in parts[0] if not key.startswith("_")}
+
+
+def forward_parts(model, parts):
+    """(rows, hazards (B, W, A)) of a batch of `_video_rows` parts; hazards None if there are no rows. A scene
+    model (`baselines.atom_former`) runs per video on its scene, the others on the concatenated input rows."""
+    if getattr(model, "scene_model", False):
+        parts = [part for part in parts if len(part["inputs"])]
+        if not parts:
+            return None, None
+        return concat_rows(parts), torch.cat([model.forward_rows(part) for part in parts])
+    rows = concat_rows(parts)
+    if len(rows["inputs"]) == 0:
+        return rows, None
+    return rows, model(rows["inputs"])[0]
 
 
 def coarsen_video(X, block_size):
@@ -1130,11 +1145,11 @@ def _validation_loss(model, training_data, val_frames, cfg, candidates=None):
     model.eval()
     losses = []
     for video_id, (frames, history) in val_frames.items():
-        rows = _video_rows(model, training_data, video_id, frames, cfg["device"], history)
-        if len(rows["inputs"]) == 0:
+        rows, hazards = forward_parts(model, [_video_rows(model, training_data, video_id, frames, cfg["device"],
+                                                          history)])
+        if hazards is None:
             continue
         at_risk = rows["at_risk"] if candidates is None else rows["at_risk"] & candidates(rows["inputs"])
-        hazards, _rules = model(rows["inputs"])
         losses.append(model.loss(hazards, rows["targets"], at_risk, rows["known"],
                                  pos_weight_of(training_data, cfg)).item())
     return sum(losses) / len(losses) if losses else float("nan")
@@ -1206,14 +1221,13 @@ def fit_onset_model(model, training_data, cfg, optimizer, history_file, regulari
         for start in range(0, len(items), cfg["videos_per_batch"]):
             parts = [_video_rows(model, training_data, video_id, frames, device, known)
                      for video_id, frames, known in items[start:start + cfg["videos_per_batch"]]]
-            rows = concat_rows(parts)
-            if len(rows["inputs"]) == 0:
+            rows, hazards = forward_parts(model, parts)
+            if hazards is None:
                 continue
             at_risk = rows["at_risk"]
             if candidates is not None:
                 at_risk = at_risk & candidates(rows["inputs"])
 
-            hazards, _hidden = model(rows["inputs"])
             onset_loss = model.loss(hazards, rows["targets"], at_risk, rows["known"], pos_weight)
             loss = onset_loss if regularization is None else onset_loss + regularization(epoch)
             optimizer.zero_grad()
