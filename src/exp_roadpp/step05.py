@@ -809,11 +809,50 @@ def prepare_training_data(cfg):
     return {**data, "train_videos": train_videos, "val_videos": val_videos}
 
 
+def _local_copy(path):
+    """The local-disk copy of path under $CAUVID_LOCAL_CACHE (`run_roadpp_docker.sh`; same relative path), made if
+    missing or stale (size or mtime differ); path itself without the variable. One process copies (a lock file),
+    the others wait for it. 2026-11-26: /storage-01 is NFS."""
+    import shutil
+    import time as _time
+    root = os.environ.get("CAUVID_LOCAL_CACHE")
+    if not root:
+        return path
+    src = str(path)
+    dst = os.path.join(root, src.lstrip("/"))
+    st = os.stat(src)
+
+    def valid():
+        return os.path.exists(dst) and os.path.getsize(dst) == st.st_size and os.path.getmtime(dst) >= st.st_mtime
+    if valid():
+        return dst
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    lock = dst + ".lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        start = _time.time()
+        while os.path.exists(lock) and _time.time() - start < 3600:
+            _time.sleep(5)
+        return dst if valid() else src
+    try:
+        t0 = _time.time()
+        shutil.copyfile(src, dst + ".tmp")
+        os.utime(dst + ".tmp", (st.st_atime, st.st_mtime))
+        os.replace(dst + ".tmp", dst)
+        print(f"[Data] local copy {dst} ({st.st_size / 2 ** 30:.1f} GB, {_time.time() - t0:.0f} s)", flush=True)
+    finally:
+        os.close(fd)
+        os.remove(lock)
+    return dst if valid() else src
+
+
 def load_data(path):
-    """torch.load of a large prepared-data file, memory-mapped (2026-11-26: sumo_maps_v8's 9.6 GB training data took
+    """torch.load of a large prepared-data file (from its local-disk copy, `_local_copy`), memory-mapped (2026-11-26: sumo_maps_v8's 9.6 GB training data took
     minutes per process, and 6 processes read it at once): the tensors are read lazily, only those used, and the
     pages are shared by every process on the machine through the page cache. Falls back to a plain load (older
     torch, or a file in the old pickle format)."""
+    path = _local_copy(path)
     try:
         return torch.load(path, map_location="cpu", mmap=True)
     except (TypeError, RuntimeError) as e:

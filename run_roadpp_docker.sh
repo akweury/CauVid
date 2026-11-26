@@ -162,6 +162,14 @@ SYNTH_DATA_HOST="${CAUVID_SYNTH_DATA_HOST:-$(dirname "$ROADPP_DATA_HOST")/synthe
 TORCH_CACHE_HOST="${CAUVID_TORCH_CACHE_HOST:-/storage-02/ml-jsha/.cache/torch}"
 MACHINE="${CAUVID_ROADPP_MACHINE:-dgx-jing}"
 
+# Local-disk copies of the large prepared-data files (step05.load_data, 2026-11-26: /storage-01 is NFS, the 9.6 GB
+# training data of sumo_maps_v8 took minutes per process); empty CAUVID_LOCAL_CACHE="" turns it off.
+LOCAL_CACHE_HOST="${CAUVID_LOCAL_CACHE-$HOME/cauvid_local_cache}"
+LOCAL_CACHE_ARGS=()
+if [[ -n "$LOCAL_CACHE_HOST" ]]; then
+    mkdir -p "$LOCAL_CACHE_HOST"
+    LOCAL_CACHE_ARGS=(-v "$LOCAL_CACHE_HOST:$LOCAL_CACHE_HOST" -e "CAUVID_LOCAL_CACHE=$LOCAL_CACHE_HOST")
+fi
 mkdir -p "$TORCH_CACHE_HOST" "$ROADPP_OUTPUT_HOST" "$SYNTH_DATA_HOST"
 
 # W&B key: the container is removed after each run (--rm, HOME=/tmp), so a key
@@ -233,6 +241,7 @@ docker run --rm -it \
     -v "$SYNTH_DATA_HOST:$SYNTH_DATA_HOST" \
     -v "$ROADPP_OUTPUT_HOST:$ROADPP_OUTPUT_HOST" \
     -v "$TORCH_CACHE_HOST:/.cache/torch" \
+    "${LOCAL_CACHE_ARGS[@]}" \
     -e PYTHONPATH=/app \
     -e MPLBACKEND=Agg \
     -e TORCH_HOME=/.cache/torch \
