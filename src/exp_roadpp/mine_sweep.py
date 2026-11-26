@@ -109,7 +109,7 @@ def load_rows(cfg, training_data, model, head_mask, possible, out_dir):
     tag = os.path.basename(str(cfg["mined_seed_file"])).replace("mined_seeds_", "").replace(".json", "")
     rows_file = out_dir / f"rows_{re.sub(r'_m[0-9]+(?=_|$)', '', tag)}{cfg.get('target_tag', '')}_s{cfg['seed']}.pt"
     if os.path.exists(rows_file) and step05.is_fresh(rows_file, cfg["training_data_file"]):
-        return torch.load(rows_file, map_location="cpu")
+        return step05.load_data(rows_file)
     train = step05_mine.collect(model, training_data, training_data["train_videos"], head_mask, possible, cfg,
                                 "Rows (train)")
     val = step05_mine.collect(model, training_data, training_data["val_videos"], head_mask, possible, cfg,

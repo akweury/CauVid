@@ -2097,7 +2097,7 @@ def add_test_videos(training_data, cfg):
     if not os.path.exists(atom_file):
         raise FileNotFoundError(f"--lab_eval_split test: no test atoms at {atom_file}")
     cache = os.path.join(os.path.dirname(str(cfg["training_data_file"])), "rule_lab_test_data.pt")
-    data = torch.load(cache, map_location="cpu") if step05.is_fresh(cache, cfg["training_data_file"], atom_file) else {}
+    data = step05.load_data(cache) if step05.is_fresh(cache, cfg["training_data_file"], atom_file) else {}
     if (data.get("min_off_frames") != cfg["min_off_frames"] or data.get("roles", []) != list(cfg["roles"])
             or data.get("geometry", []) != list(cfg["geometry"]) or data.get("grid_tag", "") != step05.grid_tag(cfg)):
         unique_atoms = utils_data.load_json(cfg["unique_atoms_file"])

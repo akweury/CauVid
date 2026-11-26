@@ -809,6 +809,18 @@ def prepare_training_data(cfg):
     return {**data, "train_videos": train_videos, "val_videos": val_videos}
 
 
+def load_data(path):
+    """torch.load of a large prepared-data file, memory-mapped (2026-11-26: sumo_maps_v8's 9.6 GB training data took
+    minutes per process, and 6 processes read it at once): the tensors are read lazily, only those used, and the
+    pages are shared by every process on the machine through the page cache. Falls back to a plain load (older
+    torch, or a file in the old pickle format)."""
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError) as e:
+        print(f"[Data] no memory-mapped load of {path} ({type(e).__name__}): plain load")
+        return torch.load(path, map_location="cpu")
+
+
 def save_data(data, path):
     """torch.save to a temporary file, then renamed: a run reading the shared file never sees half of it."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -851,7 +863,7 @@ def load_training_data(cfg):
     types of the heads ("event_types", `head_event_types`) and "target_heads" (A,) bool,
     the heads the models learn: never the geometry heads (inputs only), and not the noise
     heads if cfg["exclude_noise_heads"]."""
-    data = torch.load(cfg["training_data_file"], map_location="cpu") if os.path.exists(cfg["training_data_file"]) else {}
+    data = load_data(cfg["training_data_file"]) if os.path.exists(cfg["training_data_file"]) else {}
     if (data.get("min_off_frames") != cfg["min_off_frames"] or data.get("split") != SPLIT_SOURCE
             or data.get("roles", []) != list(cfg["roles"]) or data.get("geometry", []) != list(cfg["geometry"])
             or data.get("grid_tag", "") != grid_tag(cfg)):
