@@ -926,13 +926,28 @@ def head_event_types(training_data, unique_atoms, cfg):
     Returns {"types": (A,) long EVENT_TYPES index, "heads": {type: [{"head",
     "label", "onsets"}], most frequent first}, the two cutoffs and the onset count}."""
     A = training_data["num_atoms"]
-    counts = torch.zeros(A)
-    for video in training_data["videos"].values():
-        X = _video_from_cells(video, A, "cpu")
-        onsets = atom_onsets(X, training_data["min_off_frames"])
-        onsets[0] = False
-        onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
-        counts += onsets.sum(dim=(0, 1)).float()
+    # The counts are cached next to the training data (2026-11-25: sumo_maps_v8, ~8.5k train + val videos, took
+    # most of the rule lab's step 1; every run and every parallel part counted them again).
+    cache = f"{cfg['training_data_file']}.onset_counts.pt" if cfg.get("training_data_file") else None
+    counts = None
+    if cache and is_fresh(cache, cfg["training_data_file"]):
+        c = torch.load(cache)
+        if c.get("videos") == len(training_data["videos"]) and c.get("min_off_frames") == training_data["min_off_frames"]:
+            counts = c["counts"]
+    if counts is None:
+        # on the GPU if there is one (2026-11-25: on the CPU ~1 h for sumo_maps_v8)
+        dev = cfg.get("device", "cpu") if torch.cuda.is_available() else "cpu"
+        counts = torch.zeros(A, device=dev)
+        for video in tqdm(training_data["videos"].values(), desc="Head onset counts", mininterval=30):
+            X = _video_from_cells(video, A, dev)
+            onsets = atom_onsets(X, training_data["min_off_frames"])
+            onsets[0] = False
+            onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
+            counts += onsets.sum(dim=(0, 1)).float()
+        counts = counts.cpu()
+        if cache:
+            save_data({"counts": counts, "videos": len(training_data["videos"]),
+                       "min_off_frames": training_data["min_off_frames"]}, cache)
     types = torch.full((A,), EVENT_TYPES.index("regular"), dtype=torch.long)
     types[counts < cfg.get("rare_below", 0)] = EVENT_TYPES.index("rare")
     types[counts < cfg["noise_below"]] = EVENT_TYPES.index("noise")

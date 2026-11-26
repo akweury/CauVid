@@ -98,3 +98,9 @@
 ./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v7 --machine dgx-jing --shape_phases True --run_id 20261123-egolay_lab --lab_mlp False --lab_fast True --lab_heads Bus:VehLane,Bus:MovRht,Cyc:VehLane,Mobike:TurRht,MedVeh:HazLit,Mobike:Brake,Cyc:MovAway,Mobike:Jun --lab_variants relaxed_nn,relaxed+tr_nn,relaxed+trp_nn --lab_check True --lab_merge True 2>&1 | tee rule_lab_quick_mirror2.log
 
 ./run_roadpp_docker.sh --gpu 7 -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --dataset_only True 2>&1 | tee v8_dataset.log
+
+./run_roadpp_docker.sh --gpu 7 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_prepare_only True --lab_eval_split valtest 2>&1 | tee v8_prepare.log
+
+
+
+./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_prepare_only True --lab_eval_split valtest 2>&1 | tee v8_prepare.log

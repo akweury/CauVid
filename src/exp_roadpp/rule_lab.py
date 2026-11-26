@@ -2623,8 +2623,13 @@ def main():
     def step(k, msg):
         print(f"\n[Rule lab] step {k}/9 ({time.time() - t0:.0f} s): {msg}", flush=True)
     step(1, "training data and rule net")
+    if os.path.exists(cfg["training_data_file"]):
+        print(f"[Rule lab] loading {cfg['training_data_file']} ({os.path.getsize(cfg['training_data_file']) / 2 ** 30:.1f} GB)",
+              flush=True)
     training_data = step05.load_training_data(cfg)
+    print(f"[Rule lab] training data loaded ({time.time() - t0:.0f} s)", flush=True)
     model = step05.build_rule_net(training_data, cfg, 1).to(device)
+    print(f"[Rule lab] rule net built ({time.time() - t0:.0f} s)", flush=True)
     if args.lab_target == "eventual":
         eventual.install()
         cfg["target_tag"] = "_ev"
