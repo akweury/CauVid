@@ -2160,7 +2160,12 @@ def get_cfg(input_data):
     # OnsetMLP baseline: lr 0.01 (the rule net's) with ReLU let every hidden unit die in the
     # first epochs (a constant score per head); a smaller lr, GELU, clipping and early stopping.
     mlp_lr, mlp_activation = 1e-3, "gelu"
+    # A stronger baseline check (2026-11-26, v8: train loss 0.057 ~ val 0.059, maybe capacity bound): hidden size and
+    # dropout from the command line; non-default values go into the model file name.
+    mlp_hidden = int(input_data.get("mlp_hidden_size") or 830)
+    mlp_dropout = 0.2 if input_data.get("mlp_dropout") is None else float(input_data["mlp_dropout"])
     mlp_tag = f"{base_tag}_lr{mlp_lr:g}_{mlp_activation}" + ("_older" if slot_ranges else "")
+    mlp_tag += (f"_h{mlp_hidden}" if mlp_hidden != 830 else "") + (f"_do{mlp_dropout:g}" if mlp_dropout != 0.2 else "")
     if videos_per_batch != 4:
         mlp_tag += f"_vb{videos_per_batch}"
     return {
@@ -2274,8 +2279,8 @@ def get_cfg(input_data):
             # Fixed at 830 since the step 03 v2 anchors (own-agent clauses): about that count with them
             # (~236 bodies x 3 + 128), and no longer tied to the anchors or to --per_head_rules.
             'mlp_baseline': True,
-            'mlp_hidden_size': 830,
-            'mlp_dropout': 0.2,
+            'mlp_hidden_size': mlp_hidden,
+            'mlp_dropout': mlp_dropout,
             'mlp_weight_decay': 1e-4,
             'mlp_lr': mlp_lr,
             'mlp_activation': mlp_activation,

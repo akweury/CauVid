@@ -361,6 +361,8 @@ def get_step_05_input(args):
         "output_dir": output_dir,
         "device": args.device,
         "num_epochs": args.num_epochs,
+        "mlp_hidden_size": getattr(args, "mlp_hidden_size", None),
+        "mlp_dropout": getattr(args, "mlp_dropout", None),
         "causal_anchor_clause_file": args.output_dir / "step04_output" / "causal_clauses.json",
         "anchor_clause_file": args.output_dir / "step03_output" / "anchor_clauses.json",
         'dataset_label_file':  args.dataset_path/"gt"/"label.json",

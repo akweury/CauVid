@@ -2590,6 +2590,8 @@ def main():
                         help="per head 95%% video-bootstrap intervals of the AP (and of AP - MLP)")
     parser.add_argument("--lab_ci_ref", type=str, default="",
                         help="the reference of the AP differences (default mlp), e.g. relaxed+exh_nn/mdls_0.1")
+    parser.add_argument("--lab_mlp_only", type=str, default="False",
+                        help="only evaluate the OnsetMLP (e.g. a stronger one, --mlp_hidden_size) on the eval videos")
     parser.add_argument("--lab_mine_only", type=str, default="False",
                         help="stop after the mining step (step 5): a quick look, e.g. at the hier main cues")
     parser.add_argument("--lab_hier_mains", type=int, default=3, help="hier: main cues per head at most")
@@ -2660,6 +2662,30 @@ def main():
     # Literals: the rule net's and the derived ones (same indices in every variant; the variants without "_d"
     # may not use the derived ones).
     derived = Derived(model, names)
+    if args.lab_mlp_only == "True":
+        # Only the OnsetMLP on the evaluation videos (2026-11-26: a stronger MLP, --mlp_hidden_size / --mlp_dropout,
+        # against the rules of an earlier run on the same videos), no mining.
+        val_ids = list(training_data["val_videos"])
+        eval_ids = val_ids[1::2]
+        if args.lab_eval_split == "test":
+            eval_ids = add_test_videos(training_data, cfg)
+        elif args.lab_eval_split == "valtest":
+            eval_ids = val_ids[1::2] + add_test_videos(training_data, cfg)
+        step(8, f"OnsetMLP only on {len(eval_ids)} {args.lab_eval_split} videos")
+        stats = {"heads": list(heads)}
+        hist = evaluate(model, mlp, training_data, eval_ids, {}, head_mask, possible, cfg, k_mlp, derived, stats)
+        ci = bootstrap_ci(stats["videos"], [names[h] for h in heads], device) if args.lab_ci == "True" else None
+        ap = step07_paper._ap(*hist["mlp"])
+        per_head = {names[h]: {"mlp": _none(float(ap[h])), "onsets": int(stats["onsets"][h]),
+                               "pos_rows": int(hist["mlp"][0][h].sum()),
+                               **({"ci": ci.get(names[h], {})} if ci else {})} for h in heads}
+        mtag = os.path.basename(str(cfg["mlp_model_file"])).replace(".pt", "")
+        path = out_dir / f"mlp_only_{mtag}_{args.lab_eval_split}.json"
+        utils_data.save_json({"mlp_model_file": str(cfg["mlp_model_file"]), "eval_videos": len(eval_ids),
+                              "per_head": per_head}, path)
+        print(f"[Rule lab] --lab_mlp_only: {len(heads)} heads, macro AP "
+              f"{sum(v['mlp'] or 0 for v in per_head.values()) / max(len(per_head), 1):.3f}; saved {path}")
+        return
     step(2, "literal masks (forbidden literals per variant)")
     forbid_nn = negated_others(model)
     layout = training_data.get("grid_layout", {})
