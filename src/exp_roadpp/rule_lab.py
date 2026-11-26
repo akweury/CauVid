@@ -1689,6 +1689,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=None, l
             b = float(base[h])
         opt = torch.optim.Adam(params, lr=0.1)
         steps = steps or FIT_STEPS
+        # lr 0.1 -> 0.001 (cosine) over the steps (2026-11-26: at a constant 0.1 the end of the fit was a random point
+        # of an oscillation: Bus:OutgoLane mdls_0.1 final loss 0.136 after 500 steps, 0.099 after 2000; mdlws 0.095,
+        # then 0.127; kept rules 231-965, AP 0.34-0.46 for the same rules)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=1e-3)
         warm_steps = int(MDL_WARM * steps) if "w" in mdl_flags(mode) else 0
         for it in range(steps):
             opt.zero_grad()
@@ -1723,6 +1727,7 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=None, l
                     loss = loss + l2 * (wt ** 2).sum()
             loss.backward()
             opt.step()
+            sched.step()
         if len(heads) <= 10 and logistic:
             # the end of the fit, for a convergence check on a few heads (2026-11-26: the same rules of Bus:OutgoLane
             # kept 796 rules at AP 0.221 in one run, 248 at 0.424 in another)
@@ -3058,10 +3063,12 @@ def main():
     # The scorer of the paper protocol (`rule_paper.py`, 2026-11-26): per head the chosen variant's rules in the
     # selection's fit (body literal indices, soft gates, weights, the head's bias), all heads of this part.
     mode = args.lab_select_scorer.split(",")[0]
+    mode = "logit" if mode == "soft_logit" else mode             # the soft fit's key of the soft_logit scorer
     pick = {}
     for h in heads:
         c = choice.get(h, variants[0])
         v, m = (c.split("/") + [mode])[:2] if "/" in c else (c, mode)
+        m = "logit" if m == "soft_logit" else m
         if v in rule_sets and m in getattr(rule_sets[v], "soft", {}):
             pick[h] = (v, m)
     bodies, gates, weights, hs, bias = [], [], [], [], {}
