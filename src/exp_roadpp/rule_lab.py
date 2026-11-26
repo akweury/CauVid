@@ -3029,6 +3029,38 @@ def main():
                                        if is_temporal(m) and any("temporal" in r for r in texts[v])},
                           "hierarchy": hier_out, "eval_onsets": ons_all, "eval_videos": len(eval_ids)}, path)
     print(f"[Rule lab] saved {path}")
+    # The scorer of the paper protocol (`rule_paper.py`, 2026-11-26): per head the chosen variant's rules in the
+    # selection's fit (body literal indices, soft gates, weights, the head's bias), all heads of this part.
+    mode = args.lab_select_scorer.split(",")[0]
+    pick = {}
+    for h in heads:
+        c = choice.get(h, variants[0])
+        v, m = (c.split("/") + [mode])[:2] if "/" in c else (c, mode)
+        if v in rule_sets and m in getattr(rule_sets[v], "soft", {}):
+            pick[h] = (v, m)
+    bodies, gates, weights, hs, bias = [], [], [], [], {}
+    for h, (v, m) in pick.items():
+        rs = rule_sets[v]
+        gate, (w, b) = rs.soft[m]
+        sel = torch.nonzero(rs.head == h).flatten()
+        bias[int(h)] = float(b[h])
+        if len(sel):
+            bodies.append(rs.body[sel].cpu())
+            gates.append(gate[sel].cpu())
+            weights.append(w[sel].cpu())
+            hs += [int(h)] * len(sel)
+    K = max((x.shape[1] for x in bodies), default=1)
+    padb = lambda x: torch.nn.functional.pad(x, (0, K - x.shape[1]), value=L)
+    padg = lambda x: torch.nn.functional.pad(x, (0, K - x.shape[1]), value=1.0)
+    torch.save({"num_literals": L, "num_atoms": A, "mode": mode, "heads": [int(h) for h in pick],
+                "variant": {int(h): v for h, (v, _m) in pick.items()}, "bias": bias,
+                "head": torch.tensor(hs, dtype=torch.long),
+                "body": torch.cat([padb(x) for x in bodies]) if bodies else torch.zeros((0, K), dtype=torch.long),
+                "gate": torch.cat([padg(x) for x in gates]) if gates else torch.zeros((0, K)),
+                "weight": torch.cat(weights) if weights else torch.zeros(0)},
+               str(path).replace(".json", ".rules.pt"))
+    print(f"[Rule lab] rule scorer for the paper protocol: {str(path).replace('.json', '.rules.pt')} "
+          f"({len(hs)} rules, {len(pick)} heads, {mode})")
 
 
 if __name__ == "__main__":
