@@ -104,3 +104,10 @@
 
 
 ./run_roadpp_docker.sh --gpu 2 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_prepare_only True --lab_eval_split valtest 2>&1 | tee v8_prepare.log
+
+screen -dmS lamsel bash -c "./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_mlp True --lab_fast True --lab_variants relaxed+exh_nn --lab_check True --lab_merge True --lab_exh_gain 1.5 --lab_mdl s0.1,s0.03 --lab_select True --lab_select_scorer mdls_0.1,mdls_0.03,soft_logit --lab_select_min_pos 100 --lab_eval_split valtest --lab_tag lamsel --lab_heads Bus:OutgoLane,Cyc:OutgoLane,Bus:IncomLane,Car:Brake,Car:IncomLane 2>&1 | tee v8_lamsel.log; exec bash"
+
+./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_mlp True --lab_fast True --lab_variants relaxed+exh_nn --lab_check True --lab_merge True --lab_exh_gain 1.5 --lab_mdl s0.1,s0.03 --lab_select True --lab_select_scorer mdls_0.1,mdls_0.03,soft_logit --lab_select_min_pos 100 --lab_eval_split valtest --lab_tag lamsel --lab_heads Bus:OutgoLane,Cyc:OutgoLane,Bus:IncomLane,Car:Brake,Car:IncomLane 2>&1 | tail -40
+
+
+screen -dmS fitchk bash -c "cd ~/CauVid && for S in 500 2000; do ./run_roadpp_docker.sh --gpu 4 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_mlp True --lab_fast True --lab_variants relaxed+exh_nn --lab_select False --lab_check True --lab_merge True --lab_exh_gain 1.5 --lab_mdl s0.1,ws0.1 --lab_fit_steps \$S --lab_eval_split valtest --lab_tag fit\$S --lab_heads Bus:OutgoLane 2>&1 | tee v8_fit\$S.log; done; exec bash"

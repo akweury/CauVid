@@ -93,15 +93,27 @@ RULE_COST, RULE_TAU, MDL_SCALE = 2.0, 0.1, 100.0
 MDL_SIZE_REF = 200.0
 
 
+def mdl_flags(mode):
+    """The letters of an MDL mode "mdl<letters>_λ": s scaled by the head's size, t temporal rules, w warm start."""
+    return mode.split("_", 1)[0][3:] if mode.startswith("mdl") else ""
+
+
 def mdl_lambda(mode, onsets):
-    """λ of a "mdl_λ" / "mdls_λ" / "mdlt_λ" / "mdlts_λ" mode for a head with this many train (sample) onsets."""
+    """λ of a "mdl<flags>_λ" mode for a head with this many train (sample) onsets (flag s: scaled)."""
     lam = float(mode.split("_", 1)[1])
-    return lam * min(1.0, MDL_SIZE_REF / max(onsets, 1)) if mode.startswith(("mdls_", "mdlts_")) else lam
+    return lam * min(1.0, MDL_SIZE_REF / max(onsets, 1)) if "s" in mdl_flags(mode) else lam
 
 
 def is_temporal(mode):
-    """The MDL modes over temporal rules ("mdlt_λ", "mdlts_λ", `temporal_groups`)."""
-    return mode.startswith(("mdlt_", "mdlts_"))
+    """The MDL modes over temporal rules (flag t, `temporal_groups`)."""
+    return "t" in mdl_flags(mode)
+
+
+# Warm start (flag w, 2026-11-26): the first MDL_WARM share of the steps fit without the description length (as
+# "logit"), then the MDL term is added. From zero weights the MDL fit could drop a head's key rules: on v8 the same
+# rules of Bus:OutgoLane gave AP 0.221 in one run and 0.424 in another (soft_logit 0.436 / 0.439); with the rules
+# already weighted, tanh(|w| / RULE_TAU) is saturated for the strong ones and only the weak ones are dropped.
+MDL_WARM = 0.5
 
 
 # Temporal rules (2026-11-25, the user: the rules of one event at different times, e.g. Car:MovTow@1 +0.81,
@@ -1587,7 +1599,10 @@ def _soft_act(lits_f, body, gate):
 FIT_CELLS = 4e8             # rows x rules x literals of one head's soft fit (activations + gradients ~ 10 GB)
 
 
-def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2=1e-5, gate_reg=1e-4, temporal=None):
+FIT_STEPS = 500                 # Adam steps of a soft fit (--lab_fit_steps)
+
+
+def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=None, l2=1e-5, gate_reg=1e-4, temporal=None):
     """Soft AND and soft OR per head, fit on the weighted train sample (2026-11-22, the user: the AND within a
     rule and the OR between rules should be soft, not hard).
     Soft AND: a rule's activation a_r = prod_i (1 - g_ri (1 - x_i)); every gate g_ri starts at ~0.95 (the
@@ -1673,7 +1688,9 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
             params += [phi]
             b = float(base[h])
         opt = torch.optim.Adam(params, lr=0.1)
-        for _ in range(steps):
+        steps = steps or FIT_STEPS
+        warm_steps = int(MDL_WARM * steps) if "w" in mdl_flags(mode) else 0
+        for it in range(steps):
             opt.zero_grad()
             if tied:
                 theta = theta_p[pid]
@@ -1687,6 +1704,8 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                 loss = -(w * (y * p.log() + (1 - y) * (1 - p).log())).sum()
             if mode in SPARSE:
                 loss = loss + SPARSE[mode] * base_loss * (g.sum() / n_real + wt.abs().mean())
+            elif it < warm_steps:                                                  # warm start: as "logit"
+                loss = loss + gate_reg * (1 - g).masked_fill(pad, 0.0).sum() + l2 * (wt ** 2).sum()
             elif tied:
                 kept = torch.tanh(wt.abs() / RULE_TAU)                             # (R,) a member kept
                 norm = torch.zeros(len(local), device=device).index_add(0, gid, wt ** 2).add(1e-12).sqrt()
@@ -1704,6 +1723,11 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=500, l2
                     loss = loss + l2 * (wt ** 2).sum()
             loss.backward()
             opt.step()
+        if len(heads) <= 10 and logistic:
+            # the end of the fit, for a convergence check on a few heads (2026-11-26: the same rules of Bus:OutgoLane
+            # kept 796 rules at AP 0.221 in one run, 248 at 0.424 in another)
+            print(f"[Rule lab] fit {mode} head {h}: {len(idx)} rules, final loss {float(loss):.5f}, "
+                  f"{int((wt.detach().abs() >= DROP_WEIGHT).sum())} with |w| >= {DROP_WEIGHT}", flush=True)
         if tied:
             theta = theta_p[pid]
         gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).masked_fill(pinned, 1.0).cpu()
@@ -2552,6 +2576,7 @@ def main():
     parser.add_argument("--lab_beam", type=int, default=100, help="precise search: nodes per level")
     parser.add_argument("--lab_branch", type=int, default=10, help="precise search: children per node")
     parser.add_argument("--lab_max_rules", type=int, default=100, help="precise search: rules per head")
+    parser.add_argument("--lab_fit_steps", type=int, default=500, help="Adam steps of each soft fit")
     parser.add_argument("--lab_mdl_ref", type=float, default=200.0,
                         help="mdls_λ (--lab_mdl s0.1): λ x min(1, ref / train onsets of the head)")
     parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test", "valtest"),
@@ -2819,11 +2844,12 @@ def main():
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     # the size curve (MDL strengths); "s0.1": λ 0.1 scaled by the head's size (mode mdls_0.1)
     # "t0.1" / "ts0.1": over temporal rules (mdlt_0.1 / mdlts_0.1, `temporal_groups`)
-    prefix = {"ts": "mdlts_", "t": "mdlt_", "s": "mdls_"}
-    soft_modes += [next((v + x[len(k):] for k, v in prefix.items() if x.startswith(k)), f"mdl_{x}")
+    # letters before the number: s (scaled by head size), t (temporal rules), w (warm start), e.g. "ws0.1" -> mdlws_0.1
+    soft_modes += [f"mdl{re.match(r'[a-z]*', x).group(0)}_{x[len(re.match(r'[a-z]*', x).group(0)):]}"
                    for x in args.lab_mdl.split(",") if x]
-    global MDL_SIZE_REF
+    global MDL_SIZE_REF, FIT_STEPS
     MDL_SIZE_REF = args.lab_mdl_ref
+    FIT_STEPS = args.lab_fit_steps
     rule_sets, texts = {}, {}
     step(7, "per variant: finalize" + (", check filter" if args.lab_check == "True" else "")
          + (", merges" if args.lab_merge == "True" else "") + ", fits")

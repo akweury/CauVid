@@ -827,19 +827,36 @@ def _local_copy(path):
     if valid():
         return dst
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    lock = dst + ".lock"
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        start = _time.time()
-        while os.path.exists(lock) and _time.time() - start < 3600:
-            _time.sleep(5)
-        return dst if valid() else src
+    lock, tmp = dst + ".lock", dst + ".tmp"
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            # Another process copies: wait, with a message; a lock whose copy has not grown for STALE_S s is left
+            # over from a killed process (2026-11-26: the runs waited silently): removed, then this one copies.
+            print(f"[Data] waiting for the local copy of {os.path.basename(src)} by another process ({lock})",
+                  flush=True)
+            last, last_t = -1, _time.time()
+            while os.path.exists(lock):
+                _time.sleep(10)
+                size = os.path.getsize(tmp) if os.path.exists(tmp) else -1
+                if size != last:
+                    last, last_t = size, _time.time()
+                elif _time.time() - last_t > 120:
+                    print(f"[Data] stale lock {lock} (no progress for 120 s): removed", flush=True)
+                    for f in (lock, tmp):
+                        if os.path.exists(f):
+                            os.remove(f)
+                    break
+            if valid():
+                return dst
     try:
         t0 = _time.time()
-        shutil.copyfile(src, dst + ".tmp")
-        os.utime(dst + ".tmp", (st.st_atime, st.st_mtime))
-        os.replace(dst + ".tmp", dst)
+        print(f"[Data] copying {src} to the local disk ({st.st_size / 2 ** 30:.1f} GB)", flush=True)
+        shutil.copyfile(src, tmp)
+        os.utime(tmp, (st.st_atime, st.st_mtime))
+        os.replace(tmp, dst)
         print(f"[Data] local copy {dst} ({st.st_size / 2 ** 30:.1f} GB, {_time.time() - t0:.0f} s)", flush=True)
     finally:
         os.close(fd)
