@@ -133,6 +133,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.compare_clips"
     elif [[ "$arg" == "--rule_paper" ]]; then
         ENTRY_MODULE="src.exp_roadpp.rule_paper"
+    elif [[ "$arg" == "--former_probe" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.former_probe"
     elif [[ "$arg" == "--head_clips" ]]; then
         ENTRY_MODULE="src.exp_roadpp.head_clips"
     elif [[ "$arg" == "--turn_fail_clips" ]]; then

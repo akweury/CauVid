@@ -115,3 +115,16 @@ screen -dmS fitchk bash -c "cd ~/CauVid && for S in 500 2000; do ./run_roadpp_do
 screen -dmS fitchk bash -c "cd ~/CauVid && for S in 500 2000; do ./run_roadpp_docker.sh --gpu 6 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_mlp True --lab_fast True --lab_variants relaxed+exh_nn --lab_select False --lab_check True --lab_merge True --lab_exh_gain 1.5 --lab_mdl s0.1,ws0.1 --lab_fit_steps \$S --lab_eval_split valtest --lab_tag fit\$S --lab_heads Bus:OutgoLane 2>&1 | tee v8_fit\$S.log; done; exec bash"
 
 ./run_roadpp_docker.sh --gpu 6 --rule_paper -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --paper_rules "*_vt_p*.rules.pt" --paper_mlps 2048:0.2,2048:0 2>&1 | tee v8_paper.log
+
+
+./run_roadpp_docker.sh --gpu 5 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
+  --run_id 20261125-v8_lab --lab_mlp_only True --lab_former joint --num_epochs 2 \
+  --lab_heads Car:Brake,av:AV-Brake --lab_eval_split val 2>&1 | tee former_dbg.log
+
+
+for m in time:5 factor:6 joint:0; do
+  a=${m%%:*}; g=${m##*:}
+  screen -dmS former_$a bash -c "./run_roadpp_docker.sh --gpu $g --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing \
+    --shape_phases True --run_id 20261125-v8_lab --lab_mlp_only True --lab_former $a --lab_eval_split valtest \
+    2>&1 | tee former_$a.log; exec bash"
+done
