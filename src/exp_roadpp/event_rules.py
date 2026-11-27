@@ -33,7 +33,10 @@ def main():
     parser.add_argument("--ev_frame", type=int, required=True)
     parser.add_argument("--ev_head", type=str, required=True)
     parser.add_argument("--ev_rules", type=str, default="*_vt_p*", help="rule-lab result stem (rule_lab dir)")
-    parser.add_argument("--er_train", type=int, default=1500, help="train videos (random) for the rates")
+    parser.add_argument("--er_scan", type=str, default="False",
+                        help="False (default): only this event; the rules' own rates are their mining stats in the "
+                             "rule-lab json. True: also measure rates of rules / literal pairs on train + val rows")
+    parser.add_argument("--er_train", type=int, default=1500, help="--er_scan: train videos (random) for the rates")
     parser.add_argument("--er_min_hits", type=int, default=30, help="positive candidates: hit rows on train")
     parser.add_argument("--er_min_rows", type=int, default=300, help="negative candidates: rows on train")
     parser.add_argument("--er_neg_lift", type=float, default=0.5)
@@ -80,6 +83,11 @@ def main():
           f"true ({len(absent_only)} more only because the agent was not in view), {len(rules_ev)} of {len(sel)} "
           f"mined rules hold (full bodies)")
     K = len(cand)
+    stem = lab_dir / f"event_rules_{args.ev_video}_a{args.ev_agent}_f{args.ev_frame}_{args.ev_head.replace(':', '_')}"
+    if args.er_scan != "True":
+        single_event(args, lab_dir, stem, text, lits_ev, real, body, sc.gate[sel], weight, float(sc.bias[h]),
+                     LT, absent_only)
+        return
 
     # Rates on train and val rows.
     val_ids = list(training_data["val_videos"])[1::2]
@@ -168,8 +176,66 @@ def main():
                f"{c['hits_train']} / {c['rows_train']} | {c['hits_val']} / {c['rows_val']} |" for c in top]
     md += ["", f"Literals true only because the agent was not in view ({len(absent_only)}, not candidates): "
            + ", ".join(f"`{text(int(m))}`" for m in absent_only[:40]) + (" ..." if len(absent_only) > 40 else "")]
-    stem = lab_dir / f"event_rules_{args.ev_video}_a{args.ev_agent}_f{args.ev_frame}_{args.ev_head.replace(':', '_')}"
     utils_data.save_json(out, f"{stem}.json")
+    open(f"{stem}.md", "w").write("\n".join(md) + "\n")
+    print("\n".join(md))
+    print(f"\n[Event rules] {stem}.json / .md")
+
+
+def single_event(args, lab_dir, stem, text, lits_ev, real, body, gate, weight, bias, LT, absent_only):
+    """Only the event's row: every rule of the head that holds there, hard (full mined body) or soft (the fitted
+    gates, activation >= 0.5), with its own evidence from mining (rule-lab json: train precision, train onsets,
+    lift on the check videos) and its fitted weight / contribution; split into rules for (w > 0) and against
+    (w < 0) the onset."""
+    stats = {}
+    for f in sorted(glob.glob(str(lab_dir / f"{args.ev_rules}.json"))):
+        d = __import__("json").load(open(f))
+        if args.ev_head not in d["per_head"]:
+            continue
+        v = (d.get("selected") or {}).get(args.ev_head) or next(iter(d["rules"]))
+        for r in d["rules"][v]:
+            if r["head"] == args.ev_head:
+                stats[frozenset(r["literals"])] = r
+    soft = rule_lab._soft_act(lits_ev[None].float(), body, gate)[0]
+    hard = rule_lab._soft_act(lits_ev[None].float(), body, torch.ones_like(gate))[0]
+    rows, total = [], {"positive": 0.0, "negative": 0.0}
+    for r in torch.nonzero((hard > 0.5) | (soft >= 0.5)).flatten().tolist():
+        lits = [text(m) for m in body[r].tolist() if m < LT]
+        kept = [text(m) for m, g in zip(body[r].tolist(), gate[r].tolist()) if m < LT and g >= rule_lab.DROP_GATE]
+        st = stats.get(frozenset(lits), {})
+        # a literal of the rule that is true here only because the agent was not in view
+        art = [text(m) for m in body[r].tolist() if m < LT and bool(lits_ev[m]) and not bool(real[m])]
+        c = float(weight[r] * soft[r])
+        rows.append({"rule": " & ".join(lits), "kept_literals": " & ".join(kept), "holds_full_body": bool(hard[r] > 0.5),
+                     "activation": float(soft[r]), "weight": float(weight[r]), "contribution": c,
+                     "train_precision": st.get("precision"), "train_onsets": st.get("events"),
+                     "check_lift": st.get("check_lift"), "absent_artifact_literals": art})
+    for x in rows:
+        if abs(x["contribution"]) >= 0.0:
+            total["positive" if x["contribution"] > 0 else "negative"] += x["contribution"]
+    key = lambda x: -(x["train_precision"] or 0)
+    pos = sorted([x for x in rows if x["weight"] > 0], key=key)
+    neg = sorted([x for x in rows if x["weight"] < 0], key=key)
+    logit = bias + total["positive"] + total["negative"]
+    md = [f"# {args.ev_head} at {args.ev_video} agent {args.ev_agent} f{args.ev_frame} (this event only)", "",
+          f"rules that hold here: {len(rows)} (full mined body or fitted activation >= 0.5). Score of the fitted sum: "
+          f"bias {bias:+.2f} + for {total['positive']:+.2f} + against {total['negative']:+.2f} = logit {logit:+.2f}, "
+          f"P {1 / (1 + __import__('math').exp(-logit)):.3f}", "",
+          "precision / onsets: the rule's own train precision P(onset | rule) and distinct train onsets when mined; "
+          "check lift: its lift on the check videos. full: the whole mined body holds; act: the fitted (gated) "
+          "activation. absent: literals true only because the agent was not in view.", ""]
+    for title, lst in (("Rules FOR the onset (fitted w > 0)", pos), ("Rules AGAINST the onset (fitted w < 0)", neg)):
+        md += [f"## {title}: {len(lst)}", "",
+               "| rule (mined body) | precision | onsets | check lift | full | act | w | w x act | absent |",
+               "|---|---|---|---|---|---|---|---|---|"]
+        md += [f"| `{x['rule']}` | {x['train_precision'] if x['train_precision'] is None else round(x['train_precision'], 3)} "
+               f"| {x['train_onsets']} | {x['check_lift']} | {'yes' if x['holds_full_body'] else 'no'} | "
+               f"{x['activation']:.2f} | {x['weight']:+.2f} | {x['contribution']:+.2f} | "
+               f"{', '.join(x['absent_artifact_literals']) or '-'} |" for x in lst]
+        md.append("")
+    md += [f"Literals true only because the agent was not in view: {len(absent_only)}"]
+    utils_data.save_json({"video": args.ev_video, "agent": args.ev_agent, "frame": args.ev_frame, "head": args.ev_head,
+                          "bias": bias, "logit": logit, "for": pos, "against": neg}, f"{stem}.json")
     open(f"{stem}.md", "w").write("\n".join(md) + "\n")
     print("\n".join(md))
     print(f"\n[Event rules] {stem}.json / .md")

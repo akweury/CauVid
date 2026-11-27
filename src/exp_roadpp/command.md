@@ -144,3 +144,7 @@ screen -dmS fclips bash -c "./run_roadpp_docker.sh --gpu 5 --former_clips -- $V8
   ./run_roadpp_docker.sh --gpu 5 --event_rules -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
   --run_id 20261125-v8_lab --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun \
   2>&1 | tee event_rules_00473.log
+
+./run_roadpp_docker.sh --gpu 7 --event_rules -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
+  --run_id 20261125-v8_lab --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun \
+  2>&1 | tee event_rules_00473.log
