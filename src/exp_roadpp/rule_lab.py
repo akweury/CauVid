@@ -40,7 +40,8 @@ Scorers of a rule set, per head:
             literal missing still counts in part. The rules are combined by a logistic sum or a noisy-OR.
             The share of the literals relaxed (g < 0.5) is printed per variant.
 
-Evaluation: every at-risk row of the odd val videos, not a sample. The even ones are the m4 miner's val check.
+Evaluation: every at-risk row of the evaluation videos, not a sample. --lab_splits three (default since 2026-11-27):
+the test videos; every val video checks the rules and chooses. legacy: the odd val videos; the even ones check.
   - Label: the head switches on within clause_slots slots, as in mining.
   - MLP: its window of clause_slots x slot_size frames, on the same rows.
   - Per head: the AP of every (variant, scorer) and of the MLP, from score histograms.
@@ -2179,15 +2180,16 @@ def add_test_videos(training_data, cfg):
 
 
 def eval_videos(training_data, cfg, split):
-    """The evaluation videos of --lab_eval_split (val: the odd val videos; test; valtest: both); with --toy only the
-    toy videos (`step05.toy_settings`: the fewest giving each toy head its onsets)."""
+    """The evaluation videos of --lab_eval_split (test; legacy: val = the odd val videos, valtest = both); with --toy
+    only the toy test videos (`step05.toy_settings`: the fewest giving each toy head its onsets)."""
     val_ids = list(training_data["val_videos"])
     odd = val_ids[1::2]
     test = add_test_videos(training_data, cfg) if split in ("test", "valtest") else []
     toy = cfg.get("toy")
     if toy:
-        odd = step05.toy_videos(training_data, cfg, "val", odd, toy["onsets"][0]) if split != "test" else []
-        test = step05.toy_videos(training_data, cfg, "test", test, toy["onsets"][1]) if test else []
+        if split != "test":
+            raise ValueError("--toy evaluates on the test videos only (--lab_eval_split test)")
+        test = step05.toy_videos(training_data, cfg, "test", test, toy["onsets"])
     return {"val": odd, "test": test, "valtest": odd + test}[split]
 
 
@@ -2625,9 +2627,13 @@ def main():
     parser.add_argument("--lab_fit_steps", type=int, default=500, help="Adam steps of each soft fit")
     parser.add_argument("--lab_mdl_ref", type=float, default=200.0,
                         help="mdls_λ (--lab_mdl s0.1): λ x min(1, ref / train onsets of the head)")
-    parser.add_argument("--lab_eval_split", type=str, default="val", choices=("val", "test", "valtest"),
-                        help="evaluate on the odd val videos (default) or on every test video (SUMO _unseen: the test "
-                             "maps, untouched by the rule check and the selection); mining and selection are the same")
+    parser.add_argument("--lab_splits", type=str, default="three", choices=("three", "legacy"),
+                        help="three (2026-11-27, default): train mines / fits, ALL val videos check the rules and choose "
+                             "per head, test only evaluates (--lab_eval_split test). legacy: the even val videos check "
+                             "and choose (0,4,.. / 2,6,..), the odd val videos (and the test videos) evaluate")
+    parser.add_argument("--lab_eval_split", type=str, default="test", choices=("val", "test", "valtest"),
+                        help="the evaluation videos: test (default; with --lab_splits three the only choice); legacy: "
+                             "val = the odd val videos, valtest = odd val + test")
     parser.add_argument("--lab_head_part", type=str, default="",
                         help="i/k: only every k-th learned head from i (0-based), for parallel runs; use with --lab_tag")
     parser.add_argument("--lab_tag", type=str, default="", help="suffix of the result file (parallel runs on head batches)")
@@ -2854,9 +2860,15 @@ def main():
     # The check videos: the even val videos; with the per-head selection only every other of them (0, 4, 8, ..): the
     # selection reads the rest (2, 6, 10, ..), never the videos the rules were filtered or confirmed on (2026-11-24:
     # the exh rules had to hold on the check videos, so they looked better there and the selection preferred them).
-    check_step = 4 if args.lab_select == "True" and args.lab_select_split == "True" else 2
-    check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), check_step))), only), derived,
-                        model.num_literals, device, desc="Derived literals (check)")
+    # --lab_splits three (2026-11-27, the user: train / val / test; val split in halves left too few onsets): every
+    # val video checks the rules and chooses, the test videos evaluate.
+    three = args.lab_splits == "three"
+    if three and args.lab_eval_split != "test":
+        raise ValueError("--lab_splits three: val checks the rules and chooses, so --lab_eval_split must be test")
+    check_step = 1 if three else (4 if args.lab_select == "True" and args.lab_select_split == "True" else 2)
+    check_rows = val if three else mine_sweep.subset(val, set(range(0, len(val_ids), check_step)))
+    check = extend_rows(compact_rows(check_rows, only), derived, model.num_literals, device,
+                        desc="Derived literals (check)")
     del val
     # val: the odd val videos; valtest (2026-11-25, more eval onsets): odd val + all test videos; --toy: a few of them
     eval_ids = eval_videos(training_data, cfg, args.lab_eval_split)
@@ -3022,7 +3034,7 @@ def main():
               f"{n_d} with a derived literal)")
 
     # 3. Every at-risk row of the odd val videos.
-    step(8, "evaluation on the " + ("test videos" if args.lab_eval_split == "test" else "odd val videos"))
+    step(8, f"evaluation on {len(eval_ids)} " + ("test videos" if args.lab_eval_split == "test" else "odd val videos"))
     stats = {"heads": list(heads)}
     hist = evaluate(model, mlp, training_data, eval_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived, stats)
     # eval onsets of every learned head (not only --lab_heads): which heads need more data (v8)
@@ -3032,8 +3044,8 @@ def main():
           f"{EVAL_MIN_ONSETS}; fewer: " + ", ".join(f"{n} {k}" for k, n in few_all))
     choice = {}
     if args.lab_select == "True" and len(rule_sets) > 1:
-        # Per-head variant selection on the check videos (even val), applied to the evaluation videos (odd val).
-        check_ids = val_ids[2::4] if check_step == 4 else val_ids[0::2]   # the selection videos
+        # Per-head variant selection on val (three: all val videos; legacy: 2, 6, 10, ..), applied to the evaluation.
+        check_ids = val_ids if three else (val_ids[2::4] if check_step == 4 else val_ids[0::2])  # selection videos
         hist_c = evaluate(model, None, training_data, check_ids, rule_sets, head_mask, possible, cfg, k_mlp, derived)
         comps = {v: set(parse_variant(v)[0]) for v in variants}
         default = next((v for v in variants if "exh" in comps[v]), variants[0])
@@ -3102,7 +3114,7 @@ def main():
     rx = "-".join(k for k in args.lab_root_exclude.split(",") if k in layout)
     fb = "_fb" + "-".join(re.sub(r"[^A-Za-z0-9]", "", x) for x in args.lab_forbid.split(",") if x) if args.lab_forbid else ""
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
-    fb += {"test": "_test", "valtest": "_vt"}.get(args.lab_eval_split, "")
+    fb += {"test": "_test", "valtest": "_vt"}.get(args.lab_eval_split, "") + ("_3s" if args.lab_splits == "three" else "")
     fb += f"_{args.lab_tag}" if args.lab_tag else ""
     fb += cfg["toy"]["tag"] if cfg.get("toy") else ""
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""

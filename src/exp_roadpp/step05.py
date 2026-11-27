@@ -916,28 +916,28 @@ def subsample_train_videos(data, cfg):
 # Toy evaluation (2026-11-27, the user: a small but still useful real dataset for quick tests). A first version
 # subsampled the train videos too: on 300 train videos the AtomFormer fell to the rules' level (6 Jun heads, mean
 # AP 0.17 vs 0.17; full data 0.46 vs 0.24) and the gap to study vanished. So the training data stays whole (same
-# rules, same models, same caches) and only the evaluation is small: --toy V,E keeps, per split, the fewest videos
-# (shuffled by --toy_seed) that give every toy head >= V onsets on the odd val videos and >= E on the test videos,
-# and only the toy heads are evaluated (`rule_lab.toy_eval`). Default heads (the user: the 2 with the most onsets
+# rules, same models, same caches) and only the evaluation is small: --toy E keeps the fewest test videos (shuffled
+# by --toy_seed) that give every toy head >= E onsets, and only the toy heads are evaluated (`rule_lab.eval_videos`;
+# val, which checks the rules and chooses, stays whole). Default heads (the user: the 2 with the most onsets
 # among the largest rules vs Transformer gaps, sumo_maps_v8): Car:Jun (1840 eval onsets, gap +0.19), MedVeh:Jun
 # (958, +0.22).
 TOY_HEADS = "Car:Jun,MedVeh:Jun"
 
 
 def toy_settings(input_data):
-    """{"onsets": (V, E), "heads": [names], "seed", "tag"} of --toy, or None."""
+    """{"onsets": E, "heads": [names], "seed", "tag"} of --toy, or None."""
     spec = str(input_data.get("toy") or "")
     if not spec:
         return None
-    quota = tuple(int(x) for x in spec.split(","))
-    if len(quota) != 2:
-        raise ValueError(f"--toy needs val,test onsets per head, got {spec!r}")
+    if not spec.isdigit():
+        raise ValueError(f"--toy needs the test onsets per head (one number), got {spec!r}")
+    quota = int(spec)
     heads = [h for h in (input_data.get("toy_heads") or TOY_HEADS).split(",") if h]
     seed = int(input_data.get("toy_seed") or 0)
     import hashlib
     hid = hashlib.md5(",".join(heads).encode()).hexdigest()[:6]
     return {"onsets": quota, "heads": heads, "seed": seed,
-            "tag": f"_toy{quota[0]}-{quota[1]}h{len(heads)}{hid}" + (f"s{seed}" if seed else "")}
+            "tag": f"_toy{quota}h{len(heads)}{hid}" + (f"s{seed}" if seed else "")}
 
 
 def toy_pick(videos, ids, heads, quota, seed, num_atoms, min_off_frames, desc):

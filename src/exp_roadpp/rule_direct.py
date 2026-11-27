@@ -159,7 +159,8 @@ def main():
     S, w = model.slot_size, int(cfg.get("clause_slots", 1))
     ev_vid, ev_agent, ev_onset = args.rd_event.split(":")
     ev_key = (ev_vid, int(ev_agent), int(ev_onset))
-    splits = {"val": sorted(training_data["val_videos"]), "test": sorted(rule_lab.add_test_videos(training_data, cfg))}
+    # test: every test video, or with --toy the toy test videos (`rule_lab.eval_videos`)
+    splits = {"val": sorted(training_data["val_videos"]), "test": sorted(rule_lab.eval_videos(training_data, cfg, "test"))}
     if args.rd_videos:
         splits = {k: v[:args.rd_videos] + ([ev_vid] if ev_vid in v[args.rd_videos:] else [])
                   for k, v in splits.items()}
