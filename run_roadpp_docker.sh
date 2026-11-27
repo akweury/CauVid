@@ -141,6 +141,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.event_whatif"
     elif [[ "$arg" == "--event_rules" ]]; then
         ENTRY_MODULE="src.exp_roadpp.event_rules"
+    elif [[ "$arg" == "--rule_direct" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.rule_direct"
     elif [[ "$arg" == "--head_clips" ]]; then
         ENTRY_MODULE="src.exp_roadpp.head_clips"
     elif [[ "$arg" == "--turn_fail_clips" ]]; then
