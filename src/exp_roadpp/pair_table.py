@@ -109,7 +109,9 @@ def split_tables(d, idx, device):
     F = d["F"][:, idx.cpu()].to(device)
     y, ev = d["y"].to(device), d["ev"].to(device)
     Fh = F[y]
-    return {"F": F, "Fh": Fh, "y": y, "ev": ev, "E": d["E"], "total": len(F), "total_hit": int(y.sum()),
+    ev_row = torch.full((len(F),), -1, dtype=torch.long, device=device)
+    ev_row[y] = ev
+    return {"F": F, "Fh": Fh, "y": y, "ev": ev, "ev_row": ev_row, "E": d["E"], "total": len(F), "total_hit": int(y.sum()),
             "n1": F.sum(0).float(), "h1": Fh.sum(0).float(), "o1": onsets1(Fh, ev, d["E"]),
             "N2": cross(F, F), "H2": cross(Fh, Fh), "o2": onsets_lr(Fh, Fh, ev, d["E"])}
 
@@ -269,6 +271,92 @@ def coverage_report(cov, score, E, V_hit):
     return {"rules_total": n, "max_onsets": best, "checks": checks, "curve": [point(k) for k in ks]}
 
 
+def rule_mask(t, r):
+    """(rows,) where the rule r (column indices; >= C: the always-true padding) holds."""
+    m = torch.ones(len(t["F"]), dtype=torch.bool, device=t["F"].device)
+    for c in r:
+        if c < t["F"].shape[1]:
+            m &= t["F"][:, c]
+    return m
+
+
+def summary(t, m):
+    """Rows, hit rows, onsets, precision and onset recall of the rows m."""
+    hit = m & t["y"]
+    ons = int((torch.bincount(t["ev_row"][hit], minlength=t["E"]) > 0).sum()) if t["E"] else 0
+    rows, hits = int(m.sum()), int(hit.sum())
+    return {"rows": rows, "hit_rows": hits, "negatives": rows - hits, "onsets": ons,
+            "precision": hits / max(rows, 1), "onset_recall": ons / max(t["E"], 1)}
+
+
+def split_counts(t, m):
+    """Per literal c over the rows m: rows and hit rows with c, and the onsets of m lost if the rows with c are
+    removed (every hit row of the onset in m has c)."""
+    Fm, ym = t["F"][m], t["y"][m]
+    Fh, evm = Fm[ym], t["ev_row"][m][ym]
+    tot = torch.bincount(evm, minlength=t["E"]).float()
+    cnt = torch.zeros((t["E"], Fm.shape[1]), device=Fm.device).index_add_(0, evm, Fh.float())
+    lost = ((cnt == tot[:, None]) & (tot > 0)[:, None]).sum(0)
+    return Fm.sum(0).float(), Fh.sum(0).float(), lost
+
+
+def exceptions(tr, va, r, max_steps, min_share, ratio, val_ratio):
+    """The exception literals of the rule r (2026-11-27, the user): literals that hold where the body holds but the
+    head does not. Greedy: at each step the literal c that removes the largest share of r's train negatives (rows
+    where r holds and the head not) from the rows left, such that
+      train: it removes >= min_share of r's negatives and P(head | rows left & c) <= ratio x P(r);
+      val:   the same purity (<= ratio x val P(r)) and it removes >= val_ratio x its train share of the negatives;
+    then r := r & !c. Returns the start and every step (train / val after the step)."""
+    m, vm = rule_mask(tr, r), rule_mask(va, r)
+    s0, v0 = summary(tr, m), summary(va, vm)
+    P, vP, N0, vN0 = s0["precision"], v0["precision"], max(s0["negatives"], 1), max(v0["negatives"], 1)
+    banned = torch.zeros(tr["F"].shape[1], dtype=torch.bool, device=m.device)
+    banned[[c for c in r if c < len(banned)]] = True
+    steps, fail_val = [], None
+    for _ in range(max_steps):
+        n, h, lost = split_counts(tr, m)
+        vn, vh, vlost = split_counts(va, vm)
+        share, vshare = (n - h) / N0, (vn - vh) / vN0
+        ok_tr = ~banned & (share >= min_share) & (h / n.clamp(min=1) <= ratio * P)
+        ok = ok_tr & (vn > 0) & (vh / vn.clamp(min=1) <= ratio * vP) & (vshare >= val_ratio * share)
+        if fail_val is None:
+            fail_val = int((ok_tr & ~ok).sum())
+        if not ok.any():
+            break
+        c = int(torch.argmax(torch.where(ok, share, torch.full_like(share, -1))))
+        banned[c] = True
+        step = {"literal": c, "share": float(share[c]), "val_share": float(vshare[c]),
+                "precision_with": float(h[c] / n[c].clamp(min=1)), "val_precision_with": float(vh[c] / vn[c].clamp(min=1)),
+                "onsets_lost": int(lost[c]), "val_onsets_lost": int(vlost[c]), "candidates": int(ok.sum())}
+        m &= ~tr["F"][:, c]
+        vm &= ~va["F"][:, c]
+        step["train"], step["val"] = summary(tr, m), summary(va, vm)
+        steps.append(step)
+    return {"start": {"train": s0, "val": v0}, "steps": steps, "first_step_failed_val": fail_val}
+
+
+def choose_sizes(ex):
+    """Sizes k of the exception set (the first k greedy exceptions; 0: none), each judged on val:
+      rises       the largest k with the val precision rising at every step up to k (the search principle);
+      best_pxr    the k with the most val precision x val onset recall;
+      gain90      the smallest k reaching 90% of the largest val precision gain;
+      onsets90    the largest k keeping >= 90% of the rule's val onsets.
+    Returns {name: {"k", "val_precision", "val_onset_recall", "train_precision", "train_onset_recall"}}."""
+    pts = [ex["start"]] + [{"train": st["train"], "val": st["val"]} for st in ex["steps"]]
+    vp = [x["val"]["precision"] for x in pts]
+    vr = [x["val"]["onset_recall"] for x in pts]
+    k_rise = 0
+    while k_rise + 1 < len(pts) and vp[k_rise + 1] > vp[k_rise]:
+        k_rise += 1
+    k_pxr = max(range(len(pts)), key=lambda k: vp[k] * vr[k])
+    top = max(vp)
+    k_gain = next(k for k in range(len(pts)) if vp[k] >= vp[0] + 0.9 * (top - vp[0]) - 1e-12)
+    k_ons = max(k for k in range(len(pts)) if vr[k] >= 0.9 * vr[0] - 1e-12)
+    at = lambda k: {"k": k, "val_precision": vp[k], "val_onset_recall": vr[k],
+                    "train_precision": pts[k]["train"]["precision"], "train_onset_recall": pts[k]["train"]["onset_recall"]}
+    return {"rises": at(k_rise), "best_pxr": at(k_pxr), "gain90": at(k_gain), "onsets90": at(k_ons)}
+
+
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--pt_head", type=str, default="Car:Jun")
@@ -281,6 +369,14 @@ def main():
     parser.add_argument("--pt_block", type=int, default=2000, help="seed pairs per block of length 3")
     parser.add_argument("--pt_cover_sort", choices=["train", "val"], default="train",
                         help="coverage: the rules sorted by their train (or val) precision x recall")
+    parser.add_argument("--pt_max_len", type=int, default=3, choices=[2, 3], help="2: no length-3 rules")
+    parser.add_argument("--pt_except", type=int, default=20, help="exception sets of this many high-recall rules")
+    parser.add_argument("--pt_except_recall", type=float, default=0.2, help="high recall: train row recall >= this")
+    parser.add_argument("--pt_except_steps", type=int, default=300, help="exception literals per rule (at most; the search runs until no literal passes)")
+    parser.add_argument("--pt_except_share", type=float, default=0.002,
+                        help="an exception removes >= this share of the rule's train negatives")
+    parser.add_argument("--pt_except_ratio", type=float, default=0.25,
+                        help="an exception: P(head | rule & exception) <= this x P(rule), on train and on val")
     parser.add_argument("--pt_top", type=int, default=30)
     parser.add_argument("--pt_json", type=int, default=20000, help="rules per length in the json (most precise)")
     parser.add_argument("--pt_show", type=str, default="Car:MovTow(own)@1 & !Car:IncomLane(own)@1",
@@ -365,7 +461,11 @@ def main():
     tops = {"precision": Top(score_p, max(args.pt_json, args.pt_top)),
             "pr": Top(lambda x: score_p(x) * x[:, 4], args.pt_top), "onsets": Top(lambda x: x[:, 5], args.pt_top)}
     print(f"[Pair table] length 3: {n_seeds} seed pairs x {n_c} literals, blocks of {args.pt_block}")
-    n3, b3, kept3 = length3(tr, va, sa, sb, sid, args.pt_min_onsets, args.pt_val_ratio, args.pt_block, tops)
+    if args.pt_max_len >= 3:
+        n3, b3, kept3 = length3(tr, va, sa, sb, sid, args.pt_min_onsets, args.pt_val_ratio, args.pt_block, tops)
+    else:
+        n3, b3 = {"tested": 0, "better_train": 0, "kept": 0, "extend": 0}, [[0, 0] for _ in EDGES[:-1]]
+        kept3 = torch.zeros((0, 7))
 
     # ---- Coverage of val: every kept rule of each length (length 1: the seeds) sorted by precision x recall;
     # how many rules (in that order) cover the most val onsets
@@ -387,6 +487,40 @@ def main():
         c = cover[name]
         print(f"[Pair table] coverage {name}: {c['rules_total']} rules cover {c['max_onsets']} of {va['E']} val "
               f"onsets; " + ", ".join(f"{x['frac_of_max']:g}: {x['rules']} rules" for x in c["checks"]))
+
+    # ---- Exception sets of the high-recall rules (every kept rule of each length, length 1: the seeds; train row
+    # recall >= --pt_except_recall; the most train PxR first; rules on the same rows counted once)
+    pool = torch.cat([sets["length 1"][0], sets["length 2"][0], sets["length 3"][0]])
+    cnt = torch.cat([torch.stack([tr["n1"], tr["h1"], va["n1"], va["h1"]], 1),
+                     torch.stack([tr["N2"][ia, ib], tr["H2"][ia, ib], va["N2"][ia, ib], va["H2"][ia, ib]], 1),
+                     kept3[:, 3:7].to(device)])
+    rec = cnt[:, 1] / T_hit
+    hi = torch.nonzero(rec >= args.pt_except_recall).flatten()
+    hi = hi[torch.argsort((cnt[hi, 1] / cnt[hi, 0].clamp(min=1) * rec[hi]), descending=True)]
+    seen, picked = set(), []
+    for i in hi.tolist():
+        key = tuple(int(v) for v in cnt[i].tolist())
+        if key not in seen:
+            seen.add(key)
+            picked.append(i)
+        if len(picked) >= args.pt_except:
+            break
+    rule_text = lambda r: " & ".join(ctext(c) for c in r if c < n_c)
+    excepts = []
+    print(f"[Pair table] exceptions: {len(hi)} rules with train recall >= {args.pt_except_recall}, "
+          f"{len(picked)} distinct ones used")
+    for i in picked:
+        r = [int(c) for c in pool[i].tolist()]
+        ex = exceptions(tr, va, r, args.pt_except_steps, args.pt_except_share, args.pt_except_ratio, args.pt_val_ratio)
+        ex["rule"] = rule_text(r)
+        ex["sizes"] = choose_sizes(ex)
+        for st in ex["steps"]:
+            st["unless"] = ctext(st["literal"])
+        excepts.append(ex)
+        a, z = ex["start"], (ex["steps"][-1] if ex["steps"] else ex["start"])
+        print(f"[Pair table]   {ex['rule']}: {len(ex['steps'])} exceptions; val P {a['val']['precision']:.3f} -> "
+              f"{z['val']['precision']:.3f}, val onset recall {a['val']['onset_recall']:.3f} -> "
+              f"{z['val']['onset_recall']:.3f}; sizes " + ", ".join(f"{n} {v['k']}" for n, v in ex["sizes"].items()))
 
     # ---- Reports
     stats = {"literals_allowed": len(cols), "literals_true": int(present.sum()), "drop_onsets": drop_table,
@@ -500,6 +634,54 @@ def main():
         md += ["| fraction " + cov_hdr[0], "|---" + cov_hdr[1]]
         md += [f"| {x['frac_of_max']:g} " + cov_row(x) for x in c["checks"] if "onsets" in x]
         md += ["", "Curve:", ""] + cov_hdr + [cov_row(x) for x in c["curve"]] + [""]
+    md += ["", f"## Exception sets of the high-recall rules (train recall >= {args.pt_except_recall})", "",
+           f"Exception E of rule R: holds where R holds and the head not. Greedy: the E removing the largest share of "
+           f"R's train negatives, with P(head | R & E) <= {args.pt_except_ratio:g} x P(R) on train and val, >= "
+           f"{args.pt_except_share:g} of R's train negatives and a val share >= {args.pt_val_ratio:g} x the train "
+           f"share; then R := R & !E. Share: of R's original negatives. Lost: onsets of R removed by E.", "",
+           "| rule | exceptions | train P | train onset R | val P | val onset R | val negatives removed |", sep(7)]
+    for ex in excepts:
+        a, z = ex["start"], (ex["steps"][-1] if ex["steps"] else ex["start"])
+        md.append(f"| {ex['rule']} | {len(ex['steps'])} | {a['train']['precision']:.3f} -> {z['train']['precision']:.3f}"
+                  f" | {a['train']['onset_recall']:.3f} -> {z['train']['onset_recall']:.3f} | "
+                  f"{a['val']['precision']:.3f} -> {z['val']['precision']:.3f} | {a['val']['onset_recall']:.3f} -> "
+                  f"{z['val']['onset_recall']:.3f} | "
+                  f"{1 - z['val']['negatives'] / max(a['val']['negatives'], 1):.3f} |")
+    cell = lambda v: f"{v['k']} ({v['val_precision']:.3f} / {v['val_onset_recall']:.3f})"
+    md += ["", "### Exception set sizes (k exceptions; in brackets val P / val onset recall after them)", "",
+           "rises: val P rises at every step up to k; best_pxr: the most val P x onset recall; gain90: 90% of the "
+           "largest val P gain; onsets90: the most exceptions keeping >= 90% of the val onsets. all: until no "
+           "literal passes.", "",
+           "| rule | start (val P / onset R) | all | rises | best_pxr | gain90 | onsets90 |", sep(7)]
+    for ex in excepts:
+        a, z = ex["start"]["val"], ex["sizes"]
+        md.append(f"| {ex['rule']} | {a['precision']:.3f} / {a['onset_recall']:.3f} | {len(ex['steps'])} | "
+                  + " | ".join(cell(z[n]) for n in ("rises", "best_pxr", "gain90", "onsets90")) + " |")
+    if excepts:
+        import statistics
+        for n in ("rises", "best_pxr", "gain90", "onsets90"):
+            ks = [ex["sizes"][n]["k"] for ex in excepts]
+            md.append(f"- {n}: k median {statistics.median(ks):g}, max {max(ks)}")
+        alls = [len(ex["steps"]) for ex in excepts]
+        md.append(f"- all: k median {statistics.median(alls):g}, max {max(alls)}")
+    for ex in excepts:
+        a = ex["start"]
+        md += ["", f"### {ex['rule']}", "",
+               f"Start: train P {a['train']['precision']:.3f}, {a['train']['onsets']} onsets, {a['train']['negatives']} "
+               f"negative rows; val P {a['val']['precision']:.3f}, {a['val']['onsets']} onsets, "
+               f"{a['val']['negatives']} negative rows. First step: {ex['first_step_failed_val']} train candidates "
+               f"failed on val.", "",
+               "| step | unless | share train | share val | P with train | P with val | lost train | lost val | "
+               "after: train P | train onsets | val P | val onsets |", sep(12)]
+        shown_k = set(range(1, args.pt_top + 1)) | {v["k"] for v in ex["sizes"].values()} | \
+            {k for k in (50, 100, 200, 300, 500) if k <= len(ex["steps"])} | {len(ex["steps"])}
+        for k, st in enumerate(ex["steps"], 1):
+            if k not in shown_k:
+                continue
+            md.append(f"| {k} | {st['unless']} | {st['share']:.3f} | {st['val_share']:.3f} | "
+                      f"{st['precision_with']:.3f} | {st['val_precision_with']:.3f} | {st['onsets_lost']} | "
+                      f"{st['val_onsets_lost']} | {st['train']['precision']:.3f} | {st['train']['onsets']} | "
+                      f"{st['val']['precision']:.3f} | {st['val']['onsets']} |")
     md += ["", "## Pairs asked for (--pt_show)", ""] + [f"- {x}" for x in shown]
     stem = lab_dir / f"pairs_{args.pt_head.replace(':', '_')}"
     open(f"{stem}.md", "w").write("\n".join(md) + "\n")
@@ -508,7 +690,7 @@ def main():
                           "val": {"rows": va["total"], "hit_rows": va["total_hit"], "onsets": va["E"]},
                           "stats": stats, "bucket_labels": labels, "buckets_pairs": b2, "buckets_triples": b3,
                           "singles": singles, "pairs": pairs["precision"], "triples": trip["precision"],
-                          "coverage": cover, "shown": shown}, f"{stem}.json")
+                          "coverage": cover, "exceptions": excepts, "shown": shown}, f"{stem}.json")
     print("\n".join(md[:45]))
     print(f"\n[Pair table] {stem}.md / .json")
 
