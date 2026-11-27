@@ -137,3 +137,10 @@ V8="--exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-
 
 screen -dmS fclips bash -c "./run_roadpp_docker.sh --gpu 5 --former_clips -- $V8 --lab_former factor \
   2>&1 | tee former_clips.log; exec bash"
+
+  ./run_roadpp_docker.sh --gpu 5 --event_whatif -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
+  --run_id 20261125-v8_lab --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun --ev_span 10 \
+  2>&1 | tee whatif_00473.log
+  ./run_roadpp_docker.sh --gpu 5 --event_rules -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
+  --run_id 20261125-v8_lab --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun \
+  2>&1 | tee event_rules_00473.log
