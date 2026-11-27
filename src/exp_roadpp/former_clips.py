@@ -76,7 +76,12 @@ def explain(hr, text, h, lits, act, top=3):
     holding = [fmt(r, False) for r in order if act[r] >= 0.5 and hr.weight[r] > rule_lab.DROP_WEIGHT][:top]
     near = [r for r in r_h.tolist() if act[r] < 0.5 and hr.weight[r] > rule_lab.DROP_WEIGHT]
     near.sort(key=lambda r: -float(hr.weight[r] * act[r]))
-    return {"holding": holding, "near_miss": [fmt(r, True) for r in near[:top]]}
+    # The score's decomposition: logit = bias + positive rules + negative rules (w x activation summed).
+    c = (hr.weight[r_h] * act[r_h])
+    against = [fmt(r, False) for r in order[::-1] if float(hr.weight[r] * act[r]) <= -0.05][:top]
+    return {"holding": holding, "near_miss": [fmt(r, True) for r in near[:top]], "against": against,
+            "logit": {"bias": round(float(hr.bias[h]), 2), "positive": round(float(c[c > 0].sum()), 2),
+                      "negative": round(float(c[c < 0].sum()), 2)}}
 
 
 def own_atoms(inputs_row, model, names, slot=0):
@@ -273,6 +278,11 @@ def plot_timeline(curve, onset, thr, e, head, group, path):
     lines = [f"at f{e.get('t')} (Transformer max {e['former']:.2f}; rules max {e['rules']:.2f}):"]
     lines += [f"  holds  w {r['weight']:+.2f}: {r['rule']}" for r in ex.get("holding", [])]
     lines += [f"  near   w {r['weight']:+.2f} act {r['activation']:.2f}: {r['rule']}" for r in ex.get("near_miss", [])]
+    lines += [f"  against w {r['weight']:+.2f} act {r['activation']:.2f}: {r['rule']}" for r in ex.get("against", [])]
+    lg = ex.get("logit")
+    if lg:
+        lines.append(f"rules' logit = bias {lg['bias']:+.2f} + positive rules {lg['positive']:+.2f} "
+                     f"+ negative rules {lg['negative']:+.2f} = {lg['bias'] + lg['positive'] + lg['negative']:+.2f}")
     own = e.get("own") or []
     lines.append("own atoms (last s): " + ", ".join(own[:18]) + (" ..." if len(own) > 18 else ""))
     fig.text(0.01, -0.02, "\n".join(l[:170] for l in lines), fontsize=7, va="top", family="monospace")

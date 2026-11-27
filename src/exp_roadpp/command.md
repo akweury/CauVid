@@ -128,3 +128,12 @@ for m in time:5 factor:6 joint:0; do
     --shape_phases True --run_id 20261125-v8_lab --lab_mlp_only True --lab_former $a --lab_eval_split valtest \
     2>&1 | tee former_$a.log; exec bash"
 done
+
+
+V8="--exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --num_epochs 100"
+./run_roadpp_docker.sh --gpu 5 --former_clips -- $V8 --lab_former factor \
+  --clip_heads Car:Jun --clip_videos 100 --num 2 --controls 0 2>&1 | tee former_clips_dbg.log
+
+
+screen -dmS fclips bash -c "./run_roadpp_docker.sh --gpu 5 --former_clips -- $V8 --lab_former factor \
+  2>&1 | tee former_clips.log; exec bash"
