@@ -18,6 +18,9 @@ Ablations without attention (2026-11-27: where does the Transformers' lead over 
 two hidden layers (4 d, d) with LayerNorm on the agent's own tokens:
   "slotmlp" every slot through the same embedding (shared across slots, + a slot embedding), then concatenated;
   "deepmlp" the slots' raw tokens concatenated (no sharing), as the OnsetMLP but deeper.
+  "mlp1"    the OnsetMLP's structure (raw tokens concatenated, ONE hidden layer of 4 d units, LayerNorm + GELU)
+            with the AtomFormer's training (lr, weight decay, dropout, epochs): deepmlp vs mlp1 is the second layer,
+            mlp1 vs the OnsetMLP the training recipe.
 Read-out: the mean of the agent's slot tokens -> hazard logits (W, A), the same windows, targets and loss as the
 OnsetMLP and the TemporalRuleNet (`window_probs`, `loss`).
 
@@ -32,8 +35,8 @@ import torch.nn.functional as F
 
 from src.exp_roadpp.cauvid import TemporalRuleNet, memory_bins
 
-ATTENTIONS = ("time", "factor", "joint", "slotmlp", "deepmlp")
-MLP_MODES = ("slotmlp", "deepmlp")
+ATTENTIONS = ("time", "factor", "joint", "slotmlp", "deepmlp", "mlp1")
+MLP_MODES = ("slotmlp", "deepmlp", "mlp1")
 
 
 class Block(torch.nn.Module):
@@ -93,17 +96,21 @@ class AtomFormer(torch.nn.Module):
         self.embed = torch.nn.Linear(d_in, d_model)
         if attention in MLP_MODES:
             width = J * (d_model if attention == "slotmlp" else d_in)
-            self.mlp = torch.nn.Sequential(torch.nn.Linear(width, 4 * d_model), torch.nn.LayerNorm(4 * d_model),
-                                           torch.nn.GELU(), torch.nn.Dropout(dropout),
-                                           torch.nn.Linear(4 * d_model, d_model), torch.nn.GELU(),
-                                           torch.nn.Dropout(dropout))
+            if attention == "mlp1":
+                self.mlp = torch.nn.Sequential(torch.nn.Linear(width, 4 * d_model), torch.nn.LayerNorm(4 * d_model),
+                                               torch.nn.GELU(), torch.nn.Dropout(dropout))
+            else:
+                self.mlp = torch.nn.Sequential(torch.nn.Linear(width, 4 * d_model), torch.nn.LayerNorm(4 * d_model),
+                                               torch.nn.GELU(), torch.nn.Dropout(dropout),
+                                               torch.nn.Linear(4 * d_model, d_model), torch.nn.GELU(),
+                                               torch.nn.Dropout(dropout))
             num_layers = 0
         self.slot_embed = torch.nn.Parameter(0.02 * torch.randn(self.num_memory_slots, d_model))
         self.blocks = torch.nn.ModuleList(Block(d_model, num_heads, dropout) for _ in range(num_layers))
         # Agent-aware attention bias per block and head: 0 same agent, 1 other agent, 2 + k role-k partner.
         self.rel_bias = torch.nn.Parameter(torch.zeros(num_layers, num_heads, 2 + len(self.roles)))
         self.norm = torch.nn.LayerNorm(d_model)
-        self.head = torch.nn.Linear(d_model, len(self.windows) * num_atoms)
+        self.head = torch.nn.Linear(4 * d_model if attention == "mlp1" else d_model, len(self.windows) * num_atoms)
         torch.nn.init.constant_(self.head.bias, -6.0)          # onsets are rare (as the MLP / rule net)
 
     # ---------------- rows ----------------
@@ -164,6 +171,8 @@ class AtomFormer(torch.nn.Module):
         k = scene[..., M:].bool().view(Fc, Np, S, J, A).permute(0, 1, 3, 2, 4).reshape(Fc, Np, J, S * A)
         known = k.all(dim=-1, keepdim=True).float()             # the slot is known (absent atoms are known)
         tok = torch.cat([x, known], dim=-1)
+        if self.attention == "mlp1":
+            return self.head(self.mlp(tok.reshape(Fc, Np, -1))).view(Fc, Np, len(self.windows), A)
         if self.attention == "deepmlp":
             h = self.norm(self.mlp(tok.reshape(Fc, Np, -1)))
             return self.head(h).view(Fc, Np, len(self.windows), A)

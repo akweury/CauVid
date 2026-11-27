@@ -2631,7 +2631,7 @@ def main():
                         help="the reference of the AP differences (default mlp), e.g. relaxed+exh_nn/mdls_0.1")
     parser.add_argument("--lab_mlp_only", type=str, default="False",
                         help="only evaluate the OnsetMLP (e.g. a stronger one, --mlp_hidden_size) on the eval videos")
-    parser.add_argument("--lab_former", type=str, default="", choices=("", "time", "factor", "joint", "slotmlp", "deepmlp"),
+    parser.add_argument("--lab_former", type=str, default="", choices=("", *atom_former.ATTENTIONS),
                         help="the reference model is an AtomFormer (`baselines/atom_former.py`) with this attention "
                              "instead of the OnsetMLP (trained if missing); with --lab_mlp_only True: only it")
     parser.add_argument("--former_dim", type=int, default=128, help="AtomFormer width")
