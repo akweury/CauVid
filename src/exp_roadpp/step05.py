@@ -913,93 +913,72 @@ def subsample_train_videos(data, cfg):
     return data
 
 
-# Toy dataset (2026-11-27, the user: a small but still useful real dataset for quick tests; the number of videos and
-# of heads set by the user; the heads where the rules trail the Transformer most). --toy T,V,E keeps T train, V val
-# and (`rule_lab.add_test_videos`) E test videos, drawn by --toy_seed among the videos with an onset of a toy head,
-# and learns only the toy heads (target_heads). The head types are those of the full data (counted before). Every
-# model, rule and row-sample file gets the toy tag (base_tag), so the full-data files stay untouched.
-# Default heads: the largest AP gap of the rules (selected/mdls_0.1) to AtomFormer factor on sumo_maps_v8 (valtest):
-# Bus:Jun +0.247, LarVeh:Jun +0.236, MedVeh:Jun +0.221, Mobike:Jun +0.203, Car:Jun +0.189, av:AV-TurRht +0.178.
-TOY_HEADS = "Bus:Jun,LarVeh:Jun,MedVeh:Jun,Mobike:Jun,Car:Jun,av:AV-TurRht"
+# Toy evaluation (2026-11-27, the user: a small but still useful real dataset for quick tests). A first version
+# subsampled the train videos too: on 300 train videos the AtomFormer fell to the rules' level (6 Jun heads, mean
+# AP 0.17 vs 0.17; full data 0.46 vs 0.24) and the gap to study vanished. So the training data stays whole (same
+# rules, same models, same caches) and only the evaluation is small: --toy V,E keeps, per split, the fewest videos
+# (shuffled by --toy_seed) that give every toy head >= V onsets on the odd val videos and >= E on the test videos,
+# and only the toy heads are evaluated (`rule_lab.toy_eval`). Default heads (the user: the 2 with the most onsets
+# among the largest rules vs Transformer gaps, sumo_maps_v8): Car:Jun (1840 eval onsets, gap +0.19), MedVeh:Jun
+# (958, +0.22).
+TOY_HEADS = "Car:Jun,MedVeh:Jun"
 
 
 def toy_settings(input_data):
-    """{"counts": (T, V, E), "heads": [names], "seed", "tag"} of --toy, or None."""
+    """{"onsets": (V, E), "heads": [names], "seed", "tag"} of --toy, or None."""
     spec = str(input_data.get("toy") or "")
     if not spec:
         return None
-    counts = tuple(int(x) for x in spec.split(","))
-    if len(counts) != 3:
-        raise ValueError(f"--toy needs train,val,test video counts, got {spec!r}")
+    quota = tuple(int(x) for x in spec.split(","))
+    if len(quota) != 2:
+        raise ValueError(f"--toy needs val,test onsets per head, got {spec!r}")
     heads = [h for h in (input_data.get("toy_heads") or TOY_HEADS).split(",") if h]
     seed = int(input_data.get("toy_seed") or 0)
     import hashlib
     hid = hashlib.md5(",".join(heads).encode()).hexdigest()[:6]
-    return {"counts": counts, "heads": heads, "seed": seed,
-            "tag": f"_toy{counts[0]}-{counts[1]}-{counts[2]}h{len(heads)}{hid}" + (f"s{seed}" if seed else "")}
+    return {"onsets": quota, "heads": heads, "seed": seed,
+            "tag": f"_toy{quota[0]}-{quota[1]}h{len(heads)}{hid}" + (f"s{seed}" if seed else "")}
 
 
-def toy_pick(videos, ids, heads, n, seed, num_atoms, min_off_frames, desc):
-    """n of the video ids with >= 1 onset of the heads (shuffled by seed; scanned until n are found)."""
+def toy_pick(videos, ids, heads, quota, seed, num_atoms, min_off_frames, desc):
+    """The video ids (shuffled by seed) taken while some head has < quota onsets, a video only if it has an onset
+    of such a head. Returns (sorted ids, onsets per head)."""
     import random
     order = sorted(ids)
     random.Random(seed).shuffle(order)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     hd = torch.tensor(heads, device=dev)
+    got = torch.zeros(len(heads), dtype=torch.long, device=dev)
     out = []
     for vid in tqdm(order, desc=f"Toy videos ({desc})", mininterval=30):
+        if bool((got >= quota).all()):
+            break
         X = _video_from_cells(videos[vid], num_atoms, dev)
         onsets = atom_onsets(X, min_off_frames)
         onsets[0] = False
         onsets[1:] &= X[:-1].any(dim=2, keepdim=True)
-        if bool(onsets[..., hd].any()):
+        n = onsets[..., hd].sum(dim=(0, 1))
+        if bool(((n > 0) & (got < quota)).any()):
             out.append(vid)
-            if len(out) >= n:
-                break
-    if len(out) < n:
-        print(f"[Toy]\t only {len(out)} {desc} videos with an onset of the toy heads (asked {n})")
-    return sorted(out)
+            got += n
+    if bool((got < quota).any()):
+        print(f"[Toy]\t {desc}: only {got.tolist()} onsets of the toy heads in all {len(order)} videos (asked {quota})")
+    return sorted(out), got.tolist()
 
 
-def toy_videos(data, cfg, split, ids, n):
+def toy_videos(data, cfg, split, ids, quota):
     """The toy videos of a split, cached next to the training data (the scan reads the videos once)."""
     toy = cfg["toy"]
     cache = f"{cfg['training_data_file']}.toy_{split}{toy['tag']}.json"
     if os.path.exists(cache) and is_fresh(cache, cfg["training_data_file"]):
-        return utils_data.load_json(cache)
+        return utils_data.load_json(cache)["videos"]
     names = [_atom_name(s) for s in load_vocabulary(cfg)]
     heads = [names.index(h) for h in toy["heads"]]
-    picked = toy_pick(data["videos"], ids, heads, n, toy["seed"] + {"train": 0, "val": 1, "test": 2}[split],
-                      data["num_atoms"], data["min_off_frames"], split)
-    utils_data.save_json(picked, cache)
+    picked, got = toy_pick(data["videos"], ids, heads, quota, toy["seed"] + {"val": 1, "test": 2}[split],
+                           data["num_atoms"], data["min_off_frames"], split)
+    utils_data.save_json({"videos": picked, "onsets": dict(zip(toy["heads"], got))}, cache)
+    print(f"[Toy]\t {split}: {len(picked)} of {len(ids)} videos, onsets {dict(zip(toy['heads'], got))}")
     return picked
-
-
-def apply_toy(data, cfg):
-    """--toy: the toy train / val videos and only the toy heads learned (`toy_settings`)."""
-    toy = cfg.get("toy")
-    if not toy:
-        return data
-    names = [_atom_name(s) for s in load_vocabulary(cfg)]
-    missing = [h for h in toy["heads"] if h not in names]
-    if missing:
-        raise ValueError(f"--toy_heads not in the vocabulary: {missing}")
-    mask = torch.zeros_like(data["target_heads"])
-    mask[[names.index(h) for h in toy["heads"]]] = True
-    if (mask & ~data["target_heads"]).any():
-        print(f"[Toy]\t heads not learned in the full data (noise / input) left out: "
-              f"{[h for h in toy['heads'] if not data['target_heads'][names.index(h)]]}")
-    data["target_heads"] = data["target_heads"] & mask
-    T, V, _E = toy["counts"]
-    data["train_videos"] = toy_videos(data, cfg, "train", data["train_videos"], T)
-    data["val_videos"] = toy_videos(data, cfg, "val", data["val_videos"], V)
-    keep = set(data["train_videos"]) | set(data["val_videos"])
-    for key in ("videos", "frames", "positive_frames"):
-        if key in data and isinstance(data[key], dict):
-            data[key] = {k: v for k, v in data[key].items() if k in keep}
-    print(f"[Toy]\t {len(data['train_videos'])} train / {len(data['val_videos'])} val videos, "
-          f"{int(data['target_heads'].sum())} heads ({', '.join(toy['heads'])}), tag {toy['tag']}")
-    return data
 
 
 def load_training_data(cfg):
@@ -1019,7 +998,6 @@ def load_training_data(cfg):
     types = data["event_types"]["types"]
     noise, inputs = types == EVENT_TYPES.index("noise"), types == EVENT_TYPES.index("input")
     data["target_heads"] = ~inputs & (~noise if cfg["exclude_noise_heads"] else torch.ones_like(noise))
-    apply_toy(data, cfg)
     data["pos_weight_scale"] = head_pos_weight_scale(data["event_types"], cfg)
     print(f"[Heads]\t {int(data['target_heads'].sum())} of {data['num_atoms']} heads are learned"
           + (f" ({int(noise.sum())} noise heads, < {cfg['noise_below']} train + val onsets, left out)"
@@ -2278,8 +2256,6 @@ def get_cfg(input_data):
         base_tag += f"_tf{train_fraction:g}s{train_subset_seed}"
     if train_seed:
         base_tag += f"_seed{train_seed}"
-    if toy:
-        base_tag += toy["tag"]
     if exclude_noise_heads:
         base_tag += f"_tn{noise_below}"
     if roles:

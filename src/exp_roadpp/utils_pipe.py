@@ -113,10 +113,10 @@ def get_parser():
                              "same steps per epoch), default 1")
     parser.add_argument("--train_subset_seed", type=int, default=0, help="Seed of the --train_fraction subset")
     parser.add_argument("--toy", type=str, default="",
-                        help="Toy dataset for quick tests (step05.apply_toy): train,val,test video counts, e.g. "
-                             "300,100,100 (real videos with onsets of the toy heads); empty: the full data")
+                        help="Toy evaluation for quick tests (step05.toy_settings): onsets per toy head on the odd val "
+                             "and the test videos, e.g. 100,100 (the fewest videos giving them); training unchanged")
     parser.add_argument("--toy_heads", type=str, default="",
-                        help="--toy: the learned heads (default step05.TOY_HEADS, the largest rules vs Transformer gap)")
+                        help="--toy: the evaluated heads (default step05.TOY_HEADS: Car:Jun,MedVeh:Jun)")
     parser.add_argument("--toy_seed", type=int, default=0, help="--toy: seed of the video choice")
     parser.add_argument("--num_free_rules", type=int, default=None,
                         help="Step 05: unseeded rules (default 128; with --anchor_source none 128 + the causal seeds)")

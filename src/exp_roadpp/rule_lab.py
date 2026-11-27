@@ -2167,11 +2167,6 @@ def add_test_videos(training_data, cfg):
                     grid_tag=step05.grid_tag(cfg))
         step05.save_data(data, cache)
     test_ids = sorted(data["videos"])
-    if cfg.get("toy"):
-        test_ids = step05.toy_videos({**data, "num_atoms": training_data["num_atoms"],
-                                      "min_off_frames": cfg["min_off_frames"]}, cfg, "test", test_ids,
-                                     cfg["toy"]["counts"][2])
-        data = {**data, **{k: {v: data[k][v] for v in test_ids} for k in ("videos", "frames", "positive_frames")}}
     shared = set(test_ids) & (set(training_data["train_videos"]) | set(training_data["val_videos"]))
     if shared:
         raise ValueError(f"{len(shared)} test videos are also train / val videos, e.g. {sorted(shared)[:3]}")
@@ -2181,6 +2176,19 @@ def add_test_videos(training_data, cfg):
         training_data[key].update(data[key])
     print(f"[Rule lab] evaluation on the test split: {len(test_ids)} videos ({cache})")
     return test_ids
+
+
+def eval_videos(training_data, cfg, split):
+    """The evaluation videos of --lab_eval_split (val: the odd val videos; test; valtest: both); with --toy only the
+    toy videos (`step05.toy_settings`: the fewest giving each toy head its onsets)."""
+    val_ids = list(training_data["val_videos"])
+    odd = val_ids[1::2]
+    test = add_test_videos(training_data, cfg) if split in ("test", "valtest") else []
+    toy = cfg.get("toy")
+    if toy:
+        odd = step05.toy_videos(training_data, cfg, "val", odd, toy["onsets"][0]) if split != "test" else []
+        test = step05.toy_videos(training_data, cfg, "test", test, toy["onsets"][1]) if test else []
+    return {"val": odd, "test": test, "valtest": odd + test}[split]
 
 
 def ensure_mlp(training_data, cfg):
@@ -2724,6 +2732,8 @@ def main():
     head_mask = training_data["target_heads"].to(device)
     heads = torch.nonzero(head_mask).flatten().tolist()
     cfg["lab_all_heads"] = list(heads)                     # "tr": its sources may lie outside --lab_heads
+    if cfg.get("toy") and not args.lab_heads:
+        args.lab_heads = ",".join(cfg["toy"]["heads"])     # --toy: only the toy heads
     if args.lab_heads:
         # Only these heads (names "Car:IncomLane" or actions "IncomLane"): a quick test. The others keep their
         # base rate in the evaluation and are not mined.
@@ -2744,12 +2754,7 @@ def main():
     if args.lab_mlp_only == "True":
         # Only the OnsetMLP on the evaluation videos (2026-11-26: a stronger MLP, --mlp_hidden_size / --mlp_dropout,
         # against the rules of an earlier run on the same videos), no mining.
-        val_ids = list(training_data["val_videos"])
-        eval_ids = val_ids[1::2]
-        if args.lab_eval_split == "test":
-            eval_ids = add_test_videos(training_data, cfg)
-        elif args.lab_eval_split == "valtest":
-            eval_ids = val_ids[1::2] + add_test_videos(training_data, cfg)
+        eval_ids = eval_videos(training_data, cfg, args.lab_eval_split)
         step(8, f"OnsetMLP only on {len(eval_ids)} {args.lab_eval_split} videos")
         stats = {"heads": list(heads)}
         hist = evaluate(model, mlp, training_data, eval_ids, {}, head_mask, possible, cfg, k_mlp, derived, stats)
@@ -2759,7 +2764,7 @@ def main():
                                "pos_rows": int(hist["mlp"][0][h].sum()),
                                **({"ci": ci.get(names[h], {})} if ci else {})} for h in heads}
         mtag = os.path.basename(str(cfg["mlp_model_file"])).replace(".pt", "")
-        path = out_dir / f"mlp_only_{mtag}_{args.lab_eval_split}.json"
+        path = out_dir / f"mlp_only_{mtag}_{args.lab_eval_split}{cfg['toy']['tag'] if cfg.get('toy') else ''}.json"
         utils_data.save_json({"mlp_model_file": str(cfg["mlp_model_file"]), "eval_videos": len(eval_ids),
                               "per_head": per_head}, path)
         print(f"[Rule lab] --lab_mlp_only: {len(heads)} heads, macro AP "
@@ -2853,11 +2858,8 @@ def main():
     check = extend_rows(compact_rows(mine_sweep.subset(val, set(range(0, len(val_ids), check_step))), only), derived,
                         model.num_literals, device, desc="Derived literals (check)")
     del val
-    eval_ids = val_ids[1::2]
-    if args.lab_eval_split == "test":
-        eval_ids = add_test_videos(training_data, cfg)
-    elif args.lab_eval_split == "valtest":                 # more eval onsets (2026-11-25): odd val + all test videos
-        eval_ids = val_ids[1::2] + add_test_videos(training_data, cfg)
+    # val: the odd val videos; valtest (2026-11-25, more eval onsets): odd val + all test videos; --toy: a few of them
+    eval_ids = eval_videos(training_data, cfg, args.lab_eval_split)
 
     # 1. Rule sets on the train sample, each miner once per literal set.
     step(5, f"mining ({args.lab_variants})")
@@ -3102,6 +3104,7 @@ def main():
     fb += ("_cv" if args.lab_check == "True" else "") + ("_mg" if args.lab_merge == "True" else "")
     fb += {"test": "_test", "valtest": "_vt"}.get(args.lab_eval_split, "")
     fb += f"_{args.lab_tag}" if args.lab_tag else ""
+    fb += cfg["toy"]["tag"] if cfg.get("toy") else ""
     fb += "_nomir" if args.lab_tr_mirror != "True" and any({"tr", "trp"} & set(parse_variant(v)[0]) for v in variants) else ""
     path = out_dir / f"rule_lab_{tag}{cfg.get('target_tag', '')}_{'-'.join(variants)}{'_rx' + rx if rx else ''}{fb}.json"
     utils_data.save_json({"settings": {k: getattr(args, k) for k in vars(args) if k.startswith("lab_")},
