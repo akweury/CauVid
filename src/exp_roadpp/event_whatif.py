@@ -8,7 +8,11 @@ agent, target frame t):
   absent->u   the slots where the agent held no atom (it was not in view; own and role scopes) are unknown, and
               every unknown base literal (positive or negated) gets the value u (--ev_unknown, default 0 and 1);
               derived literals are recomputed from them.
-Per setting: P vs the rules' threshold and the logit = bias + positive rules + negative rules; at the target
+Scorings of the same fitted rules (no refit; 2026-11-27, the user: a rule that does not hold must give 0):
+  soft        as fit, a_r = prod (1 - g (1 - x)): a rule with a false literal still gives prod (1 - g) of its weight;
+  hard_kept   a_r = the AND of the literals with gate >= --ev_gate_cut (0 / 1), the others dropped;
+  hard_full   a_r = the AND of the full mined body (every gate 1).
+Per setting and scoring: P vs the rules' threshold and the logit = bias + positive rules + negative rules; at the target
 frame the rules changing most and the largest contributions. Rules: the run's rule-lab .rules.pt files.
 
     ./run_roadpp_docker.sh --gpu 3 --event_whatif -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \\
@@ -57,6 +61,7 @@ def main():
     parser.add_argument("--ev_thr", type=float, default=0.403, help="the rules' threshold (former_clips: 2% FPR)")
     parser.add_argument("--ev_rules", type=str, default="*_vt_p*", help="rule-lab result stem (rule_lab dir)")
     parser.add_argument("--ev_top", type=int, default=8)
+    parser.add_argument("--ev_gate_cut", type=float, default=0.5, help="hard_kept: literals with gate >= this kept")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id
@@ -77,6 +82,7 @@ def main():
     body, gate, weight, bias = sc.body[sel], sc.gate[sel], sc.weight[sel], float(sc.bias[h])
     pad = model.num_literals + derived.size                       # the always-true padding literal (index L)
     # settings: (name, u, absent_unknown); the first is the reference of the changes
+    gates = {"soft": gate, "hard_kept": (gate >= args.ev_gate_cut).float(), "hard_full": torch.ones_like(gate)}
     us = [("trained", 0.0, False)] + [(f"absent->{float(u):g}", float(u), True) for u in args.ev_unknown.split(",")]
 
     def rule_str(r):
@@ -97,9 +103,10 @@ def main():
             first = int(rows["first"][i, h])
             inputs = rows["inputs"][i:i + 1]
             res, acts = {}, {}
-            for u, uval, ab in us:
+            for (u0, uval, ab), (sg, gt) in [(x, y) for x in us for y in gates.items()]:
+                u = u0 if sg == "soft" else f"{u0}/{sg}"
                 lits, unknown = literal_bits(model, derived, inputs, uval, ab)
-                a = rule_lab._soft_act(lits, body, gate)[0]
+                a = rule_lab._soft_act(lits, body, gt)[0]
                 c = weight * a
                 z = bias + float(c.sum())
                 res[u] = {"p": float(torch.sigmoid(torch.tensor(z))), "logit": z, "positive": float(c[c > 0].sum()),
@@ -108,7 +115,7 @@ def main():
             n_unknown = int((unknown[0] > 0.5).sum())
             print(f"\n t={t} (onset in {first} frames; {n_unknown} base literals unknown when absent = unknown)")
             for u, r in res.items():
-                print(f"   {u:<11} P {r['p']:.3f} {'>=' if r['p'] >= args.ev_thr else '< '} thr {args.ev_thr:.3f}   "
+                print(f"   {u:<22} P {r['p']:.3f} {'>=' if r['p'] >= args.ev_thr else '< '} thr {args.ev_thr:.3f}   "
                       f"logit = bias {bias:+.2f} + pos {r['positive']:+.2f} + neg {r['negative']:+.2f} = {r['logit']:+.2f}"
                       f"   ({r['active_rules']} rules active)")
             fr = {"t": t, "onset_in": first, "unknown_literals": n_unknown, "scores": res}
@@ -131,9 +138,10 @@ def main():
                     fr[f"changes_{u}"] = [{"delta": float(d[r]), "w": float(weight[r]),
                                            "act": [float(acts[ref][r]), float(acts[u][r])],
                                            "rule": rule_str(r)} for r in order]
-                for u, _uv, _ab in us:
+                for u in [x[0] for x in us] + [f"trained/{sg}" for sg in gates if sg != "soft"]:
                     c = weight * acts[u]
-                    top = torch.argsort(c, descending=True)[:4].tolist() + torch.argsort(c)[:4].tolist()
+                    k = args.ev_top if "/" in u else 4
+                    top = torch.argsort(c, descending=True)[:k].tolist() + torch.argsort(c)[:k].tolist()
                     print(f"   largest contributions, {u}:")
                     for r in top:
                         if abs(float(c[r])) >= 0.05:

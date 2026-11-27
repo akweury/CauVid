@@ -148,3 +148,10 @@ screen -dmS fclips bash -c "./run_roadpp_docker.sh --gpu 5 --former_clips -- $V8
 ./run_roadpp_docker.sh --gpu 7 --event_rules -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \
   --run_id 20261125-v8_lab --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun \
   2>&1 | tee event_rules_00473.log
+
+  ./run_roadpp_docker.sh --gpu 3 --rule_lab -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --lab_mlp False --lab_fast True --lab_variants relaxed+exh_nn --lab_soft logit --lab_mdl s0.1,hs0.1 --lab_fit_steps 2000 --lab_select False --lab_select_scorer mdlhs_0.1 --lab_check True --lab_merge True --lab_eval_split valtest --lab_tag jun_hard --lab_heads Car:Jun 2>&1 | tee v8_jun_hard.log
+
+
+./run_roadpp_docker.sh --gpu 3 --event_rules -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --ev_rules "*_vt_jun_hard" --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun 2>&1 | tee v8_jun_hard_event.log 
+
+./run_roadpp_docker.sh --gpu 3 --event_whatif -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True --run_id 20261125-v8_lab --ev_rules "*_vt_jun_hard" --ev_video sumo_00473 --ev_agent 19 --ev_frame 57 --ev_head Car:Jun --ev_span 10 2>&1 | tee v8_jun_hard_whatif.log
