@@ -2167,6 +2167,11 @@ def add_test_videos(training_data, cfg):
                     grid_tag=step05.grid_tag(cfg))
         step05.save_data(data, cache)
     test_ids = sorted(data["videos"])
+    if cfg.get("toy"):
+        test_ids = step05.toy_videos({**data, "num_atoms": training_data["num_atoms"],
+                                      "min_off_frames": cfg["min_off_frames"]}, cfg, "test", test_ids,
+                                     cfg["toy"]["counts"][2])
+        data = {**data, **{k: {v: data[k][v] for v in test_ids} for k in ("videos", "frames", "positive_frames")}}
     shared = set(test_ids) & (set(training_data["train_videos"]) | set(training_data["val_videos"]))
     if shared:
         raise ValueError(f"{len(shared)} test videos are also train / val videos, e.g. {sorted(shared)[:3]}")
