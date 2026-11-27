@@ -1,79 +1,79 @@
 """Length-1, -2 and -3 rules of one head by tables (2026-11-27, the user's search principle).
 
-Principle (the user): a literal is added to a rule if the precision rises, by any amount (no x1.5 gain); the recall
-falling is expected. No literal may be missed: every combination is tested. The longer rules follow from tables:
+Principle (the user): a literal is added to a rule if the precision rises, by any amount (no x1.5 gain), on train
+AND on val (val precision is the final one); the recall falling is expected. No literal may be missed: every
+combination is tested, from tables of the length-1 results:
   rows(a & b) = (F^T F)[a, b], hit rows(a & b) = (F_hit^T F_hit)[a, b]   (F: the rows x literals 0 / 1 matrix),
-  rows(a & b & c) = (P^T F)[ab, c] with P the rows x seed-pairs matrix F_a & F_b (a second pass over the rows).
+  rows(a & b & c) = (P^T F)[ab, c] with P the rows x seed-pairs matrix F_a & F_b.
+The literal bits of every row are read once and kept (train and val); the seeds go through in blocks.
 
 Rows: every at-risk row of the head (`step05_mine._head_rows`, no sample) of --pt_train_videos train videos and
 --pt_val_videos val videos; a hit row has the onset within clause_slots slots; onsets: distinct (video, agent,
 onset frame) among the hit rows. Literals: the rule net's literals the miner may use (`input_mask`, not the head
 itself; as the main model's "_nn" variants: no negated "other" literals, the shape atoms in the newest slot only).
-Metrics: precision, recall (hit rows / all hit rows), precision x recall, onsets; on train and val.
-  length 1  every literal; a candidate if it has >= --pt_min_onsets train onsets;
-  length 2  every pair of candidates; kept if (a) one of its literals is of the head's own agent ("(own)"),
-            (b) its train precision is above both literals' and (c) it has >= --pt_min_onsets train onsets.
-            A kept pair is extended (a seed of length 3) only if its val precision >= --pt_val_ratio (0.5) x its
-            train precision (2026-11-27, the user);
-  length 3  every seed x every candidate; kept if its train precision is above every sub-rule's (the 3 pairs and
-            3 literals) and it has >= --pt_min_onsets train onsets ((a) holds by the seed). "extend": the same
-            val test (for a later length 4).
-"Better on val": also above every sub-rule on val.
+Metrics: precision P, recall R (hit rows / all hit rows), P x R, onsets; on train and val.
+  length 1  every literal; reported: how many remain if the literals with <= k train onsets are dropped (k = 0..5);
+            a seed (candidate) if it has >= --pt_min_onsets1 (2) train onsets. Literals true on exactly the same
+            train and val rows are merged (one column, "(= ...)" lists the others).
+  length 2  every pair of seeds; kept if (a) one of its literals is of the head's own agent ("(own)"),
+            (b) its precision is above both literals' on train and on val, (c) >= --pt_min_onsets (5) train onsets.
+            A kept pair is extended (a seed of length 3) only if val P >= --pt_val_ratio (0.5) x train P;
+  length 3  every seed pair x every seed literal; kept if its precision is above every sub-rule's (the 3 pairs
+            and 3 literals) on train and on val and it has >= --pt_min_onsets train onsets ((a) holds by the
+            seed). "extend": the same val ratio test (for a later length 4).
 
     ./run_roadpp_docker.sh --gpu 3 --pair_table -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \\
         --run_id 20261125-v8_lab --pt_head Car:Jun --pt_train_videos 1000 --pt_val_videos 500
 Writes <output_dir>/rule_lab/pairs_<head>.md / .json.
 """
+import math
+
 import torch
 
 from src.exp_roadpp import config, rule_lab, step05, step05_mine, utils_data, utils_pipe
 from src.exp_roadpp.rule_direct import head_rows
 
-MM = 256                # rows per bf16 product: counts <= 256 are exact in bf16, summed in float32
+# Rows per half-precision product. Every partial sum is a count <= MM, exact in float16 (11 bits) up to 2048,
+# so the result is exact whatever the reduction order; summed in float32.
+MM = 2048
+
+
+def _dt(device):
+    return torch.float16 if torch.device(device).type == "cuda" else torch.float32
 
 
 def cross(Lm, Rm, out=None):
-    """(Lm^T Rm) of two (rows, K) / (rows, C) bool matrices, exact: bf16 products of MM rows, summed in float32."""
+    """(Lm^T Rm) of two (rows, K) / (rows, C) bool matrices, exact."""
     out = torch.zeros((Lm.shape[1], Rm.shape[1]), device=Lm.device) if out is None else out
+    dt = _dt(Lm.device)
     for i in range(0, len(Lm), MM):
-        out += (Lm[i:i + MM].to(torch.bfloat16).T @ Rm[i:i + MM].to(torch.bfloat16)).float()
+        out += (Lm[i:i + MM].to(dt).T @ Rm[i:i + MM].to(dt)).float()
     return out
 
 
-def tables(gen, model, cols, device, desc, keep_hits=True):
-    """One pass over the rows: n1 / h1 (C,) rows / hit rows per literal, N2 / H2 (C, C) per pair, the hit rows'
-    literal bits (on the CPU) and their event index, the total rows and hit rows."""
-    C = len(cols)
-    n1, h1 = torch.zeros(C, device=device), torch.zeros(C, device=device)
-    N2, H2 = torch.zeros((C, C), device=device), torch.zeros((C, C), device=device)
-    hits, events, ev_ids = [], [], {}
-    total, total_hit = 0, 0
+def cross_pairs(F, pa, pb):
+    """(K, C) rows where the pair k (columns pa[k], pb[k]) and the column c hold, without the (rows, K) matrix."""
+    out = torch.zeros((len(pa), F.shape[1]), device=F.device)
+    dt = _dt(F.device)
+    for i in range(0, len(F), MM):
+        f = F[i:i + MM]
+        out += ((f[:, pa] & f[:, pb]).to(dt).T @ f.to(dt)).float()
+    return out
+
+
+def collect(gen, model, cols):
+    """One pass: the literal bits (rows, C) of every row (on the CPU), the hit flags and the hit rows' event index."""
+    Fs, ys, events, ev_ids = [], [], [], {}
     with torch.no_grad():
         for vid, inp, y, rk, first in gen:
-            F = model.literal_values(inp)[:, cols] > 0.5                          # (B, C)
-            n1 += F.sum(0)
-            h1 += F[y].sum(0)
-            cross(F, F, N2)
-            cross(F[y], F[y], H2)
-            total += len(F)
-            total_hit += int(y.sum())
-            if keep_hits and y.any():
-                hits.append(F[y].cpu())
-                for i in torch.nonzero(y).flatten().tolist():
-                    events.append(ev_ids.setdefault((vid, int(rk[i, 1]), int(rk[i, 0]) + int(first[i])), len(ev_ids)))
-    return {"n1": n1, "h1": h1, "N2": N2, "H2": H2, "total": total, "total_hit": total_hit,
-            "hits": torch.cat(hits) if hits else torch.zeros((0, C), dtype=torch.bool),
-            "events": torch.tensor(events, dtype=torch.long), "num_events": len(ev_ids)}
-
-
-def triple_counts(gen, model, cols, pa, pb, device):
-    """A second pass: (K, C) rows where the seed pair k (literals pa[k], pb[k]) and the literal c hold."""
-    N3 = torch.zeros((len(pa), len(cols)), device=device)
-    with torch.no_grad():
-        for _vid, inp, _y, _rk, _first in gen:
-            F = model.literal_values(inp)[:, cols] > 0.5
-            cross(F[:, pa] & F[:, pb], F, N3)
-    return N3
+            Fs.append((model.literal_values(inp)[:, cols] > 0.5).cpu())
+            ys.append(y.cpu())
+            for i in torch.nonzero(y).flatten().tolist():
+                events.append(ev_ids.setdefault((vid, int(rk[i, 1]), int(rk[i, 0]) + int(first[i])), len(ev_ids)))
+    C = len(cols)
+    return {"F": torch.cat(Fs) if Fs else torch.zeros((0, C), dtype=torch.bool),
+            "y": torch.cat(ys) if ys else torch.zeros(0, dtype=torch.bool),
+            "ev": torch.tensor(events, dtype=torch.long), "E": len(ev_ids)}
 
 
 def onsets_lr(Lh, Rh, ev, E, budget=2e8):
@@ -85,42 +85,188 @@ def onsets_lr(Lh, Rh, ev, E, budget=2e8):
     order = torch.argsort(ev)
     Lh, Rh, ev = Lh[order], Rh[order], ev[order]
     starts = torch.searchsorted(ev, torch.arange(E + 1, device=ev.device)).tolist()
-    batch = max(1, int(budget // (K * C)))
+    batch = max(1, int(budget // max(K * C, 1)))
+    dt = torch.bfloat16 if Lh.device.type == "cuda" else torch.float32     # only "> 0" is used
     for e0 in range(0, E, batch):
         e1 = min(E, e0 + batch)
         n = max(starts[e + 1] - starts[e] for e in range(e0, e1))
-        XL = torch.zeros((e1 - e0, n, K), dtype=torch.bfloat16, device=Lh.device)
-        XR = torch.zeros((e1 - e0, n, C), dtype=torch.bfloat16, device=Lh.device)
+        XL = torch.zeros((e1 - e0, n, K), dtype=dt, device=Lh.device)
+        XR = torch.zeros((e1 - e0, n, C), dtype=dt, device=Lh.device)
         for k, e in enumerate(range(e0, e1)):
-            XL[k, :starts[e + 1] - starts[e]] = Lh[starts[e]:starts[e + 1]].to(torch.bfloat16)
-            XR[k, :starts[e + 1] - starts[e]] = Rh[starts[e]:starts[e + 1]].to(torch.bfloat16)
+            XL[k, :starts[e + 1] - starts[e]] = Lh[starts[e]:starts[e + 1]].to(dt)
+            XR[k, :starts[e + 1] - starts[e]] = Rh[starts[e]:starts[e + 1]].to(dt)
         out += ((XL.transpose(1, 2) @ XR).float() > 0).sum(0).float()
     return out
 
 
-def onsets(t, device, pairs=True):
-    """Distinct onsets per literal (C,) and per pair (C, C): an onset counts if one of its hit rows holds them."""
-    Fh, ev, E = t["hits"].to(device), t["events"].to(device), t["num_events"]
-    C = Fh.shape[1]
-    o1 = (torch.zeros((E, C), device=device).index_add_(0, ev, Fh.float()) > 0).sum(0).float()
-    return o1, (onsets_lr(Fh, Fh, ev, E) if pairs else None)
+def onsets1(Fh, ev, E):
+    """(C,) distinct onsets per column."""
+    return (torch.zeros((E, Fh.shape[1]), device=Fh.device).index_add_(0, ev, Fh.float()) > 0).sum(0).float()
 
 
-def triples(t, N3, pa, pb, device):
-    """Hit rows (K, C) and onsets (K, C) of the seed pairs x literals, from the stored hit rows."""
-    Fh, ev = t["hits"].to(device), t["events"].to(device)
-    P = Fh[:, pa] & Fh[:, pb]
-    return {"N3": N3, "H3": cross(P, Fh), "o3": onsets_lr(P, Fh, ev, t["num_events"])}
+def split_tables(d, idx, device):
+    """Length 1 / 2 counts of the columns idx of one split, plus its rows on the device for length 3."""
+    F = d["F"][:, idx.cpu()].to(device)
+    y, ev = d["y"].to(device), d["ev"].to(device)
+    Fh = F[y]
+    return {"F": F, "Fh": Fh, "y": y, "ev": ev, "E": d["E"], "total": len(F), "total_hit": int(y.sum()),
+            "n1": F.sum(0).float(), "h1": Fh.sum(0).float(), "o1": onsets1(Fh, ev, d["E"]),
+            "N2": cross(F, F), "H2": cross(Fh, Fh), "o2": onsets_lr(Fh, Fh, ev, d["E"])}
 
 
-def buckets_of(rules):
-    edges = [0, 0.1, 0.2, 0.3, 0.5, 0.8, 1.01]
+def merge_identical(Ftr, Fva, device):
+    """Representative columns: the columns true on exactly the same train and val rows share one. Returns
+    (reps (R,), members: list per rep of the column indices, the rep first)."""
+    C = Ftr.shape[1]
+    if not C:
+        return torch.zeros(0, dtype=torch.long), []
+    g = torch.Generator().manual_seed(0)
+    hsh = torch.zeros(C, dtype=torch.float64, device=device)
+    for F in (Ftr, Fva):
+        r = torch.randn(len(F), generator=g, dtype=torch.float64).to(device)
+        for i in range(0, len(F), 65536):
+            hsh += r[i:i + 65536] @ F[i:i + 65536].to(device).double()
+    _u, inv = torch.unique(hsh, return_inverse=True)
+    first = torch.full((int(inv.max()) + 1,), C, device=device).scatter_reduce_(
+        0, inv, torch.arange(C, device=device), "amin")
+    rep = first[inv]                                                    # (C,) the hash group's first column
+    diff = torch.zeros(C, device=device)
+    for F in (Ftr, Fva):                                                # exact check (a hash collision: kept apart)
+        for i in range(0, len(F), 65536):
+            f = F[i:i + 65536].to(device)
+            diff += (f ^ f[:, rep]).sum(0).float()
+    rep = torch.where(diff > 0, torch.arange(C, device=device), rep).tolist()
+    groups = {}
+    for c, r in enumerate(rep):
+        groups.setdefault(r, []).append(c)
+    reps = sorted(groups)
+    return torch.tensor(reps, dtype=torch.long), [groups[r] for r in reps]
+
+
+class Top:
+    """The best rows (n, 10: a, b, c, rows, hit rows, onsets, val rows, val hit rows, val onsets, extend) by a
+    score, kept to cap while blocks of rows are added."""
+
+    def __init__(self, score, cap):
+        self.score, self.cap, self.rows = score, cap, torch.zeros((0, 10), dtype=torch.float64)
+
+    def add(self, rows):
+        x = torch.cat([self.rows, rows])
+        self.rows = x[torch.argsort(self.score(x), descending=True)[:self.cap]]
+
+
+EDGES = [0, 0.1, 0.2, 0.3, 0.5, 0.8, 1.01]
+
+
+def bucket_counts(prec, extend):
+    """Per train precision bucket: [kept rules, how many of them extend]."""
     out = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = [x for x in rules if lo <= x["train_precision"] < hi]
-        out.append({"train_precision": f"[{lo:g}, {min(hi, 1):g}{')' if hi < 1 else ']'}", "rules": len(m),
-                    "better_on_val": sum(x["better_on_val"] for x in m), "extend": sum(x["extend"] for x in m)})
+    for lo, hi in zip(EDGES[:-1], EDGES[1:]):
+        m = (prec >= lo) & (prec < hi)
+        out.append([int(m.sum()), int((m & extend).sum())])
     return out
+
+
+def above_subrules(P1, P2, pa, pb):
+    """(K, C) the best precision of the 3 pairs and 3 literals inside each seed pair (pa, pb) + literal c."""
+    m = torch.maximum(P2[pa, pb][:, None], torch.maximum(P2[pa], P2[pb]))
+    return torch.maximum(m, torch.maximum(torch.maximum(P1[pa], P1[pb])[:, None], P1[None, :]))
+
+
+def length3(tr, va, sa, sb, sid, min_onsets, ratio, block, tops):
+    """Every seed pair (sa, sb) x every literal, in blocks of seeds. Kept: >= min_onsets train onsets and the
+    precision above every sub-rule on train and on val; extend: val P >= ratio x train P. A triple is counted once,
+    at the first of its seed pairs (the same counts from each). Returns the counts, the per bucket [kept, extend]
+    and every kept triple (n, 7 float32: a, b, c, rows, hit rows, val rows, val hit rows; on the CPU); adds the
+    kept triples to the Top lists."""
+    device = tr["F"].device
+    P = lambda t: t["H2"] / t["N2"].clamp(min=1)
+    p1 = lambda t: t["h1"] / t["n1"].clamp(min=1)
+    pc, p2, vp1, vp2 = p1(tr), P(tr), p1(va), P(va)
+    n3 = {"tested": 0, "better_train": 0, "kept": 0, "extend": 0}
+    b3 = [[0, 0] for _ in EDGES[:-1]]
+    kept = []
+    n_seeds = len(sa)
+    for k0 in range(0, n_seeds, block):
+        pa, pb = sa[k0:k0 + block], sb[k0:k0 + block]
+        K = len(pa)
+        ar = torch.arange(K, device=device)
+        kk = (k0 + ar)[:, None]
+        s1, s2 = sid[pa], sid[pb]                                           # seed ids of (a, c), (b, c)
+        valid = ((s1 < 0) | (s1 > kk)) & ((s2 < 0) | (s2 > kk))
+        valid[ar, pa] = False
+        valid[ar, pb] = False
+        N3, H3 = cross_pairs(tr["F"], pa, pb), cross_pairs(tr["Fh"], pa, pb)
+        o3 = onsets_lr(tr["Fh"][:, pa] & tr["Fh"][:, pb], tr["Fh"], tr["ev"], tr["E"])
+        p3 = H3 / N3.clamp(min=1)
+        bt = valid & (o3 >= min_onsets) & (p3 > above_subrules(pc, p2, pa, pb))
+        vN3, vH3 = cross_pairs(va["F"], pa, pb), cross_pairs(va["Fh"], pa, pb)
+        vo3 = onsets_lr(va["Fh"][:, pa] & va["Fh"][:, pb], va["Fh"], va["ev"], va["E"])
+        vp3 = vH3 / vN3.clamp(min=1)
+        keep = bt & (vN3 > 0) & (vp3 > above_subrules(vp1, vp2, pa, pb))
+        ext = keep & (vp3 >= ratio * p3)
+        n3["tested"] += int(valid.sum())
+        n3["better_train"] += int(bt.sum())
+        n3["kept"] += int(keep.sum())
+        n3["extend"] += int(ext.sum())
+        ik, ic = torch.nonzero(keep, as_tuple=True)
+        for j, (a, e) in enumerate(bucket_counts(p3[ik, ic], ext[ik, ic])):
+            b3[j][0] += a
+            b3[j][1] += e
+        rows = torch.stack([pa[ik].double(), pb[ik].double(), ic.double()] +
+                           [M[ik, ic].double() for M in (N3, H3, o3, vN3, vH3, vo3, ext)], dim=1).cpu()
+        for t in tops.values():
+            t.add(rows)
+        kept.append(rows[:, [0, 1, 2, 3, 4, 6, 7]].float())
+        print(f"[Pair table]   seeds {k0 + K}/{n_seeds}: triples kept so far {n3['kept']}")
+    return n3, b3, (torch.cat(kept) if kept else torch.zeros((0, 7)))
+
+
+CHECK_FRACS = (0.5, 0.8, 0.9, 0.95, 0.99, 1.0)
+
+
+def coverage(va, rules, order, budget=5e7):
+    """Val coverage of the rules (n, 3 column indices; the index C = always true) taken in the given order: per
+    prefix k (1..n) the val rows, hit rows and onsets where at least one of the first k rules holds."""
+    C = va["F"].shape[1]
+    FT = torch.cat([va["F"], torch.ones((len(va["F"]), 1), dtype=torch.bool, device=va["F"].device)], 1).T
+    FT = FT.contiguous()
+    y, ev, E = va["y"], va["ev"], va["E"]
+    union = torch.zeros(FT.shape[1], dtype=torch.bool, device=FT.device)
+    out = {"rows": [], "hit_rows": [], "onsets": []}
+    B = max(1, int(budget // max(FT.shape[1], 1)))
+    rules = rules.to(FT.device).clamp(max=C)
+    order = order.to(FT.device)
+    for i in range(0, len(order), B):
+        r = rules[order[i:i + B]]
+        m = FT[r[:, 0]] & FT[r[:, 1]] & FT[r[:, 2]]                          # (b, rows)
+        cum = (m.int().cumsum(0) > 0) | union
+        ch = cum[:, y]
+        out["rows"].append(cum.sum(1).cpu())
+        out["hit_rows"].append(ch.sum(1).cpu())
+        out["onsets"].append(((torch.zeros((len(ch), E), device=FT.device).index_add_(1, ev, ch.float()) > 0)
+                              .sum(1)).cpu())
+        union = cum[-1]
+    return {k: torch.cat(v) if v else torch.zeros(0, dtype=torch.long) for k, v in out.items()}
+
+
+def coverage_report(cov, score, E, V_hit):
+    """How many rules (taken in order) cover a fraction of the most val onsets the set covers, and a curve."""
+    ons = cov["onsets"]
+    n = len(ons)
+    best = int(ons[-1]) if n else 0
+    point = lambda k: {"rules": k, "onsets": int(ons[k - 1]), "onset_recall": int(ons[k - 1]) / max(E, 1),
+                       "hit_rows": int(cov["hit_rows"][k - 1]), "row_recall": int(cov["hit_rows"][k - 1]) / V_hit,
+                       "rows": int(cov["rows"][k - 1]),
+                       "precision": int(cov["hit_rows"][k - 1]) / max(int(cov["rows"][k - 1]), 1),
+                       "score_of_last": float(score[k - 1])}
+    checks = []
+    for f in CHECK_FRACS:
+        k = int(torch.searchsorted(ons, torch.tensor(math.ceil(f * best - 1e-9), dtype=ons.dtype))) + 1 if n else 0
+        checks.append({"frac_of_max": f, **(point(min(k, n)) if n else {"rules": 0})})
+    ks = sorted({k for k in [1, 2, 3, 5, 10, 20, 30, 50, 100, 200, 300, 500, 1000, 2000, 5000, 10000, 20000, 50000,
+                             100000, 200000, 500000, 1000000] if k <= n} | ({n} if n else set()))
+    return {"rules_total": n, "max_onsets": best, "checks": checks, "curve": [point(k) for k in ks]}
 
 
 def main():
@@ -128,12 +274,15 @@ def main():
     parser.add_argument("--pt_head", type=str, default="Car:Jun")
     parser.add_argument("--pt_train_videos", type=int, default=1000, help="train videos (the first; 0: all)")
     parser.add_argument("--pt_val_videos", type=int, default=500, help="val videos (the first; 0: all)")
-    parser.add_argument("--pt_min_onsets", type=int, default=5, help="train onsets of a kept rule (every length)")
+    parser.add_argument("--pt_min_onsets1", type=int, default=2, help="train onsets of a length-1 seed")
+    parser.add_argument("--pt_min_onsets", type=int, default=5, help="train onsets of a kept rule of length >= 2")
     parser.add_argument("--pt_val_ratio", type=float, default=0.5,
                         help="a kept rule of length >= 2 is extended only if val precision >= this x train precision")
-    parser.add_argument("--pt_max_seeds", type=int, default=5000,
-                        help="seed pairs of length 3 (the most train precision x recall; 0: all)")
+    parser.add_argument("--pt_block", type=int, default=2000, help="seed pairs per block of length 3")
+    parser.add_argument("--pt_cover_sort", choices=["train", "val"], default="train",
+                        help="coverage: the rules sorted by their train (or val) precision x recall")
     parser.add_argument("--pt_top", type=int, default=30)
+    parser.add_argument("--pt_json", type=int, default=20000, help="rules per length in the json (most precise)")
     parser.add_argument("--pt_show", type=str, default="Car:MovTow(own)@1 & !Car:IncomLane(own)@1",
                         help="pairs to report whatever their result (';' separated, literals ' & ')")
     args = utils_pipe.parse_args(parser)
@@ -157,7 +306,6 @@ def main():
         if key in layout:
             allowed &= ~rule_lab.atom_literals(model, *layout[key], older_only=True).to(device)
     cols = torch.nonzero(allowed).flatten()
-    text = lambda c: step05_mine.literal_text(model, names, int(cols[c]))
     print(f"[Pair table] {args.pt_head}: {len(cols)} of {L} literals allowed")
 
     head_mask = training_data["target_heads"].to(device)
@@ -166,192 +314,202 @@ def main():
     tr_ids = sorted(training_data["train_videos"])[:args.pt_train_videos or None]
     va_ids = sorted(training_data["val_videos"])[:args.pt_val_videos or None]
     gen = lambda ids, d: head_rows(model, training_data, ids, h, possible, head_mask, S, w, device, d)
+    tr_raw = collect(gen(tr_ids, "train"), model, cols)
+    va_raw = collect(gen(va_ids, "val"), model, cols)
 
-    # ---- Length 1 (and the pair tables) on train
-    tr = tables(gen(tr_ids, "train"), model, cols, device, "train")
-    o1, _ = onsets(tr, device, pairs=False)
-    base_p = tr["total_hit"] / max(tr["total"], 1)
-    p1 = tr["h1"] / tr["n1"].clamp(min=1)
-    cand = torch.nonzero((o1 >= args.pt_min_onsets) & (tr["n1"] > 0)).flatten()
+    # ---- Length 1: every allowed literal; the onset thresholds; the seeds, identical ones merged
+    n1_all = tr_raw["F"].sum(0)
+    o1_all = onsets1(tr_raw["F"][tr_raw["y"]].to(device), tr_raw["ev"].to(device), tr_raw["E"]).cpu()
+    present = n1_all > 0
+    drop_table = [{"drop_onsets_le": k, "remaining": int((present & (o1_all > k)).sum())} for k in range(0, 6)]
+    print(f"[Pair table] length 1: literals true on a train row {int(present.sum())}; "
+          + ", ".join(f"onsets > {x['drop_onsets_le']}: {x['remaining']}" for x in drop_table))
+    cand0 = torch.nonzero(present & (o1_all >= args.pt_min_onsets1)).flatten()
+    rep_idx, members = merge_identical(tr_raw["F"][:, cand0], va_raw["F"][:, cand0], device)
+    cand = cand0[rep_idx]                                                   # indices into cols
     n_c = len(cand)
-    ccols = cols[cand]
-    ctext = lambda c: text(int(cand[c]))
-    own = torch.tensor([model.literal_info(int(m))["scope"] == 0 for m in ccols.tolist()], device=device)
-    print(f"[Pair table] train: {len(tr_ids)} videos, {tr['total']} rows, {tr['total_hit']} hit rows, "
-          f"{tr['num_events']} onsets, base precision {base_p:.4f}; {n_c} literals with >= "
-          f"{args.pt_min_onsets} onsets ({int(own.sum())} of the own agent)")
-    T, T_hit = tr["total_hit"], max(tr["total_hit"], 1)
+    lit_text = lambda i: step05_mine.literal_text(model, names, int(cols[i]))
+    ctexts = [lit_text(int(c)) for c in cand.tolist()]
+    alias = [[lit_text(int(cand0[m])) for m in grp[1:]] for grp in members]
+    ctext = lambda c: ctexts[c] + (f" (= {', '.join(alias[c])})" if alias[c] else "")
+    own = torch.tensor([any(model.literal_info(int(cols[cand0[m]]))["scope"] == 0 for m in grp) for grp in members],
+                       dtype=torch.bool, device=device)
+    print(f"[Pair table] seeds: {len(cand0)} literals with >= {args.pt_min_onsets1} train onsets, "
+          f"{n_c} after merging identical ones ({int(own.sum())} own)")
 
-    # ---- Length 2 on train: every pair of candidates from the tables
-    sub = lambda M: M[cand][:, cand]
-    trc = {**tr, "hits": tr["hits"][:, cand.cpu()]}
-    _o1c, o2 = onsets(trc, device)
-    N2, H2 = sub(tr["N2"]), sub(tr["H2"])
-    p2 = H2 / N2.clamp(min=1)
-    pc = p1[cand]
-    upper = torch.triu(torch.ones_like(N2, dtype=torch.bool), diagonal=1)
-    has = upper & (N2 > 0)
+    tr = split_tables(tr_raw, cand, device)
+    va = split_tables(va_raw, cand, device)
+    del tr_raw, va_raw
+    T_hit, V_hit = max(tr["total_hit"], 1), max(va["total_hit"], 1)
+    base_p, v_base = tr["total_hit"] / max(tr["total"], 1), va["total_hit"] / max(va["total"], 1)
+    pc, vp1 = tr["h1"] / tr["n1"].clamp(min=1), va["h1"] / va["n1"].clamp(min=1)
+
+    # ---- Length 2: every pair of seeds
+    p2, vp2 = tr["H2"] / tr["N2"].clamp(min=1), va["H2"] / va["N2"].clamp(min=1)
+    upper = torch.triu(torch.ones((n_c, n_c), dtype=torch.bool, device=device), diagonal=1)
+    has = upper & (tr["N2"] > 0)
     with_own = has & (own[:, None] | own[None, :])
-    enough = with_own & (o2 >= args.pt_min_onsets)
-    better = enough & (p2 > torch.maximum(pc[:, None], pc[None, :]))
+    enough = with_own & (tr["o2"] >= args.pt_min_onsets)
+    better_tr = enough & (p2 > torch.maximum(pc[:, None], pc[None, :]))
+    kept2 = better_tr & (va["N2"] > 0) & (vp2 > torch.maximum(vp1[:, None], vp1[None, :]))
+    seed = kept2 & (vp2 >= args.pt_val_ratio * p2)
 
-    # ---- Val (length 1, 2): the same counts
-    va = tables(gen(va_ids, "val"), model, ccols, device, "val")
-    vo1, vo2 = onsets(va, device)
-    V_hit = max(va["total_hit"], 1)
-    vp1 = va["h1"] / va["n1"].clamp(min=1)
-    vp2 = va["H2"] / va["N2"].clamp(min=1)
-    v_base = va["total_hit"] / max(va["total"], 1)
-    v_better = better & (va["N2"] > 0) & (vp2 > torch.maximum(vp1[:, None], vp1[None, :]))
-    seed = better & (va["N2"] > 0) & (vp2 >= args.pt_val_ratio * p2)
-
-    # ---- Length 3: the seeds x every candidate (a second pass over the rows)
+    # ---- Length 3: every seed pair x every seed literal, in blocks
     sa, sb = torch.nonzero(seed, as_tuple=True)
-    pr2 = p2 * H2 / T_hit
-    order = torch.argsort(pr2[sa, sb], descending=True)
-    n_seeds = len(order)
-    if args.pt_max_seeds and n_seeds > args.pt_max_seeds:
-        order = order[:args.pt_max_seeds]
-    pa, pb = sa[order], sb[order]
-    K = len(pa)
-    print(f"[Pair table] length 3: {K} of {n_seeds} seed pairs x {n_c} literals")
-    t3 = triples(trc, triple_counts(gen(tr_ids, "train 3"), model, ccols, pa, pb, device), pa, pb, device)
-    v3 = triples(va, triple_counts(gen(va_ids, "val 3"), model, ccols, pa, pb, device), pa, pb, device)
-    p3 = t3["H3"] / t3["N3"].clamp(min=1)
-    vp3 = v3["H3"] / v3["N3"].clamp(min=1)
+    n_seeds = len(sa)
+    sid = torch.full((n_c, n_c), -1, dtype=torch.long, device=device)
+    sid[sa, sb] = torch.arange(n_seeds, device=device)
+    sid[sb, sa] = torch.arange(n_seeds, device=device)
 
-    def above_subrules(P1, P2):
-        """(K, C) the best precision of the 3 pairs and 3 literals inside each seed + literal."""
-        P2f = torch.maximum(P2, P2.T)                                       # p2 is filled on both sides
-        m = torch.maximum(P2f[pa, pb][:, None], torch.maximum(P2f[pa], P2f[pb]))
-        return torch.maximum(m, torch.maximum(torch.maximum(P1[pa], P1[pb])[:, None], P1[None, :]))
+    score_p = lambda x: x[:, 4] / x[:, 3].clamp(min=1)
+    tops = {"precision": Top(score_p, max(args.pt_json, args.pt_top)),
+            "pr": Top(lambda x: score_p(x) * x[:, 4], args.pt_top), "onsets": Top(lambda x: x[:, 5], args.pt_top)}
+    print(f"[Pair table] length 3: {n_seeds} seed pairs x {n_c} literals, blocks of {args.pt_block}")
+    n3, b3, kept3 = length3(tr, va, sa, sb, sid, args.pt_min_onsets, args.pt_val_ratio, args.pt_block, tops)
 
-    ar = torch.arange(K, device=device)
-    valid = torch.ones((K, n_c), dtype=torch.bool, device=device)
-    valid[ar, pa] = False
-    valid[ar, pb] = False
-    keep3 = valid & (t3["o3"] >= args.pt_min_onsets) & (p3 > above_subrules(pc, p2))
-    v_better3 = keep3 & (v3["N3"] > 0) & (vp3 > above_subrules(vp1, vp2))
-    extend3 = keep3 & (v3["N3"] > 0) & (vp3 >= args.pt_val_ratio * p3)
-    # the same triple from several seeds has the same counts: keep one
-    ik, ic = torch.nonzero(keep3, as_tuple=True)
-    trip = torch.sort(torch.stack([pa[ik], pb[ik], ic], dim=1), dim=1).values
-    key = (trip[:, 0] * n_c + trip[:, 1]) * n_c + trip[:, 2]
-    uniq, inv = torch.unique(key, return_inverse=True)
-    first = torch.full((len(uniq),), len(key), device=device).scatter_reduce_(
-        0, inv, torch.arange(len(key), device=device), "amin")
-    ik, ic = ik[first], ic[first]
+    # ---- Coverage of val: every kept rule of each length (length 1: the seeds) sorted by precision x recall;
+    # how many rules (in that order) cover the most val onsets
+    ia, ib = torch.nonzero(kept2, as_tuple=True)
+    pad = lambda x: torch.full_like(x, n_c)
+    ar1 = torch.arange(n_c, device=device)
+    sets = {
+        "length 1": (torch.stack([ar1, pad(ar1), pad(ar1)], 1), pc * tr["h1"] / T_hit, vp1 * va["h1"] / V_hit),
+        "length 2": (torch.stack([ia, ib, pad(ia)], 1), p2[ia, ib] * tr["H2"][ia, ib] / T_hit,
+                     vp2[ia, ib] * va["H2"][ia, ib] / V_hit),
+        "length 3": (kept3[:, :3].long().to(device), (kept3[:, 4] ** 2 / kept3[:, 3].clamp(min=1) / T_hit).to(device),
+                     (kept3[:, 6] ** 2 / kept3[:, 5].clamp(min=1) / V_hit).to(device))}
+    sets["all"] = tuple(torch.cat([v[i] for v in sets.values()]) for i in range(3))
+    cover = {}
+    for name, (rules, s_tr, s_va) in sets.items():
+        sc = s_tr if args.pt_cover_sort == "train" else s_va
+        order = torch.argsort(sc, descending=True)
+        cover[name] = coverage_report(coverage(va, rules, order), sc[order].cpu(), va["E"], V_hit)
+        c = cover[name]
+        print(f"[Pair table] coverage {name}: {c['rules_total']} rules cover {c['max_onsets']} of {va['E']} val "
+              f"onsets; " + ", ".join(f"{x['frac_of_max']:g}: {x['rules']} rules" for x in c["checks"]))
 
-    stats = {"literals_allowed": len(cols), "candidates": n_c, "candidates_own": int(own.sum()),
+    # ---- Reports
+    stats = {"literals_allowed": len(cols), "literals_true": int(present.sum()), "drop_onsets": drop_table,
+             "seeds_literals": len(cand0), "seeds_merged": n_c, "seeds_own": int(own.sum()),
              "pairs_tested": n_c * (n_c - 1) // 2, "pairs_with_rows": int(has.sum()),
              "pairs_with_own": int(with_own.sum()), "pairs_min_onsets": int(enough.sum()),
-             "pairs_better_train": int(better.sum()), "pairs_better_train_and_val": int(v_better.sum()),
-             "pairs_extend": n_seeds, "seeds_used": K, "triples_tested": int(valid.sum()),
-             "triples_kept": len(ik), "triples_better_train_and_val": int(v_better3[ik, ic].sum()),
-             "triples_extend": int(extend3[ik, ic].sum())}
+             "pairs_better_train": int(better_tr.sum()), "pairs_kept": int(kept2.sum()), "pairs_extend": n_seeds,
+             "triples_tested": n3["tested"], "triples_better_train": n3["better_train"],
+             "triples_kept": n3["kept"], "triples_extend": n3["extend"], "cover_sort": args.pt_cover_sort}
     print(f"[Pair table] {stats}")
 
-    def metrics(prec, hit, ons, vprec, vhit, vons, vrows, rows):
+    def metrics(prec, hit, ons, rows, vprec, vhit, vons, vrows):
         r, vr = hit / T_hit, vhit / V_hit
-        return {"train_precision": prec, "train_recall": r, "train_pr": prec * r, "train_onsets": ons,
-                "train_rows": rows, "val_precision": vprec, "val_recall": vr, "val_pr": vprec * vr,
-                "val_onsets": vons, "val_rows": vrows}
+        return {"train_precision": prec, "train_recall": r, "train_pr": prec * r, "train_onsets": int(ons),
+                "train_rows": int(rows), "val_precision": vprec, "val_recall": vr, "val_pr": vprec * vr,
+                "val_onsets": int(vons), "val_rows": int(vrows)}
 
     def single(c):
-        c = int(c)
-        g = int(cand[c])
-        return {"rule": ctext(c), **metrics(float(pc[c]), float(tr["h1"][g]), int(o1[g]), float(vp1[c]),
-                                            float(va["h1"][c]), int(vo1[c]), int(va["n1"][c]), int(tr["n1"][g]))}
+        return {"rule": ctext(c), **metrics(float(pc[c]), float(tr["h1"][c]), tr["o1"][c], tr["n1"][c],
+                                            float(vp1[c]), float(va["h1"][c]), va["o1"][c], va["n1"][c])}
 
     def pair(a, b):
         a, b = int(a), int(b)
         return {"rule": f"{ctext(a)} & {ctext(b)}",
-                **metrics(float(p2[a, b]), float(H2[a, b]), int(o2[a, b]), float(vp2[a, b]), float(va["H2"][a, b]),
-                          int(vo2[a, b]), int(va["N2"][a, b]), int(N2[a, b])),
+                **metrics(float(p2[a, b]), float(tr["H2"][a, b]), tr["o2"][a, b], tr["N2"][a, b],
+                          float(vp2[a, b]), float(va["H2"][a, b]), va["o2"][a, b], va["N2"][a, b]),
                 "parents_train": [float(pc[a]), float(pc[b])], "parents_val": [float(vp1[a]), float(vp1[b])],
-                "better_on_val": bool(v_better[a, b]), "extend": bool(seed[a, b])}
+                "kept": bool(kept2[a, b]), "extend": bool(seed[a, b])}
 
-    def triple(k, c):
-        k, c = int(k), int(c)
-        a, b = int(pa[k]), int(pb[k])
+    def triple(x):
+        a, b, c = (int(v) for v in x[:3])
+        n, hh, o, vn, vh, vo, e = x[3:].tolist()
         return {"rule": f"{ctext(a)} & {ctext(b)} & {ctext(c)}",
-                **metrics(float(p3[k, c]), float(t3["H3"][k, c]), int(t3["o3"][k, c]), float(vp3[k, c]),
-                          float(v3["H3"][k, c]), int(v3["o3"][k, c]), int(v3["N3"][k, c]), int(t3["N3"][k, c])),
-                "seed_train": float(p2[a, b]), "seed_val": float(vp2[a, b]),
-                "better_on_val": bool(v_better3[k, c]), "extend": bool(extend3[k, c])}
+                **metrics(hh / max(n, 1), hh, o, n, vh / max(vn, 1), vh, vo, vn),
+                "seed_train": float(p2[a, b]), "seed_val": float(vp2[a, b]), "extend": bool(e)}
 
     singles = [single(c) for c in range(n_c)]
-    ia, ib = torch.nonzero(better, as_tuple=True)
-    kept2 = [pair(ia[k], ib[k]) for k in torch.argsort(p2[ia, ib], descending=True).tolist()]
-    # length 3: the dicts of the top rules only (and up to 20000 in the json)
-    lists3 = {}
-    for name, score in (("precision", p3[ik, ic]), ("pr", p3[ik, ic] * t3["H3"][ik, ic]),
-                        ("onsets", t3["o3"][ik, ic])):
-        lists3[name] = torch.argsort(score, descending=True)
-    kept3_json = [triple(ik[j], ic[j]) for j in lists3["precision"][:20000].tolist()]
-    top3 = {n: [triple(ik[j], ic[j]) for j in o[:args.pt_top].tolist()] for n, o in lists3.items()}
+    pairs = {}
+    for name, score in (("precision", p2[ia, ib]), ("pr", p2[ia, ib] * tr["H2"][ia, ib]), ("onsets", tr["o2"][ia, ib])):
+        n = max(args.pt_json, args.pt_top) if name == "precision" else args.pt_top
+        pairs[name] = [pair(ia[j], ib[j]) for j in torch.argsort(score, descending=True)[:n].tolist()]
+    b2 = bucket_counts(p2[ia, ib], seed[ia, ib])
+    trip = {name: [triple(x) for x in t.rows] for name, t in tops.items()}
 
-    idx = {ctext(c): c for c in range(n_c)}
+    idx = {}
+    for c in range(n_c):
+        for t in [ctexts[c]] + alias[c]:
+            idx[t] = c
     shown = []
     for spec in (s for s in args.pt_show.split(";") if s.strip()):
         a, _, b = (x.strip() for x in spec.partition("&"))
         if a in idx and b in idx:
-            x, y = sorted((idx[a], idx[b]))
-            shown.append({**pair(x, y), "kept": bool(better[x, y])})
+            shown.append(pair(*sorted((idx[a], idx[b]))))
         else:
             shown.append({"rule": spec, "missing": [t for t in (a, b) if t not in idx]})
 
-    top = lambda rules, k: sorted(rules, key=lambda x: -x[k])[:args.pt_top]
+    top1 = lambda k: sorted(singles, key=lambda x: -x[k])[:args.pt_top]
     cells = lambda x: (f"{x['train_precision']:.3f} | {x['train_recall']:.3f} | {x['train_pr']:.4f} | "
                        f"{x['train_onsets']} | {x['val_precision']:.3f} | {x['val_recall']:.3f} | {x['val_pr']:.4f} | "
                        f"{x['val_onsets']}")
     head = "train P | train R | train PxR | onsets | val P | val R | val PxR | val onsets"
     sep = lambda n: "|" + "---|" * n
+    yn = lambda v: "yes" if v else "no"
     row1 = lambda x: f"| {cells(x)} | {x['rule']} |"
     row2 = lambda x: (f"| {cells(x)} | {x['parents_train'][0]:.3f}, {x['parents_train'][1]:.3f} | "
-                      f"{x['parents_val'][0]:.3f}, {x['parents_val'][1]:.3f} | {'yes' if x['better_on_val'] else 'no'}"
-                      f" | {'yes' if x['extend'] else 'no'} | {x['rule']} |")
-    row3 = lambda x: (f"| {cells(x)} | {x['seed_train']:.3f} | {x['seed_val']:.3f} | "
-                      f"{'yes' if x['better_on_val'] else 'no'} | {'yes' if x['extend'] else 'no'} | {x['rule']} |")
+                      f"{x['parents_val'][0]:.3f}, {x['parents_val'][1]:.3f} | {yn(x['extend'])} | {x['rule']} |")
+    row3 = lambda x: f"| {cells(x)} | {x['seed_train']:.3f} | {x['seed_val']:.3f} | {yn(x['extend'])} | {x['rule']} |"
     hdr1 = [f"| {head} | rule |", sep(9)]
-    hdr2 = [f"| {head} | literals train P | literals val P | better on val | extend | rule |", sep(13)]
-    hdr3 = [f"| {head} | seed train P | seed val P | better on val | extend | rule |", sep(13)]
-    bucket_md = lambda bs: (["| train precision | kept | also better on val | extend |", sep(4)] +
-                            [f"| {b['train_precision']} | {b['rules']} | {b['better_on_val']} | {b['extend']} |"
-                             for b in bs])
-    b2, b3 = buckets_of(kept2), buckets_of(kept3_json)
+    hdr2 = [f"| {head} | literals train P | literals val P | extend | rule |", sep(12)]
+    hdr3 = [f"| {head} | seed train P | seed val P | extend | rule |", sep(12)]
+    labels = [f"[{lo:g}, {min(hi, 1):g}{')' if hi < 1 else ']'}" for lo, hi in zip(EDGES[:-1], EDGES[1:])]
+    bucket_md = lambda bs: (["| train precision | kept | extend |", sep(3)] +
+                            [f"| {lab} | {k} | {e} |" for lab, (k, e) in zip(labels, bs)])
     md = [f"# Length-1, -2 and -3 rules of {args.pt_head}", "",
-          f"Train: {len(tr_ids)} videos, {tr['total']} rows, {T} hit rows, {tr['num_events']} onsets, "
+          f"Train: {len(tr_ids)} videos, {tr['total']} rows, {tr['total_hit']} hit rows, {tr['E']} onsets, "
           f"base precision {base_p:.4f}. Val: {len(va_ids)} videos, {va['total']} rows, {va['total_hit']} hit rows, "
-          f"{va['num_events']} onsets, base precision {v_base:.4f}.",
-          "P precision, R recall (hit rows / all hit rows), PxR their product. Length >= 2 needs an (own) literal; "
-          f"extend: val P >= {args.pt_val_ratio:g} x train P.", "",
-          f"- literals allowed: {len(cols)}; length 1 with >= {args.pt_min_onsets} train onsets: {n_c} "
-          f"({stats['candidates_own']} own)",
-          f"- pairs: tested {stats['pairs_tested']}, with rows {stats['pairs_with_rows']}, with an own literal "
-          f"{stats['pairs_with_own']}, >= {args.pt_min_onsets} onsets {stats['pairs_min_onsets']}, above both "
-          f"literals on train {stats['pairs_better_train']}, also on val {stats['pairs_better_train_and_val']}, "
-          f"extended {stats['pairs_extend']} (used {K})",
-          f"- triples: tested {stats['triples_tested']}, kept (above every sub-rule on train) {stats['triples_kept']}, "
-          f"also on val {stats['triples_better_train_and_val']}, extend {stats['triples_extend']}", "",
-          "## Kept pairs by train precision", ""] + bucket_md(b2) + [
-          "", "## Kept triples by train precision" + (" (the 20000 most precise)" if len(ik) > 20000 else ""), ""
-          ] + bucket_md(b3)
+          f"{va['E']} onsets, base precision {v_base:.4f}.",
+          "P precision, R recall (hit rows / all hit rows), PxR their product. Kept (length >= 2): an (own) literal, "
+          f">= {args.pt_min_onsets} train onsets, P above every sub-rule on train and on val. "
+          f"Extend: val P >= {args.pt_val_ratio:g} x train P.", "",
+          "## Length 1: literals left if those with <= k train onsets are dropped", "",
+          "| dropped | remaining |", sep(2)]
+    md += [f"| onsets <= {x['drop_onsets_le']} | {x['remaining']} |" for x in drop_table]
+    md += ["", f"- literals allowed {len(cols)}, true on a train row {int(present.sum())}; seeds (>= "
+               f"{args.pt_min_onsets1} onsets) {len(cand0)}, {n_c} after merging identical ones ({int(own.sum())} own)",
+           f"- pairs: tested {stats['pairs_tested']}, with rows {stats['pairs_with_rows']}, with an own literal "
+           f"{stats['pairs_with_own']}, >= {args.pt_min_onsets} onsets {stats['pairs_min_onsets']}, above both "
+           f"literals on train {stats['pairs_better_train']}, also on val (kept) {stats['pairs_kept']}, "
+           f"extend {stats['pairs_extend']}",
+           f"- triples: tested {stats['triples_tested']}, above every sub-rule on train "
+           f"{stats['triples_better_train']}, also on val (kept) {stats['triples_kept']}, extend "
+           f"{stats['triples_extend']}", "", "## Kept pairs by train precision", ""]
+    md += bucket_md(b2) + ["", "## Kept triples by train precision", ""] + bucket_md(b3)
     for k, what in (("train_precision", "train precision"), ("train_pr", "train PxR")):
-        md += ["", f"## Length 1: top {args.pt_top} by {what}", ""] + hdr1 + [row1(x) for x in top(singles, k)]
-    for k, what in (("train_precision", "train precision"), ("train_pr", "train PxR"), ("train_onsets", "onsets")):
-        md += ["", f"## Length 2: top {args.pt_top} kept pairs by {what}", ""] + hdr2 + [row2(x) for x in top(kept2, k)]
+        md += ["", f"## Length 1: top {args.pt_top} by {what}", ""] + hdr1 + [row1(x) for x in top1(k)]
     for k, what in (("precision", "train precision"), ("pr", "train PxR"), ("onsets", "onsets")):
-        md += ["", f"## Length 3: top {args.pt_top} kept triples by {what}", ""] + hdr3 + [row3(x) for x in top3[k]]
+        md += ["", f"## Length 2: top {args.pt_top} kept pairs by {what}", ""] + hdr2
+        md += [row2(x) for x in pairs[k][:args.pt_top]]
+    for k, what in (("precision", "train precision"), ("pr", "train PxR"), ("onsets", "onsets")):
+        md += ["", f"## Length 3: top {args.pt_top} kept triples by {what}", ""] + hdr3
+        md += [row3(x) for x in trip[k][:args.pt_top]]
+    cov_row = lambda x: (f"| {x['rules']} | {x['onsets']} | {x['onset_recall']:.3f} | {x['row_recall']:.3f} | "
+                         f"{x['precision']:.3f} | {x['score_of_last']:.4f} |")
+    cov_hdr = ["| rules | val onsets | onset recall | row recall | precision of the union | PxR of the last |", sep(6)]
+    md += ["", f"## Val coverage: the kept rules sorted by {args.pt_cover_sort} PxR", "",
+           f"A row is covered if at least one of the first k rules holds; precision of the union = covered hit rows / "
+           f"covered rows (predict the head when any rule holds). Val: {va['E']} onsets. Length 1: the seeds.", ""]
+    for name, c in cover.items():
+        md += [f"### {name}: {c['rules_total']} rules, at most {c['max_onsets']} val onsets", "",
+               "Rules needed for a fraction of the most onsets:", ""]
+        md += ["| fraction " + cov_hdr[0], "|---" + cov_hdr[1]]
+        md += [f"| {x['frac_of_max']:g} " + cov_row(x) for x in c["checks"] if "onsets" in x]
+        md += ["", "Curve:", ""] + cov_hdr + [cov_row(x) for x in c["curve"]] + [""]
     md += ["", "## Pairs asked for (--pt_show)", ""] + [f"- {x}" for x in shown]
     stem = lab_dir / f"pairs_{args.pt_head.replace(':', '_')}"
     open(f"{stem}.md", "w").write("\n".join(md) + "\n")
     utils_data.save_json({"head": args.pt_head, "train_videos": len(tr_ids), "val_videos": len(va_ids),
-                          "train": {"rows": tr["total"], "hit_rows": T, "onsets": tr["num_events"]},
-                          "val": {"rows": va["total"], "hit_rows": va["total_hit"], "onsets": va["num_events"]},
-                          "stats": stats, "buckets_pairs": b2, "buckets_triples": b3, "singles": singles,
-                          "pairs": kept2[:20000], "triples": kept3_json, "shown": shown}, f"{stem}.json")
-    print("\n".join(md[:40]))
+                          "train": {"rows": tr["total"], "hit_rows": tr["total_hit"], "onsets": tr["E"]},
+                          "val": {"rows": va["total"], "hit_rows": va["total_hit"], "onsets": va["E"]},
+                          "stats": stats, "bucket_labels": labels, "buckets_pairs": b2, "buckets_triples": b3,
+                          "singles": singles, "pairs": pairs["precision"], "triples": trip["precision"],
+                          "coverage": cover, "shown": shown}, f"{stem}.json")
+    print("\n".join(md[:45]))
     print(f"\n[Pair table] {stem}.md / .json")
 
 
