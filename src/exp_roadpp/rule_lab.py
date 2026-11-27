@@ -95,7 +95,8 @@ MDL_SIZE_REF = 200.0
 
 
 def mdl_flags(mode):
-    """The letters of an MDL mode "mdl<letters>_λ": s scaled by the head's size, t temporal rules, w warm start."""
+    """The letters of an MDL mode "mdl<letters>_λ": s scaled by the head's size, t temporal rules, w warm start,
+    h hard rules (0 / 1 gates, `hard_gates`)."""
     return mode.split("_", 1)[0][3:] if mode.startswith("mdl") else ""
 
 
@@ -115,6 +116,17 @@ def is_temporal(mode):
 # rules of Bus:OutgoLane gave AP 0.221 in one run and 0.424 in another (soft_logit 0.436 / 0.439); with the rules
 # already weighted, tanh(|w| / RULE_TAU) is saturated for the strong ones and only the weak ones are dropped.
 MDL_WARM = 0.5
+
+
+# Hard rules (flag h, 2026-11-27, the user: a rule that does not hold must contribute nothing). With soft gates a rule
+# whose literal is false still has activation prod (1 - g) > 0, so many rules that do not hold leak their (negative)
+# weights: sumo_00473 agent 19 f57 Car:Jun, the 15 rules that hold give P 0.167, the full sum 0.038 (about -2.4 from
+# rules that do not hold). With h each gate is 0 or 1 in the forward pass (a literal is kept or dropped; the gradient
+# goes to the sigmoid, straight through), so a rule's activation is its hard AND (0 / 1) in the fit and in every
+# scorer; the saved gates are 0 / 1.
+def hard_gates(g):
+    """Gates of flag h: 0 / 1 forward, the soft gates' gradient backward."""
+    return (g >= 0.5).float() + g - g.detach()
 
 
 # Temporal rules (2026-11-25, the user: the rules of one event at different times, e.g. Car:MovTow@1 +0.81,
@@ -1695,12 +1707,16 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=None, l
         # then 0.127; kept rules 231-965, AP 0.34-0.46 for the same rules)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps, eta_min=1e-3)
         warm_steps = int(MDL_WARM * steps) if "w" in mdl_flags(mode) else 0
+        hard = "h" in mdl_flags(mode)
         for it in range(steps):
             opt.zero_grad()
             if tied:
                 theta = theta_p[pid]
-            g = torch.sigmoid(theta).masked_fill(pad, 0.0).masked_fill(pinned, 1.0)
-            a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R)
+            g = torch.sigmoid(theta)
+            if hard:
+                g = hard_gates(g)
+            g = g.masked_fill(pad, 0.0).masked_fill(pinned, 1.0)
+            a = (1 - g[None] * (1 - X)).prod(dim=2)                           # (n, R), 0 / 1 if hard
             if logistic:
                 loss = (w * torch.nn.functional.binary_cross_entropy_with_logits(a @ wt + b0, y, reduction="none")).sum()
             else:
@@ -1736,7 +1752,10 @@ def fit_soft(rules, conf, base, train, model, heads, device, mode, steps=None, l
                   f"{int((wt.detach().abs() >= DROP_WEIGHT).sum())} with |w| >= {DROP_WEIGHT}", flush=True)
         if tied:
             theta = theta_p[pid]
-        gi = torch.sigmoid(theta.detach()).masked_fill(pad, 1.0).masked_fill(pinned, 1.0).cpu()
+        gi = torch.sigmoid(theta.detach())
+        if hard:
+            gi = (gi >= 0.5).float()
+        gi = gi.masked_fill(pad, 1.0).masked_fill(pinned, 1.0).cpu()
         gate[idx] = gi
         if logistic:
             weight[idx] = wt.detach().cpu()
@@ -2874,7 +2893,8 @@ def main():
     soft_modes = [m for m in args.lab_soft.split(",") if m] if args.lab_fast != "True" else ["logit"]
     # the size curve (MDL strengths); "s0.1": λ 0.1 scaled by the head's size (mode mdls_0.1)
     # "t0.1" / "ts0.1": over temporal rules (mdlt_0.1 / mdlts_0.1, `temporal_groups`)
-    # letters before the number: s (scaled by head size), t (temporal rules), w (warm start), e.g. "ws0.1" -> mdlws_0.1
+    # letters before the number: s (scaled by head size), t (temporal rules), w (warm start), h (hard rules: 0 / 1
+    # gates, a rule that does not hold gives 0), e.g. "ws0.1" -> mdlws_0.1, "hs0.1" -> mdlhs_0.1
     soft_modes += [f"mdl{re.match(r'[a-z]*', x).group(0)}_{x[len(re.match(r'[a-z]*', x).group(0)):]}"
                    for x in args.lab_mdl.split(",") if x]
     global MDL_SIZE_REF, FIT_STEPS
