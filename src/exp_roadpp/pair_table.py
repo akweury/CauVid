@@ -396,13 +396,13 @@ def near_duplicates(tr, va, kept, score, tau):
     return rep, (ia, ib)
 
 
-def fp_classes(t, m, H, S):
+def fp_classes(t, m, H, S, masks=False):
     """The negative rows of the rows m (rule holds, no onset within the hit window) by what the agent does:
       early   the agent's onset is later within H frames (the rule fired too early), by slots ahead (first // S);
       later   the agent has an onset later than H frames;
       after   the agent's onsets are all before t (the rule fires after the action);
       never   the agent has no onset (among the split's at-risk rows).
-    Agents: distinct (video, agent) per class."""
+    Agents: distinct (video, agent) per class. masks: also "_masks" {class: (rows,) bool over all rows of t}."""
     meta, y = t["meta"], t["y"]
     key = meta[:, 0] * 1_000_000 + meta[:, 1]
     on_key = key[y]
@@ -424,6 +424,10 @@ def fp_classes(t, m, H, S):
                      "agents": int(torch.unique(k[msk]).numel())}
     slots = torch.bincount(first[early] // S, minlength=H // S + 1).tolist() if early.any() else []
     out["early_by_slots_ahead"] = {int(i): int(c) for i, c in enumerate(slots) if c}
+    if masks:
+        idx = torch.nonzero(neg).flatten()
+        full = lambda x: torch.zeros_like(neg).index_fill_(0, idx[x], True)
+        out["_masks"] = {"early": full(early), "later": full(later), "after": full(after), "never": full(never)}
     return out
 
 
