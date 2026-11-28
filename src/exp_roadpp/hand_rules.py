@@ -10,6 +10,9 @@ Box literals (2026-11-28; no atom says this, read from the agent's GT box at the
                                                     its bottom moved down (by more than 0.002 of the image);
   box:leaving   (edge_left & to_left) | (edge_right & to_right) | (edge_bottom & to_bottom): leaving the image;
   box:h_grow    over the last --hr_move frames the box height grew (the width does not matter);
+  box:new       a box at t but none at t - --hr_move: the agent just appeared (no history; its negated shape and
+                state literals hold without saying anything);
+  the edge literals and box:new need only the box at t, the others also the box at t - --hr_move;
 each also negated ("!box:leaving"; false where the agent has no box at t or t - --hr_move).
 Traffic light size (2026-11-28): the height (share of the image height) of the largest "TL" box at the row's frame;
   literals "tl:h>=0.03", "tl:h<0.2" (any number; false without a traffic light in view) and "tl:none" / "tl:any".
@@ -111,7 +114,8 @@ def rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, d
                 yield vid, rows["inputs"][keep], y[keep], rows["rows"][keep], rows["first"][keep][:, h]
 
 
-BOX_NAMES = ("edge_left", "edge_right", "edge_bottom", "to_left", "to_right", "to_bottom", "leaving", "h_grow")
+BOX_NAMES = ("edge_left", "edge_right", "edge_bottom", "to_left", "to_right", "to_bottom", "leaving", "h_grow", "new")
+NOW_ONLY = ("edge_left", "edge_right", "edge_bottom", "new")    # need only the box at t (the others also at t - k)
 BOX_LITS = [f"box:{x}" for x in BOX_NAMES] + [f"!box:{x}" for x in BOX_NAMES]
 MOVE_EPS = 0.002
 
@@ -154,17 +158,19 @@ def box_columns(d, cfg, split, num_atoms, edge, k):
             tl_h[rows] = torch.where(hts[t] >= 0, hts[t], torch.tensor(float("nan")))
         t0 = (t - k).clamp(min=0)
         b, b0 = vb[t, n], vb[t0, n]
-        ok = has[t, n] & has[t0, n] & (t >= k)
+        now = has[t, n]
+        ok = now & has[t0, n] & (t >= k)
         x1, y1, x2, y2 = b.unbind(1)
         cx, cx0 = (x1 + x2) / 2, (b0[:, 0] + b0[:, 2]) / 2
         f = {"edge_left": x1 <= edge, "edge_right": x2 >= 1 - edge, "edge_bottom": y2 >= 1 - edge,
              "to_left": cx < cx0 - MOVE_EPS, "to_right": cx > cx0 + MOVE_EPS, "to_bottom": y2 > b0[:, 3] + MOVE_EPS,
-             "h_grow": (y2 - y1) > (b0[:, 3] - b0[:, 1]) + MOVE_EPS}
+             "h_grow": (y2 - y1) > (b0[:, 3] - b0[:, 1]) + MOVE_EPS, "new": ~(has[t0, n] & (t >= k))}
         f["leaving"] = (f["edge_left"] & f["to_left"]) | (f["edge_right"] & f["to_right"]) | \
             (f["edge_bottom"] & f["to_bottom"])
         for j, name in enumerate(BOX_NAMES):
-            out[rows, j] = f[name] & ok
-            out[rows, len(BOX_NAMES) + j] = ~f[name] & ok
+            known = now if name in NOW_ONLY else ok
+            out[rows, j] = f[name] & known
+            out[rows, len(BOX_NAMES) + j] = ~f[name] & known
     return out, tl_h
 
 
