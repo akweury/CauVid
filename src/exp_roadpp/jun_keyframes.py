@@ -1,11 +1,12 @@
 """Keyframes of a head: its onsets, or the failures of a hand rule; one file per frame (2026-11-28).
 
 --kf_mode onsets    --kf_num random onsets of --kf_head; frames at --kf_times s from the onset.
---kf_mode failures  --kf_num random failures of --kf_rule (`hand_rules` syntax): rows where the rule holds and the
-                    head does not switch on within the hit window, one per agent; frames at --kf_fail_times s from
-                    the predicting frame. The title says why it failed (`pair_table.fp_classes`): the head comes
-                    too early / later / already happened (the timing), or never, with the agent's next actions
-                    (its own class's labels switching on within the horizon). The camera view (right) shows only
+--kf_mode failures  --kf_num random failures of --kf_rule (`hand_rules` syntax), the timing ignored (2026-11-28, the
+                    user: does the predicted event happen at all?): rows where the rule holds and the agent never
+                    does the head afterwards (`pair_table.fp_classes` "never" and "after": it did it only before),
+                    one per agent; a row whose agent does it later at any time counts as right. Frames at
+                    --kf_fail_times s from the predicting frame; the title gives the agent's next actions (its own
+                    class's labels switching on within the horizon). The camera view (right) shows only
                     the agent's box and the traffic lights; the top view (left) as always.
 Cases from the first --kf_val_videos val videos; the agent outlined in red. The text says only what matters; the
 video, agent and frame are in the folder name.
@@ -88,7 +89,15 @@ def main():
         kinds = ("early", "later", "after", "never")
         for i, k in enumerate(kinds):
             kind[fp["_masks"][k]] = i
-        rows = torch.nonzero(kind >= 0).flatten().tolist()
+        happens = m & (t["y"] | fp["_masks"]["early"] | fp["_masks"]["later"])     # the agent does it later
+        fa = fp_classes(t, torch.ones_like(m), H, S, masks=True)["_masks"]
+        base_rows = float((t["y"] | fa["early"] | fa["later"]).float().mean())
+        key = d["meta"][:, 0] * 1_000_000 + d["meta"][:, 1]
+        ag_all, ag_ok = torch.unique(key[m.cpu()]), torch.unique(key[happens.cpu()])
+        print(f"[Keyframes] timing ignored: the rule holds on {int(m.sum())} rows of {len(ag_all)} agents; the agent "
+              f"does {args.kf_head} later on {float(happens.sum()) / max(int(m.sum()), 1):.3f} of the rows, "
+              f"{len(ag_ok) / max(len(ag_all), 1):.3f} of the agents (base: {base_rows:.3f} of all rows)")
+        rows = torch.nonzero((kind == 2) | (kind == 3)).flatten().tolist()  # after / never: it does not happen
         rng.shuffle(rows)
         meta, kind = d["meta"].tolist(), kind.cpu().tolist()
         per_agent = {}
@@ -99,19 +108,13 @@ def main():
         for i in picked:
             v, n, tt, first = meta[i]
             k = kinds[kind[i]]
-            if k == "early":
-                why = f"Jun {first / 10:.1f} s later (too early)"
-            elif k == "later":
-                why = f"Jun > {H / 10:g} s later"
-            elif k == "after":
-                why = "Jun already happened"
-            else:
-                acts = sorted((int(f), sel_names[j]) for j, f in enumerate(nxt[i].tolist()) if f < H)
-                why = "never Jun; next: " + (", ".join(f"{a} {f / 10:.1f} s" for f, a in acts[:3]) if acts else "nothing new")
+            acts = sorted((int(f), sel_names[j]) for j, f in enumerate(nxt[i].tolist()) if f < H)
+            why = ("no Jun later (only before)" if k == "after" else "never Jun") + "; next: " + \
+                (", ".join(f"{a} {f / 10:.1f} s" for f, a in acts[:3]) if acts else "nothing new")
             cases.append((v, n, tt, f"{k}_{d['vids'][v]}_a{n}_f{tt}", why, k))
         counts = {k: sum(c[5] == k for c in cases) for k in kinds}
-        print(f"[Keyframes] rule holds on {int(m.sum())} rows; {fp['negatives']} failing rows of {len(per_agent)} "
-              f"agents; {len(cases)} shown {counts}")
+        print(f"[Keyframes] {len(rows)} rows where it never happens, {len(per_agent)} agents; {len(cases)} shown "
+              f"{counts}")
 
     dataset = Path(args.dataset_path)
     atoms = utils_data.load_json(cfg["val_atom_file"])
