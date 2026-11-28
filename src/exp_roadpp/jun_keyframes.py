@@ -117,14 +117,23 @@ def main():
         conds = [(" | ".join(c), t["F"][:, [col[x] for x in c]].any(dim=1)) for c in rule[0]]
         blocks = [(" & ".join(" | ".join(c) for c in e), hand_rules._conj_holds(t, e, col)) for e in rule[1]]
         meta = d["meta"].tolist()
+        row_of = {(v, n, tt): i for i, (v, n, tt, _f) in enumerate(meta)}
+
+        def why_at(i):
+            """The rule's failing conditions at row i (None: no row, the rule is not evaluated there)."""
+            if i is None:
+                return "rule not evaluated here (not at risk)"
+            off = [txt for txt, cm in conds if not bool(cm[i])]
+            blk = [txt for txt, bm in blocks if bool(bm[i])]
+            if not off and not blk:
+                return "rule holds here"
+            return ("not met: " + ", ".join(off) if off else "") + ("; " if off and blk else "") + \
+                ("blocked by: " + ", ".join(blk) if blk else "")
+
         for e in rng.sample(miss, min(num, len(miss))):
             i = last[e]
             v, n, tt, first = meta[i]
-            off = [txt for txt, cm in conds if not bool(cm[i])]
-            blk = [txt for txt, bm in blocks if bool(bm[i])]
-            why = ("fails: " + ", ".join(off) if off else "") + ("; " if off and blk else "") + \
-                ("blocked by: " + ", ".join(blk) if blk else "")
-            cases.append((v, n, tt + first, f"missed_{d['vids'][v]}_a{n}_f{tt + first}", why, "missed"))
+            cases.append((v, n, tt + first, f"missed_{d['vids'][v]}_a{n}_f{tt + first}", why_at(i), "missed"))
     if fail:
         fp = fp_classes(t, m, H, S, masks=True)
         kind = torch.full((len(m),), -1, dtype=torch.long, device=device)
@@ -197,11 +206,12 @@ def main():
             if group == "fail":
                 title = f"predicted {args.kf_head}, {when_text(s, 'now')} | {why}\n{car}"
             elif group == "missed":
-                title = f"{args.kf_head} {when_text(s, 'onset')}, missed | {why}\n{car}"
+                title = f"{args.kf_head} {when_text(s, 'onset')}, missed\n{car}"
             else:
                 title = f"{args.kf_head} {when_text(s, 'onset')}\n{car}"
+            red = why_at(row_of.get((v, n, f))) if group == "missed" else None
             residual_clips.sumo_render.render(dataset, vid, f, case_dir / f"{j}_{s:+g}s.png", highlight=tube,
-                                              title=title, cam_keep={tube} if ruled else None)
+                                              title=title, cam_keep={tube} if ruled else None, title_red=red)
         done.append({"case": str(case_dir.relative_to(out_dir)), "why": why, "kind": k})
         print(f"  {case_dir.relative_to(out_dir.parent)}")
     if ruled:
