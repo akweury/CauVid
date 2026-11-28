@@ -13,11 +13,12 @@ video, agent and frame are in the folder name.
 
     ./run_roadpp_docker.sh --gpu 3 --jun_keyframes -- --exp sumo_maps_v8 --machine dgx-jing --shape_phases True \\
         --run_id 20261125-v8_lab --kf_head Car:Jun --kf_mode failures
-Writes <output_dir>/keyframes/<head>[_fail_<rule hash>]/<case>/<k>_<time>s.png (+ cases.json with the rule in
+Writes <output_dir>/keyframes/<head>[_fail_<rule hash>]_<date-time>/<case>/<k>_<time>s.png (+ cases.json with the rule in
 failures mode).
 """
 import hashlib
 import random
+import time
 from pathlib import Path
 
 import torch
@@ -135,7 +136,8 @@ def main():
     label_names = [step05._atom_name(sig) for sig in unique_atoms]
     # failures: one folder per rule (a short hash of its text), so runs of different rules do not mix
     tag = "_fail_" + hashlib.md5(args.kf_rule.encode()).hexdigest()[:6] if fail else ""
-    out_dir = args.output_dir / "keyframes" / (args.kf_head.replace(":", "_") + tag)
+    # every run its own folder (the start time), so runs never mix
+    out_dir = args.output_dir / "keyframes" / (args.kf_head.replace(":", "_") + tag + time.strftime("_%Y%m%d-%H%M%S"))
     done = []
     for v, n, ref, case, why, k in cases:
         vid = d["vids"][v]
