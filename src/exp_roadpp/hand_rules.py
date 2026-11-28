@@ -1,7 +1,8 @@
 """Hand-written rules of one head, evaluated on train and val (2026-11-28).
 
-A rule is literals joined by " & ", as `step05_mine.literal_text` writes them ("Car:IncomLane(own)@1",
-"!Car:Stop(own)@2", "veh:Jun(other)@1"); rules are separated by ";". Per rule on the head's at-risk rows (as
+A rule is conditions joined by " & ", a condition one literal as `step05_mine.literal_text` writes it
+("Car:IncomLane(own)@1", "!Car:Stop(own)@2", "veh:Jun(other)@1") or several joined by " | " (any of them; brackets
+optional); rules are separated by ";", an optional "name:" before a rule labels it. Per rule on the head's at-risk rows (as
 `pair_table`): rows, precision, row recall, onsets, onset recall, and its negative rows by what the agent does
 (`pair_table.fp_classes`: early / later / after / never). Last: the union of the rules (the head predicted if any
 holds). An unknown literal stops with the closest names.
@@ -15,7 +16,7 @@ import difflib
 import torch
 
 from src.exp_roadpp import config, step05, step05_mine, utils_data, utils_pipe
-from src.exp_roadpp.pair_table import collect, fp_classes, rule_mask, split_tables, summary
+from src.exp_roadpp.pair_table import collect, fp_classes, split_tables, summary
 from src.exp_roadpp.rule_direct import head_rows
 
 # Car:Jun (the car enters the junction within the hit window): hypotheses from the length-1 table
@@ -50,12 +51,19 @@ def main():
 
     # rule text -> literal indices
     lit_of = {step05_mine.literal_text(model, names, m): m for m in range(model.num_literals)}
-    rules = [[x.strip() for x in r.split("&")] for r in args.hr_rules.split(";") if r.strip()]
+    rules, labels = [], []
+    for r in (r.strip() for r in args.hr_rules.split(";")):
+        if not r:
+            continue
+        name, sep, body = r.partition(":=")
+        labels.append(name.strip() if sep else None)
+        body = body if sep else r
+        rules.append([[x.strip(" ()") for x in c.split("|")] for c in body.split("&")])
     for r in rules:
-        for t in r:
+        for t in (t for c in r for t in c):
             if t not in lit_of:
                 raise ValueError(f"unknown literal {t!r}; close: {difflib.get_close_matches(t, list(lit_of), 5)}")
-    used = sorted({lit_of[t] for r in rules for t in r})
+    used = sorted({lit_of[t] for r in rules for c in r for t in c})
     col = {m: i for i, m in enumerate(used)}
     cols = torch.tensor(used, device=device)
 
@@ -72,10 +80,17 @@ def main():
 
     out = []
     union = {sp: torch.zeros(len(t["F"]), dtype=torch.bool, device=device) for sp, t in data.items()}
-    for r in rules + [None]:
-        res = {"rule": " & ".join(r) if r else "UNION of the rules above"}
+    def mask(t, r):
+        m = torch.ones(len(t["F"]), dtype=torch.bool, device=device)
+        for c in r:
+            m &= t["F"][:, [col[lit_of[x]] for x in c]].any(dim=1)
+        return m
+
+    text = lambda r: " & ".join(c[0] if len(c) == 1 else "(" + " | ".join(c) + ")" for c in r)
+    for r, lab in list(zip(rules, labels)) + [(None, None)]:
+        res = {"rule": (f"[{lab}] " if lab else "") + text(r) if r else "UNION of the rules above"}
         for sp, t in data.items():
-            m = rule_mask(t, [col[lit_of[x]] for x in r]) if r else union[sp]
+            m = mask(t, r) if r else union[sp]
             if r:
                 union[sp] |= m
             s = summary(t, m)
