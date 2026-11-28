@@ -87,9 +87,8 @@ def main():
         d = collect(hand_rules.rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, "val",
                                          sel, store), model, torch.tensor(used or [0], dtype=torch.long, device=device))
         d["F"] = d["F"][:, :len(used)]
-        if any(x in extra for x in lits):
-            bc, tl_h = hand_rules.box_columns(d, cfg, "val", training_data["num_atoms"], 0.02, 5)
-            d["F"] = torch.cat([d["F"], bc] + [hand_rules.tl_column(tl_h, x)[:, None] for x in tl_lits], 1)
+        bc, tl_h, leave = hand_rules.box_columns(d, cfg, "val", training_data["num_atoms"], 0.02, 5)
+        d["F"] = torch.cat([d["F"], bc] + [hand_rules.tl_column(tl_h, x)[:, None] for x in tl_lits], 1)
         t = split_tables(d, torch.arange(d["F"].shape[1]), device)
         nxt = torch.cat(store) if store else torch.zeros((0, len(sel)), dtype=torch.int16)
         m = hand_rules.rule_holds(t, rule, col)
@@ -106,7 +105,12 @@ def main():
         print(f"[Keyframes] timing ignored: the rule holds on {int(m.sum())} rows of {len(ag_all)} agents; the agent "
               f"does {args.kf_head} later on {float(happens.sum()) / max(int(m.sum()), 1):.3f} of the rows, "
               f"{len(ag_ok) / max(len(ag_all), 1):.3f} of the agents (base: {base_rows:.3f} of all rows)")
-        rows = torch.nonzero((kind == 2) | (kind == 3)).flatten().tolist()  # after / never: it does not happen
+        # after / never: it does not happen; the agent leaving the view within the horizon: unknown, not shown
+        no = (kind == 2) | (kind == 3)
+        seen = leave.to(device) >= H
+        print(f"[Keyframes] it does not happen on {int(no.sum())} rows; the agent leaves the view within {H / 10:g} s "
+              f"on {int((no & ~seen).sum())} of them (unknown, dropped)")
+        rows = torch.nonzero(no & seen).flatten().tolist()
         rng.shuffle(rows)
         meta, kind = d["meta"].tolist(), kind.cpu().tolist()
         per_agent = {}

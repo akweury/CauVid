@@ -118,6 +118,7 @@ BOX_NAMES = ("edge_left", "edge_right", "edge_bottom", "to_left", "to_right", "t
 NOW_ONLY = ("edge_left", "edge_right", "edge_bottom", "new")    # need only the box at t (the others also at t - k)
 BOX_LITS = [f"box:{x}" for x in BOX_NAMES] + [f"!box:{x}" for x in BOX_NAMES]
 MOVE_EPS = 0.002
+LEAVE_NEVER = 10 ** 9
 
 
 TL_LIT = re.compile(r"^tl:h(>=|<)([0-9.]+)$")
@@ -139,12 +140,14 @@ def tl_column(tl_h, lit):
 def box_columns(d, cfg, split, num_atoms, edge, k):
     """(rows, len(BOX_LITS)) bool of the rows of `pair_table.collect` d (meta: video index, agent, frame t), from
     the split's GT boxes (`step05._agent_boxes`, normalised x1, y1, x2, y2), and (rows,) float the height of the
-    largest traffic light ("TL") box at the row's frame (NaN: none)."""
+    largest traffic light ("TL") box at the row's frame (NaN: none), and (rows,) long the frames from t to the first
+    later frame where the agent has no box (it left the view; LEAVE_NEVER if it stays in view to the video's end)."""
     atoms = utils_data.load_json(cfg[f"{split}_atom_file"])
     boxes = torch.load(cfg[f"{split}_box_file"], map_location="cpu")
     meta = d["meta"]
     out = torch.zeros((len(meta), len(BOX_LITS)), dtype=torch.bool)
     tl_h = torch.full((len(meta),), float("nan"))
+    leave = torch.full((len(meta),), LEAVE_NEVER, dtype=torch.long)
     for v, vid in enumerate(tqdm(d["vids"], desc=f"{split}: boxes")):
         rows = torch.nonzero(meta[:, 0] == v).flatten()
         if not len(rows):
@@ -152,6 +155,12 @@ def box_columns(d, cfg, split, num_atoms, edge, k):
         X = step05.build_video_tensor(atoms[vid], num_atoms)
         vb, classes, has = step05._agent_boxes(boxes, vid, atoms[vid], X)
         n, t = meta[rows, 1], meta[rows, 2].clamp(max=vb.shape[0] - 1)
+        T = has.shape[0]
+        gone = torch.full(has.shape, LEAVE_NEVER, dtype=torch.long)             # first frame > t without a box
+        for f in range(T - 2, -1, -1):
+            gone[f] = torch.where(~has[f + 1], torch.tensor(f + 1), gone[f + 1])
+        g = gone[t, n]
+        leave[rows] = torch.where(g < LEAVE_NEVER, g - t, torch.tensor(LEAVE_NEVER))
         tl = [i for i, c in enumerate(classes) if c == "TL"]
         if tl:
             hts = (vb[:, tl, 3] - vb[:, tl, 1]).nan_to_num(nan=-1.0).max(dim=1).values      # (T,)
@@ -171,7 +180,7 @@ def box_columns(d, cfg, split, num_atoms, edge, k):
             known = now if name in NOW_ONLY else ok
             out[rows, j] = f[name] & known
             out[rows, len(BOX_NAMES) + j] = ~f[name] & known
-    return out, tl_h
+    return out, tl_h, leave
 
 
 def main():
@@ -222,10 +231,11 @@ def main():
         store = []
         d = collect(gen(ids, sp, store), model, cols)
         d["F"] = d["F"][:, :len(used)]
-        bc, tl_h = box_columns(d, cfg, sp, training_data["num_atoms"], args.hr_edge, args.hr_move)
+        bc, tl_h, leave = box_columns(d, cfg, sp, training_data["num_atoms"], args.hr_edge, args.hr_move)
         d["F"] = torch.cat([d["F"], bc] + [tl_column(tl_h, x)[:, None] for x in tl_lits], dim=1)
         data[sp] = split_tables(d, torch.arange(d["F"].shape[1]), device)
         data[sp]["tl_h"] = tl_h.to(device)
+        data[sp]["leave"] = leave.to(device)
         data[sp]["next"] = torch.cat(store).to(device) if store else torch.zeros((0, len(sel)), device=device)
 
     def next_actions(t, m, top=5):
@@ -256,10 +266,16 @@ def main():
             fm = fp.pop("_masks")
             fp["timing"] = sum(fp[k]["share"] for k in ("early", "later", "after"))
             fp["never_next"] = next_actions(t, fm["never"])
-            res[sp] = {**s, "row_recall": s["hit_rows"] / max(t["total_hit"], 1), "fp": fp}
+            # unknown outcome (2026-11-28, the user): no hit and the agent leaves the view within the hit window
+            unk = m & ~t["y"] & (t["leave"] <= w * S)
+            fp["never_left_view"] = float((fm["never"] & (t["leave"] < H)).sum()) / max(int(fm["never"].sum()), 1)
+            res[sp] = {**s, "row_recall": s["hit_rows"] / max(t["total_hit"], 1), "fp": fp,
+                       "unknown": int(unk.sum()), "unknown_share": float(unk.sum()) / max(int(m.sum()), 1),
+                       "precision_known": s["hit_rows"] / max(int(m.sum()) - int(unk.sum()), 1)}
         out.append(res)
         tr, va = res["train"], res["val"]
         print(f"[Hand rules] train P {tr['precision']:.3f} onsets {tr['onsets']} | val P {va['precision']:.3f} "
+              f"(known {va['precision_known']:.3f}, unknown {va['unknown_share']:.2f}) "
               f"onset R {va['onset_recall']:.3f} never {va['fp']['never']['share']:.2f}  {res['rule']}")
 
     base = {sp: summary(t, torch.ones(len(t["F"]), dtype=torch.bool, device=device)) for sp, t in data.items()}
@@ -267,12 +283,14 @@ def main():
           f"Train {len(tr_ids)} videos, base P {base['train']['precision']:.4f}, {base['train']['onsets']} onsets; "
           f"val {len(va_ids)} videos, base P {base['val']['precision']:.4f}, {base['val']['onsets']} onsets. "
           f"Negatives by what the agent does (share of the rule's negative rows): early = its onset comes later "
-          f"within {H} frames, never = it has no onset.", "",
-          "| train P | train onsets | val P | val onset R | val row R | val early | val never | rule |",
-          "|---|---|---|---|---|---|---|---|"]
+          f"within {H} frames, never = it has no onset. Unknown: the rule's rows without a hit where the agent leaves "
+          f"the view within the hit window ({w * S / 10:g} s), the outcome not seen; P known = P without them.", "",
+          "| train P | train onsets | val P | val P known | val unknown | val onset R | val row R | val early | "
+          "val never | rule |", "|---|---|---|---|---|---|---|---|---|---|"]
     for x in out:
         tr, va = x["train"], x["val"]
-        md.append(f"| {tr['precision']:.3f} | {tr['onsets']} | {va['precision']:.3f} | {va['onset_recall']:.3f} | "
+        md.append(f"| {tr['precision']:.3f} | {tr['onsets']} | {va['precision']:.3f} | {va['precision_known']:.3f} | "
+                  f"{va['unknown_share']:.2f} | {va['onset_recall']:.3f} | "
                   f"{va['row_recall']:.3f} | {va['fp']['early']['share']:.2f} | {va['fp']['never']['share']:.2f} | "
                   f"{x['rule']} |")
     acts = lambda x: ", ".join(f"{a} {v:.2f}" for a, v in x["top"]) + f"; nothing new {x['nothing_new']:.2f}"
@@ -280,11 +298,11 @@ def main():
            f"timing: the agent does {args.hr_head} but outside the hit window (early / later / after); other: it never "
            f"does it. Next actions of the 'other' rows: its labels switching on within {w * S / 10:g} s (the hit "
            f"window) and {H / 10:g} s, as shares of those rows.", "",
-           f"| rule | timing | other | other: next within {w * S / 10:g} s | other: next within {H / 10:g} s |",
-           "|---|---|---|---|---|"]
+           f"| rule | timing | other | other: left the view within {H / 10:g} s | other: next within {w * S / 10:g} s "
+           f"| other: next within {H / 10:g} s |", "|---|---|---|---|---|---|"]
     for x in out:
         f = x["val"]["fp"]
-        md.append(f"| {x['rule']} | {f['timing']:.2f} | {f['never']['share']:.2f} | "
+        md.append(f"| {x['rule']} | {f['timing']:.2f} | {f['never']['share']:.2f} | {f['never_left_view']:.2f} | "
                   f"{acts(f['never_next']['hit_window'])} | {acts(f['never_next']['horizon'])} |")
     # Traffic light size: precision per decile of the TL height (train deciles), all rows and the first rule's rows
     trh = data["train"]["tl_h"]
