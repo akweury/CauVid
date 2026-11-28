@@ -36,6 +36,45 @@ CAR_JUN = "; ".join([
 ])
 
 
+def parse_rules(spec, lit_of):
+    """(rules, labels): a rule is a list of conditions, a condition a list of literal texts (any of them holds)."""
+    rules, labels = [], []
+    for r in (r.strip() for r in spec.split(";")):
+        if not r:
+            continue
+        name, sep, body = r.partition(":=")
+        labels.append(name.strip() if sep else None)
+        rules.append([[x.strip(" ()") for x in c.split("|")] for c in (body if sep else r).split("&")])
+    for r in rules:
+        for t in (t for c in r for t in c):
+            if t not in lit_of:
+                raise ValueError(f"unknown literal {t!r}; close: {difflib.get_close_matches(t, list(lit_of), 5)}")
+    return rules, labels
+
+
+def rule_holds(t, r, col):
+    """(rows,) where the rule r holds; col: literal text -> column of t["F"]."""
+    m = torch.ones(len(t["F"]), dtype=torch.bool, device=t["F"].device)
+    for c in r:
+        m &= t["F"][:, [col[x] for x in c]].any(dim=1)
+    return m
+
+
+def rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, desc, sel, store):
+    """`rule_direct.head_rows`, storing per row (in store) the frames to the agent's next onset of the atoms sel."""
+    for vid in tqdm(ids, desc=desc):
+        can = possible(vid)
+        for frames in training_data["frames"][vid].split(128):
+            rows = step05._video_rows(model, training_data, vid, frames, device)
+            if len(rows["inputs"]) == 0:
+                continue
+            keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
+            keep, y = keep[:, h], y[:, h]
+            if keep.any():
+                store.append(rows["first"][keep][:, sel].to(torch.int16).cpu())
+                yield vid, rows["inputs"][keep], y[keep], rows["rows"][keep], rows["first"][keep][:, h]
+
+
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--hr_head", type=str, default="Car:Jun")
@@ -55,20 +94,9 @@ def main():
 
     # rule text -> literal indices
     lit_of = {step05_mine.literal_text(model, names, m): m for m in range(model.num_literals)}
-    rules, labels = [], []
-    for r in (r.strip() for r in args.hr_rules.split(";")):
-        if not r:
-            continue
-        name, sep, body = r.partition(":=")
-        labels.append(name.strip() if sep else None)
-        body = body if sep else r
-        rules.append([[x.strip(" ()") for x in c.split("|")] for c in body.split("&")])
-    for r in rules:
-        for t in (t for c in r for t in c):
-            if t not in lit_of:
-                raise ValueError(f"unknown literal {t!r}; close: {difflib.get_close_matches(t, list(lit_of), 5)}")
+    rules, labels = parse_rules(args.hr_rules, lit_of)
     used = sorted({lit_of[t] for r in rules for c in r for t in c})
-    col = {m: i for i, m in enumerate(used)}
+    col = {t: used.index(lit_of[t]) for r in rules for c in r for t in c}
     cols = torch.tensor(used, device=device)
 
     head_mask = training_data["target_heads"].to(device)
@@ -82,19 +110,8 @@ def main():
     sel = torch.tensor([a for a, nm in enumerate(names) if nm.startswith(cls) and a != h], device=device)
     sel_names = [names[a].split(":", 1)[1] for a in sel.tolist()]
 
-    def gen(ids, desc, store):
-        """`rule_direct.head_rows`, storing per row the frames to the next onset of the atoms sel."""
-        for vid in tqdm(ids, desc=desc):
-            can = possible(vid)
-            for frames in training_data["frames"][vid].split(128):
-                rows = step05._video_rows(model, training_data, vid, frames, device)
-                if len(rows["inputs"]) == 0:
-                    continue
-                keep, y = step05_mine._head_rows(rows, can, head_mask, S, w)
-                keep, y = keep[:, h], y[:, h]
-                if keep.any():
-                    store.append(rows["first"][keep][:, sel].to(torch.int16).cpu())
-                    yield vid, rows["inputs"][keep], y[keep], rows["rows"][keep], rows["first"][keep][:, h]
+    gen = lambda ids, desc, store: rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, desc,
+                                             sel, store)
 
     idx = torch.arange(len(used))
     data = {}
@@ -117,11 +134,7 @@ def main():
 
     out = []
     union = {sp: torch.zeros(len(t["F"]), dtype=torch.bool, device=device) for sp, t in data.items()}
-    def mask(t, r):
-        m = torch.ones(len(t["F"]), dtype=torch.bool, device=device)
-        for c in r:
-            m &= t["F"][:, [col[lit_of[x]] for x in c]].any(dim=1)
-        return m
+    mask = lambda t, r: rule_holds(t, r, col)
 
     text = lambda r: " & ".join(c[0] if len(c) == 1 else "(" + " | ".join(c) + ")" for c in r)
     for r, lab in list(zip(rules, labels)) + [(None, None)]:

@@ -122,13 +122,15 @@ TEXT_LINES = 9                          # group mode: lines of the shared text b
 LEFT_COLOR, RIGHT_COLOR = "#0d47a1", "#1b5e20"   # group mode: the top view's lines (blue), the camera view's (green)
 
 
-def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0, title=None):
+def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0, title=None,
+           cam_keep=None):
     """One image of frame (1-based) of video vid; note: an extra line for the title of the top view;
     highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`);
     groups: [(colour, [tube_uids], caption)] drawn in that colour in both views, each with a big box around all its
     members in both views and the captions under the camera view; every other agent grey (`gestalt_fail_clips`);
     font_scale: every text larger; title: the top view's whole title instead of the video / frame / ego line and
-    note, the camera view without a title (keyframes, `jun_keyframes`)."""
+    note, the camera view without a title (keyframes, `jun_keyframes`); cam_keep: a set of tube_uids, the camera
+    view draws only their boxes and the traffic lights' (TL / OthTL)."""
     fs = float(font_scale)
     hl = highlight.split("-", 1)[1] if highlight and "-" in highlight else highlight
     group_mode = groups is not None
@@ -227,6 +229,8 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
     for a in items:
         x1, y1, x2, y2 = a["box"]
         cls = labels["agent_labels"][a["agent_ids"][0]]
+        if cam_keep is not None and a.get("tube_uid") not in cam_keep and cls not in ("TL", "OthTL"):
+            continue
         col = COLORS.get(cls, "black")
         mark = highlight is not None and a.get("tube_uid") == highlight
         gcol = color_of.get(a.get("tube_uid"))
