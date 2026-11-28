@@ -62,17 +62,21 @@ def cross_pairs(F, pa, pb):
 
 
 def collect(gen, model, cols):
-    """One pass: the literal bits (rows, C) of every row (on the CPU), the hit flags and the hit rows' event index."""
-    Fs, ys, events, ev_ids = [], [], [], {}
+    """One pass: the literal bits (rows, C) of every row (on the CPU), the hit flags, the hit rows' event index and
+    per row (video index, agent n, frame t, frames to the agent's next onset; capped at the largest window)."""
+    Fs, ys, metas, events, ev_ids, vid_ids = [], [], [], [], {}, {}
     with torch.no_grad():
         for vid, inp, y, rk, first in gen:
             Fs.append((model.literal_values(inp)[:, cols] > 0.5).cpu())
             ys.append(y.cpu())
+            v = torch.full((len(y),), vid_ids.setdefault(vid, len(vid_ids)), dtype=torch.long)
+            metas.append(torch.stack([v, rk[:, 1].long().cpu(), rk[:, 0].long().cpu(), first.long().cpu()], 1))
             for i in torch.nonzero(y).flatten().tolist():
                 events.append(ev_ids.setdefault((vid, int(rk[i, 1]), int(rk[i, 0]) + int(first[i])), len(ev_ids)))
     C = len(cols)
     return {"F": torch.cat(Fs) if Fs else torch.zeros((0, C), dtype=torch.bool),
             "y": torch.cat(ys) if ys else torch.zeros(0, dtype=torch.bool),
+            "meta": torch.cat(metas) if metas else torch.zeros((0, 4), dtype=torch.long),
             "ev": torch.tensor(events, dtype=torch.long), "E": len(ev_ids)}
 
 
@@ -111,7 +115,7 @@ def split_tables(d, idx, device):
     Fh = F[y]
     ev_row = torch.full((len(F),), -1, dtype=torch.long, device=device)
     ev_row[y] = ev
-    return {"F": F, "Fh": Fh, "y": y, "ev": ev, "ev_row": ev_row, "E": d["E"], "total": len(F), "total_hit": int(y.sum()),
+    return {"F": F, "Fh": Fh, "y": y, "ev": ev, "ev_row": ev_row, "meta": d.get("meta", torch.zeros((len(F), 4), dtype=torch.long)).to(device), "E": d["E"], "total": len(F), "total_hit": int(y.sum()),
             "n1": F.sum(0).float(), "h1": Fh.sum(0).float(), "o1": onsets1(Fh, ev, d["E"]),
             "N2": cross(F, F), "H2": cross(Fh, Fh), "o2": onsets_lr(Fh, Fh, ev, d["E"])}
 
@@ -335,6 +339,94 @@ def exceptions(tr, va, r, max_steps, min_share, ratio, val_ratio):
     return {"start": {"train": s0, "val": v0}, "steps": steps, "first_step_failed_val": fail_val}
 
 
+def near_duplicates(tr, va, kept, score, tau):
+    """Kept pairs (kept (C, C) upper triangle) that are near-identical to a literal or to a better pair: Jaccard of
+    their rows >= tau on train and on val. A pair (a, b) and the literal a: |a & b| / |a|; pairs (a, b), (a, c)
+    sharing a literal: |a & b & c| / |(a & b) | (a & c)|, from the cross table of the rows where a holds. Pairs
+    not sharing a literal are not compared. Greedy: a pair near-identical to one of its literals goes to the
+    literal; the others by score (high first), each unassigned pair absorbs its unassigned near-identical pairs.
+    Returns (rep (P,) long: -1 the pair stays, >= 0 the absorbing pair's index, < -1: the literal -2 - a;
+    the pairs' (ia, ib))."""
+    C = kept.shape[0]
+    device = kept.device
+    ia, ib = torch.nonzero(kept, as_tuple=True)
+    P = len(ia)
+    pid = torch.full((C, C), -1, dtype=torch.long, device=device)
+    pid[ia, ib] = torch.arange(P, device=device)
+    pid[ib, ia] = torch.arange(P, device=device)
+    to_lit = torch.full((P,), -1, dtype=torch.long, device=device)
+    edges = []
+    sym = kept | kept.T
+    for a in range(C):
+        B = torch.nonzero(sym[a]).flatten()
+        if not len(B):
+            continue
+        Jp, Jl = None, None
+        for t in (tr, va):
+            G = t["F"][t["F"][:, a]][:, B]
+            M = cross(G, G)
+            d = torch.diagonal(M)
+            J = M / (d[:, None] + d[None, :] - M).clamp(min=1)
+            jl = d / t["n1"][a].clamp(min=1)
+            Jp = J if Jp is None else torch.minimum(Jp, J)
+            Jl = jl if Jl is None else torch.minimum(Jl, jl)
+        ids = pid[a, B]
+        near_lit = Jl >= tau
+        to_lit[ids[near_lit & (to_lit[ids] < 0)]] = a
+        i, j = torch.nonzero(torch.triu(Jp >= tau, diagonal=1), as_tuple=True)
+        if len(i):
+            edges.append(torch.stack([ids[i], ids[j]], 1))
+    rep = torch.full((P,), -1, dtype=torch.long)
+    lit = to_lit.cpu()
+    rep[lit >= 0] = -2 - lit[lit >= 0]
+    adj = {}
+    if edges:
+        for x, y in torch.cat(edges).cpu().tolist():
+            adj.setdefault(x, []).append(y)
+            adj.setdefault(y, []).append(x)
+    taken = lit >= 0
+    for r in torch.argsort(score.cpu(), descending=True).tolist():
+        if taken[r]:
+            continue
+        taken[r] = True
+        for q in adj.get(r, []):
+            if not taken[q]:
+                taken[q] = True
+                rep[q] = r
+    return rep, (ia, ib)
+
+
+def fp_classes(t, m, H, S):
+    """The negative rows of the rows m (rule holds, no onset within the hit window) by what the agent does:
+      early   the agent's onset is later within H frames (the rule fired too early), by slots ahead (first // S);
+      later   the agent has an onset later than H frames;
+      after   the agent's onsets are all before t (the rule fires after the action);
+      never   the agent has no onset (among the split's at-risk rows).
+    Agents: distinct (video, agent) per class."""
+    meta, y = t["meta"], t["y"]
+    key = meta[:, 0] * 1_000_000 + meta[:, 1]
+    on_key = key[y]
+    on_frame = (meta[:, 2] + meta[:, 3])[y]
+    uk, inv = torch.unique(on_key, return_inverse=True)
+    last = torch.full((len(uk),), -1, dtype=torch.long, device=y.device).scatter_reduce_(0, inv, on_frame, "amax")
+    neg = m & ~y
+    k, tt, first = key[neg], meta[neg, 2], meta[neg, 3]
+    pos = torch.searchsorted(uk, k).clamp(max=max(len(uk) - 1, 0))
+    has = (uk[pos] == k) if len(uk) else torch.zeros_like(k, dtype=torch.bool)
+    lastf = torch.where(has, last[pos] if len(uk) else k, torch.full_like(k, -1))
+    early = first < H
+    later = ~early & has & (lastf > tt)
+    after = ~early & ~later & has
+    never = ~early & ~has
+    out = {"negatives": int(neg.sum())}
+    for name, msk in (("early", early), ("later", later), ("after", after), ("never", never)):
+        out[name] = {"rows": int(msk.sum()), "share": float(msk.sum()) / max(int(neg.sum()), 1),
+                     "agents": int(torch.unique(k[msk]).numel())}
+    slots = torch.bincount(first[early] // S, minlength=H // S + 1).tolist() if early.any() else []
+    out["early_by_slots_ahead"] = {int(i): int(c) for i, c in enumerate(slots) if c}
+    return out
+
+
 def choose_sizes(ex):
     """Sizes k of the exception set (the first k greedy exceptions; 0: none), each judged on val:
       rises       the largest k with the val precision rising at every step up to k (the search principle);
@@ -377,6 +469,9 @@ def main():
                         help="an exception removes >= this share of the rule's train negatives")
     parser.add_argument("--pt_except_ratio", type=float, default=0.25,
                         help="an exception: P(head | rule & exception) <= this x P(rule), on train and on val")
+    parser.add_argument("--pt_dup_jaccard", type=float, default=0.99,
+                        help="kept pairs with rows this similar (Jaccard, train and val) to a literal or a better pair "
+                             "are merged into it (1.01: off)")
     parser.add_argument("--pt_top", type=int, default=30)
     parser.add_argument("--pt_json", type=int, default=20000, help="rules per length in the json (most precise)")
     parser.add_argument("--pt_show", type=str, default="Car:MovTow(own)@1 & !Car:IncomLane(own)@1",
@@ -427,7 +522,8 @@ def main():
     lit_text = lambda i: step05_mine.literal_text(model, names, int(cols[i]))
     ctexts = [lit_text(int(c)) for c in cand.tolist()]
     alias = [[lit_text(int(cand0[m])) for m in grp[1:]] for grp in members]
-    ctext = lambda c: ctexts[c] + (f" (= {', '.join(alias[c])})" if alias[c] else "")
+    ctext = lambda c: ctexts[c] + ((f" (= {', '.join(alias[c][:3])}" +
+                                    (f", ... {len(alias[c])} in all)" if len(alias[c]) > 3 else ")")) if alias[c] else "")
     own = torch.tensor([any(model.literal_info(int(cols[cand0[m]]))["scope"] == 0 for m in grp) for grp in members],
                        dtype=torch.bool, device=device)
     print(f"[Pair table] seeds: {len(cand0)} literals with >= {args.pt_min_onsets1} train onsets, "
@@ -447,7 +543,20 @@ def main():
     with_own = has & (own[:, None] | own[None, :])
     enough = with_own & (tr["o2"] >= args.pt_min_onsets)
     better_tr = enough & (p2 > torch.maximum(pc[:, None], pc[None, :]))
-    kept2 = better_tr & (va["N2"] > 0) & (vp2 > torch.maximum(vp1[:, None], vp1[None, :]))
+    kept2_all = better_tr & (va["N2"] > 0) & (vp2 > torch.maximum(vp1[:, None], vp1[None, :]))
+    # near-identical kept pairs: merged into a literal or the pair with the most train PxR
+    dup_rep, (da, db) = near_duplicates(tr, va, kept2_all, p2[kept2_all] * tr["H2"][kept2_all], args.pt_dup_jaccard)
+    kept2 = kept2_all.clone()
+    gone = dup_rep != -1
+    kept2[da[gone.to(device)], db[gone.to(device)]] = False
+    same_rows = torch.zeros((n_c, n_c), dtype=torch.long, device=device)    # pairs merged into each kept pair
+    into_pair = dup_rep >= 0
+    if into_pair.any():
+        tgt = dup_rep[into_pair].to(device)
+        same_rows.index_put_((da[tgt], db[tgt]), torch.ones_like(tgt), accumulate=True)
+    merged_into_lit = int((dup_rep < -1).sum())
+    print(f"[Pair table] length 2: {int(kept2_all.sum())} kept pairs, {int(gone.sum())} near-identical merged "
+          f"({merged_into_lit} into a literal), {int(kept2.sum())} left")
     seed = kept2 & (vp2 >= args.pt_val_ratio * p2)
 
     # ---- Length 3: every seed pair x every seed literal, in blocks
@@ -506,6 +615,9 @@ def main():
         if len(picked) >= args.pt_except:
             break
     rule_text = lambda r: " & ".join(ctext(c) for c in r if c < n_c)
+    H = int(max(model.windows))                                             # `first` is capped at H
+    all_rows = lambda t: torch.ones(len(t["F"]), dtype=torch.bool, device=device)
+    fp_base = {"train": fp_classes(tr, all_rows(tr), H, S), "val": fp_classes(va, all_rows(va), H, S)}
     excepts = []
     print(f"[Pair table] exceptions: {len(hi)} rules with train recall >= {args.pt_except_recall}, "
           f"{len(picked)} distinct ones used")
@@ -514,6 +626,7 @@ def main():
         ex = exceptions(tr, va, r, args.pt_except_steps, args.pt_except_share, args.pt_except_ratio, args.pt_val_ratio)
         ex["rule"] = rule_text(r)
         ex["sizes"] = choose_sizes(ex)
+        ex["fp"] = {"train": fp_classes(tr, rule_mask(tr, r), H, S), "val": fp_classes(va, rule_mask(va, r), H, S)}
         for st in ex["steps"]:
             st["unless"] = ctext(st["literal"])
         excepts.append(ex)
@@ -527,7 +640,9 @@ def main():
              "seeds_literals": len(cand0), "seeds_merged": n_c, "seeds_own": int(own.sum()),
              "pairs_tested": n_c * (n_c - 1) // 2, "pairs_with_rows": int(has.sum()),
              "pairs_with_own": int(with_own.sum()), "pairs_min_onsets": int(enough.sum()),
-             "pairs_better_train": int(better_tr.sum()), "pairs_kept": int(kept2.sum()), "pairs_extend": n_seeds,
+             "pairs_better_train": int(better_tr.sum()), "pairs_kept_before_merge": int(kept2_all.sum()),
+             "pairs_merged_into_literal": merged_into_lit, "pairs_merged_into_pair": int(into_pair.sum()),
+             "pairs_kept": int(kept2.sum()), "pairs_extend": n_seeds,
              "triples_tested": n3["tested"], "triples_better_train": n3["better_train"],
              "triples_kept": n3["kept"], "triples_extend": n3["extend"], "cover_sort": args.pt_cover_sort}
     print(f"[Pair table] {stats}")
@@ -544,7 +659,9 @@ def main():
 
     def pair(a, b):
         a, b = int(a), int(b)
-        return {"rule": f"{ctext(a)} & {ctext(b)}",
+        n_same = int(same_rows[a, b])
+        return {"rule": f"{ctext(a)} & {ctext(b)}" + (f" [+{n_same} near-identical pairs]" if n_same else ""),
+                "near_identical": n_same,
                 **metrics(float(p2[a, b]), float(tr["H2"][a, b]), tr["o2"][a, b], tr["N2"][a, b],
                           float(vp2[a, b]), float(va["H2"][a, b]), va["o2"][a, b], va["N2"][a, b]),
                 "parents_train": [float(pc[a]), float(pc[b])], "parents_val": [float(vp1[a]), float(vp1[b])],
@@ -608,7 +725,10 @@ def main():
                f"{args.pt_min_onsets1} onsets) {len(cand0)}, {n_c} after merging identical ones ({int(own.sum())} own)",
            f"- pairs: tested {stats['pairs_tested']}, with rows {stats['pairs_with_rows']}, with an own literal "
            f"{stats['pairs_with_own']}, >= {args.pt_min_onsets} onsets {stats['pairs_min_onsets']}, above both "
-           f"literals on train {stats['pairs_better_train']}, also on val (kept) {stats['pairs_kept']}, "
+           f"literals on train {stats['pairs_better_train']}, also on val {stats['pairs_kept_before_merge']}, "
+           f"near-identical (Jaccard >= {args.pt_dup_jaccard:g} on train and val) merged into a literal "
+           f"{stats['pairs_merged_into_literal']} / into a better pair {stats['pairs_merged_into_pair']}, kept "
+           f"{stats['pairs_kept']}, "
            f"extend {stats['pairs_extend']}",
            f"- triples: tested {stats['triples_tested']}, above every sub-rule on train "
            f"{stats['triples_better_train']}, also on val (kept) {stats['triples_kept']}, extend "
@@ -634,6 +754,19 @@ def main():
         md += ["| fraction " + cov_hdr[0], "|---" + cov_hdr[1]]
         md += [f"| {x['frac_of_max']:g} " + cov_row(x) for x in c["checks"] if "onsets" in x]
         md += ["", "Curve:", ""] + cov_hdr + [cov_row(x) for x in c["curve"]] + [""]
+    fp_names = ("early", "later", "after", "never")
+    fp_cells = lambda f: " | ".join(f"{f[n]['share']:.3f} ({f[n]['agents']})" for n in fp_names)
+    md += ["", "## Negative rows of the high-recall rules by what the agent does", "",
+           f"Negative row: the rule holds, no onset within the hit window. early: the agent's onset comes later "
+           f"within {H} frames (the rule fires too early); later: an onset more than {H} frames later; after: the "
+           f"agent's onsets are all before; never: the agent has no onset. Share of the negative rows (distinct "
+           f"agents). all rows: every at-risk row.", "",
+           "| rule | split | negatives | early | later | after | never | early rows by slots ahead |", sep(8)]
+    for name, f2 in [("all rows", fp_base)] + [(ex["rule"], ex["fp"]) for ex in excepts]:
+        for sp in ("train", "val"):
+            f = f2[sp]
+            md.append(f"| {name if sp == 'train' else ''} | {sp} | {f['negatives']} | {fp_cells(f)} | "
+                      f"{', '.join(f'{k}: {v}' for k, v in f['early_by_slots_ahead'].items())} |")
     md += ["", f"## Exception sets of the high-recall rules (train recall >= {args.pt_except_recall})", "",
            f"Exception E of rule R: holds where R holds and the head not. Greedy: the E removing the largest share of "
            f"R's train negatives, with P(head | R & E) <= {args.pt_except_ratio:g} x P(R) on train and val, >= "
@@ -690,7 +823,7 @@ def main():
                           "val": {"rows": va["total"], "hit_rows": va["total_hit"], "onsets": va["E"]},
                           "stats": stats, "bucket_labels": labels, "buckets_pairs": b2, "buckets_triples": b3,
                           "singles": singles, "pairs": pairs["precision"], "triples": trip["precision"],
-                          "coverage": cover, "exceptions": excepts, "shown": shown}, f"{stem}.json")
+                          "coverage": cover, "exceptions": excepts, "fp_all_rows": fp_base, "shown": shown}, f"{stem}.json")
     print("\n".join(md[:45]))
     print(f"\n[Pair table] {stem}.md / .json")
 
