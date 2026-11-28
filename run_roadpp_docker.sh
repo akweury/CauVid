@@ -147,6 +147,8 @@ for arg in "${EXTRA_ARGS[@]}"; do
         ENTRY_MODULE="src.exp_roadpp.pair_table"
     elif [[ "$arg" == "--hand_rules" ]]; then
         ENTRY_MODULE="src.exp_roadpp.hand_rules"
+    elif [[ "$arg" == "--jun_keyframes" ]]; then
+        ENTRY_MODULE="src.exp_roadpp.jun_keyframes"
     elif [[ "$arg" == "--head_clips" ]]; then
         ENTRY_MODULE="src.exp_roadpp.head_clips"
     elif [[ "$arg" == "--turn_fail_clips" ]]; then

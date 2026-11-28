@@ -122,12 +122,13 @@ TEXT_LINES = 9                          # group mode: lines of the shared text b
 LEFT_COLOR, RIGHT_COLOR = "#0d47a1", "#1b5e20"   # group mode: the top view's lines (blue), the camera view's (green)
 
 
-def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0):
+def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None, font_scale=1.0, title=None):
     """One image of frame (1-based) of video vid; note: an extra line for the title of the top view;
     highlight: the tube_uid of an agent drawn with a thick red outline in both views (`lane_clips`);
     groups: [(colour, [tube_uids], caption)] drawn in that colour in both views, each with a big box around all its
     members in both views and the captions under the camera view; every other agent grey (`gestalt_fail_clips`);
-    font_scale: every text larger."""
+    font_scale: every text larger; title: the top view's whole title instead of the video / frame / ego line and
+    note, the camera view without a title (keyframes, `jun_keyframes`)."""
     fs = float(font_scale)
     hl = highlight.split("-", 1)[1] if highlight and "-" in highlight else highlight
     group_mode = groups is not None
@@ -212,6 +213,8 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
         for ln in (note or "").split("\n"):
             if ln:
                 lines.append((f"[event] {ln}", "#000000"))
+    elif title is not None:
+        top.set_title(title, fontsize=12 * fs, loc="left")
     else:
         top.set_title(f"{vid} frame {frame} (t={world['t']:.1f} s)  ego: {av}, {ego['speed']:.1f} m/s"
                       + (f"\n{map_name}" if map_name else "") + (f"\n{note}" if note else ""), fontsize=10 * fs)
@@ -270,6 +273,8 @@ def render(dataset, vid, frame, out_file, note=None, highlight=None, groups=None
         for i, (text, col) in enumerate(wrapped[:TEXT_LINES]):
             fig.text(0.01, 1 - (0.08 + i * line_h) / total_h, text, fontsize=9 * fs, color=col, ha="left", va="top")
         fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=1 - text_h / total_h, wspace=0.04)
+    elif title is not None:
+        fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.90, wspace=0.04)
     else:
         cam_ax.set_title(f"camera view: {len(annos)} GT boxes\n" + (textwrap.fill(note, int(110 / fs)) if note else ""),
                          fontsize=9 * fs, loc="left")

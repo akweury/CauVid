@@ -76,7 +76,7 @@ def collect(gen, model, cols):
     C = len(cols)
     return {"F": torch.cat(Fs) if Fs else torch.zeros((0, C), dtype=torch.bool),
             "y": torch.cat(ys) if ys else torch.zeros(0, dtype=torch.bool),
-            "meta": torch.cat(metas) if metas else torch.zeros((0, 4), dtype=torch.long),
+            "meta": torch.cat(metas) if metas else torch.zeros((0, 4), dtype=torch.long), "vids": list(vid_ids),
             "ev": torch.tensor(events, dtype=torch.long), "E": len(ev_ids)}
 
 
