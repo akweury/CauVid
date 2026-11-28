@@ -427,6 +427,22 @@ def fp_classes(t, m, H, S):
     return out
 
 
+def clip_tables(md, n):
+    """Every markdown table cut to its header and first n rows (a note gives how many were cut)."""
+    out, rows = [], -2
+    for line in md + [""]:
+        if line.startswith("|"):
+            rows += 1
+            if rows <= n:
+                out.append(line)
+            continue
+        if rows > n:
+            out.append(f"({rows - n} more rows in the json)")
+        rows = -2
+        out.append(line)
+    return out[:-1]
+
+
 def choose_sizes(ex):
     """Sizes k of the exception set (the first k greedy exceptions; 0: none), each judged on val:
       rises       the largest k with the val precision rising at every step up to k (the search principle);
@@ -472,6 +488,7 @@ def main():
     parser.add_argument("--pt_dup_jaccard", type=float, default=0.99,
                         help="kept pairs with rows this similar (Jaccard, train and val) to a literal or a better pair "
                              "are merged into it (1.01: off)")
+    parser.add_argument("--pt_md_rows", type=int, default=5, help="rows per table in the .md (the json has all)")
     parser.add_argument("--pt_top", type=int, default=30)
     parser.add_argument("--pt_json", type=int, default=20000, help="rules per length in the json (most precise)")
     parser.add_argument("--pt_show", type=str, default="Car:MovTow(own)@1 & !Car:IncomLane(own)@1",
@@ -797,7 +814,7 @@ def main():
             md.append(f"- {n}: k median {statistics.median(ks):g}, max {max(ks)}")
         alls = [len(ex["steps"]) for ex in excepts]
         md.append(f"- all: k median {statistics.median(alls):g}, max {max(alls)}")
-    for ex in excepts:
+    for ex in excepts[:args.pt_md_rows]:                                   # the step tables of the first rules
         a = ex["start"]
         md += ["", f"### {ex['rule']}", "",
                f"Start: train P {a['train']['precision']:.3f}, {a['train']['onsets']} onsets, {a['train']['negatives']} "
@@ -817,6 +834,7 @@ def main():
                       f"{st['val']['precision']:.3f} | {st['val']['onsets']} |")
     md += ["", "## Pairs asked for (--pt_show)", ""] + [f"- {x}" for x in shown]
     stem = lab_dir / f"pairs_{args.pt_head.replace(':', '_')}"
+    md = clip_tables(md, args.pt_md_rows)
     open(f"{stem}.md", "w").write("\n".join(md) + "\n")
     utils_data.save_json({"head": args.pt_head, "train_videos": len(tr_ids), "val_videos": len(va_ids),
                           "train": {"rows": tr["total"], "hit_rows": tr["total_hit"], "onsets": tr["E"]},
