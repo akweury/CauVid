@@ -2,7 +2,18 @@
 
 A rule is conditions joined by " & ", a condition one literal as `step05_mine.literal_text` writes it
 ("Car:IncomLane(own)@1", "!Car:Stop(own)@2", "veh:Jun(other)@1") or several joined by " | " (any of them; brackets
-optional); rules are separated by ";", an optional "name:" before a rule labels it. Per rule on the head's at-risk rows (as
+optional); " unless " followed by such a conjunction drops the rows where that holds (several allowed: "A & B
+unless C & D unless E" = A & B & !(C & D) & !E); rules are separated by ";", an optional "name:=" labels a rule.
+Box literals (2026-11-28; no atom says this, read from the agent's GT box at the row's frame t, `box_columns`):
+  box:edge_left / box:edge_right / box:edge_bottom  the box's side within --hr_edge of that image border;
+  box:to_left / box:to_right / box:to_bottom        over the last --hr_move frames the box centre moved left / right,
+                                                    its bottom moved down (by more than 0.002 of the image);
+  box:leaving   (edge_left & to_left) | (edge_right & to_right) | (edge_bottom & to_bottom): leaving the image;
+each also negated ("!box:leaving"; false where the agent has no box at t or t - --hr_move).
+Traffic light size (2026-11-28): the height (share of the image height) of the largest "TL" box at the row's frame;
+  literals "tl:h>=0.03", "tl:h<0.2" (any number; false without a traffic light in view) and "tl:none" / "tl:any".
+  The table "traffic light size" gives the precision of the at-risk rows (and of the first rule's rows) per decile
+  of that height (train deciles) and without a traffic light, to choose the range. Per rule on the head's at-risk rows (as
 `pair_table`): rows, precision, row recall, onsets, onset recall, and its negative rows by what the agent does
 (`pair_table.fp_classes`: early / later / after / never). Last: the union of the rules (the head predicted if any
 holds). An unknown literal stops with the closest names.
@@ -16,6 +27,7 @@ of those rows ("nothing new": none switches on).
 Writes <output_dir>/rule_lab/hand_<head>.md / .json.
 """
 import difflib
+import re
 
 import torch
 from tqdm import tqdm
@@ -36,27 +48,50 @@ CAR_JUN = "; ".join([
 ])
 
 
+def _conj(text):
+    """A conjunction: a list of conditions, a condition a list of literal texts (any of them holds)."""
+    return [[x.strip(" ()") for x in c.split("|")] for c in text.split("&")]
+
+
 def parse_rules(spec, lit_of):
-    """(rules, labels): a rule is a list of conditions, a condition a list of literal texts (any of them holds)."""
+    """(rules, labels): a rule is (body, exceptions), the body a conjunction (`_conj`), the exceptions a list of
+    conjunctions (" unless ")."""
     rules, labels = [], []
     for r in (r.strip() for r in spec.split(";")):
         if not r:
             continue
         name, sep, body = r.partition(":=")
         labels.append(name.strip() if sep else None)
-        rules.append([[x.strip(" ()") for x in c.split("|")] for c in (body if sep else r).split("&")])
+        parts = (body if sep else r).split(" unless ")
+        rules.append((_conj(parts[0]), [_conj(p) for p in parts[1:]]))
     for r in rules:
-        for t in (t for c in r for t in c):
+        for t in rule_literals(r):
             if t not in lit_of:
                 raise ValueError(f"unknown literal {t!r}; close: {difflib.get_close_matches(t, list(lit_of), 5)}")
     return rules, labels
 
 
-def rule_holds(t, r, col):
-    """(rows,) where the rule r holds; col: literal text -> column of t["F"]."""
+def rule_literals(r):
+    return [t for conj in [r[0]] + r[1] for c in conj for t in c]
+
+
+def rule_text(r):
+    conj = lambda q: " & ".join(c[0] if len(c) == 1 else "(" + " | ".join(c) + ")" for c in q)
+    return conj(r[0]) + "".join(f" unless {conj(e)}" for e in r[1])
+
+
+def _conj_holds(t, conj, col):
     m = torch.ones(len(t["F"]), dtype=torch.bool, device=t["F"].device)
-    for c in r:
+    for c in conj:
         m &= t["F"][:, [col[x] for x in c]].any(dim=1)
+    return m
+
+
+def rule_holds(t, r, col):
+    """(rows,) where the rule r holds (its body and none of its exceptions); col: literal text -> column of t["F"]."""
+    m = _conj_holds(t, r[0], col)
+    for e in r[1]:
+        m &= ~_conj_holds(t, e, col)
     return m
 
 
@@ -75,12 +110,70 @@ def rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, d
                 yield vid, rows["inputs"][keep], y[keep], rows["rows"][keep], rows["first"][keep][:, h]
 
 
+BOX_NAMES = ("edge_left", "edge_right", "edge_bottom", "to_left", "to_right", "to_bottom", "leaving")
+BOX_LITS = [f"box:{x}" for x in BOX_NAMES] + [f"!box:{x}" for x in BOX_NAMES]
+MOVE_EPS = 0.002
+
+
+TL_LIT = re.compile(r"^tl:h(>=|<)([0-9.]+)$")
+
+
+def tl_literals(spec):
+    """The traffic light literals written in a rules spec."""
+    return sorted({m.group(0) for m in re.finditer(r"tl:h(?:>=|<)[0-9.]+|tl:none|tl:any", spec)})
+
+
+def tl_column(tl_h, lit):
+    """(rows,) bool of one traffic light literal from the per-row height (NaN: none in view)."""
+    if lit in ("tl:none", "tl:any"):
+        return torch.isnan(tl_h) if lit == "tl:none" else ~torch.isnan(tl_h)
+    op, v = TL_LIT.match(lit).groups()
+    return (tl_h >= float(v)) if op == ">=" else (tl_h < float(v))          # NaN compares False
+
+
+def box_columns(d, cfg, split, num_atoms, edge, k):
+    """(rows, len(BOX_LITS)) bool of the rows of `pair_table.collect` d (meta: video index, agent, frame t), from
+    the split's GT boxes (`step05._agent_boxes`, normalised x1, y1, x2, y2), and (rows,) float the height of the
+    largest traffic light ("TL") box at the row's frame (NaN: none)."""
+    atoms = utils_data.load_json(cfg[f"{split}_atom_file"])
+    boxes = torch.load(cfg[f"{split}_box_file"], map_location="cpu")
+    meta = d["meta"]
+    out = torch.zeros((len(meta), len(BOX_LITS)), dtype=torch.bool)
+    tl_h = torch.full((len(meta),), float("nan"))
+    for v, vid in enumerate(tqdm(d["vids"], desc=f"{split}: boxes")):
+        rows = torch.nonzero(meta[:, 0] == v).flatten()
+        if not len(rows):
+            continue
+        X = step05.build_video_tensor(atoms[vid], num_atoms)
+        vb, classes, has = step05._agent_boxes(boxes, vid, atoms[vid], X)
+        n, t = meta[rows, 1], meta[rows, 2].clamp(max=vb.shape[0] - 1)
+        tl = [i for i, c in enumerate(classes) if c == "TL"]
+        if tl:
+            hts = (vb[:, tl, 3] - vb[:, tl, 1]).nan_to_num(nan=-1.0).max(dim=1).values      # (T,)
+            tl_h[rows] = torch.where(hts[t] >= 0, hts[t], torch.tensor(float("nan")))
+        t0 = (t - k).clamp(min=0)
+        b, b0 = vb[t, n], vb[t0, n]
+        ok = has[t, n] & has[t0, n] & (t >= k)
+        x1, y1, x2, y2 = b.unbind(1)
+        cx, cx0 = (x1 + x2) / 2, (b0[:, 0] + b0[:, 2]) / 2
+        f = {"edge_left": x1 <= edge, "edge_right": x2 >= 1 - edge, "edge_bottom": y2 >= 1 - edge,
+             "to_left": cx < cx0 - MOVE_EPS, "to_right": cx > cx0 + MOVE_EPS, "to_bottom": y2 > b0[:, 3] + MOVE_EPS}
+        f["leaving"] = (f["edge_left"] & f["to_left"]) | (f["edge_right"] & f["to_right"]) | \
+            (f["edge_bottom"] & f["to_bottom"])
+        for j, name in enumerate(BOX_NAMES):
+            out[rows, j] = f[name] & ok
+            out[rows, len(BOX_NAMES) + j] = ~f[name] & ok
+    return out, tl_h
+
+
 def main():
     parser = utils_pipe.get_parser()
     parser.add_argument("--hr_head", type=str, default="Car:Jun")
     parser.add_argument("--hr_rules", type=str, default=CAR_JUN, help="rules ';' separated, literals ' & '")
     parser.add_argument("--hr_train_videos", type=int, default=1000, help="train videos (the first; 0: all)")
     parser.add_argument("--hr_val_videos", type=int, default=500, help="val videos (the first; 0: all)")
+    parser.add_argument("--hr_edge", type=float, default=0.02, help="box literals: a side this close to the border")
+    parser.add_argument("--hr_move", type=int, default=5, help="box literals: frames of the move")
     args = utils_pipe.parse_args(parser)
     args = config.machine_setup(args)
     args.run_dir = args.output_dir / "runs" / args.run_id
@@ -94,10 +187,13 @@ def main():
 
     # rule text -> literal indices
     lit_of = {step05_mine.literal_text(model, names, m): m for m in range(model.num_literals)}
-    rules, labels = parse_rules(args.hr_rules, lit_of)
-    used = sorted({lit_of[t] for r in rules for c in r for t in c})
-    col = {t: used.index(lit_of[t]) for r in rules for c in r for t in c}
-    cols = torch.tensor(used, device=device)
+    tl_lits = tl_literals(args.hr_rules)
+    rules, labels = parse_rules(args.hr_rules, {**lit_of, **{b: None for b in BOX_LITS + tl_lits}})
+    lits = {t for r in rules for t in rule_literals(r)}
+    used = sorted({lit_of[t] for t in lits if t in lit_of})
+    extra = BOX_LITS + tl_lits                                              # computed columns after the literals
+    col = {t: used.index(lit_of[t]) if t in lit_of else len(used) + extra.index(t) for t in lits}
+    cols = torch.tensor(used or [0], dtype=torch.long, device=device)
 
     head_mask = training_data["target_heads"].to(device)
     possible = step05.class_possible(training_data, vocab, device)
@@ -113,11 +209,15 @@ def main():
     gen = lambda ids, desc, store: rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, desc,
                                              sel, store)
 
-    idx = torch.arange(len(used))
     data = {}
     for sp, ids in (("train", tr_ids), ("val", va_ids)):
         store = []
-        data[sp] = split_tables(collect(gen(ids, sp, store), model, cols), idx, device)
+        d = collect(gen(ids, sp, store), model, cols)
+        d["F"] = d["F"][:, :len(used)]
+        bc, tl_h = box_columns(d, cfg, sp, training_data["num_atoms"], args.hr_edge, args.hr_move)
+        d["F"] = torch.cat([d["F"], bc] + [tl_column(tl_h, x)[:, None] for x in tl_lits], dim=1)
+        data[sp] = split_tables(d, torch.arange(d["F"].shape[1]), device)
+        data[sp]["tl_h"] = tl_h.to(device)
         data[sp]["next"] = torch.cat(store).to(device) if store else torch.zeros((0, len(sel)), device=device)
 
     def next_actions(t, m, top=5):
@@ -136,7 +236,7 @@ def main():
     union = {sp: torch.zeros(len(t["F"]), dtype=torch.bool, device=device) for sp, t in data.items()}
     mask = lambda t, r: rule_holds(t, r, col)
 
-    text = lambda r: " & ".join(c[0] if len(c) == 1 else "(" + " | ".join(c) + ")" for c in r)
+    text = rule_text
     for r, lab in list(zip(rules, labels)) + [(None, None)]:
         res = {"rule": (f"[{lab}] " if lab else "") + text(r) if r else "UNION of the rules above"}
         for sp, t in data.items():
@@ -178,9 +278,43 @@ def main():
         f = x["val"]["fp"]
         md.append(f"| {x['rule']} | {f['timing']:.2f} | {f['never']['share']:.2f} | "
                   f"{acts(f['never_next']['hit_window'])} | {acts(f['never_next']['horizon'])} |")
+    # Traffic light size: precision per decile of the TL height (train deciles), all rows and the first rule's rows
+    trh = data["train"]["tl_h"]
+    q = torch.quantile(trh[~torch.isnan(trh)].float().cpu(), torch.linspace(0.1, 0.9, 9)).tolist() if \
+        (~torch.isnan(trh)).any() else []
+    edges = [0.0] + q + [float("inf")]
+    first_rule = rules[0] if rules else None
+    eventual = {}                                                           # the agent does it later (any time)
+    for sp, t in data.items():
+        fa = fp_classes(t, torch.ones_like(t["y"]), H, S, masks=True)["_masks"]
+        eventual[sp] = t["y"] | fa["early"] | fa["later"]
+    tl_rows = []
+    for i in range(len(edges)):
+        row = {"bin": "none" if i == len(edges) - 1 else [edges[i], edges[i + 1]]}
+        for sp, t in data.items():
+            hh = t["tl_h"]
+            b = torch.isnan(hh) if i == len(edges) - 1 else (hh >= edges[i]) & (hh < edges[i + 1])
+            ev = eventual[sp]
+            rm = b & mask(t, first_rule) if first_rule else b
+            row[sp] = {"rows": int(b.sum()), "precision": float(t["y"][b].float().mean()) if b.any() else 0.0,
+                       "eventual": float(ev[b].float().mean()) if b.any() else 0.0,
+                       "rule_rows": int(rm.sum()), "rule_precision": float(t["y"][rm].float().mean()) if rm.any() else 0.0}
+        tl_rows.append(row)
+    lab0 = (f"[{labels[0]}]" if labels and labels[0] else "the first rule") if first_rule else "-"
+    md += ["", "## Traffic light size (height of the largest TL box, share of the image height)", "",
+           f"Per train decile of the height and without a traffic light: P = hit within the window; eventual = the "
+           f"car does {args.hr_head} later at any time; rule: the rows of {lab0}. Base val P "
+           f"{base['val']['precision']:.3f}.", "",
+           "| TL height | train rows | train P | val rows | val P | val eventual | rule val rows | rule val P |",
+           "|---|---|---|---|---|---|---|---|"]
+    for r in tl_rows:
+        bt = "no TL" if r["bin"] == "none" else f"[{r['bin'][0]:.3f}, {r['bin'][1]:.3f})"
+        tr, va = r["train"], r["val"]
+        md.append(f"| {bt} | {tr['rows']} | {tr['precision']:.3f} | {va['rows']} | {va['precision']:.3f} | "
+                  f"{va['eventual']:.3f} | {va['rule_rows']} | {va['rule_precision']:.3f} |")
     stem = args.output_dir / "rule_lab" / f"hand_{args.hr_head.replace(':', '_')}"
     open(f"{stem}.md", "w").write("\n".join(md) + "\n")
-    utils_data.save_json({"head": args.hr_head, "base": base, "rules": out}, f"{stem}.json")
+    utils_data.save_json({"head": args.hr_head, "base": base, "rules": out, "tl_size": tl_rows}, f"{stem}.json")
     print("\n".join(md))
     print(f"\n[Hand rules] {stem}.md / .json")
 

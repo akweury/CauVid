@@ -72,16 +72,23 @@ def main():
         print(f"[Keyframes] {len(onsets)} onsets of {args.kf_head} in {len(ids)} val videos; {len(cases)} shown")
     else:
         lit_of = {step05_mine.literal_text(model, names, m): m for m in range(model.num_literals)}
-        (rule,), _ = hand_rules.parse_rules(args.kf_rule, lit_of)
-        used = sorted({lit_of[x] for c in rule for x in c})
-        col = {x: used.index(lit_of[x]) for c in rule for x in c}
+        tl_lits = hand_rules.tl_literals(args.kf_rule)
+        extra = hand_rules.BOX_LITS + tl_lits
+        (rule,), _ = hand_rules.parse_rules(args.kf_rule, {**lit_of, **{b: None for b in extra}})
+        lits = set(hand_rules.rule_literals(rule))
+        used = sorted({lit_of[x] for x in lits if x in lit_of})
+        col = {x: used.index(lit_of[x]) if x in lit_of else len(used) + extra.index(x) for x in lits}
         cls = args.kf_head.split(":")[0] + ":"
         sel = torch.tensor([a for a, nm in enumerate(names) if nm.startswith(cls) and a != h], device=device)
         sel_names = [names[a].split(":", 1)[1] for a in sel.tolist()]
         store = []
         d = collect(hand_rules.rows_next(model, training_data, ids, h, possible, head_mask, S, w, device, "val",
-                                         sel, store), model, torch.tensor(used, device=device))
-        t = split_tables(d, torch.arange(len(used)), device)
+                                         sel, store), model, torch.tensor(used or [0], dtype=torch.long, device=device))
+        d["F"] = d["F"][:, :len(used)]
+        if any(x in extra for x in lits):
+            bc, tl_h = hand_rules.box_columns(d, cfg, "val", training_data["num_atoms"], 0.02, 5)
+            d["F"] = torch.cat([d["F"], bc] + [hand_rules.tl_column(tl_h, x)[:, None] for x in tl_lits], 1)
+        t = split_tables(d, torch.arange(d["F"].shape[1]), device)
         nxt = torch.cat(store) if store else torch.zeros((0, len(sel)), dtype=torch.int16)
         m = hand_rules.rule_holds(t, rule, col)
         fp = fp_classes(t, m, H, S, masks=True)
